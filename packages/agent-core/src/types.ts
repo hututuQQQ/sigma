@@ -45,6 +45,9 @@ export interface AgentRunConfig {
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
   maxToolOutputChars?: number;
+  maxMessageHistoryChars?: number;
+  messageHistoryRetain?: number;
+  compactionSummaryChars?: number;
   eventBus?: AgentEventBusLike;
 }
 
@@ -107,6 +110,8 @@ export interface SummaryJson {
   model: string;
   duration_ms: number;
   last_error: string | null;
+  final_message?: string;
+  validation_commands?: string[];
 }
 
 export function addUsage(total: TokenTotals, usage: Usage | undefined): void {

@@ -9,10 +9,12 @@ class FakeModel implements ModelClient {
   readonly provider = "deepseek" as const;
   readonly model = "fake-model";
   private index = 0;
+  readonly requests: ModelRequest[] = [];
 
   constructor(private readonly responses: ModelResponse[]) {}
 
-  async complete(_req: ModelRequest): Promise<ModelResponse> {
+  async complete(req: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(req);
     const response = this.responses[Math.min(this.index, this.responses.length - 1)];
     this.index += 1;
     return response;
@@ -122,5 +124,57 @@ describe("agent loop", () => {
 
     expect(result.status).toBe("stopped");
     expect(result.finishReason).toBe("max_turns");
+  });
+
+  it("compacts old messages without leaving an orphan tool message at the retained tail", async () => {
+    const dir = await tempWorkspace();
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-1",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-2",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "make lots of output",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 3,
+      maxMessageHistoryChars: 1000,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 500
+    });
+
+    expect(result.status).toBe("completed");
+    const thirdRequestMessages = model.requests[2].messages;
+    expect(thirdRequestMessages[0].role).toBe("system");
+    expect(thirdRequestMessages[1]).toMatchObject({ role: "user", content: "make lots of output" });
+    expect(thirdRequestMessages[2].role).toBe("user");
+    expect((thirdRequestMessages[2] as { content?: string }).content).toContain(
+      "Previous agent conversation compacted by harness."
+    );
+    expect(thirdRequestMessages[3].role).toBe("assistant");
   });
 });
