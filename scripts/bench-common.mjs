@@ -133,38 +133,65 @@ export function detectTaskSelectionFlag(helpText) {
   return candidates.find((candidate) => new RegExp(`${candidate.replace("-", "\\-")}(?![A-Za-z0-9_-])`).test(helpText)) ?? null;
 }
 
+export function detectHarborRunCapabilities(helpText = "") {
+  const hasAgentImportPath = /--agent-import-path\b/.test(helpText);
+  const hasPlainAgentKwargs = /key=value/.test(helpText) || /format\s+'key=value'/.test(helpText);
+  const hasNTasks = /--n-tasks\b/.test(helpText);
+  const hasYes = /--yes\b/.test(helpText);
+
+  return {
+    agentFlag: hasAgentImportPath ? "--agent-import-path" : "--agent",
+    agentKwargStyle: hasPlainAgentKwargs ? "plain" : "typed",
+    taskLimitFlag: hasNTasks ? "-l" : "-k",
+    yesFlag: hasYes ? "--yes" : null,
+    taskSelectionFlag: detectTaskSelectionFlag(helpText)
+  };
+}
+
+function formatAgentKwarg(key, type, value, capabilities) {
+  const style = capabilities?.agentKwargStyle ?? "typed";
+  return style === "plain" ? `${key}=${value}` : `${key}:${type}=${value}`;
+}
+
 export function buildHarborArgs(options) {
+  const capabilities = options.capabilities ?? {};
   if (options.mode === "smoke") {
-    return ["run", "-d", terminalBenchDataset, "-a", "oracle", "-l", "5"];
+    const args = ["run", "-d", terminalBenchDataset, "-a", "oracle", "-l", "5"];
+    if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
+    if (capabilities.yesFlag) args.push(capabilities.yesFlag);
+    return args;
   }
 
   const args = [
     "run",
     "-d",
     terminalBenchDataset,
-    "--agent-import-path",
+    capabilities.agentFlag ?? "--agent-import-path",
     agentImportPath
   ];
+  if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
+  if (capabilities.yesFlag) args.push(capabilities.yesFlag);
 
   if (options.mode === "task") {
     if (!options.taskId) {
       throw new Error("Task mode requires --task-id <task-id>.");
     }
-    if (!options.taskSelectionFlag) {
+    const taskSelectionFlag = options.taskSelectionFlag ?? capabilities.taskSelectionFlag;
+    if (!taskSelectionFlag) {
       throw new Error("Task mode requires a detected Harbor task selection flag.");
     }
-    args.push(options.taskSelectionFlag, options.taskId);
+    args.push(taskSelectionFlag, options.taskId);
   } else {
-    args.push("-k", String(options.k ?? 1));
+    args.push(capabilities.taskLimitFlag ?? "-k", String(options.k ?? 1));
   }
 
-  args.push("--ak", `provider:str=${options.provider}`);
+  args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
   if (options.model) {
-    args.push("--ak", `model:str=${options.model}`);
+    args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
   }
-  args.push("--ak", `max_turns:int=${options.maxTurns}`);
-  args.push("--ak", `command_timeout_sec:int=${options.commandTimeoutSec}`);
-  args.push("--ak", `max_wall_time_sec:int=${options.maxWallTimeSec}`);
+  args.push("--ak", formatAgentKwarg("max_turns", "int", options.maxTurns, capabilities));
+  args.push("--ak", formatAgentKwarg("command_timeout_sec", "int", options.commandTimeoutSec, capabilities));
+  args.push("--ak", formatAgentKwarg("max_wall_time_sec", "int", options.maxWallTimeSec, capabilities));
   return args;
 }
 
@@ -203,11 +230,26 @@ export async function runProcess(command, args, options = {}) {
 
   const result = await new Promise((resolve) => {
     let settled = false;
-    const child = spawn(command, args, {
-      cwd,
-      env,
-      windowsHide: true
-    });
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+        windowsHide: true
+      });
+    } catch (error) {
+      resolve({
+        command,
+        args,
+        cwd,
+        exitCode: 1,
+        stdout,
+        stderr: `${stderr}${stderr ? "\n" : ""}Failed to start ${command}: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      });
+      return;
+    }
 
     child.stdout?.on("data", (chunk) => {
       const text = chunk.toString("utf8");
@@ -387,6 +429,81 @@ async function listTaskDirs(runDir) {
   return dirs;
 }
 
+async function listJsonFiles(dir) {
+  if (!existsSync(dir)) return [];
+  const entries = await readdir(dir);
+  const files = [];
+  for (const entry of entries.sort()) {
+    const entryPath = path.join(dir, entry);
+    const entryStat = await stat(entryPath);
+    if (entryStat.isDirectory()) {
+      files.push(...(await listJsonFiles(entryPath)));
+    } else if (entry === "result.json") {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+function verifierMessage(trialResult) {
+  if (trialResult?.exception_info?.exception_message) return trialResult.exception_info.exception_message;
+  const rewards = trialResult?.verifier_result?.rewards;
+  if (rewards && typeof rewards === "object") {
+    const reward = rewards.reward;
+    if (typeof reward === "number" && reward < 1) return `Harbor verifier reward was ${reward}.`;
+  }
+  return null;
+}
+
+async function readHarborTrialResults(runDir) {
+  const jobsDir = path.join(runDir, "harbor-jobs");
+  const resultFiles = await listJsonFiles(jobsDir);
+  const results = [];
+  for (const filePath of resultFiles) {
+    const value = await readJsonSafe(filePath);
+    if (value && typeof value === "object" && value.trial_name && value.task_name) {
+      results.push({ ...value, result_path: path.relative(runDir, filePath).replace(/\\/g, "/") });
+    }
+  }
+  return results.sort((a, b) => String(a.trial_name).localeCompare(String(b.trial_name)));
+}
+
+function mergeHarborTrialResult(task, trialResult) {
+  const reward = trialResult?.verifier_result?.rewards?.reward;
+  const exceptionMessage = trialResult?.exception_info?.exception_message;
+  const next = {
+    ...task,
+    task_id: trialResult?.task_name ?? task.task_id,
+    trial_name: trialResult?.trial_name ?? null,
+    harbor_result_path: trialResult?.result_path ?? null,
+    reward: typeof reward === "number" ? reward : null
+  };
+
+  if (exceptionMessage) {
+    next.status = "failed";
+    next.failure_category = classifyFailure({
+      summary: {},
+      logText: exceptionMessage,
+      exitCode: 1
+    });
+    next.last_error = exceptionMessage;
+    return next;
+  }
+
+  if (typeof reward === "number") {
+    if (reward >= 1) {
+      next.status = "passed";
+      next.failure_category = null;
+    } else {
+      next.status = "failed";
+      next.failure_category = "verifier_failed";
+      next.last_error = next.last_error ?? verifierMessage(trialResult);
+    }
+  }
+
+  return next;
+}
+
 async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) {
   const metadataPath = path.join(taskDir, "metadata.json");
   const summaryPath = path.join(taskDir, "summary.json");
@@ -515,6 +632,12 @@ export async function generateBenchReport(runDir) {
   const tasks = taskDirs.length > 0
     ? await Promise.all(taskDirs.map((taskDir, index) => taskReportFromDir(runDir, taskDir, index, config, globalLogText)))
     : [syntheticRunTask(config, globalLogText)];
+  const harborTrialResults = await readHarborTrialResults(runDir);
+  if (harborTrialResults.length === tasks.length) {
+    for (let index = 0; index < tasks.length; index += 1) {
+      tasks[index] = mergeHarborTrialResult(tasks[index], harborTrialResults[index]);
+    }
+  }
 
   const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
   for (const task of tasks) {
@@ -527,6 +650,7 @@ export async function generateBenchReport(runDir) {
     notes.push("Harbor did not expose per-task trace/summary files in a predictable place for this run; inspect harbor.stdout.log and harbor.stderr.log.");
   }
 
+  const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error + counts.unknown;
   const report = {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
@@ -537,7 +661,7 @@ export async function generateBenchReport(runDir) {
     k: config.k ?? null,
     command: config.command_text ?? commandScript.trim(),
     exit_code: Number(config.exit_code ?? 1),
-    status: config.status ?? (config.exit_code === 0 ? "passed" : "failed"),
+    status: failedCount > 0 ? "failed" : config.status ?? (config.exit_code === 0 ? "passed" : "failed"),
     counts,
     tasks,
     notes
@@ -566,10 +690,21 @@ export async function ensurePlaceholderTask(runDir, metadata) {
 }
 
 export function harborEnvForRun(runDir, env = process.env) {
-  return {
+  const next = {
     ...env,
     AGENT_CLI_TARBALL: env.AGENT_CLI_TARBALL || defaultAgentCliTarball,
     PYTHONPATH: [rootDir, env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    SIGMA_BENCH_RUN_DIR: runDir
+    SIGMA_BENCH_RUN_DIR: runDir,
+    PYTHONIOENCODING: env.PYTHONIOENCODING || "utf-8",
+    PYTHONUTF8: env.PYTHONUTF8 || "1",
+    NO_COLOR: env.NO_COLOR || "1",
+    FORCE_COLOR: "0"
   };
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    const value = next[key];
+    if (typeof value === "string" && /^htpp:\/\//i.test(value)) {
+      next[key] = `http://${value.slice(7)}`;
+    }
+  }
+  return next;
 }

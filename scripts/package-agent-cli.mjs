@@ -78,7 +78,14 @@ await writeFile(
   agentBin,
   `#!/usr/bin/env sh
 set -eu
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PRG="$0"
+if command -v readlink >/dev/null 2>&1; then
+  RESOLVED=$(readlink -f "$PRG" 2>/dev/null || true)
+  if [ -n "$RESOLVED" ]; then
+    PRG="$RESOLVED"
+  fi
+fi
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$PRG")" && pwd)
 exec node "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"
 `,
   "utf8"

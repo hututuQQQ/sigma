@@ -8,6 +8,7 @@ import {
   buildCommandScript,
   buildHarborArgs,
   commandText,
+  detectHarborRunCapabilities,
   detectTaskSelectionFlag,
   ensurePlaceholderTask,
   generateBenchReport,
@@ -66,6 +67,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
 
   const runId = makeRunId(new Date(), options.provider, options.model);
   const runDir = path.join(benchRootDir, runId);
+  const jobsDir = path.join(runDir, "harbor-jobs");
   const env = harborEnvForRun(runDir);
   const startedAt = new Date().toISOString();
   const runner = deps.runProcess ?? runProcess;
@@ -73,6 +75,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   await mkdir(runDir, { recursive: true });
 
   let taskSelectionFlag = null;
+  let capabilities = {};
   let harborArgs = ["run", "--help"];
   let config = {
     run_id: runId,
@@ -85,6 +88,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     k: options.mode === "k" ? options.k : null,
     task_id: options.mode === "task" ? options.taskId : null,
     agent_cli_tarball: env.AGENT_CLI_TARBALL,
+    harbor_jobs_dir: jobsDir,
     command: ["harbor", ...harborArgs],
     command_text: commandText("harbor", harborArgs),
     exit_code: null,
@@ -119,18 +123,20 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
+  process.stdout.write(`Inspecting Harbor run CLI support...\n`);
+  const helpResult = await runner("harbor", ["run", "--help"], {
+    cwd: rootDir,
+    env,
+    stdoutPath: path.join(runDir, "harbor-run-help.stdout.log"),
+    stderrPath: path.join(runDir, "harbor-run-help.stderr.log"),
+    rawPath: path.join(runDir, "harbor-run-help.raw.log")
+  });
+  const helpText = `${helpResult.stdout}\n${helpResult.stderr}`;
+  await writeFile(path.join(runDir, "harbor-run-help.txt"), helpText, "utf8");
+  capabilities = detectHarborRunCapabilities(helpText);
+  taskSelectionFlag = detectTaskSelectionFlag(helpText);
+
   if (options.mode === "task") {
-    process.stdout.write(`Inspecting Harbor task selection support...\n`);
-    const helpResult = await runner("harbor", ["run", "--help"], {
-      cwd: rootDir,
-      env,
-      stdoutPath: path.join(runDir, "harbor-run-help.stdout.log"),
-      stderrPath: path.join(runDir, "harbor-run-help.stderr.log"),
-      rawPath: path.join(runDir, "harbor-run-help.raw.log")
-    });
-    const helpText = `${helpResult.stdout}\n${helpResult.stderr}`;
-    await writeFile(path.join(runDir, "harbor-run-help.txt"), helpText, "utf8");
-    taskSelectionFlag = detectTaskSelectionFlag(helpText);
     if (!taskSelectionFlag) {
       return await failBeforeHarbor(
         runDir,
@@ -143,12 +149,15 @@ export async function runTerminalBenchCli(argv, deps = {}) {
 
   harborArgs = buildHarborArgs({
     ...options,
-    taskSelectionFlag
+    taskSelectionFlag,
+    capabilities,
+    jobsDir
   });
   config = {
     ...config,
     command: ["harbor", ...harborArgs],
     command_text: commandText("harbor", harborArgs),
+    harbor_capabilities: capabilities,
     task_selection_flag: taskSelectionFlag
   };
   await writeRunFiles(runDir, config, harborArgs, env);
