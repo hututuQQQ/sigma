@@ -75,16 +75,6 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \\
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 \`\`\`
 
-For a single task example:
-
-\`\`\`bash
-export DEEPSEEK_API_KEY=...
-PYTHONPATH="$PWD/.artifacts/harbor-runtime" \\
-harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.task.example.json
-\`\`\`
-
-The task example uses \`openssl-selfsigned-cert\`; edit the task name in the JSON to target another Terminal-Bench task.
-
 The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent solve\`, and downloads \`summary.json\`, \`trace.jsonl\`, and best-effort attempt artifacts.
 `;
 }
@@ -126,33 +116,21 @@ export async function packageHarborRuntime(options = {}) {
     },
     path.join(harborRuntimeDir, "jobs", "deepseek-k5")
   );
-  const taskConfig = buildHarborJobConfig(
-    {
-      ...baseBenchmarkOptions(agentCliTarball),
-      mode: "task",
-      taskId: "openssl-selfsigned-cert"
-    },
-    path.join(harborRuntimeDir, "jobs", "deepseek-task-example")
-  );
   const readmeText = runtimeReadme(agentCliTarball);
   const k5ConfigText = `${JSON.stringify(k5Config, null, 2)}\n`;
-  const taskConfigText = `${JSON.stringify(taskConfig, null, 2)}\n`;
 
   assertNoRemovedHarborAdapter(readmeText, "Portable Harbor runtime README");
   assertNoRemovedHarborAdapter(k5ConfigText, "Portable Harbor k5 JobConfig");
-  assertNoRemovedHarborAdapter(taskConfigText, "Portable Harbor task JobConfig");
 
   await writeFile(path.join(harborRuntimeDir, "README.md"), readmeText, "utf8");
   await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json"), k5ConfigText, "utf8");
-  await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.task.example.json"), taskConfigText, "utf8");
 
   return {
     artifactsDir,
     harborRuntimeDir,
     runtimePath,
     agentCliTarball,
-    k5ConfigPath: path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json"),
-    taskExampleConfigPath: path.join(harborRuntimeDir, "jobconfig.deepseek.task.example.json")
+    k5ConfigPath: path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json")
   };
 }
 

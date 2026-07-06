@@ -157,8 +157,6 @@ class SigmaCliHarborAgent(BaseAgent):
         message_history_retain: int = 24,
         compaction_summary_chars: int = 30000,
         generic_validation_enabled: bool | str = False,
-        task_hints: str | list[str] | None = None,
-        verifier_feedback: str | None = None,
         **kwargs: Any,
     ) -> None:
         resolved_logs_dir = pathlib.Path(logs_dir) if logs_dir is not None else pathlib.Path.cwd() / ".agent" / "harbor"
@@ -190,8 +188,6 @@ class SigmaCliHarborAgent(BaseAgent):
         self.compaction_summary_chars = max(1, _as_int(compaction_summary_chars, 30000))
         self.generic_validation_enabled = self.validation_mode != "off"
         self.validation_timeout_sec = max(1, _as_int(validation_timeout_sec, self.precheck_timeout_sec))
-        self.task_hints = _normalize_globs(task_hints)
-        self.verifier_feedback = verifier_feedback.strip() if isinstance(verifier_feedback, str) and verifier_feedback.strip() else None
 
     @staticmethod
     def name() -> str:
@@ -238,7 +234,7 @@ class SigmaCliHarborAgent(BaseAgent):
         trace_path: pathlib.Path | None = None
 
         try:
-            await self._upload_instruction(environment, self._instruction_with_verifier_feedback(instruction))
+            await self._upload_instruction(environment, instruction)
             result = await self._run_agent_once(environment, env_vars, context)
             if _return_code(result) != 0:
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
@@ -296,11 +292,6 @@ class SigmaCliHarborAgent(BaseAgent):
             str(self.validation_timeout_sec),
             "--no-stream-ui",
         ]
-        task_id = self._context_task_id(context) if context is not None else None
-        if task_id:
-            command.extend(["--task-id", task_id])
-        if self.task_hints:
-            command.extend(["--task-hints", ",".join(self.task_hints)])
         if self.precheck_command:
             command.extend(
                 [
@@ -336,15 +327,6 @@ class SigmaCliHarborAgent(BaseAgent):
             " ".join(shlex.quote(part) for part in command),
             env=env_vars or None,
             timeout_sec=base_timeout + self.agent_timeout_grace_sec,
-        )
-
-    def _instruction_with_verifier_feedback(self, instruction: str) -> str:
-        if not self.verifier_feedback:
-            return instruction
-        return (
-            f"{instruction.rstrip()}\n\n"
-            "Additional verifier feedback from the previous attempt:\n"
-            f"{self.verifier_feedback.strip()}\n"
         )
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -579,9 +561,6 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 if not isinstance(item, dict) or _as_int(item.get("exit_code"), 0) == 0:
                     continue
                 add("validation_failed" if item.get("kind") == "validation" else "precheck_failed")
-                text = json.dumps(item, ensure_ascii=False).lower()
-                if "/tmp/frame.bmp" in text:
-                    add("missing_artifact:/tmp/frame.bmp")
 
         decisions = harness.get("retry_decisions") if isinstance(harness, dict) else []
         if isinstance(decisions, list):

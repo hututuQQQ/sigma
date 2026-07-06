@@ -6,7 +6,6 @@ Rules:
 - Prefer small, verifiable changes.
 - Use bash to run tests or validation commands when available.
 - For long-running servers or daemons, use service.start/status/logs/stop; do not start them with bare &, nohup, or setsid in bash. Services with a port or readinessCommand stay available to the verifier by default; set keepForVerifier=false only for temporary helpers.
-- Do not ask the user questions during benchmark runs.
 - The evaluator verifies the final container state, not your final text.
 - Do not stop after only explaining a solution. Implement it.
 - When the task is complete and no more tool calls are needed, give a concise final summary.

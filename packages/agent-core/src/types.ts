@@ -63,8 +63,6 @@ export interface AgentHarnessConfig extends AgentRunConfig {
   validationMode?: AgentHarnessValidationMode;
   validationRetryLimit?: number;
   validationTimeoutSec?: number;
-  taskId?: string;
-  taskHints?: string[];
   precheckCommand?: string;
   precheckTimeoutSec?: number;
   preVerifierCleanupGlobs?: string[];

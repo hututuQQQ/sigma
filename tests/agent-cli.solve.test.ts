@@ -55,7 +55,7 @@ describe("agent-cli solve", () => {
       "validation-timeout-sec": "45",
       "precheck-command": "pytest",
       "precheck-timeout-sec": "30",
-      "pre-verifier-cleanup-globs": "/tmp/frame*.bmp,/tmp/other*.bmp",
+      "pre-verifier-cleanup-globs": "/tmp/cache*.tmp,/tmp/other*.tmp",
       "harness-timeout-sec": "600",
       "retry-min-budget-sec": "90",
       "attempts-dir": "/tmp/agent/attempts"
@@ -67,7 +67,7 @@ describe("agent-cli solve", () => {
       validationTimeoutSec: 45,
       precheckCommand: "pytest",
       precheckTimeoutSec: 30,
-      preVerifierCleanupGlobs: ["/tmp/frame*.bmp", "/tmp/other*.bmp"],
+      preVerifierCleanupGlobs: ["/tmp/cache*.tmp", "/tmp/other*.tmp"],
       harnessTimeoutSec: 600,
       retryMinBudgetSec: 90,
       attemptsDir: "/tmp/agent/attempts"

@@ -70,11 +70,7 @@ async function runChecks(options: {
   if (options.config.validationMode === "auto") {
     const afterManifest = await listWorkspaceManifest(workspacePath);
     const changedFiles = options.beforeManifest ? changedWorkspaceFiles(options.beforeManifest, afterManifest) : [];
-    for (const spec of validationCommandSpecs(options.attemptSummary, changedFiles, {
-      taskId: options.config.taskId,
-      taskHints: options.config.taskHints,
-      instruction: options.config.instruction
-    })) {
+    for (const spec of validationCommandSpecs(options.attemptSummary, changedFiles)) {
       results.push(
         await runHarnessCommand({
           kind: "validation",

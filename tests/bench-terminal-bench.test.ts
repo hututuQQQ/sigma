@@ -18,9 +18,9 @@ async function writeRunnerLogs(options: Record<string, string | undefined>, resu
 
 async function writeAttemptArtifacts(configPath: string, attempt: number, passed: boolean) {
   const runDir = path.dirname(configPath);
-  const taskDir = path.join(runDir, "tasks", "retry-probe");
+  const taskDir = path.join(runDir, "tasks", "selected-task");
   await mkdir(taskDir, { recursive: true });
-  await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"terminal-bench/retry-probe"}\n', "utf8");
+  await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"terminal-bench/selected-task"}\n', "utf8");
   await writeFile(
     path.join(taskDir, "summary.json"),
     `${JSON.stringify({ status: "completed", finish_reason: "assistant_stop" })}\n`,
@@ -28,7 +28,7 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
   );
   await writeFile(
     path.join(taskDir, "verifier.log"),
-    passed ? "verifier passed\n" : "verifier failed: expected retry feedback\n",
+    passed ? "verifier passed\n" : "verifier failed: connection refused\n",
     "utf8"
   );
 
@@ -38,7 +38,7 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
     path.join(trialDir, "result.json"),
     `${JSON.stringify({
       trial_name: `trial-${attempt}`,
-      task_name: "terminal-bench/retry-probe",
+      task_name: "terminal-bench/selected-task",
       verifier_result: { rewards: { reward: passed ? 1 : 0 } }
     })}\n`,
     "utf8"
@@ -48,23 +48,23 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
     `${JSON.stringify({
       results: {
         tests: passed
-          ? [{ name: "test_retry_probe", status: "passed" }]
-          : [{ name: "test_retry_probe", status: "failed", message: "connection refused" }]
+          ? [{ name: "case_basic", status: "passed" }]
+          : [{ name: "case_basic", status: "failed", message: "connection refused" }]
       }
     })}\n`,
     "utf8"
   );
 }
 
-describe("Terminal-Bench CLI verifier feedback retry", () => {
-  it("retries when Harbor exits 0 but the generated report still failed", async () => {
+describe("Terminal-Bench CLI verifier result handling", () => {
+  it("does not retry or pass verifier result details in task mode", async () => {
     const tarball = defaultAgentCliTarballForEnv();
     await mkdir(path.dirname(tarball), { recursive: true });
     await writeFile(tarball, "stub", "utf8");
     let harborRuns = 0;
 
     const result = await runTerminalBenchCli(
-      ["--mode", "task", "--task-id", "retry-probe", "--provider", "deepseek", "--model", "retry-test-model"],
+      ["--mode", "task", "--task-id", "selected-task", "--provider", "deepseek", "--model", "retry-test-model"],
       {
         resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
         packageAgentCli: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -79,8 +79,8 @@ describe("Terminal-Bench CLI verifier feedback retry", () => {
             response = {
               exitCode: 0,
               stdout: JSON.stringify({
-                resolved_tasks: [{ name: "terminal-bench/retry-probe" }],
-                tasks: [{ task_name: "terminal-bench/retry-probe", agent_timeout_sec: 60 }],
+                resolved_tasks: [{ name: "terminal-bench/selected-task" }],
+                tasks: [{ task_name: "terminal-bench/selected-task", agent_timeout_sec: 60 }],
                 max_agent_timeout_sec: 60
               }),
               stderr: ""
@@ -88,7 +88,7 @@ describe("Terminal-Bench CLI verifier feedback retry", () => {
           } else if (args[0] === "run" && args.includes("--config")) {
             harborRuns += 1;
             const configPath = args[args.indexOf("--config") + 1];
-            await writeAttemptArtifacts(configPath, harborRuns, harborRuns > 1);
+            await writeAttemptArtifacts(configPath, harborRuns, false);
             response = { exitCode: 0, stdout: `attempt ${harborRuns}`, stderr: "" };
           }
           await writeRunnerLogs(options, response);
@@ -98,11 +98,13 @@ describe("Terminal-Bench CLI verifier feedback retry", () => {
     );
 
     try {
-      expect(result.exitCode).toBe(0);
-      expect(result.report.status).toBe("passed");
-      expect(harborRuns).toBe(2);
-      const retryConfig = JSON.parse(await readFile(path.join(result.runDir, "resolved-job.retry-1.config.json"), "utf8"));
-      expect(retryConfig.agents[0].kwargs.verifier_feedback).toContain("test_retry_probe");
+      expect(result.exitCode).toBe(1);
+      expect(result.report.status).toBe("failed");
+      expect(result.report.score_mode).toBe("standard_benchmark");
+      expect(harborRuns).toBe(1);
+      const firstConfig = JSON.parse(await readFile(path.join(result.runDir, "resolved-job.config.json"), "utf8"));
+      expect(Object.keys(firstConfig.agents[0].kwargs).some((key) => key.includes("feedback"))).toBe(false);
+      await expect(readFile(path.join(result.runDir, "resolved-job.retry-1.config.json"), "utf8")).rejects.toThrow();
     } finally {
       await rm(result.runDir, { recursive: true, force: true });
     }

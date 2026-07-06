@@ -87,8 +87,6 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
           validationMode: cliConfig.validationMode,
           validationRetryLimit: cliConfig.validationRetryLimit,
           validationTimeoutSec: cliConfig.validationTimeoutSec,
-          taskId: cliConfig.taskId,
-          taskHints: cliConfig.taskHints,
           precheckCommand: cliConfig.precheckCommand,
           precheckTimeoutSec: cliConfig.precheckTimeoutSec,
           preVerifierCleanupGlobs: cliConfig.preVerifierCleanupGlobs,

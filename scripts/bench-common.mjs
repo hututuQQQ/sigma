@@ -22,8 +22,6 @@ export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
 export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultPrecheckTimeoutSec = 45;
 export const defaultPrecheckRetryLimit = 1;
-export const defaultTaskVerifierFeedbackRetryLimit = 1;
-export const makeMipsPrecheckCommandTimeoutSec = 35;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 
@@ -266,13 +264,6 @@ export function resolveRunOptions(argv, env = process.env) {
       env.AGENT_PRECHECK_RETRY_LIMIT,
       "AGENT_PRECHECK_RETRY_LIMIT"
     ),
-    verifierFeedbackRetryLimit: asOptionalNonNegativeInt(
-      flags["verifier-feedback-retry-limit"] ?? env.AGENT_VERIFIER_FEEDBACK_RETRY_LIMIT,
-      "--verifier-feedback-retry-limit"
-    ) ?? (mode === "task" ? defaultTaskVerifierFeedbackRetryLimit : 0),
-    taskHints: typeof flags["task-hints"] === "string"
-      ? flags["task-hints"].split(",").map((item) => item.trim()).filter(Boolean)
-      : [],
     genericValidationEnabled: asBoolean(
       env.AGENT_GENERIC_VALIDATION,
       true,
@@ -398,16 +389,15 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
   const requestedPrecheckRetryLimit = precheckRetryLimitWasProvided && Number.isFinite(Number(options.precheckRetryLimit))
     ? Math.max(0, Math.ceil(Number(options.precheckRetryLimit)))
     : null;
-  const taskSpecificPrecheckEnabled = shouldEnableMakeMipsPrecheck(options, timeoutProbe);
   const genericValidationEnabled = options.mode === "smoke" ? false : options.genericValidationEnabled !== false;
   const defaultRetryLimit =
     options.mode === "smoke"
       ? 0
-      : genericValidationEnabled || taskSpecificPrecheckEnabled
+      : genericValidationEnabled
         ? defaultPrecheckRetryLimit
         : 0;
   const precheckRetryLimit = requestedPrecheckRetryLimit ?? defaultRetryLimit;
-  const validationOrPrecheckEnabled = genericValidationEnabled || taskSpecificPrecheckEnabled;
+  const validationOrPrecheckEnabled = genericValidationEnabled;
   const precheckTimeoutSec = precheckRetryLimit > 0 || validationOrPrecheckEnabled
     ? Math.max(1, Math.ceil(asFinitePositiveNumber(options.precheckTimeoutSec) ?? defaultPrecheckTimeoutSec))
     : 0;
@@ -471,36 +461,6 @@ function selectedTaskRecords(timeoutProbe) {
     .filter(Boolean);
 }
 
-function taskLooksLikeMakeMips(task) {
-  const text = [
-    task?.name,
-    task?.task_name,
-    task?.path,
-    task?.task_path,
-    task?.trial_name
-  ].filter(Boolean).join("\n");
-  return /make-mips-interpreter/i.test(text);
-}
-
-function shouldEnableMakeMipsPrecheck(options, timeoutProbe) {
-  if (taskLooksLikeMakeMips({ name: options.taskId })) return true;
-  const tasks = [
-    ...(Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : []),
-    ...(Array.isArray(timeoutProbe?.resolved_tasks) ? timeoutProbe.resolved_tasks : [])
-  ];
-  return tasks.some(taskLooksLikeMakeMips);
-}
-
-function makeMipsPrecheckCommand() {
-  return [
-    "rm -f /tmp/frame*.bmp",
-    "cd /app",
-    `node_status=0; timeout ${makeMipsPrecheckCommandTimeoutSec} node /app/vm.js || node_status=$?`,
-    "if [ \"$node_status\" -ne 0 ] && [ \"$node_status\" -ne 124 ]; then echo \"node /app/vm.js exited with status $node_status\" >&2; fi",
-    "test -s /tmp/frame.bmp || (echo 'verifier expects /tmp/frame.bmp to exist and be non-empty after node /app/vm.js' >&2; ls -l /tmp /app /app/tmp 2>/dev/null || true; exit 1)"
-  ].join("; ");
-}
-
 function benchmarkMaxTurns(options, timeoutPlan = null) {
   if (options.maxTurnsExplicit) return options.maxTurns;
   const wallTimeSec = asFinitePositiveNumber(timeoutPlan?.agent_wall_time_sec);
@@ -534,18 +494,6 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
   agentKwargs.validation_timeout_sec = timeoutPlan?.validation_timeout_sec ?? defaultPrecheckTimeoutSec;
   agentKwargs.precheck_retry_limit = timeoutPlan?.precheck_retry_limit ?? defaultPrecheckRetryLimit;
   agentKwargs.precheck_timeout_sec = timeoutPlan?.precheck_timeout_sec ?? defaultPrecheckTimeoutSec;
-  if (Array.isArray(options.taskHints) && options.taskHints.length > 0) {
-    agentKwargs.task_hints = options.taskHints.join(",");
-  }
-  if (typeof options.verifierFeedback === "string" && options.verifierFeedback.trim()) {
-    agentKwargs.verifier_feedback = options.verifierFeedback.trim();
-  }
-
-  if (shouldEnableMakeMipsPrecheck(options, timeoutProbe)) {
-    agentKwargs.precheck_command = makeMipsPrecheckCommand();
-    agentKwargs.pre_verifier_cleanup_globs = "/tmp/frame*.bmp";
-  }
-
   return agentKwargs;
 }
 
@@ -833,41 +781,6 @@ export async function readJsonSafe(filePath) {
   }
 }
 
-function truncateText(text, maxChars) {
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
-}
-
-export async function verifierFeedbackFromReport(runDir, report, maxChars = 8192) {
-  const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
-  const failed = tasks.filter((task) =>
-    task?.failure_category === "verifier_failed" ||
-    task?.verifier_status === "failed" ||
-    (typeof task?.reward === "number" && task.reward < 1)
-  );
-  if (failed.length === 0) return null;
-
-  const pieces = [];
-  for (const task of failed) {
-    pieces.push(`Task: ${task.task_id}`);
-    if (task.reward !== null && task.reward !== undefined) pieces.push(`Reward: ${task.reward}`);
-    for (const failure of Array.isArray(task.verifier_failed_tests) ? task.verifier_failed_tests : []) {
-      pieces.push(`Failed test: ${failure.name}`);
-      if (failure.message) pieces.push(`Message: ${failure.message}`);
-      if (failure.trace) pieces.push(`Trace: ${failure.trace}`);
-    }
-    if (task.verifier_log_path) {
-      const logText = await readTextSafe(path.join(runDir, task.verifier_log_path));
-      if (logText.trim()) {
-        pieces.push("Verifier stdout tail:");
-        pieces.push(logText.length <= 3000 ? logText.trim() : logText.slice(-3000).trim());
-      }
-    }
-  }
-
-  const text = pieces.join("\n").trim();
-  return text ? truncateText(text, maxChars) : null;
-}
-
 export async function readTraceEvents(tracePath) {
   const text = await readTextSafe(tracePath);
   const events = [];
@@ -989,9 +902,6 @@ function collectFailureSignals(input = {}) {
   for (const precheck of Array.isArray(metadata.precheck_results) ? metadata.precheck_results : []) {
     if (Number(precheck?.exit_code ?? 0) !== 0) {
       addSignal(signals, precheck?.kind === "validation" ? "validation_failed" : "precheck_failed");
-      if (JSON.stringify(precheck).includes("/tmp/frame.bmp")) {
-        addSignal(signals, "missing_artifact:/tmp/frame.bmp");
-      }
     }
   }
 
@@ -1006,9 +916,6 @@ function collectFailureSignals(input = {}) {
   ]) {
     if (Number(result?.exit_code ?? 0) !== 0) {
       addSignal(signals, result?.kind === "precheck" ? "precheck_failed" : "validation_failed");
-      if (JSON.stringify(result).includes("/tmp/frame.bmp")) {
-        addSignal(signals, "missing_artifact:/tmp/frame.bmp");
-      }
     }
   }
 
@@ -1048,12 +955,6 @@ function collectFailureSignals(input = {}) {
     .join("\n");
   const logText = `${input.logText ?? ""}\n${verifierText}`;
 
-  if (
-    /\/tmp\/frame\.bmp/.test(logText) &&
-    /(does not exist|not exist|is empty|missing|no such file|not found)/i.test(logText)
-  ) {
-    addSignal(signals, "missing_artifact:/tmp/frame.bmp");
-  }
   if (
     summaryHasFinishReason(summary, "max_wall_time") ||
     logIndicatesMaxWallTime(logText)
@@ -1545,12 +1446,16 @@ export function formatMarkdownReport(report) {
     `# Terminal-Bench Run ${report.run_id}`,
     "",
     `- Status: ${report.status}`,
+    `- Score status: ${report.score_status ?? report.status}`,
+    `- Infra status: ${report.infra_status ?? "unknown"}`,
     `- Provider: ${report.provider}`,
     `- Model: ${report.model ?? "default"}`,
     `- Dataset: ${report.dataset}`,
+    `- Score mode: ${report.score_mode ?? "standard_benchmark"}`,
     `- Started: ${report.started_at ?? "unknown"}`,
     `- Finished: ${report.finished_at ?? "unknown"}`,
     `- Exit code: ${report.exit_code}`,
+    `- Harbor exit code: ${report.harbor_exit_code ?? report.exit_code}`,
     `- Command: ${markdownEscape(report.command ?? "")}`,
     `- Harbor: ${markdownEscape(report.harbor_command ?? "harbor")}${report.harbor_version ? ` (${markdownEscape(report.harbor_version)})` : ""}`,
     "",
@@ -1714,6 +1619,24 @@ export async function generateBenchReport(runDir) {
   }
 
   const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error + counts.unknown;
+  const exitCode = Number(config.exit_code ?? 1);
+  const scoreStatus = incompleteReason.length > 0
+    ? "incomplete"
+    : failedCount > 0
+      ? "failed"
+      : counts.passed > 0
+        ? "passed"
+        : "unknown";
+  const hasInfraWarning = tasks.some(
+    (task) => (Array.isArray(task.infra_warnings) && task.infra_warnings.length > 0) || task.agent_exception
+  );
+  const infraStatus = incompleteReason.length > 0
+    ? "incomplete"
+    : hasInfraWarning
+      ? "warning"
+      : exitCode === 0
+        ? "passed"
+        : "failed";
   const report = {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
@@ -1730,14 +1653,18 @@ export async function generateBenchReport(runDir) {
     timeout_probe_tasks: Array.isArray(config.timeout_probe?.tasks) ? config.timeout_probe.tasks : [],
     resolved_job_config_path: config.resolved_job_config_path ?? null,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
-    exit_code: Number(config.exit_code ?? 1),
+    exit_code: exitCode,
+    harbor_exit_code: exitCode,
+    score_status: scoreStatus,
+    infra_status: infraStatus,
+    score_mode: "standard_benchmark",
     status: incompleteReason.length > 0
       ? "incomplete"
       : failedCount > 0
         ? "failed"
         : counts.passed > 0
           ? "passed"
-          : config.status ?? (config.exit_code === 0 ? "passed" : "failed"),
+          : config.status ?? (exitCode === 0 ? "passed" : "failed"),
     counts,
     tasks,
     notes

@@ -1,14 +1,12 @@
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
-import net, { type AddressInfo } from "node:net";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
 import {
   genericValidationCommandSpecs,
-  inferTaskHints,
   runHarnessCommand,
-  taskSmokeValidationCommandSpecs
+  validationCommandSpecs
 } from "../packages/agent-core/src/harness/validation.js";
 import { runAgentHarness } from "../packages/agent-core/src/index.js";
 
@@ -67,8 +65,30 @@ describe("agent-core harness", () => {
 
     expect(result).toMatchObject({
       exit_code: 124,
-      timed_out: true
+      timed_out: true,
+      settled_on: expect.any(String)
     });
+    expect(result.signal).toEqual(expect.any(String));
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("returns after shell exit even when a background child keeps stdout open", async () => {
+    const dir = await tempWorkspace();
+    const startedAt = Date.now();
+
+    const result = await runHarnessCommand({
+      kind: "validation",
+      source: "test",
+      command: "sleep 5 & printf done",
+      workspacePath: dir,
+      attempt: 1,
+      timeoutSec: 2
+    });
+
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout_tail).toContain("done");
+    expect(result.settled_on).toMatch(/close|exit-drain/);
+    expect(result.timed_out).toBeUndefined();
     expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 
@@ -99,149 +119,14 @@ describe("agent-core harness", () => {
     expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
   });
 
-  it("infers task hints from Terminal-Bench task names", () => {
-    expect(inferTaskHints({ taskId: "kv-store-grpc" })).toEqual(expect.arrayContaining(["server", "grpc", "server/grpc"]));
-    expect(inferTaskHints({ taskId: "pypi-server" })).toEqual(expect.arrayContaining(["server", "pypi", "server/pypi"]));
-    expect(inferTaskHints({ taskId: "filter-js-from-html" })).toEqual(expect.arrayContaining(["html-xss"]));
-  });
-
-  it("adds an html-xss task smoke validation that catches dangerous payloads", async () => {
-    const dir = await tempWorkspace();
-    await writeFile(
-      path.join(dir, "filter.mjs"),
-      "export default function filter(html) { return html; }\n",
-      "utf8"
-    );
-    const [spec] = taskSmokeValidationCommandSpecs(["filter.mjs"], { taskHints: ["html-xss"] });
-    expect(spec).toMatchObject({ source: "task-smoke", relatedFiles: ["filter.mjs"] });
-
-    const result = await runHarnessCommand({
-      kind: "validation",
-      source: spec.source,
-      command: spec.command,
-      workspacePath: dir,
-      attempt: 1,
-      timeoutSec: 5,
-      relatedFiles: spec.relatedFiles
-    });
-
-    expect(result.exit_code).not.toBe(0);
-    expect(result.stderr_tail).toContain("html-xss smoke failed");
-  });
-
-  it("uses Python CLI smoke for filter-js-from-html without generating node smoke", async () => {
-    const dir = await tempWorkspace();
-    await writeFile(
-      path.join(dir, "filter.py"),
-      [
-        "from pathlib import Path",
-        "import sys",
-        "print(Path(sys.argv[1]).read_text(encoding='utf-8'))",
-        ""
-      ].join("\n"),
-      "utf8"
+  it("does not generate task-specific validation", () => {
+    const specs = validationCommandSpecs(
+      { validation_commands: ["npm test"] } as never,
+      ["main.py"]
     );
 
-    const specs = taskSmokeValidationCommandSpecs(["filter.py"], { taskId: "filter-js-from-html" });
-    expect(specs).toHaveLength(1);
-    expect(specs[0].command).toContain("HTML_XSS_PY_CHANGED");
-    expect(specs[0].command).not.toContain("node --input-type");
-
-    const failed = await runHarnessCommand({
-      kind: "validation",
-      source: specs[0].source,
-      command: specs[0].command,
-      workspacePath: dir,
-      attempt: 1,
-      timeoutSec: 10,
-      relatedFiles: specs[0].relatedFiles
-    });
-    expect(failed.exit_code).not.toBe(0);
-    expect(failed.stderr_tail).toContain("html-xss python smoke failed");
-
-    await writeFile(
-      path.join(dir, "filter.py"),
-      [
-        "import sys",
-        "print('<p>safe</p>')",
-        ""
-      ].join("\n"),
-      "utf8"
-    );
-    const passed = await runHarnessCommand({
-      kind: "validation",
-      source: specs[0].source,
-      command: specs[0].command,
-      workspacePath: dir,
-      attempt: 1,
-      timeoutSec: 10,
-      relatedFiles: specs[0].relatedFiles
-    });
-    expect(passed.exit_code).toBe(0);
-  });
-
-  it("fails server smoke when registered port services are not kept for the verifier", async () => {
-    const dir = await tempWorkspace();
-    const registry = path.join(dir, "services.json");
-    await mkdir(path.dirname(registry), { recursive: true });
-    const server = net.createServer((socket) => {
-      socket.on("error", () => {});
-      socket.end("ok");
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const port = (server.address() as AddressInfo).port;
-    const previousRegistry = process.env.AGENT_SERVICE_REGISTRY;
-
-    try {
-      process.env.AGENT_SERVICE_REGISTRY = registry;
-      const service = {
-        name: "grpc-server",
-        pid: process.pid,
-        command: "test",
-        cwd: dir,
-        port,
-        logPath: path.join(dir, "service.log"),
-        keepForVerifier: false,
-        startedAt: new Date().toISOString()
-      };
-      await writeFile(registry, `${JSON.stringify({ services: [service] })}\n`, "utf8");
-
-      const [spec] = taskSmokeValidationCommandSpecs([], { taskId: "kv-store-grpc" });
-      const failed = await runHarnessCommand({
-        kind: "validation",
-        source: spec.source,
-        command: spec.command,
-        workspacePath: dir,
-        attempt: 1,
-        timeoutSec: 5
-      });
-      expect(failed.exit_code).not.toBe(0);
-      expect(failed.stderr_tail).toContain("not marked keepForVerifier");
-
-      await writeFile(registry, `${JSON.stringify({ services: [{ ...service, keepForVerifier: true }] })}\n`, "utf8");
-      const passed = await runHarnessCommand({
-        kind: "validation",
-        source: spec.source,
-        command: spec.command,
-        workspacePath: dir,
-        attempt: 1,
-        timeoutSec: 5
-      });
-      expect(passed.exit_code).toBe(0);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (previousRegistry === undefined) {
-        delete process.env.AGENT_SERVICE_REGISTRY;
-      } else {
-        process.env.AGENT_SERVICE_REGISTRY = previousRegistry;
-      }
-    }
-  });
-
-  it("includes a fresh vectorops install in the PyPI smoke", () => {
-    const specs = taskSmokeValidationCommandSpecs([], { taskId: "pypi-server" });
-    expect(specs.some((spec) => spec.command.includes("vectorops==0.1.0"))).toBe(true);
-    expect(specs.some((spec) => spec.command.includes("dotproduct([1, 2, 3], [4, 5, 6]) == 32"))).toBe(true);
+    expect(specs.map((spec) => spec.source)).toEqual(["summary", "changed-file"]);
+    expect(specs.map((spec) => spec.command)).toEqual(["npm test", "python -m py_compile main.py"]);
   });
 
   it("keeps validationMode=off as a single agent run", async () => {
@@ -361,8 +246,8 @@ describe("agent-core harness", () => {
 
   it("runs pre-verifier cleanup and records warnings separately from success", async () => {
     const dir = await tempWorkspace();
-    const target = path.join(dir, "frame.bmp");
-    await writeFile(target, "frame", "utf8");
+    const target = path.join(dir, "cleanup.tmp");
+    await writeFile(target, "cleanup", "utf8");
     const summaryPath = path.join(dir, "summary.json");
     const model = new SequenceModel([finalResponse("done")]);
 

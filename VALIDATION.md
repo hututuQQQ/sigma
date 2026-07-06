@@ -17,8 +17,7 @@ Date: 2026-07-06
 | `tar -tzf .artifacts/agent-cli-linux-x64.tgz \| grep 'bin/agent'` | PASS via PowerShell `Select-String` |
 | `tar -tzf .artifacts/agent-cli-linux-x64.tgz \| grep 'bin/node'` | PASS via PowerShell `Select-String` |
 | Debian container with no system `node`: `/usr/local/bin/agent --help` | PASS |
-| `AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id openssl-selfsigned-cert` | PASS setup/runtime startup; verifier failed 5/6 with `ModuleNotFoundError: No module named 'cryptography'` before the harness validation loop was added |
-| `AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id regex-log` | PASS |
+| `AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id <task-id>` | PASS setup/runtime startup in manual task-mode checks |
 
 ## Artifact
 
@@ -59,5 +58,5 @@ The report classifier now treats `max_wall_time_sec` as configuration text, not 
 
 ## Known Limitations
 
-- The generic harness validation loop has unit coverage but has not yet been re-run manually against `openssl-selfsigned-cert` or `regex-log` after this change.
+- The generic harness validation loop has unit coverage but has not yet been re-run manually against a live selected task after this change.
 - The package script intentionally does not download Node on demand. It uses `NODE_RUNTIME_TARBALL` or the documented `.artifacts/cache/` file and fails clearly when neither exists.
