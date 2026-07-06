@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "references": [
+    { "path": "../agent-ai" },
+    { "path": "../agent-core" }
+  ]
+}

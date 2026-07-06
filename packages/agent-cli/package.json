@@ -1,0 +1,25 @@
+{
+  "name": "agent-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "agent": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
+  },
+  "dependencies": {
+    "agent-ai": "workspace:*",
+    "agent-core": "workspace:*"
+  }
+}

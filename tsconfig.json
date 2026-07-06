@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/agent-ai" },
+    { "path": "./packages/agent-core" },
+    { "path": "./packages/agent-cli" }
+  ]
+}
