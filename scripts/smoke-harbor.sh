@@ -16,7 +16,7 @@ fi
 pnpm package:agent-cli
 
 if [ -z "${AGENT_CLI_TARBALL:-}" ]; then
-  export AGENT_CLI_TARBALL="$ROOT_DIR/.artifacts/agent-cli-linux.tgz"
+  export AGENT_CLI_TARBALL="$ROOT_DIR/.artifacts/agent-cli-linux-${AGENT_TARGET_ARCH:-x64}.tgz"
 fi
 
 if [ ! -f "$AGENT_CLI_TARBALL" ]; then

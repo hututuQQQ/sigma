@@ -21,6 +21,9 @@ export interface CliConfig {
   summaryJson?: string;
   sessionJsonl?: string;
   maxToolOutputChars: number;
+  maxMessageHistoryChars?: number;
+  messageHistoryRetain: number;
+  compactionSummaryChars: number;
   noStreamUi: boolean;
 }
 
@@ -29,7 +32,9 @@ const DEFAULTS = {
   maxWallTimeSec: 900,
   commandTimeoutSec: 60,
   permissionMode: "ask" as PermissionMode,
-  maxToolOutputChars: 12000
+  maxToolOutputChars: 12000,
+  messageHistoryRetain: 24,
+  compactionSummaryChars: 30000
 };
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -173,6 +178,27 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     maxToolOutputChars: numberValue(
       flags["max-tool-output-chars"] ?? process.env.AGENT_MAX_TOOL_OUTPUT_CHARS ?? config.max_tool_output_chars,
       DEFAULTS.maxToolOutputChars
+    ),
+    maxMessageHistoryChars:
+      flags["max-message-history-chars"] !== undefined ||
+      process.env.AGENT_MAX_MESSAGE_HISTORY_CHARS !== undefined ||
+      config.max_message_history_chars !== undefined
+        ? numberValue(
+            flags["max-message-history-chars"] ??
+              process.env.AGENT_MAX_MESSAGE_HISTORY_CHARS ??
+              config.max_message_history_chars,
+            0
+          )
+        : undefined,
+    messageHistoryRetain: numberValue(
+      flags["message-history-retain"] ?? process.env.AGENT_MESSAGE_HISTORY_RETAIN ?? config.message_history_retain,
+      DEFAULTS.messageHistoryRetain
+    ),
+    compactionSummaryChars: numberValue(
+      flags["compaction-summary-chars"] ??
+        process.env.AGENT_COMPACTION_SUMMARY_CHARS ??
+        config.compaction_summary_chars,
+      DEFAULTS.compactionSummaryChars
     ),
     noStreamUi: boolValue(flags["no-stream-ui"], false)
   };

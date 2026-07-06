@@ -63,7 +63,10 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       traceJsonlPath: cliConfig.traceJsonl,
       sessionJsonlPath: cliConfig.sessionJsonl,
       summaryJsonPath: cliConfig.summaryJson,
-      maxToolOutputChars: cliConfig.maxToolOutputChars
+      maxToolOutputChars: cliConfig.maxToolOutputChars,
+      maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
+      messageHistoryRetain: cliConfig.messageHistoryRetain,
+      compactionSummaryChars: cliConfig.compactionSummaryChars
     });
 
     printRunResult(result);

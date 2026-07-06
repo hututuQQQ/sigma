@@ -7,15 +7,21 @@ import {
   benchRootDir,
   buildCommandScript,
   buildHarborArgs,
+  buildHarborJobConfig,
+  buildHarborTimeoutProbeConfig,
   commandText,
+  computeHarborTimeoutPlan,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
   ensurePlaceholderTask,
   generateBenchReport,
+  harborPythonCommand,
   harborEnvForRun,
   loadDotEnv,
   makeRunId,
   packageAgentCli,
+  parseHarborTimeoutProbe,
+  resolveHarborCommand,
   resolveRunOptions,
   rootDir,
   runProcess,
@@ -27,9 +33,9 @@ function statusFromExitCode(exitCode) {
   return exitCode === 0 ? "passed" : "failed";
 }
 
-async function writeRunFiles(runDir, config, harborArgs, env) {
+async function writeRunFiles(runDir, config, harborCommand, harborArgs, env) {
   await writeJson(path.join(runDir, "config.json"), config);
-  await writeFile(path.join(runDir, "command.sh"), buildCommandScript(harborArgs, env), "utf8");
+  await writeFile(path.join(runDir, "command.sh"), buildCommandScript(harborCommand, harborArgs, env), "utf8");
 }
 
 async function failBeforeHarbor(runDir, config, message, exitCode) {
@@ -72,10 +78,13 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const startedAt = new Date().toISOString();
   const runner = deps.runProcess ?? runProcess;
   const packager = deps.packageAgentCli ?? packageAgentCli;
+  const harborCommandInfo = deps.resolveHarborCommand?.(env) ?? resolveHarborCommand(env);
+  const harborCommand = harborCommandInfo.command;
   await mkdir(runDir, { recursive: true });
 
   let taskSelectionFlag = null;
   let capabilities = {};
+  let harborVersion = null;
   let harborArgs = ["run", "--help"];
   let config = {
     run_id: runId,
@@ -89,13 +98,17 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     task_id: options.mode === "task" ? options.taskId : null,
     agent_cli_tarball: env.AGENT_CLI_TARBALL,
     harbor_jobs_dir: jobsDir,
-    command: ["harbor", ...harborArgs],
-    command_text: commandText("harbor", harborArgs),
+    harbor_command: harborCommand,
+    harbor_command_source: harborCommandInfo.source,
+    harbor_command_exists: harborCommandInfo.exists,
+    harbor_version: harborVersion,
+    command: [harborCommand, ...harborArgs],
+    command_text: commandText(harborCommand, harborArgs),
     exit_code: null,
     status: "running",
     notes: []
   };
-  await writeRunFiles(runDir, config, harborArgs, env);
+  await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
   process.stdout.write(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
   const packageResult = await packager({
@@ -123,47 +136,106 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
-  process.stdout.write(`Inspecting Harbor run CLI support...\n`);
-  const helpResult = await runner("harbor", ["run", "--help"], {
+  process.stdout.write(`Inspecting Harbor CLI support...\n`);
+  const versionResult = await runner(harborCommand, ["--version"], {
+    cwd: rootDir,
+    env,
+    stdoutPath: path.join(runDir, "harbor-version.stdout.log"),
+    stderrPath: path.join(runDir, "harbor-version.stderr.log"),
+    rawPath: path.join(runDir, "harbor-version.raw.log")
+  });
+  harborVersion = versionResult.exitCode === 0 ? `${versionResult.stdout}\n${versionResult.stderr}`.trim() || null : null;
+  config = {
+    ...config,
+    harbor_version: harborVersion
+  };
+  await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
+
+  const helpResult = await runner(harborCommand, ["run", "--help"], {
     cwd: rootDir,
     env,
     stdoutPath: path.join(runDir, "harbor-run-help.stdout.log"),
     stderrPath: path.join(runDir, "harbor-run-help.stderr.log"),
     rawPath: path.join(runDir, "harbor-run-help.raw.log")
   });
+  if (helpResult.exitCode !== 0) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `Harbor run --help failed with exit code ${helpResult.exitCode}. Set HARBOR_BIN if Harbor is installed outside PATH. See harbor-run-help.raw.log.`,
+      helpResult.exitCode
+    );
+  }
   const helpText = `${helpResult.stdout}\n${helpResult.stderr}`;
   await writeFile(path.join(runDir, "harbor-run-help.txt"), helpText, "utf8");
   capabilities = detectHarborRunCapabilities(helpText);
   taskSelectionFlag = detectTaskSelectionFlag(helpText);
 
-  if (options.mode === "task") {
-    if (!taskSelectionFlag) {
+  let timeoutProbe = null;
+  let timeoutPlan = null;
+  if (options.mode !== "smoke") {
+    process.stdout.write(`Inspecting selected task timeout metadata...\n`);
+    const timeoutProbeJobsDir = path.join(runDir, "harbor-timeout-probe-jobs");
+    const timeoutProbeConfig = buildHarborTimeoutProbeConfig(options, timeoutProbeJobsDir);
+    const timeoutProbeConfigPath = path.join(runDir, "harbor-timeout-probe.config.json");
+    await writeJson(timeoutProbeConfigPath, timeoutProbeConfig);
+    const timeoutProbeResult = await runner(harborPythonCommand(env), [path.join(rootDir, "scripts", "probe-harbor-timeouts.py"), timeoutProbeConfigPath], {
+      cwd: rootDir,
+      env,
+      stdoutPath: path.join(runDir, "harbor-timeout-probe.stdout.log"),
+      stderrPath: path.join(runDir, "harbor-timeout-probe.stderr.log"),
+      rawPath: path.join(runDir, "harbor-timeout-probe.raw.log")
+    });
+    if (timeoutProbeResult.exitCode !== 0) {
       return await failBeforeHarbor(
         runDir,
         config,
-        "The installed Harbor CLI does not expose a recognized task selection flag. See harbor-run-help.txt.",
+        `Harbor timeout probe failed with exit code ${timeoutProbeResult.exitCode}. See harbor-timeout-probe.raw.log.`,
+        timeoutProbeResult.exitCode
+      );
+    }
+
+    try {
+      timeoutProbe = parseHarborTimeoutProbe(timeoutProbeResult.stdout);
+    } catch (error) {
+      return await failBeforeHarbor(
+        runDir,
+        config,
+        `Harbor timeout probe output could not be parsed: ${error instanceof Error ? error.message : String(error)}. See harbor-timeout-probe.raw.log.`,
         2
       );
     }
+    timeoutPlan = computeHarborTimeoutPlan(options, timeoutProbe);
+  } else {
+    timeoutPlan = computeHarborTimeoutPlan(options, null);
   }
 
+  const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
+  const resolvedJobConfig = buildHarborJobConfig(options, jobsDir, timeoutPlan, timeoutProbe);
+  await writeJson(resolvedJobConfigPath, resolvedJobConfig);
   harborArgs = buildHarborArgs({
     ...options,
     taskSelectionFlag,
     capabilities,
-    jobsDir
+    jobsDir,
+    timeoutProbe,
+    timeoutPlan,
+    configPath: resolvedJobConfigPath
   });
   config = {
     ...config,
-    command: ["harbor", ...harborArgs],
-    command_text: commandText("harbor", harborArgs),
+    command: [harborCommand, ...harborArgs],
+    command_text: commandText(harborCommand, harborArgs),
     harbor_capabilities: capabilities,
-    task_selection_flag: taskSelectionFlag
+    task_selection_flag: taskSelectionFlag,
+    timeout_probe: timeoutProbe,
+    timeout_plan: timeoutPlan,
+    resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
   };
-  await writeRunFiles(runDir, config, harborArgs, env);
+  await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
-  process.stdout.write(`Running Harbor benchmark: ${commandText("harbor", harborArgs)}\n`);
-  const harborResult = await runner("harbor", harborArgs, {
+  process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
+  const harborResult = await runner(harborCommand, harborArgs, {
     cwd: rootDir,
     env,
     stdoutPath: path.join(runDir, "harbor.stdout.log"),

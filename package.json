@@ -16,7 +16,8 @@
     "bench:tb:smoke": "node scripts/bench-terminal-bench.mjs --mode smoke",
     "bench:tb:k": "node scripts/bench-terminal-bench.mjs --mode k",
     "bench:tb:task": "node scripts/bench-terminal-bench.mjs --mode task",
-    "bench:tb:report": "node scripts/bench-report.mjs"
+    "bench:tb:report": "node scripts/bench-report.mjs",
+    "bench:tb:report:all": "node scripts/bench-report.mjs --all"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

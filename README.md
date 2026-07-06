@@ -107,7 +107,7 @@ export DEEPSEEK_API_KEY=...
 AGENT_PROVIDER=deepseek pnpm smoke:harbor
 ```
 
-The current Harbor artifact still requires `node` in the task container. Harbor setup now checks `command -v node` and `/usr/local/bin/agent --help`; if Node is missing, setup fails clearly instead of letting the task run with a broken agent. TODO: bundle Node with the artifact or produce a true single-file binary.
+The Harbor artifact is a self-contained Linux bundle when built with a Node runtime tarball. Provide `NODE_RUNTIME_TARBALL` or place the pinned Node tarball in `.artifacts/cache/`; task containers do not need system `node` for the preferred tarball install path.
 
 ## Benchmark Runs
 
@@ -145,15 +145,26 @@ Refresh a report:
 pnpm bench:tb:report -- --run-id <run-id>
 ```
 
-Each run directory contains `config.json`, `command.sh`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the runner creates a placeholder task entry and the global Harbor logs are the source of truth.
+Refresh all reports:
 
-Failure categories are rule based and intentionally small: `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
+```bash
+pnpm bench:tb:report:all
+```
+
+Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
+
+Failure categories are rule based and intentionally small: `host_proxy_error`, `host_encoding_error`, `harbor_cli_error`, `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
+
+Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
+
+Terminal-Bench timeouts are resolved from Harbor task metadata before non-oracle runs. The runner probes the selected task set, then runs Harbor with a resolved JobConfig that uses the same task list. MVP defaults are intentionally lenient: `agent_wall_time_sec = max(recommended * 1.5, recommended + 600s)`, then Harbor's outer agent timeout adds `AGENT_TIMEOUT_GRACE_SEC` (default `120`). Override the internal agent wall time with `AGENT_MAX_WALL_TIME_SEC`; tune leniency with `AGENT_TIMEOUT_LENIENCY_MULTIPLIER` and `AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC`.
 
 Current limitations:
 
-- The packaged Harbor artifact still requires Node in the task container. `integrations/harbor/Dockerfile.agent` is a starting point for a Node-ready agent image.
-- `bench:tb:task` inspects `harbor run --help` and fails clearly if this Harbor install does not expose a recognized task selection flag.
-- Reports can only include per-task verifier status and logs that Harbor exposes to the adapter or emits to stdout/stderr.
+- Packaging needs a pre-downloaded or cached Linux Node runtime tarball; the resulting Harbor artifact does not need system Node in the task container.
+- `bench:tb:task` writes a Harbor JobConfig and does not depend on task-selection CLI flags, but still records detected CLI capabilities for diagnostics.
+- Reports include per-task verifier reward and failed test details when Harbor writes `verifier/ctrf.json` or `verifier/test-stdout.txt` under the configured jobs directory.
+- Reports mark stale run directories as `incomplete` when `config.json` is still running or expected logs are missing.
 
 ## CLI Flags
 
@@ -173,6 +184,9 @@ Current limitations:
 --summary-json <path>
 --session-jsonl <path>
 --max-tool-output-chars <number>
+--max-message-history-chars <number>
+--message-history-retain <number>
+--compaction-summary-chars <number>
 --no-stream-ui
 ```
 
@@ -225,23 +239,43 @@ The adapter writes the task instruction to `/tmp/agent/instruction.md` and runs:
   --model deepseek-v4-pro \
   --max-turns 200 \
   --command-timeout-sec 180 \
-  --max-wall-time-sec 7200 \
+  --max-wall-time-sec <lenient-task-agent-timeout-sec> \
   --permission-mode yolo \
   --trace-jsonl /tmp/agent/trace.jsonl \
   --summary-json /tmp/agent/summary.json \
+  --max-message-history-chars 250000 \
+  --message-history-retain 24 \
+  --compaction-summary-chars 30000 \
   --no-stream-ui
 ```
+
+The Harbor adapter accepts benchmark-specific kwargs for cleanup and validation loops: `pre_verifier_cleanup_globs`, `precheck_command`, `precheck_retry_limit`, `generic_validation_enabled`, `validation_timeout_sec`, `max_message_history_chars`, `message_history_retain`, and `compaction_summary_chars`. By default the Terminal-Bench runner enables one generic validation retry for non-smoke runs. After the agent exits, the harness compares `/app` manifests, runs agent-declared `validation_commands` from the summary JSON, falls back to syntax checks for changed `.py`, `.sh`, and `.js` files, and short-runs changed `check_*`, `verify_*`, `validate_*`, and `test_*` scripts. Validation failures inject the command, exit code, stdout/stderr tails, related files, and previous summary into the retry instruction before the official verifier runs. It also cleans `/tmp/frame*.bmp` before the official verifier for known `make-mips-interpreter` tasks, avoiding stale frame files from an agent self-test.
+
+The Terminal-Bench runner probes the selected Harbor task metadata before starting the real run. It reads each task's recommended `[agent].timeout_sec`, applies the MVP leniency rule, passes the widened value to `--max-wall-time-sec`, and sets Harbor's outer timeout multiplier with a grace window so summary download and cleanup can finish. Set `AGENT_MAX_WALL_TIME_SEC` only when intentionally overriding the computed wall time.
+
+Set `AGENT_PRECHECK_TIMEOUT_SEC` to tune the per-command validation timeout, `AGENT_PRECHECK_RETRY_LIMIT=0` to run validation without a retry, or `AGENT_GENERIC_VALIDATION=0` to disable the generic validation stage.
 
 Recommended Harbor setup:
 
 ```bash
 pnpm install
+export NODE_RUNTIME_TARBALL=/path/to/node-v22.16.0-linux-x64.tar.xz
 pnpm package:agent-cli
-export AGENT_CLI_TARBALL="$PWD/.artifacts/agent-cli-linux.tgz"
+export AGENT_CLI_TARBALL="$PWD/.artifacts/agent-cli-linux-x64.tgz"
 export DEEPSEEK_API_KEY=...
 ```
 
-`AGENT_CLI_TARBALL` is the preferred Harbor path because setup uploads one built artifact and extracts it in the task container. This avoids running `pnpm install` inside every task. `AGENT_CLI_DIR` remains a development fallback when you want Harbor to upload the source tree and build it in the container.
+`NODE_RUNTIME_TARBALL` must point at a pre-downloaded Linux Node tarball for the target architecture. By default packaging targets `x64`; set `AGENT_TARGET_ARCH=arm64` for an arm64 artifact. If `NODE_RUNTIME_TARBALL` is unset, the package script looks for `.artifacts/cache/node-v22.16.0-linux-x64.tar.xz` or the matching arm64 cache file and fails with instructions if it is missing.
+
+`AGENT_CLI_TARBALL` is the preferred Harbor path because setup uploads one built artifact, extracts it in the task container, links `/opt/agent-cli/bin/agent` to `/usr/local/bin/agent`, and verifies readiness with `/usr/local/bin/agent --help`. This avoids running `pnpm install` or installing Node inside every task. `AGENT_CLI_DIR` remains a development fallback when you want Harbor to upload the source tree and build it in the container.
+
+Artifact checks:
+
+```bash
+pnpm package:agent-cli
+tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/agent'
+tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/node'
+```
 
 Terminal-Bench 2.0 smoke flow:
 
@@ -255,12 +289,18 @@ harbor run -d terminal-bench/terminal-bench-2 \
   -k 5
 ```
 
+Single-task startup checks:
+
+```bash
+AGENT_PROVIDER=deepseek DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id openssl-selfsigned-cert
+AGENT_PROVIDER=deepseek DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id regex-log
+```
+
 The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container. It downloads `/tmp/agent/trace.jsonl` and `/tmp/agent/summary.json` into Harbor logs when the environment exposes a download method.
 
 ## TODOs And MVP Limits
 
 - Streaming is not implemented yet; non-streaming chat completions are the supported path.
 - Config TOML parsing supports simple top-level scalar keys only.
-- The bundled Harbor artifact still assumes Node is available in the task container; setup fails clearly when it is missing.
-- TODO: bundle Node with the Harbor artifact or produce a true single-file binary.
+- The bundled Harbor artifact contains a Linux Node runtime when `NODE_RUNTIME_TARBALL` or the documented cache file is available at package time.
 - Permission mode `ask` is non-interactive and conservative; it rejects mutating tools instead of prompting.

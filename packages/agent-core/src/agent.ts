@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ToolCall } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
+import { truncateMiddle } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createDefaultToolRegistry } from "./tools/registry.js";
 import type {
@@ -21,6 +22,9 @@ const DEFAULT_MAX_TURNS = 20;
 const DEFAULT_MAX_WALL_TIME_SEC = 900;
 const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000;
+const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
+const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
+const COMPACTION_MARKER = "Previous agent conversation compacted by harness.";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -54,8 +58,101 @@ function stringifyToolResult(result: ToolResult): string {
   });
 }
 
+function messageHistoryChars(messages: AgentMessage[]): number {
+  return messages.reduce((total, message) => total + JSON.stringify(message).length, 0);
+}
+
+function compactMessageForSummary(message: AgentMessage): string {
+  if (message.role === "assistant") {
+    const pieces = ["assistant:"];
+    if (message.reasoningContent) pieces.push(`reasoning=${truncateMiddle(message.reasoningContent, 600).text}`);
+    if (message.content) pieces.push(`content=${truncateMiddle(message.content, 600).text}`);
+    if (message.toolCalls && message.toolCalls.length > 0) {
+      const calls = message.toolCalls.map((call) => `${call.function.name}(${JSON.stringify(call.function.arguments)})`);
+      pieces.push(`tool_calls=${truncateMiddle(calls.join("; "), 1200).text}`);
+    }
+    return pieces.join(" ");
+  }
+
+  if (message.role === "tool") {
+    return `tool ${message.name ?? message.toolCallId}: ${truncateMiddle(message.content, 1200).text}`;
+  }
+
+  return `${message.role}: ${truncateMiddle(message.content, 1200).text}`;
+}
+
+function summarizeMessages(messages: AgentMessage[], maxChars: number): string {
+  const body = messages.map(compactMessageForSummary).join("\n\n");
+  return `${COMPACTION_MARKER}\n\n${truncateMiddle(body, Math.max(1, maxChars)).text}`;
+}
+
+function compactMessagesIfNeeded(
+  messages: AgentMessage[],
+  options: {
+    maxMessageHistoryChars?: number;
+    messageHistoryRetain?: number;
+    compactionSummaryChars?: number;
+  }
+): AgentMessage[] {
+  const maxChars = options.maxMessageHistoryChars;
+  if (!maxChars || maxChars <= 0 || messageHistoryChars(messages) <= maxChars || messages.length <= 3) {
+    return messages;
+  }
+
+  const retainCount = Math.max(0, Math.floor(options.messageHistoryRetain ?? DEFAULT_MESSAGE_HISTORY_RETAIN));
+  let tailStart = Math.max(2, messages.length - retainCount);
+  while (tailStart < messages.length && messages[tailStart].role === "tool") {
+    tailStart += 1;
+  }
+
+  if (tailStart <= 2 || tailStart >= messages.length) {
+    return messages;
+  }
+
+  const protectedMessages = messages.slice(0, 2);
+  const compactedMessages = messages.slice(2, tailStart);
+  const tailMessages = messages.slice(tailStart);
+  const summary: AgentMessage = {
+    role: "user",
+    content: summarizeMessages(
+      compactedMessages,
+      options.compactionSummaryChars ?? DEFAULT_COMPACTION_SUMMARY_CHARS
+    )
+  };
+  return [...protectedMessages, summary, ...tailMessages];
+}
+
+function validationCommandsFromValue(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const commands = (value as { validation_commands?: unknown; validationCommands?: unknown }).validation_commands ??
+    (value as { validation_commands?: unknown; validationCommands?: unknown }).validationCommands;
+  if (!Array.isArray(commands)) return [];
+  return commands.filter((command): command is string => typeof command === "string" && command.trim().length > 0);
+}
+
+function extractValidationCommands(finalMessage: string | undefined): string[] {
+  if (!finalMessage) return [];
+  const candidates = [finalMessage];
+  const fencedJson = /```(?:json)?\s*([\s\S]*?)```/gi;
+  for (let match = fencedJson.exec(finalMessage); match !== null; match = fencedJson.exec(finalMessage)) {
+    candidates.push(match[1]);
+  }
+
+  const commands: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      for (const command of validationCommandsFromValue(JSON.parse(candidate))) {
+        if (!commands.includes(command)) commands.push(command);
+      }
+    } catch {
+      // Non-JSON final summaries are expected; the harness simply ignores them.
+    }
+  }
+  return commands;
+}
+
 function toSummaryJson(result: AgentRunResult): SummaryJson {
-  return {
+  const summary: SummaryJson = {
     status: result.status,
     finish_reason: result.finishReason,
     turns: result.turns,
@@ -70,6 +167,14 @@ function toSummaryJson(result: AgentRunResult): SummaryJson {
     duration_ms: result.durationMs,
     last_error: result.lastError
   };
+  if (result.finalMessage) {
+    summary.final_message = result.finalMessage;
+  }
+  const validationCommands = extractValidationCommands(result.finalMessage);
+  if (validationCommands.length > 0) {
+    summary.validation_commands = validationCommands;
+  }
+  return summary;
 }
 
 export async function writeRunSummary(result: AgentRunResult, summaryJsonPath: string): Promise<void> {
@@ -134,6 +239,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       turns += 1;
+      const compactedMessages = compactMessagesIfNeeded(messages, {
+        maxMessageHistoryChars: config.maxMessageHistoryChars,
+        messageHistoryRetain: config.messageHistoryRetain,
+        compactionSummaryChars: config.compactionSummaryChars
+      });
+      if (compactedMessages !== messages) {
+        messages.splice(0, messages.length, ...compactedMessages);
+      }
       await recordEvent(event(runId, "model_start", provider, model, { turn: turns }));
       const response = await config.modelClient.complete({
         messages,
