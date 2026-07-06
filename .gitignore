@@ -2,6 +2,10 @@ node_modules/
 dist/
 coverage/
 .agent/
+.artifacts/
+.env
 trace.jsonl
 summary.json
 *.tsbuildinfo
+__pycache__/
+jobs/

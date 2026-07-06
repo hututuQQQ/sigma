@@ -78,6 +78,83 @@ pnpm --filter agent-cli start -- doctor --workspace . --provider glm --check-api
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
 ```
 
+## Smoke Tests
+
+Deterministic fake-provider smoke does not call external APIs. It verifies the CLI/core/tool pipeline against four local tasks and writes traces plus summaries under `.artifacts/smoke-local/`:
+
+```bash
+pnpm smoke:local:fake
+```
+
+Real DeepSeek local smoke:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm smoke:local
+```
+
+Real GLM/Zhipu local smoke:
+
+```bash
+export ZAI_API_KEY=...
+AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm smoke:local
+```
+
+Harbor smoke builds the CLI tarball, verifies Terminal-Bench with the oracle, then runs one custom-agent job:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek pnpm smoke:harbor
+```
+
+The current Harbor artifact still requires `node` in the task container. Harbor setup now checks `command -v node` and `/usr/local/bin/agent --help`; if Node is missing, setup fails clearly instead of letting the task run with a broken agent. TODO: bundle Node with the artifact or produce a true single-file binary.
+
+## Benchmark Runs
+
+Terminal-Bench benchmark runs use Harbor, package the Sigma CLI first, and save artifacts under `.artifacts/bench/<run-id>/`. The run id is `YYYYMMDD-HHMMSS-provider-model`.
+
+DeepSeek small batch:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm bench:tb:k -- --k 5
+```
+
+GLM/Zhipu small batch:
+
+```bash
+export ZAI_API_KEY=...
+AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm bench:tb:k -- --k 5
+```
+
+Smoke:
+
+```bash
+pnpm bench:tb:smoke
+```
+
+Single task, when the installed Harbor CLI exposes a task selection flag:
+
+```bash
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm bench:tb:task -- --task-id <task-id>
+```
+
+Refresh a report:
+
+```bash
+pnpm bench:tb:report -- --run-id <run-id>
+```
+
+Each run directory contains `config.json`, `command.sh`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the runner creates a placeholder task entry and the global Harbor logs are the source of truth.
+
+Failure categories are rule based and intentionally small: `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
+
+Current limitations:
+
+- The packaged Harbor artifact still requires Node in the task container. `integrations/harbor/Dockerfile.agent` is a starting point for a Node-ready agent image.
+- `bench:tb:task` inspects `harbor run --help` and fails clearly if this Harbor install does not expose a recognized task selection flag.
+- Reports can only include per-task verifier status and logs that Harbor exposes to the adapter or emits to stdout/stderr.
+
 ## CLI Flags
 
 `agent solve` supports:
@@ -146,8 +223,9 @@ The adapter writes the task instruction to `/tmp/agent/instruction.md` and runs:
   --instruction-file /tmp/agent/instruction.md \
   --provider deepseek \
   --model deepseek-v4-pro \
-  --max-turns 40 \
-  --command-timeout-sec 120 \
+  --max-turns 200 \
+  --command-timeout-sec 180 \
+  --max-wall-time-sec 7200 \
   --permission-mode yolo \
   --trace-jsonl /tmp/agent/trace.jsonl \
   --summary-json /tmp/agent/summary.json \
@@ -158,26 +236,23 @@ Recommended Harbor setup:
 
 ```bash
 pnpm install
-pnpm build
-export AGENT_CLI_DIR="$PWD"
+pnpm package:agent-cli
+export AGENT_CLI_TARBALL="$PWD/.artifacts/agent-cli-linux.tgz"
 export DEEPSEEK_API_KEY=...
 ```
 
-Then register `integrations/harbor/agent.py` with your Harbor version and choose `provider="deepseek"` or `provider="glm"`. Harbor APIs vary, so you may need to adjust the small `_run`, `_upload`, or `_download_if_exists` wrappers for your installed version.
+`AGENT_CLI_TARBALL` is the preferred Harbor path because setup uploads one built artifact and extracts it in the task container. This avoids running `pnpm install` inside every task. `AGENT_CLI_DIR` remains a development fallback when you want Harbor to upload the source tree and build it in the container.
 
-Terminal-Bench smoke flow, adjusted for your Harbor/Terminal-Bench command names:
+Terminal-Bench 2.0 smoke flow:
 
 ```bash
 # Verify the benchmark install with its oracle first.
-tb run --agent oracle --dataset terminal-bench-2.0 --task-id <smoke-task>
+harbor run -d terminal-bench/terminal-bench-2 -a oracle -l 5
 
 # Then run the custom Harbor agent.
-tb run \
-  --dataset terminal-bench-2.0 \
-  --agent-import integrations.harbor.agent:AgentCliHarborAgent \
-  --agent-arg provider=deepseek \
-  --agent-arg model=deepseek-v4-pro \
-  --task-id <smoke-task>
+harbor run -d terminal-bench/terminal-bench-2 \
+  --agent-import-path "integrations.harbor.agent:AgentCliHarborAgent" \
+  -k 5
 ```
 
 The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container. It downloads `/tmp/agent/trace.jsonl` and `/tmp/agent/summary.json` into Harbor logs when the environment exposes a download method.
@@ -186,5 +261,6 @@ The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL
 
 - Streaming is not implemented yet; non-streaming chat completions are the supported path.
 - Config TOML parsing supports simple top-level scalar keys only.
-- Single-file/binary packaging is deferred. The Harbor path assumes Node is available or the built workspace can be uploaded and installed.
+- The bundled Harbor artifact still assumes Node is available in the task container; setup fails clearly when it is missing.
+- TODO: bundle Node with the Harbor artifact or produce a true single-file binary.
 - Permission mode `ask` is non-interactive and conservative; it rejects mutating tools instead of prompting.

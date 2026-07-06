@@ -6,9 +6,17 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build": "pnpm -r build",
-    "test": "vitest run",
+    "test": "vitest run && python -m unittest tests.test_harbor_agent",
     "lint": "tsc -b --pretty false",
-    "clean": "pnpm -r clean"
+    "clean": "pnpm -r clean",
+    "package:agent-cli": "pnpm build && node scripts/package-agent-cli.mjs",
+    "smoke:local": "pnpm build && node scripts/smoke-local.mjs",
+    "smoke:local:fake": "pnpm build && node scripts/smoke-local.mjs --provider fake",
+    "smoke:harbor": "node scripts/run-bash.mjs scripts/smoke-harbor.sh",
+    "bench:tb:smoke": "node scripts/bench-terminal-bench.mjs --mode smoke",
+    "bench:tb:k": "node scripts/bench-terminal-bench.mjs --mode k",
+    "bench:tb:task": "node scripts/bench-terminal-bench.mjs --mode task",
+    "bench:tb:report": "node scripts/bench-report.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

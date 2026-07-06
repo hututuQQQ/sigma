@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { normalizeAssistantMessage, normalizeToolCalls, normalizeUsage } from "../packages/agent-ai/src/index.js";
+import {
+  createModelClient,
+  normalizeAssistantMessage,
+  normalizeToolCalls,
+  normalizeUsage
+} from "../packages/agent-ai/src/index.js";
 
 describe("agent-ai normalization", () => {
   it("normalizes DeepSeek-style tool calls and reasoning content", () => {
@@ -72,5 +77,15 @@ describe("agent-ai normalization", () => {
       cacheTokens: 3,
       totalTokens: 14
     });
+  });
+
+  it("creates normalized provider clients with default models", () => {
+    const deepseek = createModelClient("deepseek");
+    const glm = createModelClient("glm");
+
+    expect(deepseek.provider).toBe("deepseek");
+    expect(deepseek.model).toBe("deepseek-v4-pro");
+    expect(glm.provider).toBe("glm");
+    expect(glm.model).toBe("glm-5.2");
   });
 });
