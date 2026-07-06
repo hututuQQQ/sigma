@@ -12,6 +12,8 @@ Date: 2026-07-06
 | `pnpm lint` | PASS |
 | `pnpm package:agent-cli` | PASS |
 | `pnpm smoke:local:fake` | PASS |
+| `pnpm smoke:local` | PASS with DeepSeek |
+| `AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm smoke:local` | PASS with GLM |
 | `pnpm smoke:harbor` | NOT RUN: Harbor missing; helper failed clearly before benchmark execution |
 
 ## Local Smoke Tasks
@@ -29,7 +31,9 @@ Artifacts were written under `.artifacts/smoke-local/`.
 
 ## Optional Smokes
 
-Real provider local smoke was not run because no DeepSeek or GLM/Zhipu API key was present in the environment.
+Real provider local smoke was run with DeepSeek using `deepseek-v4-pro`; all four local smoke tasks passed.
+
+Real provider local smoke was also run with GLM using `glm-5.2`; all four local smoke tasks passed.
 
 Harbor smoke was not run because `harbor` was not installed on PATH in this environment. `pnpm smoke:harbor` was invoked and failed clearly with installation guidance before any benchmark execution.
 

@@ -3,6 +3,7 @@ dist/
 coverage/
 .agent/
 .artifacts/
+.env
 trace.jsonl
 summary.json
 *.tsbuildinfo

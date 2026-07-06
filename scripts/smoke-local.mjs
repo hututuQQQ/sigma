@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,27 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const tasksDir = path.join(rootDir, "examples", "smoke-tasks");
 const artifactsRoot = path.join(rootDir, ".artifacts", "smoke-local");
 const taskNames = ["create-file", "edit-file", "fix-test", "inspect-and-summarize"];
+
+function loadDotEnv(filePath) {
+  if (!existsSync(filePath)) return;
+  const content = readFileSync(filePath, "utf8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+
+    const key = match[1];
+    let value = match[2].trim();
+    const quoted = value.match(/^(['"])(.*)\1$/);
+    if (quoted) value = quoted[2];
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadDotEnv(path.join(rootDir, ".env"));
 
 function argValue(name) {
   const index = process.argv.indexOf(name);
