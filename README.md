@@ -164,9 +164,9 @@ Each run directory contains `config.json`, `command.sh`, `resolved-job.config.js
 
 Failure categories are rule based and intentionally small: `host_proxy_error`, `host_encoding_error`, `harbor_cli_error`, `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
 
-Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `integrations/harbor`, do not prioritize changes to the Harbor adapter.
+Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `portable/harbor` or `scripts/bench`, do not prioritize changes to Harbor adapter plumbing.
 
-Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` harness flags. `integrations/harbor` only forwards benchmark kwargs to the CLI and mirrors artifacts.
+Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` harness flags. The portable Harbor runtime only forwards benchmark kwargs to the CLI and mirrors artifacts.
 
 Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
 
@@ -269,53 +269,77 @@ When the harness performs multiple attempts, the top-level count and token field
 
 ## Harbor And Terminal-Bench 2.0
 
-The Harbor adapter lives at `integrations/harbor/agent.py` and defines `AgentCliHarborAgent`.
+The Sigma agent runtime is built from `packages/agent-ai`, `packages/agent-core`, and `packages/agent-cli`. `pnpm package:agent-cli` turns those packages into a portable Linux CLI tarball for task containers. `pnpm package:harbor-runtime` then creates the host-side portable Harbor runtime and JobConfigs in:
 
-The adapter writes the task instruction to `/tmp/agent/instruction.md` and runs:
-
-```bash
-/usr/local/bin/agent solve \
-  --workspace /app \
-  --instruction-file /tmp/agent/instruction.md \
-  --provider deepseek \
-  --model deepseek-v4-pro \
-  --max-turns 200 \
-  --command-timeout-sec 180 \
-  --max-wall-time-sec <lenient-task-agent-timeout-sec> \
-  --permission-mode yolo \
-  --trace-jsonl /tmp/agent/trace.jsonl \
-  --summary-json /tmp/agent/summary.json \
-  --validation-mode auto \
-  --validation-retry-limit 1 \
-  --validation-timeout-sec 45 \
-  --attempts-dir /tmp/agent/attempts \
-  --max-message-history-chars 250000 \
-  --message-history-retain 24 \
-  --compaction-summary-chars 30000 \
-  --no-stream-ui
+```text
+.artifacts/harbor-runtime/
+  sigma_harbor_agent.py
+  README.md
+  jobconfig.deepseek.k5.json
+  jobconfig.deepseek.task.example.json
 ```
 
-The Harbor adapter accepts legacy benchmark kwargs for compatibility: `pre_verifier_cleanup_globs`, `precheck_command`, `precheck_timeout_sec`, `precheck_retry_limit`, `generic_validation_enabled`, `validation_timeout_sec`, `harbor_agent_timeout_sec`, `retry_min_budget_sec`, `max_message_history_chars`, `message_history_retain`, and `compaction_summary_chars`. It does not execute validation or retry logic itself; it translates those kwargs into `agent solve` flags.
+## Portable Harbor Runtime
 
-The `agent-core` harness compares workspace manifests, runs agent-declared `validation_commands` from the summary JSON, falls back to syntax checks for changed `.py`, `.sh`, and `.js` files, short-runs changed `check_*`, `verify_*`, `validate_*`, and `test_*` scripts, executes optional precheck commands, writes attempt artifacts, decides whether retry budget remains, injects failure feedback into retry instructions, and runs configured pre-verifier cleanup globs. For `make-mips-interpreter`, the benchmark runner explicitly passes `/tmp/frame*.bmp` as `pre_verifier_cleanup_globs`; the Harbor adapter no longer guesses task-specific cleanup rules.
-
-The Terminal-Bench runner probes the selected Harbor task metadata before starting the real run. It reads each task's recommended `[agent].timeout_sec`, applies the MVP leniency rule, passes the widened value to `--max-wall-time-sec`, and sets Harbor's outer timeout multiplier with a grace window so summary download and cleanup can finish. Set `AGENT_MAX_WALL_TIME_SEC` only when intentionally overriding the computed wall time.
-
-Set `AGENT_PRECHECK_TIMEOUT_SEC` to tune the per-command validation/precheck timeout, `AGENT_PRECHECK_RETRY_LIMIT=0` to run validation without a retry, or `AGENT_GENERIC_VALIDATION=0` to make Harbor pass `--validation-mode off`.
-
-Recommended Harbor setup:
+Generate and run the portable path directly:
 
 ```bash
-pnpm install
-export NODE_RUNTIME_TARBALL=/path/to/node-v22.16.0-linux-x64.tar.xz
+pnpm build
 pnpm package:agent-cli
-export AGENT_CLI_TARBALL="$PWD/.artifacts/agent-cli-linux-x64.tgz"
+pnpm package:harbor-runtime
+
 export DEEPSEEK_API_KEY=...
+PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
+harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 ```
 
-`NODE_RUNTIME_TARBALL` must point at a pre-downloaded Linux Node tarball for the target architecture. By default packaging targets `x64`; set `AGENT_TARGET_ARCH=arm64` for an arm64 artifact. If `NODE_RUNTIME_TARBALL` is unset, the package script looks for `.artifacts/cache/node-v22.16.0-linux-x64.tar.xz` or the matching arm64 cache file and fails with instructions if it is missing.
+For a single task example:
 
-`AGENT_CLI_TARBALL` is the preferred Harbor path because setup uploads one built artifact, extracts it in the task container, links `/opt/agent-cli/bin/agent` to `/usr/local/bin/agent`, and verifies readiness with `/usr/local/bin/agent --help`. This avoids running `pnpm install` or installing Node inside every task. `AGENT_CLI_DIR` remains a development fallback when you want Harbor to upload the source tree and build it in the container.
+```bash
+PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
+harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.task.example.json
+```
+
+Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They should not require:
+
+```bash
+PYTHONPATH="$PWD"
+```
+
+They should not depend on:
+
+```text
+integrations.harbor.agent:AgentCliHarborAgent
+```
+
+unless legacy mode is explicitly requested.
+
+The portable Python adapter depends only on the Python standard library and Harbor. It uploads the agent CLI tarball, extracts it to `/opt/agent-cli`, symlinks `/usr/local/bin/agent`, runs `/usr/local/bin/agent solve`, forwards provider env keys, downloads `/tmp/agent/summary.json`, `/tmp/agent/trace.jsonl`, and best-effort `/tmp/agent/attempts/**`, and fills Harbor context fields. Validation, retry, precheck, and cleanup behavior lives in `agent-core` and is controlled through CLI flags.
+
+The convenience benchmark commands still work and now default to the portable runtime:
+
+```bash
+pnpm bench:tb:deepseek:k5
+pnpm bench:tb:deepseek:task -- --task-id openssl-selfsigned-cert
+```
+
+During these runs, `scripts/bench-terminal-bench.mjs` packages the agent CLI, packages the Harbor runtime, puts `.artifacts/harbor-runtime` on `PYTHONPATH`, writes a portable JobConfig, runs Harbor, and collects reports.
+
+`integrations/harbor` remains as a legacy/development helper and compatibility import. It is not the default benchmark runtime. To opt into the old import path:
+
+```bash
+SIGMA_HARBOR_AGENT_MODE=legacy pnpm bench:tb:deepseek:k5
+```
+
+or set:
+
+```bash
+SIGMA_HARBOR_AGENT_IMPORT_PATH=integrations.harbor.agent:AgentCliHarborAgent
+```
+
+Only legacy mode adds the repo root to `PYTHONPATH`.
+
+`NODE_RUNTIME_TARBALL` must point at a pre-downloaded Linux Node tarball for the target architecture when packaging the CLI. By default packaging targets `x64`; set `AGENT_TARGET_ARCH=arm64` for an arm64 artifact. If `NODE_RUNTIME_TARBALL` is unset, the package script looks for `.artifacts/cache/node-v22.16.0-linux-x64.tar.xz` or the matching arm64 cache file and fails with instructions if it is missing.
 
 Artifact checks:
 
@@ -323,28 +347,10 @@ Artifact checks:
 pnpm package:agent-cli
 tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/agent'
 tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/node'
+grep -R "integrations.harbor.agent" .artifacts/harbor-runtime
 ```
 
-Terminal-Bench 2.0 smoke flow:
-
-```bash
-# Verify the benchmark install with its oracle first.
-harbor run -d terminal-bench/terminal-bench-2 -a oracle -l 5
-
-# Then run the custom Harbor agent.
-harbor run -d terminal-bench/terminal-bench-2 \
-  --agent-import-path "integrations.harbor.agent:AgentCliHarborAgent" \
-  -k 5
-```
-
-Single-task startup checks:
-
-```bash
-AGENT_PROVIDER=deepseek DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id openssl-selfsigned-cert
-AGENT_PROVIDER=deepseek DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id regex-log
-```
-
-The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container. It downloads `/tmp/agent/trace.jsonl` and `/tmp/agent/summary.json` into Harbor logs when the environment exposes a download method.
+The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container.
 
 ## TODOs And MVP Limits
 

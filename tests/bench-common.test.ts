@@ -6,14 +6,21 @@ import {
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
+  buildCommandScript,
   classifyFailure,
   computeHarborTimeoutPlan,
+  defaultAgentCliTarballForEnv,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
   formatMarkdownReport,
   generateBenchReport,
+  harborEnvForRun,
+  harborRuntimeDir,
+  legacyAgentImportPath,
   parseHarborTimeoutProbe,
+  portableAgentImportPath,
   resolveHarborCommand,
+  rootDir,
   suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
@@ -47,9 +54,11 @@ describe("Terminal-Bench command construction", () => {
       "-d",
       terminalBenchDataset,
       "--agent-import-path",
-      "integrations.harbor.agent:AgentCliHarborAgent",
+      portableAgentImportPath,
       "-k",
       "5",
+      "--ak",
+      `agent_cli_tarball:str=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider:str=deepseek",
       "--ak",
@@ -85,12 +94,14 @@ describe("Terminal-Bench command construction", () => {
       "-d",
       terminalBenchDataset,
       "--agent",
-      "integrations.harbor.agent:AgentCliHarborAgent",
+      portableAgentImportPath,
       "--yes",
       "-l",
       "5",
       "--agent-timeout-multiplier",
       "8.12",
+      "--ak",
+      `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider=glm",
       "--ak",
@@ -308,7 +319,10 @@ describe("Terminal-Bench command construction", () => {
     expect(config.datasets).toBeUndefined();
     expect(config.tasks).toEqual([{ name: "terminal-bench/make-mips-interpreter" }]);
     expect(config.agent_timeout_multiplier).toBe(3.12);
+    expect(config.agents[0].name).toBe(portableAgentImportPath);
+    expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
+      agent_cli_tarball: defaultAgentCliTarballForEnv(),
       max_turns: 540,
       max_wall_time_sec: 2700,
       harbor_agent_timeout_sec: 5610,
@@ -351,6 +365,7 @@ describe("Terminal-Bench command construction", () => {
       generic_validation_enabled: true
     });
     expect(config.agents[0].kwargs).toMatchObject({
+      agent_cli_tarball: defaultAgentCliTarballForEnv(),
       generic_validation_enabled: true,
       validation_timeout_sec: 45,
       precheck_retry_limit: 1,
@@ -382,6 +397,67 @@ describe("Terminal-Bench command construction", () => {
     );
 
     expect(config.agents[0].kwargs.max_turns).toBe(200);
+  });
+
+  it("uses the legacy Harbor import path only when requested", () => {
+    const legacyConfig = buildHarborJobConfig(
+      {
+        mode: "k",
+        k: 1,
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        maxTurns: 200,
+        commandTimeoutSec: 180,
+        env: { SIGMA_HARBOR_AGENT_MODE: "legacy" }
+      },
+      "jobs"
+    );
+    const explicitConfig = buildHarborJobConfig(
+      {
+        mode: "k",
+        k: 1,
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        maxTurns: 200,
+        commandTimeoutSec: 180,
+        env: { SIGMA_HARBOR_AGENT_IMPORT_PATH: legacyAgentImportPath }
+      },
+      "jobs"
+    );
+
+    expect(legacyConfig.agents[0].name).toBe(legacyAgentImportPath);
+    expect(explicitConfig.agents[0].name).toBe(legacyAgentImportPath);
+  });
+
+  it("puts the portable runtime on PYTHONPATH by default and adds repo root only for legacy mode", () => {
+    const portableEnv = harborEnvForRun("run-dir", {});
+    const portablePythonPath = portableEnv.PYTHONPATH.split(path.delimiter);
+    expect(portablePythonPath).toContain(harborRuntimeDir);
+    expect(portablePythonPath).not.toContain(rootDir);
+
+    const legacyEnv = harborEnvForRun("run-dir", { SIGMA_HARBOR_AGENT_MODE: "legacy" });
+    const legacyPythonPath = legacyEnv.PYTHONPATH.split(path.delimiter);
+    expect(legacyPythonPath).toContain(harborRuntimeDir);
+    expect(legacyPythonPath).toContain(rootDir);
+  });
+
+  it("writes portable command scripts without the legacy integration import path", () => {
+    const env = harborEnvForRun("run-dir", {});
+    const args = buildHarborArgs({
+      mode: "k",
+      k: 1,
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      maxTurns: 200,
+      commandTimeoutSec: 180,
+      maxWallTimeSec: 7200,
+      env
+    });
+    const script = buildCommandScript("harbor", args, env);
+
+    expect(script).toContain(portableAgentImportPath);
+    expect(script).toContain(harborRuntimeDir);
+    expect(script).not.toContain(legacyAgentImportPath);
   });
 });
 
@@ -426,9 +502,9 @@ describe("failure classifier", () => {
   it("maps failure categories to suggested owners", () => {
     expect(suggestedOwnerForFailureCategory("host_proxy_error")).toBe("environment");
     expect(suggestedOwnerForFailureCategory("host_encoding_error")).toBe("environment");
-    expect(suggestedOwnerForFailureCategory("harbor_cli_error")).toBe("integrations/harbor");
+    expect(suggestedOwnerForFailureCategory("harbor_cli_error")).toBe("scripts/bench");
     expect(suggestedOwnerForFailureCategory("node_missing")).toBe("package-agent-cli");
-    expect(suggestedOwnerForFailureCategory("agent_setup_failed")).toBe("integrations/harbor");
+    expect(suggestedOwnerForFailureCategory("agent_setup_failed")).toBe("portable/harbor");
     expect(suggestedOwnerForFailureCategory("api_error")).toBe("agent-ai");
     expect(suggestedOwnerForFailureCategory("agent_timeout")).toBe("agent-core");
     expect(suggestedOwnerForFailureCategory("max_turns")).toBe("agent-core");
@@ -487,7 +563,7 @@ describe("markdown report formatting", () => {
       "| terminal-bench/task-a | failed | verifier_failed | agent-core | agent_completed_but_verifier_failed |"
     );
     expect(markdown).toContain("## Ownership Guidance");
-    expect(markdown).toContain("If `suggested_owner` is not `integrations/harbor`");
+    expect(markdown).toContain("If `suggested_owner` is not `portable/harbor` or `scripts/bench`");
   });
 });
 

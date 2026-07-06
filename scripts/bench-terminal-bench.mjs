@@ -20,6 +20,7 @@ import {
   loadDotEnv,
   makeRunId,
   packageAgentCli,
+  packageHarborRuntime,
   parseHarborTimeoutProbe,
   resolveHarborCommand,
   resolveRunOptions,
@@ -78,6 +79,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const startedAt = new Date().toISOString();
   const runner = deps.runProcess ?? runProcess;
   const packager = deps.packageAgentCli ?? packageAgentCli;
+  const harborRuntimePackager = deps.packageHarborRuntime ?? packageHarborRuntime;
   const harborCommandInfo = deps.resolveHarborCommand?.(env) ?? resolveHarborCommand(env);
   const harborCommand = harborCommandInfo.command;
   await mkdir(runDir, { recursive: true });
@@ -136,6 +138,23 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
+  process.stdout.write(`Packaging portable Harbor runtime...\n`);
+  const harborRuntimeResult = await harborRuntimePackager({
+    cwd: rootDir,
+    env: process.env,
+    stdoutPath: path.join(runDir, "package-harbor-runtime.stdout.log"),
+    stderrPath: path.join(runDir, "package-harbor-runtime.stderr.log"),
+    rawPath: path.join(runDir, "package-harbor-runtime.raw.log")
+  });
+  if (harborRuntimeResult.exitCode !== 0) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `pnpm package:harbor-runtime failed with exit code ${harborRuntimeResult.exitCode}. See package-harbor-runtime.raw.log.`,
+      harborRuntimeResult.exitCode
+    );
+  }
+
   process.stdout.write(`Inspecting Harbor CLI support...\n`);
   const versionResult = await runner(harborCommand, ["--version"], {
     cwd: rootDir,
@@ -176,7 +195,13 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   if (options.mode !== "smoke") {
     process.stdout.write(`Inspecting selected task timeout metadata...\n`);
     const timeoutProbeJobsDir = path.join(runDir, "harbor-timeout-probe-jobs");
-    const timeoutProbeConfig = buildHarborTimeoutProbeConfig(options, timeoutProbeJobsDir);
+    const timeoutProbeConfig = buildHarborTimeoutProbeConfig(
+      {
+        ...options,
+        agentCliTarball: env.AGENT_CLI_TARBALL
+      },
+      timeoutProbeJobsDir
+    );
     const timeoutProbeConfigPath = path.join(runDir, "harbor-timeout-probe.config.json");
     await writeJson(timeoutProbeConfigPath, timeoutProbeConfig);
     const timeoutProbeResult = await runner(harborPythonCommand(env), [path.join(rootDir, "scripts", "probe-harbor-timeouts.py"), timeoutProbeConfigPath], {
@@ -211,7 +236,15 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
 
   const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
-  const resolvedJobConfig = buildHarborJobConfig(options, jobsDir, timeoutPlan, timeoutProbe);
+  const resolvedJobConfig = buildHarborJobConfig(
+    {
+      ...options,
+      agentCliTarball: env.AGENT_CLI_TARBALL
+    },
+    jobsDir,
+    timeoutPlan,
+    timeoutProbe
+  );
   await writeJson(resolvedJobConfigPath, resolvedJobConfig);
   harborArgs = buildHarborArgs({
     ...options,

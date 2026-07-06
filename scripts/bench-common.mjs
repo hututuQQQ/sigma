@@ -7,8 +7,11 @@ import { fileURLToPath } from "node:url";
 export const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const artifactsDir = path.join(rootDir, ".artifacts");
 export const benchRootDir = path.join(artifactsDir, "bench");
+export const harborRuntimeDir = path.join(artifactsDir, "harbor-runtime");
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
-export const agentImportPath = "integrations.harbor.agent:AgentCliHarborAgent";
+export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
+export const legacyAgentImportPath = "integrations.harbor.agent:AgentCliHarborAgent";
+export const agentImportPath = portableAgentImportPath;
 export const defaultAgentCliTarball = path.join(artifactsDir, "agent-cli-linux-x64.tgz");
 export const defaultAgentTimeoutFallbackSec = 1800;
 export const defaultAgentTimeoutGraceSec = 120;
@@ -38,9 +41,9 @@ const FAILURE_COUNT_BUCKETS = new Map([
 const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["host_proxy_error", "environment"],
   ["host_encoding_error", "environment"],
-  ["harbor_cli_error", "integrations/harbor"],
+  ["harbor_cli_error", "scripts/bench"],
   ["node_missing", "package-agent-cli"],
-  ["agent_setup_failed", "integrations/harbor"],
+  ["agent_setup_failed", "portable/harbor"],
   ["api_error", "agent-ai"],
   ["agent_timeout", "agent-core"],
   ["max_turns", "agent-core"],
@@ -131,6 +134,24 @@ export function safePathPart(value, fallback = "default") {
 export function defaultAgentCliTarballForEnv(env = process.env) {
   const targetArch = env.AGENT_TARGET_ARCH || "x64";
   return path.join(artifactsDir, `agent-cli-linux-${targetArch}.tgz`);
+}
+
+export function resolveHarborAgentImportPath(env = process.env) {
+  if (typeof env.SIGMA_HARBOR_AGENT_IMPORT_PATH === "string" && env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim()) {
+    return env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim();
+  }
+  if (String(env.SIGMA_HARBOR_AGENT_MODE ?? "").trim().toLowerCase() === "legacy") {
+    return legacyAgentImportPath;
+  }
+  return portableAgentImportPath;
+}
+
+export function isLegacyHarborAgentImportPath(importPath) {
+  return importPath === legacyAgentImportPath || String(importPath ?? "").startsWith("integrations.harbor.");
+}
+
+function resolveAgentCliTarballPath(options = {}, env = process.env) {
+  return path.resolve(options.agentCliTarball ?? env.AGENT_CLI_TARBALL ?? defaultAgentCliTarballForEnv(env));
 }
 
 export function makeRunId(date, provider, model) {
@@ -468,6 +489,7 @@ function benchmarkMaxTurns(options, timeoutPlan = null) {
 
 function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) {
   const agentKwargs = {
+    agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
     max_turns: benchmarkMaxTurns(options, timeoutPlan),
     command_timeout_sec: options.commandTimeoutSec
@@ -500,7 +522,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
 }
 
 export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeoutProbe = null) {
-  const agentName = options.mode === "smoke" ? "oracle" : agentImportPath;
+  const agentName = options.mode === "smoke"
+    ? "oracle"
+    : options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env);
   const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan, timeoutProbe);
 
   const config = {
@@ -592,12 +616,13 @@ export function buildHarborArgs(options) {
     return args;
   }
 
+  const selectedAgentImportPath = options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env);
   const args = [
     "run",
     "-d",
     terminalBenchDataset,
     capabilities.agentFlag ?? "--agent-import-path",
-    agentImportPath
+    selectedAgentImportPath
   ];
   if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
   if (capabilities.yesFlag) args.push(capabilities.yesFlag);
@@ -621,6 +646,7 @@ export function buildHarborArgs(options) {
     args.push(capabilities.agentTimeoutMultiplierFlag, agentTimeoutMultiplier);
   }
 
+  args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
@@ -650,7 +676,7 @@ export function buildCommandScript(commandOrArgs, maybeArgs, maybeEnv) {
     "set -euo pipefail",
     `cd ${shellQuote(rootDir)}`,
     `export AGENT_CLI_TARBALL=${shellQuote(env.AGENT_CLI_TARBALL)}`,
-    `export PYTHONPATH=${shellQuote(rootDir)}"\${PYTHONPATH:+:\${PYTHONPATH}}"`,
+    `export PYTHONPATH=${shellQuote(env.PYTHONPATH ?? "")}`,
     `${shellQuote(harborCommand)} ${harborArgs.map(shellQuote).join(" ")}`,
     ""
   ].join("\n");
@@ -752,6 +778,10 @@ export async function runProcess(command, args, options = {}) {
 
 export async function packageAgentCli(options = {}) {
   return await runProcess(packageManagerCommand(), ["package:agent-cli"], options);
+}
+
+export async function packageHarborRuntime(options = {}) {
+  return await runProcess(packageManagerCommand(), ["package:harbor-runtime"], options);
 }
 
 async function readTextSafe(filePath) {
@@ -1468,8 +1498,8 @@ export function formatMarkdownReport(report) {
     "",
     "## Ownership Guidance",
     "",
-    "- If `suggested_owner` is not `integrations/harbor`, do not start by changing `integrations/harbor/**`.",
-    "- `integrations/harbor` is an adapter layer, not the agent harness itself.",
+    "- If `suggested_owner` is not `portable/harbor` or `scripts/bench`, do not start by changing Harbor adapter plumbing.",
+    "- The portable Harbor runtime is an adapter layer, not the agent harness itself.",
     "- Benchmark solving quality issues should start in `agent-core`, tools, prompts, or CLI behavior."
   );
 
@@ -1586,10 +1616,19 @@ export async function ensurePlaceholderTask(runDir, metadata) {
 }
 
 export function harborEnvForRun(runDir, env = process.env) {
+  const selectedAgentImportPath = resolveHarborAgentImportPath(env);
+  const pythonPathEntries = [harborRuntimeDir];
+  if (isLegacyHarborAgentImportPath(selectedAgentImportPath)) {
+    pythonPathEntries.push(rootDir);
+  }
+  if (env.PYTHONPATH) {
+    pythonPathEntries.push(env.PYTHONPATH);
+  }
+
   const next = {
     ...env,
     AGENT_CLI_TARBALL: env.AGENT_CLI_TARBALL || defaultAgentCliTarballForEnv(env),
-    PYTHONPATH: [rootDir, env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    PYTHONPATH: pythonPathEntries.filter(Boolean).join(path.delimiter),
     SIGMA_BENCH_RUN_DIR: runDir,
     PYTHONIOENCODING: env.PYTHONIOENCODING || "utf-8",
     PYTHONUTF8: env.PYTHONUTF8 || "1",

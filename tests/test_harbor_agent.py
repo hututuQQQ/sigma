@@ -54,31 +54,47 @@ def install_harbor_stubs() -> None:
 
 def import_agent_module():
     install_harbor_stubs()
+    sys.modules.pop("portable.harbor.sigma_harbor_agent", None)
     sys.modules.pop("integrations.harbor.agent", None)
     return importlib.import_module("integrations.harbor.agent")
 
 
-class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
-    async def test_model_name_is_used_unless_model_is_explicit(self):
-        module = import_agent_module()
+def import_portable_agent_module():
+    install_harbor_stubs()
+    sys.modules.pop("portable.harbor.sigma_harbor_agent", None)
+    return importlib.import_module("portable.harbor.sigma_harbor_agent")
 
-        self.assertEqual(module.AgentCliHarborAgent(model_name="custom-model").model, "custom-model")
+
+class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_import_reexports_portable_agent(self):
+        portable_module = import_portable_agent_module()
+        legacy_module = importlib.import_module("integrations.harbor.agent")
+
+        self.assertIs(legacy_module.AgentCliHarborAgent, portable_module.SigmaCliHarborAgent)
+        self.assertTrue((Path.cwd() / "portable" / "harbor" / "sigma_harbor_agent.py").is_file())
+        self.assertNotIn(
+            "integrations.harbor",
+            (Path.cwd() / "portable" / "harbor" / "sigma_harbor_agent.py").read_text(encoding="utf-8"),
+        )
+
+    async def test_model_name_is_used_unless_model_is_explicit(self):
+        module = import_portable_agent_module()
+
+        self.assertEqual(module.SigmaCliHarborAgent(model_name="custom-model").model, "custom-model")
         self.assertEqual(
-            module.AgentCliHarborAgent(model="explicit-model", model_name="custom-model").model,
+            module.SigmaCliHarborAgent(model="explicit-model", model_name="custom-model").model,
             "explicit-model",
         )
-        self.assertEqual(module.AgentCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
-        self.assertEqual(module.AgentCliHarborAgent(provider="glm").model, "glm-5.2")
+        self.assertEqual(module.SigmaCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
+        self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
 
     async def test_setup_prefers_uploaded_tarball(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             tarball = Path(tmp) / "agent-cli-linux-x64.tgz"
             tarball.write_bytes(b"fake")
             old_tarball = os.environ.get("AGENT_CLI_TARBALL")
-            old_cli_dir = os.environ.get("AGENT_CLI_DIR")
-            os.environ["AGENT_CLI_TARBALL"] = str(tarball)
-            os.environ.pop("AGENT_CLI_DIR", None)
+            os.environ.pop("AGENT_CLI_TARBALL", None)
             try:
                 env = SimpleNamespace(
                     exec=AsyncMock(
@@ -93,7 +109,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     upload_dir=AsyncMock(),
                     download_file=AsyncMock(),
                 )
-                agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+                agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs", agent_cli_tarball=tarball)
 
                 await agent.setup(env)
 
@@ -108,10 +124,6 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     os.environ.pop("AGENT_CLI_TARBALL", None)
                 else:
                     os.environ["AGENT_CLI_TARBALL"] = old_tarball
-                if old_cli_dir is None:
-                    os.environ.pop("AGENT_CLI_DIR", None)
-                else:
-                    os.environ["AGENT_CLI_DIR"] = old_cli_dir
 
     async def test_setup_checks_existing_agent_help(self):
         module = import_agent_module()
@@ -214,6 +226,42 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["timeout_sec"], 615)
             self.assertFalse(any("sigma-precheck" in command for command, _kwargs in exec_commands))
             self.assertFalse(any("sigma-validation" in command for command, _kwargs in exec_commands))
+
+    async def test_run_accepts_portable_harness_kwarg_names(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            exec_commands = []
+
+            async def exec_side_effect(command, **kwargs):
+                exec_commands.append((command, kwargs))
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="task-a")
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                validation_mode="auto",
+                validation_retry_limit=3,
+                validation_timeout_sec=50,
+                harness_timeout_sec=700,
+                agent_timeout_grace_sec=20,
+            )
+
+            await agent.run("fix the task", env, context)
+
+            command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent solve" in item[0]][0]
+            self.assertIn("--validation-mode auto", command)
+            self.assertIn("--validation-retry-limit 3", command)
+            self.assertIn("--validation-timeout-sec 50", command)
+            self.assertIn("--harness-timeout-sec 700", command)
+            self.assertEqual(kwargs["timeout_sec"], 720)
 
     async def test_run_uses_validation_off_when_generic_validation_disabled(self):
         module = import_agent_module()

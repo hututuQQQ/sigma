@@ -14,6 +14,7 @@ EOF
 fi
 
 pnpm package:agent-cli
+pnpm package:harbor-runtime
 
 if [ -z "${AGENT_CLI_TARBALL:-}" ]; then
   export AGENT_CLI_TARBALL="$ROOT_DIR/.artifacts/agent-cli-linux-${AGENT_TARGET_ARCH:-x64}.tgz"
@@ -24,15 +25,16 @@ if [ ! -f "$AGENT_CLI_TARBALL" ]; then
   exit 1
 fi
 
-export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$ROOT_DIR/.artifacts/harbor-runtime:${PYTHONPATH:-}"
 
 harbor run -d terminal-bench/terminal-bench-2 -a oracle -l 5
 
 agent_args=(
   run
   -d terminal-bench/terminal-bench-2
-  --agent-import-path "integrations.harbor.agent:AgentCliHarborAgent"
+  --agent-import-path "sigma_harbor_agent:SigmaCliHarborAgent"
   -k 1
+  --ak "agent_cli_tarball:str=$AGENT_CLI_TARBALL"
   --ak "provider:str=${AGENT_PROVIDER:-deepseek}"
 )
 
