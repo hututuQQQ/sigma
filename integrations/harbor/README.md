@@ -1,5 +1,42 @@
 # Harbor Integration
 
+## Boundary
+
+`integrations/harbor` is the Harbor / Terminal-Bench compatibility adapter for
+Sigma. It is intentionally thin glue around the real CLI, agent loop, tools,
+trace, summary, and provider layers.
+
+**Do not improve benchmark score by editing this adapter unless the failure is
+Harbor-specific.**
+
+This directory is responsible for:
+
+- Harbor agent class wrapper behavior.
+- Installing or uploading the Sigma agent CLI artifact.
+- Calling `/usr/local/bin/agent solve`.
+- Forwarding required environment variables.
+- Downloading or mirroring `summary.json`, `trace.jsonl`, metadata, and related
+  benchmark artifacts.
+- Filling Harbor context fields.
+
+Change `integrations/harbor` only when the benchmark failure is caused by:
+
+- Harbor CLI invocation errors.
+- Agent artifact installation errors.
+- Environment variables not being forwarded correctly.
+- Harbor context or artifact plumbing errors.
+- Task container setup glue errors.
+
+For other failures, start in the owning layer instead:
+
+- Prompt or agent behavior: `packages/agent-core`.
+- Tool behavior: `packages/agent-core/src/tools`.
+- Max turns, timeout, or compaction behavior: `packages/agent-core` or CLI config.
+- Provider API or model calls: `packages/agent-ai`.
+- CLI arguments, summary, or trace behavior: `packages/agent-cli` or
+  `packages/agent-core`.
+- Benchmark runner or report behavior: `scripts/bench-*.mjs`.
+
 `agent.py` defines `AgentCliHarborAgent`, a custom Harbor agent that runs:
 
 ```bash

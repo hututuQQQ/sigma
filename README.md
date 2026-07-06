@@ -113,6 +113,15 @@ The Harbor artifact is a self-contained Linux bundle when built with a Node runt
 
 Terminal-Bench benchmark runs use Harbor, package the Sigma CLI first, and save artifacts under `.artifacts/bench/<run-id>/`. The run id is `YYYYMMDD-HHMMSS-provider-model`.
 
+DeepSeek Pro fixed commands:
+
+```bash
+export DEEPSEEK_API_KEY=...
+pnpm bench:tb:deepseek:k5
+pnpm bench:tb:deepseek:k10
+pnpm bench:tb:deepseek:task -- --task-id openssl-selfsigned-cert
+```
+
 DeepSeek small batch:
 
 ```bash
@@ -154,6 +163,8 @@ pnpm bench:tb:report:all
 Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
 
 Failure categories are rule based and intentionally small: `host_proxy_error`, `host_encoding_error`, `harbor_cli_error`, `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
+
+Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `integrations/harbor`, do not prioritize changes to the Harbor adapter.
 
 Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
 

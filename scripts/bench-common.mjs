@@ -35,6 +35,36 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["agent_crashed", "failed"],
   ["unknown", "unknown"]
 ]);
+const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
+  ["host_proxy_error", "environment"],
+  ["host_encoding_error", "environment"],
+  ["harbor_cli_error", "integrations/harbor"],
+  ["node_missing", "package-agent-cli"],
+  ["agent_setup_failed", "integrations/harbor"],
+  ["api_error", "agent-ai"],
+  ["agent_timeout", "agent-core"],
+  ["max_turns", "agent-core"],
+  ["tool_timeout", "agent-core"],
+  ["verifier_failed", "agent-core"],
+  ["agent_crashed", "agent-core"],
+  ["unknown", "inspect"]
+]);
+
+export function suggestedOwnerForFailureCategory(failureCategory) {
+  const normalized = typeof failureCategory === "string" && failureCategory.length > 0 ? failureCategory : "unknown";
+  return SUGGESTED_OWNER_BY_FAILURE_CATEGORY.get(normalized) ?? "inspect";
+}
+
+function suggestedOwnerForTask(status, failureCategory) {
+  return status === "passed" ? null : suggestedOwnerForFailureCategory(failureCategory);
+}
+
+function withSuggestedOwner(task) {
+  return {
+    ...task,
+    suggested_owner: suggestedOwnerForTask(task.status, task.failure_category)
+  };
+}
 
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -1357,14 +1387,15 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
-    "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
+    "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"
   ];
 
   for (const task of report.tasks) {
     const failureSignals = Array.isArray(task.failure_signals) ? task.failure_signals.join(", ") : "";
+    const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category) ?? "";
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 
@@ -1402,6 +1433,15 @@ export function formatMarkdownReport(report) {
       lines.push(`- ${note}`);
     }
   }
+
+  lines.push(
+    "",
+    "## Ownership Guidance",
+    "",
+    "- If `suggested_owner` is not `integrations/harbor`, do not start by changing `integrations/harbor/**`.",
+    "- `integrations/harbor` is an adapter layer, not the agent harness itself.",
+    "- Benchmark solving quality issues should start in `agent-core`, tools, prompts, or CLI behavior."
+  );
 
   lines.push("");
   return lines.join("\n");
@@ -1456,6 +1496,7 @@ export async function generateBenchReport(runDir) {
       last_error: task.last_error ?? `Incomplete benchmark run: ${incompleteReason.join("; ")}`
     }));
   }
+  tasks = tasks.map(withSuggestedOwner);
 
   const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
   for (const task of tasks) {

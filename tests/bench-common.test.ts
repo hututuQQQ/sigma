@@ -10,9 +10,11 @@ import {
   computeHarborTimeoutPlan,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
+  formatMarkdownReport,
   generateBenchReport,
   parseHarborTimeoutProbe,
   resolveHarborCommand,
+  suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
@@ -419,6 +421,73 @@ describe("failure classifier", () => {
     expect(classifyFailure({ logText: '{"finish_reason":"max_wall_time"}' })).toBe("agent_timeout");
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
   });
+
+  it("maps failure categories to suggested owners", () => {
+    expect(suggestedOwnerForFailureCategory("host_proxy_error")).toBe("environment");
+    expect(suggestedOwnerForFailureCategory("host_encoding_error")).toBe("environment");
+    expect(suggestedOwnerForFailureCategory("harbor_cli_error")).toBe("integrations/harbor");
+    expect(suggestedOwnerForFailureCategory("node_missing")).toBe("package-agent-cli");
+    expect(suggestedOwnerForFailureCategory("agent_setup_failed")).toBe("integrations/harbor");
+    expect(suggestedOwnerForFailureCategory("api_error")).toBe("agent-ai");
+    expect(suggestedOwnerForFailureCategory("agent_timeout")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("max_turns")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("tool_timeout")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("verifier_failed")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("agent_crashed")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("unknown")).toBe("inspect");
+    expect(suggestedOwnerForFailureCategory("new-category")).toBe("inspect");
+  });
+});
+
+describe("markdown report formatting", () => {
+  it("includes suggested_owner in the Tasks table and ownership guidance", () => {
+    const markdown = formatMarkdownReport({
+      run_id: "owner-run",
+      status: "failed",
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      dataset: terminalBenchDataset,
+      started_at: "2026-07-06T00:00:00.000Z",
+      finished_at: "2026-07-06T00:01:00.000Z",
+      exit_code: 1,
+      command: "harbor run -k 1",
+      harbor_command: "harbor",
+      timeout_plan: null,
+      counts: {
+        passed: 0,
+        failed: 1,
+        infra_failed: 0,
+        timeout: 0,
+        api_error: 0,
+        unknown: 0
+      },
+      tasks: [
+        {
+          task_id: "terminal-bench/task-a",
+          status: "failed",
+          failure_category: "verifier_failed",
+          suggested_owner: "agent-core",
+          failure_signals: ["agent_completed_but_verifier_failed"],
+          commands_executed: 2,
+          input_tokens: 3,
+          output_tokens: 4,
+          duration_ms: 5,
+          last_error: "Verifier failed",
+          verifier_failed_tests: [],
+          reward: null
+        }
+      ],
+      incomplete_reason: null,
+      notes: []
+    });
+
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner | failure_signals |");
+    expect(markdown).toContain(
+      "| terminal-bench/task-a | failed | verifier_failed | agent-core | agent_completed_but_verifier_failed |"
+    );
+    expect(markdown).toContain("## Ownership Guidance");
+    expect(markdown).toContain("If `suggested_owner` is not `integrations/harbor`");
+  });
 });
 
 describe("benchmark report generation", () => {
@@ -472,9 +541,15 @@ describe("benchmark report generation", () => {
 
     expect(report.counts.passed).toBe(1);
     expect(report.counts.api_error).toBe(1);
+    expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
-    expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("# Terminal-Bench Run synthetic-run");
-    expect(JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8")).counts.api_error).toBe(1);
+    expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
+    const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
+    const jsonReport = JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8"));
+    expect(markdown).toContain("# Terminal-Bench Run synthetic-run");
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner |");
+    expect(jsonReport.counts.api_error).toBe(1);
+    expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
   });
 
   it("uses Harbor verifier reward to mark completed agents as failed", async () => {
