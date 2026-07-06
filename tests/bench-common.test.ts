@@ -6,13 +6,22 @@ import {
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
+  buildCommandScript,
   classifyFailure,
   computeHarborTimeoutPlan,
+  defaultAgentCliTarballForEnv,
   detectHarborRunCapabilities,
   detectTaskSelectionFlag,
+  formatMarkdownReport,
   generateBenchReport,
+  harborEnvForRun,
+  harborRuntimeDir,
   parseHarborTimeoutProbe,
+  portableAgentImportPath,
+  removedHarborAdapterErrorMessage,
+  removedHarborPackageName,
   resolveHarborCommand,
+  suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
@@ -45,9 +54,11 @@ describe("Terminal-Bench command construction", () => {
       "-d",
       terminalBenchDataset,
       "--agent-import-path",
-      "integrations.harbor.agent:AgentCliHarborAgent",
+      portableAgentImportPath,
       "-k",
       "5",
+      "--ak",
+      `agent_cli_tarball:str=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider:str=deepseek",
       "--ak",
@@ -83,12 +94,14 @@ describe("Terminal-Bench command construction", () => {
       "-d",
       terminalBenchDataset,
       "--agent",
-      "integrations.harbor.agent:AgentCliHarborAgent",
+      portableAgentImportPath,
       "--yes",
       "-l",
       "5",
       "--agent-timeout-multiplier",
       "8.12",
+      "--ak",
+      `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider=glm",
       "--ak",
@@ -306,14 +319,18 @@ describe("Terminal-Bench command construction", () => {
     expect(config.datasets).toBeUndefined();
     expect(config.tasks).toEqual([{ name: "terminal-bench/make-mips-interpreter" }]);
     expect(config.agent_timeout_multiplier).toBe(3.12);
+    expect(config.agents[0].name).toBe(portableAgentImportPath);
+    expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
+      agent_cli_tarball: defaultAgentCliTarballForEnv(),
       max_turns: 540,
       max_wall_time_sec: 2700,
       harbor_agent_timeout_sec: 5610,
       precheck_retry_limit: 1,
       precheck_timeout_sec: 45,
       generic_validation_enabled: true,
-      validation_timeout_sec: 45
+      validation_timeout_sec: 45,
+      pre_verifier_cleanup_globs: "/tmp/frame*.bmp"
     });
     expect(config.agents[0].kwargs.precheck_command).toContain("/tmp/frame.bmp");
     expect(config.agents[0].kwargs.precheck_command).toContain("timeout 35 node /app/vm.js");
@@ -348,6 +365,7 @@ describe("Terminal-Bench command construction", () => {
       generic_validation_enabled: true
     });
     expect(config.agents[0].kwargs).toMatchObject({
+      agent_cli_tarball: defaultAgentCliTarballForEnv(),
       generic_validation_enabled: true,
       validation_timeout_sec: 45,
       precheck_retry_limit: 1,
@@ -379,6 +397,74 @@ describe("Terminal-Bench command construction", () => {
     );
 
     expect(config.agents[0].kwargs.max_turns).toBe(200);
+  });
+
+  it("rejects removed Harbor import paths", () => {
+    const removedAgentClass = ["AgentCli", "HarborAgent"].join("");
+    const removedImportPath = `${removedHarborPackageName}.agent:${removedAgentClass}`;
+
+    expect(() =>
+      buildHarborJobConfig(
+        {
+          mode: "k",
+          k: 1,
+          provider: "deepseek",
+          model: "deepseek-v4-pro",
+          maxTurns: 200,
+          commandTimeoutSec: 180,
+          env: { SIGMA_HARBOR_AGENT_IMPORT_PATH: removedImportPath }
+        },
+        "jobs"
+      )
+    ).toThrow(removedHarborAdapterErrorMessage);
+    expect(() =>
+      buildHarborArgs({
+        mode: "k",
+        k: 1,
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        maxTurns: 200,
+        commandTimeoutSec: 180,
+        maxWallTimeSec: 7200,
+        agentImportPath: `${removedHarborPackageName}.custom:OtherAgent`
+      })
+    ).toThrow(removedHarborAdapterErrorMessage);
+  });
+
+  it("puts only the portable runtime and existing PYTHONPATH on PYTHONPATH", () => {
+    const portableEnv = harborEnvForRun("run-dir", {});
+    const portablePythonPath = portableEnv.PYTHONPATH.split(path.delimiter);
+    expect(portablePythonPath).toEqual([harborRuntimeDir]);
+
+    const existingEnv = harborEnvForRun("run-dir", { PYTHONPATH: ["one", "two"].join(path.delimiter) });
+    expect(existingEnv.PYTHONPATH.split(path.delimiter)).toEqual([harborRuntimeDir, "one", "two"]);
+  });
+
+  it("rejects removed Harbor import paths before building run env", () => {
+    expect(() =>
+      harborEnvForRun("run-dir", {
+        SIGMA_HARBOR_AGENT_IMPORT_PATH: `${removedHarborPackageName}.agent:RemovedAgent`
+      })
+    ).toThrow(removedHarborAdapterErrorMessage);
+  });
+
+  it("writes portable command scripts without the legacy integration import path", () => {
+    const env = harborEnvForRun("run-dir", {});
+    const args = buildHarborArgs({
+      mode: "k",
+      k: 1,
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      maxTurns: 200,
+      commandTimeoutSec: 180,
+      maxWallTimeSec: 7200,
+      env
+    });
+    const script = buildCommandScript("harbor", args, env);
+
+    expect(script).toContain(portableAgentImportPath);
+    expect(script).toContain(harborRuntimeDir);
+    expect(script).not.toContain(removedHarborPackageName);
   });
 });
 
@@ -418,6 +504,73 @@ describe("failure classifier", () => {
     expect(classifyFailure({ logText: '{"max_wall_time_sec":2700}', exitCode: 1 })).toBe("agent_crashed");
     expect(classifyFailure({ logText: '{"finish_reason":"max_wall_time"}' })).toBe("agent_timeout");
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
+  });
+
+  it("maps failure categories to suggested owners", () => {
+    expect(suggestedOwnerForFailureCategory("host_proxy_error")).toBe("environment");
+    expect(suggestedOwnerForFailureCategory("host_encoding_error")).toBe("environment");
+    expect(suggestedOwnerForFailureCategory("harbor_cli_error")).toBe("scripts/bench");
+    expect(suggestedOwnerForFailureCategory("node_missing")).toBe("package-agent-cli");
+    expect(suggestedOwnerForFailureCategory("agent_setup_failed")).toBe("portable/harbor");
+    expect(suggestedOwnerForFailureCategory("api_error")).toBe("agent-ai");
+    expect(suggestedOwnerForFailureCategory("agent_timeout")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("max_turns")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("tool_timeout")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("verifier_failed")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("agent_crashed")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("unknown")).toBe("inspect");
+    expect(suggestedOwnerForFailureCategory("new-category")).toBe("inspect");
+  });
+});
+
+describe("markdown report formatting", () => {
+  it("includes suggested_owner in the Tasks table and ownership guidance", () => {
+    const markdown = formatMarkdownReport({
+      run_id: "owner-run",
+      status: "failed",
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      dataset: terminalBenchDataset,
+      started_at: "2026-07-06T00:00:00.000Z",
+      finished_at: "2026-07-06T00:01:00.000Z",
+      exit_code: 1,
+      command: "harbor run -k 1",
+      harbor_command: "harbor",
+      timeout_plan: null,
+      counts: {
+        passed: 0,
+        failed: 1,
+        infra_failed: 0,
+        timeout: 0,
+        api_error: 0,
+        unknown: 0
+      },
+      tasks: [
+        {
+          task_id: "terminal-bench/task-a",
+          status: "failed",
+          failure_category: "verifier_failed",
+          suggested_owner: "agent-core",
+          failure_signals: ["agent_completed_but_verifier_failed"],
+          commands_executed: 2,
+          input_tokens: 3,
+          output_tokens: 4,
+          duration_ms: 5,
+          last_error: "Verifier failed",
+          verifier_failed_tests: [],
+          reward: null
+        }
+      ],
+      incomplete_reason: null,
+      notes: []
+    });
+
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner | failure_signals |");
+    expect(markdown).toContain(
+      "| terminal-bench/task-a | failed | verifier_failed | agent-core | agent_completed_but_verifier_failed |"
+    );
+    expect(markdown).toContain("## Ownership Guidance");
+    expect(markdown).toContain("If `suggested_owner` is not `portable/harbor` or `scripts/bench`");
   });
 });
 
@@ -472,9 +625,15 @@ describe("benchmark report generation", () => {
 
     expect(report.counts.passed).toBe(1);
     expect(report.counts.api_error).toBe(1);
+    expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
-    expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("# Terminal-Bench Run synthetic-run");
-    expect(JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8")).counts.api_error).toBe(1);
+    expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
+    const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
+    const jsonReport = JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8"));
+    expect(markdown).toContain("# Terminal-Bench Run synthetic-run");
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner |");
+    expect(jsonReport.counts.api_error).toBe(1);
+    expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
   });
 
   it("uses Harbor verifier reward to mark completed agents as failed", async () => {
@@ -752,6 +911,65 @@ describe("benchmark report generation", () => {
     );
     expect(markdown).toContain("missing_artifact:/tmp/frame.bmp");
     expect(markdown).toContain("Effective Harbor agent timeout sec: 5610");
+  });
+
+  it("reads harness validation, retry, and cleanup signals from summary JSON", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harness-signals-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "harness-signals-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run --config resolved-job.config.json",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "openssl-selfsigned-cert");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"openssl-selfsigned-cert"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      `${JSON.stringify({
+        status: "error",
+        finish_reason: "validation_failed",
+        commands_executed: 2,
+        input_tokens: 3,
+        output_tokens: 4,
+        duration_ms: 5,
+        last_error: "validation command failed",
+        harness: {
+          attempts: [],
+          validation_results: [{ kind: "validation", command: "python check.py", exit_code: 1 }],
+          precheck_results: [],
+          retry_decisions: [
+            { action: "started", trigger: "validation" },
+            { action: "skipped", trigger: "validation" }
+          ],
+          pre_verifier_cleanup: { patterns: ["/tmp/frame*.bmp"], exit_code: 1, warning: "cleanup failed" }
+        }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0].failure_signals).toEqual(
+      expect.arrayContaining([
+        "validation_failed",
+        "validation_retry_used",
+        "retry_cut_short_by_budget",
+        "pre_verifier_cleanup_warning"
+      ])
+    );
   });
 
   it("marks stale running runs as incomplete with missing file details", async () => {

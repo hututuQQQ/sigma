@@ -7,8 +7,14 @@ import { fileURLToPath } from "node:url";
 export const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const artifactsDir = path.join(rootDir, ".artifacts");
 export const benchRootDir = path.join(artifactsDir, "bench");
+export const harborRuntimeDir = path.join(artifactsDir, "harbor-runtime");
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
-export const agentImportPath = "integrations.harbor.agent:AgentCliHarborAgent";
+export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
+export const agentImportPath = portableAgentImportPath;
+export const removedHarborPackageName = ["integrations", "harbor"].join(".");
+export const removedHarborDirectoryName = ["integrations", "harbor"].join("/");
+export const removedHarborAdapterErrorMessage =
+  `${removedHarborDirectoryName} has been removed. Use portable runtime import path ${portableAgentImportPath}.`;
 export const defaultAgentCliTarball = path.join(artifactsDir, "agent-cli-linux-x64.tgz");
 export const defaultAgentTimeoutFallbackSec = 1800;
 export const defaultAgentTimeoutGraceSec = 120;
@@ -35,6 +41,36 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["agent_crashed", "failed"],
   ["unknown", "unknown"]
 ]);
+const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
+  ["host_proxy_error", "environment"],
+  ["host_encoding_error", "environment"],
+  ["harbor_cli_error", "scripts/bench"],
+  ["node_missing", "package-agent-cli"],
+  ["agent_setup_failed", "portable/harbor"],
+  ["api_error", "agent-ai"],
+  ["agent_timeout", "agent-core"],
+  ["max_turns", "agent-core"],
+  ["tool_timeout", "agent-core"],
+  ["verifier_failed", "agent-core"],
+  ["agent_crashed", "agent-core"],
+  ["unknown", "inspect"]
+]);
+
+export function suggestedOwnerForFailureCategory(failureCategory) {
+  const normalized = typeof failureCategory === "string" && failureCategory.length > 0 ? failureCategory : "unknown";
+  return SUGGESTED_OWNER_BY_FAILURE_CATEGORY.get(normalized) ?? "inspect";
+}
+
+function suggestedOwnerForTask(status, failureCategory) {
+  return status === "passed" ? null : suggestedOwnerForFailureCategory(failureCategory);
+}
+
+function withSuggestedOwner(task) {
+  return {
+    ...task,
+    suggested_owner: suggestedOwnerForTask(task.status, task.failure_category)
+  };
+}
 
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -101,6 +137,29 @@ export function safePathPart(value, fallback = "default") {
 export function defaultAgentCliTarballForEnv(env = process.env) {
   const targetArch = env.AGENT_TARGET_ARCH || "x64";
   return path.join(artifactsDir, `agent-cli-linux-${targetArch}.tgz`);
+}
+
+export function resolveHarborAgentImportPath(env = process.env) {
+  if (typeof env.SIGMA_HARBOR_AGENT_IMPORT_PATH === "string" && env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim()) {
+    return assertSupportedHarborAgentImportPath(env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim());
+  }
+  return portableAgentImportPath;
+}
+
+function isRemovedHarborAgentImportPath(importPath) {
+  const text = String(importPath ?? "").trim();
+  return text === removedHarborPackageName || text.startsWith(`${removedHarborPackageName}.`);
+}
+
+function assertSupportedHarborAgentImportPath(importPath) {
+  if (isRemovedHarborAgentImportPath(importPath)) {
+    throw new Error(removedHarborAdapterErrorMessage);
+  }
+  return importPath;
+}
+
+function resolveAgentCliTarballPath(options = {}, env = process.env) {
+  return path.resolve(options.agentCliTarball ?? env.AGENT_CLI_TARBALL ?? defaultAgentCliTarballForEnv(env));
 }
 
 export function makeRunId(date, provider, model) {
@@ -438,6 +497,7 @@ function benchmarkMaxTurns(options, timeoutPlan = null) {
 
 function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) {
   const agentKwargs = {
+    agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
     max_turns: benchmarkMaxTurns(options, timeoutPlan),
     command_timeout_sec: options.commandTimeoutSec
@@ -463,13 +523,18 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
 
   if (shouldEnableMakeMipsPrecheck(options, timeoutProbe)) {
     agentKwargs.precheck_command = makeMipsPrecheckCommand();
+    agentKwargs.pre_verifier_cleanup_globs = "/tmp/frame*.bmp";
   }
 
   return agentKwargs;
 }
 
 export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeoutProbe = null) {
-  const agentName = options.mode === "smoke" ? "oracle" : agentImportPath;
+  const agentName = options.mode === "smoke"
+    ? "oracle"
+    : assertSupportedHarborAgentImportPath(
+        options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+      );
   const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan, timeoutProbe);
 
   const config = {
@@ -561,12 +626,15 @@ export function buildHarborArgs(options) {
     return args;
   }
 
+  const selectedAgentImportPath = assertSupportedHarborAgentImportPath(
+    options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+  );
   const args = [
     "run",
     "-d",
     terminalBenchDataset,
     capabilities.agentFlag ?? "--agent-import-path",
-    agentImportPath
+    selectedAgentImportPath
   ];
   if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
   if (capabilities.yesFlag) args.push(capabilities.yesFlag);
@@ -590,6 +658,7 @@ export function buildHarborArgs(options) {
     args.push(capabilities.agentTimeoutMultiplierFlag, agentTimeoutMultiplier);
   }
 
+  args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
@@ -619,7 +688,7 @@ export function buildCommandScript(commandOrArgs, maybeArgs, maybeEnv) {
     "set -euo pipefail",
     `cd ${shellQuote(rootDir)}`,
     `export AGENT_CLI_TARBALL=${shellQuote(env.AGENT_CLI_TARBALL)}`,
-    `export PYTHONPATH=${shellQuote(rootDir)}"\${PYTHONPATH:+:\${PYTHONPATH}}"`,
+    `export PYTHONPATH=${shellQuote(env.PYTHONPATH ?? "")}`,
     `${shellQuote(harborCommand)} ${harborArgs.map(shellQuote).join(" ")}`,
     ""
   ].join("\n");
@@ -721,6 +790,10 @@ export async function runProcess(command, args, options = {}) {
 
 export async function packageAgentCli(options = {}) {
   return await runProcess(packageManagerCommand(), ["package:agent-cli"], options);
+}
+
+export async function packageHarborRuntime(options = {}) {
+  return await runProcess(packageManagerCommand(), ["package:harbor-runtime"], options);
 }
 
 async function readTextSafe(filePath) {
@@ -857,6 +930,23 @@ function collectFailureSignals(input = {}) {
     }
   }
 
+  const summary = input.summary ?? {};
+  const harness = summary && typeof summary === "object" && summary.harness && typeof summary.harness === "object"
+    ? summary.harness
+    : {};
+
+  for (const result of [
+    ...(Array.isArray(harness.validation_results) ? harness.validation_results : []),
+    ...(Array.isArray(harness.precheck_results) ? harness.precheck_results : [])
+  ]) {
+    if (Number(result?.exit_code ?? 0) !== 0) {
+      addSignal(signals, result?.kind === "precheck" ? "precheck_failed" : "validation_failed");
+      if (JSON.stringify(result).includes("/tmp/frame.bmp")) {
+        addSignal(signals, "missing_artifact:/tmp/frame.bmp");
+      }
+    }
+  }
+
   for (const decision of Array.isArray(metadata.retry_decisions) ? metadata.retry_decisions : []) {
     if (decision?.action === "skipped") {
       addSignal(signals, "retry_cut_short_by_harbor");
@@ -866,7 +956,19 @@ function collectFailureSignals(input = {}) {
     }
   }
 
-  const summary = input.summary ?? {};
+  for (const decision of Array.isArray(harness.retry_decisions) ? harness.retry_decisions : []) {
+    if (decision?.action === "skipped") {
+      addSignal(signals, "retry_cut_short_by_budget");
+    }
+    if (decision?.action === "started" && String(decision?.trigger ?? "").includes("validation")) {
+      addSignal(signals, "validation_retry_used");
+    }
+  }
+
+  if (harness.pre_verifier_cleanup?.warning) {
+    addSignal(signals, "pre_verifier_cleanup_warning");
+  }
+
   const events = input.traceEvents ?? [];
   const verifierFailures = Array.isArray(input.verifierFailures) ? input.verifierFailures : [];
   const verifierText = verifierFailures
@@ -1357,14 +1459,15 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
-    "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
+    "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"
   ];
 
   for (const task of report.tasks) {
     const failureSignals = Array.isArray(task.failure_signals) ? task.failure_signals.join(", ") : "";
+    const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category) ?? "";
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 
@@ -1402,6 +1505,15 @@ export function formatMarkdownReport(report) {
       lines.push(`- ${note}`);
     }
   }
+
+  lines.push(
+    "",
+    "## Ownership Guidance",
+    "",
+    "- If `suggested_owner` is not `portable/harbor` or `scripts/bench`, do not start by changing Harbor adapter plumbing.",
+    "- The portable Harbor runtime is an adapter layer, not the agent harness itself.",
+    "- Benchmark solving quality issues should start in `agent-core`, tools, prompts, or CLI behavior."
+  );
 
   lines.push("");
   return lines.join("\n");
@@ -1456,6 +1568,7 @@ export async function generateBenchReport(runDir) {
       last_error: task.last_error ?? `Incomplete benchmark run: ${incompleteReason.join("; ")}`
     }));
   }
+  tasks = tasks.map(withSuggestedOwner);
 
   const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
   for (const task of tasks) {
@@ -1515,10 +1628,16 @@ export async function ensurePlaceholderTask(runDir, metadata) {
 }
 
 export function harborEnvForRun(runDir, env = process.env) {
+  resolveHarborAgentImportPath(env);
+  const pythonPathEntries = [harborRuntimeDir];
+  if (env.PYTHONPATH) {
+    pythonPathEntries.push(env.PYTHONPATH);
+  }
+
   const next = {
     ...env,
     AGENT_CLI_TARBALL: env.AGENT_CLI_TARBALL || defaultAgentCliTarballForEnv(env),
-    PYTHONPATH: [rootDir, env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    PYTHONPATH: pythonPathEntries.filter(Boolean).join(path.delimiter),
     SIGMA_BENCH_RUN_DIR: runDir,
     PYTHONIOENCODING: env.PYTHONIOENCODING || "utf-8",
     PYTHONUTF8: env.PYTHONUTF8 || "1",

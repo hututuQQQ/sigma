@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderName } from "agent-ai";
-import type { PermissionMode } from "agent-core";
+import type { AgentHarnessValidationMode, PermissionMode } from "agent-core";
 
 export interface ParsedArgs {
   flags: Record<string, string | boolean>;
@@ -24,6 +24,15 @@ export interface CliConfig {
   maxMessageHistoryChars?: number;
   messageHistoryRetain: number;
   compactionSummaryChars: number;
+  validationMode: AgentHarnessValidationMode;
+  validationRetryLimit: number;
+  validationTimeoutSec?: number;
+  precheckCommand?: string;
+  precheckTimeoutSec?: number;
+  preVerifierCleanupGlobs: string[];
+  harnessTimeoutSec?: number;
+  retryMinBudgetSec?: number;
+  attemptsDir?: string;
   noStreamUi: boolean;
 }
 
@@ -123,6 +132,22 @@ function permissionModeValue(value: unknown): PermissionMode {
   throw new Error(`Unsupported permission mode '${String(value)}'. Use ask or yolo.`);
 }
 
+function validationModeValue(value: unknown): AgentHarnessValidationMode {
+  if (value === "off" || value === "auto") return value;
+  throw new Error(`Unsupported validation mode '${String(value)}'. Use off or auto.`);
+}
+
+function stringListValue(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function optionalNumberValue(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === true || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export function loadCliConfig(flags: Record<string, string | boolean>): CliConfig {
   const cwdConfig = loadSimpleToml(path.join(process.cwd(), ".agent", "config.toml"));
   const homeConfig = loadSimpleToml(path.join(os.homedir(), ".agent", "config.toml"));
@@ -200,6 +225,48 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         config.compaction_summary_chars,
       DEFAULTS.compactionSummaryChars
     ),
+    validationMode: validationModeValue(
+      stringValue(flags["validation-mode"]) ??
+        process.env.AGENT_VALIDATION_MODE ??
+        stringValue(config.validation_mode) ??
+        "off"
+    ),
+    validationRetryLimit: Math.max(
+      0,
+      Math.floor(
+        numberValue(
+          flags["validation-retry-limit"] ??
+            process.env.AGENT_VALIDATION_RETRY_LIMIT ??
+            config.validation_retry_limit,
+          0
+        )
+      )
+    ),
+    validationTimeoutSec: optionalNumberValue(
+      flags["validation-timeout-sec"] ?? process.env.AGENT_VALIDATION_TIMEOUT_SEC ?? config.validation_timeout_sec
+    ),
+    precheckCommand:
+      stringValue(flags["precheck-command"]) ??
+      process.env.AGENT_PRECHECK_COMMAND ??
+      stringValue(config.precheck_command),
+    precheckTimeoutSec: optionalNumberValue(
+      flags["precheck-timeout-sec"] ?? process.env.AGENT_PRECHECK_TIMEOUT_SEC ?? config.precheck_timeout_sec
+    ),
+    preVerifierCleanupGlobs: stringListValue(
+      flags["pre-verifier-cleanup-globs"] ??
+        process.env.AGENT_PRE_VERIFIER_CLEANUP_GLOBS ??
+        config.pre_verifier_cleanup_globs
+    ),
+    harnessTimeoutSec: optionalNumberValue(
+      flags["harness-timeout-sec"] ?? process.env.AGENT_HARNESS_TIMEOUT_SEC ?? config.harness_timeout_sec
+    ),
+    retryMinBudgetSec: optionalNumberValue(
+      flags["retry-min-budget-sec"] ?? process.env.AGENT_RETRY_MIN_BUDGET_SEC ?? config.retry_min_budget_sec
+    ),
+    attemptsDir:
+      stringValue(flags["attempts-dir"]) ??
+      process.env.AGENT_ATTEMPTS_DIR ??
+      stringValue(config.attempts_dir),
     noStreamUi: boolValue(flags["no-stream-ui"], false)
   };
 }
