@@ -146,8 +146,9 @@ The adapter writes the task instruction to `/tmp/agent/instruction.md` and runs:
   --instruction-file /tmp/agent/instruction.md \
   --provider deepseek \
   --model deepseek-v4-pro \
-  --max-turns 40 \
-  --command-timeout-sec 120 \
+  --max-turns 200 \
+  --command-timeout-sec 180 \
+  --max-wall-time-sec 7200 \
   --permission-mode yolo \
   --trace-jsonl /tmp/agent/trace.jsonl \
   --summary-json /tmp/agent/summary.json \
@@ -158,26 +159,23 @@ Recommended Harbor setup:
 
 ```bash
 pnpm install
-pnpm build
-export AGENT_CLI_DIR="$PWD"
+pnpm package:agent-cli
+export AGENT_CLI_TARBALL="$PWD/.artifacts/agent-cli-linux.tgz"
 export DEEPSEEK_API_KEY=...
 ```
 
-Then register `integrations/harbor/agent.py` with your Harbor version and choose `provider="deepseek"` or `provider="glm"`. Harbor APIs vary, so you may need to adjust the small `_run`, `_upload`, or `_download_if_exists` wrappers for your installed version.
+`AGENT_CLI_TARBALL` is the preferred Harbor path because setup uploads one built artifact and extracts it in the task container. This avoids running `pnpm install` inside every task. `AGENT_CLI_DIR` remains a development fallback when you want Harbor to upload the source tree and build it in the container.
 
-Terminal-Bench smoke flow, adjusted for your Harbor/Terminal-Bench command names:
+Terminal-Bench 2.0 smoke flow:
 
 ```bash
 # Verify the benchmark install with its oracle first.
-tb run --agent oracle --dataset terminal-bench-2.0 --task-id <smoke-task>
+harbor run -d terminal-bench/terminal-bench-2 -a oracle -l 5
 
 # Then run the custom Harbor agent.
-tb run \
-  --dataset terminal-bench-2.0 \
-  --agent-import integrations.harbor.agent:AgentCliHarborAgent \
-  --agent-arg provider=deepseek \
-  --agent-arg model=deepseek-v4-pro \
-  --task-id <smoke-task>
+harbor run -d terminal-bench/terminal-bench-2 \
+  --agent-import-path "integrations.harbor.agent:AgentCliHarborAgent" \
+  -k 5
 ```
 
 The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container. It downloads `/tmp/agent/trace.jsonl` and `/tmp/agent/summary.json` into Harbor logs when the environment exposes a download method.
@@ -186,5 +184,5 @@ The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL
 
 - Streaming is not implemented yet; non-streaming chat completions are the supported path.
 - Config TOML parsing supports simple top-level scalar keys only.
-- Single-file/binary packaging is deferred. The Harbor path assumes Node is available or the built workspace can be uploaded and installed.
+- The bundled Harbor artifact still assumes Node is available in the task container.
 - Permission mode `ask` is non-interactive and conservative; it rejects mutating tools instead of prompting.

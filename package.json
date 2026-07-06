@@ -6,9 +6,10 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build": "pnpm -r build",
-    "test": "vitest run",
+    "test": "vitest run && python -m unittest tests.test_harbor_agent",
     "lint": "tsc -b --pretty false",
-    "clean": "pnpm -r clean"
+    "clean": "pnpm -r clean",
+    "package:agent-cli": "pnpm build && node scripts/package-agent-cli.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
