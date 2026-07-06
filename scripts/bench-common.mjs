@@ -493,6 +493,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
 
   if (shouldEnableMakeMipsPrecheck(options, timeoutProbe)) {
     agentKwargs.precheck_command = makeMipsPrecheckCommand();
+    agentKwargs.pre_verifier_cleanup_globs = "/tmp/frame*.bmp";
   }
 
   return agentKwargs;
@@ -887,6 +888,23 @@ function collectFailureSignals(input = {}) {
     }
   }
 
+  const summary = input.summary ?? {};
+  const harness = summary && typeof summary === "object" && summary.harness && typeof summary.harness === "object"
+    ? summary.harness
+    : {};
+
+  for (const result of [
+    ...(Array.isArray(harness.validation_results) ? harness.validation_results : []),
+    ...(Array.isArray(harness.precheck_results) ? harness.precheck_results : [])
+  ]) {
+    if (Number(result?.exit_code ?? 0) !== 0) {
+      addSignal(signals, result?.kind === "precheck" ? "precheck_failed" : "validation_failed");
+      if (JSON.stringify(result).includes("/tmp/frame.bmp")) {
+        addSignal(signals, "missing_artifact:/tmp/frame.bmp");
+      }
+    }
+  }
+
   for (const decision of Array.isArray(metadata.retry_decisions) ? metadata.retry_decisions : []) {
     if (decision?.action === "skipped") {
       addSignal(signals, "retry_cut_short_by_harbor");
@@ -896,7 +914,19 @@ function collectFailureSignals(input = {}) {
     }
   }
 
-  const summary = input.summary ?? {};
+  for (const decision of Array.isArray(harness.retry_decisions) ? harness.retry_decisions : []) {
+    if (decision?.action === "skipped") {
+      addSignal(signals, "retry_cut_short_by_budget");
+    }
+    if (decision?.action === "started" && String(decision?.trigger ?? "").includes("validation")) {
+      addSignal(signals, "validation_retry_used");
+    }
+  }
+
+  if (harness.pre_verifier_cleanup?.warning) {
+    addSignal(signals, "pre_verifier_cleanup_warning");
+  }
+
   const events = input.traceEvents ?? [];
   const verifierFailures = Array.isArray(input.verifierFailures) ? input.verifierFailures : [];
   const verifierText = verifierFailures

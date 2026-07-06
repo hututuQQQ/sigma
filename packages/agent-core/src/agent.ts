@@ -151,7 +151,7 @@ function extractValidationCommands(finalMessage: string | undefined): string[] {
   return commands;
 }
 
-function toSummaryJson(result: AgentRunResult): SummaryJson {
+export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   const summary: SummaryJson = {
     status: result.status,
     finish_reason: result.finishReason,
@@ -180,7 +180,7 @@ function toSummaryJson(result: AgentRunResult): SummaryJson {
 export async function writeRunSummary(result: AgentRunResult, summaryJsonPath: string): Promise<void> {
   const resolved = path.resolve(summaryJsonPath);
   await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, `${JSON.stringify(toSummaryJson(result), null, 2)}\n`, "utf8");
+  await writeFile(resolved, `${JSON.stringify(summaryJsonFromRunResult(result), null, 2)}\n`, "utf8");
 }
 
 export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> {

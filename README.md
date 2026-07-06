@@ -3,7 +3,7 @@
 A small coding-agent monorepo inspired by Pi with only three layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
-- `packages/agent-core`: autonomous loop, JSONL tracing, session records, and workspace tools
+- `packages/agent-core`: autonomous loop, benchmark harness, JSONL tracing, session records, and workspace tools
 - `packages/agent-cli`: plain terminal CLI with `solve`, `chat`, `doctor`, and `replay`
 
 There is intentionally no TUI, MCP, sub-agent system, web UI, plugin marketplace, long-term memory, or complex sandboxing.
@@ -160,11 +160,13 @@ Refresh all reports:
 pnpm bench:tb:report:all
 ```
 
-Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
+Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl`, `summary.json`, and harness attempt artifacts; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
 
 Failure categories are rule based and intentionally small: `host_proxy_error`, `host_encoding_error`, `harbor_cli_error`, `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
 
 Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `integrations/harbor`, do not prioritize changes to the Harbor adapter.
+
+Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` harness flags. `integrations/harbor` only forwards benchmark kwargs to the CLI and mirrors artifacts.
 
 Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
 
@@ -198,10 +200,21 @@ Current limitations:
 --max-message-history-chars <number>
 --message-history-retain <number>
 --compaction-summary-chars <number>
+--validation-mode <off|auto>
+--validation-retry-limit <number>
+--validation-timeout-sec <number>
+--precheck-command <command>
+--precheck-timeout-sec <number>
+--pre-verifier-cleanup-globs <comma-separated-globs>
+--harness-timeout-sec <number>
+--retry-min-budget-sec <number>
+--attempts-dir <path>
 --no-stream-ui
 ```
 
 Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/.agent/config.toml`, then defaults. TOML support is intentionally minimal for MVP scalar values.
+
+Local `agent solve` defaults to `--validation-mode off`. Benchmark runners pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those harness behaviors are wanted.
 
 ## Tools
 
@@ -232,9 +245,27 @@ Paths are resolved relative to the workspace and rejected if they escape it. In 
   "provider": "deepseek",
   "model": "deepseek-v4-pro",
   "duration_ms": 123456,
-  "last_error": null
+  "last_error": null,
+  "validation_commands": ["python check_cert.py"],
+  "harness": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "status": "completed",
+        "finish_reason": "assistant_stop",
+        "summary_path": "attempts/attempt-1/summary.json",
+        "trace_path": "attempts/attempt-1/trace.jsonl"
+      }
+    ],
+    "validation_results": [],
+    "precheck_results": [],
+    "retry_decisions": [],
+    "pre_verifier_cleanup": null
+  }
 }
 ```
+
+When the harness performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory.
 
 ## Harbor And Terminal-Bench 2.0
 
@@ -254,17 +285,23 @@ The adapter writes the task instruction to `/tmp/agent/instruction.md` and runs:
   --permission-mode yolo \
   --trace-jsonl /tmp/agent/trace.jsonl \
   --summary-json /tmp/agent/summary.json \
+  --validation-mode auto \
+  --validation-retry-limit 1 \
+  --validation-timeout-sec 45 \
+  --attempts-dir /tmp/agent/attempts \
   --max-message-history-chars 250000 \
   --message-history-retain 24 \
   --compaction-summary-chars 30000 \
   --no-stream-ui
 ```
 
-The Harbor adapter accepts benchmark-specific kwargs for cleanup and validation loops: `pre_verifier_cleanup_globs`, `precheck_command`, `precheck_retry_limit`, `generic_validation_enabled`, `validation_timeout_sec`, `max_message_history_chars`, `message_history_retain`, and `compaction_summary_chars`. By default the Terminal-Bench runner enables one generic validation retry for non-smoke runs. After the agent exits, the harness compares `/app` manifests, runs agent-declared `validation_commands` from the summary JSON, falls back to syntax checks for changed `.py`, `.sh`, and `.js` files, and short-runs changed `check_*`, `verify_*`, `validate_*`, and `test_*` scripts. Validation failures inject the command, exit code, stdout/stderr tails, related files, and previous summary into the retry instruction before the official verifier runs. It also cleans `/tmp/frame*.bmp` before the official verifier for known `make-mips-interpreter` tasks, avoiding stale frame files from an agent self-test.
+The Harbor adapter accepts legacy benchmark kwargs for compatibility: `pre_verifier_cleanup_globs`, `precheck_command`, `precheck_timeout_sec`, `precheck_retry_limit`, `generic_validation_enabled`, `validation_timeout_sec`, `harbor_agent_timeout_sec`, `retry_min_budget_sec`, `max_message_history_chars`, `message_history_retain`, and `compaction_summary_chars`. It does not execute validation or retry logic itself; it translates those kwargs into `agent solve` flags.
+
+The `agent-core` harness compares workspace manifests, runs agent-declared `validation_commands` from the summary JSON, falls back to syntax checks for changed `.py`, `.sh`, and `.js` files, short-runs changed `check_*`, `verify_*`, `validate_*`, and `test_*` scripts, executes optional precheck commands, writes attempt artifacts, decides whether retry budget remains, injects failure feedback into retry instructions, and runs configured pre-verifier cleanup globs. For `make-mips-interpreter`, the benchmark runner explicitly passes `/tmp/frame*.bmp` as `pre_verifier_cleanup_globs`; the Harbor adapter no longer guesses task-specific cleanup rules.
 
 The Terminal-Bench runner probes the selected Harbor task metadata before starting the real run. It reads each task's recommended `[agent].timeout_sec`, applies the MVP leniency rule, passes the widened value to `--max-wall-time-sec`, and sets Harbor's outer timeout multiplier with a grace window so summary download and cleanup can finish. Set `AGENT_MAX_WALL_TIME_SEC` only when intentionally overriding the computed wall time.
 
-Set `AGENT_PRECHECK_TIMEOUT_SEC` to tune the per-command validation timeout, `AGENT_PRECHECK_RETRY_LIMIT=0` to run validation without a retry, or `AGENT_GENERIC_VALIDATION=0` to disable the generic validation stage.
+Set `AGENT_PRECHECK_TIMEOUT_SEC` to tune the per-command validation/precheck timeout, `AGENT_PRECHECK_RETRY_LIMIT=0` to run validation without a retry, or `AGENT_GENERIC_VALIDATION=0` to make Harbor pass `--validation-mode off`.
 
 Recommended Harbor setup:
 

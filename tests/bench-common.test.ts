@@ -315,7 +315,8 @@ describe("Terminal-Bench command construction", () => {
       precheck_retry_limit: 1,
       precheck_timeout_sec: 45,
       generic_validation_enabled: true,
-      validation_timeout_sec: 45
+      validation_timeout_sec: 45,
+      pre_verifier_cleanup_globs: "/tmp/frame*.bmp"
     });
     expect(config.agents[0].kwargs.precheck_command).toContain("/tmp/frame.bmp");
     expect(config.agents[0].kwargs.precheck_command).toContain("timeout 35 node /app/vm.js");
@@ -827,6 +828,65 @@ describe("benchmark report generation", () => {
     );
     expect(markdown).toContain("missing_artifact:/tmp/frame.bmp");
     expect(markdown).toContain("Effective Harbor agent timeout sec: 5610");
+  });
+
+  it("reads harness validation, retry, and cleanup signals from summary JSON", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harness-signals-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "harness-signals-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run --config resolved-job.config.json",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "openssl-selfsigned-cert");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"openssl-selfsigned-cert"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      `${JSON.stringify({
+        status: "error",
+        finish_reason: "validation_failed",
+        commands_executed: 2,
+        input_tokens: 3,
+        output_tokens: 4,
+        duration_ms: 5,
+        last_error: "validation command failed",
+        harness: {
+          attempts: [],
+          validation_results: [{ kind: "validation", command: "python check.py", exit_code: 1 }],
+          precheck_results: [],
+          retry_decisions: [
+            { action: "started", trigger: "validation" },
+            { action: "skipped", trigger: "validation" }
+          ],
+          pre_verifier_cleanup: { patterns: ["/tmp/frame*.bmp"], exit_code: 1, warning: "cleanup failed" }
+        }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0].failure_signals).toEqual(
+      expect.arrayContaining([
+        "validation_failed",
+        "validation_retry_used",
+        "retry_cut_short_by_budget",
+        "pre_verifier_cleanup_warning"
+      ])
+    );
   });
 
   it("marks stale running runs as incomplete with missing file details", async () => {

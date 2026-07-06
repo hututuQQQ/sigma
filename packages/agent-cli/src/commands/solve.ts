@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { stdin as processStdin } from "node:process";
 import type { ModelClient, ProviderName, ProviderOptions } from "agent-ai";
 import { createModelClient } from "agent-ai";
-import { runAgent } from "agent-core";
+import { runAgent, runAgentHarness } from "agent-core";
 import { loadCliConfig, parseArgs } from "../config.js";
 import { printRunResult } from "../output.js";
 
@@ -42,6 +42,18 @@ async function resolveInstruction(
   throw new Error("No instruction supplied. Use --instruction, --instruction-file, or pipe text on stdin.");
 }
 
+function shouldUseHarness(cliConfig: ReturnType<typeof loadCliConfig>): boolean {
+  return (
+    cliConfig.validationMode === "auto" ||
+    cliConfig.validationRetryLimit > 0 ||
+    Boolean(cliConfig.precheckCommand?.trim()) ||
+    cliConfig.preVerifierCleanupGlobs.length > 0 ||
+    Boolean(cliConfig.harnessTimeoutSec) ||
+    Boolean(cliConfig.retryMinBudgetSec) ||
+    Boolean(cliConfig.attemptsDir)
+  );
+}
+
 export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
   const stderr = deps.stderr ?? process.stderr;
   const factory = deps.modelClientFactory ?? createModelClient;
@@ -52,7 +64,7 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
     const instruction = await resolveInstruction(flags, deps);
     const modelClient = factory(cliConfig.provider, { model: cliConfig.model });
 
-    const result = await runAgent({
+    const runConfig = {
       instruction,
       workspacePath: cliConfig.workspace,
       modelClient,
@@ -67,7 +79,22 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
       messageHistoryRetain: cliConfig.messageHistoryRetain,
       compactionSummaryChars: cliConfig.compactionSummaryChars
-    });
+    };
+
+    const result = shouldUseHarness(cliConfig)
+      ? await runAgentHarness({
+          ...runConfig,
+          validationMode: cliConfig.validationMode,
+          validationRetryLimit: cliConfig.validationRetryLimit,
+          validationTimeoutSec: cliConfig.validationTimeoutSec,
+          precheckCommand: cliConfig.precheckCommand,
+          precheckTimeoutSec: cliConfig.precheckTimeoutSec,
+          preVerifierCleanupGlobs: cliConfig.preVerifierCleanupGlobs,
+          harnessTimeoutSec: cliConfig.harnessTimeoutSec,
+          retryMinBudgetSec: cliConfig.retryMinBudgetSec,
+          attemptsDir: cliConfig.attemptsDir
+        })
+      : await runAgent(runConfig);
 
     printRunResult(result);
     return result.status === "error" ? 1 : 0;

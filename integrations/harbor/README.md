@@ -51,8 +51,25 @@ For other failures, start in the owning layer instead:
   --permission-mode yolo \
   --trace-jsonl /tmp/agent/trace.jsonl \
   --summary-json /tmp/agent/summary.json \
+  --validation-mode auto \
+  --validation-retry-limit 1 \
+  --validation-timeout-sec 45 \
+  --attempts-dir /tmp/agent/attempts \
   --no-stream-ui
 ```
+
+The adapter accepts legacy Harbor JobConfig kwargs such as
+`generic_validation_enabled`, `precheck_command`, `precheck_timeout_sec`,
+`precheck_retry_limit`, `validation_timeout_sec`,
+`pre_verifier_cleanup_globs`, `harbor_agent_timeout_sec`, and
+`retry_min_budget_sec`, but it only converts them into CLI flags. Validation,
+retry, precheck, cleanup, harness summaries, and attempt artifacts are owned by
+`packages/agent-core` via `runAgentHarness`, with `packages/agent-cli` mapping
+CLI flags into core config.
+
+Future benchmark solving quality fixes should start in `packages/agent-core`,
+the tools, prompts, or CLI configuration. Change this adapter only for Harbor
+install, invocation, environment, context, or artifact plumbing problems.
 
 The preferred setup is to build the bundled Linux artifact once on the host:
 
@@ -72,14 +89,14 @@ The adapter uploads `AGENT_CLI_TARBALL`, extracts it in the task container, link
 `/usr/local/bin/agent --help`. Task containers do not need system `node` when the artifact includes
 `bin/node`. `AGENT_CLI_DIR` is still available as a slower source-build fallback for development.
 
-For benchmark runs, the adapter can run a generic post-agent validation loop before the official
-verifier. When `generic_validation_enabled` is set, it snapshots the `/app` manifest before and after
-the agent run, executes any `validation_commands` emitted in `/tmp/agent/summary.json`, and falls back
-to syntax checks for changed `.py`, `.sh`, and `.js` files plus short runs of changed `check_*`,
-`verify_*`, `validate_*`, and `test_*` scripts. Failures can consume `precheck_retry_limit` retry
-budget and are fed back to the next agent attempt with command, exit code, stdout/stderr tails,
-related files, and the previous summary. The Terminal-Bench wrapper enables this generic validation
-and one retry by default for non-smoke runs; it does not read or mirror official task verifier tests.
+For benchmark runs, the Terminal-Bench wrapper enables core-owned generic
+validation and one retry by default for non-smoke runs. The core harness
+snapshots the workspace manifest before and after each attempt, executes
+`validation_commands` emitted in `/tmp/agent/summary.json`, falls back to syntax
+checks for changed `.py`, `.sh`, and `.js` files plus short runs of changed
+`check_*`, `verify_*`, `validate_*`, and `test_*` scripts, and writes the results
+under `summary.harness`. The adapter mirrors the top-level `summary.json`,
+`trace.jsonl`, and `attempts/**` artifacts when Harbor exposes download methods.
 
 Artifact checks:
 
