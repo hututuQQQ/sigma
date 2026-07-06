@@ -132,7 +132,7 @@ describe("Terminal-Bench command construction", () => {
       agentTimeoutMultiplierFlag: "--agent-timeout-multiplier"
     };
     const timeoutProbe = {
-      tasks: [{ task_name: "terminal-bench/make-mips-interpreter", agent_timeout_sec: 1800 }],
+      tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
     const timeoutPlan = computeHarborTimeoutPlan(
@@ -216,7 +216,7 @@ describe("Terminal-Bench command construction", () => {
       buildHarborTimeoutProbeConfig(
         {
           mode: "task",
-          taskId: "make-mips-interpreter",
+          taskId: "selected-task",
           provider: "deepseek",
           model: "deepseek-v4-pro",
           maxTurns: 200,
@@ -226,7 +226,7 @@ describe("Terminal-Bench command construction", () => {
       )
     ).toMatchObject({
       jobs_dir: "probe-jobs",
-      tasks: [{ name: "terminal-bench/make-mips-interpreter" }]
+      tasks: [{ name: "terminal-bench/selected-task" }]
     });
   });
 
@@ -295,10 +295,10 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
-  it("builds resolved JobConfig with selected tasks, lenient timeout, and make-mips precheck", () => {
+  it("builds resolved JobConfig without task-specific prechecks", () => {
     const timeoutProbe = {
-      resolved_tasks: [{ name: "terminal-bench/make-mips-interpreter" }],
-      tasks: [{ task_name: "terminal-bench/make-mips-interpreter", agent_timeout_sec: 1800 }],
+      resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
+      tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
     const timeoutPlan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
@@ -317,7 +317,7 @@ describe("Terminal-Bench command construction", () => {
     );
 
     expect(config.datasets).toBeUndefined();
-    expect(config.tasks).toEqual([{ name: "terminal-bench/make-mips-interpreter" }]);
+    expect(config.tasks).toEqual([{ name: "terminal-bench/long-runtime-task" }]);
     expect(config.agent_timeout_multiplier).toBe(3.12);
     expect(config.agents[0].name).toBe(portableAgentImportPath);
     expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
@@ -329,24 +329,23 @@ describe("Terminal-Bench command construction", () => {
       precheck_retry_limit: 1,
       precheck_timeout_sec: 45,
       generic_validation_enabled: true,
-      validation_timeout_sec: 45,
-      pre_verifier_cleanup_globs: "/tmp/frame*.bmp"
+      validation_timeout_sec: 45
     });
-    expect(config.agents[0].kwargs.precheck_command).toContain("/tmp/frame.bmp");
-    expect(config.agents[0].kwargs.precheck_command).toContain("timeout 35 node /app/vm.js");
+    expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
+    expect(config.agents[0].kwargs.pre_verifier_cleanup_globs).toBeUndefined();
   });
 
   it("enables generic validation retry budget for ordinary Terminal-Bench tasks", () => {
     const timeoutProbe = {
-      resolved_tasks: [{ name: "terminal-bench/regex-log" }],
-      tasks: [{ task_name: "terminal-bench/regex-log", agent_timeout_sec: 1800 }],
+      resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
+      tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
     const timeoutPlan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
     const config = buildHarborJobConfig(
       {
         mode: "task",
-        taskId: "regex-log",
+        taskId: "ordinary-task",
         provider: "deepseek",
         model: "deepseek-v4-pro",
         maxTurns: 200,
@@ -374,17 +373,29 @@ describe("Terminal-Bench command construction", () => {
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
   });
 
+  it("keeps the default validation retry when precheckRetryLimit is unset or null", () => {
+    const timeoutProbe = {
+      resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
+      tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
+      max_agent_timeout_sec: 1800
+    };
+
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe).precheck_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: null }, timeoutProbe).precheck_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: 0 }, timeoutProbe).precheck_retry_limit).toBe(0);
+  });
+
   it("preserves explicit max turns in resolved JobConfig", () => {
     const timeoutProbe = {
-      resolved_tasks: [{ name: "terminal-bench/make-mips-interpreter" }],
-      tasks: [{ task_name: "terminal-bench/make-mips-interpreter", agent_timeout_sec: 1800 }],
+      resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
+      tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
     const timeoutPlan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
     const config = buildHarborJobConfig(
       {
         mode: "task",
-        taskId: "make-mips-interpreter",
+        taskId: "long-runtime-task",
         provider: "deepseek",
         model: "deepseek-v4-pro",
         maxTurns: 200,
@@ -565,9 +576,9 @@ describe("markdown report formatting", () => {
       notes: []
     });
 
-    expect(markdown).toContain("| task | status | failure_category | suggested_owner | failure_signals |");
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals |");
     expect(markdown).toContain(
-      "| terminal-bench/task-a | failed | verifier_failed | agent-core | agent_completed_but_verifier_failed |"
+      "| terminal-bench/task-a | failed | verifier_failed | agent-core | 0 |  | agent_completed_but_verifier_failed |"
     );
     expect(markdown).toContain("## Ownership Guidance");
     expect(markdown).toContain("If `suggested_owner` is not `portable/harbor` or `scripts/bench`");
@@ -717,6 +728,69 @@ describe("benchmark report generation", () => {
     expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Verifier Failures");
   });
 
+  it("keeps reward=1 tasks passed when Harbor also reports an agent exception", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harbor-warning-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "harbor-warning-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run -l 1",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "task-a");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"task-a","status":"failed"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":2,"input_tokens":3,"output_tokens":4,"duration_ms":5,"last_error":null}\n',
+      "utf8"
+    );
+
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(trialDir, { recursive: true });
+    await writeFile(
+      path.join(trialDir, "result.json"),
+      `${JSON.stringify({
+        trial_name: "trial-1",
+        task_name: "terminal-bench/task-a",
+        verifier_result: { rewards: { reward: 1.0 } },
+        exception_info: { exception_message: "AgentTimeoutError after verifier pass" }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.status).toBe("passed");
+    expect(report.score_status).toBe("passed");
+    expect(report.infra_status).toBe("warning");
+    expect(report.exit_code).toBe(1);
+    expect(report.harbor_exit_code).toBe(1);
+    expect(report.counts.passed).toBe(1);
+    expect(report.tasks[0]).toMatchObject({
+      status: "passed",
+      failure_category: null,
+      verifier_status: "passed",
+      infra_warnings: ["agent_exception_after_verifier_pass"],
+      agent_exception: { message: "AgentTimeoutError after verifier pass" }
+    });
+    const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
+    expect(markdown).toContain("- Infra status: warning");
+    expect(markdown).toContain("- Harbor exit code: 1");
+    expect(markdown).toContain("## Infra Warnings");
+  });
+
   it("matches Harbor trial results by task name instead of sorted order", async () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harbor-match-"));
     await writeFile(
@@ -792,12 +866,12 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
-    const taskDir = path.join(runDir, "tasks", "openssl-selfsigned-cert");
+    const taskDir = path.join(runDir, "tasks", "python-module-task");
     await mkdir(taskDir, { recursive: true });
     await writeFile(
       path.join(taskDir, "metadata.json"),
       `${JSON.stringify({
-        task_id: "terminal-bench/openssl-selfsigned-cert",
+        task_id: "terminal-bench/python-module-task",
         status: "failed",
         max_wall_time_sec: 2700,
         failure_signals: ["agent_setup_ok"]
@@ -828,7 +902,7 @@ describe("benchmark report generation", () => {
     expect(report.tasks[0].failure_signals).not.toContain("max_wall_time");
   });
 
-  it("reports secondary failure signals for missing make-mips frame artifacts", async () => {
+  it("reports precheck and max wall time signals without artifact-specific defaults", async () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-signals-"));
     await writeFile(
       path.join(runDir, "config.json"),
@@ -853,15 +927,15 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
-    const taskDir = path.join(runDir, "tasks", "make-mips-interpreter");
+    const taskDir = path.join(runDir, "tasks", "artifact-task");
     await mkdir(taskDir, { recursive: true });
     await writeFile(
       path.join(taskDir, "metadata.json"),
       `${JSON.stringify({
-        task_id: "terminal-bench/make-mips-interpreter",
+        task_id: "terminal-bench/artifact-task",
         status: "failed",
         failure_signals: ["precheck_failed"],
-        precheck_results: [{ exit_code: 1, message: "File /tmp/frame.bmp does not exist" }]
+        precheck_results: [{ exit_code: 1, message: "File /tmp/output.dat does not exist" }]
       })}\n`,
       "utf8"
     );
@@ -877,7 +951,7 @@ describe("benchmark report generation", () => {
       path.join(trialDir, "result.json"),
       `${JSON.stringify({
         trial_name: "trial-1",
-        task_name: "terminal-bench/make-mips-interpreter",
+        task_name: "terminal-bench/artifact-task",
         verifier_result: { rewards: { reward: 0 } },
         exception_info: { exception_message: "Agent execution timed out after 5610.0 seconds" }
       })}\n`,
@@ -891,10 +965,10 @@ describe("benchmark report generation", () => {
         results: {
           tests: [
             {
-              name: "test_frame_bmp_exists",
+              name: "artifact_exists",
               status: "failed",
-              message: "File /tmp/frame.bmp does not exist",
-              trace: "assert frame_path.exists()"
+              message: "File /tmp/output.dat does not exist",
+              trace: "assert artifact_path.exists()"
             }
           ]
         }
@@ -907,9 +981,10 @@ describe("benchmark report generation", () => {
 
     expect(report.tasks[0].failure_category).toBe("agent_timeout");
     expect(report.tasks[0].failure_signals).toEqual(
-      expect.arrayContaining(["precheck_failed", "missing_artifact:/tmp/frame.bmp", "max_wall_time"])
+      expect.arrayContaining(["precheck_failed", "max_wall_time"])
     );
-    expect(markdown).toContain("missing_artifact:/tmp/frame.bmp");
+    expect(report.tasks[0].failure_signals.some((signal) => signal.startsWith("missing_artifact:"))).toBe(false);
+    expect(markdown).not.toContain("missing_artifact:");
     expect(markdown).toContain("Effective Harbor agent timeout sec: 5610");
   });
 
@@ -924,18 +999,18 @@ describe("benchmark report generation", () => {
         dataset: terminalBenchDataset,
         k: 1,
         command_text: "harbor run --config resolved-job.config.json",
-        exit_code: 1,
-        status: "failed"
+        exit_code: 0,
+        status: "passed"
       })}\n`,
       "utf8"
     );
     await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
-    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 0\n", "utf8");
 
-    const taskDir = path.join(runDir, "tasks", "openssl-selfsigned-cert");
+    const taskDir = path.join(runDir, "tasks", "validation-task");
     await mkdir(taskDir, { recursive: true });
-    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"openssl-selfsigned-cert"}\n', "utf8");
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"validation-task"}\n', "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
       `${JSON.stringify({
@@ -954,7 +1029,7 @@ describe("benchmark report generation", () => {
             { action: "started", trigger: "validation" },
             { action: "skipped", trigger: "validation" }
           ],
-          pre_verifier_cleanup: { patterns: ["/tmp/frame*.bmp"], exit_code: 1, warning: "cleanup failed" }
+          pre_verifier_cleanup: { patterns: ["/tmp/cache*.tmp"], exit_code: 1, warning: "cleanup failed" }
         }
       })}\n`,
       "utf8"
@@ -970,6 +1045,86 @@ describe("benchmark report generation", () => {
         "pre_verifier_cleanup_warning"
       ])
     );
+  });
+
+  it("attributes verifier failures after service cleanup to the service harness", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-service-cleanup-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "service-cleanup-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run --config resolved-job.config.json",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "service-task");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"terminal-bench/service-task"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      `${JSON.stringify({
+        status: "completed",
+        finish_reason: "assistant_stop",
+        harness: {
+          service_cleanup: {
+            stopped: ["kvstore-server"],
+            kept: [],
+            missing: [],
+            errors: []
+          }
+        }
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(taskDir, "verifier.log"), "verifier failed: connection refused on 127.0.0.1:5328\n", "utf8");
+
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(path.join(trialDir, "agent"), { recursive: true });
+    await mkdir(path.join(trialDir, "verifier"), { recursive: true });
+    await writeFile(
+      path.join(trialDir, "result.json"),
+      `${JSON.stringify({
+        trial_name: "trial-1",
+        task_name: "terminal-bench/service-task",
+        verifier_result: { rewards: { reward: 0 } }
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(
+      path.join(trialDir, "agent", "trace.jsonl"),
+      `${JSON.stringify({ type: "run_end", metadata: { result: { status: "completed", finishReason: "assistant_stop" } } })}\n`,
+      "utf8"
+    );
+    await writeFile(
+      path.join(trialDir, "verifier", "ctrf.json"),
+      `${JSON.stringify({
+        results: {
+          tests: [{ name: "connection_check", status: "failed", message: "connection refused" }]
+        }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+    const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
+
+    expect(report.tasks[0].failure_category).toBe("verifier_failed");
+    expect(report.tasks[0].failure_signals).toEqual(
+      expect.arrayContaining(["agent_completed_but_verifier_failed", "service_stopped_before_verifier"])
+    );
+    expect(report.tasks[0].suggested_owner).toBe("agent-core/tools/service");
+    expect(markdown).toContain("service_stopped_before_verifier");
+    expect(markdown).toContain("agent-core/tools/service");
   });
 
   it("marks stale running runs as incomplete with missing file details", async () => {

@@ -235,7 +235,7 @@ class SigmaCliHarborAgent(BaseAgent):
 
         try:
             await self._upload_instruction(environment, instruction)
-            result = await self._run_agent_once(environment, env_vars)
+            result = await self._run_agent_once(environment, env_vars, context)
             if _return_code(result) != 0:
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
         except Exception as exc:
@@ -258,7 +258,7 @@ class SigmaCliHarborAgent(BaseAgent):
         self._populate_context(context, result, summary, error_message)
         self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
 
-    def _agent_command(self) -> list[str]:
+    def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         command = [
             "/usr/local/bin/agent",
             "solve",
@@ -320,8 +320,8 @@ class SigmaCliHarborAgent(BaseAgent):
             )
         return command
 
-    async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str]) -> Any:
-        command = self._agent_command()
+    async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str], context: AgentContext) -> Any:
+        command = self._agent_command(context)
         base_timeout = self.harbor_agent_timeout_sec or self.max_wall_time_sec
         return await environment.exec(
             " ".join(shlex.quote(part) for part in command),
@@ -561,9 +561,6 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 if not isinstance(item, dict) or _as_int(item.get("exit_code"), 0) == 0:
                     continue
                 add("validation_failed" if item.get("kind") == "validation" else "precheck_failed")
-                text = json.dumps(item, ensure_ascii=False).lower()
-                if "/tmp/frame.bmp" in text:
-                    add("missing_artifact:/tmp/frame.bmp")
 
         decisions = harness.get("retry_decisions") if isinstance(harness, dict) else []
         if isinstance(decisions, list):

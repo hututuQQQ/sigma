@@ -16,20 +16,14 @@ describe("package-harbor-runtime", () => {
 
     const runtimeSource = await readFile(path.join(result.harborRuntimeDir, "sigma_harbor_agent.py"), "utf8");
     const k5Config = JSON.parse(await readFile(path.join(result.harborRuntimeDir, "jobconfig.deepseek.k5.json"), "utf8"));
-    const taskConfig = JSON.parse(
-      await readFile(path.join(result.harborRuntimeDir, "jobconfig.deepseek.task.example.json"), "utf8")
-    );
     const readme = await readFile(path.join(result.harborRuntimeDir, "README.md"), "utf8");
 
     expect(runtimeSource).toContain("class SigmaCliHarborAgent(BaseAgent):");
     expect(runtimeSource).not.toContain(removedHarborPackageName);
     expect(k5Config.agents[0].name).toBe(portableAgentImportPath);
-    expect(taskConfig.agents[0].name).toBe(portableAgentImportPath);
     expect(JSON.stringify(k5Config)).not.toContain(removedHarborPackageName);
-    expect(JSON.stringify(taskConfig)).not.toContain(removedHarborPackageName);
     expect(k5Config.agents[0].kwargs.agent_cli_tarball).toBe(result.agentCliTarball);
     expect(path.isAbsolute(k5Config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
-    expect(taskConfig.tasks).toEqual([{ name: "terminal-bench/openssl-selfsigned-cert" }]);
     expect(readme).not.toContain(removedHarborPackageName);
     expect(readme).not.toContain(removedHarborDirectoryName);
     expect(readme).toContain("pnpm package:agent-cli");

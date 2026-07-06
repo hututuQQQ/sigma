@@ -119,7 +119,7 @@ DeepSeek Pro fixed commands:
 export DEEPSEEK_API_KEY=...
 pnpm bench:tb:deepseek:k5
 pnpm bench:tb:deepseek:k10
-pnpm bench:tb:deepseek:task -- --task-id openssl-selfsigned-cert
+pnpm bench:tb:deepseek:task -- --task-id <task-id>
 ```
 
 DeepSeek small batch:
@@ -276,7 +276,6 @@ The Sigma agent runtime is built from `packages/agent-ai`, `packages/agent-core`
   sigma_harbor_agent.py
   README.md
   jobconfig.deepseek.k5.json
-  jobconfig.deepseek.task.example.json
 ```
 
 ## Portable Harbor Runtime
@@ -293,13 +292,6 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 ```
 
-For a single task example:
-
-```bash
-PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
-harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.task.example.json
-```
-
 Harbor benchmark execution uses the portable runtime generated under `.artifacts/harbor-runtime`. The old in-repo Harbor adapter has been removed. Use `sigma_harbor_agent:SigmaCliHarborAgent`.
 
 Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They require the portable runtime directory on `PYTHONPATH`; they do not require the repo root.
@@ -310,7 +302,7 @@ The convenience benchmark commands still work and now default to the portable ru
 
 ```bash
 pnpm bench:tb:deepseek:k5
-pnpm bench:tb:deepseek:task -- --task-id openssl-selfsigned-cert
+pnpm bench:tb:deepseek:task -- --task-id <task-id>
 ```
 
 During these runs, `scripts/bench-terminal-bench.mjs` packages the agent CLI, packages the Harbor runtime, puts `.artifacts/harbor-runtime` on `PYTHONPATH`, writes a portable JobConfig, runs Harbor, and collects reports.

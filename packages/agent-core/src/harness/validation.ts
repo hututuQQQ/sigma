@@ -1,8 +1,6 @@
-import { spawn } from "node:child_process";
-import { Buffer } from "node:buffer";
-import { existsSync } from "node:fs";
 import path from "node:path";
 import type { HarnessCommandResult, SummaryJson } from "../types.js";
+import { runBashCommand } from "../command-runner.js";
 
 export interface ValidationCommandSpec {
   source: string;
@@ -17,20 +15,6 @@ function tailText(text: string, limit = 4000): string {
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:=+-]+$/.test(value)) return value;
   return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function bashExecutable(): string {
-  if (process.env.AGENT_BASH_PATH) return process.env.AGENT_BASH_PATH;
-  if (process.platform === "win32") {
-    const candidates = [
-      "C:\\Program Files\\Git\\bin\\bash.exe",
-      "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-      "C:\\msys64\\usr\\bin\\bash.exe"
-    ];
-    const found = candidates.find((candidate) => existsSync(candidate));
-    if (found) return found;
-  }
-  return "bash";
 }
 
 function validationCommandsFromValue(value: unknown): string[] {
@@ -90,8 +74,14 @@ export function genericValidationCommandSpecs(changedFiles: string[]): Validatio
   return specs;
 }
 
-export function validationCommandSpecs(summary: SummaryJson, changedFiles: string[]): ValidationCommandSpec[] {
-  const specs = [...summaryValidationCommands(summary), ...genericValidationCommandSpecs(changedFiles)];
+export function validationCommandSpecs(
+  summary: SummaryJson,
+  changedFiles: string[]
+): ValidationCommandSpec[] {
+  const specs = [
+    ...summaryValidationCommands(summary),
+    ...genericValidationCommandSpecs(changedFiles)
+  ];
   const seen = new Set<string>();
   return specs.filter((spec) => {
     if (seen.has(spec.command)) return false;
@@ -110,83 +100,50 @@ export async function runHarnessCommand(options: {
   relatedFiles?: string[];
 }): Promise<HarnessCommandResult> {
   const startedAt = Date.now();
-  const stdoutChunks: Buffer[] = [];
-  const stderrChunks: Buffer[] = [];
-  let timedOut = false;
-
-  return await new Promise<HarnessCommandResult>((resolve) => {
-    let settled = false;
-    let escalationTimer: ReturnType<typeof setTimeout> | undefined;
-    const child = spawn(bashExecutable(), ["-lc", options.command], {
-      cwd: options.workspacePath,
-      env: process.env,
-      windowsHide: true
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      escalationTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
-        }
-      }, 500).unref();
-    }, Math.max(1, Math.floor(options.timeoutSec * 1000)));
-
-    child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      if (escalationTimer) clearTimeout(escalationTimer);
-      if (settled) return;
-      settled = true;
-      resolve({
-        kind: options.kind,
-        source: options.source,
-        command: options.command,
-        attempt: options.attempt,
-        exit_code: 127,
-        stdout_tail: "",
-        stderr_tail: error.message,
-        related_files: options.relatedFiles ?? [],
-        timeout_sec: options.timeoutSec,
-        duration_ms: Date.now() - startedAt,
-        message: `${options.kind} command failed: ${error.message}`
-      });
-    });
-
-    const finish = (exitCode: number | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (escalationTimer) clearTimeout(escalationTimer);
-      const code = timedOut ? 124 : exitCode ?? 1;
-      const stdoutTail = tailText(Buffer.concat(stdoutChunks).toString("utf8"));
-      const stderrTail = tailText(Buffer.concat(stderrChunks).toString("utf8"));
-      const label = options.kind === "validation" ? "validation" : "precheck";
-      resolve({
-        kind: options.kind,
-        source: options.source,
-        command: options.command,
-        attempt: options.attempt,
-        exit_code: code,
-        stdout_tail: stdoutTail,
-        stderr_tail: stderrTail,
-        related_files: options.relatedFiles ?? [],
-        timeout_sec: options.timeoutSec,
-        duration_ms: Date.now() - startedAt,
-        timed_out: timedOut || undefined,
-        message: code === 0 ? `${label} command passed` : `${label} command failed with exit code ${code}`
-      });
-    };
-
-    child.on("exit", (exitCode) => {
-      if (timedOut) finish(exitCode);
-    });
-
-    child.on("close", (exitCode) => {
-      finish(exitCode);
-    });
+  const result = await runBashCommand({
+    command: options.command,
+    cwd: options.workspacePath,
+    env: process.env,
+    timeoutMs: Math.max(1, Math.floor(options.timeoutSec * 1000))
   });
+
+  if (result.error) {
+    return {
+      kind: options.kind,
+      source: options.source,
+      command: options.command,
+      attempt: options.attempt,
+      exit_code: 127,
+      stdout_tail: tailText(result.stdout.toString("utf8")),
+      stderr_tail: result.error.message,
+      related_files: options.relatedFiles ?? [],
+      timeout_sec: options.timeoutSec,
+      duration_ms: Date.now() - startedAt,
+      settled_on: result.settledOn,
+      signal: result.signal ?? undefined,
+      timed_out: result.timedOut || undefined,
+      message: `${options.kind} command failed: ${result.error.message}`
+    };
+  }
+
+  const code = result.timedOut ? 124 : result.exitCode ?? 1;
+  const stdoutTail = tailText(result.stdout.toString("utf8"));
+  const stderrTail = tailText(result.stderr.toString("utf8"));
+  const label = options.kind === "validation" ? "validation" : "precheck";
+  return {
+    kind: options.kind,
+    source: options.source,
+    command: options.command,
+    attempt: options.attempt,
+    exit_code: code,
+    stdout_tail: stdoutTail,
+    stderr_tail: stderrTail,
+    related_files: options.relatedFiles ?? [],
+    timeout_sec: options.timeoutSec,
+    duration_ms: result.durationMs,
+    settled_on: result.settledOn,
+    signal: result.signal ?? undefined,
+    timed_out: result.timedOut || undefined,
+    message: code === 0 ? `${label} command passed` : `${label} command failed with exit code ${code}`
+  };
 }

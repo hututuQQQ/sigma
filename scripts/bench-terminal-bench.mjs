@@ -235,19 +235,17 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     timeoutPlan = computeHarborTimeoutPlan(options, null);
   }
 
+  let harborResult = null;
+  let report = null;
   const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
-  const resolvedJobConfig = buildHarborJobConfig(
-    {
-      ...options,
-      agentCliTarball: env.AGENT_CLI_TARBALL
-    },
-    jobsDir,
-    timeoutPlan,
-    timeoutProbe
-  );
+  const attemptOptions = {
+    ...options,
+    agentCliTarball: env.AGENT_CLI_TARBALL
+  };
+  const resolvedJobConfig = buildHarborJobConfig(attemptOptions, jobsDir, timeoutPlan, timeoutProbe);
   await writeJson(resolvedJobConfigPath, resolvedJobConfig);
   harborArgs = buildHarborArgs({
-    ...options,
+    ...attemptOptions,
     taskSelectionFlag,
     capabilities,
     jobsDir,
@@ -257,18 +255,22 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   });
   config = {
     ...config,
+    finished_at: null,
+    exit_code: null,
+    status: "running",
     command: [harborCommand, ...harborArgs],
     command_text: commandText(harborCommand, harborArgs),
     harbor_capabilities: capabilities,
     task_selection_flag: taskSelectionFlag,
     timeout_probe: timeoutProbe,
     timeout_plan: timeoutPlan,
+    score_mode: "standard_benchmark",
     resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
   process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
-  const harborResult = await runner(harborCommand, harborArgs, {
+  harborResult = await runner(harborCommand, harborArgs, {
     cwd: rootDir,
     env,
     stdoutPath: path.join(runDir, "harbor.stdout.log"),
@@ -290,10 +292,16 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
   });
 
-  const report = await generateBenchReport(runDir);
+  report = await generateBenchReport(runDir);
+
   process.stdout.write(`Benchmark artifacts: ${runDir}\n`);
   process.stdout.write(`Report: ${path.join(runDir, "report.md")}\n`);
-  return { exitCode: harborResult.exitCode, runDir, report };
+  const exitCode = report?.status === "passed"
+    ? 0
+    : harborResult?.exitCode && harborResult.exitCode !== 0
+      ? harborResult.exitCode
+      : 1;
+  return { exitCode, runDir, report };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

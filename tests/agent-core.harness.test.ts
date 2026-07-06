@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { genericValidationCommandSpecs, runHarnessCommand } from "../packages/agent-core/src/harness/validation.js";
+import {
+  genericValidationCommandSpecs,
+  runHarnessCommand,
+  validationCommandSpecs
+} from "../packages/agent-core/src/harness/validation.js";
 import { runAgentHarness } from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
@@ -61,8 +65,30 @@ describe("agent-core harness", () => {
 
     expect(result).toMatchObject({
       exit_code: 124,
-      timed_out: true
+      timed_out: true,
+      settled_on: expect.any(String)
     });
+    expect(result.signal).toEqual(expect.any(String));
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("returns after shell exit even when a background child keeps stdout open", async () => {
+    const dir = await tempWorkspace();
+    const startedAt = Date.now();
+
+    const result = await runHarnessCommand({
+      kind: "validation",
+      source: "test",
+      command: "sleep 5 & printf done",
+      workspacePath: dir,
+      attempt: 1,
+      timeoutSec: 2
+    });
+
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout_tail).toContain("done");
+    expect(result.settled_on).toMatch(/close|exit-drain/);
+    expect(result.timed_out).toBeUndefined();
     expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 
@@ -91,6 +117,16 @@ describe("agent-core harness", () => {
     expect(commands.some((command) => command.includes("node --check parser.js"))).toBe(true);
     expect(commands).not.toContain("python main.py");
     expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
+  });
+
+  it("does not generate task-specific validation", () => {
+    const specs = validationCommandSpecs(
+      { validation_commands: ["npm test"] } as never,
+      ["main.py"]
+    );
+
+    expect(specs.map((spec) => spec.source)).toEqual(["summary", "changed-file"]);
+    expect(specs.map((spec) => spec.command)).toEqual(["npm test", "python -m py_compile main.py"]);
   });
 
   it("keeps validationMode=off as a single agent run", async () => {
@@ -210,8 +246,8 @@ describe("agent-core harness", () => {
 
   it("runs pre-verifier cleanup and records warnings separately from success", async () => {
     const dir = await tempWorkspace();
-    const target = path.join(dir, "frame.bmp");
-    await writeFile(target, "frame", "utf8");
+    const target = path.join(dir, "cleanup.tmp");
+    await writeFile(target, "cleanup", "utf8");
     const summaryPath = path.join(dir, "summary.json");
     const model = new SequenceModel([finalResponse("done")]);
 

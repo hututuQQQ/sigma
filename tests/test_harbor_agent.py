@@ -185,7 +185,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 precheck_command="pytest",
                 precheck_timeout_sec=30,
                 precheck_retry_limit=2,
-                pre_verifier_cleanup_globs="/tmp/frame*.bmp",
+                pre_verifier_cleanup_globs="/tmp/cache*.tmp",
                 harbor_agent_timeout_sec=600,
                 agent_timeout_grace_sec=15,
                 retry_min_budget_sec=90,
@@ -201,7 +201,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--validation-timeout-sec 45", command)
             self.assertIn("--precheck-command pytest", command)
             self.assertIn("--precheck-timeout-sec 30", command)
-            self.assertIn("--pre-verifier-cleanup-globs '/tmp/frame*.bmp'", command)
+            self.assertIn("--pre-verifier-cleanup-globs '/tmp/cache*.tmp'", command)
             self.assertIn("--harness-timeout-sec 600", command)
             self.assertIn("--retry-min-budget-sec 90", command)
             self.assertIn("--attempts-dir /tmp/agent/attempts", command)
@@ -306,7 +306,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     ],
                     "precheck_results": [],
                     "retry_decisions": [{"action": "skipped", "trigger": "validation"}],
-                    "pre_verifier_cleanup": {"patterns": ["/tmp/frame*.bmp"], "exit_code": 1, "warning": "cleanup failed"},
+                    "pre_verifier_cleanup": {"patterns": ["/tmp/cache*.tmp"], "exit_code": 1, "warning": "cleanup failed"},
                 },
             }
 
@@ -334,7 +334,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     upload_dir=AsyncMock(),
                     download_file=AsyncMock(side_effect=download_side_effect),
                 )
-                context = SimpleNamespace(task_id="openssl-selfsigned-cert")
+                context = SimpleNamespace(task_id="service-task")
                 agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
 
                 await agent.run("fix the task", env, context)
@@ -349,7 +349,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(context.cost_usd, 0.123)
 
                 metadata = json.loads(
-                    (Path(tmp) / "tasks" / "openssl-selfsigned-cert" / "metadata.json").read_text(encoding="utf-8")
+                    (Path(tmp) / "tasks" / "service-task" / "metadata.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(metadata["validation_results"][0]["command"], "python check.py")
                 self.assertEqual(metadata["pre_verifier_cleanup"]["warning"], "cleanup failed")

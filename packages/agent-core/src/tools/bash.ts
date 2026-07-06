@@ -1,9 +1,7 @@
-import { spawn } from "node:child_process";
-import { Buffer } from "node:buffer";
-import { existsSync } from "node:fs";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { truncateMiddle } from "../compaction.js";
 import { isProbablyMutatingCommand, resolveWorkspacePath } from "../policy.js";
+import { runBashCommand } from "../command-runner.js";
 
 interface BashArgs {
   command?: unknown;
@@ -23,24 +21,6 @@ function formatOutput(exitCode: number | null, stdout: string, stderr: string, t
   parts.push("stderr:");
   parts.push(stderr);
   return parts.join("\n");
-}
-
-function bashExecutable(): string {
-  if (process.env.AGENT_BASH_PATH) {
-    return process.env.AGENT_BASH_PATH;
-  }
-
-  if (process.platform === "win32") {
-    const candidates = [
-      "C:\\Program Files\\Git\\bin\\bash.exe",
-      "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-      "C:\\msys64\\usr\\bin\\bash.exe"
-    ];
-    const found = candidates.find((candidate) => existsSync(candidate));
-    if (found) return found;
-  }
-
-  return "bash";
 }
 
 export async function executeBashTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
@@ -66,59 +46,46 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
 
   const timeoutSec = asNumber(parsed.timeoutSec) ?? context.commandTimeoutSec;
   const timeoutMs = Math.max(1, Math.floor(timeoutSec * 1000));
-  const startedAt = Date.now();
-  const stdoutChunks: Buffer[] = [];
-  const stderrChunks: Buffer[] = [];
-  let timedOut = false;
-
-  return await new Promise<ToolResult>((resolve) => {
-    const child = spawn(bashExecutable(), ["-lc", command], {
-      cwd,
-      env: process.env,
-      windowsHide: true
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
-      }, 500).unref();
-    }, timeoutMs);
-
-    child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        content: `Failed to start bash: ${error.message}`,
-        metadata: {
-          durationMs: Date.now() - startedAt,
-          truncated: false
-        }
-      });
-    });
-
-    child.on("close", (exitCode) => {
-      clearTimeout(timer);
-      const stdoutBuffer = Buffer.concat(stdoutChunks);
-      const stderrBuffer = Buffer.concat(stderrChunks);
-      const content = formatOutput(exitCode, stdoutBuffer.toString("utf8"), stderrBuffer.toString("utf8"), timedOut);
-      const truncated = truncateMiddle(content, context.maxToolOutputChars);
-      resolve({
-        ok: !timedOut && exitCode === 0,
-        content: truncated.text,
-        metadata: {
-          exitCode,
-          durationMs: Date.now() - startedAt,
-          stdoutBytes: stdoutBuffer.byteLength,
-          stderrBytes: stderrBuffer.byteLength,
-          truncated: truncated.truncated,
-          timedOut
-        }
-      });
-    });
+  const result = await runBashCommand({
+    command,
+    cwd,
+    env: process.env,
+    timeoutMs
   });
+
+  if (result.error) {
+    return {
+      ok: false,
+      content: `Failed to start bash: ${result.error.message}`,
+      metadata: {
+        durationMs: result.durationMs,
+        settledOn: result.settledOn,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        truncated: false
+      }
+    };
+  }
+
+  const content = formatOutput(
+    result.exitCode,
+    result.stdout.toString("utf8"),
+    result.stderr.toString("utf8"),
+    result.timedOut
+  );
+  const truncated = truncateMiddle(content, context.maxToolOutputChars);
+  return {
+    ok: !result.timedOut && result.exitCode === 0,
+    content: truncated.text,
+    metadata: {
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      stdoutBytes: result.stdout.byteLength,
+      stderrBytes: result.stderr.byteLength,
+      truncated: truncated.truncated,
+      settledOn: result.settledOn,
+      signal: result.signal,
+      timedOut: result.timedOut
+    }
+  };
 }
