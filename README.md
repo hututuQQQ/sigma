@@ -78,6 +78,37 @@ pnpm --filter agent-cli start -- doctor --workspace . --provider glm --check-api
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
 ```
 
+## Smoke Tests
+
+Deterministic fake-provider smoke does not call external APIs. It verifies the CLI/core/tool pipeline against four local tasks and writes traces plus summaries under `.artifacts/smoke-local/`:
+
+```bash
+pnpm smoke:local:fake
+```
+
+Real DeepSeek local smoke:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm smoke:local
+```
+
+Real GLM/Zhipu local smoke:
+
+```bash
+export ZAI_API_KEY=...
+AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm smoke:local
+```
+
+Harbor smoke builds the CLI tarball, verifies Terminal-Bench with the oracle, then runs one custom-agent job:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek pnpm smoke:harbor
+```
+
+The current Harbor artifact still requires `node` in the task container. Harbor setup now checks `command -v node` and `/usr/local/bin/agent --help`; if Node is missing, setup fails clearly instead of letting the task run with a broken agent. TODO: bundle Node with the artifact or produce a true single-file binary.
+
 ## CLI Flags
 
 `agent solve` supports:
@@ -184,5 +215,6 @@ The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL
 
 - Streaming is not implemented yet; non-streaming chat completions are the supported path.
 - Config TOML parsing supports simple top-level scalar keys only.
-- The bundled Harbor artifact still assumes Node is available in the task container.
+- The bundled Harbor artifact still assumes Node is available in the task container; setup fails clearly when it is missing.
+- TODO: bundle Node with the Harbor artifact or produce a true single-file binary.
 - Permission mode `ask` is non-interactive and conservative; it rejects mutating tools instead of prompting.

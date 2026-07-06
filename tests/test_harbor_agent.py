@@ -58,6 +58,17 @@ def import_agent_module():
 
 
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
+    async def test_model_name_is_used_unless_model_is_explicit(self):
+        module = import_agent_module()
+
+        self.assertEqual(module.AgentCliHarborAgent(model_name="custom-model").model, "custom-model")
+        self.assertEqual(
+            module.AgentCliHarborAgent(model="explicit-model", model_name="custom-model").model,
+            "explicit-model",
+        )
+        self.assertEqual(module.AgentCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
+        self.assertEqual(module.AgentCliHarborAgent(provider="glm").model, "glm-5.2")
+
     async def test_setup_prefers_uploaded_tarball(self):
         module = import_agent_module()
         with TemporaryDirectory() as tmp:
@@ -74,6 +85,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                             SimpleNamespace(return_code=0),
                             SimpleNamespace(return_code=1),
                             SimpleNamespace(return_code=0),
+                            SimpleNamespace(return_code=0),
+                            SimpleNamespace(return_code=0),
                         ]
                     ),
                     upload_file=AsyncMock(),
@@ -86,7 +99,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
                 env.upload_file.assert_awaited_once_with(tarball, "/tmp/agent/agent-cli.tgz")
                 env.upload_dir.assert_not_called()
-                self.assertEqual(env.exec.await_count, 3)
+                self.assertEqual(env.exec.await_count, 5)
+                commands = [call.args[0] for call in env.exec.await_args_list]
+                self.assertIn("command -v node >/dev/null", commands)
+                self.assertIn("/usr/local/bin/agent --help", commands)
             finally:
                 if old_tarball is None:
                     os.environ.pop("AGENT_CLI_TARBALL", None)
@@ -96,6 +112,60 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     os.environ.pop("AGENT_CLI_DIR", None)
                 else:
                     os.environ["AGENT_CLI_DIR"] = old_cli_dir
+
+    async def test_setup_checks_existing_agent_help(self):
+        module = import_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(return_code=0),
+                        SimpleNamespace(return_code=0),
+                        SimpleNamespace(return_code=0),
+                        SimpleNamespace(return_code=0),
+                    ]
+                ),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+
+            await agent.setup(env)
+
+            commands = [call.args[0] for call in env.exec.await_args_list]
+            self.assertEqual(
+                commands,
+                [
+                    "mkdir -p /tmp/agent",
+                    "command -v /usr/local/bin/agent >/dev/null 2>&1",
+                    "command -v node >/dev/null",
+                    "/usr/local/bin/agent --help",
+                ],
+            )
+
+    async def test_setup_fails_clearly_when_node_is_missing(self):
+        module = import_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(
+                    side_effect=[
+                        SimpleNamespace(return_code=0),
+                        SimpleNamespace(return_code=0),
+                        SimpleNamespace(return_code=1, stderr="node missing"),
+                    ]
+                ),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+
+            with self.assertRaisesRegex(RuntimeError, "Node is required"):
+                await agent.setup(env)
+
+            commands = [call.args[0] for call in env.exec.await_args_list]
+            self.assertNotIn("/usr/local/bin/agent --help", commands)
 
     async def test_run_uses_async_signature_downloads_logs_and_populates_context(self):
         module = import_agent_module()

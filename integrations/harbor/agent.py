@@ -25,6 +25,10 @@ ENV_KEYS = [
 ]
 
 
+def _default_model(provider: str) -> str:
+    return "glm-5.2" if provider == "glm" else "deepseek-v4-pro"
+
+
 def _return_code(result: Any) -> int:
     for attr in ("return_code", "exit_code", "returncode", "code"):
         value = getattr(result, attr, None)
@@ -80,10 +84,11 @@ class AgentCliHarborAgent(BaseAgent):
         **kwargs: Any,
     ) -> None:
         resolved_logs_dir = pathlib.Path(logs_dir) if logs_dir is not None else pathlib.Path.cwd() / ".agent" / "harbor"
-        model_name = kwargs.pop("model_name", model)
-        super().__init__(logs_dir=resolved_logs_dir, model_name=model_name, **kwargs)
+        harbor_model_name = kwargs.pop("model_name", None)
+        resolved_model = model or harbor_model_name or _default_model(provider)
+        super().__init__(logs_dir=resolved_logs_dir, model_name=resolved_model, **kwargs)
         self.provider = provider
-        self.model = model or ("glm-5.2" if provider == "glm" else "deepseek-v4-pro")
+        self.model = resolved_model
         self.max_turns = max_turns
         self.command_timeout_sec = command_timeout_sec
         self.max_wall_time_sec = max_wall_time_sec
@@ -99,16 +104,19 @@ class AgentCliHarborAgent(BaseAgent):
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
+            await self._verify_agent_ready(environment)
             return
 
         tarball = os.environ.get("AGENT_CLI_TARBALL")
         if tarball:
             await self._install_tarball(environment, pathlib.Path(tarball))
+            await self._verify_agent_ready(environment)
             return
 
         cli_dir = os.environ.get("AGENT_CLI_DIR")
         if cli_dir:
             await self._install_source_dir(environment, pathlib.Path(cli_dir))
+            await self._verify_agent_ready(environment)
             return
 
         raise RuntimeError(
@@ -200,6 +208,23 @@ command -v /usr/local/bin/agent >/dev/null
             "npm link packages/agent-cli",
             timeout_sec=600,
         )
+
+    async def _verify_agent_ready(self, environment: BaseEnvironment) -> None:
+        node_check = await environment.exec("command -v node >/dev/null", timeout_sec=30)
+        if _return_code(node_check) != 0:
+            output = _output_text(node_check).strip()
+            details = f" Output: {output}" if output else ""
+            raise RuntimeError(
+                "Node is required to run the current Sigma agent CLI artifact in Harbor task containers. "
+                "Install Node in the task container or publish a future bundled-node artifact before running "
+                f"this agent.{details}"
+            )
+
+        help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
+        if _return_code(help_check) != 0:
+            output = _output_text(help_check).strip()
+            details = f" Output: {output}" if output else ""
+            raise RuntimeError(f"agent CLI was installed, but /usr/local/bin/agent --help failed.{details}")
 
     async def _upload_instruction(self, environment: BaseEnvironment, instruction: str) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
