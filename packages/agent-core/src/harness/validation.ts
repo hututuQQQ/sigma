@@ -56,7 +56,7 @@ export function summaryValidationCommands(summary: SummaryJson | Record<string, 
 
 function scriptRunCommand(filePath: string): string | null {
   const base = path.posix.basename(filePath);
-  if (!/^(check|verify|validate|test)_/.test(base)) return null;
+  if (!/^(check|verify|validate|test)(?:[_\-.].*|$)/.test(base)) return null;
   const quoted = shellQuote(filePath);
   if (filePath.endsWith(".py")) return `python ${quoted}`;
   if (filePath.endsWith(".sh")) return `bash ${quoted}`;
@@ -115,6 +115,8 @@ export async function runHarnessCommand(options: {
   let timedOut = false;
 
   return await new Promise<HarnessCommandResult>((resolve) => {
+    let settled = false;
+    let escalationTimer: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(bashExecutable(), ["-lc", options.command], {
       cwd: options.workspacePath,
       env: process.env,
@@ -124,8 +126,10 @@ export async function runHarnessCommand(options: {
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-      setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
+      escalationTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
       }, 500).unref();
     }, Math.max(1, Math.floor(options.timeoutSec * 1000)));
 
@@ -134,6 +138,9 @@ export async function runHarnessCommand(options: {
 
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      if (settled) return;
+      settled = true;
       resolve({
         kind: options.kind,
         source: options.source,
@@ -149,8 +156,11 @@ export async function runHarnessCommand(options: {
       });
     });
 
-    child.on("close", (exitCode) => {
+    const finish = (exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (escalationTimer) clearTimeout(escalationTimer);
       const code = timedOut ? 124 : exitCode ?? 1;
       const stdoutTail = tailText(Buffer.concat(stdoutChunks).toString("utf8"));
       const stderrTail = tailText(Buffer.concat(stderrChunks).toString("utf8"));
@@ -169,6 +179,14 @@ export async function runHarnessCommand(options: {
         timed_out: timedOut || undefined,
         message: code === 0 ? `${label} command passed` : `${label} command failed with exit code ${code}`
       });
+    };
+
+    child.on("exit", (exitCode) => {
+      if (timedOut) finish(exitCode);
+    });
+
+    child.on("close", (exitCode) => {
+      finish(exitCode);
     });
   });
 }

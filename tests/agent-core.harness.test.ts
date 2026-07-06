@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
+import { genericValidationCommandSpecs, runHarnessCommand } from "../packages/agent-core/src/harness/validation.js";
 import { runAgentHarness } from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
@@ -45,6 +46,53 @@ async function tempWorkspace(): Promise<string> {
 }
 
 describe("agent-core harness", () => {
+  it("kills timed-out validation commands that ignore SIGTERM", async () => {
+    const dir = await tempWorkspace();
+    const startedAt = Date.now();
+
+    const result = await runHarnessCommand({
+      kind: "validation",
+      source: "test",
+      command: 'trap "" TERM; sleep 5',
+      workspacePath: dir,
+      attempt: 1,
+      timeoutSec: 0.1
+    });
+
+    expect(result).toMatchObject({
+      exit_code: 124,
+      timed_out: true
+    });
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("runs common changed validation scripts without treating ordinary files as scripts", () => {
+    const specs = genericValidationCommandSpecs([
+      "check.py",
+      "check-cert.py",
+      "check.cert.py",
+      "validate.sh",
+      "test.js",
+      "verify-log.py",
+      "main.py",
+      "parser.js"
+    ]);
+    const commands = specs.map((spec) => spec.command);
+
+    expect(commands).toEqual(expect.arrayContaining([
+      "python check.py",
+      "python check-cert.py",
+      "python check.cert.py",
+      "bash validate.sh",
+      "python verify-log.py"
+    ]));
+    expect(commands.some((command) => command.includes("node test.js"))).toBe(true);
+    expect(commands).toContain("python -m py_compile main.py");
+    expect(commands.some((command) => command.includes("node --check parser.js"))).toBe(true);
+    expect(commands).not.toContain("python main.py");
+    expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
+  });
+
   it("keeps validationMode=off as a single agent run", async () => {
     const dir = await tempWorkspace();
     const model = new SequenceModel([finalResponse("all set")]);
