@@ -565,9 +565,9 @@ describe("markdown report formatting", () => {
       notes: []
     });
 
-    expect(markdown).toContain("| task | status | failure_category | suggested_owner | failure_signals |");
+    expect(markdown).toContain("| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals |");
     expect(markdown).toContain(
-      "| terminal-bench/task-a | failed | verifier_failed | agent-core | agent_completed_but_verifier_failed |"
+      "| terminal-bench/task-a | failed | verifier_failed | agent-core | 0 |  | agent_completed_but_verifier_failed |"
     );
     expect(markdown).toContain("## Ownership Guidance");
     expect(markdown).toContain("If `suggested_owner` is not `portable/harbor` or `scripts/bench`");
@@ -715,6 +715,62 @@ describe("benchmark report generation", () => {
     });
     expect(report.tasks[0].last_error).toContain("test_outputs.py::test_vm_execution");
     expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Verifier Failures");
+  });
+
+  it("keeps reward=1 tasks passed when Harbor also reports an agent exception", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harbor-warning-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "harbor-warning-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run -l 1",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "task-a");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"task-a","status":"failed"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":2,"input_tokens":3,"output_tokens":4,"duration_ms":5,"last_error":null}\n',
+      "utf8"
+    );
+
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(trialDir, { recursive: true });
+    await writeFile(
+      path.join(trialDir, "result.json"),
+      `${JSON.stringify({
+        trial_name: "trial-1",
+        task_name: "terminal-bench/task-a",
+        verifier_result: { rewards: { reward: 1.0 } },
+        exception_info: { exception_message: "AgentTimeoutError after verifier pass" }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.status).toBe("passed");
+    expect(report.counts.passed).toBe(1);
+    expect(report.tasks[0]).toMatchObject({
+      status: "passed",
+      failure_category: null,
+      verifier_status: "passed",
+      infra_warnings: ["agent_exception_after_verifier_pass"],
+      agent_exception: { message: "AgentTimeoutError after verifier pass" }
+    });
+    expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Infra Warnings");
   });
 
   it("matches Harbor trial results by task name instead of sorted order", async () => {

@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { genericValidationCommandSpecs, runHarnessCommand } from "../packages/agent-core/src/harness/validation.js";
+import {
+  genericValidationCommandSpecs,
+  inferTaskHints,
+  runHarnessCommand,
+  taskSmokeValidationCommandSpecs
+} from "../packages/agent-core/src/harness/validation.js";
 import { runAgentHarness } from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
@@ -91,6 +96,36 @@ describe("agent-core harness", () => {
     expect(commands.some((command) => command.includes("node --check parser.js"))).toBe(true);
     expect(commands).not.toContain("python main.py");
     expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
+  });
+
+  it("infers task hints from Terminal-Bench task names", () => {
+    expect(inferTaskHints({ taskId: "kv-store-grpc" })).toEqual(expect.arrayContaining(["server", "grpc", "server/grpc"]));
+    expect(inferTaskHints({ taskId: "pypi-server" })).toEqual(expect.arrayContaining(["server", "pypi", "server/pypi"]));
+    expect(inferTaskHints({ taskId: "filter-js-from-html" })).toEqual(expect.arrayContaining(["html-xss"]));
+  });
+
+  it("adds an html-xss task smoke validation that catches dangerous payloads", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(
+      path.join(dir, "filter.mjs"),
+      "export default function filter(html) { return html; }\n",
+      "utf8"
+    );
+    const [spec] = taskSmokeValidationCommandSpecs(["filter.mjs"], { taskHints: ["html-xss"] });
+    expect(spec).toMatchObject({ source: "task-smoke", relatedFiles: ["filter.mjs"] });
+
+    const result = await runHarnessCommand({
+      kind: "validation",
+      source: spec.source,
+      command: spec.command,
+      workspacePath: dir,
+      attempt: 1,
+      timeoutSec: 5,
+      relatedFiles: spec.relatedFiles
+    });
+
+    expect(result.exit_code).not.toBe(0);
+    expect(result.stderr_tail).toContain("html-xss smoke failed");
   });
 
   it("keeps validationMode=off as a single agent run", async () => {

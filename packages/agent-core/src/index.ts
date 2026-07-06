@@ -10,6 +10,8 @@ export {
   executeBashTool,
   executeEditTool,
   executeReadTool,
+  executeServiceTool,
+  cleanupServicesBeforeVerifier,
   executeWriteTool
 } from "./tools/index.js";
 export type {
@@ -26,6 +28,7 @@ export type {
   HarnessCleanupResult,
   HarnessCommandResult,
   HarnessRetryDecision,
+  HarnessServiceCleanupResult,
   PermissionMode,
   RegisteredTool,
   SummaryJson,

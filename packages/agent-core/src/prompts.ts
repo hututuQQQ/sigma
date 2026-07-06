@@ -5,6 +5,7 @@ Rules:
 - Inspect before editing.
 - Prefer small, verifiable changes.
 - Use bash to run tests or validation commands when available.
+- For long-running servers or daemons, use service.start/status/logs/stop; do not start them with bare &, nohup, or setsid in bash.
 - Do not ask the user questions during benchmark runs.
 - The evaluator verifies the final container state, not your final text.
 - Do not stop after only explaining a solution. Implement it.

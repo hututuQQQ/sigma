@@ -63,6 +63,8 @@ export interface AgentHarnessConfig extends AgentRunConfig {
   validationMode?: AgentHarnessValidationMode;
   validationRetryLimit?: number;
   validationTimeoutSec?: number;
+  taskId?: string;
+  taskHints?: string[];
   precheckCommand?: string;
   precheckTimeoutSec?: number;
   preVerifierCleanupGlobs?: string[];
@@ -137,6 +139,8 @@ export interface HarnessCommandResult {
   timeout_sec: number;
   duration_ms: number;
   timed_out?: boolean;
+  settled_on?: string;
+  signal?: string | null;
   message: string;
   agent_summary?: string;
   trace_tail?: string;
@@ -159,6 +163,13 @@ export interface HarnessCleanupResult {
   warning?: string;
 }
 
+export interface HarnessServiceCleanupResult {
+  stopped: string[];
+  kept: string[];
+  missing: string[];
+  errors: string[];
+}
+
 export interface HarnessAttemptSummary {
   attempt: number;
   status: AgentRunStatus;
@@ -172,6 +183,7 @@ export interface AgentHarnessSummary {
   validation_results: HarnessCommandResult[];
   precheck_results: HarnessCommandResult[];
   retry_decisions: HarnessRetryDecision[];
+  service_cleanup?: HarnessServiceCleanupResult | null;
   pre_verifier_cleanup: HarnessCleanupResult | null;
 }
 

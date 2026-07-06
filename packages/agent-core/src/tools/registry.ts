@@ -4,6 +4,7 @@ import { executeBashTool } from "./bash.js";
 import { executeReadTool } from "./read.js";
 import { executeWriteTool } from "./write.js";
 import { executeEditTool } from "./edit.js";
+import { executeServiceTool } from "./service.js";
 
 const bashTool: RegisteredTool = {
   definition: {
@@ -90,9 +91,38 @@ const editTool: RegisteredTool = {
   execute: executeEditTool
 };
 
+const serviceTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "service",
+      description:
+        "Manage long-running background services. Use service.start for servers instead of bare '&', nohup, or setsid in bash.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["start", "status", "logs", "stop"] },
+          name: { type: "string" },
+          command: { type: "string" },
+          cwd: { type: "string" },
+          port: { type: "number" },
+          readinessCommand: { type: "string" },
+          logPath: { type: "string" },
+          keepForVerifier: { type: "boolean" },
+          readinessTimeoutSec: { type: "number" },
+          maxLogChars: { type: "number" }
+        },
+        required: ["action"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeServiceTool
+};
+
 export function createDefaultToolRegistry(): ToolRegistry {
   const tools = new Map<string, RegisteredTool>();
-  for (const tool of [bashTool, readTool, writeTool, editTool]) {
+  for (const tool of [bashTool, serviceTool, readTool, writeTool, editTool]) {
     tools.set(tool.definition.function.name, tool);
   }
 

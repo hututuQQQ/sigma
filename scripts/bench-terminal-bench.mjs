@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -27,6 +27,7 @@ import {
   rootDir,
   runProcess,
   terminalBenchDataset,
+  verifierFeedbackFromReport,
   writeJson
 } from "./bench-common.mjs";
 
@@ -63,6 +64,12 @@ async function failBeforeHarbor(runDir, config, message, exitCode) {
   });
   const report = await generateBenchReport(runDir);
   return { exitCode, runDir, report };
+}
+
+async function archiveIfExists(targetPath, archivedPath) {
+  if (!existsSync(targetPath)) return;
+  await rm(archivedPath, { recursive: true, force: true });
+  await rename(targetPath, archivedPath);
 }
 
 export async function runTerminalBenchCli(argv, deps = {}) {
@@ -235,65 +242,91 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     timeoutPlan = computeHarborTimeoutPlan(options, null);
   }
 
-  const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
-  const resolvedJobConfig = buildHarborJobConfig(
-    {
+  let harborResult = null;
+  let report = null;
+  let verifierFeedback = null;
+  const verifierRetryLimit = Math.max(0, Math.floor(options.verifierFeedbackRetryLimit ?? 0));
+
+  for (let verifierAttempt = 0; verifierAttempt <= verifierRetryLimit; verifierAttempt += 1) {
+    if (verifierAttempt > 0) {
+      await archiveIfExists(path.join(runDir, "tasks"), path.join(runDir, `tasks-verifier-attempt-${verifierAttempt}`));
+      await archiveIfExists(jobsDir, path.join(runDir, `harbor-jobs-verifier-attempt-${verifierAttempt}`));
+    }
+
+    const resolvedJobConfigPath = path.join(
+      runDir,
+      verifierAttempt === 0 ? "resolved-job.config.json" : `resolved-job.retry-${verifierAttempt}.config.json`
+    );
+    const attemptOptions = {
       ...options,
-      agentCliTarball: env.AGENT_CLI_TARBALL
-    },
-    jobsDir,
-    timeoutPlan,
-    timeoutProbe
-  );
-  await writeJson(resolvedJobConfigPath, resolvedJobConfig);
-  harborArgs = buildHarborArgs({
-    ...options,
-    taskSelectionFlag,
-    capabilities,
-    jobsDir,
-    timeoutProbe,
-    timeoutPlan,
-    configPath: resolvedJobConfigPath
-  });
-  config = {
-    ...config,
-    command: [harborCommand, ...harborArgs],
-    command_text: commandText(harborCommand, harborArgs),
-    harbor_capabilities: capabilities,
-    task_selection_flag: taskSelectionFlag,
-    timeout_probe: timeoutProbe,
-    timeout_plan: timeoutPlan,
-    resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
-  };
-  await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
+      agentCliTarball: env.AGENT_CLI_TARBALL,
+      verifierFeedback: verifierFeedback ?? undefined
+    };
+    const resolvedJobConfig = buildHarborJobConfig(attemptOptions, jobsDir, timeoutPlan, timeoutProbe);
+    await writeJson(resolvedJobConfigPath, resolvedJobConfig);
+    harborArgs = buildHarborArgs({
+      ...attemptOptions,
+      taskSelectionFlag,
+      capabilities,
+      jobsDir,
+      timeoutProbe,
+      timeoutPlan,
+      configPath: resolvedJobConfigPath
+    });
+    config = {
+      ...config,
+      finished_at: null,
+      exit_code: null,
+      status: "running",
+      command: [harborCommand, ...harborArgs],
+      command_text: commandText(harborCommand, harborArgs),
+      harbor_capabilities: capabilities,
+      task_selection_flag: taskSelectionFlag,
+      timeout_probe: timeoutProbe,
+      timeout_plan: timeoutPlan,
+      verifier_feedback_retry_limit: verifierRetryLimit,
+      verifier_feedback_attempt: verifierAttempt,
+      resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
+    };
+    await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
-  process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
-  const harborResult = await runner(harborCommand, harborArgs, {
-    cwd: rootDir,
-    env,
-    stdoutPath: path.join(runDir, "harbor.stdout.log"),
-    stderrPath: path.join(runDir, "harbor.stderr.log"),
-    rawPath: path.join(runDir, "result.raw.log")
-  });
+    process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
+    harborResult = await runner(harborCommand, harborArgs, {
+      cwd: rootDir,
+      env,
+      stdoutPath: path.join(runDir, "harbor.stdout.log"),
+      stderrPath: path.join(runDir, "harbor.stderr.log"),
+      rawPath: path.join(runDir, "result.raw.log")
+    });
 
-  const finishedAt = new Date().toISOString();
-  config = {
-    ...config,
-    finished_at: finishedAt,
-    exit_code: harborResult.exitCode,
-    status: statusFromExitCode(harborResult.exitCode)
-  };
-  await writeJson(path.join(runDir, "config.json"), config);
-  await ensurePlaceholderTask(runDir, {
-    status: statusFromExitCode(harborResult.exitCode),
-    exit_code: harborResult.exitCode,
-    artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
-  });
+    const finishedAt = new Date().toISOString();
+    config = {
+      ...config,
+      finished_at: finishedAt,
+      exit_code: harborResult.exitCode,
+      status: statusFromExitCode(harborResult.exitCode)
+    };
+    await writeJson(path.join(runDir, "config.json"), config);
+    await ensurePlaceholderTask(runDir, {
+      status: statusFromExitCode(harborResult.exitCode),
+      exit_code: harborResult.exitCode,
+      artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
+    });
 
-  const report = await generateBenchReport(runDir);
+    report = await generateBenchReport(runDir);
+    if (harborResult.exitCode === 0 || verifierAttempt >= verifierRetryLimit) break;
+    verifierFeedback = await verifierFeedbackFromReport(runDir, report);
+    if (!verifierFeedback) break;
+    config = {
+      ...config,
+      notes: [...(config.notes ?? []), `Retrying after verifier feedback attempt ${verifierAttempt + 1}.`]
+    };
+    await writeJson(path.join(runDir, "config.json"), config);
+  }
+
   process.stdout.write(`Benchmark artifacts: ${runDir}\n`);
   process.stdout.write(`Report: ${path.join(runDir, "report.md")}\n`);
-  return { exitCode: harborResult.exitCode, runDir, report };
+  return { exitCode: report?.status === "passed" ? 0 : harborResult?.exitCode ?? 1, runDir, report };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

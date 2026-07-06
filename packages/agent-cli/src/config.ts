@@ -27,6 +27,8 @@ export interface CliConfig {
   validationMode: AgentHarnessValidationMode;
   validationRetryLimit: number;
   validationTimeoutSec?: number;
+  taskId?: string;
+  taskHints: string[];
   precheckCommand?: string;
   precheckTimeoutSec?: number;
   preVerifierCleanupGlobs: string[];
@@ -244,6 +246,15 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     ),
     validationTimeoutSec: optionalNumberValue(
       flags["validation-timeout-sec"] ?? process.env.AGENT_VALIDATION_TIMEOUT_SEC ?? config.validation_timeout_sec
+    ),
+    taskId:
+      stringValue(flags["task-id"]) ??
+      process.env.AGENT_TASK_ID ??
+      stringValue(config.task_id),
+    taskHints: stringListValue(
+      flags["task-hints"] ??
+        process.env.AGENT_TASK_HINTS ??
+        config.task_hints
     ),
     precheckCommand:
       stringValue(flags["precheck-command"]) ??

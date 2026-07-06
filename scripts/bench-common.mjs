@@ -22,6 +22,7 @@ export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
 export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultPrecheckTimeoutSec = 45;
 export const defaultPrecheckRetryLimit = 1;
+export const defaultTaskVerifierFeedbackRetryLimit = 1;
 export const makeMipsPrecheckCommandTimeoutSec = 35;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
@@ -261,6 +262,13 @@ export function resolveRunOptions(argv, env = process.env) {
       env.AGENT_PRECHECK_RETRY_LIMIT,
       "AGENT_PRECHECK_RETRY_LIMIT"
     ),
+    verifierFeedbackRetryLimit: asOptionalNonNegativeInt(
+      flags["verifier-feedback-retry-limit"] ?? env.AGENT_VERIFIER_FEEDBACK_RETRY_LIMIT,
+      "--verifier-feedback-retry-limit"
+    ) ?? (mode === "task" ? defaultTaskVerifierFeedbackRetryLimit : 0),
+    taskHints: typeof flags["task-hints"] === "string"
+      ? flags["task-hints"].split(",").map((item) => item.trim()).filter(Boolean)
+      : [],
     genericValidationEnabled: asBoolean(
       env.AGENT_GENERIC_VALIDATION,
       true,
@@ -520,6 +528,12 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
   agentKwargs.validation_timeout_sec = timeoutPlan?.validation_timeout_sec ?? defaultPrecheckTimeoutSec;
   agentKwargs.precheck_retry_limit = timeoutPlan?.precheck_retry_limit ?? defaultPrecheckRetryLimit;
   agentKwargs.precheck_timeout_sec = timeoutPlan?.precheck_timeout_sec ?? defaultPrecheckTimeoutSec;
+  if (Array.isArray(options.taskHints) && options.taskHints.length > 0) {
+    agentKwargs.task_hints = options.taskHints.join(",");
+  }
+  if (typeof options.verifierFeedback === "string" && options.verifierFeedback.trim()) {
+    agentKwargs.verifier_feedback = options.verifierFeedback.trim();
+  }
 
   if (shouldEnableMakeMipsPrecheck(options, timeoutProbe)) {
     agentKwargs.precheck_command = makeMipsPrecheckCommand();
@@ -811,6 +825,41 @@ export async function readJsonSafe(filePath) {
   } catch {
     return {};
   }
+}
+
+function truncateText(text, maxChars) {
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+export async function verifierFeedbackFromReport(runDir, report, maxChars = 8192) {
+  const tasks = Array.isArray(report?.tasks) ? report.tasks : [];
+  const failed = tasks.filter((task) =>
+    task?.failure_category === "verifier_failed" ||
+    task?.verifier_status === "failed" ||
+    (typeof task?.reward === "number" && task.reward < 1)
+  );
+  if (failed.length === 0) return null;
+
+  const pieces = [];
+  for (const task of failed) {
+    pieces.push(`Task: ${task.task_id}`);
+    if (task.reward !== null && task.reward !== undefined) pieces.push(`Reward: ${task.reward}`);
+    for (const failure of Array.isArray(task.verifier_failed_tests) ? task.verifier_failed_tests : []) {
+      pieces.push(`Failed test: ${failure.name}`);
+      if (failure.message) pieces.push(`Message: ${failure.message}`);
+      if (failure.trace) pieces.push(`Trace: ${failure.trace}`);
+    }
+    if (task.verifier_log_path) {
+      const logText = await readTextSafe(path.join(runDir, task.verifier_log_path));
+      if (logText.trim()) {
+        pieces.push("Verifier stdout tail:");
+        pieces.push(logText.length <= 3000 ? logText.trim() : logText.slice(-3000).trim());
+      }
+    }
+  }
+
+  const text = pieces.join("\n").trim();
+  return text ? truncateText(text, maxChars) : null;
 }
 
 export async function readTraceEvents(tracePath) {
@@ -1214,6 +1263,20 @@ function verifierMessage(trialResult) {
   return null;
 }
 
+function verifierStatusFromReward(reward, failedTests = []) {
+  if (typeof reward === "number") return reward >= 1 ? "passed" : "failed";
+  return Array.isArray(failedTests) && failedTests.length > 0 ? "failed" : null;
+}
+
+function agentExceptionFromTrial(trialResult, exceptionMessage) {
+  if (!exceptionMessage) return null;
+  const exceptionInfo = trialResult?.exception_info;
+  return {
+    message: exceptionMessage,
+    type: typeof exceptionInfo?.exception_type === "string" ? exceptionInfo.exception_type : null
+  };
+}
+
 async function readHarborTrialResults(runDir) {
   const jobsDir = path.join(runDir, "harbor-jobs");
   const resultFiles = await listJsonFiles(jobsDir);
@@ -1253,23 +1316,35 @@ function mergeHarborTrialResult(task, trialResult) {
   const reward = trialResult?.verifier_result?.rewards?.reward;
   const exceptionMessage = trialResult?.exception_info?.exception_message;
   const traceSummary = trialResult?.agent_trace_summary ?? {};
+  const verifierFailedTests = Array.isArray(trialResult?.verifier_failed_tests) ? trialResult.verifier_failed_tests : [];
   const next = {
     ...task,
     task_id: trialResult?.task_name ?? task.task_id,
     trial_name: trialResult?.trial_name ?? null,
     harbor_result_path: trialResult?.result_path ?? null,
     reward: typeof reward === "number" ? reward : null,
+    verifier_status: verifierStatusFromReward(reward, verifierFailedTests),
+    agent_exception: agentExceptionFromTrial(trialResult, exceptionMessage),
+    infra_warnings: Array.isArray(task.infra_warnings) ? [...task.infra_warnings] : [],
     trace_path: task.trace_path ?? trialResult?.agent_trace_path ?? null,
     commands_executed: task.commands_executed || Number(traceSummary.commands_executed ?? 0),
     input_tokens: task.input_tokens || Number(traceSummary.input_tokens ?? 0),
     output_tokens: task.output_tokens || Number(traceSummary.output_tokens ?? 0),
     duration_ms: task.duration_ms || Number(traceSummary.duration_ms ?? 0),
     last_error: task.last_error ?? traceSummary.last_error ?? null,
-    verifier_failed_tests: Array.isArray(trialResult?.verifier_failed_tests) ? trialResult.verifier_failed_tests : [],
+    verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
     failure_signals: Array.isArray(task.failure_signals) ? [...task.failure_signals] : []
   };
   const trialLogText = `${exceptionMessage ?? ""}\n${JSON.stringify(trialResult)}`;
+
+  if (exceptionMessage && typeof reward === "number" && reward >= 1) {
+    next.status = "passed";
+    next.failure_category = null;
+    next.failure_signals = [];
+    addSignal(next.infra_warnings, "agent_exception_after_verifier_pass");
+    return next;
+  }
 
   if (exceptionMessage) {
     next.status = "failed";
@@ -1294,6 +1369,7 @@ function mergeHarborTrialResult(task, trialResult) {
     if (reward >= 1) {
       next.status = "passed";
       next.failure_category = null;
+      next.failure_signals = [];
     } else {
       next.status = "failed";
       next.failure_category = "verifier_failed";
@@ -1385,6 +1461,9 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     trial_name: null,
     harbor_result_path: null,
     reward: null,
+    verifier_status: null,
+    agent_exception: null,
+    infra_warnings: [],
     verifier_failed_tests: [],
     verifier_log_path: null
   };
@@ -1417,6 +1496,9 @@ function syntheticRunTask(config, globalLogText) {
     trial_name: null,
     harbor_result_path: null,
     reward: null,
+    verifier_status: null,
+    agent_exception: null,
+    infra_warnings: [],
     verifier_failed_tests: [],
     verifier_log_path: null
   };
@@ -1459,16 +1541,34 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | suggested_owner | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
-    "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |"
   ];
 
   for (const task of report.tasks) {
     const failureSignals = Array.isArray(task.failure_signals) ? task.failure_signals.join(", ") : "";
     const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category) ?? "";
+    const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
     );
+  }
+
+  const tasksWithWarnings = report.tasks.filter((task) => {
+    return (Array.isArray(task.infra_warnings) && task.infra_warnings.length > 0) || task.agent_exception;
+  });
+  if (tasksWithWarnings.length > 0) {
+    lines.push("", "## Infra Warnings", "");
+    for (const task of tasksWithWarnings) {
+      lines.push(`### ${markdownEscape(task.task_id)}`);
+      for (const warning of Array.isArray(task.infra_warnings) ? task.infra_warnings : []) {
+        lines.push(`- ${markdownEscape(warning)}`);
+      }
+      if (task.agent_exception?.message) {
+        lines.push(`- agent_exception: ${markdownEscape(task.agent_exception.message)}`);
+      }
+      lines.push("");
+    }
   }
 
   const tasksWithVerifierFailures = report.tasks.filter(
@@ -1599,7 +1699,13 @@ export async function generateBenchReport(runDir) {
     resolved_job_config_path: config.resolved_job_config_path ?? null,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
     exit_code: Number(config.exit_code ?? 1),
-    status: incompleteReason.length > 0 ? "incomplete" : failedCount > 0 ? "failed" : config.status ?? (config.exit_code === 0 ? "passed" : "failed"),
+    status: incompleteReason.length > 0
+      ? "incomplete"
+      : failedCount > 0
+        ? "failed"
+        : counts.passed > 0
+          ? "passed"
+          : config.status ?? (config.exit_code === 0 ? "passed" : "failed"),
     counts,
     tasks,
     notes
