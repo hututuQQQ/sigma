@@ -162,6 +162,8 @@ describe("agent-core tools", () => {
     const { dir, context } = await workspace();
     process.env.AGENT_SERVICE_REGISTRY = path.join(dir, "services.json");
     process.env.AGENT_SERVICE_LOG_DIR = path.join(dir, "logs");
+    const defaultPort = await freePort();
+    const explicitStopPort = await freePort();
 
     await expect(
       executeServiceTool(
@@ -175,12 +177,53 @@ describe("agent-core tools", () => {
         context
       )
     ).resolves.toMatchObject({ ok: true });
+    await expect(
+      executeServiceTool(
+        {
+          action: "start",
+          name: "port-default",
+          command: `node -e "require('http').createServer((req,res)=>res.end('ok')).listen(${defaultPort}, '127.0.0.1')"`,
+          port: defaultPort,
+          readinessTimeoutSec: 5
+        },
+        context
+      )
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      executeServiceTool(
+        {
+          action: "start",
+          name: "readiness-default",
+          command: "node -e \"setInterval(()=>{}, 1000)\"",
+          readinessCommand: "node -e \"process.exit(0)\""
+        },
+        context
+      )
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      executeServiceTool(
+        {
+          action: "start",
+          name: "explicit-stop",
+          command: `node -e "require('http').createServer((req,res)=>res.end('ok')).listen(${explicitStopPort}, '127.0.0.1')"`,
+          port: explicitStopPort,
+          keepForVerifier: false,
+          readinessTimeoutSec: 5
+        },
+        context
+      )
+    ).resolves.toMatchObject({ ok: true });
 
     const cleanup = await cleanupServicesBeforeVerifier();
     expect(cleanup.stopped).toContain("temp");
+    expect(cleanup.stopped).toContain("explicit-stop");
     expect(cleanup.kept).toContain("kept");
+    expect(cleanup.kept).toContain("port-default");
+    expect(cleanup.kept).toContain("readiness-default");
 
     await executeServiceTool({ action: "stop", name: "kept" }, context);
+    await executeServiceTool({ action: "stop", name: "port-default" }, context);
+    await executeServiceTool({ action: "stop", name: "readiness-default" }, context);
   });
 
   it("fails readiness timeouts while keeping service logs", async () => {

@@ -62,14 +62,18 @@ export function suggestedOwnerForFailureCategory(failureCategory) {
   return SUGGESTED_OWNER_BY_FAILURE_CATEGORY.get(normalized) ?? "inspect";
 }
 
-function suggestedOwnerForTask(status, failureCategory) {
+function suggestedOwnerForTask(status, failureCategory, failureSignals = []) {
+  if (status !== "passed" && Array.isArray(failureSignals) && failureSignals.includes("service_stopped_before_verifier")) {
+    return "agent-core/tools/service";
+  }
   return status === "passed" ? null : suggestedOwnerForFailureCategory(failureCategory);
 }
 
 function withSuggestedOwner(task) {
+  const { harness_service_cleanup_stopped: _harnessServiceCleanupStopped, ...publicTask } = task;
   return {
-    ...task,
-    suggested_owner: suggestedOwnerForTask(task.status, task.failure_category)
+    ...publicTask,
+    suggested_owner: suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals)
   };
 }
 
@@ -389,7 +393,9 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     0,
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
-  const requestedPrecheckRetryLimit = Number.isFinite(Number(options.precheckRetryLimit))
+  const precheckRetryLimitWasProvided =
+    options.precheckRetryLimit !== undefined && options.precheckRetryLimit !== null && options.precheckRetryLimit !== "";
+  const requestedPrecheckRetryLimit = precheckRetryLimitWasProvided && Number.isFinite(Number(options.precheckRetryLimit))
     ? Math.max(0, Math.ceil(Number(options.precheckRetryLimit)))
     : null;
   const taskSpecificPrecheckEnabled = shouldEnableMakeMipsPrecheck(options, timeoutProbe);
@@ -959,6 +965,16 @@ function missingPythonModuleSignals(logText = "") {
   return signals;
 }
 
+function serviceCleanupStoppedFromSummary(summary = {}) {
+  const harness = summary && typeof summary === "object" && summary.harness && typeof summary.harness === "object"
+    ? summary.harness
+    : {};
+  const serviceCleanup = harness.service_cleanup && typeof harness.service_cleanup === "object"
+    ? harness.service_cleanup
+    : {};
+  return Array.isArray(serviceCleanup.stopped) ? serviceCleanup.stopped.filter(Boolean).map(String) : [];
+}
+
 function collectFailureSignals(input = {}) {
   const signals = [];
   for (const signal of Array.isArray(input.existingSignals) ? input.existingSignals : []) {
@@ -1016,6 +1032,13 @@ function collectFailureSignals(input = {}) {
 
   if (harness.pre_verifier_cleanup?.warning) {
     addSignal(signals, "pre_verifier_cleanup_warning");
+  }
+  const stoppedServices = [
+    ...serviceCleanupStoppedFromSummary(summary),
+    ...(Array.isArray(input.serviceCleanupStopped) ? input.serviceCleanupStopped.filter(Boolean).map(String) : [])
+  ];
+  if (input.verifierFailed === true && stoppedServices.length > 0) {
+    addSignal(signals, "service_stopped_before_verifier");
   }
 
   const events = input.traceEvents ?? [];
@@ -1334,7 +1357,10 @@ function mergeHarborTrialResult(task, trialResult) {
     last_error: task.last_error ?? traceSummary.last_error ?? null,
     verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
-    failure_signals: Array.isArray(task.failure_signals) ? [...task.failure_signals] : []
+    failure_signals: Array.isArray(task.failure_signals) ? [...task.failure_signals] : [],
+    harness_service_cleanup_stopped: Array.isArray(task.harness_service_cleanup_stopped)
+      ? [...task.harness_service_cleanup_stopped]
+      : []
   };
   const trialLogText = `${exceptionMessage ?? ""}\n${JSON.stringify(trialResult)}`;
 
@@ -1360,7 +1386,9 @@ function mergeHarborTrialResult(task, trialResult) {
       summary: traceSummary,
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: trialLogText,
-      verifierFailures: next.verifier_failed_tests
+      verifierFailures: next.verifier_failed_tests,
+      verifierFailed: next.failure_category === "verifier_failed",
+      serviceCleanupStopped: next.harness_service_cleanup_stopped
     });
     return next;
   }
@@ -1395,7 +1423,9 @@ function mergeHarborTrialResult(task, trialResult) {
         summary: traceSummary,
         traceEvents: trialResult?.agent_trace_events ?? [],
         logText: trialLogText,
-        verifierFailures: next.verifier_failed_tests
+        verifierFailures: next.verifier_failed_tests,
+        verifierFailed: next.status === "failed" && next.failure_category === "verifier_failed",
+        serviceCleanupStopped: next.harness_service_cleanup_stopped
       });
   if (next.status === "failed" && next.failure_category === "verifier_failed" && traceSummary.status === "completed") {
     addSignal(next.failure_signals, "agent_completed_but_verifier_failed");
@@ -1439,7 +1469,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
         metadata,
         summary,
         traceEvents,
-        logText: combinedLogText
+        logText: combinedLogText,
+        verifierFailed: status === "failed" && failureCategory === "verifier_failed"
       });
   if (status === "failed" && failureCategory === "verifier_failed" && summary.status === "completed") {
     addSignal(failureSignals, "agent_completed_but_verifier_failed");
@@ -1465,7 +1496,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     agent_exception: null,
     infra_warnings: [],
     verifier_failed_tests: [],
-    verifier_log_path: null
+    verifier_log_path: null,
+    harness_service_cleanup_stopped: serviceCleanupStoppedFromSummary(summary)
   };
 }
 
@@ -1547,7 +1579,7 @@ export function formatMarkdownReport(report) {
 
   for (const task of report.tasks) {
     const failureSignals = Array.isArray(task.failure_signals) ? task.failure_signals.join(", ") : "";
-    const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category) ?? "";
+    const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals) ?? "";
     const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
       `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`

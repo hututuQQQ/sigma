@@ -73,8 +73,16 @@ function asNumber(value: unknown): number | undefined {
   return undefined;
 }
 
-function asBool(value: unknown): boolean {
-  return value === true || value === "true" || value === "1";
+function asOptionalBool(value: unknown): boolean | undefined {
+  if (value === true || value === "true" || value === "1") return true;
+  if (value === false || value === "false" || value === "0") return false;
+  return undefined;
+}
+
+function defaultKeepForVerifier(args: ServiceArgs, port: number | undefined, readinessCommand: string | undefined): boolean {
+  const explicit = asOptionalBool(args.keepForVerifier);
+  if (explicit !== undefined) return explicit;
+  return port !== undefined || readinessCommand !== undefined;
 }
 
 async function readRegistry(): Promise<ServiceRecord[]> {
@@ -233,7 +241,7 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
     ...(port ? { port } : {}),
     ...(readinessCommand ? { readinessCommand } : {}),
     logPath,
-    keepForVerifier: asBool(args.keepForVerifier),
+    keepForVerifier: defaultKeepForVerifier(args, port, readinessCommand),
     startedAt: new Date().toISOString()
   };
 

@@ -374,6 +374,18 @@ describe("Terminal-Bench command construction", () => {
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
   });
 
+  it("keeps the default validation retry when precheckRetryLimit is unset or null", () => {
+    const timeoutProbe = {
+      resolved_tasks: [{ name: "terminal-bench/regex-log" }],
+      tasks: [{ task_name: "terminal-bench/regex-log", agent_timeout_sec: 1800 }],
+      max_agent_timeout_sec: 1800
+    };
+
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe).precheck_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: null }, timeoutProbe).precheck_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: 0 }, timeoutProbe).precheck_retry_limit).toBe(0);
+  });
+
   it("preserves explicit max turns in resolved JobConfig", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/make-mips-interpreter" }],
@@ -980,14 +992,14 @@ describe("benchmark report generation", () => {
         dataset: terminalBenchDataset,
         k: 1,
         command_text: "harbor run --config resolved-job.config.json",
-        exit_code: 1,
-        status: "failed"
+        exit_code: 0,
+        status: "passed"
       })}\n`,
       "utf8"
     );
     await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
-    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 0\n", "utf8");
 
     const taskDir = path.join(runDir, "tasks", "openssl-selfsigned-cert");
     await mkdir(taskDir, { recursive: true });
@@ -1026,6 +1038,86 @@ describe("benchmark report generation", () => {
         "pre_verifier_cleanup_warning"
       ])
     );
+  });
+
+  it("attributes verifier failures after service cleanup to the service harness", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-service-cleanup-"));
+    await writeFile(
+      path.join(runDir, "config.json"),
+      `${JSON.stringify({
+        run_id: "service-cleanup-run",
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        dataset: terminalBenchDataset,
+        k: 1,
+        command_text: "harbor run --config resolved-job.config.json",
+        exit_code: 1,
+        status: "failed"
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
+
+    const taskDir = path.join(runDir, "tasks", "kv-store-grpc");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"terminal-bench/kv-store-grpc"}\n', "utf8");
+    await writeFile(
+      path.join(taskDir, "summary.json"),
+      `${JSON.stringify({
+        status: "completed",
+        finish_reason: "assistant_stop",
+        harness: {
+          service_cleanup: {
+            stopped: ["kvstore-server"],
+            kept: [],
+            missing: [],
+            errors: []
+          }
+        }
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(path.join(taskDir, "verifier.log"), "verifier failed: connection refused on 127.0.0.1:5328\n", "utf8");
+
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    await mkdir(path.join(trialDir, "agent"), { recursive: true });
+    await mkdir(path.join(trialDir, "verifier"), { recursive: true });
+    await writeFile(
+      path.join(trialDir, "result.json"),
+      `${JSON.stringify({
+        trial_name: "trial-1",
+        task_name: "terminal-bench/kv-store-grpc",
+        verifier_result: { rewards: { reward: 0 } }
+      })}\n`,
+      "utf8"
+    );
+    await writeFile(
+      path.join(trialDir, "agent", "trace.jsonl"),
+      `${JSON.stringify({ type: "run_end", metadata: { result: { status: "completed", finishReason: "assistant_stop" } } })}\n`,
+      "utf8"
+    );
+    await writeFile(
+      path.join(trialDir, "verifier", "ctrf.json"),
+      `${JSON.stringify({
+        results: {
+          tests: [{ name: "test_grpc_port", status: "failed", message: "connection refused" }]
+        }
+      })}\n`,
+      "utf8"
+    );
+
+    const report = await generateBenchReport(runDir);
+    const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
+
+    expect(report.tasks[0].failure_category).toBe("verifier_failed");
+    expect(report.tasks[0].failure_signals).toEqual(
+      expect.arrayContaining(["agent_completed_but_verifier_failed", "service_stopped_before_verifier"])
+    );
+    expect(report.tasks[0].suggested_owner).toBe("agent-core/tools/service");
+    expect(markdown).toContain("service_stopped_before_verifier");
+    expect(markdown).toContain("agent-core/tools/service");
   });
 
   it("marks stale running runs as incomplete with missing file details", async () => {

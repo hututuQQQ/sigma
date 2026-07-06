@@ -314,7 +314,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     });
 
     report = await generateBenchReport(runDir);
-    if (harborResult.exitCode === 0 || verifierAttempt >= verifierRetryLimit) break;
+    if (report?.status === "passed" || verifierAttempt >= verifierRetryLimit) break;
     verifierFeedback = await verifierFeedbackFromReport(runDir, report);
     if (!verifierFeedback) break;
     config = {
