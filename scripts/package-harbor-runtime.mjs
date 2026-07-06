@@ -8,6 +8,8 @@ import {
   defaultAgentCliTarballForEnv,
   harborRuntimeDir as defaultHarborRuntimeDir,
   portableAgentImportPath,
+  removedHarborDirectoryName,
+  removedHarborPackageName,
   rootDir as defaultRootDir,
   terminalBenchDataset
 } from "./bench-common.mjs";
@@ -87,6 +89,12 @@ The Python adapter only depends on the Python standard library and Harbor. It up
 `;
 }
 
+function assertNoRemovedHarborAdapter(text, description) {
+  if (text.includes(removedHarborPackageName) || text.includes(removedHarborDirectoryName)) {
+    throw new Error(`${description} must not reference the removed Harbor adapter.`);
+  }
+}
+
 export async function packageHarborRuntime(options = {}) {
   const rootDir = options.rootDir ? path.resolve(options.rootDir) : defaultRootDir;
   const env = options.env ?? process.env;
@@ -102,9 +110,7 @@ export async function packageHarborRuntime(options = {}) {
   }
 
   const sourceText = await readFile(sourcePath, "utf8");
-  if (sourceText.includes("integrations.harbor")) {
-    throw new Error("Portable Harbor runtime source must not reference integrations.harbor.");
-  }
+  assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
 
   await rm(harborRuntimeDir, { recursive: true, force: true });
   await mkdir(harborRuntimeDir, { recursive: true });
@@ -128,14 +134,17 @@ export async function packageHarborRuntime(options = {}) {
     },
     path.join(harborRuntimeDir, "jobs", "deepseek-task-example")
   );
+  const readmeText = runtimeReadme(agentCliTarball);
+  const k5ConfigText = `${JSON.stringify(k5Config, null, 2)}\n`;
+  const taskConfigText = `${JSON.stringify(taskConfig, null, 2)}\n`;
 
-  await writeFile(path.join(harborRuntimeDir, "README.md"), runtimeReadme(agentCliTarball), "utf8");
-  await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json"), `${JSON.stringify(k5Config, null, 2)}\n`, "utf8");
-  await writeFile(
-    path.join(harborRuntimeDir, "jobconfig.deepseek.task.example.json"),
-    `${JSON.stringify(taskConfig, null, 2)}\n`,
-    "utf8"
-  );
+  assertNoRemovedHarborAdapter(readmeText, "Portable Harbor runtime README");
+  assertNoRemovedHarborAdapter(k5ConfigText, "Portable Harbor k5 JobConfig");
+  assertNoRemovedHarborAdapter(taskConfigText, "Portable Harbor task JobConfig");
+
+  await writeFile(path.join(harborRuntimeDir, "README.md"), readmeText, "utf8");
+  await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json"), k5ConfigText, "utf8");
+  await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.task.example.json"), taskConfigText, "utf8");
 
   return {
     artifactsDir,

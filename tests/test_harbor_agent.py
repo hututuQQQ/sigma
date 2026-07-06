@@ -52,13 +52,6 @@ def install_harbor_stubs() -> None:
     sys.modules["harbor.models.agent.context"] = context_module
 
 
-def import_agent_module():
-    install_harbor_stubs()
-    sys.modules.pop("portable.harbor.sigma_harbor_agent", None)
-    sys.modules.pop("integrations.harbor.agent", None)
-    return importlib.import_module("integrations.harbor.agent")
-
-
 def import_portable_agent_module():
     install_harbor_stubs()
     sys.modules.pop("portable.harbor.sigma_harbor_agent", None)
@@ -66,17 +59,6 @@ def import_portable_agent_module():
 
 
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
-    async def test_legacy_import_reexports_portable_agent(self):
-        portable_module = import_portable_agent_module()
-        legacy_module = importlib.import_module("integrations.harbor.agent")
-
-        self.assertIs(legacy_module.AgentCliHarborAgent, portable_module.SigmaCliHarborAgent)
-        self.assertTrue((Path.cwd() / "portable" / "harbor" / "sigma_harbor_agent.py").is_file())
-        self.assertNotIn(
-            "integrations.harbor",
-            (Path.cwd() / "portable" / "harbor" / "sigma_harbor_agent.py").read_text(encoding="utf-8"),
-        )
-
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
 
@@ -126,7 +108,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     os.environ["AGENT_CLI_TARBALL"] = old_tarball
 
     async def test_setup_checks_existing_agent_help(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             env = SimpleNamespace(
                 exec=AsyncMock(
@@ -140,7 +122,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 upload_dir=AsyncMock(),
                 download_file=AsyncMock(),
             )
-            agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
 
             await agent.setup(env)
 
@@ -155,7 +137,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             env = SimpleNamespace(
                 exec=AsyncMock(
@@ -169,7 +151,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 upload_dir=AsyncMock(),
                 download_file=AsyncMock(),
             )
-            agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
 
             with self.assertRaises(RuntimeError) as raised:
                 await agent.setup(env)
@@ -177,7 +159,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("missing runtime", str(raised.exception))
 
     async def test_run_forwards_harness_kwargs_as_cli_flags(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
 
@@ -196,7 +178,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 download_file=AsyncMock(),
             )
             context = SimpleNamespace(task_id="task-a")
-            agent = module.AgentCliHarborAgent(
+            agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
                 generic_validation_enabled=True,
                 validation_timeout_sec=45,
@@ -264,7 +246,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["timeout_sec"], 720)
 
     async def test_run_uses_validation_off_when_generic_validation_disabled(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
 
@@ -281,7 +263,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 download_file=AsyncMock(),
             )
             context = SimpleNamespace(task_id="task-a")
-            agent = module.AgentCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
 
             await agent.run("fix the task", env, context)
 
@@ -290,7 +272,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--validation-retry-limit 0", command)
 
     async def test_run_downloads_logs_populates_context_and_mirrors_harness_metadata(self):
-        module = import_agent_module()
+        module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
             os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
@@ -353,7 +335,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     download_file=AsyncMock(side_effect=download_side_effect),
                 )
                 context = SimpleNamespace(task_id="openssl-selfsigned-cert")
-                agent = module.AgentCliHarborAgent(logs_dir=logs_dir)
+                agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
 
                 await agent.run("fix the task", env, context)
 

@@ -10,8 +10,11 @@ export const benchRootDir = path.join(artifactsDir, "bench");
 export const harborRuntimeDir = path.join(artifactsDir, "harbor-runtime");
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
-export const legacyAgentImportPath = "integrations.harbor.agent:AgentCliHarborAgent";
 export const agentImportPath = portableAgentImportPath;
+export const removedHarborPackageName = ["integrations", "harbor"].join(".");
+export const removedHarborDirectoryName = ["integrations", "harbor"].join("/");
+export const removedHarborAdapterErrorMessage =
+  `${removedHarborDirectoryName} has been removed. Use portable runtime import path ${portableAgentImportPath}.`;
 export const defaultAgentCliTarball = path.join(artifactsDir, "agent-cli-linux-x64.tgz");
 export const defaultAgentTimeoutFallbackSec = 1800;
 export const defaultAgentTimeoutGraceSec = 120;
@@ -138,16 +141,21 @@ export function defaultAgentCliTarballForEnv(env = process.env) {
 
 export function resolveHarborAgentImportPath(env = process.env) {
   if (typeof env.SIGMA_HARBOR_AGENT_IMPORT_PATH === "string" && env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim()) {
-    return env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim();
-  }
-  if (String(env.SIGMA_HARBOR_AGENT_MODE ?? "").trim().toLowerCase() === "legacy") {
-    return legacyAgentImportPath;
+    return assertSupportedHarborAgentImportPath(env.SIGMA_HARBOR_AGENT_IMPORT_PATH.trim());
   }
   return portableAgentImportPath;
 }
 
-export function isLegacyHarborAgentImportPath(importPath) {
-  return importPath === legacyAgentImportPath || String(importPath ?? "").startsWith("integrations.harbor.");
+function isRemovedHarborAgentImportPath(importPath) {
+  const text = String(importPath ?? "").trim();
+  return text === removedHarborPackageName || text.startsWith(`${removedHarborPackageName}.`);
+}
+
+function assertSupportedHarborAgentImportPath(importPath) {
+  if (isRemovedHarborAgentImportPath(importPath)) {
+    throw new Error(removedHarborAdapterErrorMessage);
+  }
+  return importPath;
 }
 
 function resolveAgentCliTarballPath(options = {}, env = process.env) {
@@ -524,7 +532,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
 export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeoutProbe = null) {
   const agentName = options.mode === "smoke"
     ? "oracle"
-    : options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env);
+    : assertSupportedHarborAgentImportPath(
+        options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+      );
   const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan, timeoutProbe);
 
   const config = {
@@ -616,7 +626,9 @@ export function buildHarborArgs(options) {
     return args;
   }
 
-  const selectedAgentImportPath = options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env);
+  const selectedAgentImportPath = assertSupportedHarborAgentImportPath(
+    options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
+  );
   const args = [
     "run",
     "-d",
@@ -1616,11 +1628,8 @@ export async function ensurePlaceholderTask(runDir, metadata) {
 }
 
 export function harborEnvForRun(runDir, env = process.env) {
-  const selectedAgentImportPath = resolveHarborAgentImportPath(env);
+  resolveHarborAgentImportPath(env);
   const pythonPathEntries = [harborRuntimeDir];
-  if (isLegacyHarborAgentImportPath(selectedAgentImportPath)) {
-    pythonPathEntries.push(rootDir);
-  }
   if (env.PYTHONPATH) {
     pythonPathEntries.push(env.PYTHONPATH);
   }

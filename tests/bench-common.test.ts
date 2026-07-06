@@ -16,11 +16,11 @@ import {
   generateBenchReport,
   harborEnvForRun,
   harborRuntimeDir,
-  legacyAgentImportPath,
   parseHarborTimeoutProbe,
   portableAgentImportPath,
+  removedHarborAdapterErrorMessage,
+  removedHarborPackageName,
   resolveHarborCommand,
-  rootDir,
   suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
@@ -399,46 +399,53 @@ describe("Terminal-Bench command construction", () => {
     expect(config.agents[0].kwargs.max_turns).toBe(200);
   });
 
-  it("uses the legacy Harbor import path only when requested", () => {
-    const legacyConfig = buildHarborJobConfig(
-      {
-        mode: "k",
-        k: 1,
-        provider: "deepseek",
-        model: "deepseek-v4-pro",
-        maxTurns: 200,
-        commandTimeoutSec: 180,
-        env: { SIGMA_HARBOR_AGENT_MODE: "legacy" }
-      },
-      "jobs"
-    );
-    const explicitConfig = buildHarborJobConfig(
-      {
-        mode: "k",
-        k: 1,
-        provider: "deepseek",
-        model: "deepseek-v4-pro",
-        maxTurns: 200,
-        commandTimeoutSec: 180,
-        env: { SIGMA_HARBOR_AGENT_IMPORT_PATH: legacyAgentImportPath }
-      },
-      "jobs"
-    );
+  it("rejects removed Harbor import paths", () => {
+    const removedAgentClass = ["AgentCli", "HarborAgent"].join("");
+    const removedImportPath = `${removedHarborPackageName}.agent:${removedAgentClass}`;
 
-    expect(legacyConfig.agents[0].name).toBe(legacyAgentImportPath);
-    expect(explicitConfig.agents[0].name).toBe(legacyAgentImportPath);
+    expect(() =>
+      buildHarborJobConfig(
+        {
+          mode: "k",
+          k: 1,
+          provider: "deepseek",
+          model: "deepseek-v4-pro",
+          maxTurns: 200,
+          commandTimeoutSec: 180,
+          env: { SIGMA_HARBOR_AGENT_IMPORT_PATH: removedImportPath }
+        },
+        "jobs"
+      )
+    ).toThrow(removedHarborAdapterErrorMessage);
+    expect(() =>
+      buildHarborArgs({
+        mode: "k",
+        k: 1,
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        maxTurns: 200,
+        commandTimeoutSec: 180,
+        maxWallTimeSec: 7200,
+        agentImportPath: `${removedHarborPackageName}.custom:OtherAgent`
+      })
+    ).toThrow(removedHarborAdapterErrorMessage);
   });
 
-  it("puts the portable runtime on PYTHONPATH by default and adds repo root only for legacy mode", () => {
+  it("puts only the portable runtime and existing PYTHONPATH on PYTHONPATH", () => {
     const portableEnv = harborEnvForRun("run-dir", {});
     const portablePythonPath = portableEnv.PYTHONPATH.split(path.delimiter);
-    expect(portablePythonPath).toContain(harborRuntimeDir);
-    expect(portablePythonPath).not.toContain(rootDir);
+    expect(portablePythonPath).toEqual([harborRuntimeDir]);
 
-    const legacyEnv = harborEnvForRun("run-dir", { SIGMA_HARBOR_AGENT_MODE: "legacy" });
-    const legacyPythonPath = legacyEnv.PYTHONPATH.split(path.delimiter);
-    expect(legacyPythonPath).toContain(harborRuntimeDir);
-    expect(legacyPythonPath).toContain(rootDir);
+    const existingEnv = harborEnvForRun("run-dir", { PYTHONPATH: ["one", "two"].join(path.delimiter) });
+    expect(existingEnv.PYTHONPATH.split(path.delimiter)).toEqual([harborRuntimeDir, "one", "two"]);
+  });
+
+  it("rejects removed Harbor import paths before building run env", () => {
+    expect(() =>
+      harborEnvForRun("run-dir", {
+        SIGMA_HARBOR_AGENT_IMPORT_PATH: `${removedHarborPackageName}.agent:RemovedAgent`
+      })
+    ).toThrow(removedHarborAdapterErrorMessage);
   });
 
   it("writes portable command scripts without the legacy integration import path", () => {
@@ -457,7 +464,7 @@ describe("Terminal-Bench command construction", () => {
 
     expect(script).toContain(portableAgentImportPath);
     expect(script).toContain(harborRuntimeDir);
-    expect(script).not.toContain(legacyAgentImportPath);
+    expect(script).not.toContain(removedHarborPackageName);
   });
 });
 

@@ -300,19 +300,9 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.task.example.json
 ```
 
-Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They should not require:
+Harbor benchmark execution uses the portable runtime generated under `.artifacts/harbor-runtime`. The old in-repo Harbor adapter has been removed. Use `sigma_harbor_agent:SigmaCliHarborAgent`.
 
-```bash
-PYTHONPATH="$PWD"
-```
-
-They should not depend on:
-
-```text
-integrations.harbor.agent:AgentCliHarborAgent
-```
-
-unless legacy mode is explicitly requested.
+Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They require the portable runtime directory on `PYTHONPATH`; they do not require the repo root.
 
 The portable Python adapter depends only on the Python standard library and Harbor. It uploads the agent CLI tarball, extracts it to `/opt/agent-cli`, symlinks `/usr/local/bin/agent`, runs `/usr/local/bin/agent solve`, forwards provider env keys, downloads `/tmp/agent/summary.json`, `/tmp/agent/trace.jsonl`, and best-effort `/tmp/agent/attempts/**`, and fills Harbor context fields. Validation, retry, precheck, and cleanup behavior lives in `agent-core` and is controlled through CLI flags.
 
@@ -325,20 +315,6 @@ pnpm bench:tb:deepseek:task -- --task-id openssl-selfsigned-cert
 
 During these runs, `scripts/bench-terminal-bench.mjs` packages the agent CLI, packages the Harbor runtime, puts `.artifacts/harbor-runtime` on `PYTHONPATH`, writes a portable JobConfig, runs Harbor, and collects reports.
 
-`integrations/harbor` remains as a legacy/development helper and compatibility import. It is not the default benchmark runtime. To opt into the old import path:
-
-```bash
-SIGMA_HARBOR_AGENT_MODE=legacy pnpm bench:tb:deepseek:k5
-```
-
-or set:
-
-```bash
-SIGMA_HARBOR_AGENT_IMPORT_PATH=integrations.harbor.agent:AgentCliHarborAgent
-```
-
-Only legacy mode adds the repo root to `PYTHONPATH`.
-
 `NODE_RUNTIME_TARBALL` must point at a pre-downloaded Linux Node tarball for the target architecture when packaging the CLI. By default packaging targets `x64`; set `AGENT_TARGET_ARCH=arm64` for an arm64 artifact. If `NODE_RUNTIME_TARBALL` is unset, the package script looks for `.artifacts/cache/node-v22.16.0-linux-x64.tar.xz` or the matching arm64 cache file and fails with instructions if it is missing.
 
 Artifact checks:
@@ -347,7 +323,7 @@ Artifact checks:
 pnpm package:agent-cli
 tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/agent'
 tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/node'
-grep -R "integrations.harbor.agent" .artifacts/harbor-runtime
+grep -R "sigma_harbor_agent:SigmaCliHarborAgent" .artifacts/harbor-runtime/jobconfig*.json
 ```
 
 The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container.
