@@ -109,6 +109,52 @@ AGENT_PROVIDER=deepseek pnpm smoke:harbor
 
 The current Harbor artifact still requires `node` in the task container. Harbor setup now checks `command -v node` and `/usr/local/bin/agent --help`; if Node is missing, setup fails clearly instead of letting the task run with a broken agent. TODO: bundle Node with the artifact or produce a true single-file binary.
 
+## Benchmark Runs
+
+Terminal-Bench benchmark runs use Harbor, package the Sigma CLI first, and save artifacts under `.artifacts/bench/<run-id>/`. The run id is `YYYYMMDD-HHMMSS-provider-model`.
+
+DeepSeek small batch:
+
+```bash
+export DEEPSEEK_API_KEY=...
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm bench:tb:k -- --k 5
+```
+
+GLM/Zhipu small batch:
+
+```bash
+export ZAI_API_KEY=...
+AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm bench:tb:k -- --k 5
+```
+
+Smoke:
+
+```bash
+pnpm bench:tb:smoke
+```
+
+Single task, when the installed Harbor CLI exposes a task selection flag:
+
+```bash
+AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro pnpm bench:tb:task -- --task-id <task-id>
+```
+
+Refresh a report:
+
+```bash
+pnpm bench:tb:report -- --run-id <run-id>
+```
+
+Each run directory contains `config.json`, `command.sh`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl` and `summary.json`; if Harbor does not expose task context in a predictable way, the runner creates a placeholder task entry and the global Harbor logs are the source of truth.
+
+Failure categories are rule based and intentionally small: `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
+
+Current limitations:
+
+- The packaged Harbor artifact still requires Node in the task container. `integrations/harbor/Dockerfile.agent` is a starting point for a Node-ready agent image.
+- `bench:tb:task` inspects `harbor run --help` and fails clearly if this Harbor install does not expose a recognized task selection flag.
+- Reports can only include per-task verifier status and logs that Harbor exposes to the adapter or emits to stdout/stderr.
+
 ## CLI Flags
 
 `agent solve` supports:

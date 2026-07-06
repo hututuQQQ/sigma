@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
+import shutil
 import tempfile
+import uuid
 from typing import Any
 
 from harbor.agents.base import BaseAgent
@@ -162,6 +165,8 @@ class AgentCliHarborAgent(BaseAgent):
         env_vars = self._agent_env()
         result: Any | None = None
         error_message: str | None = None
+        summary_path: pathlib.Path | None = None
+        trace_path: pathlib.Path | None = None
 
         try:
             result = await environment.exec(
@@ -172,11 +177,18 @@ class AgentCliHarborAgent(BaseAgent):
         except Exception as exc:
             error_message = str(exc)
         finally:
-            summary_path = await self._download_if_present(environment, "/tmp/agent/summary.json", "summary.json")
-            await self._download_if_present(environment, "/tmp/agent/trace.jsonl", "trace.jsonl")
+            try:
+                summary_path = await self._download_if_present(environment, "/tmp/agent/summary.json", "summary.json")
+            except Exception as exc:
+                error_message = error_message or f"failed to download summary.json: {exc}"
+            try:
+                trace_path = await self._download_if_present(environment, "/tmp/agent/trace.jsonl", "trace.jsonl")
+            except Exception as exc:
+                error_message = error_message or f"failed to download trace.jsonl: {exc}"
 
         summary = self._read_summary(summary_path)
         self._populate_context(context, result, summary, error_message)
+        self._mirror_bench_artifacts(context, result, summary_path, trace_path)
 
     async def _install_tarball(self, environment: BaseEnvironment, tarball: pathlib.Path) -> None:
         await environment.upload_file(tarball, "/tmp/agent/agent-cli.tgz")
@@ -310,3 +322,67 @@ command -v /usr/local/bin/agent >/dev/null
             setattr(context, "metadata", metadata)
         except Exception:
             pass
+
+    def _mirror_bench_artifacts(
+        self,
+        context: AgentContext,
+        result: Any | None,
+        summary_path: pathlib.Path | None,
+        trace_path: pathlib.Path | None,
+    ) -> None:
+        run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
+        if not run_dir:
+            return
+
+        task_id = self._context_task_id(context) or str(uuid.uuid4())
+        safe_task_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-") or "task"
+        task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        if summary_path is not None and summary_path.is_file():
+            shutil.copy2(summary_path, task_dir / "summary.json")
+        if trace_path is not None and trace_path.is_file():
+            shutil.copy2(trace_path, task_dir / "trace.jsonl")
+
+        output = _output_text(result).strip() if result is not None else ""
+        if output:
+            (task_dir / "agent.log").write_text(f"{output}\n", encoding="utf-8")
+
+        metadata = {
+            "task_id": task_id,
+            "source_logs_dir": str(self.logs_dir),
+            "exit_code": getattr(context, "exit_code", None),
+            "error_message": getattr(context, "error_message", None),
+            "commands_executed": getattr(context, "commands_executed", 0),
+            "n_input_tokens": getattr(context, "n_input_tokens", 0),
+            "n_output_tokens": getattr(context, "n_output_tokens", 0),
+            "n_cache_tokens": getattr(context, "n_cache_tokens", 0),
+            "cost_usd": getattr(context, "cost_usd", None),
+        }
+        (task_dir / "metadata.json").write_text(f"{json.dumps(metadata, indent=2)}\n", encoding="utf-8")
+
+    def _context_task_id(self, context: AgentContext) -> str | None:
+        for attr in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
+            value = getattr(context, attr, None)
+            if isinstance(value, str) and value:
+                return value
+
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            for key in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+        return None
+
+    def _unique_task_dir(self, base_dir: pathlib.Path) -> pathlib.Path:
+        if not base_dir.exists() or not any(base_dir.iterdir()):
+            return base_dir
+
+        for index in range(2, 1000):
+            candidate = pathlib.Path(f"{base_dir}-{index}")
+            if not candidate.exists() or not any(candidate.iterdir()):
+                return candidate
+
+        return pathlib.Path(f"{base_dir}-{uuid.uuid4()}")
