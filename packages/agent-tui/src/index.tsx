@@ -55,6 +55,7 @@ Inside the TUI:
   /status (/s)
   /tokens (/tk)
   /context (/c)
+  /files (/f)
   /tools (/t)
   /diff (/d)
   /diff stat (/ds)
@@ -82,7 +83,8 @@ Shortcuts:
   Ctrl+W delete previous word
   Ctrl+Y yank killed text
   Left/Right move cursor
-  Tab accepts command/file suggestions or toggles plan/build mode
+  Tab accepts command/file suggestions or opens the workbench
+  Shift+Tab toggles plan/build mode
   Up/Down cycle prompt history
   @prefix suggests workspace files
 `);

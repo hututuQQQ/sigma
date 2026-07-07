@@ -16,6 +16,7 @@ import {
   yank
 } from "../packages/agent-tui/src/composer-state.js";
 import { renderComposer } from "../packages/agent-tui/src/render/composer.js";
+import { assertWithinWidth } from "../packages/agent-tui/src/ui/layout.js";
 
 const savedEnv = {
   SIGMA_ASCII: process.env.SIGMA_ASCII,
@@ -112,20 +113,27 @@ describe("agent-tui composer editor", () => {
     expect(state.text).toBe("draft");
   });
 
-  it("renders compact mode-aware composer snapshots", () => {
-    expect(renderComposer({
+  it("renders focused composer prompts with action hints", () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const build = renderComposer({
       state: createComposerState("fix tests"),
       mode: "build",
       running: false,
       approvalPending: false,
       width: 80,
       color: false
-    })).toMatchInlineSnapshot(`
-      "build › fix tests▌
-      enter send · ctrl+j newline · tab plan/build · / commands · @ files · ! shell"
-    `);
+    });
 
-    expect(renderComposer({
+    expect(build).toContain("\u2500\u2500\u2500\u2500");
+    expect(build).toContain("> fix tests\u258c");
+    expect(build).not.toContain("\u256d");
+    expect(build).not.toContain("\u2502fix tests\u258c");
+    expect(build).toContain("? for shortcuts");
+    expect(build).toContain("tab workbench");
+    expect(build).toContain("/ commands");
+    expect(assertWithinWidth(build, 80)).toBe(true);
+
+    const queued = renderComposer({
       state: createComposerState("inspect"),
       mode: "plan",
       running: true,
@@ -133,11 +141,29 @@ describe("agent-tui composer editor", () => {
       queuedInstruction: "run the focused tests",
       width: 80,
       color: false
-    })).toMatchInlineSnapshot(`
-      "draft › inspect▌
-      queued › run the focused tests
-      enter queue · ctrl+j newline · tab plan/build · / commands · @ files · ! shell"
-    `);
+    });
+
+    expect(queued).toContain("> inspect\u258c");
+    expect(queued).toContain("queued \u203a run the focused tests");
+    expect(queued).toContain("? for shortcuts");
+    expect(assertWithinWidth(queued, 80)).toBe(true);
+  });
+
+  it("renders compact mode as one prompt line", () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const rendered = renderComposer({
+      state: createComposerState("fix tests"),
+      mode: "build",
+      running: false,
+      approvalPending: false,
+      width: 80,
+      color: false,
+      compact: true
+    });
+
+    expect(rendered).toContain("> fix tests\u258c");
+    expect(rendered).not.toContain("\u256d");
+    expect(assertWithinWidth(rendered, 80)).toBe(true);
   });
 
   it("renders exactly one fake cursor glyph in composer text", () => {

@@ -1,4 +1,4 @@
-import { glyphs, truncateToWidth } from "../ui/theme.js";
+import { accent, dim, glyphs, truncateToWidth, visibleWidth } from "../ui/theme.js";
 
 export type CommandGroup = "core" | "inspect" | "run" | "configure";
 
@@ -23,14 +23,15 @@ export const COMMANDS: CommandSpec[] = [
   { name: "/status", usage: "/status", aliases: ["/s"], group: "inspect", description: "Show current run settings" },
   { name: "/tokens", usage: "/tokens", aliases: ["/tk"], group: "inspect", description: "Show token usage" },
   { name: "/context", usage: "/context", aliases: ["/c"], group: "inspect", description: "Show context and skills state" },
+  { name: "/files", usage: "/files", aliases: ["/f"], group: "inspect", description: "Open files, changes, tools, and checks", shortcut: "Tab" },
   { name: "/tools", usage: "/tools", aliases: ["/t"], group: "inspect", description: "Show recent tool calls", shortcut: "Ctrl+T" },
   { name: "/diff", usage: "/diff", aliases: ["/d"], group: "inspect", description: "Show changed-file stats", shortcut: "Ctrl+D" },
   { name: "/diff stat", usage: "/diff stat", aliases: ["/ds"], group: "inspect", description: "Show changed-file stats" },
   { name: "/diff patch", usage: "/diff patch", aliases: ["/dp"], group: "inspect", description: "Show current git patch" },
   { name: "/test", usage: "/test <command>", aliases: [], group: "run", description: "Run a local validation command", takesValue: true },
   { name: "/shell", usage: "/shell <command>", aliases: ["!"], group: "run", description: "Run a local shell command", takesValue: true },
-  { name: "/mode plan", usage: "/mode plan", aliases: [], group: "configure", description: "Disable mutating tools for new runs", shortcut: "Tab" },
-  { name: "/mode build", usage: "/mode build", aliases: [], group: "configure", description: "Restore normal tool filters", shortcut: "Tab" },
+  { name: "/mode plan", usage: "/mode plan", aliases: [], group: "configure", description: "Disable mutating tools for new runs", shortcut: "Shift+Tab" },
+  { name: "/mode build", usage: "/mode build", aliases: [], group: "configure", description: "Restore normal tool filters", shortcut: "Shift+Tab" },
   { name: "/model", usage: "/model <name>", aliases: [], group: "configure", description: "Change model", takesValue: true },
   { name: "/provider", usage: "/provider <deepseek|glm>", aliases: [], group: "configure", description: "Change provider", takesValue: true },
   { name: "/permission", usage: "/permission <ask|yolo>", aliases: [], group: "configure", description: "Change permission mode", takesValue: true },
@@ -118,11 +119,11 @@ export function canonicalCommandInput(input: string): string | null {
   return [resolved.spec.name, resolved.value].filter(Boolean).join(" ");
 }
 
-export function renderCommandPalette(buffer: string, width: number, maxRows = 14): string[] {
+export function renderCommandPalette(buffer: string, width: number, maxRows = 14, color = false): string[] {
   const g = glyphs();
   const suggestions = commandSuggestions(buffer).slice(0, maxRows);
   const query = normalizedInput(buffer) || "/";
-  const lines = ["commands"];
+  const lines = [accent("commands", color)];
   if (query !== "/") lines.push(`  ${truncateToWidth(query, Math.max(10, width - 2))}`);
   if (suggestions.length === 0) {
     lines.push("  no matching commands");
@@ -132,15 +133,16 @@ export function renderCommandPalette(buffer: string, width: number, maxRows = 14
   let lastGroup: CommandGroup | null = null;
   const nameWidth = Math.min(18, Math.max(10, ...suggestions.map((item) => item.name.length)));
   const aliasWidth = Math.min(10, Math.max(4, ...suggestions.map((item) => item.aliases.join(", ").length)));
-  for (const command of suggestions) {
+  for (const [index, command] of suggestions.entries()) {
     if (command.group !== lastGroup) {
-      lines.push(`  ${command.group}`);
+      lines.push(dim(`  ${command.group}`, color));
       lastGroup = command.group;
     }
     const aliases = command.aliases.join(", ");
     const shortcut = command.shortcut ? ` ${g.separator} ${command.shortcut}` : "";
-    const prefix = `  ${command.name.padEnd(nameWidth)}  ${aliases.padEnd(aliasWidth)}  `;
-    lines.push(`${prefix}${truncateToWidth(`${command.description}${shortcut}`, Math.max(8, width - prefix.length))}`);
+    const marker = index === 0 ? accent(g.pointer, color) : " ";
+    const prefix = `${marker} ${command.name.padEnd(nameWidth)}  ${aliases.padEnd(aliasWidth)}  `;
+    lines.push(`${prefix}${truncateToWidth(`${command.description}${shortcut}`, Math.max(8, width - visibleWidth(prefix)))}`);
   }
   const remaining = commandSuggestions(buffer).length - suggestions.length;
   if (remaining > 0) lines.push(`  ${g.ellipsis} ${remaining} more`);

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRunResult } from "../packages/agent-core/src/index.js";
 import { TuiApp, HIDE_CURSOR, SHOW_CURSOR, type TuiAppOptions, type TuiSessionRunner } from "../packages/agent-tui/src/app.js";
 import { setComposerText, type ComposerState } from "../packages/agent-tui/src/composer-state.js";
+import { stripAnsi } from "../packages/agent-tui/src/ui/theme.js";
 import { SHELL_COMMAND_HINT } from "../packages/agent-tui/src/workspace-command.js";
 
 const savedEnv = {
@@ -125,9 +126,12 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     try {
       await submit(app, "/help");
 
+      const plain = stripAnsi(stdout.last());
       expect(calls).toHaveLength(0);
-      expect(stdout.last()).toContain("\u2211 Sigma");
-      expect(stdout.last()).toContain("sum the repo \u00b7 ship the patch");
+      expect(plain).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+      expect(plain).toContain("\u2588\u2588          DeepSeek \u00b7 default");
+      expect(plain).not.toContain("\u203a_");
+      expect(plain).toContain("help");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -165,6 +169,32 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(calls).toHaveLength(0);
       expect(stdout.last()).toContain("Ready in");
       expect(stdout.last()).not.toContain(`workspace: ${root}`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("opens the workbench with /files without calling the model", async () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-files-"));
+    fs.writeFileSync(path.join(root, "README.md"), "");
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    stdout.columns = 124;
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      await submit(app, "/files");
+
+      expect(calls).toHaveLength(0);
+      expect(stdout.last()).toContain("\u2211 Workbench");
+      expect(stdout.last()).toContain("Files");
+      expect(stdout.last()).toContain("README.md");
+      expect(stdout.last()).toContain("Benchmark");
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
