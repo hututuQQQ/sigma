@@ -38,7 +38,7 @@ export function retryBudgetDecision(options: {
     return {
       retry_number: options.retryNumber,
       action: "skipped",
-      reason: "insufficient_harness_budget_for_retry",
+      reason: "insufficient_run_controller_budget_for_retry",
       trigger: options.trigger,
       remaining_harness_budget_sec: remaining,
       minimum_retry_budget_sec: minimum
@@ -65,7 +65,7 @@ export function instructionWithRetryFeedback(options: {
   const lines = [
     options.originalInstruction,
     "",
-    "The previous attempt failed harness validation. Fix the issue and rerun validation before finishing."
+    "The previous attempt failed post-run checks. Fix the issue and rerun the relevant checks before finishing."
   ];
 
   options.failedResults.forEach((result, index) => {

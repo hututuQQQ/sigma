@@ -259,6 +259,13 @@ export interface AgentHarnessSummary {
   post_run_cleanup: HarnessCleanupResult | null;
 }
 
+export type AgentRunControllerConfig = AgentHarnessConfig;
+export type AgentRunControllerSummary = AgentHarnessSummary;
+export type RunControllerCommandResult = HarnessCommandResult;
+export type RunControllerRetryDecision = HarnessRetryDecision;
+export type RunControllerCleanupResult = HarnessCleanupResult;
+export type RunControllerServiceCleanupResult = HarnessServiceCleanupResult;
+
 export interface SummaryJson {
   status: AgentRunStatus;
   finish_reason: AgentFinishReason;

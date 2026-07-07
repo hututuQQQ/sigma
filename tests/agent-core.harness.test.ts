@@ -8,11 +8,20 @@ import {
   runHarnessCommand,
   validationCommandSpecs
 } from "../packages/agent-core/src/harness/validation.js";
-import { runAgentHarness } from "../packages/agent-core/src/index.js";
+import {
+  runAgentHarness,
+  runAgentWithController,
+  type AgentRunControllerConfig,
+  type AgentRunControllerSummary,
+  type RunControllerCleanupResult,
+  type RunControllerCommandResult,
+  type RunControllerRetryDecision,
+  type RunControllerServiceCleanupResult
+} from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
   readonly provider = "deepseek" as const;
-  readonly model = "fake-harness-model";
+  readonly model = "fake-run-controller-model";
   readonly requests: ModelRequest[] = [];
   private index = 0;
 
@@ -46,10 +55,31 @@ function writeResponse(filePath: string, content: string): ModelResponse {
 }
 
 async function tempWorkspace(): Promise<string> {
-  return await mkdtemp(path.join(os.tmpdir(), "agent-harness-"));
+  return await mkdtemp(path.join(os.tmpdir(), "agent-run-controller-"));
 }
 
+function acceptRunControllerAliases(
+  _config: AgentRunControllerConfig,
+  _summary: AgentRunControllerSummary,
+  _command: RunControllerCommandResult,
+  _decision: RunControllerRetryDecision,
+  _cleanup: RunControllerCleanupResult,
+  _serviceCleanup: RunControllerServiceCleanupResult
+): void {}
+
 describe("agent-core harness", () => {
+  it("exports run-controller aliases for the existing controller API", () => {
+    expect(runAgentWithController).toBe(runAgentHarness);
+    acceptRunControllerAliases(
+      {} as AgentRunControllerConfig,
+      {} as AgentRunControllerSummary,
+      {} as RunControllerCommandResult,
+      {} as RunControllerRetryDecision,
+      {} as RunControllerCleanupResult,
+      {} as RunControllerServiceCleanupResult
+    );
+  });
+
   it("kills timed-out validation commands that ignore SIGTERM", async () => {
     const dir = await tempWorkspace();
     const startedAt = Date.now();
@@ -198,6 +228,9 @@ describe("agent-core harness", () => {
       request.messages.some((message) => message.role === "user" && String(message.content).includes("Validation failure 1"))
     );
     expect(retryRequest).toBeTruthy();
+    const retryInstruction = retryRequest?.messages.find((message) => message.role === "user")?.content;
+    expect(String(retryInstruction)).toContain("The previous attempt failed post-run checks.");
+    expect(String(retryInstruction).toLowerCase()).not.toContain("harness");
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
     expect(summary.harness.retry_decisions).toEqual([expect.objectContaining({ action: "started", trigger: "validation" })]);
     await expect(stat(path.join(attemptsDir, "attempt-1", "summary.json"))).resolves.toBeTruthy();

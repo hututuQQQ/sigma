@@ -269,7 +269,7 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     if (lastFailed.length === 0) break;
 
     if (attempt > retryLimit) {
-      failureMessage = lastFailed[lastFailed.length - 1]?.message ?? "harness validation failed";
+      failureMessage = lastFailed[lastFailed.length - 1]?.message ?? "post-run checks failed";
       break;
     }
 
@@ -286,7 +286,7 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     });
     harness.retry_decisions.push(decision);
     if (decision.action === "skipped") {
-      failureMessage = `${lastFailed[lastFailed.length - 1]?.message ?? "harness validation failed"}; retry skipped because harness budget remaining (${decision.remaining_harness_budget_sec}s) is below ${decision.minimum_retry_budget_sec}s`;
+      failureMessage = `${lastFailed[lastFailed.length - 1]?.message ?? "post-run checks failed"}; retry skipped because run-controller budget remaining (${decision.remaining_harness_budget_sec}s) is below ${decision.minimum_retry_budget_sec}s`;
       break;
     }
 

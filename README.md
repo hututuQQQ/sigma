@@ -70,6 +70,14 @@ pnpm --filter agent-tui start -- \
 
 Type a task and press Enter to start one run. TUI commands include `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, and `/diff`. The TUI uses `agent-core` directly; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
+Programmatic product integrations should prefer the run-controller API names:
+
+```ts
+import { runAgentWithController, type AgentRunControllerConfig } from "agent-core";
+```
+
+The older `runAgentHarness` and `AgentHarnessConfig` exports remain available for compatibility with existing adapters and scripts.
+
 GLM/Zhipu example:
 
 ```bash
@@ -232,7 +240,7 @@ Current limitations:
 --validation-command <command>
 --validation-commands <comma-separated-commands>
 --post-run-cleanup-globs <comma-separated-globs>
---harness-timeout-sec <number>
+--harness-timeout-sec <number>      Legacy-compatible spelling for the run-controller timeout
 --retry-min-budget-sec <number>
 --attempts-dir <path>
 --allowed-tools <comma-separated-tools>
@@ -251,7 +259,7 @@ Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/
 
 Local `agent solve` defaults to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
 
-Environment variables mirror the new flags:
+Environment variables mirror the new flags. `AGENT_HARNESS_TIMEOUT_SEC` is the compatibility spelling for the run-controller timeout:
 
 ```text
 AGENT_VALIDATION_MODE
@@ -431,7 +439,7 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
 
 When the run controller performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory.
 
-The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers.
+The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers. The summary object key is still `harness` for compatibility; product code should treat it as run-controller metadata.
 
 ## Harbor And Terminal-Bench 2.0
 

@@ -1,5 +1,5 @@
 export { runAgent, summaryJsonFromRunResult, writeRunSummary } from "./agent.js";
-export { runAgentHarness } from "./harness/index.js";
+export { runAgentHarness, runAgentHarness as runAgentWithController } from "./harness/index.js";
 export { createMcpToolRegistry } from "./mcp.js";
 export type { CreateMcpToolRegistryOptions, CreateMcpToolRegistryResult } from "./mcp.js";
 export {
@@ -47,6 +47,8 @@ export type {
   AgentHarnessConfig,
   AgentHarnessSummary,
   AgentHarnessValidationMode,
+  AgentRunControllerConfig,
+  AgentRunControllerSummary,
   AgentRunConfig,
   AgentRunResult,
   AgentRunStatus,
@@ -62,6 +64,10 @@ export type {
   PermissionMode,
   PermissionRequest,
   RegisteredTool,
+  RunControllerCleanupResult,
+  RunControllerCommandResult,
+  RunControllerRetryDecision,
+  RunControllerServiceCleanupResult,
   SummaryJson,
   TodoItem,
   TodoStatus,

@@ -6,27 +6,26 @@ Date: 2026-07-07
 
 | Command | Status |
 | --- | --- |
-| `pnpm install` | PASS: refreshed workspace links for `packages/agent-tui` |
 | `pnpm build` | PASS |
 | `pnpm lint` | PASS |
-| `pnpm test` | PASS: Vitest only; Harbor adapter tests are not part of the root test script |
+| `pnpm test` | PASS |
 | `pnpm test:harbor` | PASS: `Ran 8 tests` |
-| `pnpm test:all` | PASS: ordinary tests plus Harbor adapter tests |
 | `pnpm --filter agent-tui build` | PASS |
 | `pnpm --filter agent-tui start -- --help` | PASS: printed TUI usage and commands |
-| `rg -n "evaluator\|verifier\|benchmark\|terminal-bench\|harbor" packages\agent-core packages\agent-tui` | PASS: no matches |
 | `pnpm package:harbor-runtime` | PASS: created `.artifacts\harbor-runtime` |
-| `node -e "const p=require('./package.json'); if(!p.scripts['bench:tb:deepseek:k5']) process.exit(1); console.log(p.scripts['bench:tb:deepseek:k5'])"` | PASS: script still exists |
+| `rg -n "harness validation\|failed harness validation\|previous attempt failed harness\|verifier\|evaluator\|terminal-bench\|harbor" packages/agent-core packages/agent-tui` | PASS: no matches |
+| `rg -n "agent-tui\|packages/agent-tui\|workspacePackages" scripts/package-agent-cli.mjs tests/package-agent-cli.test.ts` | PASS: no matches |
+| `Get-ChildItem scripts -Filter 'bench-*'` | PASS: `bench-common.mjs`, `bench-report.mjs`, and `bench-terminal-bench.mjs` are present |
+| `node -e "const p=require('./package.json'); for (const k of ['bench:tb:smoke','bench:tb:k','bench:tb:task','package:harbor-runtime','test:harbor']) console.log(k+'='+p.scripts[k])"` | PASS: benchmark, packaging, and Harbor test scripts still exist |
 
 ## Coverage Notes
 
-- Product packages no longer expose evaluator/verifier/benchmark/Harbor terms in core prompt, agent loop, run controller, or TUI runtime.
-- Assistant final text is not parsed for validation commands. Validation comes from explicit config/CLI commands and the changed-file strategy.
-- Harbor adapter tests cover canonical kwargs: `validation_mode`, `validation_retry_limit`, `validation_timeout_sec`, `precheck_command`, `precheck_timeout_sec`, `post_run_cleanup_globs`, and `harness_timeout_sec`.
-- Root `pnpm test` is independent from the Harbor adapter suite; `pnpm test:harbor` and `pnpm test:all` cover the adapter path.
-- TUI build and help output verify the new package entrypoint is wired into the workspace.
+- Retry feedback sent to the next model attempt now says "post-run checks" and the agent-core test asserts the generated retry instruction does not contain the old term.
+- `agent-core` exports run-controller aliases while retaining the existing harness-named API for adapters and scripts.
+- Harbor adapter tests cover canonical run-controller kwargs and still assert `/usr/local/bin/agent solve` is used.
+- Product packages do not expose evaluator/verifier/Terminal-Bench/Harbor terms in `packages/agent-core` or `packages/agent-tui`.
+- The Harbor/Terminal-Bench adapter files and benchmark npm scripts remain in place. `package-agent-cli.mjs` still has no `agent-tui` package inclusion.
 
 ## Known Limitations
 
-- TUI updates are event-based at turn/tool granularity. Token delta rendering is future work once `agent-core` emits assistant delta events from provider streaming.
-- `pnpm package:agent-cli` was not rerun in this validation pass; `pnpm package:harbor-runtime` still generated the host-side portable runtime and JobConfig.
+- TUI updates are event-based at turn/tool granularity, not token delta streaming. Token delta rendering is future work once `agent-core` emits assistant delta events from provider streaming.

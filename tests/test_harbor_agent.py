@@ -158,7 +158,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("usage blew up", str(raised.exception))
             self.assertIn("missing runtime", str(raised.exception))
 
-    async def test_run_forwards_harness_kwargs_as_cli_flags(self):
+    async def test_run_forwards_run_controller_kwargs_as_cli_flags(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -209,7 +209,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any("sigma-precheck" in command for command, _kwargs in exec_commands))
             self.assertFalse(any("sigma-validation" in command for command, _kwargs in exec_commands))
 
-    async def test_run_accepts_portable_harness_kwarg_names(self):
+    async def test_run_forwards_canonical_run_controller_kwargs(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
