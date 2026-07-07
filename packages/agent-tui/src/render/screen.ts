@@ -1,10 +1,10 @@
-import path from "node:path";
 import type { ProviderName } from "agent-ai";
 import type { AgentEvent, AgentRunResult, PermissionMode } from "agent-core";
 import type { ComposerState } from "../composer-state.js";
 import type { TuiRunMode } from "../mode.js";
 import type { TranscriptEntry } from "../view-model.js";
 import { lineCount, splitLines } from "../ui/layout.js";
+import { displayPathName } from "../ui/path.js";
 import { truncateToWidth } from "../ui/theme.js";
 import { renderComposer } from "./composer.js";
 import { renderTranscript } from "./transcript.js";
@@ -33,7 +33,7 @@ export interface RenderScreenOptions {
 export function renderTopBar(options: RenderScreenOptions): string {
   const g = streamGlyphs();
   const width = options.width;
-  const workspace = path.basename(options.workspacePath) || options.workspacePath;
+  const workspace = displayPathName(options.workspacePath);
   const model = options.model ?? options.result?.model ?? "default";
   const state = options.running ? "running" : options.result?.status ?? "idle";
   const brand = roleColor("brand", `${g.sigma} Sigma`, options.color ?? false);

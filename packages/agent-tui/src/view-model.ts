@@ -1,4 +1,3 @@
-import path from "node:path";
 import {
   redactSecretText,
   type AgentEvent,
@@ -14,6 +13,7 @@ import {
   toolNameFromEvent,
   truncate
 } from "./components/formatting.js";
+import { displayPathName } from "./ui/path.js";
 import { glyphs } from "./ui/theme.js";
 
 export type TranscriptEntry =
@@ -39,7 +39,7 @@ function eventTime(event: AgentEvent): string {
 }
 
 function workspaceName(value: string): string {
-  return path.basename(value) || redactSecretText(value);
+  return displayPathName(redactSecretText(value));
 }
 
 function logoLockup(): string[] {
