@@ -2,7 +2,7 @@ import { redactSecretText } from "agent-core";
 import type { TranscriptEntry } from "../view-model.js";
 import { oneLine } from "../components/formatting.js";
 import { fitStreamLine, muted, roleColor, streamGlyphs } from "./theme.js";
-import { truncateToWidth, wrapText } from "../ui/theme.js";
+import { rgb, truncateToWidth, wrapText } from "../ui/theme.js";
 
 function statusMarker(status: "running" | "ok" | "failed" | undefined, color: boolean): string {
   const g = streamGlyphs();
@@ -48,10 +48,60 @@ function wrapIndented(text: string, width: number, indent = "  "): string[] {
   return wrapText(text, Math.max(10, width - indent.length)).map((line) => `${indent}${line}`);
 }
 
+const ICON_COLUMN_WIDTH = 18;
+const ICON_TILE: [number, number, number] = [63, 65, 66];
+const ICON_SIGMA: [number, number, number] = [84, 198, 190];
+const TITLE_SIGMA: [number, number, number] = [84, 198, 190];
+
+function colorWelcomeIcon(value: string, color: boolean): string {
+  return Array.from(value).map((char) => {
+    if (char === "\u25a3" || char === "[" || char === "]") {
+      return rgb(char, ICON_TILE, color);
+    }
+    if (char === "\u2211" || char === "S" || char === "\u2588") return rgb(char, ICON_SIGMA, color);
+    return char;
+  }).join("");
+}
+
+function colorBrandTitle(value: string, color: boolean): string {
+  const sigmaIndex = value.indexOf("\u2211");
+  if (sigmaIndex >= 0) {
+    return `${value.slice(0, sigmaIndex)}${rgb("\u2211", TITLE_SIGMA, color)}${value.slice(sigmaIndex + 1)}`;
+  }
+  const asciiIndex = value.indexOf("S Sigma");
+  if (asciiIndex >= 0) {
+    return `${value.slice(0, asciiIndex)}${rgb("S", TITLE_SIGMA, color)}${value.slice(asciiIndex + 1)}`;
+  }
+  return value;
+}
+
+function isWelcomeLine(text: string): boolean {
+  return text.includes("Sigma Code")
+    || text.includes("\u2588")
+    || /^\s*(?:S{2,}|SS)/.test(text);
+}
+
+function welcomeLine(line: string, color: boolean): string {
+  if (!color) return line;
+  const logo = line.slice(0, ICON_COLUMN_WIDTH);
+  const rest = line.slice(ICON_COLUMN_WIDTH);
+  return `${colorWelcomeIcon(logo, color)}${colorBrandTitle(rest, color)}`;
+}
+
 function systemLines(text: string, width: number, color: boolean): string[] {
   const g = streamGlyphs();
   const lines = text.split(/\r?\n/);
-  if (text.startsWith(g.sigma) || text.startsWith("Try:") || text.startsWith("  ")) return lines;
+  if (text.trim().length === 0) return [""];
+  if (isWelcomeLine(text)) {
+    return lines.map((line) => welcomeLine(line, color));
+  }
+  if (
+    text.startsWith(g.sigma)
+    || text.startsWith(g.topLeft)
+    || text.startsWith(g.vertical)
+    || text.startsWith(g.bottomLeft)
+    || text.startsWith("  ")
+  ) return lines;
   const [first = "", ...rest] = lines;
   return [
     `${muted(g.info, color)} ${truncateToWidth(first, Math.max(1, width - 2))}`,
@@ -76,6 +126,18 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
   }
   if (entry.kind === "diff") {
     return [joinParts([entry.mode, entry.summary])];
+  }
+  if (entry.kind === "changes") {
+    const maxShown = 8;
+    const files = entry.files.slice(0, maxShown);
+    const lines = [
+      `${statusMarker("ok", color)} Changed ${entry.files.length} file${entry.files.length === 1 ? "" : "s"}`,
+      ...files.map((file) => `  ${truncateToWidth(redactSecretText(file), Math.max(10, width - 2))}`)
+    ];
+    if (entry.files.length > files.length) lines.push(`  ${g.ellipsis} ${entry.files.length - files.length} more`);
+    lines.push("");
+    lines.push("Next: run tests?  [enter] yes  [esc] no  [d] diff");
+    return lines.map((line) => truncateToWidth(line, width));
   }
   if (entry.kind === "assistant") {
     return wrapIndented(redactSecretText(entry.text), width);

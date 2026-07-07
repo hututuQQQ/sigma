@@ -8,11 +8,13 @@ import {
   renderCommandPalette,
   resolveCommand
 } from "../packages/agent-tui/src/components/commands.js";
+import { renderFileMentionPalette } from "../packages/agent-tui/src/render/palette.js";
 import {
   activeFileMention,
   fileMentionSuggestions,
   insertFileMention
 } from "../packages/agent-tui/src/file-mentions.js";
+import { assertWithinWidth } from "../packages/agent-tui/src/ui/layout.js";
 import {
   listWorkspaceEntries,
   resolveLocalTerminalInput,
@@ -25,6 +27,7 @@ describe("agent-tui commands and mention palettes", () => {
     expect(resolveCommand("/dp")?.spec.name).toBe("/diff patch");
     expect(resolveCommand("/ds")?.spec.name).toBe("/diff stat");
     expect(resolveCommand("/q")?.spec.name).toBe("/exit");
+    expect(resolveCommand("/f")?.spec.name).toBe("/files");
     expect(resolveCommand("/w packages")).toMatchObject({
       canonicalInput: "/workspace",
       value: "packages"
@@ -43,6 +46,7 @@ describe("agent-tui commands and mention palettes", () => {
       "/diff patch"
     ]);
     const palette = renderCommandPalette("/d", 80).join("\n");
+    expect(palette).toContain("\u203a /diff");
     expect(palette).toContain("/dp");
     expect(palette).toContain("/ds");
     expect(palette).toContain("inspect");
@@ -64,6 +68,14 @@ describe("agent-tui commands and mention palettes", () => {
       text: "open @src/app.tsx",
       cursor: "open @src/app.tsx".length
     });
+
+    const palette = renderFileMentionPalette("src/", [
+      { path: "src/app.tsx", score: 100 },
+      { path: "src/render/screen-with-a-very-long-name.ts", score: 80 }
+    ], 28, 4, false);
+    expect(palette).toContain("\u203a src/app.tsx");
+    expect(palette).toContain("Tab/Enter inserts");
+    expect(assertWithinWidth(palette, 28)).toBe(true);
   });
 
   it("classifies cd as a local workspace switch before model submission", () => {

@@ -13,8 +13,8 @@ import {
   toolNameFromEvent,
   truncate
 } from "./components/formatting.js";
+import { sigmaWelcome } from "./ui/brand.js";
 import { displayPathName } from "./ui/path.js";
-import { glyphs } from "./ui/theme.js";
 
 export type TranscriptEntry =
   | { kind: "system"; text: string; timestamp?: string }
@@ -23,11 +23,14 @@ export type TranscriptEntry =
   | { kind: "tool"; name: string; status: "running" | "ok" | "failed"; summary: string; durationMs?: number; timestamp?: string }
   | { kind: "approval"; toolName: string; risk: string; summary: string; timestamp?: string }
   | { kind: "diff"; mode: "stat" | "patch"; summary: string; timestamp?: string }
+  | { kind: "changes"; files: string[]; timestamp?: string }
   | { kind: "test"; command: string; status: "running" | "ok" | "failed"; summary: string; durationMs?: number; timestamp?: string }
   | { kind: "summary"; text: string; status?: string; timestamp?: string };
 
 export interface BuildTranscriptOptions {
   workspacePath: string;
+  provider?: string;
+  model?: string;
   events: AgentEvent[];
   result: AgentRunResult | null;
   localEntries?: TranscriptEntry[];
@@ -40,14 +43,6 @@ function eventTime(event: AgentEvent): string {
 
 function workspaceName(value: string): string {
   return displayPathName(redactSecretText(value));
-}
-
-function logoLockup(): string[] {
-  const g = glyphs();
-  return [
-    `${g.sigma} Sigma`,
-    `  sum the repo ${g.separator} ship the patch`
-  ];
 }
 
 function resultStatus(result: { ok?: boolean } | undefined): "ok" | "failed" {
@@ -173,7 +168,11 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
   }
   if (entries.length === 0) {
     const workspace = workspaceName(options.workspacePath);
-    for (const line of logoLockup()) {
+    for (const line of sigmaWelcome({
+      provider: options.provider,
+      model: options.model ?? options.result?.model,
+      workspacePath: redactSecretText(options.workspacePath)
+    })) {
       entries.push({
         kind: "system",
         text: line,
@@ -182,27 +181,12 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
     }
     entries.push({
       kind: "system",
+      text: "",
+      timestamp: new Date(0).toISOString()
+    });
+    entries.push({
+      kind: "system",
       text: `Ready in ${workspace}`,
-      timestamp: new Date(0).toISOString()
-    });
-    entries.push({
-      kind: "system",
-      text: "Try:",
-      timestamp: new Date(0).toISOString()
-    });
-    entries.push({
-      kind: "system",
-      text: "  /mode plan inspect this package",
-      timestamp: new Date(0).toISOString()
-    });
-    entries.push({
-      kind: "system",
-      text: "  @src/app.tsx explain rendering",
-      timestamp: new Date(0).toISOString()
-    });
-    entries.push({
-      kind: "system",
-      text: "  !pnpm test",
       timestamp: new Date(0).toISOString()
     });
   }
@@ -219,6 +203,13 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
         timestamp: new Date(Date.now() + 1).toISOString()
       });
       return sortEntries(entries);
+    }
+    if (options.result.changedFiles && options.result.changedFiles.length > 0) {
+      entries.push({
+        kind: "changes",
+        files: options.result.changedFiles,
+        timestamp: new Date(Date.now()).toISOString()
+      });
     }
     const usageText = (options.result.usage.totalTokens ?? 0) > 0 ? formatUsage(options.result.usage) : "";
     const resultText = [

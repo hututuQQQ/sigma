@@ -57,7 +57,8 @@ import { mergeDisabledToolsForMode, type TuiRunMode } from "./mode.js";
 import { TuiPermissionController } from "./permission.js";
 import { renderCommandPaletteOverlay, renderFileMentionPalette, renderFocusOverlay } from "./render/palette.js";
 import { renderScreen } from "./render/screen.js";
-import { streamColorEnabled, streamGlyphs } from "./render/theme.js";
+import { streamColorEnabled } from "./render/theme.js";
+import { sigmaTagline, sigmaWelcome } from "./ui/brand.js";
 import { buildTranscript, type TranscriptEntry } from "./view-model.js";
 import { runSession } from "./run-session.js";
 import { truncateToWidth, wrapText } from "./ui/theme.js";
@@ -224,6 +225,8 @@ export class TuiApp {
   private queuedInstruction: string | null = null;
   private filePaths: string[] = [];
   private paletteHidden = false;
+  private workbenchOpen = false;
+  private changePromptDismissed = false;
 
   constructor(
     private readonly options: TuiAppOptions,
@@ -356,14 +359,20 @@ export class TuiApp {
     }
     if (key.name === "tab") {
       if (!key.shift && this.acceptPaletteSuggestion()) return;
-      this.toggleMode();
+      if (key.shift) {
+        this.toggleMode();
+        return;
+      }
+      void this.toggleWorkbench();
       return;
     }
     if (key.name === "return") {
       if (this.acceptFileMention()) return;
+      if (this.handleChangePromptKey("return")) return;
       void this.submitInput();
       return;
     }
+    if (!key.ctrl && !key.meta && text.toLowerCase() === "d" && this.handleChangePromptKey("d")) return;
     if (text && !key.ctrl && !key.meta && text >= " ") {
       insertText(this.composer, text);
       this.afterComposerEdit();
@@ -456,6 +465,7 @@ export class TuiApp {
       this.render();
       return;
     }
+    if (this.handleChangePromptKey("escape")) return;
     if (this.composer.text.length > 0) {
       clearComposer(this.composer);
       this.paletteHidden = false;
@@ -543,6 +553,10 @@ export class TuiApp {
     }
     if (name === "/tools") {
       this.toggleFocus("tools");
+      return;
+    }
+    if (name === "/files") {
+      await this.openWorkbench("Workbench opened.");
       return;
     }
     if (name === "/mode plan" || name === "/mode build") {
@@ -668,6 +682,8 @@ export class TuiApp {
     this.localEntries.length = 0;
     this.localCommandSnapshot = null;
     this.focusMode = "none";
+    this.workbenchOpen = false;
+    this.changePromptDismissed = false;
     this.message = message;
     this.render();
   }
@@ -690,6 +706,54 @@ export class TuiApp {
     this.render();
   }
 
+  private async openWorkbench(message: string): Promise<void> {
+    this.workbenchOpen = true;
+    this.message = message;
+    await this.refreshDiff();
+    this.render();
+  }
+
+  private async toggleWorkbench(): Promise<void> {
+    if (this.workbenchOpen) {
+      this.workbenchOpen = false;
+      this.message = "Workbench closed.";
+      this.render();
+      return;
+    }
+    await this.openWorkbench("Workbench opened.");
+  }
+
+  private changePromptActive(): boolean {
+    return !this.running
+      && !this.changePromptDismissed
+      && this.composer.text.length === 0
+      && (this.result?.changedFiles?.length ?? 0) > 0;
+  }
+
+  private handleChangePromptKey(key: "return" | "escape" | "d"): boolean {
+    if (!this.changePromptActive()) return false;
+    if (key === "escape") {
+      this.changePromptDismissed = true;
+      this.message = "Test prompt skipped.";
+      this.render();
+      return true;
+    }
+    if (key === "d") {
+      void this.toggleDiffDetail();
+      return true;
+    }
+
+    this.changePromptDismissed = true;
+    const command = this.options.validationCommands?.[0];
+    if (!command) {
+      this.message = "No validation command configured. Use /test <command>.";
+      this.render();
+      return true;
+    }
+    void this.runLocalCommand(command, "test");
+    return true;
+  }
+
   private async toggleDiffDetail(): Promise<void> {
     if (this.focusMode === "diff") {
       this.focusMode = "none";
@@ -707,6 +771,7 @@ export class TuiApp {
     this.running = true;
     this.result = null;
     this.focusMode = "none";
+    this.changePromptDismissed = false;
     this.message = "Run started.";
     this.render();
     try {
@@ -830,6 +895,8 @@ export class TuiApp {
     const rows = Math.max(12, this.stdout.rows ?? 32);
     const entries = buildTranscript({
       workspacePath: this.options.workspace,
+      provider: this.options.provider,
+      model: this.options.model ?? this.result?.model,
       events: this.events,
       result: this.result,
       localEntries: this.localEntries,
@@ -842,6 +909,9 @@ export class TuiApp {
       provider: this.options.provider,
       model: this.options.model,
       permissionMode: this.options.permissionMode,
+      validationMode: this.options.validationMode,
+      finalEvidenceMode: this.options.finalEvidenceMode,
+      maxTurns: this.options.maxTurns,
       mode: this.mode,
       running: this.running,
       result: this.result,
@@ -850,6 +920,9 @@ export class TuiApp {
       queuedInstruction: this.queuedInstruction,
       composer: this.composer,
       entries,
+      workbenchOpen: this.workbenchOpen,
+      filePaths: this.filePaths,
+      diffText: this.diffText,
       overlay,
       palette,
       width,
@@ -957,19 +1030,22 @@ export class TuiApp {
   }
 
   private helpLines(width: number): string[] {
-    const g = streamGlyphs();
     const commandLines = COMMANDS.map((command) => {
       const aliases = command.aliases.length > 0 ? ` ${command.aliases.join(", ")}` : "";
       return truncateToWidth(`${command.usage.padEnd(20)}${aliases.padEnd(10)}${command.description}`, width);
     });
     return [
-      `${g.sigma} Sigma`,
-      `  sum the repo ${g.separator} ship the patch`,
+      ...sigmaWelcome({
+        provider: this.options.provider,
+        model: this.options.model ?? this.result?.model,
+        workspacePath: redactSecretText(this.options.workspace)
+      }),
+      `  ${sigmaTagline()}`,
       "",
       "Shortcuts",
-      "Enter send   Ctrl+J newline   Tab plan/build   Esc close/clear   Ctrl+L redraw/clear",
+      "Enter send   Ctrl+J newline   Tab workbench   Shift+Tab plan/build   Esc close/clear",
       "Left/Right move cursor   Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
-      "Ctrl+D diff   Ctrl+T tools   F1 help   @ file mention   !command shell",
+      "Ctrl+D diff   Ctrl+T tools   F1 help   /files workbench   @ file mention   !command shell",
       "Local: cd <path>, pwd, ls/dir, clear/cls",
       "",
       "Commands",

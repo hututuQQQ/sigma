@@ -67,23 +67,146 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("\u2211 Sigma agent-tui");
-    expect(rendered).toContain("\u2211 Sigma");
-    expect(rendered).toContain("sum the repo \u00b7 ship the patch");
+    expect(rendered).toContain("Sigma Code v0.1.0");
+    expect(rendered).toContain("\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588");
+    expect(rendered).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+    expect(rendered).toContain("\u2588\u2588          DeepSeek \u00b7 default");
+    expect(rendered).not.toContain("\u203a_");
+    expect(rendered).toContain("DeepSeek \u00b7 default");
+    expect(rendered).toContain("D:\\software\\sigma\\packages\\agent-tui");
     expect(rendered).toContain("Ready in agent-tui");
-    expect(rendered).toContain("/mode plan inspect this package");
-    expect(rendered).toContain("@src/app.tsx explain rendering");
-    expect(rendered).toContain("!pnpm test");
-    expect(rendered).toContain(`build \u203a fi\u258cx tests`);
+    expect(rendered).not.toContain("/files open workbench");
+    expect(rendered).not.toContain("@src/app.tsx explain rendering");
+    expect(rendered).not.toContain("!pnpm test");
+    expect(rendered).toContain("> fi\u258cx tests");
+    expect(rendered).not.toContain("\u256d");
+    expect(rendered).not.toContain("\u2502fi\u258cx tests");
+    expect(rendered).toContain("? for shortcuts");
+    expect(rendered).toContain("build \u00b7 deepseek/default \u00b7 ask \u00b7 idle");
+    expect(rendered).not.toContain("auto-approve:off");
     expect(rendered).not.toContain("+--");
+    expect(rendered).not.toContain("Workbench");
     expect(rendered).not.toContain("Status");
     expect(rendered).not.toContain("Timeline");
     expect(rendered).not.toContain("system    ");
     expect(rendered).not.toContain("input=0 output=0 total=0");
+    expect(rendered).not.toContain("\u001b[");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
 
     const fullWidthRules = splitLines(rendered).filter((line) => /^\u2500{80,}$/.test(line));
-    expect(fullWidthRules.length).toBeLessThanOrEqual(1);
+    expect(fullWidthRules.length).toBeLessThanOrEqual(2);
+  });
+
+  it("renders a wide workbench panel with files, changes, tools, and checks", () => {
+    process.env.TERM = "xterm-256color";
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const start = event("tool_start", {
+      toolCall: { id: "call-1", function: { name: "read", arguments: { path: "package.json" } } }
+    });
+    const end = event("tool_end", {
+      toolName: "read",
+      result: { ok: true, content: "{}", metadata: { durationMs: 18 } }
+    }, start.id);
+    const result: AgentRunResult = {
+      status: "completed",
+      finishReason: "assistant_stop",
+      turns: 2,
+      toolCalls: 1,
+      commandsExecuted: 0,
+      usage: { inputTokens: 10, outputTokens: 5, cacheTokens: 0, totalTokens: 15 },
+      provider: "deepseek",
+      model: "fake-model",
+      durationMs: 1200,
+      lastError: null
+    };
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [start, end],
+      result
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      model: "fake-model",
+      permissionMode: "ask",
+      validationMode: "auto",
+      finalEvidenceMode: "auto",
+      maxTurns: 4,
+      mode: "build",
+      running: false,
+      result,
+      events: [start, end],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      workbenchOpen: true,
+      filePaths: ["package.json", "packages/agent-tui/src/app.tsx"],
+      diffText: " packages/agent-tui/src/app.tsx | 24 ++++++++++----",
+      width: 124,
+      height: 28,
+      color: false
+    });
+
+    expect(rendered).toContain("\u2211 Workbench");
+    expect(rendered).toContain("Files");
+    expect(rendered).toContain("package.json");
+    expect(rendered).toContain("Changes");
+    expect(rendered).toContain("packages/agent-tui/src/app.tsx");
+    expect(rendered).toContain("Tool calls");
+    expect(rendered).toContain("Benchmark");
+    expect(rendered).toContain("tokens      input=10 output=5 total=15");
+    expect(rendered).toContain("read path=package.json");
+    expect(rendered).toContain("ctx input=10/output=5/total=15");
+    expect(assertWithinWidth(rendered, 124)).toBe(true);
+  });
+
+  it("renders a diff-first changed files card after edits", () => {
+    process.env.TERM = "xterm-256color";
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const result: AgentRunResult = {
+      status: "completed",
+      finishReason: "assistant_stop",
+      turns: 2,
+      toolCalls: 1,
+      commandsExecuted: 0,
+      usage: { inputTokens: 10, outputTokens: 5, cacheTokens: 0, totalTokens: 15 },
+      provider: "deepseek",
+      model: "fake-model",
+      durationMs: 1200,
+      lastError: null,
+      changedFiles: [
+        "packages/agent-tui/src/app.tsx",
+        "packages/agent-tui/src/render/screen.ts"
+      ]
+    };
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [],
+      result
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      model: "fake-model",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(rendered).toContain("Changed 2 files");
+    expect(rendered).toContain("packages/agent-tui/src/app.tsx");
+    expect(rendered).toContain("Next: run tests?  [enter] yes  [esc] no  [d] diff");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
   });
 
   it("defaults to Unicode on Windows-like terminals without WT_SESSION", () => {
@@ -108,8 +231,8 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("\u2211 Sigma");
-    expect(rendered).not.toContain("S Sigma");
+    expect(rendered).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+    expect(rendered).not.toContain("S sigma");
   });
 
   it("renders missing API key errors as a single actionable card", () => {
@@ -175,10 +298,13 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("S Sigma");
-    expect(rendered).toContain("sum the repo | ship the patch");
-    expect(rendered).not.toContain("\u2211 Sigma");
-    expect(rendered).not.toContain("+---");
+    expect(rendered).toContain("SSSSSSSSSSS");
+    expect(rendered).toContain("SS        S Sigma Code v0.1.0");
+    expect(rendered).toContain("SS          DeepSeek | default");
+    expect(rendered).not.toContain(">_");
+    expect(rendered).toContain("DeepSeek | default");
+    expect(rendered).toContain("/tmp/sigma");
+    expect(rendered).not.toContain("\u2211 sigma");
     expect(assertWithinWidth(rendered, 54)).toBe(true);
   });
 
@@ -202,8 +328,10 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(ascii).toContain("S Sigma");
-    expect(ascii).not.toContain("\u2211 Sigma");
+    expect(ascii).toContain("SS        S Sigma Code v0.1.0");
+    expect(ascii).toContain("SS          DeepSeek | default");
+    expect(ascii).not.toContain(">_");
+    expect(ascii).not.toContain("\u2211 Sigma Code");
 
     process.env.TERM = "dumb";
     delete process.env.SIGMA_ASCII;
@@ -224,8 +352,8 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(forced).toContain("\u2211 Sigma");
-    expect(forced).not.toContain("S Sigma");
+    expect(forced).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+    expect(forced).not.toContain("S Sigma Code");
   });
 
   it("turns raw events into product-level transcript entries", () => {

@@ -16,14 +16,14 @@ export interface TerminalTheme {
 
 export const DEFAULT_THEME: TerminalTheme = {
   colors: {
-    brand: ["\x1b[36m", "\x1b[0m"],
-    accent: ["\x1b[36m", "\x1b[0m"],
-    danger: ["\x1b[31m", "\x1b[0m"],
-    dim: ["\x1b[2m", "\x1b[0m"],
-    info: ["\x1b[34m", "\x1b[0m"],
-    muted: ["\x1b[90m", "\x1b[0m"],
-    success: ["\x1b[32m", "\x1b[0m"],
-    warning: ["\x1b[33m", "\x1b[0m"]
+    brand: ["\x1b[36m", "\x1b[39m"],
+    accent: ["\x1b[36m", "\x1b[39m"],
+    danger: ["\x1b[31m", "\x1b[39m"],
+    dim: ["\x1b[2m", "\x1b[22m"],
+    info: ["\x1b[34m", "\x1b[39m"],
+    muted: ["\x1b[90m", "\x1b[39m"],
+    success: ["\x1b[32m", "\x1b[39m"],
+    warning: ["\x1b[33m", "\x1b[39m"]
   }
 };
 
@@ -119,6 +119,18 @@ export function color(text: string, role: ColorRole, enabled = supportsColor()):
   if (!enabled || text.length === 0) return text;
   const [open, close] = ROLE_CODES[role];
   return `${open}${text}${close}`;
+}
+
+export function rgb(text: string, value: [number, number, number], enabled = supportsColor()): string {
+  if (!enabled || text.length === 0) return text;
+  const [red, green, blue] = value;
+  return `\x1b[38;2;${red};${green};${blue}m${text}\x1b[39m`;
+}
+
+export function bgRgb(text: string, value: [number, number, number], enabled = supportsColor()): string {
+  if (!enabled || text.length === 0) return text;
+  const [red, green, blue] = value;
+  return `\x1b[48;2;${red};${green};${blue}m${text}\x1b[0m`;
 }
 
 export function bold(text: string, enabled = supportsColor()): string {
