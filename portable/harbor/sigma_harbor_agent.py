@@ -115,18 +115,6 @@ def _normalize_globs(value: str | list[str] | tuple[str, ...] | None) -> list[st
     return []
 
 
-def _as_bool(value: Any, fallback: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"1", "true", "yes", "on"}:
-            return True
-        if text in {"0", "false", "no", "off"}:
-            return False
-    return fallback
-
-
 class SigmaCliHarborAgent(BaseAgent):
     """Run Sigma's packaged Node CLI as a Harbor external agent."""
 
@@ -142,21 +130,18 @@ class SigmaCliHarborAgent(BaseAgent):
         max_turns: int = 200,
         command_timeout_sec: int = 180,
         max_wall_time_sec: int = 7200,
-        pre_verifier_cleanup_globs: str | list[str] | None = None,
+        post_run_cleanup_globs: str | list[str] | None = None,
         precheck_command: str | None = None,
         precheck_timeout_sec: int | None = None,
         validation_mode: str | None = None,
-        validation_retry_limit: int | None = None,
+        validation_retry_limit: int = 0,
         validation_timeout_sec: int | None = None,
         harness_timeout_sec: int | None = None,
-        precheck_retry_limit: int = 0,
-        harbor_agent_timeout_sec: int | None = None,
         agent_timeout_grace_sec: int = 120,
         retry_min_budget_sec: int | None = None,
         max_message_history_chars: int | None = 250000,
         message_history_retain: int = 24,
         compaction_summary_chars: int = 30000,
-        generic_validation_enabled: bool | str = False,
         **kwargs: Any,
     ) -> None:
         resolved_logs_dir = pathlib.Path(logs_dir) if logs_dir is not None else pathlib.Path.cwd() / ".agent" / "harbor"
@@ -169,15 +154,13 @@ class SigmaCliHarborAgent(BaseAgent):
         self.max_turns = max_turns
         self.command_timeout_sec = command_timeout_sec
         self.max_wall_time_sec = max_wall_time_sec
-        self.cleanup_globs = _normalize_globs(pre_verifier_cleanup_globs)
+        self.cleanup_globs = _normalize_globs(post_run_cleanup_globs)
         self.precheck_command = precheck_command.strip() if isinstance(precheck_command, str) and precheck_command.strip() else None
         self.precheck_timeout_sec = max(1, _as_int(precheck_timeout_sec, command_timeout_sec))
-        retry_limit = validation_retry_limit if validation_retry_limit is not None else precheck_retry_limit
-        self.validation_retry_limit = max(0, _as_int(retry_limit, 0))
-        self.validation_mode = self._resolve_validation_mode(validation_mode, generic_validation_enabled)
-        harbor_timeout_value = harness_timeout_sec if harness_timeout_sec is not None else harbor_agent_timeout_sec
-        harbor_timeout = _as_int(harbor_timeout_value, 0)
-        self.harbor_agent_timeout_sec = harbor_timeout if harbor_timeout > 0 else None
+        self.validation_retry_limit = max(0, _as_int(validation_retry_limit, 0))
+        self.validation_mode = self._resolve_validation_mode(validation_mode)
+        harness_timeout = _as_int(harness_timeout_sec, 0)
+        self.harness_timeout_sec = harness_timeout if harness_timeout > 0 else None
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         retry_min_budget = _as_int(retry_min_budget_sec, 0)
         self.retry_min_budget_sec = retry_min_budget if retry_min_budget > 0 else None
@@ -186,7 +169,6 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self.message_history_retain = max(0, _as_int(message_history_retain, 24))
         self.compaction_summary_chars = max(1, _as_int(compaction_summary_chars, 30000))
-        self.generic_validation_enabled = self.validation_mode != "off"
         self.validation_timeout_sec = max(1, _as_int(validation_timeout_sec, self.precheck_timeout_sec))
 
     @staticmethod
@@ -196,10 +178,10 @@ class SigmaCliHarborAgent(BaseAgent):
     def version(self) -> str | None:
         return "0.1.0"
 
-    def _resolve_validation_mode(self, validation_mode: str | None, generic_validation_enabled: bool | str) -> str:
+    def _resolve_validation_mode(self, validation_mode: str | None) -> str:
         if isinstance(validation_mode, str) and validation_mode.strip():
             return validation_mode.strip()
-        return "auto" if _as_bool(generic_validation_enabled, False) else "off"
+        return "off"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
@@ -302,9 +284,9 @@ class SigmaCliHarborAgent(BaseAgent):
                 ]
             )
         if self.cleanup_globs:
-            command.extend(["--pre-verifier-cleanup-globs", ",".join(self.cleanup_globs)])
-        if self.harbor_agent_timeout_sec is not None:
-            command.extend(["--harness-timeout-sec", str(self.harbor_agent_timeout_sec)])
+            command.extend(["--post-run-cleanup-globs", ",".join(self.cleanup_globs)])
+        if self.harness_timeout_sec is not None:
+            command.extend(["--harness-timeout-sec", str(self.harness_timeout_sec)])
         if self.retry_min_budget_sec is not None:
             command.extend(["--retry-min-budget-sec", str(self.retry_min_budget_sec)])
         if self.max_message_history_chars and self.max_message_history_chars > 0:
@@ -322,7 +304,7 @@ class SigmaCliHarborAgent(BaseAgent):
 
     async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str], context: AgentContext) -> Any:
         command = self._agent_command(context)
-        base_timeout = self.harbor_agent_timeout_sec or self.max_wall_time_sec
+        base_timeout = self.harness_timeout_sec or self.max_wall_time_sec
         return await environment.exec(
             " ".join(shlex.quote(part) for part in command),
             env=env_vars or None,
@@ -500,7 +482,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         validation_results = harness.get("validation_results") if isinstance(harness, dict) else []
         precheck_results = harness.get("precheck_results") if isinstance(harness, dict) else []
         retry_decisions = harness.get("retry_decisions") if isinstance(harness, dict) else []
-        cleanup = harness.get("pre_verifier_cleanup") if isinstance(harness, dict) else None
+        cleanup = harness.get("post_run_cleanup") if isinstance(harness, dict) else None
 
         metadata = {
             "task_id": task_id,
@@ -515,13 +497,13 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "cost_usd": getattr(context, "cost_usd", None),
             "precheck_results": precheck_results if isinstance(precheck_results, list) else [],
             "validation_results": validation_results if isinstance(validation_results, list) else [],
-            "generic_validation_enabled": self.generic_validation_enabled,
+            "validation_mode": self.validation_mode,
             "validation_timeout_sec": self.validation_timeout_sec,
             "precheck_timeout_sec": self.precheck_timeout_sec,
             "retry_decisions": retry_decisions if isinstance(retry_decisions, list) else [],
             "changed_app_files": self._changed_files_from_harness(summary),
             "workspace_snapshots": [],
-            "pre_verifier_cleanup": cleanup,
+            "post_run_cleanup": cleanup,
             "failure_signals": self._failure_signals_for_metadata(result, summary),
         }
         (task_dir / "metadata.json").write_text(f"{json.dumps(metadata, indent=2)}\n", encoding="utf-8")
@@ -572,9 +554,9 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 if decision.get("action") == "started" and "validation" in str(decision.get("trigger") or ""):
                     add("validation_retry_used")
 
-        cleanup = harness.get("pre_verifier_cleanup") if isinstance(harness, dict) else None
+        cleanup = harness.get("post_run_cleanup") if isinstance(harness, dict) else None
         if isinstance(cleanup, dict) and cleanup.get("warning"):
-            add("pre_verifier_cleanup_warning")
+            add("post_run_cleanup_warning")
 
         result_text = _output_text(result) if result is not None else ""
         if re.search(r"finish[_ ]?reason\"?\s*[:=]\s*\"?max_wall_time", result_text, flags=re.IGNORECASE) or re.search(

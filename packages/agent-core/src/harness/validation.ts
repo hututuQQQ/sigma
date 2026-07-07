@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { HarnessCommandResult, SummaryJson } from "../types.js";
+import type { HarnessCommandResult } from "../types.js";
 import { runBashCommand } from "../command-runner.js";
 
 export interface ValidationCommandSpec {
@@ -17,27 +17,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function validationCommandsFromValue(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((command): command is string => typeof command === "string" && command.trim().length > 0);
-}
-
-export function summaryValidationCommands(summary: SummaryJson | Record<string, unknown> | undefined): ValidationCommandSpec[] {
-  if (!summary || typeof summary !== "object") return [];
-  const commands = [
-    ...validationCommandsFromValue((summary as { validation_commands?: unknown }).validation_commands),
-    ...validationCommandsFromValue((summary as { validationCommands?: unknown }).validationCommands)
-  ];
-  const harness = (summary as { harness?: unknown }).harness;
-  if (harness && typeof harness === "object") {
-    commands.push(
-      ...validationCommandsFromValue((harness as { validation_commands?: unknown }).validation_commands),
-      ...validationCommandsFromValue((harness as { validationCommands?: unknown }).validationCommands)
-    );
-  }
-  return [...new Set(commands)].map((command) => ({ source: "summary", command, relatedFiles: [] }));
-}
-
 function scriptRunCommand(filePath: string): string | null {
   const base = path.posix.basename(filePath);
   if (!/^(check|verify|validate|test)(?:[_\-.].*|$)/.test(base)) return null;
@@ -48,6 +27,13 @@ function scriptRunCommand(filePath: string): string | null {
     return `if command -v node >/dev/null 2>&1; then node ${quoted}; else echo 'node not found for validation' >&2; exit 127; fi`;
   }
   return null;
+}
+
+export function explicitValidationCommandSpecs(commands: string[] = []): ValidationCommandSpec[] {
+  return commands
+    .map((command) => command.trim())
+    .filter((command, index, list) => command.length > 0 && list.indexOf(command) === index)
+    .map((command) => ({ source: "configured", command, relatedFiles: [] }));
 }
 
 export function genericValidationCommandSpecs(changedFiles: string[]): ValidationCommandSpec[] {
@@ -75,11 +61,11 @@ export function genericValidationCommandSpecs(changedFiles: string[]): Validatio
 }
 
 export function validationCommandSpecs(
-  summary: SummaryJson,
+  configuredCommands: string[] = [],
   changedFiles: string[]
 ): ValidationCommandSpec[] {
   const specs = [
-    ...summaryValidationCommands(summary),
+    ...explicitValidationCommandSpecs(configuredCommands),
     ...genericValidationCommandSpecs(changedFiles)
   ];
   const seen = new Set<string>();

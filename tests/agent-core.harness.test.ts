@@ -8,11 +8,20 @@ import {
   runHarnessCommand,
   validationCommandSpecs
 } from "../packages/agent-core/src/harness/validation.js";
-import { runAgentHarness } from "../packages/agent-core/src/index.js";
+import {
+  runAgentHarness,
+  runAgentWithController,
+  type AgentRunControllerConfig,
+  type AgentRunControllerSummary,
+  type RunControllerCleanupResult,
+  type RunControllerCommandResult,
+  type RunControllerRetryDecision,
+  type RunControllerServiceCleanupResult
+} from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
   readonly provider = "deepseek" as const;
-  readonly model = "fake-harness-model";
+  readonly model = "fake-run-controller-model";
   readonly requests: ModelRequest[] = [];
   private index = 0;
 
@@ -46,10 +55,31 @@ function writeResponse(filePath: string, content: string): ModelResponse {
 }
 
 async function tempWorkspace(): Promise<string> {
-  return await mkdtemp(path.join(os.tmpdir(), "agent-harness-"));
+  return await mkdtemp(path.join(os.tmpdir(), "agent-run-controller-"));
 }
 
+function acceptRunControllerAliases(
+  _config: AgentRunControllerConfig,
+  _summary: AgentRunControllerSummary,
+  _command: RunControllerCommandResult,
+  _decision: RunControllerRetryDecision,
+  _cleanup: RunControllerCleanupResult,
+  _serviceCleanup: RunControllerServiceCleanupResult
+): void {}
+
 describe("agent-core harness", () => {
+  it("exports run-controller aliases for the existing controller API", () => {
+    expect(runAgentWithController).toBe(runAgentHarness);
+    acceptRunControllerAliases(
+      {} as AgentRunControllerConfig,
+      {} as AgentRunControllerSummary,
+      {} as RunControllerCommandResult,
+      {} as RunControllerRetryDecision,
+      {} as RunControllerCleanupResult,
+      {} as RunControllerServiceCleanupResult
+    );
+  });
+
   it("kills timed-out validation commands that ignore SIGTERM", async () => {
     const dir = await tempWorkspace();
     const startedAt = Date.now();
@@ -119,13 +149,13 @@ describe("agent-core harness", () => {
     expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
   });
 
-  it("does not generate task-specific validation", () => {
+  it("combines explicitly configured validation with generic changed-file checks", () => {
     const specs = validationCommandSpecs(
-      { validation_commands: ["npm test"] } as never,
+      ["npm test"],
       ["main.py"]
     );
 
-    expect(specs.map((spec) => spec.source)).toEqual(["summary", "changed-file"]);
+    expect(specs.map((spec) => spec.source)).toEqual(["configured", "changed-file"]);
     expect(specs.map((spec) => spec.command)).toEqual(["npm test", "python -m py_compile main.py"]);
   });
 
@@ -198,6 +228,9 @@ describe("agent-core harness", () => {
       request.messages.some((message) => message.role === "user" && String(message.content).includes("Validation failure 1"))
     );
     expect(retryRequest).toBeTruthy();
+    const retryInstruction = retryRequest?.messages.find((message) => message.role === "user")?.content;
+    expect(String(retryInstruction)).toContain("The previous attempt failed post-run checks.");
+    expect(String(retryInstruction).toLowerCase()).not.toContain("harness");
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
     expect(summary.harness.retry_decisions).toEqual([expect.objectContaining({ action: "started", trigger: "validation" })]);
     await expect(stat(path.join(attemptsDir, "attempt-1", "summary.json"))).resolves.toBeTruthy();
@@ -244,7 +277,7 @@ describe("agent-core harness", () => {
     expect(retryRequest).toBeTruthy();
   });
 
-  it("runs pre-verifier cleanup and records warnings separately from success", async () => {
+  it("runs post-run cleanup and records warnings separately from success", async () => {
     const dir = await tempWorkspace();
     const target = path.join(dir, "cleanup.tmp");
     await writeFile(target, "cleanup", "utf8");
@@ -256,14 +289,14 @@ describe("agent-core harness", () => {
       workspacePath: dir,
       modelClient: model,
       validationMode: "off",
-      preVerifierCleanupGlobs: [target],
+      postRunCleanupGlobs: [target],
       permissionMode: "yolo",
       summaryJsonPath: summaryPath
     });
 
     expect(result.status).toBe("completed");
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
-    expect(summary.harness.pre_verifier_cleanup).toMatchObject({ patterns: [target], exit_code: 0 });
+    expect(summary.harness.post_run_cleanup).toMatchObject({ patterns: [target], exit_code: 0 });
     await expect(stat(target)).rejects.toThrow();
   });
 });

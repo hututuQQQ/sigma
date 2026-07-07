@@ -23,11 +23,33 @@ function formatOutput(exitCode: number | null, stdout: string, stderr: string, t
   return parts.join("\n");
 }
 
+function looksLikeLongRunningServerCommand(command: string): boolean {
+  const normalized = command.replace(/\s+/g, " ").trim().toLowerCase();
+  const patterns = [
+    /(?:^|[;&|()]\s*)(?:npm|pnpm|yarn|bun) (?:run )?dev(?:\s|$)/,
+    /(?:^|[;&|()]\s*)(?:npx )?vite(?:\s|$)/,
+    /(?:^|[;&|()]\s*)(?:npm exec |pnpm exec |yarn )?vite(?:\s|$)/,
+    /(?:^|[;&|()]\s*)(?:npx )?next dev(?:\s|$)/,
+    /(?:^|[;&|()]\s*)(?:npx )?astro dev(?:\s|$)/,
+    /(?:^|[;&|()]\s*)(?:npx )?nuxt dev(?:\s|$)/
+  ];
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
 export async function executeBashTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
   const parsed = (args && typeof args === "object" ? args : {}) as BashArgs;
   const command = typeof parsed.command === "string" ? parsed.command : "";
   if (!command.trim()) {
     return { ok: false, content: "bash requires a non-empty command string" };
+  }
+
+  if (looksLikeLongRunningServerCommand(command)) {
+    return {
+      ok: false,
+      content:
+        "This looks like a long-running dev server command. Use service.start instead of bash so the run can continue after the server is ready.",
+      metadata: { blockedReason: "long_running_service_command" }
+    };
   }
 
   if (isProbablyMutatingCommand(command)) {

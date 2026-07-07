@@ -173,7 +173,7 @@ describe("agent loop", () => {
     expect(thirdRequestMessages[1]).toMatchObject({ role: "user", content: "make lots of output" });
     expect(thirdRequestMessages[2].role).toBe("user");
     expect((thirdRequestMessages[2] as { content?: string }).content).toContain(
-      "Previous agent conversation compacted by harness."
+      "Previous agent conversation compacted by the run controller."
     );
     expect(thirdRequestMessages[3].role).toBe("assistant");
   });

@@ -35,6 +35,15 @@ importers:
         specifier: workspace:*
         version: link:../agent-ai
 
+  packages/agent-tui:
+    dependencies:
+      agent-ai:
+        specifier: workspace:*
+        version: link:../agent-ai
+      agent-core:
+        specifier: workspace:*
+        version: link:../agent-core
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.1':

@@ -24,7 +24,7 @@ async function pathsForPattern(pattern: string): Promise<string[]> {
   }
 }
 
-export async function runPreVerifierCleanup(patterns: string[]): Promise<HarnessCleanupResult | null> {
+export async function runPostRunCleanup(patterns: string[]): Promise<HarnessCleanupResult | null> {
   if (patterns.length === 0) return null;
   const removed: string[] = [];
   const skipped: string[] = [];

@@ -25,11 +25,12 @@ export interface CliConfig {
   messageHistoryRetain: number;
   compactionSummaryChars: number;
   validationMode: AgentHarnessValidationMode;
+  validationCommands: string[];
   validationRetryLimit: number;
   validationTimeoutSec?: number;
   precheckCommand?: string;
   precheckTimeoutSec?: number;
-  preVerifierCleanupGlobs: string[];
+  postRunCleanupGlobs: string[];
   harnessTimeoutSec?: number;
   retryMinBudgetSec?: number;
   attemptsDir?: string;
@@ -158,6 +159,25 @@ function stringListValue(value: unknown): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function validationCommandList(options: { singleValues: unknown[]; listValues: unknown[] }): string[] {
+  const seen = new Set<string>();
+  const items: string[] = [];
+  const add = (values: string[]) => {
+    for (const item of values.map((value) => value.trim()).filter(Boolean)) {
+      if (seen.has(item)) continue;
+      seen.add(item);
+      items.push(item);
+    }
+  };
+  for (const value of options.singleValues) {
+    if (typeof value === "string") add([value]);
+  }
+  for (const value of options.listValues) {
+    add(stringListValue(value));
+  }
+  return items;
+}
+
 function optionalNumberValue(value: unknown): number | undefined {
   if (value === undefined || value === null || value === true || value === "") return undefined;
   const parsed = Number(value);
@@ -254,6 +274,10 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         stringValue(config.validation_mode) ??
         "off"
     ),
+    validationCommands: validationCommandList({
+      singleValues: [flags["validation-command"], process.env.AGENT_VALIDATION_COMMAND, config.validation_command],
+      listValues: [flags["validation-commands"], process.env.AGENT_VALIDATION_COMMANDS, config.validation_command_list]
+    }),
     validationRetryLimit: Math.max(
       0,
       Math.floor(
@@ -275,10 +299,10 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     precheckTimeoutSec: optionalNumberValue(
       flags["precheck-timeout-sec"] ?? process.env.AGENT_PRECHECK_TIMEOUT_SEC ?? config.precheck_timeout_sec
     ),
-    preVerifierCleanupGlobs: stringListValue(
-      flags["pre-verifier-cleanup-globs"] ??
-        process.env.AGENT_PRE_VERIFIER_CLEANUP_GLOBS ??
-        config.pre_verifier_cleanup_globs
+    postRunCleanupGlobs: stringListValue(
+      flags["post-run-cleanup-globs"] ??
+        process.env.AGENT_POST_RUN_CLEANUP_GLOBS ??
+        config.post_run_cleanup_globs
     ),
     harnessTimeoutSec: optionalNumberValue(
       flags["harness-timeout-sec"] ?? process.env.AGENT_HARNESS_TIMEOUT_SEC ?? config.harness_timeout_sec

@@ -7,50 +7,25 @@ Date: 2026-07-07
 | Command | Status |
 | --- | --- |
 | `pnpm build` | PASS |
-| `pnpm test` | PASS: Vitest suite and `python -m unittest tests.test_harbor_agent` |
 | `pnpm lint` | PASS |
-| `pnpm smoke:local:fake` | PASS |
-| `pnpm package:agent-cli` | PASS: created `.artifacts\agent-cli-linux-x64.tgz` using `.artifacts\cache\node-v22.16.0-linux-x64.tar.xz` |
-| `node packages\agent-cli\dist\index.js --help` | PASS |
-| `node packages\agent-cli\dist\index.js doctor --workspace .` | PASS: reported local config; `DEEPSEEK_API_KEY=missing` is environmental and not required for this check |
-| `node packages\agent-cli\dist\index.js replay --trace-jsonl .artifacts\smoke-local\create-file\trace.jsonl` | PASS |
+| `pnpm test` | PASS |
+| `pnpm test:harbor` | PASS: `Ran 8 tests` |
+| `pnpm --filter agent-tui build` | PASS |
+| `pnpm --filter agent-tui start -- --help` | PASS: printed TUI usage and commands |
+| `pnpm package:harbor-runtime` | PASS: created `.artifacts\harbor-runtime` |
+| `rg -n "harness validation\|failed harness validation\|previous attempt failed harness\|verifier\|evaluator\|terminal-bench\|harbor" packages/agent-core packages/agent-tui` | PASS: no matches |
+| `rg -n "agent-tui\|packages/agent-tui\|workspacePackages" scripts/package-agent-cli.mjs tests/package-agent-cli.test.ts` | PASS: no matches |
+| `Get-ChildItem scripts -Filter 'bench-*'` | PASS: `bench-common.mjs`, `bench-report.mjs`, and `bench-terminal-bench.mjs` are present |
+| `node -e "const p=require('./package.json'); for (const k of ['bench:tb:smoke','bench:tb:k','bench:tb:task','package:harbor-runtime','test:harbor']) console.log(k+'='+p.scripts[k])"` | PASS: benchmark, packaging, and Harbor test scripts still exist |
 
-## Smoke Tasks
+## Coverage Notes
 
-`pnpm smoke:local:fake` passed all deterministic local tasks:
-
-| Task | Status |
-| --- | --- |
-| `create-file` | PASS |
-| `edit-file` | PASS |
-| `fix-test` | PASS |
-| `inspect-and-summarize` | PASS |
-
-Artifacts were written under `.artifacts/smoke-local/`.
-
-## Feature Coverage
-
-This validation covers:
-
-- Extensible tool registry injection, merging, filtering, and duplicate-name rejection.
-- New tools: `list`, `glob`, `grep`, `git_status`, `git_diff`, `apply_patch`, and `todo`.
-- `apply_patch` timeout handling for stalled `git apply` subprocesses, including `metadata.timedOut` and stdout/stderr tails.
-- `apply_patch` path parsing for quoted paths with spaces, check-only quoted paths, quoted traversal rejection, and malformed `diff --git` headers.
-- Shared timeout handling for `git_status` and `git_diff`.
-- Permission decider behavior for `ask`, `yolo`, denial, allow, and per-run `always_allow`.
-- Project instruction loading from AGENTS/SIGMA-style files.
-- Deterministic repo-map prompt context.
-- Live stderr stream UI and `--no-stream-ui`.
-- CLI config flags/env/config plumbing for tools, context, MCP, and stream UI.
-- Stdio MCP v0 with fake server lifecycle, tool listing, tool calls, timeouts, filtering, disabled servers, and approval policy.
-- CLI-visible MCP enabled-server errors via redacted `[sigma] mcp_error ...` stderr warnings while preserving non-strict core-tool behavior and summary `mcp_servers` error data.
-- Summary JSON optional fields for tools, changed files, todos, project instruction sources, context mode, repo-map size, and MCP servers.
-- Secret redaction for traces, summaries, stream UI, final output, and approval prompts.
-- Existing Harbor unit tests and fake-provider smoke tasks.
+- Retry feedback sent to the next model attempt now says "post-run checks" and the agent-core test asserts the generated retry instruction does not contain the old term.
+- `agent-core` exports run-controller aliases while retaining the existing harness-named API for adapters and scripts.
+- Harbor adapter tests cover canonical run-controller kwargs and still assert `/usr/local/bin/agent solve` is used.
+- Product packages do not expose evaluator/verifier/Terminal-Bench/Harbor terms in `packages/agent-core` or `packages/agent-tui`.
+- The Harbor/Terminal-Bench adapter files and benchmark npm scripts remain in place. `package-agent-cli.mjs` still has no `agent-tui` package inclusion.
 
 ## Known Limitations
 
-- MCP v0 supports local stdio servers only; HTTP/OAuth MCP is future work.
-- Repo maps are static, deterministic context blocks. They do not use embeddings or a vector database.
-- Stream UI is event-based and does not require provider token streaming. Provider SSE streaming remains optional future work.
-- Config TOML parsing remains intentionally minimal: top-level scalar values and comma-separated list strings.
+- TUI updates are event-based at turn/tool granularity, not token delta streaming. Token delta rendering is future work once `agent-core` emits assistant delta events from provider streaming.

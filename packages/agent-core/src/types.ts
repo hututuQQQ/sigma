@@ -125,11 +125,12 @@ export interface AgentRunConfig {
 
 export interface AgentHarnessConfig extends AgentRunConfig {
   validationMode?: AgentHarnessValidationMode;
+  validationCommands?: string[];
   validationRetryLimit?: number;
   validationTimeoutSec?: number;
   precheckCommand?: string;
   precheckTimeoutSec?: number;
-  preVerifierCleanupGlobs?: string[];
+  postRunCleanupGlobs?: string[];
   harnessTimeoutSec?: number;
   retryMinBudgetSec?: number;
   attemptsDir?: string;
@@ -254,9 +255,16 @@ export interface AgentHarnessSummary {
   validation_results: HarnessCommandResult[];
   precheck_results: HarnessCommandResult[];
   retry_decisions: HarnessRetryDecision[];
-  service_cleanup?: HarnessServiceCleanupResult | null;
-  pre_verifier_cleanup: HarnessCleanupResult | null;
+  managed_service_finalization?: HarnessServiceCleanupResult | null;
+  post_run_cleanup: HarnessCleanupResult | null;
 }
+
+export type AgentRunControllerConfig = AgentHarnessConfig;
+export type AgentRunControllerSummary = AgentHarnessSummary;
+export type RunControllerCommandResult = HarnessCommandResult;
+export type RunControllerRetryDecision = HarnessRetryDecision;
+export type RunControllerCleanupResult = HarnessCleanupResult;
+export type RunControllerServiceCleanupResult = HarnessServiceCleanupResult;
 
 export interface SummaryJson {
   status: AgentRunStatus;
@@ -273,7 +281,6 @@ export interface SummaryJson {
   duration_ms: number;
   last_error: string | null;
   final_message?: string;
-  validation_commands?: string[];
   harness?: AgentHarnessSummary;
   tools_available?: string[];
   changed_files?: string[];

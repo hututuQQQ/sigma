@@ -2,7 +2,7 @@ export { executeBashTool } from "./bash.js";
 export { executeReadTool } from "./read.js";
 export { executeWriteTool } from "./write.js";
 export { executeEditTool } from "./edit.js";
-export { executeServiceTool, cleanupServicesBeforeVerifier } from "./service.js";
+export { executeServiceTool, finalizeManagedServices } from "./service.js";
 export { executeListTool } from "./list.js";
 export { executeGlobTool, matchesSimpleGlob } from "./glob.js";
 export { executeGrepTool } from "./grep.js";

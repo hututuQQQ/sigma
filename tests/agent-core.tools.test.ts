@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  cleanupServicesBeforeVerifier,
   executeBashTool,
   executeEditTool,
   executeReadTool,
+  finalizeManagedServices,
   executeServiceTool,
   executeWriteTool,
   type ToolExecutionContext
@@ -64,6 +64,15 @@ describe("agent-core tools", () => {
     const result = await executeBashTool({ command: "sleep 2; echo late", timeoutSec: 0.1 }, context);
     expect(result.ok).toBe(false);
     expect(result.metadata?.timedOut).toBe(true);
+  });
+
+  it("guides dev servers to the service tool instead of blocking bash", async () => {
+    const { context } = await workspace();
+    const result = await executeBashTool({ command: "npm run dev -- --host 127.0.0.1" }, context);
+
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("service.start");
+    expect(result.metadata?.blockedReason).toBe("long_running_service_command");
   });
 
   it("returns after shell exit even when a background child keeps stdout open", async () => {
@@ -147,6 +156,8 @@ describe("agent-core tools", () => {
       context
     );
     expect(start.ok).toBe(true);
+    expect(start.content).toContain(`url=http://127.0.0.1:${port}`);
+    expect(start.metadata?.url).toBe(`http://127.0.0.1:${port}`);
 
     const status = await executeServiceTool({ action: "status", name: "web" }, context);
     expect(status.ok).toBe(true);
@@ -160,7 +171,7 @@ describe("agent-core tools", () => {
     expect(stop.ok).toBe(true);
   });
 
-  it("preserves keepForVerifier services during pre-verifier cleanup", async () => {
+  it("preserves keepAliveAfterRun services during managed service finalization", async () => {
     const { dir, context } = await workspace();
     process.env.AGENT_SERVICE_REGISTRY = path.join(dir, "services.json");
     process.env.AGENT_SERVICE_LOG_DIR = path.join(dir, "logs");
@@ -175,7 +186,7 @@ describe("agent-core tools", () => {
     ).resolves.toMatchObject({ ok: true });
     await expect(
       executeServiceTool(
-        { action: "start", name: "kept", command: "node -e \"setInterval(()=>{}, 1000)\"", keepForVerifier: true },
+        { action: "start", name: "kept", command: "node -e \"setInterval(()=>{}, 1000)\"", keepAliveAfterRun: true },
         context
       )
     ).resolves.toMatchObject({ ok: true });
@@ -209,14 +220,14 @@ describe("agent-core tools", () => {
           name: "explicit-stop",
           command: `node -e "require('http').createServer((req,res)=>res.end('ok')).listen(${explicitStopPort}, '127.0.0.1')"`,
           port: explicitStopPort,
-          keepForVerifier: false,
+          keepAliveAfterRun: false,
           readinessTimeoutSec: 5
         },
         context
       )
     ).resolves.toMatchObject({ ok: true });
 
-    const cleanup = await cleanupServicesBeforeVerifier();
+    const cleanup = await finalizeManagedServices();
     expect(cleanup.stopped).toContain("temp");
     expect(cleanup.stopped).toContain("explicit-stop");
     expect(cleanup.kept).toContain("kept");

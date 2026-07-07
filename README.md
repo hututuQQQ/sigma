@@ -1,12 +1,13 @@
 # Sigma Agent Runtime
 
-A small coding-agent monorepo inspired by Pi with three layers:
+A small coding-agent monorepo inspired by Pi with four layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
-- `packages/agent-core`: autonomous loop, extensible tool registry, repo-aware context, benchmark harness, JSONL tracing, session records, MCP bridge, and workspace tools
+- `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, JSONL tracing, session records, MCP bridge, and workspace tools
 - `packages/agent-cli`: plain terminal CLI with `solve`, `chat`, `doctor`, and `replay`
+- `packages/agent-tui`: interactive terminal product entry that drives `agent-core` directly
 
-Sigma keeps the CLI and harness portable while adding repo instructions, deterministic repo maps, live stderr progress, approval-gated mutating tools, and stdio MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
+Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, and stdio MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
 
 ## Install And Build
 
@@ -14,12 +15,21 @@ Sigma keeps the CLI and harness portable while adding repo instructions, determi
 pnpm install
 pnpm build
 pnpm test
+pnpm test:harbor
 ```
+
+`pnpm test` runs the product TypeScript/Vitest suite. `pnpm test:harbor` runs only the external Harbor adapter Python tests, and `pnpm test:all` runs both.
 
 The CLI binary is named `agent` after build:
 
 ```bash
 pnpm --filter agent-cli start -- --help
+```
+
+The TUI entry is named `agent-tui` after build:
+
+```bash
+pnpm --filter agent-tui start -- --help
 ```
 
 ## Local Usage
@@ -47,6 +57,26 @@ DEEPSEEK_API_KEY=... pnpm --filter agent-cli start -- solve \
   --trace-jsonl ./trace.jsonl \
   --summary-json ./summary.json
 ```
+
+Interactive TUI example:
+
+```bash
+pnpm --filter agent-tui start -- \
+  --workspace . \
+  --provider deepseek \
+  --model deepseek-v4-pro \
+  --permission-mode ask
+```
+
+Type a task and press Enter to start one run. TUI commands include `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, and `/diff`. The TUI uses `agent-core` directly; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
+
+Programmatic product integrations should prefer the run-controller API names:
+
+```ts
+import { runAgentWithController, type AgentRunControllerConfig } from "agent-core";
+```
+
+The older `runAgentHarness` and `AgentHarnessConfig` exports remain available for compatibility with existing adapters and scripts.
 
 GLM/Zhipu example:
 
@@ -109,7 +139,9 @@ AGENT_PROVIDER=deepseek pnpm smoke:harbor
 
 The Harbor artifact is a self-contained Linux bundle when built with a Node runtime tarball. Provide `NODE_RUNTIME_TARBALL` or place the pinned Node tarball in `.artifacts/cache/`; task containers do not need system `node` for the preferred tarball install path.
 
-## Benchmark Runs
+## External Benchmark Adapters
+
+Harbor and Terminal-Bench support lives at the edge of the repo in `portable/harbor` and `scripts/bench-*`. Those files are external adapters and reporting tools. They may package and launch Sigma, but product core code must not depend on Harbor task identity, verifier output, benchmark names, or scoring details.
 
 Terminal-Bench benchmark runs use Harbor, package the Sigma CLI first, and save artifacts under `.artifacts/bench/<run-id>/`. The run id is `YYYYMMDD-HHMMSS-provider-model`.
 
@@ -160,13 +192,13 @@ Refresh all reports:
 pnpm bench:tb:report:all
 ```
 
-Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl`, `summary.json`, and harness attempt artifacts; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
+Each run directory contains `config.json`, `command.sh`, `resolved-job.config.json`, `harbor.stdout.log`, `harbor.stderr.log`, `result.raw.log`, `report.json`, `report.md`, and `tasks/<task-id-or-index>/` when per-task files are available. The Harbor adapter always attempts to download `trace.jsonl`, `summary.json`, and run attempt artifacts; if Harbor does not expose task context in a predictable way, the report falls back to `harbor-jobs/**/agent/trace.jsonl` and Harbor trial `result.json`.
 
 Failure categories are rule based and intentionally small: `host_proxy_error`, `host_encoding_error`, `harbor_cli_error`, `node_missing`, `agent_setup_failed`, `api_error`, `agent_timeout`, `max_turns`, `tool_timeout`, `verifier_failed`, `agent_crashed`, and `unknown`. Counts in `report.json` group those into `passed`, `failed`, `infra_failed`, `timeout`, `api_error`, and `unknown`.
 
 Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `portable/harbor` or `scripts/bench`, do not prioritize changes to Harbor adapter plumbing.
 
-Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` harness flags. The portable Harbor runtime only forwards benchmark kwargs to the CLI and mirrors artifacts.
+Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` run-controller flags. The portable Harbor runtime only forwards explicit adapter kwargs to the CLI and mirrors artifacts; it must not feed verifier failures or benchmark identity back into the solving agent.
 
 Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
 
@@ -205,8 +237,10 @@ Current limitations:
 --validation-timeout-sec <number>
 --precheck-command <command>
 --precheck-timeout-sec <number>
---pre-verifier-cleanup-globs <comma-separated-globs>
---harness-timeout-sec <number>
+--validation-command <command>
+--validation-commands <comma-separated-commands>
+--post-run-cleanup-globs <comma-separated-globs>
+--harness-timeout-sec <number>      Legacy-compatible spelling for the run-controller timeout
 --retry-min-budget-sec <number>
 --attempts-dir <path>
 --allowed-tools <comma-separated-tools>
@@ -223,11 +257,21 @@ Current limitations:
 
 Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/.agent/config.toml`, then defaults. TOML support is intentionally minimal for MVP scalar values.
 
-Local `agent solve` defaults to `--validation-mode off`. Benchmark runners pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those harness behaviors are wanted.
+Local `agent solve` defaults to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
 
-Environment variables mirror the new flags:
+Environment variables mirror the new flags. `AGENT_HARNESS_TIMEOUT_SEC` is the compatibility spelling for the run-controller timeout:
 
 ```text
+AGENT_VALIDATION_MODE
+AGENT_VALIDATION_COMMAND
+AGENT_VALIDATION_COMMANDS
+AGENT_VALIDATION_RETRY_LIMIT
+AGENT_VALIDATION_TIMEOUT_SEC
+AGENT_PRECHECK_COMMAND
+AGENT_PRECHECK_TIMEOUT_SEC
+AGENT_POST_RUN_CLEANUP_GLOBS
+AGENT_HARNESS_TIMEOUT_SEC
+AGENT_RETRY_MIN_BUDGET_SEC
 AGENT_ALLOWED_TOOLS
 AGENT_DISABLED_TOOLS
 AGENT_NO_PROJECT_INSTRUCTIONS
@@ -261,7 +305,7 @@ The core loop exposes these default tools:
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `todo`: maintains run-scoped todo state for the agent.
 
-Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and remains the expected mode for automated benchmarks.
+Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and is intended only for trusted unattended automation.
 
 Interactive approval prompt:
 
@@ -355,7 +399,6 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
   "model": "deepseek-v4-pro",
   "duration_ms": 123456,
   "last_error": null,
-  "validation_commands": ["python check_cert.py"],
   "tools_available": ["bash", "read", "write"],
   "changed_files": ["src/index.ts"],
   "todo_items": [
@@ -388,18 +431,19 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
     "validation_results": [],
     "precheck_results": [],
     "retry_decisions": [],
-    "pre_verifier_cleanup": null
+    "managed_service_finalization": null,
+    "post_run_cleanup": null
   }
 }
 ```
 
-When the harness performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory.
+When the run controller performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory.
 
-The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers.
+The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers. The summary object key is still `harness` for compatibility; product code should treat it as run-controller metadata.
 
 ## Harbor And Terminal-Bench 2.0
 
-The Sigma agent runtime is built from `packages/agent-ai`, `packages/agent-core`, and `packages/agent-cli`. `pnpm package:agent-cli` turns those packages into a portable Linux CLI tarball for task containers. `pnpm package:harbor-runtime` then creates the host-side portable Harbor runtime and JobConfigs in:
+The portable Harbor runtime is built from `packages/agent-ai`, `packages/agent-core`, and `packages/agent-cli`. `packages/agent-tui` is intentionally not included in the Harbor task-container bundle. `pnpm package:agent-cli` turns the CLI packages into a portable Linux tarball for task containers. `pnpm package:harbor-runtime` then creates the host-side portable Harbor runtime and JobConfigs in:
 
 ```text
 .artifacts/harbor-runtime/
@@ -422,7 +466,7 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 ```
 
-Harbor benchmark execution uses the portable runtime generated under `.artifacts/harbor-runtime`. The old in-repo Harbor adapter has been removed. Use `sigma_harbor_agent:SigmaCliHarborAgent`.
+Harbor benchmark execution uses the portable runtime generated under `.artifacts/harbor-runtime` from `portable/harbor/sigma_harbor_agent.py`. Product packages do not import this adapter. Use `sigma_harbor_agent:SigmaCliHarborAgent`.
 
 Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They require the portable runtime directory on `PYTHONPATH`; they do not require the repo root.
 
