@@ -14,6 +14,7 @@ export function printRunResult(
   const lines = [
     `status=${result.status}`,
     `finish_reason=${result.finishReason}`,
+    ...(result.sessionId ? [`session_id=${result.sessionId}`] : []),
     `turns=${result.turns}`,
     `tool_calls=${result.toolCalls}`,
     `commands_executed=${result.commandsExecuted}`,

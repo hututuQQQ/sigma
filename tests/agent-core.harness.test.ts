@@ -11,6 +11,7 @@ import {
 import {
   runAgentHarness,
   runAgentWithController,
+  listSessions,
   type AgentRunControllerConfig,
   type AgentRunControllerSummary,
   type RunControllerCleanupResult,
@@ -263,6 +264,81 @@ describe("agent-core harness", () => {
 
     expect(result.status).toBe("error");
     expect(result.finishReason).toBe("validation_failed");
+  });
+
+  it("records validation failure as the final durable session status", async () => {
+    const dir = await tempWorkspace();
+    const model = new SequenceModel([finalResponse("attempt completed")]);
+
+    const result = await runAgentHarness({
+      instruction: "finish but fail validation",
+      workspacePath: dir,
+      modelClient: model,
+      validationMode: "auto",
+      validationCommands: ["node -e \"process.stderr.write('validation failed'); process.exit(1)\""],
+      validationRetryLimit: 0,
+      validationTimeoutSec: 5,
+      permissionMode: "yolo"
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.finishReason).toBe("validation_failed");
+    expect(result.sessionId).toEqual(expect.any(String));
+
+    const sessions = await listSessions({ workspacePath: dir });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      sessionId: result.sessionId,
+      status: "error",
+      finishReason: "validation_failed"
+    });
+    const summary = JSON.parse(await readFile(sessions[0].summaryPath, "utf8"));
+    expect(summary).toMatchObject({
+      status: "error",
+      finish_reason: "validation_failed",
+      harness: {
+        validation_results: [
+          expect.objectContaining({
+            kind: "validation",
+            exit_code: 1
+          })
+        ]
+      }
+    });
+  });
+
+  it("records precheck failure as the final durable session status", async () => {
+    const dir = await tempWorkspace();
+    const model = new SequenceModel([finalResponse("attempt completed")]);
+
+    const result = await runAgentHarness({
+      instruction: "finish but fail precheck",
+      workspacePath: dir,
+      modelClient: model,
+      validationMode: "off",
+      validationRetryLimit: 0,
+      precheckCommand: "node -e \"process.stderr.write('precheck failed'); process.exit(1)\"",
+      precheckTimeoutSec: 5,
+      permissionMode: "yolo"
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.finishReason).toBe("precheck_failed");
+
+    const sessions = await listSessions({ workspacePath: dir });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      sessionId: result.sessionId,
+      status: "error",
+      finishReason: "precheck_failed"
+    });
+    const summary = JSON.parse(await readFile(sessions[0].summaryPath, "utf8"));
+    expect(summary.harness.precheck_results).toEqual([
+      expect.objectContaining({
+        kind: "precheck",
+        exit_code: 1
+      })
+    ]);
   });
 
   it("adds precheck failure details to retry feedback", async () => {

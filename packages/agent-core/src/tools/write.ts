@@ -47,6 +47,7 @@ export async function executeWriteTool(args: unknown, context: ToolExecutionCont
       metadata: {
         path: filePath,
         relativePath,
+        changedFiles: [relativePath],
         bytes: Buffer.byteLength(parsed.content, "utf8")
       }
     };

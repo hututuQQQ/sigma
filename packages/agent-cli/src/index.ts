@@ -2,6 +2,12 @@
 import { runChatCommand } from "./commands/chat.js";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runReplayCommand } from "./commands/replay.js";
+import {
+  runCheckpointCommand,
+  runCheckpointsCommand,
+  runSessionCommand,
+  runSessionsCommand
+} from "./commands/session.js";
 import { runRunCommand, runSolveCommand } from "./commands/solve.js";
 
 function printHelp(): void {
@@ -11,6 +17,11 @@ Commands:
   run      Run the autonomous coding agent once
   solve    Compatibility alias for run
   chat     Start a minimal plain-terminal chat session
+  sessions List recent durable sessions
+  history  Compatibility alias for sessions
+  session  Show, search, resume, or fork sessions
+  checkpoints List checkpoints for a session
+  checkpoint  Show or restore a checkpoint
   doctor   Check local configuration
   replay   Summarize a trace JSONL file
 
@@ -47,6 +58,10 @@ async function main(): Promise<number> {
   if (command === "run") return await runRunCommand(rest);
   if (command === "solve") return await runSolveCommand(rest);
   if (command === "chat") return await runChatCommand(rest);
+  if (command === "sessions" || command === "history") return await runSessionsCommand(rest);
+  if (command === "session") return await runSessionCommand(rest);
+  if (command === "checkpoints") return await runCheckpointsCommand(rest);
+  if (command === "checkpoint") return await runCheckpointCommand(rest);
   if (command === "doctor") return await runDoctorCommand(rest);
   if (command === "replay") return await runReplayCommand(rest);
 

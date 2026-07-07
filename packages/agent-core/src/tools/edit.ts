@@ -77,7 +77,7 @@ export async function executeEditTool(args: unknown, context: ToolExecutionConte
     return {
       ok: true,
       content: `Edited ${relativePath} (${replacements} replacement(s))`,
-      metadata: { path: filePath, relativePath, replacements }
+      metadata: { path: filePath, relativePath, changedFiles: [relativePath], replacements }
     };
   } catch (error) {
     return { ok: false, content: error instanceof Error ? error.message : String(error) };

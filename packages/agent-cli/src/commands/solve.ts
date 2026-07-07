@@ -21,6 +21,13 @@ export interface SolveCommandDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
 }
 
+export interface RunCommandOverrides {
+  instruction?: string;
+  workspacePath?: string;
+  parentSessionId?: string;
+  forkedFromSessionId?: string;
+}
+
 async function readStdin(stream: NodeJS.ReadableStream): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) {
@@ -122,7 +129,8 @@ Output flags:
 async function runNonInteractiveCommand(
   argv: string[],
   deps: SolveCommandDeps,
-  commandName: "run" | "solve"
+  commandName: "run" | "solve",
+  overrides: RunCommandOverrides = {}
 ): Promise<number> {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
@@ -139,7 +147,8 @@ async function runNonInteractiveCommand(
 
     const { flags, positionals } = parseArgs(argv);
     const cliConfig = loadCliConfig(flags);
-    const instruction = await resolveInstruction(flags, positionals, deps);
+    const instruction = overrides.instruction ?? await resolveInstruction(flags, positionals, deps);
+    const workspacePath = overrides.workspacePath ?? cliConfig.workspace;
     const eventBus = new AgentEventBus();
     detachJsonStream = cliConfig.outputFormat === "stream-json"
       ? eventBus.on((event) => writeStreamJsonEvent(event, stdout))
@@ -155,9 +164,11 @@ async function runNonInteractiveCommand(
 
     const { result } = await runConfiguredAgent({
       instruction,
-      workspacePath: cliConfig.workspace,
+      workspacePath,
       provider: cliConfig.provider,
       model: cliConfig.model,
+      parentSessionId: overrides.parentSessionId,
+      forkedFromSessionId: overrides.forkedFromSessionId,
       modelClientFactory: factory,
       maxTurns: cliConfig.maxTurns,
       maxWallTimeSec: cliConfig.maxWallTimeSec,
@@ -220,4 +231,12 @@ export async function runRunCommand(argv: string[], deps: SolveCommandDeps = {})
 
 export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
   return await runNonInteractiveCommand(argv, deps, "solve");
+}
+
+export async function runRunCommandWithOverrides(
+  argv: string[],
+  deps: SolveCommandDeps = {},
+  overrides: RunCommandOverrides = {}
+): Promise<number> {
+  return await runNonInteractiveCommand(argv, deps, "run", overrides);
 }

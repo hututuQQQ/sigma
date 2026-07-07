@@ -25,6 +25,11 @@ export interface RunConfiguredAgentOptions {
   model?: string;
   modelClient?: ModelClient;
   modelClientFactory?: (provider: ProviderName, options: ProviderOptions) => ModelClient;
+  sessionId?: string;
+  sessionRootDir?: string;
+  durableSession?: boolean;
+  parentSessionId?: string;
+  forkedFromSessionId?: string;
   permissionMode?: PermissionMode;
   maxTurns?: number;
   maxWallTimeSec?: number;
@@ -61,6 +66,7 @@ export interface RunConfiguredAgentOptions {
   permissionDecider?: PermissionDecider;
   toolRegistry?: ToolRegistry;
   onMcpServers?: (servers: McpServerRunSummary[]) => void;
+  abortSignal?: AbortSignal;
 }
 
 export interface RunConfiguredAgentResult {
@@ -100,6 +106,11 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     instruction: options.instruction,
     workspacePath: options.workspacePath,
     modelClient,
+    ...(defined(options.sessionId) ? { sessionId: options.sessionId } : {}),
+    ...(defined(options.sessionRootDir) ? { sessionRootDir: options.sessionRootDir } : {}),
+    ...(defined(options.durableSession) ? { durableSession: options.durableSession } : {}),
+    ...(defined(options.parentSessionId) ? { parentSessionId: options.parentSessionId } : {}),
+    ...(defined(options.forkedFromSessionId) ? { forkedFromSessionId: options.forkedFromSessionId } : {}),
     ...(defined(options.maxTurns) ? { maxTurns: options.maxTurns } : {}),
     ...(defined(options.maxWallTimeSec) ? { maxWallTimeSec: options.maxWallTimeSec } : {}),
     ...(defined(options.commandTimeoutSec) ? { commandTimeoutSec: options.commandTimeoutSec } : {}),
@@ -123,7 +134,8 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     ...(defined(options.finalEvidenceMode) ? { finalEvidenceMode: options.finalEvidenceMode } : {}),
     ...(defined(options.skillsMode) ? { skillsMode: options.skillsMode } : {}),
     ...(defined(options.skillsMaxChars) ? { skillsMaxChars: options.skillsMaxChars } : {}),
-    ...(defined(options.eventBus) ? { eventBus: options.eventBus } : {})
+    ...(defined(options.eventBus) ? { eventBus: options.eventBus } : {}),
+    ...(defined(options.abortSignal) ? { abortSignal: options.abortSignal } : {})
   };
 }
 
