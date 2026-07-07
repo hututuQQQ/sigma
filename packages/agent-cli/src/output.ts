@@ -1,6 +1,16 @@
-import { redactSecretText, type AgentRunResult } from "agent-core";
+import { redactSecrets, redactSecretText, type AgentEvent, type AgentRunResult } from "agent-core";
 
-export function printRunResult(result: AgentRunResult, stdout: NodeJS.WritableStream = process.stdout): void {
+export function printRunResult(
+  result: AgentRunResult,
+  stdout: NodeJS.WritableStream = process.stdout,
+  options: { quiet?: boolean } = {}
+): void {
+  if (options.quiet) {
+    const message = result.finalMessage?.trim();
+    stdout.write(message ? `${redactSecretText(message)}\n` : `status=${result.status} finish_reason=${result.finishReason}\n`);
+    return;
+  }
+
   const lines = [
     `status=${result.status}`,
     `finish_reason=${result.finishReason}`,
@@ -18,6 +28,18 @@ export function printRunResult(result: AgentRunResult, stdout: NodeJS.WritableSt
     lines.push(redactSecretText(result.finalMessage));
   }
   stdout.write(`${lines.join("\n")}\n`);
+}
+
+export function printJsonRunResult(result: AgentRunResult, stdout: NodeJS.WritableStream = process.stdout): void {
+  stdout.write(`${JSON.stringify(redactSecrets(result))}\n`);
+}
+
+export function writeJsonLine(value: unknown, stdout: NodeJS.WritableStream = process.stdout): void {
+  stdout.write(`${JSON.stringify(redactSecrets(value))}\n`);
+}
+
+export function writeStreamJsonEvent(event: AgentEvent, stdout: NodeJS.WritableStream = process.stdout): void {
+  writeJsonLine({ type: "event", event }, stdout);
 }
 
 export function maskSecret(value: string | undefined): string {

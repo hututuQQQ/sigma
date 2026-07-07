@@ -19,6 +19,8 @@ export interface CliConfig {
   workspace: string;
   provider: ProviderName;
   model?: string;
+  outputFormat: CliOutputFormat;
+  quiet: boolean;
   maxTurns: number;
   maxWallTimeSec: number;
   commandTimeoutSec: number;
@@ -54,6 +56,8 @@ export interface CliConfig {
   noStreamUi: boolean;
 }
 
+export type CliOutputFormat = "text" | "json" | "stream-json";
+
 const DEFAULTS = {
   maxTurns: 20,
   maxWallTimeSec: 900,
@@ -67,6 +71,15 @@ const DEFAULTS = {
   repoMapMaxChars: 20000,
   skillsMaxChars: 8000
 };
+
+const BOOLEAN_FLAGS = new Set([
+  "enable-mcp",
+  "json",
+  "no-project-instructions",
+  "no-stream-ui",
+  "quiet",
+  "stream-ui"
+]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const flags: Record<string, string | boolean> = {};
@@ -83,6 +96,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
     const equalsIndex = withoutPrefix.indexOf("=");
     if (equalsIndex !== -1) {
       flags[withoutPrefix.slice(0, equalsIndex)] = withoutPrefix.slice(equalsIndex + 1);
+      continue;
+    }
+
+    if (BOOLEAN_FLAGS.has(withoutPrefix)) {
+      flags[withoutPrefix] = true;
       continue;
     }
 
@@ -159,6 +177,11 @@ function validationModeValue(value: unknown): AgentHarnessValidationMode {
   throw new Error(`Unsupported validation mode '${String(value)}'. Use off or auto.`);
 }
 
+function outputFormatValue(value: unknown): CliOutputFormat {
+  if (value === "text" || value === "json" || value === "stream-json") return value;
+  throw new Error(`Unsupported output format '${String(value)}'. Use text, json, or stream-json.`);
+}
+
 function finalEvidenceModeValue(value: unknown): AgentFinalEvidenceMode {
   if (value === "off" || value === "auto") return value;
   throw new Error(`Unsupported final evidence mode '${String(value)}'. Use off or auto.`);
@@ -233,13 +256,24 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     process.env.AGENT_SESSION_JSONL ??
     stringValue(config.session_jsonl) ??
     path.join(workspace, ".agent", "session.jsonl");
+  const outputFormat = flags.json !== undefined
+    ? "json"
+    : outputFormatValue(
+        stringValue(flags["output-format"]) ??
+          process.env.AGENT_OUTPUT_FORMAT ??
+          stringValue(config.output_format) ??
+          "text"
+      );
+  const quiet = boolValue(flags.quiet ?? process.env.AGENT_QUIET ?? config.quiet, false);
   const configuredNoStreamUi = boolValue(process.env.AGENT_NO_STREAM_UI ?? config.no_stream_ui, false);
   const configuredStreamUi =
     flags["stream-ui"] !== undefined
       ? true
       : flags["no-stream-ui"] !== undefined
         ? false
-        : boolValue(process.env.AGENT_STREAM_UI ?? config.stream_ui, !configuredNoStreamUi);
+        : outputFormat !== "text" || quiet
+          ? false
+          : boolValue(process.env.AGENT_STREAM_UI ?? config.stream_ui, !configuredNoStreamUi);
   const validationMode = validationModeValue(
     stringValue(flags["validation-mode"]) ??
       process.env.AGENT_VALIDATION_MODE ??
@@ -251,6 +285,8 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     workspace,
     provider,
     model,
+    outputFormat,
+    quiet,
     maxTurns: numberValue(flags["max-turns"] ?? process.env.AGENT_MAX_TURNS ?? config.max_turns, DEFAULTS.maxTurns),
     maxWallTimeSec: numberValue(
       flags["max-wall-time-sec"] ?? process.env.AGENT_MAX_WALL_TIME_SEC ?? config.max_wall_time_sec,

@@ -4,8 +4,8 @@ import path from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
-import { loadCliConfig } from "../packages/agent-cli/src/config.js";
-import { runSolveCommand } from "../packages/agent-cli/src/commands/solve.js";
+import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
+import { runRunCommand, runSolveCommand } from "../packages/agent-cli/src/commands/solve.js";
 
 class FinalModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -125,6 +125,23 @@ describe("agent-cli solve", () => {
     });
   });
 
+  it("parses output flags and positional instructions", () => {
+    const parsed = parseArgs(["Fix failing tests", "--json", "--quiet"]);
+    expect(parsed.positionals).toEqual(["Fix failing tests"]);
+    const flagFirst = parseArgs(["--json", "Fix failing tests"]);
+    expect(flagFirst.flags.json).toBe(true);
+    expect(flagFirst.positionals).toEqual(["Fix failing tests"]);
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "output-format": "stream-json" })).toMatchObject({
+      outputFormat: "stream-json",
+      noStreamUi: true
+    });
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", json: true, quiet: true })).toMatchObject({
+      outputFormat: "json",
+      quiet: true,
+      noStreamUi: true
+    });
+  });
+
   it("defaults final evidence mode to auto only when validation is auto", () => {
     expect(loadCliConfig({ workspace: "work", provider: "deepseek" }).finalEvidenceMode).toBe("off");
     expect(loadCliConfig({ workspace: "work", provider: "deepseek", "validation-mode": "auto" }).finalEvidenceMode).toBe("auto");
@@ -160,6 +177,90 @@ describe("agent-cli solve", () => {
     expect(summary).toMatchObject({ status: "completed", provider: "deepseek", model: "fake-cli-model" });
     expect(summary).not.toHaveProperty("harness");
     await expect(readFile(tracePath, "utf8")).resolves.toContain("run_end");
+  });
+
+  it("supports agent run with a positional instruction", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-run-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+
+    const code = await runRunCommand(
+      ["finish immediately", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "yolo", "--no-stream-ui"],
+      {
+        stdout,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain("status=completed");
+  });
+
+  it("prints exactly one parseable JSON result in json mode", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-json-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+
+    const code = await runRunCommand(
+      ["finish immediately", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "yolo", "--json"],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stderr.text()).toBe("");
+    const parsed = JSON.parse(stdout.text()) as { status?: string; finalMessage?: string };
+    expect(parsed).toMatchObject({ status: "completed", finalMessage: "all set" });
+    expect(stdout.text()).not.toContain("status=completed");
+  });
+
+  it("prints valid JSONL events and a final result in stream-json mode", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-stream-json-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+
+    const code = await runRunCommand(
+      [
+        "finish immediately",
+        "--workspace",
+        dir,
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--output-format",
+        "stream-json"
+      ],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stderr.text()).toBe("");
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
+    expect(records.some((record) => record.type === "event")).toBe(true);
+    expect(records[records.length - 1]).toMatchObject({ type: "result" });
+  });
+
+  it("prints only the final message in quiet text mode", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-quiet-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+
+    const code = await runRunCommand(
+      ["finish immediately", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "yolo", "--quiet"],
+      {
+        stdout,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stdout.text()).toBe("all set\n");
   });
 
   it("prints live stream UI to stderr unless disabled", async () => {

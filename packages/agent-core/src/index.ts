@@ -1,5 +1,13 @@
 export { runAgent, summaryJsonFromRunResult, writeRunSummary } from "./agent.js";
 export { runAgentHarness, runAgentHarness as runAgentWithController } from "./harness/index.js";
+export {
+  runConfiguredAgent,
+  shouldUseAgentRunController
+} from "./run-controller.js";
+export type {
+  RunConfiguredAgentOptions,
+  RunConfiguredAgentResult
+} from "./run-controller.js";
 export { createMcpToolRegistry } from "./mcp.js";
 export type { CreateMcpToolRegistryOptions, CreateMcpToolRegistryResult } from "./mcp.js";
 export {

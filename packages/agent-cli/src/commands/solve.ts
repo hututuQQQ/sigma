@@ -4,18 +4,13 @@ import type { ModelClient, ProviderName, ProviderOptions } from "agent-ai";
 import { createModelClient } from "agent-ai";
 import {
   AgentEventBus,
-  createDefaultToolRegistry,
-  createMcpToolRegistry,
-  mergeToolRegistries,
   redactSecretText,
-  runAgent,
-  runAgentHarness,
+  runConfiguredAgent,
   truncateMiddle,
-  type McpServerRunSummary,
-  type ToolRegistry
+  type McpServerRunSummary
 } from "agent-core";
 import { loadCliConfig, parseArgs } from "../config.js";
-import { printRunResult } from "../output.js";
+import { printJsonRunResult, printRunResult, writeJsonLine, writeStreamJsonEvent } from "../output.js";
 import { createInteractivePermissionDecider } from "../permission.js";
 import { attachStreamUi } from "../stream-ui.js";
 
@@ -36,6 +31,7 @@ async function readStdin(stream: NodeJS.ReadableStream): Promise<string> {
 
 async function resolveInstruction(
   flags: Record<string, string | boolean>,
+  positionals: string[],
   deps: SolveCommandDeps
 ): Promise<string> {
   if (typeof flags.instruction === "string") {
@@ -44,6 +40,10 @@ async function resolveInstruction(
 
   if (typeof flags["instruction-file"] === "string") {
     return await readFile(flags["instruction-file"], "utf8");
+  }
+
+  if (positionals.length > 0) {
+    return positionals.join(" ");
   }
 
   const stdin = deps.stdin ?? processStdin;
@@ -55,19 +55,6 @@ async function resolveInstruction(
   throw new Error("No instruction supplied. Use --instruction, --instruction-file, or pipe text on stdin.");
 }
 
-function shouldUseHarness(cliConfig: ReturnType<typeof loadCliConfig>): boolean {
-  return (
-    cliConfig.validationMode === "auto" ||
-    cliConfig.validationCommands.length > 0 ||
-    cliConfig.validationRetryLimit > 0 ||
-    Boolean(cliConfig.precheckCommand?.trim()) ||
-    cliConfig.postRunCleanupGlobs.length > 0 ||
-    Boolean(cliConfig.harnessTimeoutSec) ||
-    Boolean(cliConfig.retryMinBudgetSec) ||
-    Boolean(cliConfig.attemptsDir)
-  );
-}
-
 function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.WritableStream): void {
   for (const server of servers) {
     if (!server.enabled || !server.error) continue;
@@ -77,19 +64,86 @@ function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.W
   }
 }
 
-export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
+function printNonInteractiveHelp(commandName: "run" | "solve", stdout: NodeJS.WritableStream): void {
+  const aliasNote = commandName === "solve" ? "Compatibility alias for agent run." : "Run the autonomous coding agent once.";
+  stdout.write(`${commandName === "solve" ? "agent solve" : "agent run"} [instruction] [flags]
+
+${aliasNote}
+
+Instruction input:
+  agent run "Fix failing tests"
+  agent run --instruction "Fix failing tests"
+  agent run --instruction-file ./task.md
+  printf "Fix failing tests" | agent run
+
+Core flags:
+  --workspace <path>
+  --provider <deepseek|glm>
+  --model <name>
+  --permission-mode <ask|yolo>
+  --max-turns <number>
+  --max-wall-time-sec <number>
+  --command-timeout-sec <number>
+
+Run-controller flags:
+  --validation-mode <off|auto>
+  --validation-command <command>
+  --validation-commands <comma-separated>
+  --validation-retry-limit <number>
+  --validation-timeout-sec <number>
+  --precheck-command <command>
+  --precheck-timeout-sec <number>
+  --harness-timeout-sec <number>
+  --retry-min-budget-sec <number>
+  --attempts-dir <path>
+
+Context and tool flags:
+  --allowed-tools <comma-separated>
+  --disabled-tools <comma-separated>
+  --context-mode <off|repo-map>
+  --repo-map-max-chars <number>
+  --final-evidence-mode <off|auto>
+  --skills-mode <off|auto>
+  --skills-max-chars <number>
+  --enable-mcp
+  --mcp-config <path>
+
+Output flags:
+  --output-format <text|json|stream-json>
+  --json
+  --quiet
+  --stream-ui / --no-stream-ui
+  --trace-jsonl <path>
+  --session-jsonl <path>
+  --summary-json <path>
+`);
+}
+
+async function runNonInteractiveCommand(
+  argv: string[],
+  deps: SolveCommandDeps,
+  commandName: "run" | "solve"
+): Promise<number> {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   const stdin = deps.stdin ?? processStdin;
   const factory = deps.modelClientFactory ?? createModelClient;
   let detachStreamUi: (() => void) | undefined;
+  let detachJsonStream: (() => void) | undefined;
 
   try {
-    const { flags } = parseArgs(argv);
+    if (argv.includes("--help") || argv.includes("-h")) {
+      printNonInteractiveHelp(commandName, stdout);
+      return 0;
+    }
+
+    const { flags, positionals } = parseArgs(argv);
     const cliConfig = loadCliConfig(flags);
-    const instruction = await resolveInstruction(flags, deps);
-    const modelClient = factory(cliConfig.provider, { model: cliConfig.model });
+    const instruction = await resolveInstruction(flags, positionals, deps);
     const eventBus = new AgentEventBus();
+    detachJsonStream = cliConfig.outputFormat === "stream-json"
+      ? eventBus.on((event) => writeStreamJsonEvent(event, stdout))
+      : undefined;
     detachStreamUi = cliConfig.noStreamUi ? undefined : attachStreamUi(eventBus, stderr);
     const permissionDecider = cliConfig.permissionMode === "ask"
       ? createInteractivePermissionDecider({
@@ -98,22 +152,13 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
           stderr
         })
       : undefined;
-    let toolRegistry: ToolRegistry | undefined;
-    let mcpServers: McpServerRunSummary[] | undefined;
-    if (cliConfig.enableMcp) {
-      const mcp = await createMcpToolRegistry({
-        workspacePath: cliConfig.workspace,
-        configPath: cliConfig.mcpConfig
-      });
-      mcpServers = mcp.servers;
-      writeMcpServerWarnings(mcpServers, stderr);
-      toolRegistry = mergeToolRegistries([createDefaultToolRegistry(), mcp.registry]);
-    }
 
-    const runConfig = {
+    const { result } = await runConfiguredAgent({
       instruction,
       workspacePath: cliConfig.workspace,
-      modelClient,
+      provider: cliConfig.provider,
+      model: cliConfig.model,
+      modelClientFactory: factory,
       maxTurns: cliConfig.maxTurns,
       maxWallTimeSec: cliConfig.maxWallTimeSec,
       commandTimeoutSec: cliConfig.commandTimeoutSec,
@@ -125,6 +170,16 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
       messageHistoryRetain: cliConfig.messageHistoryRetain,
       compactionSummaryChars: cliConfig.compactionSummaryChars,
+      validationMode: cliConfig.validationMode,
+      validationCommands: cliConfig.validationCommands,
+      validationRetryLimit: cliConfig.validationRetryLimit,
+      validationTimeoutSec: cliConfig.validationTimeoutSec,
+      precheckCommand: cliConfig.precheckCommand,
+      precheckTimeoutSec: cliConfig.precheckTimeoutSec,
+      postRunCleanupGlobs: cliConfig.postRunCleanupGlobs,
+      harnessTimeoutSec: cliConfig.harnessTimeoutSec,
+      retryMinBudgetSec: cliConfig.retryMinBudgetSec,
+      attemptsDir: cliConfig.attemptsDir,
       allowedTools: cliConfig.allowedTools,
       disabledTools: cliConfig.disabledTools,
       permissionDecider,
@@ -135,33 +190,34 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       finalEvidenceMode: cliConfig.finalEvidenceMode,
       skillsMode: cliConfig.skillsMode,
       skillsMaxChars: cliConfig.skillsMaxChars,
+      enableMcp: cliConfig.enableMcp,
+      mcpConfig: cliConfig.mcpConfig,
       eventBus,
-      ...(toolRegistry ? { toolRegistry } : {}),
-      ...(mcpServers ? { mcpServers } : {})
-    };
-
-    const result = shouldUseHarness(cliConfig)
-      ? await runAgentHarness({
-          ...runConfig,
-          validationMode: cliConfig.validationMode,
-          validationCommands: cliConfig.validationCommands,
-          validationRetryLimit: cliConfig.validationRetryLimit,
-          validationTimeoutSec: cliConfig.validationTimeoutSec,
-          precheckCommand: cliConfig.precheckCommand,
-          precheckTimeoutSec: cliConfig.precheckTimeoutSec,
-          postRunCleanupGlobs: cliConfig.postRunCleanupGlobs,
-          harnessTimeoutSec: cliConfig.harnessTimeoutSec,
-          retryMinBudgetSec: cliConfig.retryMinBudgetSec,
-          attemptsDir: cliConfig.attemptsDir
-        })
-      : await runAgent(runConfig);
+      onMcpServers: (servers) => writeMcpServerWarnings(servers, stderr)
+    });
 
     detachStreamUi?.();
-    printRunResult(result, stdout);
+    detachJsonStream?.();
+    if (cliConfig.outputFormat === "json") {
+      printJsonRunResult(result, stdout);
+    } else if (cliConfig.outputFormat === "stream-json") {
+      writeJsonLine({ type: "result", result }, stdout);
+    } else {
+      printRunResult(result, stdout, { quiet: cliConfig.quiet });
+    }
     return result.status === "error" ? 1 : 0;
   } catch (error) {
     detachStreamUi?.();
+    detachJsonStream?.();
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
+}
+
+export async function runRunCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
+  return await runNonInteractiveCommand(argv, deps, "run");
+}
+
+export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
+  return await runNonInteractiveCommand(argv, deps, "solve");
 }
