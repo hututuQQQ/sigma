@@ -51,7 +51,7 @@ describe("smoke fake model", () => {
     expect(smokeTaskNames).toEqual(taskNames);
 
     for (const taskName of taskNames) {
-      const taskDir = path.resolve("examples", "smoke-tasks", taskName);
+      const taskDir = path.resolve("test-fixtures", "smoke-tasks", taskName);
       const workspace = await mkdtemp(path.join(os.tmpdir(), `sigma-smoke-${taskName}-`));
       const seedPath = path.join(taskDir, "seed.sh");
       if (existsSync(seedPath)) {
