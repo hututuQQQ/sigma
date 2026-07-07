@@ -81,6 +81,10 @@ function looksLikeSymbolLine(line: string): boolean {
   );
 }
 
+function looksLikeTestLine(line: string): boolean {
+  return /\b(describe|it|test)\s*\(|\b(assert|expect)\s*\(/.test(line);
+}
+
 function pathScore(file: WalkFile, tokens: string[], kind: RepoQueryKind): number {
   const lowerPath = file.relativePath.toLowerCase();
   let score = 0;
@@ -107,12 +111,6 @@ async function scoreFile(options: {
   tokens: string[];
   kind: RepoQueryKind;
 }): Promise<RepoQueryMatch[]> {
-  const info = await stat(options.file.absolutePath);
-  if (info.size > MAX_FILE_BYTES) return [];
-  const buffer = await readFile(options.file.absolutePath);
-  if (isBinary(buffer)) return [];
-  const text = buffer.toString("utf8");
-  const lines = text.split(/\r?\n/);
   const matches: RepoQueryMatch[] = [];
   const basePathScore = pathScore(options.file, options.tokens, options.kind);
 
@@ -120,23 +118,42 @@ async function scoreFile(options: {
     matches.push({
       path: options.file.relativePath,
       lineStart: 1,
-      lineEnd: Math.min(3, lines.length),
+      lineEnd: 1,
       score: basePathScore,
-      snippet: lines.slice(0, Math.min(3, lines.length)).join("\n")
+      snippet: options.file.relativePath
     });
+    return matches;
   }
+  if (options.kind === "path") return [];
+
+  const info = await stat(options.file.absolutePath);
+  if (info.size > MAX_FILE_BYTES) return [];
+  const buffer = await readFile(options.file.absolutePath);
+  if (isBinary(buffer)) return [];
+  const text = buffer.toString("utf8");
+  const lines = text.split(/\r?\n/);
+  const isConfigFile = isConfigPath(options.file.relativePath);
+  const isTestFile = isTestPath(options.file.relativePath);
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const lowerLine = line.toLowerCase();
-    let score = basePathScore;
+    const tokenHits = options.tokens.filter((token) => lowerLine.includes(token)).length;
+    const isSymbolLine = looksLikeSymbolLine(line);
+    const isTestLine = looksLikeTestLine(line);
+
+    if (options.kind === "text" && tokenHits === 0) continue;
+    if (options.kind === "symbol" && (tokenHits === 0 || !isSymbolLine)) continue;
+    if (options.kind === "config" && (tokenHits === 0 || !isConfigFile)) continue;
+    if (options.kind === "test" && (tokenHits === 0 || (!isTestFile && !isTestLine))) continue;
+
+    let score = basePathScore + tokenHits * 10;
     for (const token of options.tokens) {
-      if (lowerLine.includes(token)) score += 10;
+      if (lowerLine === token) score += 4;
     }
-    if (score === basePathScore && basePathScore < 10) continue;
-    if (options.kind === "symbol" && looksLikeSymbolLine(line)) score += 18;
-    if (options.kind === "config" && isConfigPath(options.file.relativePath)) score += 8;
-    if (options.kind === "test" && isTestPath(options.file.relativePath)) score += 8;
+    if (options.kind === "symbol") score += 18;
+    if (options.kind === "config") score += 8;
+    if (options.kind === "test") score += 8;
     if (score <= 0) continue;
     const snippet = snippetForLines(lines, index, options.kind === "symbol" ? 1 : 2);
     matches.push({

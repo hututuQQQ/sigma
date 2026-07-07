@@ -7,6 +7,45 @@ import {
 } from "./validation.js";
 
 const DEFAULT_MAX_VALIDATION_COMMANDS = 12;
+const PROJECT_RELEVANT_BASE_NAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "tsconfig.json",
+  "jsconfig.json",
+  "pyproject.toml",
+  "requirements.txt",
+  "setup.py",
+  "setup.cfg",
+  "pytest.ini",
+  "tox.ini",
+  "uv.lock",
+  "go.mod",
+  "go.sum",
+  "Cargo.toml",
+  "Cargo.lock",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "gradle.properties",
+  "gradlew",
+  "Makefile",
+  "makefile",
+  "Dockerfile",
+  "biome.json",
+  "deno.json",
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  "compose.yml",
+  "compose.yaml",
+  "nx.json",
+  "turbo.json"
+]);
+const PROJECT_RELEVANT_EXTENSIONS = /\.(?:[cm]?[jt]sx?|py|sh|bash|zsh|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|rb|php|swift|scala|sql)$/i;
 
 export interface ValidationPlanOptions {
   workspacePath: string;
@@ -37,6 +76,15 @@ function packageManagerExecutable(packageManager: ProjectProfile["node"]["packag
   return packageManager;
 }
 
+function localOrGlobalTscCommand(): string {
+  return [
+    "if [ -f ./node_modules/.bin/tsc ]; then ./node_modules/.bin/tsc --noEmit",
+    "elif [ -f ./node_modules/.bin/tsc.cmd ]; then ./node_modules/.bin/tsc.cmd --noEmit",
+    "elif command -v tsc >/dev/null 2>&1; then tsc --noEmit",
+    "else echo 'tsc not found for validation' >&2; exit 127; fi"
+  ].join("; ");
+}
+
 function nodeTypecheckCommand(profile: ProjectProfile): string | null {
   const scripts = profile.node.scripts;
   const packageManager = profile.node.packageManager;
@@ -45,10 +93,7 @@ function nodeTypecheckCommand(profile: ProjectProfile): string | null {
     return guardCommand(packageManagerExecutable(packageManager), nodeScriptCommand(packageManager, explicitScript));
   }
   if (!profile.node.hasTypeScript || !profile.node.tscLikelyAvailable) return null;
-  if (packageManager === "pnpm") return guardCommand("pnpm", "pnpm exec tsc --noEmit");
-  if (packageManager === "yarn") return guardCommand("yarn", "yarn tsc --noEmit");
-  if (packageManager === "bun") return guardCommand("bun", "bun x tsc --noEmit");
-  return guardCommand("npx", "npx tsc --noEmit");
+  return localOrGlobalTscCommand();
 }
 
 function nodeProjectSpecs(profile: ProjectProfile): ValidationCommandSpec[] {
@@ -89,9 +134,26 @@ function pythonProjectSpecs(profile: ProjectProfile): ValidationCommandSpec[] {
     profile.python.hasUvLock ? "uv.lock" : ""
   ].filter(Boolean);
   const command = profile.python.prefersUv
-    ? guardCommand("uv", "uv run pytest -q")
+    ? "if command -v uv >/dev/null 2>&1; then uv run pytest -q; else python -m pytest -q; fi"
     : "python -m pytest -q";
   return [{ source: "project-python", command, relatedFiles }];
+}
+
+function isProjectRelevantChangedFile(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  const base = normalized.split("/").pop() ?? normalized;
+  if (PROJECT_RELEVANT_BASE_NAMES.has(base)) return true;
+  if (/^\.github\/workflows\//.test(normalized)) return true;
+  if (/(^|\/)(eslint|prettier|vitest|vite|webpack|rollup|babel|jest|mocha|pytest|ruff|mypy|tsup|turbo|nx)\.config\./i.test(normalized)) {
+    return true;
+  }
+  if (/(^|\/)(?:tsconfig|jsconfig)(?:\.[^/]+)?\.json$/i.test(normalized)) {
+    return true;
+  }
+  if (/(^|\/)\.(?:eslintrc|prettierrc|npmrc|yarnrc|node-version|python-version)(?:\.|$)/i.test(normalized)) {
+    return true;
+  }
+  return PROJECT_RELEVANT_EXTENSIONS.test(base);
 }
 
 function projectLevelSpecs(profile: ProjectProfile): ValidationCommandSpec[] {
@@ -156,10 +218,13 @@ export function dedupeAndBoundValidationSpecs(
 
 export async function planValidationCommandSpecs(options: ValidationPlanOptions): Promise<ValidationCommandSpec[]> {
   const profile = options.profile ?? await detectProjectProfile(options.workspacePath);
+  const configuredSpecs = explicitValidationCommandSpecs(options.configuredCommands ?? []);
+  const changedFiles = options.changedFiles ?? [];
+  const includeProjectLevelSpecs = changedFiles.some(isProjectRelevantChangedFile);
   const specs = [
-    ...explicitValidationCommandSpecs(options.configuredCommands ?? []),
-    ...genericValidationCommandSpecs(options.changedFiles ?? []),
-    ...projectLevelSpecs(profile)
+    ...configuredSpecs,
+    ...genericValidationCommandSpecs(changedFiles),
+    ...(includeProjectLevelSpecs ? projectLevelSpecs(profile) : [])
   ];
   return dedupeAndBoundValidationSpecs(specs, options.maxCommands);
 }

@@ -10,6 +10,7 @@ export interface NodeProjectProfile {
   hasPackageJson: boolean;
   hasLockfile: boolean;
   hasTypeScript: boolean;
+  hasLocalTsc: boolean;
   tscLikelyAvailable: boolean;
 }
 
@@ -91,7 +92,20 @@ function packageJsonHasDependency(packageJson: string, dependencyName: string): 
   }
 }
 
-function packageManagerFromFiles(files: Set<string>): NodePackageManager {
+function packageManagerFromPackageJson(packageJson: string): NodePackageManager | null {
+  try {
+    const parsed = JSON.parse(packageJson) as { packageManager?: unknown };
+    if (typeof parsed.packageManager !== "string") return null;
+    const name = parsed.packageManager.split("@")[0];
+    return name === "npm" || name === "pnpm" || name === "yarn" || name === "bun" ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+function packageManagerFromFiles(files: Set<string>, packageJson: string): NodePackageManager {
+  const fromPackageJson = packageManagerFromPackageJson(packageJson);
+  if (fromPackageJson) return fromPackageJson;
   if (files.has("pnpm-lock.yaml")) return "pnpm";
   if (files.has("yarn.lock")) return "yarn";
   if (files.has("bun.lock") || files.has("bun.lockb")) return "bun";
@@ -158,10 +172,13 @@ export async function detectProjectProfile(workspacePath: string): Promise<Proje
     files.has("tsconfig.json") ||
     packageJsonHasDependency(packageJson, "typescript") ||
     /\btsc\b|typescript|ts-node|tsx/.test(scriptText);
+  const hasLocalTsc =
+    (await exists(workspace, path.join("node_modules", ".bin", "tsc"))) ||
+    (await exists(workspace, path.join("node_modules", ".bin", "tsc.cmd")));
 
   const node: NodeProjectProfile = {
     packageJsonPath: files.has("package.json") ? "package.json" : undefined,
-    packageManager: packageManagerFromFiles(files),
+    packageManager: packageManagerFromFiles(files, packageJson),
     scripts,
     hasPackageJson: files.has("package.json"),
     hasLockfile:
@@ -172,12 +189,13 @@ export async function detectProjectProfile(workspacePath: string): Promise<Proje
       files.has("bun.lock") ||
       files.has("bun.lockb"),
     hasTypeScript,
+    hasLocalTsc,
     tscLikelyAvailable:
       hasTypeScript &&
       (packageJsonHasDependency(packageJson, "typescript") ||
         scriptText.includes("tsc") ||
         files.has("tsconfig.json") ||
-        (await exists(workspace, path.join("node_modules", ".bin", process.platform === "win32" ? "tsc.cmd" : "tsc"))))
+        hasLocalTsc)
   };
 
   const hasPytestConfig =

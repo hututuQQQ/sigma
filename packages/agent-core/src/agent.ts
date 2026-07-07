@@ -77,6 +77,23 @@ function stringifyToolResult(result: ToolResult): string {
   });
 }
 
+function toolArgumentsObject(args: unknown): Record<string, unknown> | null {
+  if (args && typeof args === "object") return args as Record<string, unknown>;
+  if (typeof args !== "string") return null;
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function toolCallCountsAsCommand(call: ToolCall): boolean {
+  if (call.function.name === "bash") return true;
+  if (call.function.name !== "shell_session") return false;
+  return toolArgumentsObject(call.function.arguments)?.action === "send";
+}
+
 function messageHistoryChars(messages: AgentMessage[]): number {
   return messages.reduce((total, message) => total + JSON.stringify(message).length, 0);
 }
@@ -377,7 +394,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         const toolStart = event(runId, "tool_start", provider, model, { toolCall: call }, undefined);
         await recordEvent(toolStart);
         toolCalls += 1;
-        if (call.function.name === "bash") {
+        if (toolCallCountsAsCommand(call as ToolCall)) {
           commandsExecuted += 1;
         }
 

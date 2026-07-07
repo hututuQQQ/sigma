@@ -31,7 +31,15 @@ interface ShellSessionRecord {
   sequence: number;
 }
 
-const sessions = new Map<string, ShellSessionRecord>();
+interface ShellSessionStore {
+  sessions: Map<string, ShellSessionRecord>;
+}
+
+export interface ShellSessionToolController {
+  execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult>;
+  close(): Promise<void>;
+}
+
 const MAX_BUFFER_CHARS = 200000;
 
 function actionValue(value: unknown): ShellSessionAction | null {
@@ -114,7 +122,7 @@ function extractMarker(stdout: string, marker: string): { found: boolean; stdout
   };
 }
 
-async function startSession(args: ShellSessionArgs, context: ToolExecutionContext): Promise<ToolResult> {
+async function startSession(args: ShellSessionArgs, context: ToolExecutionContext, store: ShellSessionStore): Promise<ToolResult> {
   const denied = await requestToolPermission(context, {
     toolName: "shell_session",
     arguments: args,
@@ -131,7 +139,7 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
   }
 
   const id = stringValue(args.sessionId) ?? randomUUID();
-  if (sessions.has(id)) return { ok: false, content: `shell_session already exists: ${id}` };
+  if (store.sessions.has(id)) return { ok: false, content: `shell_session already exists: ${id}` };
   const child = spawn(bashExecutable(), ["--noprofile", "--norc"], {
     cwd,
     env: process.env,
@@ -154,13 +162,13 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
     session.stderr = appendBounded(session.stderr, chunk.toString("utf8"));
   });
   child.on("exit", () => {
-    sessions.delete(id);
+    store.sessions.delete(id);
   });
   child.on("error", (error) => {
     session.stderr = appendBounded(session.stderr, error.message);
-    sessions.delete(id);
+    store.sessions.delete(id);
   });
-  sessions.set(id, session);
+  store.sessions.set(id, session);
   return {
     ok: true,
     content: `shell_session ${id} started cwd=${workspaceRelativePath(context.workspacePath, cwd) || "."}`,
@@ -168,11 +176,11 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
   };
 }
 
-async function sendToSession(args: ShellSessionArgs, context: ToolExecutionContext): Promise<ToolResult> {
+async function sendToSession(args: ShellSessionArgs, context: ToolExecutionContext, store: ShellSessionStore): Promise<ToolResult> {
   const id = stringValue(args.sessionId);
   const input = stringValue(args.input);
   if (!id || !input) return { ok: false, content: "shell_session.send requires sessionId and input" };
-  const session = sessions.get(id);
+  const session = store.sessions.get(id);
   if (!session) return { ok: false, content: `Unknown shell_session: ${id}` };
 
   if (isProbablyMutatingCommand(input)) {
@@ -222,10 +230,10 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
   };
 }
 
-async function readSession(args: ShellSessionArgs, context: ToolExecutionContext): Promise<ToolResult> {
+async function readSession(args: ShellSessionArgs, context: ToolExecutionContext, store: ShellSessionStore): Promise<ToolResult> {
   const id = stringValue(args.sessionId);
   if (!id) return { ok: false, content: "shell_session.read requires sessionId" };
-  const session = sessions.get(id);
+  const session = store.sessions.get(id);
   if (!session) return { ok: false, content: `Unknown shell_session: ${id}` };
   const output = readAndClear(session);
   const maxOutputChars = numberValue(args.maxOutputChars, context.maxToolOutputChars, 200, 50000);
@@ -234,10 +242,10 @@ async function readSession(args: ShellSessionArgs, context: ToolExecutionContext
   return { ok: true, content: truncated.text, metadata: { sessionId: id, truncated: truncated.truncated } };
 }
 
-async function stopSession(args: ShellSessionArgs, context: ToolExecutionContext): Promise<ToolResult> {
+async function stopSession(args: ShellSessionArgs, context: ToolExecutionContext, store: ShellSessionStore): Promise<ToolResult> {
   const id = stringValue(args.sessionId);
   if (!id) return { ok: false, content: "shell_session.stop requires sessionId" };
-  const session = sessions.get(id);
+  const session = store.sessions.get(id);
   if (!session) return { ok: false, content: `Unknown shell_session: ${id}` };
   const denied = await requestToolPermission(context, {
     toolName: "shell_session",
@@ -247,15 +255,15 @@ async function stopSession(args: ShellSessionArgs, context: ToolExecutionContext
   });
   if (denied) return denied;
   stopSessionRecord(session);
-  sessions.delete(id);
+  store.sessions.delete(id);
   return { ok: true, content: `shell_session ${id} stopped`, metadata: { sessionId: id } };
 }
 
-function listSessions(): ToolResult {
+function listSessions(store: ShellSessionStore): ToolResult {
   return {
     ok: true,
     content: JSON.stringify(
-      [...sessions.values()].map((session) => ({
+      [...store.sessions.values()].map((session) => ({
         sessionId: session.id,
         cwd: session.cwd,
         startedAt: session.startedAt
@@ -263,24 +271,50 @@ function listSessions(): ToolResult {
       null,
       2
     ),
-    metadata: { sessionIds: [...sessions.keys()] }
+    metadata: { sessionIds: [...store.sessions.keys()] }
   };
 }
 
-export async function executeShellSessionTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
+async function executeShellSessionToolWithStore(
+  args: unknown,
+  context: ToolExecutionContext,
+  store: ShellSessionStore
+): Promise<ToolResult> {
   const parsed = (args && typeof args === "object" ? args : {}) as ShellSessionArgs;
   const action = actionValue(parsed.action);
   if (!action) return { ok: false, content: "shell_session requires action: start, send, read, stop, or list" };
-  if (action === "start") return await startSession(parsed, context);
-  if (action === "send") return await sendToSession(parsed, context);
-  if (action === "read") return await readSession(parsed, context);
-  if (action === "stop") return await stopSession(parsed, context);
-  return listSessions();
+  if (action === "start") return await startSession(parsed, context, store);
+  if (action === "send") return await sendToSession(parsed, context, store);
+  if (action === "read") return await readSession(parsed, context, store);
+  if (action === "stop") return await stopSession(parsed, context, store);
+  return listSessions(store);
+}
+
+async function closeShellSessionStore(store: ShellSessionStore): Promise<void> {
+  for (const session of store.sessions.values()) {
+    stopSessionRecord(session);
+  }
+  store.sessions.clear();
+}
+
+export function createShellSessionToolController(): ShellSessionToolController {
+  const store: ShellSessionStore = { sessions: new Map<string, ShellSessionRecord>() };
+  return {
+    async execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
+      return await executeShellSessionToolWithStore(args, context, store);
+    },
+    async close(): Promise<void> {
+      await closeShellSessionStore(store);
+    }
+  };
+}
+
+const defaultShellSessionController = createShellSessionToolController();
+
+export async function executeShellSessionTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
+  return await defaultShellSessionController.execute(args, context);
 }
 
 export async function closeShellSessions(): Promise<void> {
-  for (const session of sessions.values()) {
-    stopSessionRecord(session);
-  }
-  sessions.clear();
+  await defaultShellSessionController.close();
 }

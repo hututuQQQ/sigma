@@ -2,8 +2,10 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ToolCall } from "agent-ai";
 import {
   closeShellSessions,
+  createDefaultToolRegistry,
   executeApplyPatchTool,
   executeGitDiffTool,
   executeGitStatusTool,
@@ -53,6 +55,10 @@ function quotedReplacementPatch(file: string, before: string, after: string): st
     `+${after}`,
     ""
   ].join("\n");
+}
+
+function shellSessionCall(id: string, args: Record<string, unknown>): ToolCall {
+  return { id, type: "function", function: { name: "shell_session", arguments: args } };
 }
 
 async function installStallingGitOverride(dir: string): Promise<() => void> {
@@ -256,6 +262,29 @@ describe("new core workspace tools", () => {
     expect(outside.content).toContain("outside the workspace");
   });
 
+  it("repo_query path kind returns path matches without content snippets", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "payment-ledger.ts"), "const unrelated = true;\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "payment ledger", kind: "path" }, context);
+
+    expect(result.ok).toBe(true);
+    const matches = (result.metadata as { matches: Array<{ path: string; snippet: string }> }).matches;
+    expect(matches).toEqual([expect.objectContaining({ path: "src/payment-ledger.ts", snippet: "src/payment-ledger.ts" })]);
+  });
+
+  it("repo_query does not return path-score-only line matches", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "payment-ledger.ts"), "const unrelated = true;\nconst alsoUnrelated = false;\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "payment ledger", kind: "text" }, context);
+
+    expect(result.ok).toBe(true);
+    expect((result.metadata as { matches: unknown[] }).matches).toEqual([]);
+  });
+
   it("repo_query respects max snippets and chars", async () => {
     const { dir, context } = await workspace();
     await writeFile(path.join(dir, "a.txt"), "needle one\nneedle two\nneedle three\n", "utf8");
@@ -319,5 +348,33 @@ describe("new core workspace tools", () => {
       context
     );
     expect(truncated.content.length).toBeLessThanOrEqual(200);
+  });
+
+  it("shell_session registries do not close each other's sessions", async () => {
+    const { context: contextA } = await workspace();
+    const { context: contextB } = await workspace();
+    const registryA = createDefaultToolRegistry();
+    const registryB = createDefaultToolRegistry();
+
+    try {
+      const [startA, startB] = await Promise.all([
+        registryA.execute(shellSessionCall("start-a", { action: "start", sessionId: "shared-session" }), contextA),
+        registryB.execute(shellSessionCall("start-b", { action: "start", sessionId: "shared-session" }), contextB)
+      ]);
+      expect(startA.ok).toBe(true);
+      expect(startB.ok).toBe(true);
+
+      await registryA.close?.();
+      const sentB = await registryB.execute(
+        shellSessionCall("send-b", { action: "send", sessionId: "shared-session", input: "printf registry-b" }),
+        contextB
+      );
+
+      expect(sentB.ok).toBe(true);
+      expect(sentB.content).toContain("registry-b");
+    } finally {
+      await registryA.close?.();
+      await registryB.close?.();
+    }
   });
 });
