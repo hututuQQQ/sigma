@@ -38,21 +38,21 @@ export function sigmaWelcome(options: SigmaWelcomeOptions): string[] {
   if (!supportsUnicode()) {
     return [
       "  SSSSSSSSSSS",
-      `        SS        S Sigma Code ${VERSION}`,
-      `      SS          ${provider} ${g.separator} ${model}`,
-      `    SS            ${options.workspacePath}`,
-      "      SS",
-      "        SS",
+      `  SS              S Sigma Code ${VERSION}`,
+      `    SS            ${provider} ${g.separator} ${model}`,
+      `      SS          ${options.workspacePath}`,
+      "    SS",
+      "  SS",
       "  SSSSSSSSSSS"
     ];
   }
   return [
     "  \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588",
-    `        \u2588\u2588        ${g.sigma} Sigma Code ${VERSION}`,
-    `      \u2588\u2588          ${provider} ${g.separator} ${model}`,
-    `    \u2588\u2588            ${options.workspacePath}`,
-    "      \u2588\u2588",
-    "        \u2588\u2588",
+    `  \u2588\u2588              ${g.sigma} Sigma Code ${VERSION}`,
+    `    \u2588\u2588            ${provider} ${g.separator} ${model}`,
+    `      \u2588\u2588          ${options.workspacePath}`,
+    "    \u2588\u2588",
+    "  \u2588\u2588",
     "  \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588"
   ];
 }

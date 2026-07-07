@@ -128,8 +128,8 @@ describe("agent-tui app lifecycle and local terminal input", () => {
 
       const plain = stripAnsi(stdout.last());
       expect(calls).toHaveLength(0);
-      expect(plain).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
-      expect(plain).toContain("\u2588\u2588          DeepSeek \u00b7 default");
+      expect(plain).toContain("\u2588\u2588              \u2211 Sigma Code v0.1.0");
+      expect(plain).toContain("\u2588\u2588            DeepSeek \u00b7 default");
       expect(plain).not.toContain("\u203a_");
       expect(plain).toContain("help");
     } finally {

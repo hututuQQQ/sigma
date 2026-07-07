@@ -76,11 +76,11 @@ Type a task and press Enter to start one run. The TUI opens as a transcript-firs
 
 ```text
   ███████████
-        ██        ∑ Sigma Code v0.1.0
-      ██          DeepSeek · deepseek-v4-pro
-    ██            ./agent-tui
-      ██
-        ██
+  ██              ∑ Sigma Code v0.1.0
+    ██            DeepSeek · deepseek-v4-pro
+      ██          ./agent-tui
+    ██
+  ██
   ███████████
 
 * Ready in agent-tui

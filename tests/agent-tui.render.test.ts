@@ -69,8 +69,8 @@ describe("agent-tui stream rendering", () => {
 
     expect(rendered).toContain("Sigma Code v0.1.0");
     expect(rendered).toContain("\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588");
-    expect(rendered).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
-    expect(rendered).toContain("\u2588\u2588          DeepSeek \u00b7 default");
+    expect(rendered).toContain("\u2588\u2588              \u2211 Sigma Code v0.1.0");
+    expect(rendered).toContain("\u2588\u2588            DeepSeek \u00b7 default");
     expect(rendered).not.toContain("\u203a_");
     expect(rendered).toContain("DeepSeek \u00b7 default");
     expect(rendered).toContain("D:\\software\\sigma\\packages\\agent-tui");
@@ -231,7 +231,7 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+    expect(rendered).toContain("\u2588\u2588              \u2211 Sigma Code v0.1.0");
     expect(rendered).not.toContain("S sigma");
   });
 
@@ -299,8 +299,8 @@ describe("agent-tui stream rendering", () => {
     });
 
     expect(rendered).toContain("SSSSSSSSSSS");
-    expect(rendered).toContain("SS        S Sigma Code v0.1.0");
-    expect(rendered).toContain("SS          DeepSeek | default");
+    expect(rendered).toContain("SS              S Sigma Code v0.1.0");
+    expect(rendered).toContain("SS            DeepSeek | default");
     expect(rendered).not.toContain(">_");
     expect(rendered).toContain("DeepSeek | default");
     expect(rendered).toContain("/tmp/sigma");
@@ -328,8 +328,8 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(ascii).toContain("SS        S Sigma Code v0.1.0");
-    expect(ascii).toContain("SS          DeepSeek | default");
+    expect(ascii).toContain("SS              S Sigma Code v0.1.0");
+    expect(ascii).toContain("SS            DeepSeek | default");
     expect(ascii).not.toContain(">_");
     expect(ascii).not.toContain("\u2211 Sigma Code");
 
@@ -352,7 +352,7 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(forced).toContain("\u2588\u2588        \u2211 Sigma Code v0.1.0");
+    expect(forced).toContain("\u2588\u2588              \u2211 Sigma Code v0.1.0");
     expect(forced).not.toContain("S Sigma Code");
   });
 
