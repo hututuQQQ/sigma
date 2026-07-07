@@ -21,7 +21,7 @@ export function streamGlyphs(): StreamGlyphs {
   if (!supportsUnicode()) {
     return { ...base, cursor: "|", prompt: ">" };
   }
-  return { ...base, cursor: "▌", prompt: "›" };
+  return { ...base, cursor: "\u258c", prompt: "\u203a" };
 }
 
 export function streamColorEnabled(stream: NodeJS.WriteStream = process.stdout): boolean {
@@ -36,9 +36,11 @@ export function warning(text: string, enabled: boolean): string {
   return color(text, "warning", enabled);
 }
 
-export function roleColor(role: "accent" | "danger" | "dim" | "success" | "warning", text: string, enabled: boolean): string {
+export function roleColor(role: "brand" | "accent" | "danger" | "dim" | "info" | "success" | "warning", text: string, enabled: boolean): string {
+  if (role === "brand") return color(text, "brand", enabled);
   if (role === "accent") return accent(text, enabled);
   if (role === "danger") return danger(text, enabled);
+  if (role === "info") return color(text, "info", enabled);
   if (role === "success") return success(text, enabled);
   if (role === "warning") return warning(text, enabled);
   return dim(text, enabled);
@@ -51,7 +53,7 @@ export function separatorLine(width: number): string {
 }
 
 export function fitStreamLine(line: string, width: number): string {
-  return truncateToWidth(line, width);
+  return visibleWidth(line) <= width ? line : truncateToWidth(line, width);
 }
 
 export function rightPadVisible(line: string, width: number): string {

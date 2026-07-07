@@ -200,4 +200,19 @@ describe("agent-tui formatting helpers", () => {
       summaryJson: "summary.json"
     });
   });
+
+  it("resolves TUI workspace paths from the pnpm invocation directory", () => {
+    const previous = process.env.INIT_CWD;
+    const invocationDir = path.resolve("..");
+    process.env.INIT_CWD = invocationDir;
+    try {
+      const parsed = parseTuiArgs(["--workspace", "packages/agent-tui"]);
+      expect(parsed).not.toBe("help");
+      if (parsed === "help") return;
+      expect(parsed.workspace).toBe(path.resolve(invocationDir, "packages/agent-tui"));
+    } finally {
+      if (previous === undefined) delete process.env.INIT_CWD;
+      else process.env.INIT_CWD = previous;
+    }
+  });
 });

@@ -135,11 +135,18 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       continue;
     }
     if (event.type === "error") {
-      entries.push({ kind: "summary", status: "error", text: `error ${redactSecretText(String(meta.message ?? ""))}`, timestamp: eventTime(event) });
+      entries.push({ kind: "summary", status: "error", text: redactSecretText(String(meta.message ?? "")), timestamp: eventTime(event) });
       continue;
     }
   }
   return entries;
+}
+
+function sortEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => (a.entry.timestamp ?? "").localeCompare(b.entry.timestamp ?? "") || a.index - b.index)
+    .map((item) => item.entry);
 }
 
 export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntry[] {
@@ -156,29 +163,54 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
     });
   }
   if (entries.length === 0) {
+    const workspace = workspaceName(options.workspacePath);
     entries.push({
       kind: "system",
-      text: `ready in ${redactSecretText(options.workspacePath)}`,
+      text: `\u2211 Ready in ${workspace}`,
       timestamp: new Date(0).toISOString()
     });
     entries.push({
       kind: "system",
-      text: "No run yet. Ask Sigma to inspect, plan, edit, or test this workspace.",
+      text: "Try:",
       timestamp: new Date(0).toISOString()
     });
     entries.push({
       kind: "system",
-      text: "Try: /mode plan migrate the TUI to a transcript stream  or  @src/app.tsx explain rendering.",
+      text: "  /mode plan inspect this package",
+      timestamp: new Date(0).toISOString()
+    });
+    entries.push({
+      kind: "system",
+      text: "  @src/app.tsx explain rendering",
+      timestamp: new Date(0).toISOString()
+    });
+    entries.push({
+      kind: "system",
+      text: "  !pnpm test",
       timestamp: new Date(0).toISOString()
     });
   }
   if (options.result) {
+    const hasErrorSummary = entries.some((entry) => entry.kind === "summary" && entry.status === "error");
+    if (options.result.status === "error" && hasErrorSummary) {
+      return sortEntries(entries);
+    }
+    if (options.result.status === "error") {
+      entries.push({
+        kind: "summary",
+        status: "error",
+        text: options.result.lastError ?? options.result.finishReason,
+        timestamp: new Date(Date.now() + 1).toISOString()
+      });
+      return sortEntries(entries);
+    }
+    const usageText = (options.result.usage.totalTokens ?? 0) > 0 ? formatUsage(options.result.usage) : "";
     const resultText = [
       `${options.result.status} ${options.result.finishReason}`,
-      `${options.result.toolCalls} tools`,
-      `${options.result.turns} turns`,
-      formatUsage(options.result.usage)
-    ].join("  ");
+      options.result.toolCalls > 0 ? `${options.result.toolCalls} tools` : "",
+      options.result.turns > 0 ? `${options.result.turns} turns` : "",
+      usageText
+    ].filter(Boolean).join("  ");
     entries.push({
       kind: "summary",
       status: options.result.status,
@@ -187,8 +219,5 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
     });
   }
 
-  return entries
-    .map((entry, index) => ({ entry, index }))
-    .sort((a, b) => (a.entry.timestamp ?? "").localeCompare(b.entry.timestamp ?? "") || a.index - b.index)
-    .map((item) => item.entry);
+  return sortEntries(entries);
 }

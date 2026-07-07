@@ -61,6 +61,7 @@ import { streamColorEnabled } from "./render/theme.js";
 import { buildTranscript, type TranscriptEntry } from "./view-model.js";
 import { runSession } from "./run-session.js";
 import { truncateToWidth, wrapText } from "./ui/theme.js";
+import { resolveLocalWorkspaceInput, resolveWorkspaceTarget, type WorkspaceChangeResult } from "./workspace-command.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -464,6 +465,11 @@ class TuiApp {
       await this.handleCommand(value);
       return;
     }
+    const workspaceInput = resolveLocalWorkspaceInput(value, this.options.workspace);
+    if (workspaceInput.handled) {
+      this.applyWorkspaceChange(workspaceInput);
+      return;
+    }
     if (this.running) {
       this.queuedInstruction = value;
       this.message = "Queued one follow-up task for the next run.";
@@ -549,6 +555,10 @@ class TuiApp {
       this.render();
       return;
     }
+    if (name === "/workspace") {
+      this.applyWorkspaceChange(resolveWorkspaceTarget(this.options.workspace, value));
+      return;
+    }
     if (name === "/diff" || name === "/diff stat" || name === "/diff patch") {
       const requested = name === "/diff patch" ? "patch" : name === "/diff stat" ? "stat" : parseDiffMode(value);
       if (!requested) {
@@ -577,6 +587,31 @@ class TuiApp {
       await this.runLocalCommand(value, "shell");
       return;
     }
+  }
+
+  private applyWorkspaceChange(result: WorkspaceChangeResult): void {
+    if (!result.handled) return;
+    if (this.running) {
+      const message = "Wait for the active run to finish before switching workspace.";
+      this.localEntries.push({ kind: "system", text: message, timestamp: nowIso() });
+      this.message = message;
+      this.render();
+      return;
+    }
+    if (!result.ok) {
+      this.localEntries.push({ kind: "system", text: result.message, timestamp: nowIso() });
+      this.message = result.message;
+      this.render();
+      return;
+    }
+    this.options.workspace = result.workspace;
+    this.filePaths = listWorkspaceFiles(this.options.workspace);
+    this.diffText = "";
+    this.localCommandSnapshot = null;
+    this.result = null;
+    this.message = result.message;
+    this.localEntries.push({ kind: "system", text: result.message, timestamp: nowIso() });
+    this.render();
   }
 
   private clearTranscript(message: string): void {
@@ -667,7 +702,9 @@ class TuiApp {
       this.result = result;
       this.message = this.completionMessage(result);
     } catch (error) {
-      this.message = `Run failed: ${error instanceof Error ? error.message : String(error)}`;
+      const message = error instanceof Error ? error.message : String(error);
+      this.localEntries.push({ kind: "summary", status: "error", text: message, timestamp: nowIso() });
+      this.message = `Run failed: ${message}`;
     } finally {
       this.running = false;
       const next = this.queuedInstruction;

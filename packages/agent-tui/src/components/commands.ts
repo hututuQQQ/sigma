@@ -34,6 +34,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: "/model", usage: "/model <name>", aliases: [], group: "configure", description: "Change model", takesValue: true },
   { name: "/provider", usage: "/provider <deepseek|glm>", aliases: [], group: "configure", description: "Change provider", takesValue: true },
   { name: "/permission", usage: "/permission <ask|yolo>", aliases: [], group: "configure", description: "Change permission mode", takesValue: true },
+  { name: "/workspace", usage: "/workspace <path>", aliases: ["/w"], group: "configure", description: "Switch workspace", takesValue: true },
   { name: "/clear", usage: "/clear", aliases: ["/cl"], group: "core", description: "Clear transcript and result" },
   { name: "/exit", usage: "/exit", aliases: ["/q"], group: "core", description: "Exit Sigma" }
 ];

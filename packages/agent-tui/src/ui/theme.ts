@@ -1,4 +1,5 @@
 export type ColorRole =
+  | "brand"
   | "accent"
   | "danger"
   | "dim"
@@ -9,15 +10,40 @@ export type ColorRole =
 
 const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
 
-const ROLE_CODES: Record<ColorRole, [string, string]> = {
-  accent: ["\x1b[36m", "\x1b[0m"],
-  danger: ["\x1b[31m", "\x1b[0m"],
-  dim: ["\x1b[2m", "\x1b[0m"],
-  info: ["\x1b[34m", "\x1b[0m"],
-  muted: ["\x1b[90m", "\x1b[0m"],
-  success: ["\x1b[32m", "\x1b[0m"],
-  warning: ["\x1b[33m", "\x1b[0m"]
+export interface TerminalTheme {
+  colors: Record<ColorRole, [string, string]>;
+}
+
+export const DEFAULT_THEME: TerminalTheme = {
+  colors: {
+    brand: ["\x1b[36m", "\x1b[0m"],
+    accent: ["\x1b[36m", "\x1b[0m"],
+    danger: ["\x1b[31m", "\x1b[0m"],
+    dim: ["\x1b[2m", "\x1b[0m"],
+    info: ["\x1b[34m", "\x1b[0m"],
+    muted: ["\x1b[90m", "\x1b[0m"],
+    success: ["\x1b[32m", "\x1b[0m"],
+    warning: ["\x1b[33m", "\x1b[0m"]
+  }
 };
+
+const ROLE_CODES: Record<ColorRole, [string, string]> = DEFAULT_THEME.colors;
+
+function envFlag(name: string): boolean | undefined {
+  const value = process.env[name];
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "" || normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no") return false;
+  return true;
+}
+
+function forceColorEnabled(): boolean | undefined {
+  const sigmaForce = envFlag("SIGMA_FORCE_COLOR");
+  if (sigmaForce !== undefined) return sigmaForce;
+  const force = process.env.FORCE_COLOR;
+  if (force === undefined) return undefined;
+  return !["", "0", "false", "off", "no"].includes(force.trim().toLowerCase());
+}
 
 export interface Glyphs {
   sigma: string;
@@ -38,13 +64,16 @@ export interface Glyphs {
 }
 
 export function supportsColor(stream: NodeJS.WriteStream = process.stdout): boolean {
-  return Boolean(stream.isTTY) && !process.env.NO_COLOR && process.env.TERM !== "dumb";
+  const forced = forceColorEnabled();
+  if (forced !== undefined) return forced;
+  if (envFlag("SIGMA_NO_COLOR") || envFlag("NO_COLOR")) return false;
+  return Boolean(stream.isTTY) && process.env.TERM !== "dumb";
 }
 
 export function supportsUnicode(): boolean {
-  if (process.env.SIGMA_ASCII === "1" || process.env.TERM === "dumb") return false;
-  if (process.platform !== "win32") return true;
-  return Boolean(process.env.WT_SESSION || process.env.TERMINAL_EMULATOR || process.env.ConEmuANSI === "ON");
+  if (envFlag("SIGMA_FORCE_UNICODE")) return true;
+  if (envFlag("SIGMA_ASCII") || process.env.TERM === "dumb") return false;
+  return true;
 }
 
 export function glyphs(): Glyphs {
@@ -68,21 +97,21 @@ export function glyphs(): Glyphs {
     };
   }
   return {
-    sigma: "∑",
-    separator: "·",
-    pointer: "›",
-    ellipsis: "…",
-    ok: "✓",
-    fail: "✕",
-    running: "◌",
+    sigma: "\u2211",
+    separator: "\u00b7",
+    pointer: "\u203a",
+    ellipsis: "\u2026",
+    ok: "\u2713",
+    fail: "\u2715",
+    running: "\u25cc",
     blocked: "!",
-    info: "•",
-    topLeft: "╭",
-    topRight: "╮",
-    bottomLeft: "╰",
-    bottomRight: "╯",
-    horizontal: "─",
-    vertical: "│"
+    info: "\u2022",
+    topLeft: "\u256d",
+    topRight: "\u256e",
+    bottomLeft: "\u2570",
+    bottomRight: "\u256f",
+    horizontal: "\u2500",
+    vertical: "\u2502"
   };
 }
 

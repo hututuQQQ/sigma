@@ -15,6 +15,7 @@ import {
   rememberInput,
   yank
 } from "../packages/agent-tui/src/composer-state.js";
+import { renderComposer } from "../packages/agent-tui/src/render/composer.js";
 
 describe("agent-tui composer editor", () => {
   it("inserts text at the cursor and supports backspace/delete", () => {
@@ -96,5 +97,33 @@ describe("agent-tui composer editor", () => {
 
     recallHistory(state, "down");
     expect(state.text).toBe("draft");
+  });
+
+  it("renders compact mode-aware composer snapshots", () => {
+    expect(renderComposer({
+      state: createComposerState("fix tests"),
+      mode: "build",
+      running: false,
+      approvalPending: false,
+      width: 80,
+      color: false
+    })).toMatchInlineSnapshot(`
+      "build › fix tests▌
+      enter send · ctrl+j newline · tab plan/build · / commands · @ files · ! shell"
+    `);
+
+    expect(renderComposer({
+      state: createComposerState("inspect"),
+      mode: "plan",
+      running: true,
+      approvalPending: false,
+      queuedInstruction: "run the focused tests",
+      width: 80,
+      color: false
+    })).toMatchInlineSnapshot(`
+      "draft › inspect▌
+      queued › run the focused tests
+      enter queue · ctrl+j newline · tab plan/build · / commands · @ files · ! shell"
+    `);
   });
 });

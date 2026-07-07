@@ -68,22 +68,39 @@ pnpm --filter agent-tui start -- \
   --permission-mode ask
 ```
 
-Type a task and press Enter to start one run. The TUI opens as a transcript-first `∑ sigma` stream rather than a boxed dashboard:
+Type a task and press Enter to start one run. The TUI opens as a transcript-first `∑ Sigma` stream rather than a boxed dashboard:
 
 ```text
-∑ sigma  agent-tui · deepseek/default · mode build · ask · idle      ? help · / commands
-────────────────────────────────────────────────────────────────────────────────
-system    ready in D:\software\sigma\packages\agent-tui
-system    No run yet. Ask Sigma to inspect, plan, edit, or test this workspace.
-
-────────────────────────────────────────────────────────────────────────────────
-build › fix the TUI composer▌
-  [enter] send   [ctrl+j] newline   [tab] plan/build   [/] commands   [@] files
+∑ Sigma agent-tui  deepseek/deepseek-v4-pro · build · ask · idle
+∑ Ready in agent-tui
+Try:
+  /mode plan inspect this package
+  @src/app.tsx explain rendering
+  !pnpm test
+build › fix the failing tests▌
+enter send · ctrl+j newline · tab plan/build · / commands · @ files · ! shell
 ```
 
-During a run, user, assistant, tool, validation, approval, diff, and summary entries are rendered inline in the stream. `/status`, `/tools`, `/tokens`, `/context`, `/diff stat`, and `/diff patch` open focused details only when requested; there is no permanent right-hand status wall. `/` opens a compact command palette above the composer. Aliases include `/h` or `/?` for help, `/s` status, `/d` diff, `/ds` diff stat, `/dp` diff patch, `/t` tools, `/c` context, `/tk` tokens, `/q` exit, and `/cl` clear.
+Windows PowerShell uses Unicode by default in normal terminals:
 
-Composer editing is handled in raw mode: Left/Right move the cursor, `Ctrl+A/E` jump to start/end, `Ctrl+U/K` kill to start/end, `Ctrl+W` deletes the previous word, `Ctrl+Y` yanks killed text, `Ctrl+J` inserts a newline, and Up/Down cycle in-memory prompt history. `Tab` toggles plan/build mode unless a command or file suggestion is active; `/mode plan` and `/mode build` are also available. Plan mode disables mutating/run tools for new agent runs: `write`, `edit`, `apply_patch`, `bash`, `shell_session`, and `service`. Typing `@prefix` suggests workspace files, ignoring `.git`, `node_modules`, `dist`, `build`, and `.agent/attempts`. Typing `!command` runs a local shell command through the same approval flow as `/shell <command>`.
+```powershell
+$env:DEEPSEEK_API_KEY='sk-...'
+pnpm --filter agent-tui start -- --workspace . --provider deepseek
+# ∑ Sigma sigma  deepseek/default · build · ask · idle
+```
+
+If a provider key is missing, the stream shows one actionable card instead of duplicate raw error rows:
+
+```text
+✕ Missing DEEPSEEK_API_KEY
+  Set it with: $env:DEEPSEEK_API_KEY='...' on PowerShell
+  Or switch provider: /provider glm
+  Run /status or agent doctor --check-api
+```
+
+During a run, user, assistant, tool, validation, approval, diff, and summary entries are rendered inline in the stream. `/status`, `/tools`, `/tokens`, `/context`, `/diff stat`, and `/diff patch` open focused details only when requested; there is no permanent right-hand status wall. `/` opens a compact command palette above the composer. Aliases include `/h` or `/?` for help, `/s` status, `/d` diff, `/ds` diff stat, `/dp` diff patch, `/t` tools, `/c` context, `/tk` tokens, `/w` workspace, `/q` exit, and `/cl` clear.
+
+Composer editing is handled in raw mode: Left/Right move the cursor, `Ctrl+A/E` jump to start/end, `Ctrl+U/K` kill to start/end, `Ctrl+W` deletes the previous word, `Ctrl+Y` yanks killed text, `Ctrl+J` inserts a newline, and Up/Down cycle in-memory prompt history. `Tab` toggles plan/build mode unless a command or file suggestion is active; `/mode plan` and `/mode build` are also available, and the composer visibly switches between `plan ›`, `build ›`, and `draft ›` while a run is active. Plan mode disables mutating/run tools for new agent runs: `write`, `edit`, `apply_patch`, `bash`, `shell_session`, and `service`. Typing `@prefix` suggests workspace files, ignoring `.git`, `node_modules`, `dist`, `build`, and `.agent/attempts`. Typing `!command` runs a local shell command through the same approval flow as `/shell <command>`. Typing `cd <path>` switches workspace locally when the directory exists; use `/workspace <path>` or `/w <path>` for the explicit command form.
 
 Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI does not yet provide persisted session index/resume/fork, transcript search, multiple selection in the file palette, or shell completion. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 

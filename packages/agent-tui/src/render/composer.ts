@@ -2,7 +2,7 @@ import { redactSecretText } from "agent-core";
 import type { ComposerState } from "../composer-state.js";
 import type { TuiRunMode } from "../mode.js";
 import { oneLine } from "../components/formatting.js";
-import { fitStreamLine, muted, separatorLine, streamGlyphs, warning } from "./theme.js";
+import { fitStreamLine, muted, streamGlyphs, warning } from "./theme.js";
 import { truncateToWidth } from "../ui/theme.js";
 
 export interface RenderComposerOptions {
@@ -35,7 +35,7 @@ export function renderComposer(options: RenderComposerOptions): string {
   const prompt = promptLabel(options);
   const input = redactSecretText(textWithCursor(options.state));
   const inputLines = input.split(/\r?\n/);
-  const lines = [separatorLine(width)];
+  const lines: string[] = [];
   const firstPrefix = options.approvalPending ? warning(prompt, options.color ?? false) : prompt;
   lines.push(fitStreamLine(`${firstPrefix}${inputLines[0] ?? g.cursor}`, width));
   for (const line of inputLines.slice(1)) {
@@ -44,11 +44,12 @@ export function renderComposer(options: RenderComposerOptions): string {
 
   if (!options.compact) {
     const queue = options.queuedInstruction
-      ? `  queued ${g.pointer} ${truncateToWidth(oneLine(redactSecretText(options.queuedInstruction)), Math.max(10, width - 12))}`
+      ? `queued ${g.pointer} ${truncateToWidth(oneLine(redactSecretText(options.queuedInstruction)), Math.max(10, width - 10))}`
       : "";
     if (queue) lines.push(fitStreamLine(muted(queue, options.color ?? false), width));
-    const send = options.running ? "[enter] queue" : "[enter] send";
-    lines.push(fitStreamLine(muted(`  ${send}   [ctrl+j] newline   [tab] plan/build   [/] commands   [@] files`, options.color ?? false), width));
+    const send = options.running ? "enter queue" : "enter send";
+    const hints = `${send} ${g.separator} ctrl+j newline ${g.separator} tab plan/build ${g.separator} / commands ${g.separator} @ files ${g.separator} ! shell`;
+    lines.push(fitStreamLine(muted(hints, options.color ?? false), width));
   }
   return lines.join("\n");
 }

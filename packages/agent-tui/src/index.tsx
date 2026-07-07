@@ -68,6 +68,7 @@ Inside the TUI:
   /model <name>
   /provider <deepseek|glm>
   /permission <ask|yolo>
+  /workspace <path> (/w)
 
 Shortcuts:
   Esc close palette/detail, then clear draft
@@ -144,6 +145,11 @@ function validationCommands(flags: Map<string, string | true>): string[] | undef
   return commands.length > 0 ? [...new Set(commands)] : undefined;
 }
 
+function invocationCwd(): string {
+  const initCwd = process.env.INIT_CWD;
+  return initCwd && path.isAbsolute(initCwd) ? initCwd : process.cwd();
+}
+
 export function parseTuiArgs(argv: string[]): CliOptions | "help" {
   const flags = new Map<string, string | true>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -169,7 +175,7 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
   const workspace = flags.get("workspace");
   const model = flags.get("model");
   return {
-    workspace: path.resolve(typeof workspace === "string" ? workspace : process.cwd()),
+    workspace: path.resolve(invocationCwd(), typeof workspace === "string" ? workspace : "."),
     provider: providerValue(flags.get("provider")),
     model: typeof model === "string" ? model : undefined,
     permissionMode: permissionModeValue(flags.get("permission-mode")),

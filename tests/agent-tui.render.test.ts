@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentEvent, PermissionRequest } from "../packages/agent-core/src/index.js";
+import type { AgentEvent, AgentRunResult, PermissionRequest } from "../packages/agent-core/src/index.js";
 import { approvalPromptLines } from "../packages/agent-tui/src/components/approval-prompt.js";
 import { renderDiffLines } from "../packages/agent-tui/src/components/diff-panel.js";
 import { createComposerState } from "../packages/agent-tui/src/composer-state.js";
@@ -8,13 +8,24 @@ import { renderScreen } from "../packages/agent-tui/src/render/screen.js";
 import { buildTranscript } from "../packages/agent-tui/src/view-model.js";
 import { assertWithinWidth, splitLines } from "../packages/agent-tui/src/ui/layout.js";
 
-const savedEnv = { TERM: process.env.TERM, WT_SESSION: process.env.WT_SESSION, SIGMA_ASCII: process.env.SIGMA_ASCII };
+const savedEnv = {
+  FORCE_COLOR: process.env.FORCE_COLOR,
+  NO_COLOR: process.env.NO_COLOR,
+  SIGMA_ASCII: process.env.SIGMA_ASCII,
+  SIGMA_FORCE_COLOR: process.env.SIGMA_FORCE_COLOR,
+  SIGMA_FORCE_UNICODE: process.env.SIGMA_FORCE_UNICODE,
+  SIGMA_NO_COLOR: process.env.SIGMA_NO_COLOR,
+  TERM: process.env.TERM,
+  WT_SESSION: process.env.WT_SESSION
+};
+const savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 
 afterEach(() => {
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (savedPlatform) Object.defineProperty(process, "platform", savedPlatform);
 });
 
 function event(type: AgentEvent["type"], metadata: Record<string, unknown>, parentId?: string): AgentEvent {
@@ -30,8 +41,8 @@ function event(type: AgentEvent["type"], metadata: Record<string, unknown>, pare
 
 describe("agent-tui stream rendering", () => {
   it("renders an idle transcript-first screen without a box farm", () => {
-    process.env.WT_SESSION = "1";
-    delete process.env.TERM;
+    process.env.TERM = "xterm-256color";
+    delete process.env.SIGMA_ASCII;
     const composer = createComposerState("fix tests");
     composer.cursor = 2;
     const entries = buildTranscript({
@@ -56,16 +67,91 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("∑ sigma");
-    expect(rendered).toContain("ready in D:\\software\\sigma\\packages\\agent-tui");
-    expect(rendered).toContain("fi▌x tests");
+    expect(rendered).toContain("\u2211 Sigma agent-tui");
+    expect(rendered).toContain("\u2211 Ready in agent-tui");
+    expect(rendered).toContain("/mode plan inspect this package");
+    expect(rendered).toContain("@src/app.tsx explain rendering");
+    expect(rendered).toContain("!pnpm test");
+    expect(rendered).toContain(`build \u203a fi\u258cx tests`);
     expect(rendered).not.toContain("+--");
     expect(rendered).not.toContain("Status");
     expect(rendered).not.toContain("Timeline");
+    expect(rendered).not.toContain("system    ");
+    expect(rendered).not.toContain("input=0 output=0 total=0");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
 
-    const fullWidthRules = splitLines(rendered).filter((line) => /^─{80,}$/.test(line));
-    expect(fullWidthRules.length).toBeLessThanOrEqual(2);
+    const fullWidthRules = splitLines(rendered).filter((line) => /^\u2500{80,}$/.test(line));
+    expect(fullWidthRules.length).toBeLessThanOrEqual(1);
+  });
+
+  it("defaults to Unicode on Windows-like terminals without WT_SESSION", () => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    process.env.TERM = "xterm-256color";
+    delete process.env.WT_SESSION;
+    delete process.env.SIGMA_ASCII;
+
+    const rendered = renderScreen({
+      workspacePath: "D:\\software\\sigma\\packages\\agent-tui",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: null,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries: buildTranscript({ workspacePath: "D:\\software\\sigma\\packages\\agent-tui", events: [], result: null }),
+      width: 88,
+      height: 18,
+      color: false
+    });
+
+    expect(rendered).toContain("\u2211 Sigma");
+    expect(rendered).not.toContain("S Sigma");
+  });
+
+  it("renders missing API key errors as a single actionable card", () => {
+    process.env.TERM = "xterm-256color";
+    const errorResult = {
+      status: "error",
+      finishReason: "model_error",
+      lastError: "deepseek API key is missing. Set DEEPSEEK_API_KEY or pass an apiKey explicitly.",
+      toolCalls: 0,
+      turns: 1,
+      usage: { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 }
+    } as AgentRunResult;
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [
+        event("error", {
+          message: "deepseek API key is missing. Set DEEPSEEK_API_KEY or pass an apiKey explicitly."
+        })
+      ],
+      result: errorResult
+    });
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: errorResult,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      width: 92,
+      height: 16,
+      color: false
+    });
+
+    expect(rendered).toContain("Missing DEEPSEEK_API_KEY");
+    expect(rendered).toContain("Set it with: $env:DEEPSEEK_API_KEY='...' on PowerShell");
+    expect(rendered).toContain("Or switch provider: /provider glm");
+    expect(rendered).toContain("Run /status or agent doctor --check-api");
+    expect(rendered).not.toContain("summary   error | error");
+    expect(rendered).not.toContain("system    ");
+    expect(rendered).not.toContain("input=0 output=0 total=0");
   });
 
   it("keeps narrow screens within width and falls back plainly for dumb terminals", () => {
@@ -87,7 +173,7 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
-    expect(rendered).toContain("S sigma");
+    expect(rendered).toContain("S Sigma");
     expect(rendered).not.toContain("+---");
     expect(assertWithinWidth(rendered, 54)).toBe(true);
   });

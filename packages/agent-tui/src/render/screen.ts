@@ -4,13 +4,11 @@ import type { AgentEvent, AgentRunResult, PermissionMode } from "agent-core";
 import type { ComposerState } from "../composer-state.js";
 import type { TuiRunMode } from "../mode.js";
 import type { TranscriptEntry } from "../view-model.js";
-import { formatUsage } from "../components/formatting.js";
-import { usageFromEvents } from "../components/status-bar.js";
 import { lineCount, splitLines } from "../ui/layout.js";
 import { truncateToWidth } from "../ui/theme.js";
 import { renderComposer } from "./composer.js";
 import { renderTranscript } from "./transcript.js";
-import { fitStreamLine, muted, roleColor, separatorLine, streamGlyphs } from "./theme.js";
+import { fitStreamLine, roleColor, streamGlyphs } from "./theme.js";
 
 export interface RenderScreenOptions {
   workspacePath: string;
@@ -32,49 +30,30 @@ export interface RenderScreenOptions {
   color?: boolean;
 }
 
-function lastTurn(events: AgentEvent[]): number | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const turn = events[index].metadata?.turn;
-    if (typeof turn === "number") return turn;
-  }
-  return null;
-}
-
 export function renderTopBar(options: RenderScreenOptions): string {
   const g = streamGlyphs();
   const width = options.width;
   const workspace = path.basename(options.workspacePath) || options.workspacePath;
   const model = options.model ?? options.result?.model ?? "default";
   const state = options.running ? "running" : options.result?.status ?? "idle";
-  const turn = options.result?.turns ?? lastTurn(options.events) ?? 0;
-  const tools = options.result?.toolCalls ?? options.events.filter((event) => event.type === "tool_start").length;
-  const usage = options.result?.usage ?? usageFromEvents(options.events);
-  const brand = roleColor("accent", `${g.sigma} sigma`, options.color ?? false);
-
-  const wideParts = [
-    brand,
-    workspace,
-    `${options.provider}/${model}`,
-    `mode ${options.mode}`,
-    options.permissionMode,
-    state,
-    turn > 0 ? `turn ${turn}` : "",
-    tools > 0 ? `tools ${tools}` : "",
-    usage ? formatUsage(usage) : "",
-    options.message ? `notice ${options.message}` : "",
-    "? help",
-    "/ commands"
-  ].filter(Boolean);
-
-  const narrowParts = [
-    brand,
-    `${options.mode}`,
-    state,
-    options.message ? truncateToWidth(options.message, 24) : ""
-  ].filter(Boolean);
-
-  const parts = width < 80 ? narrowParts : wideParts;
-  return fitStreamLine(parts.join(` ${g.separator} `), width);
+  const brand = roleColor("brand", `${g.sigma} Sigma`, options.color ?? false);
+  const stateRole: "danger" | "dim" | "success" | "warning" = options.running
+    ? "warning"
+    : state === "error"
+      ? "danger"
+      : state === "completed"
+        ? "success"
+        : state === "stopped"
+          ? "warning"
+          : "dim";
+  const status = roleColor(stateRole, state, options.color ?? false);
+  const chips = width < 72
+    ? [options.mode, status]
+    : [`${options.provider}/${model}`, options.mode, options.permissionMode, status];
+  return fitStreamLine([
+    `${brand} ${truncateToWidth(workspace, Math.max(10, Math.floor(width / 4)))}`,
+    chips.join(` ${g.separator} `)
+  ].filter(Boolean).join("  "), width);
 }
 
 function trimScreen(lines: string[], height: number): string[] {
@@ -84,9 +63,7 @@ function trimScreen(lines: string[], height: number): string[] {
 
 export function renderScreen(options: RenderScreenOptions): string {
   const compact = options.height < 24;
-  const topLines = compact
-    ? [renderTopBar(options)]
-    : [renderTopBar(options), muted(separatorLine(options.width), options.color ?? false)];
+  const topLines = [renderTopBar(options)];
   const composer = renderComposer({
     state: options.composer,
     mode: options.mode,

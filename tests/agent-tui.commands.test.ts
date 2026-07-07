@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   canonicalCommandInput,
@@ -10,12 +13,17 @@ import {
   fileMentionSuggestions,
   insertFileMention
 } from "../packages/agent-tui/src/file-mentions.js";
+import { resolveLocalWorkspaceInput } from "../packages/agent-tui/src/workspace-command.js";
 
 describe("agent-tui commands and mention palettes", () => {
   it("resolves aliases to canonical commands", () => {
     expect(resolveCommand("/dp")?.spec.name).toBe("/diff patch");
     expect(resolveCommand("/ds")?.spec.name).toBe("/diff stat");
     expect(resolveCommand("/q")?.spec.name).toBe("/exit");
+    expect(resolveCommand("/w packages")).toMatchObject({
+      canonicalInput: "/workspace",
+      value: "packages"
+    });
     expect(resolveCommand("!pnpm test")).toMatchObject({
       canonicalInput: "/shell",
       value: "pnpm test"
@@ -51,5 +59,23 @@ describe("agent-tui commands and mention palettes", () => {
       text: "open @src/app.tsx",
       cursor: "open @src/app.tsx".length
     });
+  });
+
+  it("classifies cd as a local workspace switch before model submission", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-"));
+    try {
+      const child = path.join(root, "child");
+      fs.mkdirSync(child);
+
+      const result = resolveLocalWorkspaceInput("cd child", root);
+
+      expect(result).toMatchObject({
+        handled: true,
+        ok: true,
+        workspace: child
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
