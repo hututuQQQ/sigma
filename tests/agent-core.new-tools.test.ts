@@ -1,14 +1,19 @@
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import type { ToolCall } from "agent-ai";
 import {
+  closeShellSessions,
+  createDefaultToolRegistry,
   executeApplyPatchTool,
   executeGitDiffTool,
   executeGitStatusTool,
   executeGlobTool,
   executeGrepTool,
   executeListTool,
+  executeRepoQueryTool,
+  executeShellSessionTool,
   executeTodoTool,
   type ToolExecutionContext
 } from "../packages/agent-core/src/index.js";
@@ -52,6 +57,10 @@ function quotedReplacementPatch(file: string, before: string, after: string): st
   ].join("\n");
 }
 
+function shellSessionCall(id: string, args: Record<string, unknown>): ToolCall {
+  return { id, type: "function", function: { name: "shell_session", arguments: args } };
+}
+
 async function installStallingGitOverride(dir: string): Promise<() => void> {
   const fakeBin = path.join(dir, "fake-bin");
   await mkdir(fakeBin, { recursive: true });
@@ -81,6 +90,10 @@ async function installStallingGitOverride(dir: string): Promise<() => void> {
 }
 
 describe("new core workspace tools", () => {
+  afterEach(async () => {
+    await closeShellSessions();
+  });
+
   it("lists workspace entries deterministically while skipping ignored directories", async () => {
     const { dir, context } = await workspace();
     await mkdir(path.join(dir, "src"), { recursive: true });
@@ -222,5 +235,159 @@ describe("new core workspace tools", () => {
     expect((listed.metadata as { todoItems: Array<{ text: string; status: string; note?: string }> }).todoItems).toEqual([
       { id: "1", text: "inspect", status: "done", note: "ok" }
     ]);
+  });
+
+  it("repo_query finds symbols", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "math.ts"), "export function addNumbers(a: number, b: number) {\n  return a + b;\n}\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "addNumbers", kind: "symbol" }, context);
+
+    expect(result.ok).toBe(true);
+    const matches = (result.metadata as { matches: Array<{ path: string; lineStart: number }> }).matches;
+    expect(matches[0]).toMatchObject({ path: "src/math.ts", lineStart: 1 });
+  });
+
+  it("repo_query finds config files and respects workspace boundaries", async () => {
+    const { dir, context } = await workspace();
+    await writeFile(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: "vitest run" } }), "utf8");
+
+    const config = await executeRepoQueryTool({ query: "scripts test", kind: "config" }, context);
+    expect(config.ok).toBe(true);
+    expect((config.metadata as { matches: Array<{ path: string }> }).matches[0].path).toBe("package.json");
+
+    const outside = await executeRepoQueryTool({ query: "anything", path: "../outside" }, context);
+    expect(outside.ok).toBe(false);
+    expect(outside.content).toContain("outside the workspace");
+  });
+
+  it("repo_query path kind returns path matches without content snippets", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "payment-ledger.ts"), "const unrelated = true;\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "payment ledger", kind: "path" }, context);
+
+    expect(result.ok).toBe(true);
+    const matches = (result.metadata as { matches: Array<{ path: string; snippet: string }> }).matches;
+    expect(matches).toEqual([expect.objectContaining({ path: "src/payment-ledger.ts", snippet: "src/payment-ledger.ts" })]);
+  });
+
+  it("repo_query does not return path-score-only line matches", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "payment-ledger.ts"), "const unrelated = true;\nconst alsoUnrelated = false;\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "payment ledger", kind: "text" }, context);
+
+    expect(result.ok).toBe(true);
+    expect((result.metadata as { matches: unknown[] }).matches).toEqual([]);
+  });
+
+  it("repo_query respects max snippets and chars", async () => {
+    const { dir, context } = await workspace();
+    await writeFile(path.join(dir, "a.txt"), "needle one\nneedle two\nneedle three\n", "utf8");
+
+    const result = await executeRepoQueryTool({ query: "needle", maxSnippets: 1, maxChars: 500 }, context);
+
+    expect(result.ok).toBe(true);
+    expect(result.content.length).toBeLessThanOrEqual(500);
+    expect((result.metadata as { matches: unknown[] }).matches).toHaveLength(1);
+  });
+
+  it("shell_session start/send/read echoes output", async () => {
+    const { context } = await workspace();
+    const start = await executeShellSessionTool({ action: "start", sessionId: "echo-test" }, context);
+    expect(start.ok).toBe(true);
+
+    const sent = await executeShellSessionTool({ action: "send", sessionId: "echo-test", input: "printf hello" }, context);
+    expect(sent.ok).toBe(true);
+    expect(sent.content).toContain("hello");
+
+    const read = await executeShellSessionTool({ action: "read", sessionId: "echo-test" }, context);
+    expect(read.ok).toBe(true);
+  });
+
+  it("shell_session persists cwd across commands and stops cleanly", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "nested"), { recursive: true });
+    await expect(executeShellSessionTool({ action: "start", sessionId: "cwd-test" }, context)).resolves.toMatchObject({
+      ok: true
+    });
+
+    await expect(executeShellSessionTool({ action: "send", sessionId: "cwd-test", input: "cd nested" }, context)).resolves.toMatchObject({
+      ok: true
+    });
+    const pwd = await executeShellSessionTool({ action: "send", sessionId: "cwd-test", input: "basename \"$PWD\"" }, context);
+    expect(pwd.ok).toBe(true);
+    expect(pwd.content).toContain("nested");
+
+    await expect(executeShellSessionTool({ action: "stop", sessionId: "cwd-test" }, context)).resolves.toMatchObject({
+      ok: true
+    });
+    const listed = await executeShellSessionTool({ action: "list" }, context);
+    expect((listed.metadata as { sessionIds: string[] }).sessionIds).not.toContain("cwd-test");
+  });
+
+  it("shell_session send timeout does not hang and output truncates", async () => {
+    const { context } = await workspace();
+    await expect(executeShellSessionTool({ action: "start", sessionId: "timeout-test" }, context)).resolves.toMatchObject({
+      ok: true
+    });
+
+    const timeout = await executeShellSessionTool(
+      { action: "send", sessionId: "timeout-test", input: "sleep 2", timeoutSec: 1 },
+      context
+    );
+    expect(timeout.ok).toBe(false);
+    expect(timeout.metadata?.timedOut).toBe(true);
+    expect(timeout.metadata?.sessionState).toBe("stopped_after_timeout");
+    expect(timeout.content).toContain("sessionState: stopped_after_timeout");
+
+    const afterTimeout = await executeShellSessionTool(
+      { action: "send", sessionId: "timeout-test", input: "printf should-not-run" },
+      context
+    );
+    expect(afterTimeout.ok).toBe(false);
+    expect(afterTimeout.content).toContain("Unknown shell_session: timeout-test");
+
+    await expect(executeShellSessionTool({ action: "start", sessionId: "truncate-test" }, context)).resolves.toMatchObject({
+      ok: true
+    });
+
+    const truncated = await executeShellSessionTool(
+      { action: "send", sessionId: "truncate-test", input: "printf 'abcdef%.0s' {1..80}", maxOutputChars: 200 },
+      context
+    );
+    expect(truncated.content.length).toBeLessThanOrEqual(200);
+  });
+
+  it("shell_session registries do not close each other's sessions", async () => {
+    const { context: contextA } = await workspace();
+    const { context: contextB } = await workspace();
+    const registryA = createDefaultToolRegistry();
+    const registryB = createDefaultToolRegistry();
+
+    try {
+      const [startA, startB] = await Promise.all([
+        registryA.execute(shellSessionCall("start-a", { action: "start", sessionId: "shared-session" }), contextA),
+        registryB.execute(shellSessionCall("start-b", { action: "start", sessionId: "shared-session" }), contextB)
+      ]);
+      expect(startA.ok).toBe(true);
+      expect(startB.ok).toBe(true);
+
+      await registryA.close?.();
+      const sentB = await registryB.execute(
+        shellSessionCall("send-b", { action: "send", sessionId: "shared-session", input: "printf registry-b" }),
+        contextB
+      );
+
+      expect(sentB.ok).toBe(true);
+      expect(sentB.content).toContain("registry-b");
+    } finally {
+      await registryA.close?.();
+      await registryB.close?.();
+    }
   });
 });

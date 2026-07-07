@@ -198,6 +198,16 @@ describe("agent-core harness", () => {
         expect.objectContaining({ command: expect.stringContaining("node --check parser.js"), exit_code: 0 })
       ])
     );
+    expect(summary.evidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolName: "harness.validation",
+          executable: true,
+          command: expect.stringContaining("node --check parser.js"),
+          exitCode: 0
+        })
+      ])
+    );
   });
 
   it("retries after validation failure and preserves attempt artifacts", async () => {

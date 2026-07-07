@@ -40,6 +40,34 @@ class FinalModel implements ModelClient {
   }
 }
 
+class ShellSessionMetricModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-shell-session-metric-model";
+  private index = 0;
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    const responses: ModelResponse[] = [
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            { id: "shell-start", type: "function", function: { name: "shell_session", arguments: { action: "start", sessionId: "metric" } } },
+            {
+              id: "shell-send",
+              type: "function",
+              function: { name: "shell_session", arguments: { action: "send", sessionId: "metric", input: "printf ok" } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ];
+    const response = responses[Math.min(this.index, responses.length - 1)];
+    this.index += 1;
+    return response;
+  }
+}
+
 describe("summary JSON fields", () => {
   it("includes new fields when relevant", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-summary-"));
@@ -85,5 +113,21 @@ describe("summary JSON fields", () => {
     expect(summary).not.toHaveProperty("mcp_servers");
     expect(summary.context_mode).toBe("off");
   });
-});
 
+  it("counts shell_session.send in command execution metrics", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-summary-shell-session-"));
+    const summaryPath = path.join(dir, "summary.json");
+
+    await runAgent({
+      instruction: "run a persistent shell command",
+      workspacePath: dir,
+      modelClient: new ShellSessionMetricModel(),
+      permissionMode: "yolo",
+      summaryJsonPath: summaryPath
+    });
+
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.tool_calls).toBe(2);
+    expect(summary.commands_executed).toBe(1);
+  });
+});

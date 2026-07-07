@@ -1,7 +1,37 @@
 import type { AgentRunResult, HarnessCommandResult, HarnessRetryDecision, SummaryJson } from "../types.js";
 
-function tailText(text: string, limit = 6000): string {
+function tailText(text: string, limit = 1600): string {
   return text.length <= limit ? text : text.slice(-limit);
+}
+
+function inferFailureCategory(result: HarnessCommandResult): string {
+  const combined = `${result.command}\n${result.stdout_tail}\n${result.stderr_tail}`.toLowerCase();
+  if (result.timed_out || result.exit_code === 124 || combined.includes("timed out")) return "timeout";
+  if (/\b(tsc|typecheck|type-check)\b/.test(combined)) return "typecheck";
+  if (/\b(pytest|go test|cargo test|mvn test|gradle test|npm test|pnpm test|yarn test|bun test)\b/.test(combined)) return "test";
+  if (/\b(eslint|lint)\b/.test(combined)) return "lint";
+  if (/\b(build|compile)\b/.test(combined)) return "build";
+  if (/syntaxerror|parse error|unexpected token|unterminated|syntax error/.test(combined)) return "syntax";
+  if (/enoent|not found|command not found/.test(combined)) return "missing-tool-or-file";
+  return "unknown";
+}
+
+export function formatFailureCard(result: HarnessCommandResult, index: number): string {
+  const label = result.kind === "validation" ? "Validation" : "Precheck";
+  const lines = [
+    `${label} failure ${index + 1} card:`,
+    `- command: ${result.command}`,
+    `- exit code: ${result.exit_code}`,
+    `- suspected category: ${inferFailureCategory(result)}`
+  ];
+  if (result.related_files.length > 0) {
+    lines.push(`- related files: ${result.related_files.join(", ")}`);
+  }
+  const stdout = tailText(result.stdout_tail).trim();
+  const stderr = tailText(result.stderr_tail).trim();
+  if (stdout) lines.push(`- stdout tail:\n${stdout}`);
+  if (stderr) lines.push(`- stderr tail:\n${stderr}`);
+  return lines.join("\n");
 }
 
 export function retryTrigger(failedResults: HarnessCommandResult[]): HarnessRetryDecision["trigger"] {
@@ -69,14 +99,8 @@ export function instructionWithRetryFeedback(options: {
   ];
 
   options.failedResults.forEach((result, index) => {
-    const label = result.kind === "validation" ? "Validation" : "Precheck";
     lines.push("");
-    lines.push(`${label} failure ${index + 1}:`);
-    lines.push(`- command: ${result.command}`);
-    lines.push(`- exit code: ${result.exit_code}`);
-    if (result.related_files.length > 0) lines.push(`- related files: ${result.related_files.join(", ")}`);
-    if (result.stdout_tail.trim()) lines.push(`- stdout tail:\n${tailText(result.stdout_tail)}`);
-    if (result.stderr_tail.trim()) lines.push(`- stderr tail:\n${tailText(result.stderr_tail)}`);
+    lines.push(formatFailureCard(result, index));
   });
 
   lines.push("");
@@ -97,8 +121,8 @@ export function instructionWithRetryFeedback(options: {
 
   if (options.traceTail.trim()) {
     lines.push("");
-    lines.push("Trace tail key events:");
-    lines.push(tailText(options.traceTail));
+    lines.push("Trace tail key events (truncated):");
+    lines.push(tailText(options.traceTail, 2000));
   }
 
   return lines.join("\n");

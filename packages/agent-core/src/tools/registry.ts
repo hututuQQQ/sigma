@@ -18,6 +18,8 @@ import { executeGrepTool } from "./grep.js";
 import { executeGitStatusTool, executeGitDiffTool } from "./git.js";
 import { executeApplyPatchTool } from "./apply-patch.js";
 import { executeTodoTool } from "./todo.js";
+import { executeRepoQueryTool } from "./repo-query.js";
+import { createShellSessionToolController } from "./shell-session.js";
 
 const bashTool: RegisteredTool = {
   definition: {
@@ -207,6 +209,61 @@ const grepTool: RegisteredTool = {
   risk: "read"
 };
 
+const repoQueryTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "repo_query",
+      description:
+        "Search the workspace semantically by query and return compact scored file snippets. Useful for finding symbols, tests, configs, or paths.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          kind: { type: "string", enum: ["text", "symbol", "test", "config", "path"] },
+          path: { type: "string" },
+          maxSnippets: { type: "number" },
+          maxChars: { type: "number" }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeRepoQueryTool,
+  risk: "read"
+};
+
+function createShellSessionTool(): RegisteredTool & { registryClose: ToolRegistry["close"] } {
+  const controller = createShellSessionToolController();
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "shell_session",
+        description:
+          "Manage a persistent non-PTY bash session for multi-step terminal workflows. Use action start, send, read, stop, or list.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["start", "send", "read", "stop", "list"] },
+            sessionId: { type: "string" },
+            cwd: { type: "string" },
+            input: { type: "string" },
+            timeoutSec: { type: "number" },
+            maxOutputChars: { type: "number" }
+          },
+          required: ["action"],
+          additionalProperties: false
+        }
+      }
+    },
+    execute: controller.execute,
+    risk: "execute",
+    registryClose: controller.close
+  };
+}
+
 const gitStatusTool: RegisteredTool = {
   definition: {
     type: "function",
@@ -339,10 +396,12 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
       listTool,
       globTool,
       grepTool,
+      repoQueryTool,
       gitStatusTool,
       gitDiffTool,
       applyPatchTool,
-      todoTool
+      todoTool,
+      createShellSessionTool()
     ],
     _options
   );

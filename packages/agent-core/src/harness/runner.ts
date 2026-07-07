@@ -6,6 +6,7 @@ import type {
   AgentHarnessConfig,
   AgentHarnessSummary,
   AgentRunResult,
+  EvidenceRecord,
   HarnessCommandResult,
   SummaryJson
 } from "../types.js";
@@ -13,9 +14,11 @@ import { changedWorkspaceFiles, listWorkspaceManifest } from "./manifest.js";
 import { retryBudgetDecision, retryTrigger, instructionWithRetryFeedback } from "./retry.js";
 import { runPostRunCleanup } from "./cleanup.js";
 import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } from "./summary.js";
-import { runHarnessCommand, validationCommandSpecs } from "./validation.js";
+import { runHarnessCommand } from "./validation.js";
+import { planValidationCommandSpecs } from "./validation-planner.js";
 import { finalizeManagedServices } from "../tools/service.js";
 import { redactSecrets } from "../redaction.js";
+import { evidenceKindForCommand } from "../controller/evidence.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
 const DEFAULT_PRECHECK_TIMEOUT_SEC = 60;
@@ -63,6 +66,22 @@ function failedResults(results: HarnessCommandResult[]): HarnessCommandResult[] 
   return results.filter((result) => result.exit_code !== 0);
 }
 
+function evidenceRecordsFromHarnessResults(results: HarnessCommandResult[]): EvidenceRecord[] {
+  return results
+    .filter((result) => result.exit_code === 0)
+    .map((result) => ({
+      kind: evidenceKindForCommand(result.command),
+      toolName: `harness.${result.kind}`,
+      ok: true,
+      executable: true,
+      command: result.command,
+      summary: result.message,
+      relatedFiles: result.related_files,
+      exitCode: result.exit_code,
+      timestamp: new Date().toISOString()
+    }));
+}
+
 function harnessEnabled(config: AgentHarnessConfig): boolean {
   return (
     config.validationMode === "auto" ||
@@ -87,7 +106,11 @@ async function runChecks(options: {
   if (options.config.validationMode === "auto") {
     const afterManifest = await listWorkspaceManifest(workspacePath);
     const changedFiles = options.beforeManifest ? changedWorkspaceFiles(options.beforeManifest, afterManifest) : [];
-    for (const spec of validationCommandSpecs(options.config.validationCommands ?? [], changedFiles)) {
+    for (const spec of await planValidationCommandSpecs({
+      workspacePath,
+      configuredCommands: options.config.validationCommands ?? [],
+      changedFiles
+    })) {
       emitHarnessEvent(options.config, "harness_check_start", {
         kind: "validation",
         source: spec.source,
@@ -166,6 +189,13 @@ function finalResultForHarness(options: {
         ? "validation_failed"
         : options.finalAttempt.finishReason;
   const status = firstFailure ? "error" : options.finalAttempt.status;
+  const evidenceRecords = [
+    ...(options.finalAttempt.evidenceRecords ?? []),
+    ...evidenceRecordsFromHarnessResults([
+      ...options.harness.validation_results,
+      ...options.harness.precheck_results
+    ])
+  ];
   return {
     status,
     finishReason,
@@ -185,7 +215,11 @@ function finalResultForHarness(options: {
     projectInstructionSources: options.finalAttempt.projectInstructionSources,
     contextMode: options.finalAttempt.contextMode,
     repoMapChars: options.finalAttempt.repoMapChars,
-    mcpServers: options.finalAttempt.mcpServers
+    mcpServers: options.finalAttempt.mcpServers,
+    workflow: options.finalAttempt.workflow,
+    evidenceRecords,
+    finalGate: options.finalAttempt.finalGate,
+    selectedSkills: options.finalAttempt.selectedSkills
   };
 }
 

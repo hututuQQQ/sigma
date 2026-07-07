@@ -249,6 +249,9 @@ Current limitations:
 --project-doc-max-bytes <number>
 --context-mode <off|repo-map>
 --repo-map-max-chars <number>
+--final-evidence-mode <off|auto>
+--skills-mode <off|auto>
+--skills-max-chars <number>
 --enable-mcp
 --mcp-config <path>
 --stream-ui
@@ -258,6 +261,8 @@ Current limitations:
 Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/.agent/config.toml`, then defaults. TOML support is intentionally minimal for MVP scalar values.
 
 Local `agent solve` defaults to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
+
+`--validation-mode auto` also defaults `--final-evidence-mode auto`, which gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. Set `--final-evidence-mode off` to preserve the older stop behavior. When skills are enabled, selected skill names and sources are recorded in summary JSON.
 
 Environment variables mirror the new flags. `AGENT_HARNESS_TIMEOUT_SEC` is the compatibility spelling for the run-controller timeout:
 
@@ -278,6 +283,9 @@ AGENT_NO_PROJECT_INSTRUCTIONS
 AGENT_PROJECT_DOC_MAX_BYTES
 AGENT_CONTEXT_MODE
 AGENT_REPO_MAP_MAX_CHARS
+AGENT_FINAL_EVIDENCE_MODE
+AGENT_SKILLS_MODE
+AGENT_SKILLS_MAX_CHARS
 AGENT_ENABLE_MCP
 AGENT_MCP_CONFIG
 AGENT_STREAM_UI
@@ -300,10 +308,12 @@ The core loop exposes these default tools:
 - `list`: lists workspace files/directories with `path`, `depth`, `includeHidden`, and `maxEntries`.
 - `glob`: finds files with simple `*`, `**`, and `?` patterns.
 - `grep`: searches text files, preferring `rg` when available and falling back to Node.
+- `repo_query`: searches workspace files by query and returns compact scored snippets for text, symbols, tests, configs, or paths.
 - `git_status`: read-only `git status`, bounded by the command timeout.
 - `git_diff`: read-only `git diff` or `git diff --staged`, bounded by the command timeout.
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `todo`: maintains run-scoped todo state for the agent.
+- `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
 Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and is intended only for trusted unattended automation.
 
@@ -330,6 +340,8 @@ SIGMA.md
 The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
 
 Local `agent solve` defaults to `--context-mode repo-map`. The repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+
+Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
 
 ## MCP V0
 
@@ -416,6 +428,32 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
       "name": "local",
       "enabled": true,
       "tools_loaded": 1
+    }
+  ],
+  "workflow": {
+    "phase": "final",
+    "commands_tried": ["pnpm test"],
+    "changed_files": ["src/index.ts"]
+  },
+  "evidence": [
+    {
+      "kind": "test",
+      "toolName": "bash",
+      "ok": true,
+      "executable": true,
+      "command": "pnpm test",
+      "timestamp": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "final_gate": {
+    "mode": "auto",
+    "nudged": false,
+    "status": "satisfied"
+  },
+  "selected_skills": [
+    {
+      "name": "node-typescript",
+      "source": "built-in"
     }
   ],
   "harness": {

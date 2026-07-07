@@ -132,6 +132,9 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       projectDocMaxBytes: cliConfig.projectDocMaxBytes,
       contextMode: cliConfig.contextMode,
       repoMapMaxChars: cliConfig.repoMapMaxChars,
+      finalEvidenceMode: cliConfig.finalEvidenceMode,
+      skillsMode: cliConfig.skillsMode,
+      skillsMaxChars: cliConfig.skillsMaxChars,
       eventBus,
       ...(toolRegistry ? { toolRegistry } : {}),
       ...(mcpServers ? { mcpServers } : {})
