@@ -1,56 +1,95 @@
+import path from "node:path";
 import { redactSecretText, type AgentEvent } from "agent-core";
+import { box } from "../ui/box.js";
+import { glyphs, truncateToWidth } from "../ui/theme.js";
+import {
+  eventUsage,
+  formatUsage,
+  oneLine,
+  summarizeToolArguments,
+  toolArgsFromEvent,
+  toolNameFromEvent,
+  truncate
+} from "./formatting.js";
 
-function truncate(value: string, max = 120): string {
-  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 3))}...`;
+function compactTime(timestamp: string): string {
+  return timestamp.includes("T") ? timestamp.slice(11, 16) : timestamp.slice(0, 5);
 }
 
-function toolStartDetail(toolCall: { function?: { name?: string; arguments?: unknown } } | undefined): string {
-  const name = toolCall?.function?.name ?? "unknown";
-  const args = toolCall?.function?.arguments;
-  if (args && typeof args === "object") {
-    const values = args as Record<string, unknown>;
-    if (name === "bash" && typeof values.command === "string") {
-      return `${name} ${truncate(redactSecretText(values.command), 100)}`;
-    }
-    if (name === "service") {
-      const action = typeof values.action === "string" ? values.action : "service";
-      const serviceName = typeof values.name === "string" ? ` ${values.name}` : "";
-      const command = typeof values.command === "string" ? ` ${truncate(redactSecretText(values.command), 80)}` : "";
-      return `${name} ${action}${serviceName}${command}`;
-    }
-  }
-  return name;
+function formatBytes(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function eventLine(event: AgentEvent): string {
-  const time = event.timestamp.slice(11, 19);
+function workspaceName(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) return "";
+  return path.basename(value) || redactSecretText(value);
+}
+
+function joinDetails(parts: string[]): string {
+  const g = glyphs();
+  return parts.filter(Boolean).join(` ${g.separator} `);
+}
+
+export function formatTimelineEvent(event: AgentEvent): string {
+  const g = glyphs();
+  const time = compactTime(event.timestamp);
   const meta = event.metadata ?? {};
-  if (event.type === "run_start") return `${time} run_start workspace=${meta.workspacePath ?? ""}`;
-  if (event.type === "model_start") return `${time} model_start turn=${meta.turn ?? ""}`;
-  if (event.type === "model_end") return `${time} model_end turn=${meta.turn ?? ""}`;
+  const prefix = (marker: string, text: string) => `${time}  ${marker} ${text}`;
+
+  if (event.type === "run_start") {
+    return prefix(g.sigma, joinDetails(["run started", workspaceName(meta.workspacePath) ? `workspace=${workspaceName(meta.workspacePath)}` : ""]));
+  }
+  if (event.type === "model_start") return prefix(g.running, `model turn ${meta.turn ?? "?"} started`);
+  if (event.type === "model_end") return prefix(g.ok, joinDetails([`model turn ${meta.turn ?? "?"} ended`, formatUsage(eventUsage(event))]));
   if (event.type === "assistant_message") {
-    const content = typeof meta.content === "string" ? redactSecretText(meta.content) : "";
-    const toolCalls = Array.isArray(meta.toolCalls) ? ` tool_calls=${meta.toolCalls.length}` : "";
-    return `${time} assistant ${truncate(content || "(tool call)")}${toolCalls}`;
+    const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
+    if (toolCalls > 0) return prefix(g.info, `assistant proposed ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`);
+    const content = typeof meta.content === "string" ? oneLine(redactSecretText(meta.content)) : "";
+    return prefix(g.info, `assistant ${truncate(content || "(message)", 130)}`);
   }
   if (event.type === "tool_start") {
-    const toolCall = meta.toolCall as { function?: { name?: string } } | undefined;
-    return `${time} tool_start ${toolStartDetail(toolCall)}`;
+    const toolName = toolNameFromEvent(event);
+    const detail = summarizeToolArguments(toolName, toolArgsFromEvent(event));
+    return prefix(g.running, joinDetails([`${toolName} started`, detail]));
   }
   if (event.type === "tool_end") {
-    const result = meta.result as { ok?: boolean; content?: string } | undefined;
-    return `${time} tool_end ${meta.toolName ?? "unknown"} ok=${String(result?.ok ?? false)} ${truncate(redactSecretText(result?.content ?? ""), 90)}`;
+    const result = meta.result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined;
+    const status = result?.ok ? "ok" : "failed";
+    const duration = typeof result?.metadata?.durationMs === "number" ? `${result.metadata.durationMs}ms` : "";
+    const outputSize = formatBytes(result?.metadata?.sizeBytes);
+    const tail = result?.content ? truncate(oneLine(redactSecretText(result.content)), 90) : "";
+    return prefix(result?.ok ? g.ok : g.fail, joinDetails([`${meta.toolName ?? "tool"} ${status}`, outputSize, duration, tail]));
   }
-  if (event.type === "error") return `${time} error ${truncate(redactSecretText(String(meta.message ?? "")))}`;
+  if (event.type === "harness_check_start") {
+    const command = typeof meta.command === "string" ? truncateToWidth(oneLine(redactSecretText(meta.command)), 120) : "";
+    return prefix(g.running, joinDetails([`${meta.kind ?? "check"} check started`, `attempt=${meta.attempt ?? "?"}`, command]));
+  }
+  if (event.type === "harness_check_end") {
+    const ok = meta.exitCode === 0;
+    return prefix(ok ? g.ok : g.fail, joinDetails([`${meta.kind ?? "check"} check ${ok ? "passed" : "failed"}`, `attempt=${meta.attempt ?? "?"}`, `exit=${meta.exitCode ?? "?"}`, `${meta.durationMs ?? "?"}ms`]));
+  }
+  if (event.type === "usage") return prefix(g.info, joinDetails([`usage turn=${meta.turn ?? "?"}`, formatUsage(eventUsage(event))]));
+  if (event.type === "error") return prefix(g.fail, `error ${truncate(redactSecretText(String(meta.message ?? "")))}`);
   if (event.type === "run_end") {
     const result = meta.result as { status?: string; finishReason?: string } | undefined;
-    return `${time} run_end status=${result?.status ?? ""} finish=${result?.finishReason ?? ""}`;
+    return prefix(result?.status === "completed" ? g.ok : g.fail, joinDetails(["run completed", result?.status ?? "", result?.finishReason ?? ""]));
   }
-  return `${time} ${event.type}`;
+  return prefix(g.info, String((event as { type: string }).type).replaceAll("_", " "));
 }
 
-export function Timeline(events: AgentEvent[], maxLines: number): string {
+export function Timeline(events: AgentEvent[], maxLines: number, width = 80, height?: number, color = false): string {
   const visible = events.slice(Math.max(0, events.length - maxLines));
-  if (visible.length === 0) return "Timeline\n  No runs yet.";
-  return ["Timeline", ...visible.map((event) => `  ${eventLine(event)}`)].join("\n");
+  const lines = visible.length === 0
+    ? ["No runs yet.", "Type a task and press Enter to start."]
+    : visible.map((event) => formatTimelineEvent(event));
+  return box({
+    title: `${glyphs().sigma} Timeline`,
+    width,
+    height,
+    color,
+    lines
+  });
 }

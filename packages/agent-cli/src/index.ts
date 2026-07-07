@@ -2,23 +2,27 @@
 import { runChatCommand } from "./commands/chat.js";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runReplayCommand } from "./commands/replay.js";
-import { runSolveCommand } from "./commands/solve.js";
+import { runRunCommand, runSolveCommand } from "./commands/solve.js";
 
 function printHelp(): void {
   process.stdout.write(`agent <command> [flags]
 
 Commands:
-  solve    Run the autonomous coding agent once
+  run      Run the autonomous coding agent once
+  solve    Compatibility alias for run
   chat     Start a minimal plain-terminal chat session
   doctor   Check local configuration
   replay   Summarize a trace JSONL file
 
-Run "agent solve --instruction '...'" to start.
+Run "agent run 'Fix failing tests'" to start.
 
-Common solve flags:
+Common run flags:
   --workspace <path>
   --provider <deepseek|glm>
   --permission-mode <ask|yolo>
+  --output-format <text|json|stream-json>
+  --json
+  --quiet
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
   --context-mode <off|repo-map>
@@ -40,6 +44,7 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  if (command === "run") return await runRunCommand(rest);
   if (command === "solve") return await runSolveCommand(rest);
   if (command === "chat") return await runChatCommand(rest);
   if (command === "doctor") return await runDoctorCommand(rest);

@@ -4,8 +4,8 @@ A small coding-agent monorepo inspired by Pi with four layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
 - `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, JSONL tracing, session records, MCP bridge, and workspace tools
-- `packages/agent-cli`: plain terminal CLI with `solve`, `chat`, `doctor`, and `replay`
-- `packages/agent-tui`: interactive terminal product entry that drives `agent-core` directly
+- `packages/agent-cli`: plain terminal CLI with `run`, `solve` compatibility alias, `chat`, `doctor`, and `replay`
+- `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
 Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, and stdio MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
 
@@ -48,7 +48,7 @@ DeepSeek example:
 pnpm install
 pnpm build
 
-DEEPSEEK_API_KEY=... pnpm --filter agent-cli start -- solve \
+DEEPSEEK_API_KEY=... pnpm --filter agent-cli start -- run \
   --workspace ./examples/hello \
   --instruction "Create hello.txt containing hello world" \
   --provider deepseek \
@@ -68,12 +68,46 @@ pnpm --filter agent-tui start -- \
   --permission-mode ask
 ```
 
-Type a task and press Enter to start one run. TUI commands include `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, and `/diff`. The TUI uses `agent-core` directly; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
+Type a task and press Enter to start one run. The TUI opens as a transcript-first `∑ Sigma` stream rather than a boxed dashboard:
+
+```text
+∑ Sigma agent-tui  deepseek/deepseek-v4-pro · build · ask · idle
+∑ Ready in agent-tui
+Try:
+  /mode plan inspect this package
+  @src/app.tsx explain rendering
+  !pnpm test
+build › fix the failing tests▌
+enter send · ctrl+j newline · tab plan/build · / commands · @ files · ! shell
+```
+
+Windows PowerShell uses Unicode by default in normal terminals:
+
+```powershell
+$env:DEEPSEEK_API_KEY='sk-...'
+pnpm --filter agent-tui start -- --workspace . --provider deepseek
+# ∑ Sigma sigma  deepseek/default · build · ask · idle
+```
+
+If a provider key is missing, the stream shows one actionable card instead of duplicate raw error rows:
+
+```text
+✕ Missing DEEPSEEK_API_KEY
+  Set it with: $env:DEEPSEEK_API_KEY='...' on PowerShell
+  Or switch provider: /provider glm
+  Run /status or agent doctor --check-api
+```
+
+During a run, user, assistant, tool, validation, approval, diff, and summary entries are rendered inline in the stream. `/status`, `/tools`, `/tokens`, `/context`, `/diff stat`, and `/diff patch` open focused details only when requested; there is no permanent right-hand status wall. `/` opens a compact command palette above the composer. Aliases include `/h` or `/?` for help, `/s` status, `/d` diff, `/ds` diff stat, `/dp` diff patch, `/t` tools, `/c` context, `/tk` tokens, `/w` workspace, `/q` exit, and `/cl` clear.
+
+Composer editing is handled in raw mode: Left/Right move the cursor, `Ctrl+A/E` jump to start/end, `Ctrl+U/K` kill to start/end, `Ctrl+W` deletes the previous word, `Ctrl+Y` yanks killed text, `Ctrl+J` inserts a newline, and Up/Down cycle in-memory prompt history. `Tab` toggles plan/build mode unless a command or file suggestion is active; `/mode plan` and `/mode build` are also available, and the composer visibly switches between `plan ›`, `build ›`, and `draft ›` while a run is active. Plan mode disables mutating/run tools for new agent runs: `write`, `edit`, `apply_patch`, `bash`, `shell_session`, and `service`. Typing `@prefix` suggests workspace files, ignoring `.git`, `node_modules`, `dist`, `build`, and `.agent/attempts`. Typing `!command` runs a local shell command through the same approval flow as `/shell <command>`. Typing `cd <path>` switches workspace locally when the directory exists; use `/workspace <path>` or `/w <path>` for the explicit command form.
+
+Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI does not yet provide persisted session index/resume/fork, transcript search, multiple selection in the file palette, or shell completion. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
 Programmatic product integrations should prefer the run-controller API names:
 
 ```ts
-import { runAgentWithController, type AgentRunControllerConfig } from "agent-core";
+import { runConfiguredAgent, runAgentWithController, type AgentRunControllerConfig } from "agent-core";
 ```
 
 The older `runAgentHarness` and `AgentHarnessConfig` exports remain available for compatibility with existing adapters and scripts.
@@ -81,7 +115,7 @@ The older `runAgentHarness` and `AgentHarnessConfig` exports remain available fo
 GLM/Zhipu example:
 
 ```bash
-ZAI_API_KEY=... pnpm --filter agent-cli start -- solve \
+ZAI_API_KEY=... pnpm --filter agent-cli start -- run \
   --workspace ./examples/hello \
   --instruction "Create hello.txt containing hello world" \
   --provider glm \
@@ -91,9 +125,11 @@ ZAI_API_KEY=... pnpm --filter agent-cli start -- solve \
   --summary-json ./summary.json
 ```
 
-Instruction input can come from `--instruction`, `--instruction-file`, or stdin:
+Instruction input can come from a positional string, `--instruction`, `--instruction-file`, or stdin:
 
 ```bash
+pnpm --filter agent-cli start -- run "Fix the failing tests" --workspace .
+
 printf "Fix the failing tests" | pnpm --filter agent-cli start -- solve \
   --workspace . \
   --provider deepseek \
@@ -104,8 +140,10 @@ Useful checks:
 
 ```bash
 pnpm --filter agent-cli start -- doctor --workspace .
+pnpm --filter agent-cli start -- doctor --workspace . --json
 pnpm --filter agent-cli start -- doctor --workspace . --provider glm --check-api
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
+pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl --timeline
 ```
 
 ## Smoke Tests
@@ -213,7 +251,7 @@ Current limitations:
 
 ## CLI Flags
 
-`agent solve` supports:
+`agent run` supports the non-interactive coding-agent flow. `agent solve` remains a compatibility alias with the same flags:
 
 ```text
 --workspace <path>
@@ -228,6 +266,9 @@ Current limitations:
 --trace-jsonl <path>
 --summary-json <path>
 --session-jsonl <path>
+--output-format <text|json|stream-json>
+--json
+--quiet
 --max-tool-output-chars <number>
 --max-message-history-chars <number>
 --message-history-retain <number>
@@ -260,7 +301,7 @@ Current limitations:
 
 Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/.agent/config.toml`, then defaults. TOML support is intentionally minimal for MVP scalar values.
 
-Local `agent solve` defaults to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
+Local `agent run` and `agent solve` default to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
 
 `--validation-mode auto` also defaults `--final-evidence-mode auto`, which gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. Set `--final-evidence-mode off` to preserve the older stop behavior. When skills are enabled, selected skill names and sources are recorded in summary JSON.
 
@@ -288,11 +329,13 @@ AGENT_SKILLS_MODE
 AGENT_SKILLS_MAX_CHARS
 AGENT_ENABLE_MCP
 AGENT_MCP_CONFIG
+AGENT_OUTPUT_FORMAT
+AGENT_QUIET
 AGENT_STREAM_UI
 AGENT_NO_STREAM_UI
 ```
 
-`agent solve` prints live progress to stderr by default and keeps the final status summary on stdout. Use `--no-stream-ui` for quiet machine-driven runs. `scripts/smoke-local.mjs` already passes `--no-stream-ui` for real CLI smoke tasks.
+In text mode, `agent run` prints live progress to stderr by default and keeps the final status summary on stdout. Use `--quiet` for only the final message or a minimal final summary, or `--no-stream-ui` to suppress live progress. `--output-format json` (or `--json`) writes one redacted `AgentRunResult` object to stdout. `--output-format stream-json` writes redacted JSONL event records to stdout and ends with a `{"type":"result","result":...}` record. Human stream UI is disabled by default in JSON modes unless `--stream-ui` is explicitly passed. `scripts/smoke-local.mjs` already passes `--no-stream-ui` for real CLI smoke tasks.
 
 ## Tools And Permissions
 
@@ -339,7 +382,7 @@ SIGMA.md
 
 The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
 
-Local `agent solve` defaults to `--context-mode repo-map`. The repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+Local `agent run` and `agent solve` default to `--context-mode repo-map`. The repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
 
 Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
 
@@ -356,7 +399,7 @@ Default config path:
 Custom config:
 
 ```bash
-pnpm --filter agent-cli start -- solve \
+pnpm --filter agent-cli start -- run \
   --workspace . \
   --instruction "Use the local MCP echo tool" \
   --provider deepseek \
@@ -394,7 +437,7 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
 
 ## Summary JSON
 
-`agent solve` writes:
+`agent run` and the compatibility `agent solve` command write:
 
 ```json
 {
