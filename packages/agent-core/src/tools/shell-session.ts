@@ -215,7 +215,14 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
   }
 
   const output = readAndClear(session);
-  const content = formatOutput(output.stdout, output.stderr, exitCode, !found);
+  if (!found) {
+    stopSessionRecord(session);
+    store.sessions.delete(id);
+  }
+  const content = [
+    formatOutput(output.stdout, output.stderr, exitCode, !found),
+    !found ? "sessionState: stopped_after_timeout" : ""
+  ].filter(Boolean).join("\n");
   const maxOutputChars = numberValue(args.maxOutputChars, context.maxToolOutputChars, 200, 50000);
   const truncated = truncateMiddle(content, maxOutputChars);
   return {
@@ -225,6 +232,7 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
       sessionId: id,
       exitCode,
       timedOut: !found,
+      sessionState: found ? "idle" : "stopped_after_timeout",
       truncated: truncated.truncated
     }
   };

@@ -342,9 +342,22 @@ describe("new core workspace tools", () => {
     );
     expect(timeout.ok).toBe(false);
     expect(timeout.metadata?.timedOut).toBe(true);
+    expect(timeout.metadata?.sessionState).toBe("stopped_after_timeout");
+    expect(timeout.content).toContain("sessionState: stopped_after_timeout");
+
+    const afterTimeout = await executeShellSessionTool(
+      { action: "send", sessionId: "timeout-test", input: "printf should-not-run" },
+      context
+    );
+    expect(afterTimeout.ok).toBe(false);
+    expect(afterTimeout.content).toContain("Unknown shell_session: timeout-test");
+
+    await expect(executeShellSessionTool({ action: "start", sessionId: "truncate-test" }, context)).resolves.toMatchObject({
+      ok: true
+    });
 
     const truncated = await executeShellSessionTool(
-      { action: "send", sessionId: "timeout-test", input: "printf 'abcdef%.0s' {1..80}", maxOutputChars: 200 },
+      { action: "send", sessionId: "truncate-test", input: "printf 'abcdef%.0s' {1..80}", maxOutputChars: 200 },
       context
     );
     expect(truncated.content.length).toBeLessThanOrEqual(200);

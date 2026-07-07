@@ -91,6 +91,23 @@ describe("validation planner", () => {
     expect(commands).toContain("if command -v bun >/dev/null 2>&1; then bun run build; else echo 'bun not found for validation' >&2; exit 127; fi");
   });
 
+  it("prefers lockfiles over packageManager when inferring package manager", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(
+      path.join(dir, "package.json"),
+      JSON.stringify({ packageManager: "bun@1.2.0", scripts: { test: "vitest run" } }),
+      "utf8"
+    );
+    await writeFile(path.join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+
+    const commands = (await planValidationCommandSpecs({ workspacePath: dir, changedFiles: ["package.json"] })).map(
+      (spec) => spec.command
+    );
+
+    expect(commands).toContain("if command -v pnpm >/dev/null 2>&1; then pnpm test; else echo 'pnpm not found for validation' >&2; exit 127; fi");
+    expect(commands.join("\n")).not.toContain("bun");
+  });
+
   it("plans Go and Rust project checks", async () => {
     const dir = await tempWorkspace();
     await writeFile(path.join(dir, "go.mod"), "module example.com/app\n", "utf8");

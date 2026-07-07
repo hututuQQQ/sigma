@@ -104,11 +104,11 @@ function packageManagerFromPackageJson(packageJson: string): NodePackageManager 
 }
 
 function packageManagerFromFiles(files: Set<string>, packageJson: string): NodePackageManager {
-  const fromPackageJson = packageManagerFromPackageJson(packageJson);
-  if (fromPackageJson) return fromPackageJson;
   if (files.has("pnpm-lock.yaml")) return "pnpm";
   if (files.has("yarn.lock")) return "yarn";
   if (files.has("bun.lock") || files.has("bun.lockb")) return "bun";
+  const fromPackageJson = packageManagerFromPackageJson(packageJson);
+  if (fromPackageJson) return fromPackageJson;
   return "npm";
 }
 
