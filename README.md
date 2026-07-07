@@ -68,9 +68,9 @@ pnpm --filter agent-tui start -- \
   --permission-mode ask
 ```
 
-Type a task and press Enter to start one run. TUI commands include `/help`, `/status`, `/tokens`, `/context`, `/test <command>`, `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, `/diff stat`, and `/diff patch`. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
+Type a task and press Enter to start one run. The TUI opens as a terminal-first `∑ Sigma` cockpit with a masthead, activity timeline, focus panel, and boxed composer. Slash commands are discoverable: typing `/` opens the command palette and partial input such as `/di` filters to matching diff commands. Commands include `/help`, `/status`, `/tokens`, `/context`, `/test <command>`, `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, `/diff stat`, and `/diff patch`. Shortcuts include `Esc` to clear input or close the current focus panel, `Ctrl+L` to clear, `Ctrl+D` for diff, `Ctrl+T` for tools, `F1` for help, `Ctrl+J` for a composer newline, and Up/Down for in-memory prompt history. If a run is active, pressing Enter on a normal task queues one follow-up task for the next run instead of discarding the draft.
 
-Current UX boundary: `agent run` is the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The interactive UI is still launched through the `agent-tui` binary; root `agent` does not auto-enter the TUI and `agent tui` is not implemented yet. Session index/resume/fork, shell completion, color polish, and multiline/autocomplete composer upgrades are future follow-ups.
+Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI has multiline input via `Ctrl+J` and slash-command suggestions, but it does not yet provide persisted session index/resume/fork, shell completion, or tab autocomplete. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
 Programmatic product integrations should prefer the run-controller API names:
 

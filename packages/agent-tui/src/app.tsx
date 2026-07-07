@@ -15,14 +15,18 @@ import {
   type TokenTotals
 } from "agent-core";
 import { ApprovalPrompt } from "./components/approval-prompt.js";
+import { COMMANDS, renderCommandPalette } from "./components/commands.js";
 import { Composer } from "./components/composer.js";
 import { DiffPanel, parseDiffMode, type DiffMode } from "./components/diff-panel.js";
 import { eventUsage, formatUsage, oneLine, truncate } from "./components/formatting.js";
-import { StatusBar } from "./components/status-bar.js";
+import { StatusBar, usageFromEvents } from "./components/status-bar.js";
 import { Timeline } from "./components/timeline.js";
 import { ToolPanel } from "./components/tool-panel.js";
 import { TuiPermissionController } from "./permission.js";
 import { runSession } from "./run-session.js";
+import { box } from "./ui/box.js";
+import { lineCount, renderMainArea } from "./ui/layout.js";
+import { glyphs, supportsColor, truncateToWidth, wrapText } from "./ui/theme.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -66,6 +70,13 @@ interface CommandResult {
   durationMs: number;
 }
 
+interface TestSnapshot {
+  command: string;
+  result: CommandResult;
+}
+
+type FocusMode = "status" | "tokens" | "context" | "tools" | "diff" | "test" | "help";
+
 function shellCommand(command: string): { file: string; args: string[] } {
   return process.platform === "win32"
     ? { file: "cmd.exe", args: ["/d", "/s", "/c", command] }
@@ -74,7 +85,16 @@ function shellCommand(command: string): { file: string; args: string[] } {
 
 function blockTail(value: string, max = 4000): string {
   const redacted = redactSecretText(value);
-  return redacted.length <= max ? redacted : `${redacted.slice(0, 1200)}\n... truncated ...\n${redacted.slice(-Math.max(0, max - 1220))}`;
+  if (redacted.length <= max) return redacted;
+  return `${redacted.slice(0, 1200)}\n... truncated ...\n${redacted.slice(-Math.max(0, max - 1220))}`;
+}
+
+function listValue(value: string[] | undefined, empty = "none"): string {
+  return value && value.length > 0 ? value.map((item) => redactSecretText(item)).join(", ") : empty;
+}
+
+function field(label: string, value: string | number | undefined | null, width: number): string[] {
+  return wrapText(`${label}: ${value ?? "default"}`, width);
 }
 
 async function runLocalShellCommand(command: string, cwd: string, timeoutSec: number): Promise<CommandResult> {
@@ -113,18 +133,24 @@ class TuiApp {
   private events: AgentEvent[] = [];
   private result: AgentRunResult | null = null;
   private message: string | null = null;
-  private infoText: string | null = null;
-  private showTools = false;
-  private showDiff = false;
+  private focusMode: FocusMode = "status";
   private diffMode: DiffMode = "stat";
   private diffText = "";
+  private testSnapshot: TestSnapshot | null = null;
+  private queuedInstruction: string | null = null;
+  private readonly history: string[] = [];
+  private historyCursor: number | null = null;
+  private historyDraft = "";
   private readonly permissionController = new TuiPermissionController();
+  private readonly colorEnabled: boolean;
 
   constructor(
     private readonly options: TuiAppOptions,
     private readonly stdin: NodeJS.ReadStream,
     private readonly stdout: NodeJS.WriteStream
-  ) {}
+  ) {
+    this.colorEnabled = supportsColor(stdout);
+  }
 
   async start(): Promise<void> {
     readline.emitKeypressEvents(this.stdin);
@@ -158,21 +184,54 @@ class TuiApp {
       return;
     }
 
-    if (key.name === "return") {
-      void this.submitInput();
-      return;
-    }
     if (key.name === "backspace") {
+      this.resetHistoryCursor();
       this.inputBuffer = this.inputBuffer.slice(0, -1);
       this.render();
       return;
     }
-    if (key.name === "escape") {
-      this.inputBuffer = "";
+    if (key.ctrl && key.name === "j") {
+      this.resetHistoryCursor();
+      this.inputBuffer += "\n";
       this.render();
       return;
     }
+    if (key.ctrl && key.name === "l") {
+      this.clearTimeline("Cleared.");
+      return;
+    }
+    if (key.ctrl && key.name === "d") {
+      void this.toggleDiffPanel();
+      return;
+    }
+    if (key.ctrl && key.name === "t") {
+      this.toggleToolsPanel();
+      return;
+    }
+    if (key.name === "f1" || (key.ctrl && key.name === "h")) {
+      this.focusMode = "help";
+      this.message = "Help opened.";
+      this.render();
+      return;
+    }
+    if (key.name === "escape") {
+      this.handleEscape();
+      return;
+    }
+    if (key.name === "up") {
+      this.recallHistory("up");
+      return;
+    }
+    if (key.name === "down") {
+      this.recallHistory("down");
+      return;
+    }
+    if (key.name === "return") {
+      void this.submitInput();
+      return;
+    }
     if (text && !key.ctrl && !key.meta && text >= " ") {
+      this.resetHistoryCursor();
       this.inputBuffer += text;
       this.render();
     }
@@ -186,19 +245,66 @@ class TuiApp {
     return null;
   }
 
+  private resetHistoryCursor(): void {
+    this.historyCursor = null;
+    this.historyDraft = "";
+  }
+
+  private recallHistory(direction: "up" | "down"): void {
+    if (this.history.length === 0) return;
+    if (this.historyCursor === null) {
+      this.historyCursor = this.history.length;
+      this.historyDraft = this.inputBuffer;
+    }
+    if (direction === "up") this.historyCursor = Math.max(0, this.historyCursor - 1);
+    else this.historyCursor = Math.min(this.history.length, this.historyCursor + 1);
+
+    if (this.historyCursor === this.history.length) {
+      this.inputBuffer = this.historyDraft;
+      this.resetHistoryCursor();
+    } else {
+      this.inputBuffer = this.history[this.historyCursor] ?? "";
+    }
+    this.render();
+  }
+
+  private rememberInput(value: string): void {
+    if (!value) return;
+    if (this.history[this.history.length - 1] !== value) this.history.push(value);
+    if (this.history.length > 100) this.history.shift();
+    this.resetHistoryCursor();
+  }
+
+  private handleEscape(): void {
+    if (this.inputBuffer.length > 0) {
+      this.inputBuffer = "";
+      this.resetHistoryCursor();
+      this.message = "Input cleared.";
+    } else if (this.focusMode !== "status") {
+      this.focusMode = "status";
+      this.message = "Focus closed.";
+    } else {
+      this.message = null;
+    }
+    this.render();
+  }
+
   private async submitInput(): Promise<void> {
     const value = this.inputBuffer.trim();
-    this.inputBuffer = "";
     if (!value) {
+      this.inputBuffer = "";
       this.render();
       return;
     }
+    this.rememberInput(value);
+    this.inputBuffer = "";
     if (value.startsWith("/")) {
       await this.handleCommand(value);
       return;
     }
     if (this.running) {
-      this.message = "A run is already active.";
+      this.queuedInstruction = value;
+      this.message = "Queued one follow-up task for the next run.";
       this.render();
       return;
     }
@@ -219,33 +325,29 @@ class TuiApp {
       return;
     }
     if (name === "/clear") {
-      this.events = [];
-      this.result = null;
-      this.infoText = null;
-      this.message = "Cleared.";
-      this.render();
+      this.clearTimeline("Cleared.");
       return;
     }
     if (name === "/help") {
-      this.infoText = this.helpText();
+      this.focusMode = "help";
       this.message = "Help opened.";
       this.render();
       return;
     }
     if (name === "/status") {
-      this.infoText = this.statusText();
+      this.focusMode = "status";
       this.message = "Status opened.";
       this.render();
       return;
     }
     if (name === "/tokens") {
-      this.infoText = this.tokensText();
+      this.focusMode = "tokens";
       this.message = "Token usage opened.";
       this.render();
       return;
     }
     if (name === "/context") {
-      this.infoText = this.contextText();
+      this.focusMode = "context";
       this.message = "Context opened.";
       this.render();
       return;
@@ -277,8 +379,7 @@ class TuiApp {
       return;
     }
     if (name === "/tools") {
-      this.showTools = !this.showTools;
-      this.render();
+      this.toggleToolsPanel();
       return;
     }
     if (name === "/diff") {
@@ -289,8 +390,12 @@ class TuiApp {
         return;
       }
       this.diffMode = requestedMode;
-      this.showDiff = value ? true : !this.showDiff;
-      if (this.showDiff) await this.refreshDiff();
+      if (value || this.focusMode !== "diff") {
+        this.focusMode = "diff";
+        await this.refreshDiff();
+      } else {
+        this.focusMode = "status";
+      }
       this.render();
       return;
     }
@@ -298,7 +403,35 @@ class TuiApp {
       await this.runTestCommand(value);
       return;
     }
+    this.focusMode = "help";
     this.message = `Unknown command: ${name}`;
+    this.render();
+  }
+
+  private clearTimeline(message: string): void {
+    this.events = [];
+    this.result = null;
+    this.testSnapshot = null;
+    this.message = message;
+    this.render();
+  }
+
+  private toggleToolsPanel(): void {
+    this.focusMode = this.focusMode === "tools" ? "status" : "tools";
+    this.message = this.focusMode === "tools" ? "Tools opened." : "Tools closed.";
+    this.render();
+  }
+
+  private async toggleDiffPanel(): Promise<void> {
+    if (this.focusMode === "diff") {
+      this.focusMode = "status";
+      this.message = "Diff closed.";
+      this.render();
+      return;
+    }
+    this.focusMode = "diff";
+    this.message = "Diff opened.";
+    await this.refreshDiff();
     this.render();
   }
 
@@ -347,11 +480,19 @@ class TuiApp {
       });
       this.result = result;
       this.message = this.completionMessage(result);
-      if (this.showDiff) await this.refreshDiff();
+      this.focusMode = "status";
     } catch (error) {
       this.message = `Run failed: ${error instanceof Error ? error.message : String(error)}`;
     } finally {
       this.running = false;
+      const next = this.queuedInstruction;
+      if (next && !this.exitAfterRun) {
+        this.queuedInstruction = null;
+        this.message = "Starting queued task.";
+        this.render();
+        await this.startRun(next);
+        return;
+      }
       this.render();
       if (this.exitAfterRun) this.stop();
     }
@@ -377,39 +518,101 @@ class TuiApp {
   }
 
   private render(): void {
-    const rows = this.stdout.rows ?? 30;
-    const infoRows = this.infoText ? Math.min(10, this.infoText.split(/\r?\n/).length + 1) : 0;
-    const reserved = 8 + infoRows + (this.showTools ? 8 : 0) + (this.showDiff ? 8 : 0);
-    const timelineRows = Math.max(4, rows - reserved);
-    const sections = [
-      StatusBar({
-        workspacePath: this.options.workspace,
-        provider: this.options.provider,
-        model: this.options.model,
-        permissionMode: this.options.permissionMode,
-        validationMode: this.options.validationMode,
-        finalEvidenceMode: this.options.finalEvidenceMode,
-        running: this.running,
-        result: this.result,
-        events: this.events,
-        message: this.message
-      }),
-      "",
-      ApprovalPrompt(this.permissionController.pending),
-      this.infoText ?? "",
-      Timeline(this.events, timelineRows),
-      this.showTools ? ToolPanel(this.events, this.result) : "",
-      this.showDiff ? DiffPanel(this.result, this.diffText, this.diffMode) : "",
-      "",
-      this.result ? this.resultSummary(this.result) : "",
-      Composer({
-        input: this.inputBuffer,
-        running: this.running,
-        approvalPending: Boolean(this.permissionController.pending),
-        lastStatus: this.result?.status
-      })
-    ].filter((section) => section.length > 0);
-    this.stdout.write(`\x1b[2J\x1b[H${sections.join("\n\n")}`);
+    const width = Math.max(60, this.stdout.columns ?? 100);
+    const rows = Math.max(20, this.stdout.rows ?? 32);
+    const masthead = StatusBar({
+      workspacePath: this.options.workspace,
+      provider: this.options.provider,
+      model: this.options.model,
+      permissionMode: this.options.permissionMode,
+      validationMode: this.options.validationMode,
+      finalEvidenceMode: this.options.finalEvidenceMode,
+      running: this.running,
+      result: this.result,
+      events: this.events,
+      message: this.message,
+      maxTurns: this.options.maxTurns,
+      enableMcp: this.options.enableMcp,
+      queuedInstruction: this.queuedInstruction,
+      width,
+      color: this.colorEnabled
+    });
+    const composer = Composer({
+      input: this.inputBuffer,
+      running: this.running,
+      approvalPending: Boolean(this.permissionController.pending),
+      lastStatus: this.result?.status,
+      queuedInstruction: this.queuedInstruction,
+      width,
+      color: this.colorEnabled
+    });
+    const fixedRows = lineCount(masthead) + lineCount(composer) + 2;
+    const mainHeight = Math.max(8, rows - fixedRows);
+    const main = this.renderMain(width, mainHeight);
+    this.stdout.write(`\x1b[2J\x1b[H${masthead}\n${main}\n${composer}`);
+  }
+
+  private renderMain(width: number, height: number): string {
+    if (width >= 100) {
+      const timelineWidth = Math.max(44, Math.floor(width * 0.58));
+      const focusWidth = Math.max(40, width - timelineWidth - 2);
+      const timeline = Timeline(this.events, Math.max(2, height - 2), timelineWidth, height, this.colorEnabled);
+      const focus = this.renderFocus(focusWidth, height);
+      return renderMainArea({ timeline, focus, width, height });
+    }
+
+    const timelineHeight = Math.max(5, Math.floor(height * 0.48));
+    const focusHeight = Math.max(5, height - timelineHeight);
+    const timeline = Timeline(this.events, Math.max(2, timelineHeight - 2), width, timelineHeight, this.colorEnabled);
+    const focus = this.renderFocus(width, focusHeight);
+    return `${timeline}\n${focus}`;
+  }
+
+  private renderFocus(width: number, height: number): string {
+    const pending = this.permissionController.pending;
+    if (pending) return ApprovalPrompt(pending, { width, height, color: this.colorEnabled });
+    if (this.inputBuffer.trimStart().startsWith("/")) {
+      return box({
+        title: `${glyphs().sigma} Help`,
+        width,
+        height,
+        variant: "accent",
+        color: this.colorEnabled,
+        lines: renderCommandPalette(this.inputBuffer, Math.max(20, width - 4), Math.max(4, height - 5))
+      });
+    }
+
+    if (this.focusMode === "tools") return ToolPanel(this.events, this.result, width, height, this.colorEnabled);
+    if (this.focusMode === "diff") return DiffPanel(this.result, this.diffText, this.diffMode, width, height, this.colorEnabled);
+
+    const g = glyphs();
+    const lines = this.focusMode === "help"
+      ? this.helpLines(width)
+      : this.focusMode === "tokens"
+        ? this.tokensLines(width)
+        : this.focusMode === "context"
+          ? this.contextLines(width)
+          : this.focusMode === "test"
+            ? this.testLines(width)
+            : this.statusLines(width);
+    const title = this.focusMode === "help"
+      ? `${g.sigma} Help`
+      : this.focusMode === "tokens"
+        ? `${g.sigma} Tokens`
+        : this.focusMode === "context"
+          ? `${g.sigma} Context`
+          : this.focusMode === "test"
+            ? `${g.sigma} Test`
+            : this.result
+              ? `${g.sigma} Summary`
+              : `${g.sigma} Status`;
+    return box({
+      title,
+      width,
+      height,
+      color: this.colorEnabled,
+      lines
+    });
   }
 
   private completionMessage(result: AgentRunResult): string {
@@ -418,107 +621,124 @@ class TuiApp {
     return `Run failed: ${result.lastError ?? result.finishReason}.`;
   }
 
-  private resultSummary(result: AgentRunResult): string {
+  private summaryLines(result: AgentRunResult, width: number): string[] {
+    const g = glyphs();
+    const evidenceTotal = result.evidenceRecords?.length ?? 0;
+    const evidenceOk = result.evidenceRecords?.filter((item) => item.ok).length ?? 0;
+    const validationFailed = result.harness
+      ? [...result.harness.validation_results, ...result.harness.precheck_results].some((item) => item.exit_code !== 0)
+      : false;
+    const validation = result.harness ? (validationFailed ? "failed" : "ok") : this.options.validationMode ?? "off";
     const lines = [
-      "Summary",
-      `  status: ${result.status}`,
-      `  finish: ${result.finishReason}`,
-      `  changed: ${(result.changedFiles ?? []).join(", ") || "none"}`,
-      `  tools: ${result.toolCalls}`,
-      `  tokens: ${formatUsage(result.usage)}`
+      `${g.sigma} Summary`,
+      `result: ${result.status} ${g.separator} ${result.finishReason}`,
+      `changed: ${(result.changedFiles ?? []).length} files`,
+      `evidence: ${evidenceTotal > 0 ? `${evidenceOk}/${evidenceTotal} ok` : "none"}`,
+      `validation: ${validation}`,
+      `tokens: ${formatUsage(result.usage)}`
     ];
-    if (result.harness) {
-      const failed = [...result.harness.validation_results, ...result.harness.precheck_results].filter((item) => item.exit_code !== 0);
-      lines.push(`  harness: attempts=${result.harness.attempts.length} failed_checks=${failed.length}`);
+    if (result.finalMessage) {
+      lines.push(`final: ${truncateToWidth(oneLine(redactSecretText(result.finalMessage)), Math.max(20, width - 8))}`);
     }
-    if (result.finalGate) lines.push(`  final_gate: ${result.finalGate.status}`);
-    if (result.evidenceRecords && result.evidenceRecords.length > 0) {
-      lines.push(`  evidence: ${result.evidenceRecords.filter((item) => item.ok).length}/${result.evidenceRecords.length} ok`);
-    }
-    if (result.todoItems && result.todoItems.length > 0) {
-      lines.push(`  todos: ${result.todoItems.map((item) => `${item.id}:${item.status}:${item.text}`).join(" | ")}`);
-    }
-    if (result.finalMessage) lines.push(`  final: ${truncate(oneLine(redactSecretText(result.finalMessage)), 180)}`);
-    return lines.join("\n");
+    return lines;
   }
 
-  private helpText(): string {
-    return [
-      "Commands",
-      "  /help                 Show commands",
-      "  /status               Show run settings and latest result",
-      "  /tokens               Show current or last token usage",
-      "  /context              Show context, project instruction, and skill state",
-      "  /test <command>       Run a local command in the workspace",
-      "  /tools                Toggle tool panel",
-      "  /diff                 Toggle git diff stat",
-      "  /diff stat            Show git diff stat",
-      "  /diff patch           Show truncated git patch",
-      "  /model <name>         Set model",
-      "  /provider <name>      Set provider",
-      "  /permission <mode>    Set ask or yolo",
-      "  /clear                Clear timeline and result",
-      "  /exit                 Exit"
-    ].join("\n");
+  private statusLines(width: number): string[] {
+    const innerWidth = Math.max(20, width - 4);
+    const result = this.result;
+    const lines = result ? [...this.summaryLines(result, innerWidth), ""] : [];
+    lines.push(
+      ...field("state", this.running ? "running" : result?.status ?? "idle", innerWidth),
+      ...field("workspace", redactSecretText(this.options.workspace), innerWidth),
+      ...field("provider/model", `${this.options.provider}/${this.options.model ?? result?.model ?? "default"}`, innerWidth),
+      ...field("permission", this.options.permissionMode, innerWidth),
+      ...field("validation", this.options.validationMode ?? "off", innerWidth),
+      ...field("final evidence", this.options.finalEvidenceMode ?? "off", innerWidth),
+      ...field("mcp", this.options.enableMcp ? "enabled" : "off", innerWidth),
+      ...field("max turns", this.options.maxTurns, innerWidth),
+      ...field("max wall time sec", this.options.maxWallTimeSec, innerWidth),
+      ...field("command timeout sec", this.options.commandTimeoutSec, innerWidth),
+      ...field("validation commands", listValue(this.options.validationCommands), innerWidth),
+      ...field("allowed tools", listValue(this.options.allowedTools), innerWidth),
+      ...field("disabled tools", listValue(this.options.disabledTools), innerWidth),
+      ...field("queued", this.queuedInstruction ? truncate(oneLine(redactSecretText(this.queuedInstruction)), 120) : "none", innerWidth),
+      ...field("last result", result ? `${result.status} ${result.finishReason}` : "none", innerWidth)
+    );
+    return lines;
   }
 
   private latestUsage(): Partial<TokenTotals> | null {
     if (this.result) return this.result.usage;
-    const total: Partial<TokenTotals> = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 };
-    let seen = false;
-    for (const event of this.events) {
-      if (event.type !== "usage") continue;
-      const usage = eventUsage(event);
-      if (!usage) continue;
-      seen = true;
-      total.inputTokens = (total.inputTokens ?? 0) + (usage.inputTokens ?? 0);
-      total.outputTokens = (total.outputTokens ?? 0) + (usage.outputTokens ?? 0);
-      total.cacheTokens = (total.cacheTokens ?? 0) + (usage.cacheTokens ?? 0);
-      total.totalTokens = (total.totalTokens ?? 0) + (usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0));
-    }
-    return seen ? total : null;
+    return usageFromEvents(this.events) ?? null;
   }
 
-  private statusText(): string {
-    const result = this.result;
-    return [
-      "Status",
-      `  state: ${this.running ? "running" : result?.status ?? "idle"}`,
-      `  provider: ${this.options.provider}`,
-      `  model: ${this.options.model ?? "default"}`,
-      `  permission: ${this.options.permissionMode}`,
-      `  workspace: ${this.options.workspace}`,
-      `  max_turns: ${this.options.maxTurns ?? "default"}`,
-      `  max_wall_time_sec: ${this.options.maxWallTimeSec ?? "default"}`,
-      `  command_timeout_sec: ${this.options.commandTimeoutSec ?? "default"}`,
-      `  validation: ${this.options.validationMode ?? "off"}`,
-      `  final_evidence: ${this.options.finalEvidenceMode ?? "off"}`,
-      `  mcp: ${this.options.enableMcp ? "enabled" : "off"}`,
-      result ? `  last_result: ${result.status} ${result.finishReason}` : "  last_result: none"
-    ].join("\n");
-  }
-
-  private tokensText(): string {
+  private tokensLines(width: number): string[] {
     const usage = this.latestUsage();
-    return ["Tokens", `  ${usage ? formatUsage(usage) : "No usage yet."}`].join("\n");
+    const innerWidth = Math.max(20, width - 4);
+    if (!usage) return ["No usage yet.", "Usage appears after the first model turn."];
+    const input = usage.inputTokens ?? 0;
+    const output = usage.outputTokens ?? 0;
+    const cache = usage.cacheTokens ?? 0;
+    const total = usage.totalTokens ?? input + output;
+    return [
+      ...field("input", input, innerWidth),
+      ...field("output", output, innerWidth),
+      ...field("cache", cache, innerWidth),
+      ...field("total", total, innerWidth)
+    ];
   }
 
-  private contextText(): string {
+  private contextLines(width: number): string[] {
+    const innerWidth = Math.max(20, width - 4);
     const sources = this.result?.projectInstructionSources ?? [];
     const skills = this.result?.selectedSkills ?? [];
+    const mcpServers = this.result?.mcpServers ?? [];
     return [
-      "Context",
-      `  mode: ${this.options.contextMode ?? this.result?.contextMode ?? "repo-map"}`,
-      `  repo_map_max_chars: ${this.options.repoMapMaxChars ?? "default"}`,
-      `  repo_map_chars: ${this.result?.repoMapChars ?? "unknown"}`,
-      `  project_instructions: ${sources.length > 0 ? sources.join(", ") : "not loaded yet"}`,
-      `  skills_mode: ${this.options.skillsMode ?? "auto"}`,
-      `  selected_skills: ${skills.length > 0 ? skills.map((skill) => `${skill.name}:${skill.source}`).join(", ") : "none yet"}`
-    ].join("\n");
+      ...field("context mode", this.options.contextMode ?? this.result?.contextMode ?? "repo-map", innerWidth),
+      ...field("repo map max chars", this.options.repoMapMaxChars, innerWidth),
+      ...field("repo map chars", this.result?.repoMapChars ?? "unknown", innerWidth),
+      ...field("project instructions", sources.length > 0 ? sources.map((source) => redactSecretText(source)).join(", ") : "not loaded yet", innerWidth),
+      ...field("skills mode", this.options.skillsMode ?? "auto", innerWidth),
+      ...field("selected skills", skills.length > 0 ? skills.map((skill) => `${skill.name}:${skill.source}`).join(", ") : "none yet", innerWidth),
+      ...field("mcp", mcpServers.length > 0 ? mcpServers.map((server) => `${server.name}:${server.enabled ? "on" : "off"}:${server.tools_loaded}`).join(", ") : this.options.enableMcp ? "enabled, not loaded yet" : "off", innerWidth)
+    ];
+  }
+
+  private helpLines(width: number): string[] {
+    const g = glyphs();
+    const innerWidth = Math.max(20, width - 4);
+    return [
+      ...renderCommandPalette("/", innerWidth, COMMANDS.length),
+      "",
+      "Shortcuts",
+      `Ctrl+C exit ${g.separator} Esc clear input/close focus ${g.separator} Ctrl+L clear`,
+      `Ctrl+D diff ${g.separator} Ctrl+T tools ${g.separator} F1 help ${g.separator} Ctrl+J newline`,
+      "Up/Down cycles prompt history. Ctrl+H opens help where the terminal reports it distinctly from Backspace."
+    ];
+  }
+
+  private testLines(width: number): string[] {
+    const innerWidth = Math.max(20, width - 4);
+    if (!this.testSnapshot) return ["No /test command has been run yet.", "Use /test <command> to run a local validation command."];
+    const { command, result } = this.testSnapshot;
+    const stdout = blockTail(result.stdout || "(empty)", 1400).split(/\r?\n/);
+    const stderr = blockTail(result.stderr || "(empty)", 1400).split(/\r?\n/);
+    return [
+      ...field("command", truncate(oneLine(redactSecretText(command)), 160), innerWidth),
+      ...field("exit", `${result.exitCode ?? "signal"}${result.timedOut ? " timed out" : ""}`, innerWidth),
+      ...field("duration", `${result.durationMs}ms`, innerWidth),
+      "",
+      "stdout",
+      ...stdout.map((line) => truncateToWidth(`  ${line}`, innerWidth)),
+      "",
+      "stderr",
+      ...stderr.map((line) => truncateToWidth(`  ${line}`, innerWidth))
+    ];
   }
 
   private async runTestCommand(command: string): Promise<void> {
     if (!command) {
+      this.focusMode = "help";
       this.message = "Usage: /test <command>";
       this.render();
       return;
@@ -544,19 +764,11 @@ class TuiApp {
       }
     }
 
+    this.focusMode = "test";
     this.message = "Running test command.";
     this.render();
     const result = await runLocalShellCommand(command, this.options.workspace, this.options.commandTimeoutSec ?? 60);
-    this.infoText = [
-      "Test",
-      `  command: ${truncate(oneLine(redactSecretText(command)), 160)}`,
-      `  exit: ${result.exitCode ?? "signal"}${result.timedOut ? " timed_out=true" : ""}`,
-      `  duration_ms: ${result.durationMs}`,
-      "  stdout:",
-      ...blockTail(result.stdout || "(empty)", 2500).split(/\r?\n/).map((line) => `    ${line}`),
-      "  stderr:",
-      ...blockTail(result.stderr || "(empty)", 2500).split(/\r?\n/).map((line) => `    ${line}`)
-    ].join("\n");
+    this.testSnapshot = { command, result };
     this.message = result.exitCode === 0 && !result.timedOut ? "Test command passed." : "Test command finished with issues.";
     this.render();
   }

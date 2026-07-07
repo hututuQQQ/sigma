@@ -50,6 +50,7 @@ Flags:
   --help                         Show this help
 
 Inside the TUI:
+  Type / to open the command palette; partial input filters suggestions.
   /help
   /status
   /tokens
@@ -64,6 +65,15 @@ Inside the TUI:
   /diff
   /diff stat
   /diff patch
+
+Shortcuts:
+  Esc clear input or close focus
+  Ctrl+L clear timeline/result
+  Ctrl+D toggle diff
+  Ctrl+T toggle tools
+  F1 open help
+  Ctrl+J insert newline
+  Up/Down cycle prompt history
 `);
 }
 

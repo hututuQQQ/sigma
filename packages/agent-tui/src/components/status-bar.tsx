@@ -1,7 +1,17 @@
 import path from "node:path";
 import type { ProviderName } from "agent-ai";
-import type { AgentEvent, AgentFinalEvidenceMode, AgentHarnessValidationMode, AgentRunResult, PermissionMode, TokenTotals } from "agent-core";
-import { formatUsage, eventUsage, oneLine, truncate } from "./formatting.js";
+import {
+  redactSecretText,
+  type AgentEvent,
+  type AgentFinalEvidenceMode,
+  type AgentHarnessValidationMode,
+  type AgentRunResult,
+  type PermissionMode,
+  type TokenTotals
+} from "agent-core";
+import { box } from "../ui/box.js";
+import { glyphs, truncateToWidth } from "../ui/theme.js";
+import { eventUsage, formatUsage, oneLine } from "./formatting.js";
 
 export interface StatusBarProps {
   workspacePath: string;
@@ -14,6 +24,11 @@ export interface StatusBarProps {
   result: AgentRunResult | null;
   events: AgentEvent[];
   message: string | null;
+  maxTurns?: number;
+  enableMcp?: boolean;
+  queuedInstruction?: string | null;
+  width?: number;
+  color?: boolean;
 }
 
 function lastTurn(events: AgentEvent[]): number | null {
@@ -24,7 +39,7 @@ function lastTurn(events: AgentEvent[]): number | null {
   return null;
 }
 
-function usageFromEvents(events: AgentEvent[]): Partial<TokenTotals> | undefined {
+export function usageFromEvents(events: AgentEvent[]): Partial<TokenTotals> | undefined {
   const total: Partial<TokenTotals> = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 };
   let seen = false;
   for (const event of events) {
@@ -40,28 +55,55 @@ function usageFromEvents(events: AgentEvent[]): Partial<TokenTotals> | undefined
   return seen ? total : undefined;
 }
 
+function validationState(props: StatusBarProps): string {
+  if (props.result?.harness) {
+    const failed = [...props.result.harness.validation_results, ...props.result.harness.precheck_results]
+      .some((item) => item.exit_code !== 0);
+    return failed ? "failed" : "ok";
+  }
+  return props.validationMode ?? "off";
+}
+
+function mcpState(result: AgentRunResult | null, enabled?: boolean): string {
+  if (result?.mcpServers && result.mcpServers.length > 0) {
+    const loaded = result.mcpServers.reduce((sum, server) => sum + server.tools_loaded, 0);
+    const failed = result.mcpServers.filter((server) => server.error).length;
+    return failed > 0 ? `${loaded} tools/${failed} errors` : `${loaded} tools`;
+  }
+  return enabled ? "enabled" : "off";
+}
+
 export function StatusBar(props: StatusBarProps): string {
+  const g = glyphs();
+  const width = props.width ?? 100;
   const state = props.running ? "running" : props.result ? props.result.status : "idle";
-  const finish = props.result ? ` finish=${props.result.finishReason}` : "";
+  const finish = props.result ? ` ${props.result.finishReason}` : "";
   const turn = props.result?.turns ?? lastTurn(props.events) ?? 0;
+  const turnLimit = props.maxTurns ? `/${props.maxTurns}` : "";
   const toolCalls = props.result?.toolCalls ?? props.events.filter((event) => event.type === "tool_start").length;
   const usage = props.result?.usage ?? usageFromEvents(props.events);
-  const validation = props.result?.harness
-    ? `validation=${props.result.harness.validation_results.some((item) => item.exit_code !== 0) ? "failed" : "ok"}`
-    : `validation=${props.validationMode ?? "off"}`;
-  const finalEvidence = props.result?.finalGate?.status ?? props.finalEvidenceMode ?? "off";
-  const base = path.basename(props.workspacePath) || props.workspacePath;
-  const message = props.message ? ` | ${truncate(oneLine(props.message), 90)}` : "";
-  return [
-    `Sigma TUI | ${state}${finish}`,
-    `provider=${props.provider}`,
-    `model=${props.model ?? "default"}`,
-    `permission=${props.permissionMode}`,
-    `workspace=${base} (${props.workspacePath})`,
-    `turns=${turn}`,
-    `tools=${toolCalls}`,
-    usage ? `tokens=${formatUsage(usage)}` : "tokens=unknown",
-    validation,
-    `final_evidence=${finalEvidence}${message}`
-  ].join(" | ");
+  const workspaceBase = path.basename(props.workspacePath) || props.workspacePath;
+  const workspace = redactSecretText(props.workspacePath);
+  const model = props.model ?? props.result?.model ?? "default";
+  const validation = validationState(props);
+  const evidence = props.result?.finalGate?.status ?? props.finalEvidenceMode ?? "off";
+  const queue = props.queuedInstruction
+    ? `queued ${g.pointer} ${truncateToWidth(oneLine(redactSecretText(props.queuedInstruction)), 64)}`
+    : "queue empty";
+  const message = props.message
+    ? `notice ${g.pointer} ${truncateToWidth(oneLine(redactSecretText(props.message)), 96)}`
+    : "notice ready";
+
+  return box({
+    title: `${g.sigma} Sigma`,
+    width,
+    variant: "accent",
+    color: props.color,
+    lines: [
+      `repo ${workspaceBase} ${g.separator} path ${workspace}`,
+      `${props.provider}/${model} ${g.separator} permission ${props.permissionMode} ${g.separator} state ${state}${finish}`,
+      `turns ${turn}${turnLimit} ${g.separator} tools ${toolCalls} ${g.separator} tokens ${usage ? formatUsage(usage) : "unknown"} ${g.separator} validation ${validation} ${g.separator} evidence ${evidence} ${g.separator} mcp ${mcpState(props.result, props.enableMcp)}`,
+      `${queue} ${g.separator} ${message}`
+    ]
+  });
 }
