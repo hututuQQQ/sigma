@@ -68,9 +68,24 @@ pnpm --filter agent-tui start -- \
   --permission-mode ask
 ```
 
-Type a task and press Enter to start one run. The TUI opens as a terminal-first `∑ Sigma` cockpit with a masthead, activity timeline, focus panel, and boxed composer. Slash commands are discoverable: typing `/` opens the command palette and partial input such as `/di` filters to matching diff commands. Commands include `/help`, `/status`, `/tokens`, `/context`, `/test <command>`, `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, `/diff stat`, and `/diff patch`. Shortcuts include `Esc` to clear input or close the current focus panel, `Ctrl+L` to clear, `Ctrl+D` for diff, `Ctrl+T` for tools, `F1` for help, `Ctrl+J` for a composer newline, and Up/Down for in-memory prompt history. If a run is active, pressing Enter on a normal task queues one follow-up task for the next run instead of discarding the draft.
+Type a task and press Enter to start one run. The TUI opens as a transcript-first `∑ sigma` stream rather than a boxed dashboard:
 
-Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI has multiline input via `Ctrl+J` and slash-command suggestions, but it does not yet provide persisted session index/resume/fork, shell completion, or tab autocomplete. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
+```text
+∑ sigma  agent-tui · deepseek/default · mode build · ask · idle      ? help · / commands
+────────────────────────────────────────────────────────────────────────────────
+system    ready in D:\software\sigma\packages\agent-tui
+system    No run yet. Ask Sigma to inspect, plan, edit, or test this workspace.
+
+────────────────────────────────────────────────────────────────────────────────
+build › fix the TUI composer▌
+  [enter] send   [ctrl+j] newline   [tab] plan/build   [/] commands   [@] files
+```
+
+During a run, user, assistant, tool, validation, approval, diff, and summary entries are rendered inline in the stream. `/status`, `/tools`, `/tokens`, `/context`, `/diff stat`, and `/diff patch` open focused details only when requested; there is no permanent right-hand status wall. `/` opens a compact command palette above the composer. Aliases include `/h` or `/?` for help, `/s` status, `/d` diff, `/ds` diff stat, `/dp` diff patch, `/t` tools, `/c` context, `/tk` tokens, `/q` exit, and `/cl` clear.
+
+Composer editing is handled in raw mode: Left/Right move the cursor, `Ctrl+A/E` jump to start/end, `Ctrl+U/K` kill to start/end, `Ctrl+W` deletes the previous word, `Ctrl+Y` yanks killed text, `Ctrl+J` inserts a newline, and Up/Down cycle in-memory prompt history. `Tab` toggles plan/build mode unless a command or file suggestion is active; `/mode plan` and `/mode build` are also available. Plan mode disables mutating/run tools for new agent runs: `write`, `edit`, `apply_patch`, `bash`, `shell_session`, and `service`. Typing `@prefix` suggests workspace files, ignoring `.git`, `node_modules`, `dist`, `build`, and `.agent/attempts`. Typing `!command` runs a local shell command through the same approval flow as `/shell <command>`.
+
+Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI does not yet provide persisted session index/resume/fork, transcript search, multiple selection in the file palette, or shell completion. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
 Programmatic product integrations should prefer the run-controller API names:
 

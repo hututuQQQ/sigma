@@ -1,5 +1,4 @@
 import { redactSecretText, type AgentRunResult } from "agent-core";
-import { box } from "../ui/box.js";
 import { accent, danger, glyphs, success, truncateToWidth } from "../ui/theme.js";
 
 export type DiffMode = "stat" | "patch";
@@ -28,19 +27,28 @@ function formatPatchLine(line: string, colorEnabled: boolean): string {
   return line;
 }
 
-function formatDiffBody(diffText: string, mode: DiffMode, width: number, maxLines: number, colorEnabled: boolean): string[] {
+export function renderDiffLines(
+  result: AgentRunResult | null,
+  diffText: string,
+  mode: DiffMode = "stat",
+  width = 80,
+  maxLines = 20,
+  color = false
+): string[] {
   const raw = redactSecretText(diffText).trim();
-  if (!raw) return ["No diff available."];
-  const lines = raw.split(/\r?\n/);
-  const clipped = lines.slice(0, maxLines);
+  const body = raw ? raw.split(/\r?\n/) : ["No diff available."];
+  const clipped = body.slice(0, Math.max(1, maxLines - 4));
   const formatted = clipped.map((line) => {
-    const body = truncateToWidth(line, width);
-    return mode === "patch" ? formatPatchLine(body, colorEnabled) : body;
+    const bodyLine = truncateToWidth(line, width);
+    return mode === "patch" ? formatPatchLine(bodyLine, color) : bodyLine;
   });
-  if (lines.length > clipped.length) {
-    formatted.push(`${glyphs().ellipsis} ${lines.length - clipped.length} diff lines truncated`);
-  }
-  return formatted;
+  if (body.length > clipped.length) formatted.push(`${glyphs().ellipsis} ${body.length - clipped.length} diff lines truncated`);
+  return [
+    `mode: ${mode}`,
+    ...changedLines(result?.changedFiles ?? [], width),
+    "",
+    ...formatted
+  ];
 }
 
 export function DiffPanel(
@@ -51,21 +59,5 @@ export function DiffPanel(
   height?: number,
   color = false
 ): string {
-  const g = glyphs();
-  const innerWidth = Math.max(20, width - 4);
-  const bodyMax = Math.max(4, (height ?? 28) - 8);
-  const changed = result?.changedFiles ?? [];
-  const lines = [
-    `mode: ${mode}`,
-    ...changedLines(changed, innerWidth),
-    "",
-    ...formatDiffBody(diffText, mode, innerWidth, bodyMax, color)
-  ];
-  return box({
-    title: `${g.sigma} Diff`,
-    width,
-    height,
-    color,
-    lines
-  });
+  return renderDiffLines(result, diffText, mode, width, height ?? 24, color).join("\n");
 }

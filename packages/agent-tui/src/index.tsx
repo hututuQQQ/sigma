@@ -50,30 +50,40 @@ Flags:
   --help                         Show this help
 
 Inside the TUI:
-  Type / to open the command palette; partial input filters suggestions.
-  /help
-  /status
-  /tokens
-  /context
+  Type / to open the compact command palette; aliases resolve to canonical commands.
+  /help (/h, /?)
+  /status (/s)
+  /tokens (/tk)
+  /context (/c)
+  /tools (/t)
+  /diff (/d)
+  /diff stat (/ds)
+  /diff patch (/dp)
   /test <command>
-  /exit
-  /clear
+  /shell <command> or !<command>
+  /mode plan
+  /mode build
+  /exit (/q)
+  /clear (/cl)
   /model <name>
   /provider <deepseek|glm>
   /permission <ask|yolo>
-  /tools
-  /diff
-  /diff stat
-  /diff patch
 
 Shortcuts:
-  Esc clear input or close focus
+  Esc close palette/detail, then clear draft
   Ctrl+L clear timeline/result
   Ctrl+D toggle diff
   Ctrl+T toggle tools
   F1 open help
   Ctrl+J insert newline
+  Ctrl+A/E move to start/end
+  Ctrl+U/K kill to start/end
+  Ctrl+W delete previous word
+  Ctrl+Y yank killed text
+  Left/Right move cursor
+  Tab accepts command/file suggestions or toggles plan/build mode
   Up/Down cycle prompt history
+  @prefix suggests workspace files
 `);
 }
 

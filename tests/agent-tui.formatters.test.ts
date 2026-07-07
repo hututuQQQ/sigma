@@ -63,12 +63,12 @@ describe("agent-tui formatting helpers", () => {
     };
 
     const rendered = ApprovalPrompt(request, { width: 90 });
-    expect(rendered).toContain("tool: bash");
-    expect(rendered).toContain("risk: execute");
+    expect(rendered).toContain("bash");
+    expect(rendered).toContain("execute");
     expect(rendered).toContain("workspace: D:\\software\\sigma");
     expect(rendered).toContain("pnpm test --token=[REDACTED]");
     expect(rendered).not.toContain("sk-testSecret123456");
-    expect(rendered).toContain("keys: y allow once");
+    expect(rendered).toContain("[y] allow once");
   });
 
   it("formats harness timeline events with command and result details", () => {
