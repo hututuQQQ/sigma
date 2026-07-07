@@ -66,6 +66,15 @@ describe("agent-core tools", () => {
     expect(result.metadata?.timedOut).toBe(true);
   });
 
+  it("guides dev servers to the service tool instead of blocking bash", async () => {
+    const { context } = await workspace();
+    const result = await executeBashTool({ command: "npm run dev -- --host 127.0.0.1" }, context);
+
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("service.start");
+    expect(result.metadata?.blockedReason).toBe("long_running_service_command");
+  });
+
   it("returns after shell exit even when a background child keeps stdout open", async () => {
     const { context } = await workspace();
     const startedAt = Date.now();
@@ -147,6 +156,8 @@ describe("agent-core tools", () => {
       context
     );
     expect(start.ok).toBe(true);
+    expect(start.content).toContain(`url=http://127.0.0.1:${port}`);
+    expect(start.metadata?.url).toBe(`http://127.0.0.1:${port}`);
 
     const status = await executeServiceTool({ action: "status", name: "web" }, context);
     expect(status.ok).toBe(true);

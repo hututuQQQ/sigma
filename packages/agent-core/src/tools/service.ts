@@ -92,6 +92,10 @@ function defaultKeepAliveAfterRun(args: ServiceArgs, port: number | undefined, r
   return port !== undefined || readinessCommand !== undefined;
 }
 
+function serviceUrl(port: number | undefined): string | undefined {
+  return port ? `http://127.0.0.1:${port}` : undefined;
+}
+
 async function readRegistry(): Promise<ServiceRecord[]> {
   try {
     const value = JSON.parse(await readFile(registryPath(), "utf8"));
@@ -287,10 +291,11 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
     };
   }
 
+  const url = serviceUrl(record.port);
   return {
     ok: true,
-    content: `service ${name} started pid=${pid} log=${logPath}`,
-    metadata: { ...record, ready: true }
+    content: `service ${name} started${url ? ` url=${url}` : ""} pid=${pid} log=${logPath}`,
+    metadata: { ...record, ready: true, ...(url ? { url } : {}) }
   };
 }
 

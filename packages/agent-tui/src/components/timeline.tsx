@@ -4,6 +4,24 @@ function truncate(value: string, max = 120): string {
   return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 3))}...`;
 }
 
+function toolStartDetail(toolCall: { function?: { name?: string; arguments?: unknown } } | undefined): string {
+  const name = toolCall?.function?.name ?? "unknown";
+  const args = toolCall?.function?.arguments;
+  if (args && typeof args === "object") {
+    const values = args as Record<string, unknown>;
+    if (name === "bash" && typeof values.command === "string") {
+      return `${name} ${truncate(redactSecretText(values.command), 100)}`;
+    }
+    if (name === "service") {
+      const action = typeof values.action === "string" ? values.action : "service";
+      const serviceName = typeof values.name === "string" ? ` ${values.name}` : "";
+      const command = typeof values.command === "string" ? ` ${truncate(redactSecretText(values.command), 80)}` : "";
+      return `${name} ${action}${serviceName}${command}`;
+    }
+  }
+  return name;
+}
+
 function eventLine(event: AgentEvent): string {
   const time = event.timestamp.slice(11, 19);
   const meta = event.metadata ?? {};
@@ -17,7 +35,7 @@ function eventLine(event: AgentEvent): string {
   }
   if (event.type === "tool_start") {
     const toolCall = meta.toolCall as { function?: { name?: string } } | undefined;
-    return `${time} tool_start ${toolCall?.function?.name ?? "unknown"}`;
+    return `${time} tool_start ${toolStartDetail(toolCall)}`;
   }
   if (event.type === "tool_end") {
     const result = meta.result as { ok?: boolean; content?: string } | undefined;

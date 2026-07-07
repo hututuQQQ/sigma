@@ -45,7 +45,7 @@ class TuiApp {
     if (this.stdin.isTTY) this.stdin.setRawMode(true);
     this.stdin.resume();
     this.stdin.on("keypress", this.handleKeypress);
-    this.stdout.write("\x1b[?25l");
+    this.stdout.write("\x1b[?25h");
     this.render();
     await new Promise<void>((resolve) => {
       this.resolveExit = resolve;
@@ -64,6 +64,10 @@ class TuiApp {
     if (pending) {
       const decision = this.permissionDecisionForKey(text);
       if (decision) this.permissionController.respond(decision);
+      else {
+        this.message = "Approval waiting: press y to allow, n to deny, or a to always allow.";
+        this.render();
+      }
       return;
     }
 
@@ -194,10 +198,10 @@ class TuiApp {
         }
       });
       this.result = result;
-      this.message = result.finalMessage ?? null;
+      this.message = this.completionMessage(result);
       if (this.showDiff) await this.refreshDiff();
     } catch (error) {
-      this.message = error instanceof Error ? error.message : String(error);
+      this.message = `Run failed: ${error instanceof Error ? error.message : String(error)}`;
     } finally {
       this.running = false;
       this.render();
@@ -241,10 +245,17 @@ class TuiApp {
       Composer({
         input: this.inputBuffer,
         running: this.running,
-        approvalPending: Boolean(this.permissionController.pending)
+        approvalPending: Boolean(this.permissionController.pending),
+        lastStatus: this.result?.status
       })
     ].filter((section) => section.length > 0);
     this.stdout.write(`\x1b[2J\x1b[H${sections.join("\n\n")}`);
+  }
+
+  private completionMessage(result: AgentRunResult): string {
+    if (result.status === "completed") return "Run completed.";
+    if (result.status === "stopped") return `Run stopped: ${result.finishReason}.`;
+    return `Run failed: ${result.lastError ?? result.finishReason}.`;
   }
 
   private resultSummary(result: AgentRunResult): string {
