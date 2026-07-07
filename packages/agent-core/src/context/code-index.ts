@@ -229,7 +229,7 @@ export async function getCodeIndexForTool(
     path: options.path ?? ".",
     maxFiles: options.maxFiles ?? DEFAULT_MAX_FILES,
     maxFileBytes: options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
-    changedFiles: context.runState.changedFiles.size
+    version: context.runState.contextIndexVersion ?? 0
   });
   context.runState.contextIndexes ??= new Map<string, unknown>();
   const cached = context.runState.contextIndexes.get(cacheKey);
@@ -237,4 +237,9 @@ export async function getCodeIndexForTool(
   const index = await buildCodeIndex({ workspacePath: context.workspacePath, ...options });
   context.runState.contextIndexes.set(cacheKey, index);
   return index;
+}
+
+export function invalidateContextIndexes(context: ToolExecutionContext): void {
+  context.runState.contextIndexVersion = (context.runState.contextIndexVersion ?? 0) + 1;
+  context.runState.contextIndexes?.clear();
 }

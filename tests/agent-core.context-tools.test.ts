@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ToolCall } from "../packages/agent-ai/src/index.js";
 import {
+  createDefaultToolRegistry,
   executeRepoQueryTool,
   executeSymbolSearchTool,
   executeValidateTool,
@@ -22,6 +24,10 @@ async function workspace(): Promise<{ dir: string; context: ToolExecutionContext
       alwaysAllowTools: new Set<string>()
     }
   };
+}
+
+function toolCall(id: string, name: string, args: Record<string, unknown>): ToolCall {
+  return { id, type: "function", function: { name, arguments: args } };
 }
 
 describe("repo context tools", () => {
@@ -56,6 +62,39 @@ describe("repo context tools", () => {
     expect(result.ok).toBe(true);
     const matches = result.metadata?.matches as Array<{ name: string; kind: string; path: string }>;
     expect(matches[0]).toMatchObject({ name: "RunConfig", kind: "interface", path: "src/index.ts" });
+  });
+
+  it("invalidates symbol_search cache after a same-file mutation", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "index.ts"), "export function oldName() { return 1; }\n", "utf8");
+
+    const oldResult = await executeSymbolSearchTool({ query: "oldName" }, context);
+    expect(oldResult.ok).toBe(true);
+    expect((oldResult.metadata?.matches as Array<{ name: string }>)[0]).toMatchObject({ name: "oldName" });
+
+    const registry = createDefaultToolRegistry();
+    try {
+      const writeResult = await registry.execute(
+        toolCall("write-new-name", "write", {
+          path: "src/index.ts",
+          content: "export function newName() { return 2; }\n",
+          createDirs: true
+        }),
+        context
+      );
+      expect(writeResult.ok).toBe(true);
+
+      const newResult = await executeSymbolSearchTool({ query: "newName" }, context);
+      expect(newResult.ok).toBe(true);
+      expect((newResult.metadata?.matches as Array<{ name: string }>)[0]).toMatchObject({ name: "newName" });
+
+      const staleResult = await executeSymbolSearchTool({ query: "oldName" }, context);
+      expect(staleResult.ok).toBe(true);
+      expect(staleResult.metadata?.matches).toEqual([]);
+    } finally {
+      await registry.close?.();
+    }
   });
 });
 

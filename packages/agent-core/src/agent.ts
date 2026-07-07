@@ -192,6 +192,9 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.finalMessage) {
     summary.final_message = result.finalMessage;
   }
+  if (result.harness) {
+    summary.harness = result.harness;
+  }
   if (result.toolsAvailable && result.toolsAvailable.length > 0) {
     summary.tools_available = result.toolsAvailable;
   }

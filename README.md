@@ -627,5 +627,5 @@ The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL
 - MCP v0 supports local stdio servers only.
 - Repo maps are deterministic static context, not embeddings or a vector database.
 - Checkpoints currently restore through git reverse patches only. Non-git workspaces still get durable sessions but do not get restoreable checkpoints yet.
-- Provider streaming has compatibility event types in core, but model token streaming is not wired into providers or TUI rendering yet.
+- Streaming/abort support is foundation-level today: core defines compatibility event types and checks abort signals before model requests, but provider token streaming, TUI token-level rendering, mid-model cancellation, and mid-tool cancellation are future work.
 - The bundled Harbor artifact contains a Linux Node runtime when `NODE_RUNTIME_TARBALL` or the documented cache file is available at package time.

@@ -18,6 +18,7 @@ export { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 export {
   buildCodeIndex,
   getCodeIndexForTool,
+  invalidateContextIndexes,
   isConfigPath,
   isTestPath
 } from "./context/code-index.js";

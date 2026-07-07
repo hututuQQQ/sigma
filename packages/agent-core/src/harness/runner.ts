@@ -1,7 +1,8 @@
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { runAgent } from "../agent.js";
+import { runAgent, summaryJsonFromRunResult } from "../agent.js";
+import { createSessionManager } from "../session/session-manager.js";
 import type {
   AgentHarnessConfig,
   AgentHarnessSummary,
@@ -179,6 +180,7 @@ function finalResultForHarness(options: {
   harness: AgentHarnessSummary;
   failed: HarnessCommandResult[];
   failureMessage: string | null;
+  sessionId?: string;
 }): AgentRunResult {
   const aggregate = aggregateAttemptResults(options.attempts);
   const firstFailure = options.failed[0];
@@ -197,7 +199,7 @@ function finalResultForHarness(options: {
     ])
   ];
   return {
-    sessionId: options.finalAttempt.sessionId,
+    sessionId: options.sessionId ?? options.finalAttempt.sessionId,
     status,
     finishReason,
     turns: aggregate.turns,
@@ -239,9 +241,26 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
   }
 
   const startedAtMs = Date.now();
+  const workspacePath = path.resolve(config.workspacePath);
   const summaryDir = path.dirname(path.resolve(config.summaryJsonPath ?? path.join(config.workspacePath, ".agent", "summary.json")));
   const attemptsDir = path.resolve(config.attemptsDir ?? path.join(summaryDir, "attempts"));
   await mkdir(attemptsDir, { recursive: true });
+  const durableSession = config.durableSession === false
+    ? null
+    : await createSessionManager({
+        sessionId: config.sessionId,
+        runId: randomUUID(),
+        instruction: config.instruction,
+        workspacePath,
+        provider: config.modelClient.provider,
+        model: config.modelClient.model,
+        sessionRootDir: config.sessionRootDir,
+        traceJsonlPath: config.traceJsonlPath,
+        sessionJsonlPath: config.sessionJsonlPath,
+        summaryJsonPath: config.summaryJsonPath,
+        parentSessionId: config.parentSessionId,
+        forkedFromSessionId: config.forkedFromSessionId
+      });
 
   const attempts: AgentRunResult[] = [];
   const validationResults: HarnessCommandResult[] = [];
@@ -273,7 +292,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       ...config,
       instruction: activeInstruction,
       summaryJsonPath: attemptSummaryPath,
-      traceJsonlPath: attemptTracePath
+      traceJsonlPath: attemptTracePath,
+      durableSession: false
     });
     attempts.push(attemptResult);
     finalTracePath = attemptTracePath;
@@ -342,7 +362,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     finalAttempt,
     harness,
     failed: lastFailed,
-    failureMessage
+    failureMessage,
+    sessionId: durableSession?.sessionId
   });
 
   await writeHarnessSummary(finalResult, config.summaryJsonPath);
@@ -350,6 +371,7 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     await mkdir(path.dirname(path.resolve(config.traceJsonlPath)), { recursive: true });
     await copyFile(finalTracePath, config.traceJsonlPath);
   }
+  await durableSession?.complete(finalResult, summaryJsonFromRunResult(finalResult));
 
   return finalResult;
 }

@@ -138,6 +138,7 @@ export interface AgentRunState {
   nextTodoId: number;
   changedFiles: Set<string>;
   contextIndexes?: Map<string, unknown>;
+  contextIndexVersion?: number;
 }
 
 export type ContextMode = "off" | "repo-map";

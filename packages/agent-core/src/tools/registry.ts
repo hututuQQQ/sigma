@@ -5,7 +5,8 @@ import type {
   ToolRegistry,
   ToolRegistryFilter,
   ToolRegistryOptions,
-  ToolResult
+  ToolResult,
+  WorkspaceManifest
 } from "../types.js";
 import { executeBashTool } from "./bash.js";
 import { executeReadTool } from "./read.js";
@@ -22,6 +23,60 @@ import { executeRepoQueryTool } from "./repo-query.js";
 import { executeSymbolSearchTool } from "./symbol-search.js";
 import { executeValidateTool } from "./validate.js";
 import { createShellSessionToolController } from "./shell-session.js";
+import { invalidateContextIndexes } from "../context/code-index.js";
+import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifest.js";
+
+const FILE_MUTATING_TOOLS = new Set(["write", "edit", "apply_patch", "bash", "shell_session", "service"]);
+
+function resultChangedFiles(result: ToolResult): string[] {
+  const metadata = result.metadata ?? {};
+  if (metadata.checkOnly === true) return [];
+  const changedFiles = metadata.changedFiles;
+  if (Array.isArray(changedFiles)) return changedFiles.filter((file): file is string => typeof file === "string" && file.length > 0);
+  if (typeof metadata.relativePath === "string" && metadata.relativePath.length > 0) return [metadata.relativePath];
+  return [];
+}
+
+function contextIndexCacheActive(context: ToolExecutionContext): boolean {
+  return (context.runState.contextIndexes?.size ?? 0) > 0;
+}
+
+async function safeWorkspaceManifest(context: ToolExecutionContext): Promise<WorkspaceManifest | null> {
+  try {
+    return await listWorkspaceManifest(context.workspacePath);
+  } catch {
+    return null;
+  }
+}
+
+function manifestChangedFiles(before: WorkspaceManifest, after: WorkspaceManifest): string[] {
+  const changed = new Set(changedWorkspaceFiles(before, after));
+  for (const filePath of Object.keys(before)) {
+    if (!after[filePath]) changed.add(filePath);
+  }
+  return [...changed].sort((a, b) => a.localeCompare(b, "en"));
+}
+
+async function executeWithContextIndexInvalidation(
+  tool: RegisteredTool,
+  toolCall: ToolCall,
+  context: ToolExecutionContext
+): Promise<ToolResult> {
+  const toolName = toolCall.function.name;
+  const shouldWatchManifest = FILE_MUTATING_TOOLS.has(toolName) && contextIndexCacheActive(context);
+  const beforeManifest = shouldWatchManifest ? await safeWorkspaceManifest(context) : null;
+  const result = await tool.execute(toolCall.function.arguments, context);
+  if (!result.ok || !FILE_MUTATING_TOOLS.has(toolName)) return result;
+
+  const changedFiles = resultChangedFiles(result);
+  const manifestChanges = beforeManifest
+    ? manifestChangedFiles(beforeManifest, await safeWorkspaceManifest(context) ?? beforeManifest)
+    : [];
+  if (changedFiles.length > 0 || manifestChanges.length > 0) {
+    invalidateContextIndexes(context);
+  }
+  return result;
+}
 
 const bashTool: RegisteredTool = {
   definition: {
@@ -423,7 +478,7 @@ export function createToolRegistryFromTools(
       if (!tool) {
         return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
       }
-      return await tool.execute(toolCall.function.arguments, context);
+      return await executeWithContextIndexInvalidation(tool, toolCall, context);
     },
     async close(): Promise<void> {
       const closers = new Set<ToolRegistry["close"]>();

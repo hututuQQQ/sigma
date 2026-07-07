@@ -37,7 +37,7 @@ function scoreSymbol(symbol: CodeSymbol, filePath: string, tokens: string[]): nu
     else if (name.includes(token)) score += 24;
     if (lowerPath.includes(token)) score += 8;
   }
-  if (symbol.exported) score += 5;
+  if (symbol.exported && score > 0) score += 5;
   return score;
 }
 

@@ -28,4 +28,4 @@ Date: 2026-07-07
 
 ## Known Limitations
 
-- TUI updates are event-based at turn/tool granularity, not token delta streaming. Token delta rendering is future work once `agent-core` emits assistant delta events from provider streaming.
+- TUI updates are event-based at turn/tool granularity, not token delta streaming. Core has compatibility event types and a pre-model abort check, but provider token streaming, TUI token rendering, mid-model cancellation, and mid-tool cancellation are future work.

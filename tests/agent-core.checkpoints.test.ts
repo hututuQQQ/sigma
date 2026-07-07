@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -85,5 +85,28 @@ describe("git checkpoints", () => {
 
     expect(restored.ok).toBe(true);
     await expect(readFile(path.join(dir, "note.txt"), "utf8").then((text) => text.replace(/\r\n/g, "\n"))).resolves.toBe("original\n");
+  });
+
+  it("fails checkpoint restore cleanly when the patch file is missing", async () => {
+    const dir = await gitWorkspace();
+    const result = await runAgent({
+      instruction: "change note",
+      workspacePath: dir,
+      modelClient: new WriteModel(),
+      permissionMode: "yolo"
+    });
+    const checkpoints = await listCheckpoints({ sessionId: result.sessionId as string, workspacePath: dir });
+    await rm(checkpoints[0].patchPath, { force: true });
+
+    const restored = await restoreCheckpoint({
+      sessionId: result.sessionId as string,
+      checkpointId: checkpoints[0].id,
+      workspacePath: dir
+    });
+
+    expect(restored.ok).toBe(false);
+    expect(restored.exitCode).toBe(1);
+    expect(restored.stderr).toContain("checkpoint patch is unreadable");
+    await expect(readFile(path.join(dir, "note.txt"), "utf8")).resolves.toBe("changed\n");
   });
 });

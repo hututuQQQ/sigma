@@ -253,7 +253,20 @@ export async function restoreCheckpoint(options: {
     };
   }
   const workspacePath = path.resolve(options.workspacePath ?? record.workspacePath);
-  const patch = await readFile(record.patchPath, "utf8");
+  let patch: string;
+  try {
+    patch = await readFile(record.patchPath, "utf8");
+  } catch (error) {
+    return {
+      ok: false,
+      checkpointId: record.id,
+      command: "git apply -R --check --whitespace=nowarn",
+      exitCode: 1,
+      stdout: "",
+      stderr: `checkpoint patch is unreadable: ${record.patchPath}: ${error instanceof Error ? error.message : String(error)}`,
+      durationMs: 0
+    };
+  }
   const check = await gitOutput({
     workspacePath,
     args: ["apply", "-R", "--check", "--whitespace=nowarn"],
