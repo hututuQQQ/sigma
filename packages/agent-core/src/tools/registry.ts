@@ -19,6 +19,8 @@ import { executeGitStatusTool, executeGitDiffTool } from "./git.js";
 import { executeApplyPatchTool } from "./apply-patch.js";
 import { executeTodoTool } from "./todo.js";
 import { executeRepoQueryTool } from "./repo-query.js";
+import { executeSymbolSearchTool } from "./symbol-search.js";
+import { executeValidateTool } from "./validate.js";
 import { createShellSessionToolController } from "./shell-session.js";
 
 const bashTool: RegisteredTool = {
@@ -234,6 +236,55 @@ const repoQueryTool: RegisteredTool = {
   risk: "read"
 };
 
+const symbolSearchTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "symbol_search",
+      description:
+        "Search declared functions, classes, interfaces, types, constants, and tests using Sigma's lightweight local code index.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          kind: { type: "string", enum: ["function", "class", "interface", "type", "const", "method", "test", "unknown"] },
+          path: { type: "string" },
+          maxResults: { type: "number" },
+          maxChars: { type: "number" }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeSymbolSearchTool,
+  risk: "read"
+};
+
+const validateTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "validate",
+      description:
+        "Run an in-loop validation command or infer a project validation command for changed files, a file, or the whole project.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["auto", "test", "lint", "typecheck", "build"] },
+          scope: { type: "string", enum: ["changed", "project", "file"] },
+          path: { type: "string" },
+          command: { type: "string" },
+          timeoutSec: { type: "number" }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeValidateTool,
+  risk: "execute"
+};
+
 function createShellSessionTool(): RegisteredTool & { registryClose: ToolRegistry["close"] } {
   const controller = createShellSessionToolController();
   return {
@@ -397,9 +448,11 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
       globTool,
       grepTool,
       repoQueryTool,
+      symbolSearchTool,
       gitStatusTool,
       gitDiffTool,
       applyPatchTool,
+      validateTool,
       todoTool,
       createShellSessionTool()
     ],

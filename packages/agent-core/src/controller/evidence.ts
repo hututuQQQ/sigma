@@ -111,5 +111,22 @@ export function inferEvidenceRecord(options: {
     };
   }
 
+  if (options.toolName === "validate") {
+    const command = typeof options.result.metadata?.command === "string" ? options.result.metadata.command : undefined;
+    return {
+      kind: command ? evidenceKindForCommand(command) : "unknown",
+      toolName: options.toolName,
+      ok: true,
+      executable: true,
+      command,
+      relatedFiles: Array.isArray(options.result.metadata?.relatedFiles)
+        ? options.result.metadata.relatedFiles.filter((item): item is string => typeof item === "string")
+        : undefined,
+      exitCode: numberMetadata(options.result, "exitCode"),
+      summary: summarizeResult(options.result),
+      timestamp
+    };
+  }
+
   return null;
 }

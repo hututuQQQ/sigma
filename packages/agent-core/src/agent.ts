@@ -5,6 +5,7 @@ import type { AgentMessage, ToolCall } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
 import { truncateMiddle } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
+import { createSessionManager, type SessionManager } from "./session/session-manager.js";
 import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
@@ -55,13 +56,15 @@ function event(
   provider: string,
   model: string,
   metadata?: Record<string, unknown>,
-  parentId?: string
+  parentId?: string,
+  sessionId?: string
 ): AgentEvent {
   return {
     id: randomUUID(),
     timestamp: nowIso(),
     type,
     runId,
+    sessionId,
     parentId,
     provider,
     model,
@@ -171,6 +174,7 @@ async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegis
 
 export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   const summary: SummaryJson = {
+    ...(result.sessionId ? { session_id: result.sessionId } : {}),
     status: result.status,
     finish_reason: result.finishReason,
     turns: result.turns,
@@ -246,12 +250,30 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     runState: {
       todos: [],
       nextTodoId: 1,
-      changedFiles: new Set<string>()
+      changedFiles: new Set<string>(),
+      contextIndexes: new Map<string, unknown>()
     },
-    alwaysAllowTools: new Set<string>()
+    alwaysAllowTools: new Set<string>(),
+    ...(config.abortSignal ? { abortSignal: config.abortSignal } : {})
   };
   const traceStore = config.traceJsonlPath ? new JsonlSessionStore(config.traceJsonlPath) : undefined;
   const sessionStore = config.sessionJsonlPath ? new JsonlSessionStore(config.sessionJsonlPath) : undefined;
+  const durableSession: SessionManager | null = config.durableSession === false
+    ? null
+    : await createSessionManager({
+        sessionId: config.sessionId,
+        runId,
+        instruction: config.instruction,
+        workspacePath: context.workspacePath,
+        provider,
+        model,
+        sessionRootDir: config.sessionRootDir,
+        traceJsonlPath: config.traceJsonlPath,
+        sessionJsonlPath: config.sessionJsonlPath,
+        summaryJsonPath: config.summaryJsonPath,
+        parentSessionId: config.parentSessionId,
+        forkedFromSessionId: config.forkedFromSessionId
+      });
   const workflow = createWorkflowState();
   const finalEvidenceMode = config.finalEvidenceMode ?? "off";
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
@@ -264,6 +286,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     if (config.sessionJsonlPath !== config.traceJsonlPath) {
       await sessionStore?.append(safeEvent);
     }
+    await durableSession?.appendEvent(safeEvent);
   };
 
   const usage: TokenTotals = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 };
@@ -313,6 +336,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
 
   await recordEvent(
     event(runId, "run_start", provider, model, {
+      sessionId: durableSession?.sessionId,
+      parentSessionId: config.parentSessionId,
+      forkedFromSessionId: config.forkedFromSessionId,
       workspacePath: context.workspacePath,
       maxTurns,
       maxWallTimeSec,
@@ -322,7 +348,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       contextMode: config.contextMode,
       repoMapChars: repoMap?.chars,
       selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
-    })
+    }, undefined, durableSession?.sessionId)
   );
 
   try {
@@ -342,16 +368,23 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (compactedMessages !== messages) {
         messages.splice(0, messages.length, ...compactedMessages);
       }
-      await recordEvent(event(runId, "model_start", provider, model, { turn: turns }));
+      if (config.abortSignal?.aborted) {
+        finishReason = "error";
+        lastError = "Run aborted before model request.";
+        await recordEvent(event(runId, "run_abort", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
+        break;
+      }
+
+      await recordEvent(event(runId, "model_start", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
       const response = await config.modelClient.complete({
         messages,
         tools: registry.definitions,
         toolChoice: "auto"
       });
       addUsage(usage, response.usage);
-      await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }));
+      await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       if (response.usage) {
-        await recordEvent(event(runId, "usage", provider, model, { turn: turns, usage: response.usage }));
+        await recordEvent(event(runId, "usage", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       }
 
       messages.push(response.message);
@@ -362,7 +395,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           content: response.message.content,
           reasoningContent: response.message.reasoningContent,
           toolCalls: response.message.toolCalls
-        })
+        }, undefined, durableSession?.sessionId)
       );
 
       const calls = response.message.toolCalls ?? [];
@@ -391,7 +424,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       for (const call of calls) {
-        const toolStart = event(runId, "tool_start", provider, model, { toolCall: call }, undefined);
+        const toolStart = event(runId, "tool_start", provider, model, { toolCall: call }, undefined, durableSession?.sessionId);
         await recordEvent(toolStart);
         toolCalls += 1;
         if (toolCallCountsAsCommand(call as ToolCall)) {
@@ -399,6 +432,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         }
 
         let result: ToolResult;
+        const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call as ToolCall) ?? null;
+        let checkpointId: string | undefined;
         try {
           result = await registry.execute(call as ToolCall, context);
         } catch (error) {
@@ -407,6 +442,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             content: error instanceof Error ? error.message : String(error)
           };
         }
+        const checkpoint = await durableSession?.checkpoints.afterTool(pendingCheckpoint, result) ?? null;
+        checkpointId = checkpoint?.id;
 
         await recordEvent(
           event(
@@ -414,8 +451,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             "tool_end",
             provider,
             model,
-            { toolCallId: call.id, toolName: call.function.name, result },
-            toolStart.id
+            { toolCallId: call.id, toolName: call.function.name, result, ...(checkpointId ? { checkpointId } : {}) },
+            toolStart.id,
+            durableSession?.sessionId
           )
         );
         const evidence = inferEvidenceRecord({
@@ -445,12 +483,13 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   } catch (error) {
     finishReason = "error";
     lastError = error instanceof Error ? error.message : String(error);
-    await recordEvent(event(runId, "error", provider, model, { message: lastError }));
+    await recordEvent(event(runId, "error", provider, model, { message: lastError }, undefined, durableSession?.sessionId));
   }
 
   const status = finishReason === "error" ? "error" : finishReason === "assistant_stop" ? "completed" : "stopped";
   const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
   const result: AgentRunResult = {
+    ...(durableSession?.sessionId ? { sessionId: durableSession.sessionId } : {}),
     status,
     finishReason,
     turns,
@@ -475,10 +514,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
   };
 
-  await recordEvent(event(runId, "run_end", provider, model, { result }));
+  await recordEvent(event(runId, "run_end", provider, model, { result }, undefined, durableSession?.sessionId));
   if (config.summaryJsonPath) {
     await writeRunSummary(result, config.summaryJsonPath);
   }
+  await durableSession?.complete(result, summaryJsonFromRunResult(result));
   await registry.close?.();
 
   return result;

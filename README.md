@@ -7,8 +7,8 @@
 A small coding-agent monorepo inspired by Pi with four layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
-- `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, JSONL tracing, session records, MCP bridge, and workspace tools
-- `packages/agent-cli`: plain terminal CLI with `run`, `solve` compatibility alias, `chat`, `doctor`, and `replay`
+- `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, durable sessions, checkpoints, JSONL tracing, MCP bridge, and workspace tools
+- `packages/agent-cli`: plain terminal CLI with `run`, `solve` compatibility alias, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
 - `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
 Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, and stdio MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
@@ -111,7 +111,7 @@ During a run, user, assistant, tool, validation, approval, diff, and summary ent
 
 Composer editing is handled in raw mode: Left/Right move the cursor, `Ctrl+A/E` jump to start/end, `Ctrl+U/K` kill to start/end, `Ctrl+W` deletes the previous word, `Ctrl+Y` yanks killed text, `Ctrl+J` inserts a newline, and Up/Down cycle in-memory prompt history. `Tab` accepts an active command/file suggestion or opens the workbench; `Shift+Tab` toggles plan/build mode. `/mode plan` and `/mode build` are also available, and the composer footer shows the active mode while a run is active. Plan mode disables mutating/run tools for new agent runs: `write`, `edit`, `apply_patch`, `bash`, `shell_session`, and `service`. Typing `@prefix` suggests workspace files, ignoring `.git`, `node_modules`, `dist`, `build`, and `.agent/attempts`. Typing `!command` runs a local shell command through the same approval flow as `/shell <command>`. Typing `cd <path>` switches workspace locally when the directory exists; use `/workspace <path>` or `/w <path>` for the explicit command form.
 
-Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI does not yet provide persisted session index/resume/fork, transcript search, multiple selection in the file palette, or shell completion. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
+Current UX boundary: the interactive UI is still launched through the `agent-tui` binary. Root `agent` does not auto-enter the TUI and `agent tui` is not implemented. The TUI uses the shared `agent-core` run path and records durable sessions, but it does not yet provide an in-app session browser/resume/fork UI, transcript search, multiple selection in the file palette, or shell completion. `agent run` remains the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The TUI does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
 Programmatic product integrations should prefer the run-controller API names:
 
@@ -154,6 +154,39 @@ pnpm --filter agent-cli start -- doctor --workspace . --provider glm --check-api
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl --timeline
 ```
+
+Durable sessions are recorded by default under `.agent/sessions/` while the compatibility files `.agent/trace.jsonl`, `.agent/session.jsonl`, and `.agent/summary.json` continue to be written:
+
+```text
+.agent/sessions/index.jsonl
+.agent/sessions/<session-id>/meta.json
+.agent/sessions/<session-id>/events.jsonl
+.agent/sessions/<session-id>/summary.json
+.agent/sessions/<session-id>/checkpoints/
+```
+
+Session commands:
+
+```bash
+pnpm --filter agent-cli start -- sessions --workspace .
+pnpm --filter agent-cli start -- history --workspace .
+pnpm --filter agent-cli start -- session show <session-id> --workspace .
+pnpm --filter agent-cli start -- session search "parser error" --workspace .
+pnpm --filter agent-cli start -- session resume <session-id> "continue the fix" --workspace .
+pnpm --filter agent-cli start -- session fork <session-id> "try a smaller approach" --workspace .
+```
+
+`resume` and `fork` start a fresh run with a concise prior-session context block, not a provider-specific replay of every tool message. The new session records `parentSessionId`; forked sessions also record `forkedFromSessionId`.
+
+In git workspaces, mutating tools create lightweight patch checkpoints when they actually change files:
+
+```bash
+pnpm --filter agent-cli start -- checkpoints <session-id> --workspace .
+pnpm --filter agent-cli start -- checkpoint show <session-id> <checkpoint-id> --workspace .
+pnpm --filter agent-cli start -- checkpoint restore <session-id> <checkpoint-id> --workspace .
+```
+
+Checkpoint restore is conservative: it first runs `git apply -R --check` and only applies the reverse patch if the current workspace can accept it cleanly. Non-git checkpointing is not implemented yet; non-git runs continue normally without checkpoint files.
 
 ## Smoke Tests
 
@@ -360,10 +393,12 @@ The core loop exposes these default tools:
 - `list`: lists workspace files/directories with `path`, `depth`, `includeHidden`, and `maxEntries`.
 - `glob`: finds files with simple `*`, `**`, and `?` patterns.
 - `grep`: searches text files, preferring `rg` when available and falling back to Node.
-- `repo_query`: searches workspace files by query and returns compact scored snippets for text, symbols, tests, configs, or paths.
+- `repo_query`: searches workspace files by query and returns compact scored snippets for text, symbols, tests, configs, or paths. Matches include path, line range, score, reasons, and snippet.
+- `symbol_search`: searches declared functions, classes, interfaces, types, constants, and test declarations using the lightweight local code index.
 - `git_status`: read-only `git status`, bounded by the command timeout.
 - `git_diff`: read-only `git diff` or `git diff --staged`, bounded by the command timeout.
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
+- `validate`: runs an explicit validation command or infers one for changed files, a file, or the project. It returns structured `ok`, `command`, `kind`, `exitCode`, output tails, related files, and best-effort diagnostics.
 - `todo`: maintains run-scoped todo state for the agent.
 - `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
@@ -392,6 +427,8 @@ SIGMA.md
 The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
 
 Local `agent run` and `agent solve` default to `--context-mode repo-map`. The repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+
+`repo_query` and `symbol_search` use a separate lightweight code index during tool calls. It scans workspace files with the existing ignore behavior and records file size/mtime, language/ext, declared symbols, imports/requires, and test/config markers. It is deterministic, local, and does not use embeddings or external services.
 
 Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
 
@@ -589,4 +626,6 @@ The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL
 - Config TOML parsing supports simple top-level scalar keys only.
 - MCP v0 supports local stdio servers only.
 - Repo maps are deterministic static context, not embeddings or a vector database.
+- Checkpoints currently restore through git reverse patches only. Non-git workspaces still get durable sessions but do not get restoreable checkpoints yet.
+- Provider streaming has compatibility event types in core, but model token streaming is not wired into providers or TUI rendering yet.
 - The bundled Harbor artifact contains a Linux Node runtime when `NODE_RUNTIME_TARBALL` or the documented cache file is available at package time.

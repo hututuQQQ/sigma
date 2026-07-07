@@ -96,6 +96,7 @@ export interface ToolExecutionContext {
   permissionDecider?: PermissionDecider;
   runState: AgentRunState;
   alwaysAllowTools: Set<string>;
+  abortSignal?: AbortSignal;
 }
 
 export interface ToolHandler {
@@ -136,6 +137,7 @@ export interface AgentRunState {
   todos: TodoItem[];
   nextTodoId: number;
   changedFiles: Set<string>;
+  contextIndexes?: Map<string, unknown>;
 }
 
 export type ContextMode = "off" | "repo-map";
@@ -151,6 +153,11 @@ export interface AgentRunConfig {
   instruction: string;
   workspacePath: string;
   modelClient: ModelClient;
+  sessionId?: string;
+  sessionRootDir?: string;
+  durableSession?: boolean;
+  parentSessionId?: string;
+  forkedFromSessionId?: string;
   maxTurns?: number;
   maxWallTimeSec?: number;
   commandTimeoutSec?: number;
@@ -176,6 +183,7 @@ export interface AgentRunConfig {
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface AgentHarnessConfig extends AgentRunConfig {
@@ -200,6 +208,11 @@ export interface AgentEvent {
   timestamp: string;
   type:
     | "run_start"
+    | "assistant_delta"
+    | "reasoning_delta"
+    | "tool_call_delta"
+    | "model_heartbeat"
+    | "run_abort"
     | "model_start"
     | "model_end"
     | "assistant_message"
@@ -211,6 +224,7 @@ export interface AgentEvent {
     | "error"
     | "run_end";
   runId: string;
+  sessionId?: string;
   parentId?: string;
   provider?: string;
   model?: string;
@@ -225,6 +239,7 @@ export interface TokenTotals {
 }
 
 export interface AgentRunResult {
+  sessionId?: string;
   status: AgentRunStatus;
   finishReason: AgentFinishReason;
   turns: number;
@@ -326,6 +341,7 @@ export type RunControllerCleanupResult = HarnessCleanupResult;
 export type RunControllerServiceCleanupResult = HarnessServiceCleanupResult;
 
 export interface SummaryJson {
+  session_id?: string;
   status: AgentRunStatus;
   finish_reason: AgentFinishReason;
   turns: number;

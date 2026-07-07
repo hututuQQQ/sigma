@@ -197,6 +197,7 @@ function finalResultForHarness(options: {
     ])
   ];
   return {
+    sessionId: options.finalAttempt.sessionId,
     status,
     finishReason,
     turns: aggregate.turns,
