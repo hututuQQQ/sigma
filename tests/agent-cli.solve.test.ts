@@ -1,6 +1,7 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadCliConfig } from "../packages/agent-cli/src/config.js";
@@ -45,6 +46,20 @@ class WriteInvalidJsModel implements ModelClient {
   }
 }
 
+class MemoryWritable extends Writable {
+  readonly chunks: string[] = [];
+  isTTY = true;
+
+  _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.chunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
+    callback();
+  }
+
+  text(): string {
+    return this.chunks.join("");
+  }
+}
+
 describe("agent-cli solve", () => {
   it("parses harness flags", () => {
     const config = loadCliConfig({
@@ -71,6 +86,34 @@ describe("agent-cli solve", () => {
       harnessTimeoutSec: 600,
       retryMinBudgetSec: 90,
       attemptsDir: "/tmp/agent/attempts"
+    });
+  });
+
+  it("parses new tool, context, MCP, and stream flags", () => {
+    const config = loadCliConfig({
+      workspace: "work",
+      provider: "deepseek",
+      "allowed-tools": "read,grep",
+      "disabled-tools": "bash",
+      "no-project-instructions": true,
+      "project-doc-max-bytes": "1234",
+      "context-mode": "off",
+      "repo-map-max-chars": "5678",
+      "enable-mcp": true,
+      "mcp-config": ".agent/custom-mcp.json",
+      "no-stream-ui": true
+    });
+
+    expect(config).toMatchObject({
+      allowedTools: ["read", "grep"],
+      disabledTools: ["bash"],
+      noProjectInstructions: true,
+      projectDocMaxBytes: 1234,
+      contextMode: "off",
+      repoMapMaxChars: 5678,
+      enableMcp: true,
+      mcpConfig: ".agent/custom-mcp.json",
+      noStreamUi: true
     });
   });
 
@@ -106,6 +149,48 @@ describe("agent-cli solve", () => {
     await expect(readFile(tracePath, "utf8")).resolves.toContain("run_end");
   });
 
+  it("prints live stream UI to stderr unless disabled", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-stream-${Date.now()}`), { recursive: true });
+    const stderr = new MemoryWritable();
+    const stdout = new MemoryWritable();
+
+    const code = await runSolveCommand(
+      ["--workspace", dir, "--instruction", "finish immediately", "--provider", "deepseek", "--permission-mode", "yolo"],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stderr.text()).toContain("run_start");
+    expect(stdout.text()).toContain("status=completed");
+
+    const quietStderr = new MemoryWritable();
+    const quietStdout = new MemoryWritable();
+    const quietDir = await mkdir(path.join(os.tmpdir(), `agent-cli-no-stream-${Date.now()}`), { recursive: true });
+    await runSolveCommand(
+      [
+        "--workspace",
+        quietDir,
+        "--instruction",
+        "finish immediately",
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--no-stream-ui"
+      ],
+      {
+        stdout: quietStdout,
+        stderr: quietStderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+    expect(quietStderr.text()).toBe("");
+  });
+
   it("uses the harness runner when validation mode is auto", async () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-harness-${Date.now()}`), { recursive: true });
     const summaryPath = path.join(dir, "summary.json");
@@ -133,6 +218,69 @@ describe("agent-cli solve", () => {
     expect(code).toBe(0);
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
     expect(summary.harness.attempts).toHaveLength(1);
+  });
+
+  it("prints enabled MCP server errors to stderr and preserves summary data", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-mcp-${Date.now()}`), { recursive: true });
+    const agentDir = path.join(dir, ".agent");
+    await mkdir(agentDir, { recursive: true });
+    const summaryPath = path.join(dir, "summary.json");
+    await writeFile(
+      path.join(agentDir, "mcp.json"),
+      `${JSON.stringify(
+        {
+          servers: {
+            local: {
+              command: process.execPath,
+              args: ["missing-mcp-server.mjs"],
+              startupTimeoutSec: 1
+            }
+          }
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+    const code = await runSolveCommand(
+      [
+        "--workspace",
+        dir,
+        "--instruction",
+        "finish immediately",
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--enable-mcp",
+        "--mcp-config",
+        ".agent/mcp.json",
+        "--summary-json",
+        summaryPath,
+        "--no-stream-ui"
+      ],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stderr.text()).toContain("[sigma] mcp_error server=local error=");
+    expect(stdout.text()).toContain("status=completed");
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.mcp_servers).toEqual([
+      expect.objectContaining({
+        name: "local",
+        enabled: true,
+        tools_loaded: 0,
+        error: expect.any(String)
+      })
+    ]);
   });
 
   it("returns non-zero when harness validation fails", async () => {

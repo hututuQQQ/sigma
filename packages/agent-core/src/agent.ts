@@ -5,7 +5,10 @@ import type { AgentMessage, ToolCall } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
 import { truncateMiddle } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
-import { createDefaultToolRegistry } from "./tools/registry.js";
+import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
+import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
+import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
+import { redactSecrets } from "./redaction.js";
 import type {
   AgentEvent,
   AgentFinishReason,
@@ -14,6 +17,7 @@ import type {
   SummaryJson,
   TokenTotals,
   ToolExecutionContext,
+  ToolRegistry,
   ToolResult
 } from "./types.js";
 import { addUsage } from "./types.js";
@@ -24,6 +28,8 @@ const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000;
 const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
 const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
+const DEFAULT_PROJECT_DOC_MAX_BYTES = 32768;
+const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 const COMPACTION_MARKER = "Previous agent conversation compacted by harness.";
 
 function nowIso(): string {
@@ -151,6 +157,17 @@ function extractValidationCommands(finalMessage: string | undefined): string[] {
   return commands;
 }
 
+async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegistry> {
+  if (config.toolRegistry && config.toolRegistryFactory) {
+    throw new Error("Configure either toolRegistry or toolRegistryFactory, not both.");
+  }
+  const registry = config.toolRegistry ?? (config.toolRegistryFactory ? await config.toolRegistryFactory() : createDefaultToolRegistry());
+  return filterToolRegistry(registry, {
+    allowedTools: config.allowedTools,
+    disabledTools: config.disabledTools
+  });
+}
+
 export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   const summary: SummaryJson = {
     status: result.status,
@@ -174,13 +191,34 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (validationCommands.length > 0) {
     summary.validation_commands = validationCommands;
   }
+  if (result.toolsAvailable && result.toolsAvailable.length > 0) {
+    summary.tools_available = result.toolsAvailable;
+  }
+  if (result.changedFiles && result.changedFiles.length > 0) {
+    summary.changed_files = result.changedFiles;
+  }
+  if (result.todoItems && result.todoItems.length > 0) {
+    summary.todo_items = result.todoItems;
+  }
+  if (result.projectInstructionSources && result.projectInstructionSources.length > 0) {
+    summary.project_instruction_sources = result.projectInstructionSources;
+  }
+  if (result.contextMode) {
+    summary.context_mode = result.contextMode;
+  }
+  if (typeof result.repoMapChars === "number") {
+    summary.repo_map_chars = result.repoMapChars;
+  }
+  if (result.mcpServers && result.mcpServers.length > 0) {
+    summary.mcp_servers = result.mcpServers;
+  }
   return summary;
 }
 
 export async function writeRunSummary(result: AgentRunResult, summaryJsonPath: string): Promise<void> {
   const resolved = path.resolve(summaryJsonPath);
   await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, `${JSON.stringify(summaryJsonFromRunResult(result), null, 2)}\n`, "utf8");
+  await writeFile(resolved, `${JSON.stringify(redactSecrets(summaryJsonFromRunResult(result)), null, 2)}\n`, "utf8");
 }
 
 export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> {
@@ -194,25 +232,53 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     workspacePath: path.resolve(config.workspacePath),
     permissionMode: config.permissionMode ?? "ask",
     commandTimeoutSec: config.commandTimeoutSec ?? DEFAULT_COMMAND_TIMEOUT_SEC,
-    maxToolOutputChars: config.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS
+    maxToolOutputChars: config.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+    permissionDecider: config.permissionDecider,
+    runState: {
+      todos: [],
+      nextTodoId: 1,
+      changedFiles: new Set<string>()
+    },
+    alwaysAllowTools: new Set<string>()
   };
   const traceStore = config.traceJsonlPath ? new JsonlSessionStore(config.traceJsonlPath) : undefined;
   const sessionStore = config.sessionJsonlPath ? new JsonlSessionStore(config.sessionJsonlPath) : undefined;
 
   const recordEvent = async (agentEvent: AgentEvent): Promise<void> => {
-    config.eventBus?.emit(agentEvent);
-    await traceStore?.append(agentEvent);
+    const safeEvent = redactSecrets(agentEvent);
+    config.eventBus?.emit(safeEvent);
+    await traceStore?.append(safeEvent);
     if (config.sessionJsonlPath !== config.traceJsonlPath) {
-      await sessionStore?.append(agentEvent);
+      await sessionStore?.append(safeEvent);
     }
   };
 
   const usage: TokenTotals = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 };
+  const loadedProjectInstructions = await loadProjectInstructions({
+    workspacePath: context.workspacePath,
+    enabled: config.projectInstructionsEnabled !== false,
+    maxBytes: config.projectDocMaxBytes ?? DEFAULT_PROJECT_DOC_MAX_BYTES
+  });
+  const repoMap = config.contextMode === "repo-map"
+    ? await generateRepoMap({
+        workspacePath: context.workspacePath,
+        maxChars: config.repoMapMaxChars ?? DEFAULT_REPO_MAP_MAX_CHARS
+      })
+    : null;
+  const systemSections = [DEFAULT_SYSTEM_PROMPT];
+  const projectInstructionsBlock = formatProjectInstructionsBlock(loadedProjectInstructions);
+  if (projectInstructionsBlock) {
+    systemSections.push(projectInstructionsBlock);
+  }
+  if (repoMap) {
+    systemSections.push(formatRepoMapBlock(repoMap));
+  }
   const messages: AgentMessage[] = [
-    { role: "system", content: DEFAULT_SYSTEM_PROMPT },
+    { role: "system", content: systemSections.join("\n\n") },
     { role: "user", content: config.instruction }
   ];
-  const registry = createDefaultToolRegistry();
+  const registry = await resolveRunToolRegistry(config);
+  const toolsAvailable = registry.definitions.map((definition) => definition.function.name).sort((a, b) => a.localeCompare(b, "en"));
   let turns = 0;
   let toolCalls = 0;
   let commandsExecuted = 0;
@@ -226,7 +292,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       workspacePath: context.workspacePath,
       maxTurns,
       maxWallTimeSec,
-      permissionMode: context.permissionMode
+      permissionMode: context.permissionMode,
+      toolsAvailable,
+      projectInstructionSources: loadedProjectInstructions.sources,
+      contextMode: config.contextMode,
+      repoMapChars: repoMap?.chars
     })
   );
 
@@ -335,13 +405,21 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     model,
     durationMs: Date.now() - startedAt,
     lastError,
-    finalMessage
+    finalMessage,
+    toolsAvailable,
+    changedFiles: [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en")),
+    todoItems: context.runState.todos,
+    projectInstructionSources: loadedProjectInstructions.sources,
+    contextMode: config.contextMode,
+    repoMapChars: repoMap?.chars,
+    mcpServers: config.mcpServers
   };
 
   await recordEvent(event(runId, "run_end", provider, model, { result }));
   if (config.summaryJsonPath) {
     await writeRunSummary(result, config.summaryJsonPath);
   }
+  await registry.close?.();
 
   return result;
 }

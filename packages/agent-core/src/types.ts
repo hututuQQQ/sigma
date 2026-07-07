@@ -2,6 +2,22 @@ import type { ModelClient, ToolCall, ToolDefinition, Usage } from "agent-ai";
 
 export type PermissionMode = "ask" | "yolo";
 
+export type ToolRisk = "read" | "write" | "execute" | "network" | "unknown";
+
+export interface PermissionRequest {
+  toolName: string;
+  arguments: unknown;
+  risk: ToolRisk;
+  reason: string;
+  workspacePath: string;
+}
+
+export type PermissionDecision = "allow" | "deny" | "always_allow";
+
+export interface PermissionDecider {
+  decide(request: PermissionRequest): Promise<PermissionDecision>;
+}
+
 export type AgentRunStatus = "completed" | "stopped" | "error";
 
 export type AgentFinishReason =
@@ -25,6 +41,9 @@ export interface ToolExecutionContext {
   permissionMode: PermissionMode;
   commandTimeoutSec: number;
   maxToolOutputChars: number;
+  permissionDecider?: PermissionDecider;
+  runState: AgentRunState;
+  alwaysAllowTools: Set<string>;
 }
 
 export interface ToolHandler {
@@ -34,11 +53,46 @@ export interface ToolHandler {
 export interface RegisteredTool {
   definition: ToolDefinition;
   execute: ToolHandler;
+  risk?: ToolRisk;
 }
 
 export interface ToolRegistry {
   definitions: ToolDefinition[];
   execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult>;
+  close?(): Promise<void>;
+}
+
+export interface ToolRegistryOptions {
+  allowOverrides?: boolean;
+}
+
+export interface ToolRegistryFilter {
+  allowedTools?: string[];
+  disabledTools?: string[];
+}
+
+export type TodoStatus = "pending" | "in_progress" | "done" | "blocked";
+
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: TodoStatus;
+  note?: string;
+}
+
+export interface AgentRunState {
+  todos: TodoItem[];
+  nextTodoId: number;
+  changedFiles: Set<string>;
+}
+
+export type ContextMode = "off" | "repo-map";
+
+export interface McpServerRunSummary {
+  name: string;
+  enabled: boolean;
+  tools_loaded: number;
+  error?: string;
 }
 
 export interface AgentRunConfig {
@@ -57,6 +111,16 @@ export interface AgentRunConfig {
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
   eventBus?: AgentEventBusLike;
+  toolRegistry?: ToolRegistry;
+  toolRegistryFactory?: () => ToolRegistry | Promise<ToolRegistry>;
+  allowedTools?: string[];
+  disabledTools?: string[];
+  permissionDecider?: PermissionDecider;
+  projectInstructionsEnabled?: boolean;
+  projectDocMaxBytes?: number;
+  contextMode?: ContextMode;
+  repoMapMaxChars?: number;
+  mcpServers?: McpServerRunSummary[];
 }
 
 export interface AgentHarnessConfig extends AgentRunConfig {
@@ -85,6 +149,8 @@ export interface AgentEvent {
     | "assistant_message"
     | "tool_start"
     | "tool_end"
+    | "harness_check_start"
+    | "harness_check_end"
     | "usage"
     | "error"
     | "run_end";
@@ -115,6 +181,13 @@ export interface AgentRunResult {
   lastError: string | null;
   finalMessage?: string;
   harness?: AgentHarnessSummary;
+  toolsAvailable?: string[];
+  changedFiles?: string[];
+  todoItems?: TodoItem[];
+  projectInstructionSources?: string[];
+  contextMode?: ContextMode;
+  repoMapChars?: number;
+  mcpServers?: McpServerRunSummary[];
 }
 
 export interface WorkspaceManifestEntry {
@@ -202,6 +275,13 @@ export interface SummaryJson {
   final_message?: string;
   validation_commands?: string[];
   harness?: AgentHarnessSummary;
+  tools_available?: string[];
+  changed_files?: string[];
+  todo_items?: TodoItem[];
+  project_instruction_sources?: string[];
+  context_mode?: ContextMode;
+  repo_map_chars?: number;
+  mcp_servers?: McpServerRunSummary[];
 }
 
 export function addUsage(total: TokenTotals, usage: Usage | undefined): void {

@@ -21,7 +21,9 @@ async function workspace(): Promise<{ dir: string; context: ToolExecutionContext
       workspacePath: dir,
       permissionMode: "yolo",
       commandTimeoutSec: 2,
-      maxToolOutputChars: 200
+      maxToolOutputChars: 200,
+      runState: { todos: [], nextTodoId: 1, changedFiles: new Set<string>() },
+      alwaysAllowTools: new Set<string>()
     }
   };
 }

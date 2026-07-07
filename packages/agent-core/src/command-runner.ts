@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 
 export type CommandSettledOn = "close" | "exit-drain" | "timeout" | "error";
 
-export interface BashCommandResult {
+export interface CommandResult {
   exitCode: number | null;
   signal: NodeJS.Signals | string | null;
   stdout: Buffer;
@@ -12,6 +12,22 @@ export interface BashCommandResult {
   timedOut: boolean;
   settledOn: CommandSettledOn;
   error?: Error;
+}
+
+export type BashCommandResult = CommandResult;
+
+export interface RunCommandOptions {
+  command: string;
+  args?: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  stdin?: string | Buffer;
+  timeoutMs: number;
+  drainMs?: number;
+  killSettleMs?: number;
+  termToKillMs?: number;
+  detachedProcessGroup?: boolean;
+  windowsHide?: boolean;
 }
 
 export interface RunBashCommandOptions {
@@ -47,7 +63,21 @@ function clearTimer(timer: ReturnType<typeof setTimeout> | undefined): void {
   if (timer) clearTimeout(timer);
 }
 
+function killWindowsProcessTree(pid: number): void {
+  const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+    stdio: "ignore",
+    windowsHide: true
+  });
+  killer.on("error", () => {
+    // Fall back to child.kill below when taskkill is unavailable.
+  });
+  killer.unref();
+}
+
 function killProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  if (process.platform === "win32" && child.pid !== undefined) {
+    killWindowsProcessTree(child.pid);
+  }
   if (process.platform !== "win32" && child.pid !== undefined) {
     try {
       process.kill(-child.pid, signal);
@@ -59,7 +89,7 @@ function killProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.S
   child.kill(signal);
 }
 
-export async function runBashCommand(options: RunBashCommandOptions): Promise<BashCommandResult> {
+export async function runCommand(options: RunCommandOptions): Promise<CommandResult> {
   const startedAt = Date.now();
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
@@ -68,7 +98,7 @@ export async function runBashCommand(options: RunBashCommandOptions): Promise<Ba
   const termToKillMs = Math.max(1, Math.min(killSettleMs, Math.floor(options.termToKillMs ?? 500)));
   const detachedProcessGroup = options.detachedProcessGroup ?? process.platform !== "win32";
 
-  return await new Promise<BashCommandResult>((resolve) => {
+  return await new Promise<CommandResult>((resolve) => {
     let child: ChildProcessWithoutNullStreams | undefined;
     let settled = false;
     let timedOut = false;
@@ -114,11 +144,11 @@ export async function runBashCommand(options: RunBashCommandOptions): Promise<Ba
     }
 
     try {
-      child = spawn(bashExecutable(), ["-lc", options.command], {
+      child = spawn(options.command, options.args ?? [], {
         cwd: options.cwd,
         env: options.env ?? process.env,
         detached: detachedProcessGroup,
-        windowsHide: true
+        windowsHide: options.windowsHide ?? true
       });
     } catch (error) {
       finish("error", error instanceof Error ? error : new Error(String(error)));
@@ -128,6 +158,10 @@ export async function runBashCommand(options: RunBashCommandOptions): Promise<Ba
     const runningChild = child;
     runningChild.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
     runningChild.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+    runningChild.stdin.on("error", () => {
+      // The process may exit before it consumes stdin.
+    });
+    runningChild.stdin.end(options.stdin);
 
     timeoutTimer = setTimeout(() => {
       timedOut = true;
@@ -161,5 +195,20 @@ export async function runBashCommand(options: RunBashCommandOptions): Promise<Ba
       exitSignal = signal;
       finish("close");
     });
+  });
+}
+
+export async function runBashCommand(options: RunBashCommandOptions): Promise<BashCommandResult> {
+  return await runCommand({
+    command: bashExecutable(),
+    args: ["-lc", options.command],
+    cwd: options.cwd,
+    env: options.env,
+    timeoutMs: options.timeoutMs,
+    drainMs: options.drainMs,
+    killSettleMs: options.killSettleMs,
+    termToKillMs: options.termToKillMs,
+    detachedProcessGroup: options.detachedProcessGroup,
+    windowsHide: true
   });
 }

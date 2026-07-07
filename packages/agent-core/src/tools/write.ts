@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Buffer } from "node:buffer";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
-import { resolveWorkspacePath } from "../policy.js";
+import { requestToolPermission, resolveWorkspacePath, workspaceRelativePath } from "../policy.js";
 
 interface WriteArgs {
   path?: unknown;
@@ -11,13 +11,6 @@ interface WriteArgs {
 }
 
 export async function executeWriteTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
-  if (context.permissionMode !== "yolo") {
-    return {
-      ok: false,
-      content: "Permission mode 'ask' is non-interactive in this MVP; write is rejected."
-    };
-  }
-
   const parsed = (args && typeof args === "object" ? args : {}) as WriteArgs;
   if (typeof parsed.path !== "string" || parsed.path.length === 0) {
     return { ok: false, content: "write requires a path string" };
@@ -33,16 +26,27 @@ export async function executeWriteTool(args: unknown, context: ToolExecutionCont
     return { ok: false, content: error instanceof Error ? error.message : String(error) };
   }
 
+  const relativePath = workspaceRelativePath(context.workspacePath, filePath);
+  const denied = await requestToolPermission(context, {
+    toolName: "write",
+    arguments: args,
+    risk: "write",
+    reason: `Write UTF-8 file ${relativePath}`
+  });
+  if (denied) return denied;
+
   try {
     if (parsed.createDirs === true) {
       await mkdir(path.dirname(filePath), { recursive: true });
     }
     await writeFile(filePath, parsed.content, "utf8");
+    context.runState.changedFiles.add(relativePath);
     return {
       ok: true,
-      content: `Wrote ${path.relative(context.workspacePath, filePath)}`,
+      content: `Wrote ${relativePath}`,
       metadata: {
         path: filePath,
+        relativePath,
         bytes: Buffer.byteLength(parsed.content, "utf8")
       }
     };

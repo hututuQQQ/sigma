@@ -1,6 +1,6 @@
-import type { AgentRunResult } from "agent-core";
+import { redactSecretText, type AgentRunResult } from "agent-core";
 
-export function printRunResult(result: AgentRunResult): void {
+export function printRunResult(result: AgentRunResult, stdout: NodeJS.WritableStream = process.stdout): void {
   const lines = [
     `status=${result.status}`,
     `finish_reason=${result.finishReason}`,
@@ -11,13 +11,13 @@ export function printRunResult(result: AgentRunResult): void {
     `output_tokens=${result.usage.outputTokens}`
   ];
   if (result.lastError) {
-    lines.push(`last_error=${result.lastError}`);
+    lines.push(`last_error=${redactSecretText(result.lastError)}`);
   }
   if (result.finalMessage) {
     lines.push("");
-    lines.push(result.finalMessage);
+    lines.push(redactSecretText(result.finalMessage));
   }
-  process.stdout.write(`${lines.join("\n")}\n`);
+  stdout.write(`${lines.join("\n")}\n`);
 }
 
 export function maskSecret(value: string | undefined): string {

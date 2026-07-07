@@ -5,7 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { bashExecutable, runBashCommand } from "../command-runner.js";
-import { resolveWorkspacePath } from "../policy.js";
+import { requestToolPermission, resolveWorkspacePath } from "../policy.js";
 
 type ServiceAction = "start" | "status" | "logs" | "stop";
 
@@ -48,8 +48,15 @@ function registryPath(): string {
   return path.resolve(process.env.AGENT_SERVICE_REGISTRY ?? "/tmp/agent/services.json");
 }
 
-function serviceLogDir(): string {
-  return path.resolve(process.env.AGENT_SERVICE_LOG_DIR ?? "/tmp/agent/services");
+function serviceLogDir(workspacePath: string): string {
+  if (process.env.AGENT_SERVICE_LOG_DIR) {
+    try {
+      return resolveWorkspacePath(workspacePath, process.env.AGENT_SERVICE_LOG_DIR);
+    } catch {
+      return path.join(workspacePath, ".agent", "services");
+    }
+  }
+  return path.join(workspacePath, ".agent", "services");
 }
 
 function safeName(value: string): string {
@@ -182,22 +189,27 @@ async function stopRecord(record: ServiceRecord): Promise<"stopped" | "missing">
   return "stopped";
 }
 
-function resolveOptionalPath(value: unknown, cwd: string): string | undefined {
+function resolveOptionalPath(value: unknown, workspacePath: string, cwd: string): string | undefined {
   const text = asString(value);
   if (!text) return undefined;
-  return path.isAbsolute(text) ? path.resolve(text) : path.resolve(cwd, text);
+  const candidate = path.isAbsolute(text) ? path.resolve(text) : path.resolve(cwd, text);
+  return resolveWorkspacePath(workspacePath, candidate);
 }
 
 async function startService(args: ServiceArgs, context: ToolExecutionContext): Promise<ToolResult> {
-  if (context.permissionMode === "ask") {
-    return { ok: false, content: "Permission mode 'ask' is non-interactive in this MVP; service start is rejected." };
-  }
-
   const name = asString(args.name);
   const command = asString(args.command);
   if (!name || !command) {
     return { ok: false, content: "service.start requires name and command" };
   }
+
+  const denied = await requestToolPermission(context, {
+    toolName: "service",
+    arguments: args,
+    risk: "execute",
+    reason: `Start background service ${name}`
+  });
+  if (denied) return denied;
 
   let cwd: string;
   try {
@@ -208,7 +220,13 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
 
   const port = asNumber(args.port);
   const readinessCommand = asString(args.readinessCommand);
-  const logPath = resolveOptionalPath(args.logPath, cwd) ?? path.join(serviceLogDir(), `${safeName(name)}.log`);
+  let logPath: string;
+  try {
+    logPath = resolveOptionalPath(args.logPath, context.workspacePath, cwd) ??
+      path.join(serviceLogDir(context.workspacePath), `${safeName(name)}.log`);
+  } catch (error) {
+    return { ok: false, content: error instanceof Error ? error.message : String(error) };
+  }
   await mkdir(path.dirname(logPath), { recursive: true });
   const outFd = openSync(logPath, "a");
   let pid: number | undefined;
@@ -311,11 +329,15 @@ async function logsService(args: ServiceArgs): Promise<ToolResult> {
 }
 
 async function stopService(args: ServiceArgs, context: ToolExecutionContext): Promise<ToolResult> {
-  if (context.permissionMode === "ask") {
-    return { ok: false, content: "Permission mode 'ask' is non-interactive in this MVP; service stop is rejected." };
-  }
-
   const name = asString(args.name);
+  const denied = await requestToolPermission(context, {
+    toolName: "service",
+    arguments: args,
+    risk: "execute",
+    reason: name ? `Stop background service ${name}` : "Stop background services"
+  });
+  if (denied) return denied;
+
   const services = await readRegistry();
   const selected = name ? services.filter((service) => service.name === name) : services;
   const results: ServiceCleanupResult = { stopped: [], kept: [], missing: [], errors: [] };
