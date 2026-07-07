@@ -29,6 +29,58 @@ export type AgentFinishReason =
   | "error";
 
 export type AgentHarnessValidationMode = "off" | "auto";
+export type AgentFinalEvidenceMode = "off" | "auto";
+export type AgentSkillsMode = "off" | "auto";
+
+export type WorkflowPhase =
+  | "triage"
+  | "explore"
+  | "plan"
+  | "implement"
+  | "verify"
+  | "repair"
+  | "review"
+  | "final";
+
+export type EvidenceKind =
+  | "test"
+  | "build"
+  | "lint"
+  | "typecheck"
+  | "manual-check"
+  | "service"
+  | "file-check"
+  | "unknown";
+
+export interface EvidenceRecord {
+  kind: EvidenceKind;
+  toolName: string;
+  ok: boolean;
+  executable: boolean;
+  command?: string;
+  summary?: string;
+  relatedFiles?: string[];
+  exitCode?: number | null;
+  timestamp: string;
+}
+
+export interface FinalGateStatus {
+  mode: AgentFinalEvidenceMode;
+  nudged: boolean;
+  status: "off" | "not-needed" | "satisfied" | "nudged" | "allowed-after-nudge" | "budget-exhausted";
+  reason?: string;
+}
+
+export interface WorkflowStateSummary {
+  phase: WorkflowPhase;
+  commands_tried: string[];
+  changed_files: string[];
+}
+
+export interface SelectedSkillSummary {
+  name: string;
+  source: "built-in" | "workspace";
+}
 
 export interface ToolResult {
   ok: boolean;
@@ -121,6 +173,9 @@ export interface AgentRunConfig {
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
   mcpServers?: McpServerRunSummary[];
+  finalEvidenceMode?: AgentFinalEvidenceMode;
+  skillsMode?: AgentSkillsMode;
+  skillsMaxChars?: number;
 }
 
 export interface AgentHarnessConfig extends AgentRunConfig {
@@ -189,6 +244,10 @@ export interface AgentRunResult {
   contextMode?: ContextMode;
   repoMapChars?: number;
   mcpServers?: McpServerRunSummary[];
+  workflow?: WorkflowStateSummary;
+  evidenceRecords?: EvidenceRecord[];
+  finalGate?: FinalGateStatus;
+  selectedSkills?: SelectedSkillSummary[];
 }
 
 export interface WorkspaceManifestEntry {
@@ -289,6 +348,10 @@ export interface SummaryJson {
   context_mode?: ContextMode;
   repo_map_chars?: number;
   mcp_servers?: McpServerRunSummary[];
+  workflow?: WorkflowStateSummary;
+  evidence?: EvidenceRecord[];
+  final_gate?: FinalGateStatus;
+  selected_skills?: SelectedSkillSummary[];
 }
 
 export function addUsage(total: TokenTotals, usage: Usage | undefined): void {

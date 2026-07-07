@@ -22,6 +22,8 @@ Common solve flags:
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
   --context-mode <off|repo-map>
+  --final-evidence-mode <off|auto>
+  --skills-mode <off|auto>
   --enable-mcp
   --stream-ui / --no-stream-ui
 `);

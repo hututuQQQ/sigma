@@ -101,6 +101,9 @@ describe("agent-cli solve", () => {
       "project-doc-max-bytes": "1234",
       "context-mode": "off",
       "repo-map-max-chars": "5678",
+      "final-evidence-mode": "auto",
+      "skills-mode": "off",
+      "skills-max-chars": "123",
       "enable-mcp": true,
       "mcp-config": ".agent/custom-mcp.json",
       "no-stream-ui": true
@@ -113,10 +116,18 @@ describe("agent-cli solve", () => {
       projectDocMaxBytes: 1234,
       contextMode: "off",
       repoMapMaxChars: 5678,
+      finalEvidenceMode: "auto",
+      skillsMode: "off",
+      skillsMaxChars: 123,
       enableMcp: true,
       mcpConfig: ".agent/custom-mcp.json",
       noStreamUi: true
     });
+  });
+
+  it("defaults final evidence mode to auto only when validation is auto", () => {
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek" }).finalEvidenceMode).toBe("off");
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "validation-mode": "auto" }).finalEvidenceMode).toBe("auto");
   });
 
   it("runs with an injected fake provider and writes summary JSON", async () => {

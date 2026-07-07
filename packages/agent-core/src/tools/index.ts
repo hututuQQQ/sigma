@@ -6,9 +6,11 @@ export { executeServiceTool, finalizeManagedServices } from "./service.js";
 export { executeListTool } from "./list.js";
 export { executeGlobTool, matchesSimpleGlob } from "./glob.js";
 export { executeGrepTool } from "./grep.js";
+export { executeRepoQueryTool } from "./repo-query.js";
 export { executeGitStatusTool, executeGitDiffTool } from "./git.js";
 export { executeApplyPatchTool } from "./apply-patch.js";
 export { executeTodoTool } from "./todo.js";
+export { closeShellSessions, executeShellSessionTool } from "./shell-session.js";
 export {
   createDefaultToolRegistry,
   createToolRegistryFromTools,

@@ -2,7 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderName } from "agent-ai";
-import type { AgentHarnessValidationMode, ContextMode, PermissionMode } from "agent-core";
+import type {
+  AgentFinalEvidenceMode,
+  AgentHarnessValidationMode,
+  AgentSkillsMode,
+  ContextMode,
+  PermissionMode
+} from "agent-core";
 
 export interface ParsedArgs {
   flags: Record<string, string | boolean>;
@@ -40,6 +46,9 @@ export interface CliConfig {
   projectDocMaxBytes: number;
   contextMode: ContextMode;
   repoMapMaxChars: number;
+  finalEvidenceMode: AgentFinalEvidenceMode;
+  skillsMode: AgentSkillsMode;
+  skillsMaxChars: number;
   enableMcp: boolean;
   mcpConfig?: string;
   noStreamUi: boolean;
@@ -55,7 +64,8 @@ const DEFAULTS = {
   compactionSummaryChars: 30000,
   projectDocMaxBytes: 32768,
   contextMode: "repo-map" as ContextMode,
-  repoMapMaxChars: 20000
+  repoMapMaxChars: 20000,
+  skillsMaxChars: 8000
 };
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -149,6 +159,16 @@ function validationModeValue(value: unknown): AgentHarnessValidationMode {
   throw new Error(`Unsupported validation mode '${String(value)}'. Use off or auto.`);
 }
 
+function finalEvidenceModeValue(value: unknown): AgentFinalEvidenceMode {
+  if (value === "off" || value === "auto") return value;
+  throw new Error(`Unsupported final evidence mode '${String(value)}'. Use off or auto.`);
+}
+
+function skillsModeValue(value: unknown): AgentSkillsMode {
+  if (value === "off" || value === "auto") return value;
+  throw new Error(`Unsupported skills mode '${String(value)}'. Use off or auto.`);
+}
+
 function contextModeValue(value: unknown): ContextMode {
   if (value === "off" || value === "repo-map") return value;
   throw new Error(`Unsupported context mode '${String(value)}'. Use off or repo-map.`);
@@ -220,6 +240,12 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       : flags["no-stream-ui"] !== undefined
         ? false
         : boolValue(process.env.AGENT_STREAM_UI ?? config.stream_ui, !configuredNoStreamUi);
+  const validationMode = validationModeValue(
+    stringValue(flags["validation-mode"]) ??
+      process.env.AGENT_VALIDATION_MODE ??
+      stringValue(config.validation_mode) ??
+      "off"
+  );
 
   return {
     workspace,
@@ -268,12 +294,7 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         config.compaction_summary_chars,
       DEFAULTS.compactionSummaryChars
     ),
-    validationMode: validationModeValue(
-      stringValue(flags["validation-mode"]) ??
-        process.env.AGENT_VALIDATION_MODE ??
-        stringValue(config.validation_mode) ??
-        "off"
-    ),
+    validationMode,
     validationCommands: validationCommandList({
       singleValues: [flags["validation-command"], process.env.AGENT_VALIDATION_COMMAND, config.validation_command],
       listValues: [flags["validation-commands"], process.env.AGENT_VALIDATION_COMMANDS, config.validation_command_list]
@@ -333,6 +354,22 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     repoMapMaxChars: numberValue(
       flags["repo-map-max-chars"] ?? process.env.AGENT_REPO_MAP_MAX_CHARS ?? config.repo_map_max_chars,
       DEFAULTS.repoMapMaxChars
+    ),
+    finalEvidenceMode: finalEvidenceModeValue(
+      stringValue(flags["final-evidence-mode"]) ??
+        process.env.AGENT_FINAL_EVIDENCE_MODE ??
+        stringValue(config.final_evidence_mode) ??
+        (validationMode === "auto" ? "auto" : "off")
+    ),
+    skillsMode: skillsModeValue(
+      stringValue(flags["skills-mode"]) ??
+        process.env.AGENT_SKILLS_MODE ??
+        stringValue(config.skills_mode) ??
+        "auto"
+    ),
+    skillsMaxChars: numberValue(
+      flags["skills-max-chars"] ?? process.env.AGENT_SKILLS_MAX_CHARS ?? config.skills_max_chars,
+      DEFAULTS.skillsMaxChars
     ),
     enableMcp: boolValue(flags["enable-mcp"] ?? process.env.AGENT_ENABLE_MCP ?? config.enable_mcp, false),
     mcpConfig:

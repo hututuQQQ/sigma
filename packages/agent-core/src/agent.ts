@@ -8,6 +8,18 @@ import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
+import { detectProjectProfile } from "./harness/project-detector.js";
+import { formatSelectedSkills } from "./skills/format-skills.js";
+import { loadAllSkills } from "./skills/load-skills.js";
+import { projectHintsFromProfile, retrieveSkills } from "./skills/retrieve-skills.js";
+import type { AgentSkill } from "./skills/types.js";
+import { inferEvidenceRecord } from "./controller/evidence.js";
+import { createInitialFinalGateStatus, finalGateNudge } from "./controller/final-gate.js";
+import {
+  createWorkflowState,
+  recordToolInWorkflow,
+  summarizeWorkflowState
+} from "./controller/workflow-state.js";
 import { redactSecrets } from "./redaction.js";
 import type {
   AgentEvent,
@@ -30,6 +42,7 @@ const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
 const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
 const DEFAULT_PROJECT_DOC_MAX_BYTES = 32768;
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
+const DEFAULT_SKILLS_MAX_CHARS = 8000;
 const COMPACTION_MARKER = "Previous agent conversation compacted by the run controller.";
 
 function nowIso(): string {
@@ -179,6 +192,18 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.mcpServers && result.mcpServers.length > 0) {
     summary.mcp_servers = result.mcpServers;
   }
+  if (result.workflow) {
+    summary.workflow = result.workflow;
+  }
+  if (result.evidenceRecords && result.evidenceRecords.length > 0) {
+    summary.evidence = result.evidenceRecords;
+  }
+  if (result.finalGate) {
+    summary.final_gate = result.finalGate;
+  }
+  if (result.selectedSkills && result.selectedSkills.length > 0) {
+    summary.selected_skills = result.selectedSkills;
+  }
   return summary;
 }
 
@@ -210,6 +235,10 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   };
   const traceStore = config.traceJsonlPath ? new JsonlSessionStore(config.traceJsonlPath) : undefined;
   const sessionStore = config.sessionJsonlPath ? new JsonlSessionStore(config.sessionJsonlPath) : undefined;
+  const workflow = createWorkflowState();
+  const finalEvidenceMode = config.finalEvidenceMode ?? "off";
+  let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
+  let finalGateAlreadyNudged = false;
 
   const recordEvent = async (agentEvent: AgentEvent): Promise<void> => {
     const safeEvent = redactSecrets(agentEvent);
@@ -240,6 +269,17 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   if (repoMap) {
     systemSections.push(formatRepoMapBlock(repoMap));
   }
+  let selectedSkills: AgentSkill[] = [];
+  if ((config.skillsMode ?? "auto") === "auto") {
+    const profile = await detectProjectProfile(context.workspacePath);
+    const allSkills = await loadAllSkills(context.workspacePath);
+    selectedSkills = retrieveSkills(allSkills, {
+      instruction: config.instruction,
+      projectHints: projectHintsFromProfile(profile)
+    });
+    const skillsBlock = formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS);
+    if (skillsBlock) systemSections.push(skillsBlock);
+  }
   const messages: AgentMessage[] = [
     { role: "system", content: systemSections.join("\n\n") },
     { role: "user", content: config.instruction }
@@ -263,7 +303,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       toolsAvailable,
       projectInstructionSources: loadedProjectInstructions.sources,
       contextMode: config.contextMode,
-      repoMapChars: repoMap?.chars
+      repoMapChars: repoMap?.chars,
+      selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
     })
   );
 
@@ -309,6 +350,24 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
 
       const calls = response.message.toolCalls ?? [];
       if (calls.length === 0) {
+        const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+        const workflowSummary = summarizeWorkflowState(workflow, changedFiles);
+        const gate = finalGateNudge({
+          mode: finalEvidenceMode,
+          alreadyNudged: finalGateAlreadyNudged,
+          instruction: config.instruction,
+          workflow: workflowSummary,
+          evidenceRecords: workflow.evidenceRecords,
+          turns,
+          maxTurns
+        });
+        finalGateStatus = gate.status;
+        if (gate.message) {
+          finalGateAlreadyNudged = true;
+          messages.push({ role: "user", content: gate.message });
+          continue;
+        }
+        workflow.phase = "final";
         finishReason = "assistant_stop";
         stoppedByAssistant = true;
         break;
@@ -342,6 +401,18 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             toolStart.id
           )
         );
+        const evidence = inferEvidenceRecord({
+          toolName: call.function.name,
+          args: call.function.arguments,
+          result
+        });
+        recordToolInWorkflow({
+          workflow,
+          toolName: call.function.name,
+          args: call.function.arguments,
+          result,
+          evidence
+        });
         messages.push({
           role: "tool",
           toolCallId: call.id,
@@ -361,6 +432,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   }
 
   const status = finishReason === "error" ? "error" : finishReason === "assistant_stop" ? "completed" : "stopped";
+  const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
   const result: AgentRunResult = {
     status,
     finishReason,
@@ -374,12 +446,16 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     lastError,
     finalMessage,
     toolsAvailable,
-    changedFiles: [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en")),
+    changedFiles,
     todoItems: context.runState.todos,
     projectInstructionSources: loadedProjectInstructions.sources,
     contextMode: config.contextMode,
     repoMapChars: repoMap?.chars,
-    mcpServers: config.mcpServers
+    mcpServers: config.mcpServers,
+    workflow: summarizeWorkflowState(workflow, changedFiles),
+    evidenceRecords: workflow.evidenceRecords,
+    finalGate: finalGateStatus,
+    selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
   };
 
   await recordEvent(event(runId, "run_end", provider, model, { result }));
