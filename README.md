@@ -256,9 +256,9 @@ The core loop exposes these default tools:
 - `list`: lists workspace files/directories with `path`, `depth`, `includeHidden`, and `maxEntries`.
 - `glob`: finds files with simple `*`, `**`, and `?` patterns.
 - `grep`: searches text files, preferring `rg` when available and falling back to Node.
-- `git_status`: read-only `git status`.
-- `git_diff`: read-only `git diff` or `git diff --staged`.
-- `apply_patch`: validates and applies safe unified diffs to workspace-relative files.
+- `git_status`: read-only `git status`, bounded by the command timeout.
+- `git_diff`: read-only `git diff` or `git diff --staged`, bounded by the command timeout.
+- `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `todo`: maintains run-scoped todo state for the agent.
 
 Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and remains the expected mode for automated benchmarks.
@@ -333,6 +333,8 @@ MCP tool names are exposed as `mcp_<server>_<tool>` after sanitization, for exam
 - `prompt`: ask in `permission-mode ask`.
 - `approve`: allow configured tools.
 - `auto`: allow only tools with MCP `annotations.readOnlyHint`; otherwise ask or deny based on permission mode.
+
+When `--enable-mcp` is set, enabled server startup/listing failures are reported to stderr as redacted warnings such as `[sigma] mcp_error server=local error=MCP request timed out: initialize`. Core tools still load by default, and summary JSON includes each server's `mcp_servers` entry with any error text.
 
 ## Summary JSON
 

@@ -7,8 +7,10 @@ import {
   createDefaultToolRegistry,
   createMcpToolRegistry,
   mergeToolRegistries,
+  redactSecretText,
   runAgent,
   runAgentHarness,
+  truncateMiddle,
   type McpServerRunSummary,
   type ToolRegistry
 } from "agent-core";
@@ -65,6 +67,15 @@ function shouldUseHarness(cliConfig: ReturnType<typeof loadCliConfig>): boolean 
   );
 }
 
+function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.WritableStream): void {
+  for (const server of servers) {
+    if (!server.enabled || !server.error) continue;
+    const name = redactSecretText(server.name).replace(/\s+/g, "_");
+    const error = truncateMiddle(redactSecretText(server.error.replace(/\s+/g, " ").trim()), 300).text;
+    stderr.write(`[sigma] mcp_error server=${name} error=${error}\n`);
+  }
+}
+
 export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
@@ -94,6 +105,7 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
         configPath: cliConfig.mcpConfig
       });
       mcpServers = mcp.servers;
+      writeMcpServerWarnings(mcpServers, stderr);
       toolRegistry = mergeToolRegistries([createDefaultToolRegistry(), mcp.registry]);
     }
 

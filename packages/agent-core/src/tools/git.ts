@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { truncateMiddle } from "../compaction.js";
 import { resolveWorkspacePath, workspaceRelativePath } from "../policy.js";
+import { runCommand } from "../command-runner.js";
+import { gitCommandSpec } from "./git-command.js";
 
 interface GitStatusArgs {
   porcelain?: unknown;
@@ -17,8 +18,12 @@ interface GitDiffArgs {
 
 interface GitResult {
   exitCode: number | null;
+  signal: NodeJS.Signals | string | null;
   stdout: string;
   stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  settledOn: string;
 }
 
 function numberOrDefault(value: unknown, fallback: number, min: number, max: number): number {
@@ -26,26 +31,41 @@ function numberOrDefault(value: unknown, fallback: number, min: number, max: num
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
-function runGit(args: string[], cwd: string): Promise<GitResult> {
-  return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (error) => {
-      resolve({ exitCode: 127, stdout, stderr: error.message });
-    });
-    child.on("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
+async function runGit(args: string[], cwd: string, timeoutSec: number): Promise<GitResult> {
+  const git = gitCommandSpec();
+  const result = await runCommand({
+    command: git.command,
+    args: [...git.argsPrefix, ...args],
+    cwd,
+    timeoutMs: Math.max(1, Math.floor(timeoutSec)) * 1000
   });
+  return {
+    exitCode: result.error ? 127 : result.exitCode,
+    signal: result.signal,
+    stdout: result.stdout.toString("utf8"),
+    stderr: result.error ? result.error.message : result.stderr.toString("utf8"),
+    durationMs: result.durationMs,
+    timedOut: result.timedOut,
+    settledOn: result.settledOn
+  };
+}
+
+function timeoutResult(tool: "git_status" | "git_diff", result: GitResult, timeoutSec: number): ToolResult {
+  return {
+    ok: false,
+    content: `${tool} timed out after ${Math.max(1, Math.floor(timeoutSec))}s`,
+    metadata: {
+      exitCode: result.exitCode,
+      timedOut: true,
+      signal: result.signal,
+      durationMs: result.durationMs,
+      settledOn: result.settledOn
+    }
+  };
 }
 
 function isNotGitWorkspace(result: GitResult): boolean {
-  return result.exitCode !== 0 && /not a git repository|not a git command|No such file/i.test(result.stderr);
+  return !result.timedOut && result.exitCode !== 0 && /not a git repository|not a git command|No such file/i.test(result.stderr);
 }
 
 export async function executeGitStatusTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
@@ -53,7 +73,9 @@ export async function executeGitStatusTool(args: unknown, context: ToolExecution
   const porcelain = parsed.porcelain !== false;
   const maxOutputChars = numberOrDefault(parsed.maxOutputChars, context.maxToolOutputChars, 1, 200000);
   const gitArgs = porcelain ? ["status", "--short", "--branch"] : ["status"];
-  const result = await runGit(gitArgs, context.workspacePath);
+  const timeoutSec = Math.max(1, Math.floor(context.commandTimeoutSec));
+  const result = await runGit(gitArgs, context.workspacePath, timeoutSec);
+  if (result.timedOut) return timeoutResult("git_status", result, timeoutSec);
   if (isNotGitWorkspace(result)) {
     return { ok: true, content: "Not a git workspace.", metadata: { git: false } };
   }
@@ -83,7 +105,9 @@ export async function executeGitDiffTool(args: unknown, context: ToolExecutionCo
     }
   }
 
-  const result = await runGit(gitArgs, context.workspacePath);
+  const timeoutSec = Math.max(1, Math.floor(context.commandTimeoutSec));
+  const result = await runGit(gitArgs, context.workspacePath, timeoutSec);
+  if (result.timedOut) return timeoutResult("git_diff", result, timeoutSec);
   if (isNotGitWorkspace(result)) {
     return { ok: true, content: "Not a git workspace.", metadata: { git: false } };
   }
@@ -100,4 +124,3 @@ export async function executeGitDiffTool(args: unknown, context: ToolExecutionCo
     }
   };
 }
-

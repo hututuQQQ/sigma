@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { requestToolPermission, resolveWorkspacePath } from "../policy.js";
+import { runCommand } from "../command-runner.js";
+import { gitCommandSpec } from "./git-command.js";
 
 interface ApplyPatchArgs {
   patch?: unknown;
@@ -11,31 +12,130 @@ interface ApplyPatchArgs {
 
 interface ProcessResult {
   exitCode: number | null;
+  signal: NodeJS.Signals | string | null;
   stdout: string;
   stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  settledOn: string;
 }
 
-function runGitApply(args: string[], patch: string, cwd: string): Promise<ProcessResult> {
-  return new Promise((resolve) => {
-    const child = spawn("git", ["apply", ...args], { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (error) => {
-      resolve({ exitCode: 127, stdout, stderr: error.message });
-    });
-    child.on("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
-    child.stdin.end(patch);
+interface ParsedPathToken {
+  value: string;
+  rest: string;
+}
+
+const OUTPUT_TAIL_CHARS = 4000;
+
+async function runGitApply(args: string[], patch: string, cwd: string, timeoutSec: number): Promise<ProcessResult> {
+  const git = gitCommandSpec();
+  const result = await runCommand({
+    command: git.command,
+    args: [...git.argsPrefix, "apply", ...args],
+    cwd,
+    stdin: patch,
+    timeoutMs: Math.max(1, Math.floor(timeoutSec)) * 1000
   });
+  return {
+    exitCode: result.error ? 127 : result.exitCode,
+    signal: result.signal,
+    stdout: result.stdout.toString("utf8"),
+    stderr: result.error ? result.error.message : result.stderr.toString("utf8"),
+    durationMs: result.durationMs,
+    timedOut: result.timedOut,
+    settledOn: result.settledOn
+  };
+}
+
+function textTail(value: string): string {
+  return value.length > OUTPUT_TAIL_CHARS ? value.slice(-OUTPUT_TAIL_CHARS) : value;
+}
+
+function timeoutMetadata(result: ProcessResult, extra: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...extra,
+    timedOut: true,
+    exitCode: result.exitCode,
+    signal: result.signal,
+    durationMs: result.durationMs,
+    settledOn: result.settledOn,
+    ...(result.stdout ? { stdoutTail: textTail(result.stdout) } : {}),
+    ...(result.stderr ? { stderrTail: textTail(result.stderr) } : {})
+  };
+}
+
+function timeoutContent(command: string, timeoutSec: number): string {
+  return `${command} timed out after ${Math.max(1, Math.floor(timeoutSec))}s`;
+}
+
+function decodeQuotedEscape(input: string, index: number): { value: string; index: number } | null {
+  const escaped = input[index];
+  if (escaped === undefined) return null;
+  if (/[0-7]/.test(escaped)) {
+    let octal = escaped;
+    let nextIndex = index;
+    for (let count = 0; count < 2 && nextIndex + 1 < input.length && /[0-7]/.test(input[nextIndex + 1]); count += 1) {
+      nextIndex += 1;
+      octal += input[nextIndex];
+    }
+    return { value: String.fromCharCode(Number.parseInt(octal, 8)), index: nextIndex };
+  }
+  const escapes: Record<string, string> = {
+    "\\": "\\",
+    "\"": "\"",
+    t: "\t",
+    n: "\n",
+    r: "\r",
+    b: "\b",
+    f: "\f"
+  };
+  return { value: escapes[escaped] ?? escaped, index };
+}
+
+function readQuotedPathToken(input: string): ParsedPathToken | null {
+  if (!input.startsWith("\"")) return null;
+  let value = "";
+  for (let index = 1; index < input.length; index += 1) {
+    const char = input[index];
+    if (char === "\"") return { value, rest: input.slice(index + 1) };
+    if (char !== "\\") {
+      value += char;
+      continue;
+    }
+    const decoded = decodeQuotedEscape(input, index + 1);
+    if (!decoded) return null;
+    value += decoded.value;
+    index = decoded.index;
+  }
+  return null;
+}
+
+function readDiffPathToken(input: string): ParsedPathToken | null {
+  const trimmed = input.trimStart();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("\"")) return readQuotedPathToken(trimmed);
+  const match = trimmed.match(/^(\S+)/);
+  return match ? { value: match[1], rest: trimmed.slice(match[1].length) } : null;
+}
+
+function parseDiffGitPaths(line: string): [string, string] | null {
+  const first = readDiffPathToken(line.slice("diff --git ".length));
+  if (!first) return null;
+  const second = readDiffPathToken(first.rest);
+  if (!second || second.rest.trim().length > 0) return null;
+  return [first.value, second.value];
+}
+
+function parseFileHeaderPath(line: string): string | null {
+  const body = line.slice(4).trimStart();
+  if (!body) return null;
+  if (body.startsWith("\"")) return readQuotedPathToken(body)?.value ?? null;
+  const tabIndex = body.indexOf("\t");
+  return tabIndex === -1 ? body : body.slice(0, tabIndex);
 }
 
 function stripPatchPrefix(rawPath: string): string | null {
-  const trimmed = rawPath.trim().replace(/^"|"$/g, "");
+  const trimmed = rawPath.trim();
   if (trimmed === "/dev/null") return null;
   if (trimmed.startsWith("a/") || trimmed.startsWith("b/")) return trimmed.slice(2);
   return trimmed;
@@ -60,15 +160,17 @@ function parsePatchFiles(patch: string): string[] {
   const files = new Set<string>();
   for (const line of patch.split(/\r?\n/)) {
     if (line.startsWith("diff --git ")) {
-      const parts = line.split(/\s+/);
-      for (const candidate of parts.slice(2, 4)) {
+      const paths = parseDiffGitPaths(line);
+      if (!paths) throw new Error(`Malformed patch: invalid diff --git header: ${line}`);
+      for (const candidate of paths) {
         const normalized = normalizePatchPath(candidate);
         if (normalized) files.add(normalized);
       }
       continue;
     }
     if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-      const rawPath = line.slice(4).split(/\t/)[0];
+      const rawPath = parseFileHeaderPath(line);
+      if (rawPath === null) throw new Error(`Malformed patch: invalid file header: ${line}`);
       const normalized = normalizePatchPath(rawPath);
       if (normalized) files.add(normalized);
     }
@@ -136,7 +238,15 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
     };
   }
 
-  const check = await runGitApply(["--check", "--whitespace=nowarn"], parsed.patch, context.workspacePath);
+  const timeoutSec = Math.max(1, Math.floor(context.commandTimeoutSec));
+  const check = await runGitApply(["--check", "--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec);
+  if (check.timedOut) {
+    return {
+      ok: false,
+      content: timeoutContent("git apply --check", timeoutSec),
+      metadata: timeoutMetadata(check, { changedFiles, checkOnly: parsed.checkOnly === true })
+    };
+  }
   if (check.exitCode !== 0) {
     return {
       ok: false,
@@ -145,7 +255,14 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
     };
   }
 
-  const numstat = await runGitApply(["--numstat"], parsed.patch, context.workspacePath);
+  const numstat = await runGitApply(["--numstat"], parsed.patch, context.workspacePath, timeoutSec);
+  if (numstat.timedOut) {
+    return {
+      ok: false,
+      content: timeoutContent("git apply --numstat", timeoutSec),
+      metadata: timeoutMetadata(numstat, { changedFiles, checkOnly: parsed.checkOnly === true })
+    };
+  }
   const stats = numstat.exitCode === 0 ? parseNumstat(numstat.stdout) : [];
 
   if (parsed.checkOnly === true) {
@@ -164,7 +281,14 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
   });
   if (denied) return denied;
 
-  const applied = await runGitApply(["--whitespace=nowarn"], parsed.patch, context.workspacePath);
+  const applied = await runGitApply(["--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec);
+  if (applied.timedOut) {
+    return {
+      ok: false,
+      content: timeoutContent("git apply", timeoutSec),
+      metadata: timeoutMetadata(applied, { changedFiles, stats })
+    };
+  }
   if (applied.exitCode !== 0) {
     return {
       ok: false,
@@ -182,4 +306,3 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
     metadata: { changedFiles, stats, checkOnly: false }
   };
 }
-

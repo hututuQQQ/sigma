@@ -5,6 +5,7 @@ import path from "node:path";
 import type { RegisteredTool, ToolExecutionContext, ToolRegistry, ToolResult, McpServerRunSummary } from "./types.js";
 import { requestToolPermission, resolveWorkspacePath } from "./policy.js";
 import { createToolRegistryFromTools } from "./tools/registry.js";
+import { redactSecretText } from "./redaction.js";
 
 type McpApprovalMode = "prompt" | "auto" | "approve";
 
@@ -323,7 +324,9 @@ export async function createMcpToolRegistry(
       }
       clients.push(client);
     } catch (error) {
-      summary.error = `${error instanceof Error ? error.message : String(error)}${client.stderrTail() ? `; stderr: ${client.stderrTail()}` : ""}`;
+      summary.error = redactSecretText(
+        `${error instanceof Error ? error.message : String(error)}${client.stderrTail() ? `; stderr: ${client.stderrTail()}` : ""}`
+      );
       await client.close();
     }
   }

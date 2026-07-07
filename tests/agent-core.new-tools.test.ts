@@ -40,6 +40,46 @@ function replacementPatch(file: string, before: string, after: string): string {
   ].join("\n");
 }
 
+function quotedReplacementPatch(file: string, before: string, after: string): string {
+  return [
+    `diff --git "a/${file}" "b/${file}"`,
+    `--- "a/${file}"`,
+    `+++ "b/${file}"`,
+    "@@ -1 +1 @@",
+    `-${before}`,
+    `+${after}`,
+    ""
+  ].join("\n");
+}
+
+async function installStallingGitOverride(dir: string): Promise<() => void> {
+  const fakeBin = path.join(dir, "fake-bin");
+  await mkdir(fakeBin, { recursive: true });
+  const stallScript = path.join(fakeBin, "stall-git.mjs");
+  await writeFile(
+    stallScript,
+    "process.stdout.write('fake git stdout\\n'); process.stderr.write('fake git stderr\\n'); setInterval(() => {}, 1000);\n",
+    "utf8"
+  );
+
+  const originalGitPath = process.env.AGENT_GIT_PATH;
+  const originalGitArgs = process.env.AGENT_GIT_ARGS;
+  process.env.AGENT_GIT_PATH = process.execPath;
+  process.env.AGENT_GIT_ARGS = JSON.stringify([stallScript]);
+  return () => {
+    if (originalGitPath === undefined) {
+      delete process.env.AGENT_GIT_PATH;
+    } else {
+      process.env.AGENT_GIT_PATH = originalGitPath;
+    }
+    if (originalGitArgs === undefined) {
+      delete process.env.AGENT_GIT_ARGS;
+    } else {
+      process.env.AGENT_GIT_ARGS = originalGitArgs;
+    }
+  };
+}
+
 describe("new core workspace tools", () => {
   it("lists workspace entries deterministically while skipping ignored directories", async () => {
     const { dir, context } = await workspace();
@@ -109,6 +149,55 @@ describe("new core workspace tools", () => {
     expect(applied.ok).toBe(true);
     expect((await readFile(path.join(dir, "a.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("new\n");
     expect([...context.runState.changedFiles]).toEqual(["a.txt"]);
+  });
+
+  it("applies quoted patches for files with spaces in their path", async () => {
+    const { dir, context } = await workspace();
+    await writeFile(path.join(dir, "foo bar.txt"), "old\n", "utf8");
+    const patch = quotedReplacementPatch("foo bar.txt", "old", "new");
+
+    const applied = await executeApplyPatchTool({ patch, expectedFiles: ["foo bar.txt"] }, context);
+    expect(applied.ok).toBe(true);
+    expect((await readFile(path.join(dir, "foo bar.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("new\n");
+    expect((applied.metadata as { changedFiles: string[] }).changedFiles).toEqual(["foo bar.txt"]);
+  });
+
+  it("validates quoted paths in check-only mode", async () => {
+    const { dir, context } = await workspace();
+    await writeFile(path.join(dir, "quoted path.txt"), "old\n", "utf8");
+    const patch = quotedReplacementPatch("quoted path.txt", "old", "new");
+
+    const check = await executeApplyPatchTool({ patch, checkOnly: true, expectedFiles: ["quoted path.txt"] }, context);
+    expect(check.ok).toBe(true);
+    expect((await readFile(path.join(dir, "quoted path.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("old\n");
+    expect((check.metadata as { changedFiles: string[]; checkOnly: boolean }).changedFiles).toEqual(["quoted path.txt"]);
+  });
+
+  it("rejects quoted traversal paths and malformed diff headers", async () => {
+    const { context } = await workspace();
+    await expect(
+      executeApplyPatchTool({ patch: quotedReplacementPatch("../outside.txt", "old", "new") }, context)
+    ).resolves.toMatchObject({ ok: false });
+    await expect(
+      executeApplyPatchTool({ patch: "diff --git \"a/missing-second.txt\"\n--- a/missing-second.txt\n" }, context)
+    ).resolves.toMatchObject({ ok: false });
+  });
+
+  it("times out stalled git apply subprocesses", async () => {
+    const { dir, context } = await workspace();
+    context.commandTimeoutSec = 1;
+    await writeFile(path.join(dir, "a.txt"), "old\n", "utf8");
+    const restorePath = await installStallingGitOverride(dir);
+    try {
+      const result = await executeApplyPatchTool({ patch: replacementPatch("a.txt", "old", "new") }, context);
+      expect(result.ok).toBe(false);
+      expect(result.content).toContain("timed out");
+      expect(result.metadata).toMatchObject({ timedOut: true, changedFiles: ["a.txt"] });
+      expect(result.metadata?.stdoutTail).toContain("fake git stdout");
+      expect(result.metadata?.stderrTail).toContain("fake git stderr");
+    } finally {
+      restorePath();
+    }
   });
 
   it("rejects unsafe, malformed, and unexpected patches", async () => {

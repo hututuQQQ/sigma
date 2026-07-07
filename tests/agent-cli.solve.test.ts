@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -218,6 +218,69 @@ describe("agent-cli solve", () => {
     expect(code).toBe(0);
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
     expect(summary.harness.attempts).toHaveLength(1);
+  });
+
+  it("prints enabled MCP server errors to stderr and preserves summary data", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-mcp-${Date.now()}`), { recursive: true });
+    const agentDir = path.join(dir, ".agent");
+    await mkdir(agentDir, { recursive: true });
+    const summaryPath = path.join(dir, "summary.json");
+    await writeFile(
+      path.join(agentDir, "mcp.json"),
+      `${JSON.stringify(
+        {
+          servers: {
+            local: {
+              command: process.execPath,
+              args: ["missing-mcp-server.mjs"],
+              startupTimeoutSec: 1
+            }
+          }
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+    const code = await runSolveCommand(
+      [
+        "--workspace",
+        dir,
+        "--instruction",
+        "finish immediately",
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--enable-mcp",
+        "--mcp-config",
+        ".agent/mcp.json",
+        "--summary-json",
+        summaryPath,
+        "--no-stream-ui"
+      ],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(stderr.text()).toContain("[sigma] mcp_error server=local error=");
+    expect(stdout.text()).toContain("status=completed");
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.mcp_servers).toEqual([
+      expect.objectContaining({
+        name: "local",
+        enabled: true,
+        tools_loaded: 0,
+        error: expect.any(String)
+      })
+    ]);
   });
 
   it("returns non-zero when harness validation fails", async () => {
