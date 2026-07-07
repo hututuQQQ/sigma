@@ -215,12 +215,10 @@ function asOptionalNonNegativeInt(value, name) {
   return parsed;
 }
 
-function asBoolean(value, fallback, name) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const text = String(value).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(text)) return true;
-  if (["0", "false", "no", "off"].includes(text)) return false;
-  throw new Error(`${name} must be a boolean-like value.`);
+function asValidationMode(value, fallback = "auto") {
+  const text = String(value ?? fallback).trim().toLowerCase();
+  if (text === "auto" || text === "off") return text;
+  throw new Error("AGENT_VALIDATION_MODE must be auto or off.");
 }
 
 export function resolveRunOptions(argv, env = process.env) {
@@ -260,15 +258,11 @@ export function resolveRunOptions(argv, env = process.env) {
       defaultPrecheckTimeoutSec,
       "AGENT_PRECHECK_TIMEOUT_SEC"
     ),
-    precheckRetryLimit: asOptionalNonNegativeInt(
-      env.AGENT_PRECHECK_RETRY_LIMIT,
-      "AGENT_PRECHECK_RETRY_LIMIT"
+    validationRetryLimit: asOptionalNonNegativeInt(
+      env.AGENT_VALIDATION_RETRY_LIMIT,
+      "AGENT_VALIDATION_RETRY_LIMIT"
     ),
-    genericValidationEnabled: asBoolean(
-      env.AGENT_GENERIC_VALIDATION,
-      true,
-      "AGENT_GENERIC_VALIDATION"
-    )
+    validationMode: asValidationMode(env.AGENT_VALIDATION_MODE, "auto")
   };
 }
 
@@ -384,32 +378,32 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     0,
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
-  const precheckRetryLimitWasProvided =
-    options.precheckRetryLimit !== undefined && options.precheckRetryLimit !== null && options.precheckRetryLimit !== "";
-  const requestedPrecheckRetryLimit = precheckRetryLimitWasProvided && Number.isFinite(Number(options.precheckRetryLimit))
-    ? Math.max(0, Math.ceil(Number(options.precheckRetryLimit)))
+  const validationRetryLimitWasProvided =
+    options.validationRetryLimit !== undefined && options.validationRetryLimit !== null && options.validationRetryLimit !== "";
+  const requestedValidationRetryLimit = validationRetryLimitWasProvided && Number.isFinite(Number(options.validationRetryLimit))
+    ? Math.max(0, Math.ceil(Number(options.validationRetryLimit)))
     : null;
-  const genericValidationEnabled = options.mode === "smoke" ? false : options.genericValidationEnabled !== false;
+  const validationMode = options.mode === "smoke" ? "off" : asValidationMode(options.validationMode, "auto");
+  const validationEnabled = validationMode === "auto";
   const defaultRetryLimit =
     options.mode === "smoke"
       ? 0
-      : genericValidationEnabled
+      : validationEnabled
         ? defaultPrecheckRetryLimit
         : 0;
-  const precheckRetryLimit = requestedPrecheckRetryLimit ?? defaultRetryLimit;
-  const validationOrPrecheckEnabled = genericValidationEnabled;
-  const precheckTimeoutSec = precheckRetryLimit > 0 || validationOrPrecheckEnabled
+  const validationRetryLimit = requestedValidationRetryLimit ?? defaultRetryLimit;
+  const precheckTimeoutSec = validationRetryLimit > 0 || validationEnabled
     ? Math.max(1, Math.ceil(asFinitePositiveNumber(options.precheckTimeoutSec) ?? defaultPrecheckTimeoutSec))
     : 0;
-  const retryBudgetSec = precheckRetryLimit * agentWallTimeSec;
+  const retryBudgetSec = validationRetryLimit * agentWallTimeSec;
   const precheckBudgetSec = precheckTimeoutSec > 0
-    ? (precheckRetryLimit + (validationOrPrecheckEnabled ? 1 : 0)) * precheckTimeoutSec
+    ? (validationRetryLimit + (validationEnabled ? 1 : 0)) * precheckTimeoutSec
     : 0;
   const cleanupGraceSec = graceSec;
-  const harborAgentTimeoutSec = agentWallTimeSec + retryBudgetSec + precheckBudgetSec + cleanupGraceSec;
+  const harnessTimeoutSec = agentWallTimeSec + retryBudgetSec + precheckBudgetSec + cleanupGraceSec;
   const agentTimeoutMultiplier =
-    harborAgentTimeoutSec > recommendedAgentTimeoutSec
-      ? formatMultiplier(harborAgentTimeoutSec / recommendedAgentTimeoutSec)
+    harnessTimeoutSec > recommendedAgentTimeoutSec
+      ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
 
   return {
@@ -418,12 +412,12 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     cleanup_grace_sec: cleanupGraceSec,
     retry_budget_sec: retryBudgetSec,
     precheck_timeout_sec: precheckTimeoutSec,
-    precheck_retry_limit: precheckRetryLimit,
+    validation_retry_limit: validationRetryLimit,
     precheck_budget_sec: precheckBudgetSec,
-    generic_validation_enabled: genericValidationEnabled,
+    validation_mode: validationMode,
     validation_timeout_sec: precheckTimeoutSec,
-    harbor_agent_timeout_sec: harborAgentTimeoutSec,
-    effective_harbor_agent_timeout_sec: harborAgentTimeoutSec,
+    harness_timeout_sec: harnessTimeoutSec,
+    effective_harness_timeout_sec: harnessTimeoutSec,
     leniency_multiplier: leniencyMultiplier,
     leniency_min_extra_sec: leniencyMinExtraSec,
     recommended_agent_timeout_sec: recommendedAgentTimeoutSec,
@@ -483,16 +477,16 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
   if (timeoutPlan?.agent_wall_time_sec) {
     agentKwargs.max_wall_time_sec = timeoutPlan.agent_wall_time_sec;
   }
-  if (timeoutPlan?.effective_harbor_agent_timeout_sec) {
-    agentKwargs.harbor_agent_timeout_sec = timeoutPlan.effective_harbor_agent_timeout_sec;
+  if (timeoutPlan?.effective_harness_timeout_sec) {
+    agentKwargs.harness_timeout_sec = timeoutPlan.effective_harness_timeout_sec;
   }
   if (timeoutPlan?.cleanup_grace_sec !== undefined) {
     agentKwargs.agent_timeout_grace_sec = timeoutPlan.cleanup_grace_sec;
   }
 
-  agentKwargs.generic_validation_enabled = timeoutPlan?.generic_validation_enabled ?? options.genericValidationEnabled !== false;
+  agentKwargs.validation_mode = timeoutPlan?.validation_mode ?? asValidationMode(options.validationMode, "auto");
   agentKwargs.validation_timeout_sec = timeoutPlan?.validation_timeout_sec ?? defaultPrecheckTimeoutSec;
-  agentKwargs.precheck_retry_limit = timeoutPlan?.precheck_retry_limit ?? defaultPrecheckRetryLimit;
+  agentKwargs.validation_retry_limit = timeoutPlan?.validation_retry_limit ?? defaultPrecheckRetryLimit;
   agentKwargs.precheck_timeout_sec = timeoutPlan?.precheck_timeout_sec ?? defaultPrecheckTimeoutSec;
   return agentKwargs;
 }
@@ -634,6 +628,11 @@ export function buildHarborArgs(options) {
   args.push("--ak", formatAgentKwarg("max_turns", "int", options.maxTurns, capabilities));
   args.push("--ak", formatAgentKwarg("command_timeout_sec", "int", options.commandTimeoutSec, capabilities));
   args.push("--ak", formatAgentKwarg("max_wall_time_sec", "int", timeoutPlan.agent_wall_time_sec, capabilities));
+  args.push("--ak", formatAgentKwarg("harness_timeout_sec", "int", timeoutPlan.effective_harness_timeout_sec, capabilities));
+  args.push("--ak", formatAgentKwarg("validation_mode", "str", timeoutPlan.validation_mode, capabilities));
+  args.push("--ak", formatAgentKwarg("validation_retry_limit", "int", timeoutPlan.validation_retry_limit, capabilities));
+  args.push("--ak", formatAgentKwarg("validation_timeout_sec", "int", timeoutPlan.validation_timeout_sec, capabilities));
+  args.push("--ak", formatAgentKwarg("precheck_timeout_sec", "int", timeoutPlan.precheck_timeout_sec, capabilities));
   return args;
 }
 
@@ -937,8 +936,8 @@ function collectFailureSignals(input = {}) {
     }
   }
 
-  if (harness.pre_verifier_cleanup?.warning) {
-    addSignal(signals, "pre_verifier_cleanup_warning");
+  if (harness.post_run_cleanup?.warning) {
+    addSignal(signals, "post_run_cleanup_warning");
   }
   const stoppedServices = [
     ...serviceCleanupStoppedFromSummary(summary),
@@ -1466,8 +1465,8 @@ export function formatMarkdownReport(report) {
     `- Agent wall time sec: ${report.timeout_plan?.agent_wall_time_sec ?? "unknown"}`,
     `- Retry budget sec: ${report.timeout_plan?.retry_budget_sec ?? "unknown"}`,
     `- Precheck timeout sec: ${report.timeout_plan?.precheck_timeout_sec ?? "unknown"}`,
-    `- Harbor agent timeout sec: ${report.timeout_plan?.harbor_agent_timeout_sec ?? "unknown"}`,
-    `- Effective Harbor agent timeout sec: ${report.timeout_plan?.effective_harbor_agent_timeout_sec ?? report.timeout_plan?.harbor_agent_timeout_sec ?? "unknown"}`,
+    `- Harness timeout sec: ${report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
+    `- Effective harness timeout sec: ${report.timeout_plan?.effective_harness_timeout_sec ?? report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
     `- Agent timeout multiplier: ${report.timeout_plan?.agent_timeout_multiplier ?? "none"}`,
     "",
     "## Counts",

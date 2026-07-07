@@ -1,3 +1,3 @@
 export { runAgentHarness } from "./runner.js";
 export { listWorkspaceManifest, changedWorkspaceFiles } from "./manifest.js";
-export { genericValidationCommandSpecs, summaryValidationCommands, validationCommandSpecs } from "./validation.js";
+export { explicitValidationCommandSpecs, genericValidationCommandSpecs, validationCommandSpecs } from "./validation.js";

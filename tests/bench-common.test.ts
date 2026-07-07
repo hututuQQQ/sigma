@@ -68,7 +68,17 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "command_timeout_sec:int=180",
       "--ak",
-      "max_wall_time_sec:int=7200"
+      "max_wall_time_sec:int=7200",
+      "--ak",
+      "harness_timeout_sec:int=14610",
+      "--ak",
+      "validation_mode:str=auto",
+      "--ak",
+      "validation_retry_limit:int=1",
+      "--ak",
+      "validation_timeout_sec:int=45",
+      "--ak",
+      "precheck_timeout_sec:int=45"
     ]);
   });
 
@@ -111,7 +121,17 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "command_timeout_sec=180",
       "--ak",
-      "max_wall_time_sec=7200"
+      "max_wall_time_sec=7200",
+      "--ak",
+      "harness_timeout_sec=14610",
+      "--ak",
+      "validation_mode=auto",
+      "--ak",
+      "validation_retry_limit=1",
+      "--ak",
+      "validation_timeout_sec=45",
+      "--ak",
+      "precheck_timeout_sec=45"
     ]);
   });
 
@@ -146,9 +166,9 @@ describe("Terminal-Bench command construction", () => {
       agent_wall_time_sec: 2700,
       retry_budget_sec: 2700,
       precheck_timeout_sec: 45,
-      precheck_retry_limit: 1,
-      harbor_agent_timeout_sec: 5610,
-      effective_harbor_agent_timeout_sec: 5610,
+      validation_retry_limit: 1,
+      harness_timeout_sec: 5610,
+      effective_harness_timeout_sec: 5610,
       agent_timeout_multiplier: "3.12",
       source: "harbor_task_metadata"
     });
@@ -182,8 +202,8 @@ describe("Terminal-Bench command construction", () => {
       agent_wall_time_sec: 9000,
       retry_budget_sec: 9000,
       precheck_timeout_sec: 45,
-      precheck_retry_limit: 1,
-      harbor_agent_timeout_sec: 18210,
+      validation_retry_limit: 1,
+      harness_timeout_sec: 18210,
       agent_timeout_multiplier: "3.04",
       leniency_multiplier: 1.5,
       leniency_min_extra_sec: 600
@@ -205,7 +225,7 @@ describe("Terminal-Bench command construction", () => {
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 6000,
       retry_budget_sec: 6000,
-      harbor_agent_timeout_sec: 12210,
+      harness_timeout_sec: 12210,
       agent_timeout_multiplier: "6.79",
       source: "explicit_max_wall_time"
     });
@@ -325,14 +345,14 @@ describe("Terminal-Bench command construction", () => {
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
       max_turns: 540,
       max_wall_time_sec: 2700,
-      harbor_agent_timeout_sec: 5610,
-      precheck_retry_limit: 1,
+      harness_timeout_sec: 5610,
+      validation_retry_limit: 1,
       precheck_timeout_sec: 45,
-      generic_validation_enabled: true,
+      validation_mode: "auto",
       validation_timeout_sec: 45
     });
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
-    expect(config.agents[0].kwargs.pre_verifier_cleanup_globs).toBeUndefined();
+    expect(config.agents[0].kwargs.post_run_cleanup_globs).toBeUndefined();
   });
 
   it("enables generic validation retry budget for ordinary Terminal-Bench tasks", () => {
@@ -359,30 +379,30 @@ describe("Terminal-Bench command construction", () => {
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 2700,
       retry_budget_sec: 2700,
-      precheck_retry_limit: 1,
+      validation_retry_limit: 1,
       precheck_timeout_sec: 45,
-      generic_validation_enabled: true
+      validation_mode: "auto"
     });
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
-      generic_validation_enabled: true,
+      validation_mode: "auto",
       validation_timeout_sec: 45,
-      precheck_retry_limit: 1,
+      validation_retry_limit: 1,
       precheck_timeout_sec: 45
     });
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
   });
 
-  it("keeps the default validation retry when precheckRetryLimit is unset or null", () => {
+  it("keeps the default validation retry when validationRetryLimit is unset or null", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
       tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
 
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe).precheck_retry_limit).toBe(1);
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: null }, timeoutProbe).precheck_retry_limit).toBe(1);
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, precheckRetryLimit: 0 }, timeoutProbe).precheck_retry_limit).toBe(0);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe).validation_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, validationRetryLimit: null }, timeoutProbe).validation_retry_limit).toBe(1);
+    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, validationRetryLimit: 0 }, timeoutProbe).validation_retry_limit).toBe(0);
   });
 
   it("preserves explicit max turns in resolved JobConfig", () => {
@@ -918,7 +938,7 @@ describe("benchmark report generation", () => {
         timeout_plan: {
           retry_budget_sec: 2700,
           precheck_timeout_sec: 45,
-          effective_harbor_agent_timeout_sec: 5610
+          effective_harness_timeout_sec: 5610
         }
       })}\n`,
       "utf8"
@@ -985,7 +1005,7 @@ describe("benchmark report generation", () => {
     );
     expect(report.tasks[0].failure_signals.some((signal) => signal.startsWith("missing_artifact:"))).toBe(false);
     expect(markdown).not.toContain("missing_artifact:");
-    expect(markdown).toContain("Effective Harbor agent timeout sec: 5610");
+    expect(markdown).toContain("Effective harness timeout sec: 5610");
   });
 
   it("reads harness validation, retry, and cleanup signals from summary JSON", async () => {
@@ -1029,7 +1049,7 @@ describe("benchmark report generation", () => {
             { action: "started", trigger: "validation" },
             { action: "skipped", trigger: "validation" }
           ],
-          pre_verifier_cleanup: { patterns: ["/tmp/cache*.tmp"], exit_code: 1, warning: "cleanup failed" }
+          post_run_cleanup: { patterns: ["/tmp/cache*.tmp"], exit_code: 1, warning: "cleanup failed" }
         }
       })}\n`,
       "utf8"
@@ -1042,7 +1062,7 @@ describe("benchmark report generation", () => {
         "validation_failed",
         "validation_retry_used",
         "retry_cut_short_by_budget",
-        "pre_verifier_cleanup_warning"
+        "post_run_cleanup_warning"
       ])
     );
   });

@@ -88,8 +88,7 @@ export function instructionWithRetryFeedback(options: {
         finish_reason: options.previousAttemptResult.finishReason,
         turns: options.previousAttemptResult.turns,
         commands_executed: options.previousAttemptResult.commandsExecuted,
-        last_error: options.previousAttemptResult.lastError,
-        validation_commands: options.previousAttemptSummary.validation_commands ?? []
+        last_error: options.previousAttemptResult.lastError
       },
       null,
       2

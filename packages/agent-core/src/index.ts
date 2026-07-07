@@ -33,7 +33,7 @@ export {
   executeListTool,
   executeReadTool,
   executeServiceTool,
-  cleanupServicesBeforeVerifier,
+  finalizeManagedServices,
   executeTodoTool,
   filterToolRegistry,
   matchesSimpleGlob,

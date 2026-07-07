@@ -30,7 +30,7 @@ const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
 const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
 const DEFAULT_PROJECT_DOC_MAX_BYTES = 32768;
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
-const COMPACTION_MARKER = "Previous agent conversation compacted by harness.";
+const COMPACTION_MARKER = "Previous agent conversation compacted by the run controller.";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -128,35 +128,6 @@ function compactMessagesIfNeeded(
   return [...protectedMessages, summary, ...tailMessages];
 }
 
-function validationCommandsFromValue(value: unknown): string[] {
-  if (!value || typeof value !== "object") return [];
-  const commands = (value as { validation_commands?: unknown; validationCommands?: unknown }).validation_commands ??
-    (value as { validation_commands?: unknown; validationCommands?: unknown }).validationCommands;
-  if (!Array.isArray(commands)) return [];
-  return commands.filter((command): command is string => typeof command === "string" && command.trim().length > 0);
-}
-
-function extractValidationCommands(finalMessage: string | undefined): string[] {
-  if (!finalMessage) return [];
-  const candidates = [finalMessage];
-  const fencedJson = /```(?:json)?\s*([\s\S]*?)```/gi;
-  for (let match = fencedJson.exec(finalMessage); match !== null; match = fencedJson.exec(finalMessage)) {
-    candidates.push(match[1]);
-  }
-
-  const commands: string[] = [];
-  for (const candidate of candidates) {
-    try {
-      for (const command of validationCommandsFromValue(JSON.parse(candidate))) {
-        if (!commands.includes(command)) commands.push(command);
-      }
-    } catch {
-      // Non-JSON final summaries are expected; the harness simply ignores them.
-    }
-  }
-  return commands;
-}
-
 async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegistry> {
   if (config.toolRegistry && config.toolRegistryFactory) {
     throw new Error("Configure either toolRegistry or toolRegistryFactory, not both.");
@@ -186,10 +157,6 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   };
   if (result.finalMessage) {
     summary.final_message = result.finalMessage;
-  }
-  const validationCommands = extractValidationCommands(result.finalMessage);
-  if (validationCommands.length > 0) {
-    summary.validation_commands = validationCommands;
   }
   if (result.toolsAvailable && result.toolsAvailable.length > 0) {
     summary.tools_available = result.toolsAvailable;

@@ -66,11 +66,12 @@ describe("agent-cli solve", () => {
       workspace: "work",
       provider: "deepseek",
       "validation-mode": "auto",
+      "validation-command": "npm test",
       "validation-retry-limit": "2",
       "validation-timeout-sec": "45",
       "precheck-command": "pytest",
       "precheck-timeout-sec": "30",
-      "pre-verifier-cleanup-globs": "/tmp/cache*.tmp,/tmp/other*.tmp",
+      "post-run-cleanup-globs": "/tmp/cache*.tmp,/tmp/other*.tmp",
       "harness-timeout-sec": "600",
       "retry-min-budget-sec": "90",
       "attempts-dir": "/tmp/agent/attempts"
@@ -78,11 +79,12 @@ describe("agent-cli solve", () => {
 
     expect(config).toMatchObject({
       validationMode: "auto",
+      validationCommands: ["npm test"],
       validationRetryLimit: 2,
       validationTimeoutSec: 45,
       precheckCommand: "pytest",
       precheckTimeoutSec: 30,
-      preVerifierCleanupGlobs: ["/tmp/cache*.tmp", "/tmp/other*.tmp"],
+      postRunCleanupGlobs: ["/tmp/cache*.tmp", "/tmp/other*.tmp"],
       harnessTimeoutSec: 600,
       retryMinBudgetSec: 90,
       attemptsDir: "/tmp/agent/attempts"

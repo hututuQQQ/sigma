@@ -114,7 +114,7 @@ const serviceTool: RegisteredTool = {
     function: {
       name: "service",
       description:
-        "Manage long-running background services. Use service.start for servers instead of bare '&', nohup, or setsid in bash. Services with a port or readinessCommand are kept for the verifier by default; set keepForVerifier=false only for temporary helpers.",
+        "Manage long-running background services. Use service.start for servers instead of bare '&', nohup, or setsid in bash. Services with a port or readinessCommand stay available after the run by default; set keepAliveAfterRun=false only for temporary helpers.",
       parameters: {
         type: "object",
         properties: {
@@ -125,7 +125,7 @@ const serviceTool: RegisteredTool = {
           port: { type: "number" },
           readinessCommand: { type: "string" },
           logPath: { type: "string" },
-          keepForVerifier: { type: "boolean" },
+          keepAliveAfterRun: { type: "boolean" },
           readinessTimeoutSec: { type: "number" },
           maxLogChars: { type: "number" }
         },

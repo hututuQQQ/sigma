@@ -11,10 +11,10 @@ import type {
 } from "../types.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "./manifest.js";
 import { retryBudgetDecision, retryTrigger, instructionWithRetryFeedback } from "./retry.js";
-import { runPreVerifierCleanup } from "./cleanup.js";
+import { runPostRunCleanup } from "./cleanup.js";
 import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } from "./summary.js";
 import { runHarnessCommand, validationCommandSpecs } from "./validation.js";
-import { cleanupServicesBeforeVerifier } from "../tools/service.js";
+import { finalizeManagedServices } from "../tools/service.js";
 import { redactSecrets } from "../redaction.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
@@ -52,8 +52,7 @@ function summaryFeedback(summary: SummaryJson): string {
       finish_reason: summary.finish_reason,
       turns: summary.turns,
       commands_executed: summary.commands_executed,
-      last_error: summary.last_error,
-      validation_commands: summary.validation_commands ?? []
+      last_error: summary.last_error
     },
     null,
     2
@@ -68,7 +67,7 @@ function harnessEnabled(config: AgentHarnessConfig): boolean {
   return (
     config.validationMode === "auto" ||
     Boolean(config.precheckCommand?.trim()) ||
-    (config.preVerifierCleanupGlobs?.length ?? 0) > 0 ||
+    (config.postRunCleanupGlobs?.length ?? 0) > 0 ||
     (config.validationRetryLimit ?? 0) > 0 ||
     Boolean(config.attemptsDir)
   );
@@ -88,7 +87,7 @@ async function runChecks(options: {
   if (options.config.validationMode === "auto") {
     const afterManifest = await listWorkspaceManifest(workspacePath);
     const changedFiles = options.beforeManifest ? changedWorkspaceFiles(options.beforeManifest, afterManifest) : [];
-    for (const spec of validationCommandSpecs(options.attemptSummary, changedFiles)) {
+    for (const spec of validationCommandSpecs(options.config.validationCommands ?? [], changedFiles)) {
       emitHarnessEvent(options.config, "harness_check_start", {
         kind: "validation",
         source: spec.source,
@@ -194,12 +193,6 @@ async function writeHarnessSummary(result: AgentRunResult, summaryJsonPath?: str
   if (!summaryJsonPath) return;
   const summary = summaryFromAttempt(result);
   summary.harness = result.harness;
-  if (result.harness) {
-    const validationCommands = result.harness.validation_results.map((item) => item.command);
-    if (validationCommands.length > 0) {
-      summary.validation_commands = [...new Set([...(summary.validation_commands ?? []), ...validationCommands])];
-    }
-  }
   const resolved = path.resolve(summaryJsonPath);
   await mkdir(path.dirname(resolved), { recursive: true });
   await writeFile(resolved, `${JSON.stringify(redactSecrets(summary), null, 2)}\n`, "utf8");
@@ -223,8 +216,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     validation_results: validationResults,
     precheck_results: precheckResults,
     retry_decisions: [],
-    service_cleanup: null,
-    pre_verifier_cleanup: null
+    managed_service_finalization: null,
+    post_run_cleanup: null
   };
 
   const retryLimit = Math.max(0, Math.floor(config.validationRetryLimit ?? 0));
@@ -306,8 +299,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     });
   }
 
-  harness.service_cleanup = await cleanupServicesBeforeVerifier();
-  harness.pre_verifier_cleanup = await runPreVerifierCleanup(config.preVerifierCleanupGlobs ?? []);
+  harness.managed_service_finalization = await finalizeManagedServices();
+  harness.post_run_cleanup = await runPostRunCleanup(config.postRunCleanupGlobs ?? []);
   const finalAttempt = attempts[attempts.length - 1];
   const finalResult = finalResultForHarness({
     attempts,

@@ -17,7 +17,7 @@ interface ServiceArgs {
   port?: unknown;
   readinessCommand?: unknown;
   logPath?: unknown;
-  keepForVerifier?: unknown;
+  keepAliveAfterRun?: unknown;
   readinessTimeoutSec?: unknown;
   maxLogChars?: unknown;
 }
@@ -30,7 +30,7 @@ export interface ServiceRecord {
   port?: number;
   readinessCommand?: string;
   logPath: string;
-  keepForVerifier: boolean;
+  keepAliveAfterRun: boolean;
   startedAt: string;
 }
 
@@ -86,8 +86,8 @@ function asOptionalBool(value: unknown): boolean | undefined {
   return undefined;
 }
 
-function defaultKeepForVerifier(args: ServiceArgs, port: number | undefined, readinessCommand: string | undefined): boolean {
-  const explicit = asOptionalBool(args.keepForVerifier);
+function defaultKeepAliveAfterRun(args: ServiceArgs, port: number | undefined, readinessCommand: string | undefined): boolean {
+  const explicit = asOptionalBool(args.keepAliveAfterRun);
   if (explicit !== undefined) return explicit;
   return port !== undefined || readinessCommand !== undefined;
 }
@@ -259,7 +259,7 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
     ...(port ? { port } : {}),
     ...(readinessCommand ? { readinessCommand } : {}),
     logPath,
-    keepForVerifier: defaultKeepForVerifier(args, port, readinessCommand),
+    keepAliveAfterRun: defaultKeepAliveAfterRun(args, port, readinessCommand),
     startedAt: new Date().toISOString()
   };
 
@@ -358,11 +358,11 @@ async function stopService(args: ServiceArgs, context: ToolExecutionContext): Pr
   };
 }
 
-export async function cleanupServicesBeforeVerifier(): Promise<ServiceCleanupResult> {
+export async function finalizeManagedServices(): Promise<ServiceCleanupResult> {
   const services = await readRegistry();
   const result: ServiceCleanupResult = { stopped: [], kept: [], missing: [], errors: [] };
   for (const service of services) {
-    if (service.keepForVerifier) {
+    if (service.keepAliveAfterRun) {
       result.kept.push(service.name);
       continue;
     }
@@ -374,7 +374,7 @@ export async function cleanupServicesBeforeVerifier(): Promise<ServiceCleanupRes
     }
   }
   const removed = new Set([...result.stopped, ...result.missing]);
-  await writeRegistry(services.filter((service) => service.keepForVerifier || !removed.has(service.name)));
+  await writeRegistry(services.filter((service) => service.keepAliveAfterRun || !removed.has(service.name)));
   return result;
 }
 

@@ -180,13 +180,13 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             context = SimpleNamespace(task_id="task-a")
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
-                generic_validation_enabled=True,
+                validation_mode="auto",
                 validation_timeout_sec=45,
                 precheck_command="pytest",
                 precheck_timeout_sec=30,
-                precheck_retry_limit=2,
-                pre_verifier_cleanup_globs="/tmp/cache*.tmp",
-                harbor_agent_timeout_sec=600,
+                validation_retry_limit=2,
+                post_run_cleanup_globs="/tmp/cache*.tmp",
+                harness_timeout_sec=600,
                 agent_timeout_grace_sec=15,
                 retry_min_budget_sec=90,
             )
@@ -201,7 +201,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--validation-timeout-sec 45", command)
             self.assertIn("--precheck-command pytest", command)
             self.assertIn("--precheck-timeout-sec 30", command)
-            self.assertIn("--pre-verifier-cleanup-globs '/tmp/cache*.tmp'", command)
+            self.assertIn("--post-run-cleanup-globs '/tmp/cache*.tmp'", command)
             self.assertIn("--harness-timeout-sec 600", command)
             self.assertIn("--retry-min-budget-sec 90", command)
             self.assertIn("--attempts-dir /tmp/agent/attempts", command)
@@ -245,7 +245,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--harness-timeout-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)
 
-    async def test_run_uses_validation_off_when_generic_validation_disabled(self):
+    async def test_run_uses_validation_off_by_default(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -306,7 +306,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     ],
                     "precheck_results": [],
                     "retry_decisions": [{"action": "skipped", "trigger": "validation"}],
-                    "pre_verifier_cleanup": {"patterns": ["/tmp/cache*.tmp"], "exit_code": 1, "warning": "cleanup failed"},
+                    "post_run_cleanup": {"patterns": ["/tmp/cache*.tmp"], "exit_code": 1, "warning": "cleanup failed"},
                 },
             }
 
@@ -352,10 +352,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     (Path(tmp) / "tasks" / "service-task" / "metadata.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(metadata["validation_results"][0]["command"], "python check.py")
-                self.assertEqual(metadata["pre_verifier_cleanup"]["warning"], "cleanup failed")
+                self.assertEqual(metadata["post_run_cleanup"]["warning"], "cleanup failed")
                 self.assertIn("validation_failed", metadata["failure_signals"])
                 self.assertIn("retry_cut_short_by_budget", metadata["failure_signals"])
-                self.assertIn("pre_verifier_cleanup_warning", metadata["failure_signals"])
+                self.assertIn("post_run_cleanup_warning", metadata["failure_signals"])
             finally:
                 if old_run_dir is None:
                     os.environ.pop("SIGMA_BENCH_RUN_DIR", None)

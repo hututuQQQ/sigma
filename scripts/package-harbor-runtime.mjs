@@ -39,7 +39,7 @@ function baseBenchmarkOptions(agentCliTarball) {
     model: "deepseek-v4-pro",
     maxTurns: 200,
     commandTimeoutSec: 180,
-    genericValidationEnabled: true,
+    validationMode: "auto",
     agentCliTarball,
     agentImportPath: portableAgentImportPath,
     env: {}

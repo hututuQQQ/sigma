@@ -58,9 +58,10 @@ async function resolveInstruction(
 function shouldUseHarness(cliConfig: ReturnType<typeof loadCliConfig>): boolean {
   return (
     cliConfig.validationMode === "auto" ||
+    cliConfig.validationCommands.length > 0 ||
     cliConfig.validationRetryLimit > 0 ||
     Boolean(cliConfig.precheckCommand?.trim()) ||
-    cliConfig.preVerifierCleanupGlobs.length > 0 ||
+    cliConfig.postRunCleanupGlobs.length > 0 ||
     Boolean(cliConfig.harnessTimeoutSec) ||
     Boolean(cliConfig.retryMinBudgetSec) ||
     Boolean(cliConfig.attemptsDir)
@@ -140,11 +141,12 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       ? await runAgentHarness({
           ...runConfig,
           validationMode: cliConfig.validationMode,
+          validationCommands: cliConfig.validationCommands,
           validationRetryLimit: cliConfig.validationRetryLimit,
           validationTimeoutSec: cliConfig.validationTimeoutSec,
           precheckCommand: cliConfig.precheckCommand,
           precheckTimeoutSec: cliConfig.precheckTimeoutSec,
-          preVerifierCleanupGlobs: cliConfig.preVerifierCleanupGlobs,
+          postRunCleanupGlobs: cliConfig.postRunCleanupGlobs,
           harnessTimeoutSec: cliConfig.harnessTimeoutSec,
           retryMinBudgetSec: cliConfig.retryMinBudgetSec,
           attemptsDir: cliConfig.attemptsDir
