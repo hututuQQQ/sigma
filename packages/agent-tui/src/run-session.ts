@@ -27,6 +27,10 @@ export interface RunSessionOptions {
   validationTimeoutSec?: number;
   precheckCommand?: string;
   precheckTimeoutSec?: number;
+  postRunCleanupGlobs?: string[];
+  harnessTimeoutSec?: number;
+  retryMinBudgetSec?: number;
+  attemptsDir?: string;
   allowedTools?: string[];
   disabledTools?: string[];
   contextMode?: ContextMode;
@@ -65,6 +69,10 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       validationTimeoutSec: options.validationTimeoutSec,
       precheckCommand: options.precheckCommand,
       precheckTimeoutSec: options.precheckTimeoutSec,
+      postRunCleanupGlobs: options.postRunCleanupGlobs,
+      harnessTimeoutSec: options.harnessTimeoutSec,
+      retryMinBudgetSec: options.retryMinBudgetSec,
+      attemptsDir: options.attemptsDir,
       allowedTools: options.allowedTools,
       disabledTools: options.disabledTools,
       contextMode: options.contextMode ?? "repo-map",

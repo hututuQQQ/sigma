@@ -40,6 +40,10 @@ export interface TuiAppOptions {
   validationTimeoutSec?: number;
   precheckCommand?: string;
   precheckTimeoutSec?: number;
+  postRunCleanupGlobs?: string[];
+  harnessTimeoutSec?: number;
+  retryMinBudgetSec?: number;
+  attemptsDir?: string;
   allowedTools?: string[];
   disabledTools?: string[];
   contextMode?: ContextMode;
@@ -319,6 +323,10 @@ class TuiApp {
         validationTimeoutSec: this.options.validationTimeoutSec,
         precheckCommand: this.options.precheckCommand,
         precheckTimeoutSec: this.options.precheckTimeoutSec,
+        postRunCleanupGlobs: this.options.postRunCleanupGlobs,
+        harnessTimeoutSec: this.options.harnessTimeoutSec,
+        retryMinBudgetSec: this.options.retryMinBudgetSec,
+        attemptsDir: this.options.attemptsDir,
         allowedTools: this.options.allowedTools,
         disabledTools: this.options.disabledTools,
         contextMode: this.options.contextMode,

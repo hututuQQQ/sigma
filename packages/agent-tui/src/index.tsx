@@ -31,6 +31,10 @@ Flags:
   --validation-timeout-sec <number>
   --precheck-command <command>
   --precheck-timeout-sec <number>
+  --post-run-cleanup-globs <comma-separated-globs>
+  --harness-timeout-sec <number>
+  --retry-min-budget-sec <number>
+  --attempts-dir <path>
   --allowed-tools <comma-separated-tools>
   --disabled-tools <comma-separated-tools>
   --context-mode <off|repo-map>
@@ -158,6 +162,10 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
     validationTimeoutSec: numberFlag(flags, "validation-timeout-sec"),
     precheckCommand: typeof flags.get("precheck-command") === "string" ? flags.get("precheck-command") as string : undefined,
     precheckTimeoutSec: numberFlag(flags, "precheck-timeout-sec"),
+    postRunCleanupGlobs: stringList(flags.get("post-run-cleanup-globs")),
+    harnessTimeoutSec: numberFlag(flags, "harness-timeout-sec"),
+    retryMinBudgetSec: numberFlag(flags, "retry-min-budget-sec"),
+    attemptsDir: typeof flags.get("attempts-dir") === "string" ? flags.get("attempts-dir") as string : undefined,
     allowedTools: stringList(flags.get("allowed-tools")),
     disabledTools: stringList(flags.get("disabled-tools")),
     contextMode: contextModeValue(flags.get("context-mode")),

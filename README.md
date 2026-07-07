@@ -70,6 +70,8 @@ pnpm --filter agent-tui start -- \
 
 Type a task and press Enter to start one run. TUI commands include `/help`, `/status`, `/tokens`, `/context`, `/test <command>`, `/exit`, `/clear`, `/model`, `/provider`, `/permission`, `/tools`, `/diff stat`, and `/diff patch`. The TUI uses the shared `agent-core` run path; it does not shell out to `agent chat` and does not import Harbor or Terminal-Bench scripts.
 
+Current UX boundary: `agent run` is the primary non-interactive path and `agent solve` remains a compatibility alias with the same flags. The interactive UI is still launched through the `agent-tui` binary; root `agent` does not auto-enter the TUI and `agent tui` is not implemented yet. Session index/resume/fork, shell completion, color polish, and multiline/autocomplete composer upgrades are future follow-ups.
+
 Programmatic product integrations should prefer the run-controller API names:
 
 ```ts

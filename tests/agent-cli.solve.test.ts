@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
@@ -46,6 +46,36 @@ class WriteInvalidJsModel implements ModelClient {
   }
 }
 
+class WriteThenFinalModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-cli-model";
+  private index = 0;
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    const responses: ModelResponse[] = [
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "write-file",
+              type: "function",
+              function: { name: "write", arguments: { path: "approval.txt", content: "approved\n", createDirs: true } }
+            }
+          ]
+        }
+      },
+      {
+        message: { role: "assistant", content: "done after approval" },
+        usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 }
+      }
+    ];
+    const response = responses[Math.min(this.index, responses.length - 1)];
+    this.index += 1;
+    return response;
+  }
+}
+
 class MemoryWritable extends Writable {
   readonly chunks: string[] = [];
   isTTY = true;
@@ -58,6 +88,12 @@ class MemoryWritable extends Writable {
   text(): string {
     return this.chunks.join("");
   }
+}
+
+function ttyReadable(input: string): NodeJS.ReadableStream & { isTTY?: boolean } {
+  const stream = Readable.from([input]) as NodeJS.ReadableStream & { isTTY?: boolean };
+  stream.isTTY = true;
+  return stream;
 }
 
 describe("agent-cli solve", () => {
@@ -216,6 +252,34 @@ describe("agent-cli solve", () => {
     expect(stdout.text()).not.toContain("status=completed");
   });
 
+  it("keeps JSON stdout pure when interactive approval is requested", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-json-approval-${Date.now()}`), { recursive: true });
+    const stdin = ttyReadable("n\n");
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+
+    const code = await runRunCommand(
+      ["write a file", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "ask", "--json"],
+      {
+        stdin,
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new WriteThenFinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    const stdoutText = stdout.text();
+    const stdoutLines = stdoutText.trim().split(/\r?\n/);
+    expect(stdoutLines).toHaveLength(1);
+    const parsed = JSON.parse(stdoutText) as { status?: string; finalMessage?: string };
+    expect(parsed).toMatchObject({ status: "completed", finalMessage: "done after approval" });
+    expect(stdoutText).not.toMatch(/Tool:|Risk:|Allow\?|\[sigma\]|status=completed/);
+    expect(stderr.text()).toContain("Tool: write");
+    expect(stderr.text()).toContain("Risk: write");
+    expect(stderr.text()).toContain("Allow?");
+  });
+
   it("prints valid JSONL events and a final result in stream-json mode", async () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-stream-json-${Date.now()}`), { recursive: true });
     const stdout = new MemoryWritable();
@@ -242,9 +306,55 @@ describe("agent-cli solve", () => {
 
     expect(code).toBe(0);
     expect(stderr.text()).toBe("");
-    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
+    const lines = stdout.text().trim().split(/\r?\n/);
+    const records = lines.map((line) => JSON.parse(line) as { type: string });
+    expect(records.length).toBeGreaterThan(0);
     expect(records.some((record) => record.type === "event")).toBe(true);
     expect(records[records.length - 1]).toMatchObject({ type: "result" });
+  });
+
+  it("keeps stream-json stdout pure while --stream-ui writes human lines to stderr", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-stream-json-ui-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+
+    const code = await runRunCommand(
+      [
+        "finish immediately",
+        "--workspace",
+        dir,
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--output-format",
+        "stream-json",
+        "--stream-ui"
+      ],
+      {
+        stdout,
+        stderr,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(0);
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
+    expect(records.length).toBeGreaterThan(0);
+    expect(records[records.length - 1]).toMatchObject({ type: "result" });
+    expect(stderr.text()).toContain("[sigma] run_start");
+  });
+
+  it("prints help for run and solve entrypoints", async () => {
+    const runStdout = new MemoryWritable();
+    await expect(runRunCommand(["--help"], { stdout: runStdout })).resolves.toBe(0);
+    expect(runStdout.text()).toContain("agent run [instruction] [flags]");
+    expect(runStdout.text()).toContain("Run the autonomous coding agent once.");
+
+    const solveStdout = new MemoryWritable();
+    await expect(runSolveCommand(["--help"], { stdout: solveStdout })).resolves.toBe(0);
+    expect(solveStdout.text()).toContain("agent solve [instruction] [flags]");
+    expect(solveStdout.text()).toContain("Compatibility alias for agent run.");
   });
 
   it("prints only the final message in quiet text mode", async () => {
