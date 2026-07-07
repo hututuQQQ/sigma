@@ -14,6 +14,16 @@ Commands:
   replay   Summarize a trace JSONL file
 
 Run "agent solve --instruction '...'" to start.
+
+Common solve flags:
+  --workspace <path>
+  --provider <deepseek|glm>
+  --permission-mode <ask|yolo>
+  --allowed-tools <comma-separated>
+  --disabled-tools <comma-separated>
+  --context-mode <off|repo-map>
+  --enable-mcp
+  --stream-ui / --no-stream-ui
 `);
 }
 

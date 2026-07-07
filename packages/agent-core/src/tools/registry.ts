@@ -1,10 +1,23 @@
 import type { ToolCall } from "agent-ai";
-import type { RegisteredTool, ToolExecutionContext, ToolRegistry, ToolResult } from "../types.js";
+import type {
+  RegisteredTool,
+  ToolExecutionContext,
+  ToolRegistry,
+  ToolRegistryFilter,
+  ToolRegistryOptions,
+  ToolResult
+} from "../types.js";
 import { executeBashTool } from "./bash.js";
 import { executeReadTool } from "./read.js";
 import { executeWriteTool } from "./write.js";
 import { executeEditTool } from "./edit.js";
 import { executeServiceTool } from "./service.js";
+import { executeListTool } from "./list.js";
+import { executeGlobTool } from "./glob.js";
+import { executeGrepTool } from "./grep.js";
+import { executeGitStatusTool, executeGitDiffTool } from "./git.js";
+import { executeApplyPatchTool } from "./apply-patch.js";
+import { executeTodoTool } from "./todo.js";
 
 const bashTool: RegisteredTool = {
   definition: {
@@ -24,7 +37,8 @@ const bashTool: RegisteredTool = {
       }
     }
   },
-  execute: executeBashTool
+  execute: executeBashTool,
+  risk: "execute"
 };
 
 const readTool: RegisteredTool = {
@@ -45,7 +59,8 @@ const readTool: RegisteredTool = {
       }
     }
   },
-  execute: executeReadTool
+  execute: executeReadTool,
+  risk: "read"
 };
 
 const writeTool: RegisteredTool = {
@@ -66,7 +81,8 @@ const writeTool: RegisteredTool = {
       }
     }
   },
-  execute: executeWriteTool
+  execute: executeWriteTool,
+  risk: "write"
 };
 
 const editTool: RegisteredTool = {
@@ -88,7 +104,8 @@ const editTool: RegisteredTool = {
       }
     }
   },
-  execute: executeEditTool
+  execute: executeEditTool,
+  risk: "write"
 };
 
 const serviceTool: RegisteredTool = {
@@ -117,23 +134,263 @@ const serviceTool: RegisteredTool = {
       }
     }
   },
-  execute: executeServiceTool
+  execute: executeServiceTool,
+  risk: "execute"
 };
 
-export function createDefaultToolRegistry(): ToolRegistry {
-  const tools = new Map<string, RegisteredTool>();
-  for (const tool of [bashTool, serviceTool, readTool, writeTool, editTool]) {
-    tools.set(tool.definition.function.name, tool);
+const listTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "list",
+      description: "List workspace files and directories safely with bounded depth.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          depth: { type: "number" },
+          includeHidden: { type: "boolean" },
+          maxEntries: { type: "number" }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeListTool,
+  risk: "read"
+};
+
+const globTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "glob",
+      description: "Find workspace files by simple glob patterns supporting *, **, and ?.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          cwd: { type: "string" },
+          maxMatches: { type: "number" }
+        },
+        required: ["pattern"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeGlobTool,
+  risk: "read"
+};
+
+const grepTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "grep",
+      description: "Search text files in the workspace and return matching snippets.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string" },
+          glob: { type: "string" },
+          caseSensitive: { type: "boolean" },
+          contextLines: { type: "number" },
+          maxMatches: { type: "number" }
+        },
+        required: ["pattern"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeGrepTool,
+  risk: "read"
+};
+
+const gitStatusTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "Show git status for the workspace without modifying files.",
+      parameters: {
+        type: "object",
+        properties: {
+          porcelain: { type: "boolean" },
+          maxOutputChars: { type: "number" }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeGitStatusTool,
+  risk: "read"
+};
+
+const gitDiffTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Show git diff for the workspace or one workspace-contained path.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          staged: { type: "boolean" },
+          maxOutputChars: { type: "number" }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeGitDiffTool,
+  risk: "read"
+};
+
+const applyPatchTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description: "Apply a safe unified diff patch to workspace-relative files.",
+      parameters: {
+        type: "object",
+        properties: {
+          patch: { type: "string" },
+          expectedFiles: { type: "array", items: { type: "string" } },
+          checkOnly: { type: "boolean" }
+        },
+        required: ["patch"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeApplyPatchTool,
+  risk: "write"
+};
+
+const todoTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "todo",
+      description: "Maintain a run-scoped task scratchpad for the agent.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "set", "add", "update", "clear"] },
+          items: { type: "array" },
+          text: { type: "string" },
+          id: { oneOf: [{ type: "string" }, { type: "number" }] },
+          status: { type: "string", enum: ["pending", "in_progress", "done", "blocked"] },
+          note: { type: "string" }
+        },
+        required: ["action"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeTodoTool,
+  risk: "read"
+};
+
+export function createToolRegistryFromTools(
+  registeredTools: RegisteredTool[],
+  options: ToolRegistryOptions = {}
+): ToolRegistry {
+  const toolMap = new Map<string, RegisteredTool>();
+  for (const tool of registeredTools) {
+    const name = tool.definition.function.name;
+    if (toolMap.has(name) && options.allowOverrides !== true) {
+      throw new Error(`Duplicate tool name: ${name}`);
+    }
+    toolMap.set(name, tool);
   }
 
   return {
-    definitions: Array.from(tools.values(), (tool) => tool.definition),
+    definitions: Array.from(toolMap.values(), (tool) => tool.definition),
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
-      const tool = tools.get(toolCall.function.name);
+      const tool = toolMap.get(toolCall.function.name);
       if (!tool) {
         return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
       }
       return await tool.execute(toolCall.function.arguments, context);
+    },
+    async close(): Promise<void> {
+      const closers = new Set<ToolRegistry["close"]>();
+      for (const tool of toolMap.values()) {
+        const registry = (tool as RegisteredTool & { registryClose?: ToolRegistry["close"] }).registryClose;
+        if (registry) closers.add(registry);
+      }
+      await Promise.all([...closers].map((close) => close?.()));
+    }
+  };
+}
+
+export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): ToolRegistry {
+  return createToolRegistryFromTools(
+    [
+      bashTool,
+      serviceTool,
+      readTool,
+      writeTool,
+      editTool,
+      listTool,
+      globTool,
+      grepTool,
+      gitStatusTool,
+      gitDiffTool,
+      applyPatchTool,
+      todoTool
+    ],
+    _options
+  );
+}
+
+export function mergeToolRegistries(registries: ToolRegistry[], options: ToolRegistryOptions = {}): ToolRegistry {
+  const definitionsByName = new Map<string, { registry: ToolRegistry; definition: ToolRegistry["definitions"][number] }>();
+  for (const registry of registries) {
+    for (const definition of registry.definitions) {
+      const name = definition.function.name;
+      if (definitionsByName.has(name) && options.allowOverrides !== true) {
+        throw new Error(`Duplicate tool name: ${name}`);
+      }
+      definitionsByName.set(name, { registry, definition });
+    }
+  }
+  return {
+    definitions: [...definitionsByName.values()].map((entry) => entry.definition),
+    async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
+      const entry = definitionsByName.get(toolCall.function.name);
+      if (!entry) return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
+      return await entry.registry.execute(toolCall, context);
+    },
+    async close(): Promise<void> {
+      await Promise.all(registries.map((registry) => registry.close?.()));
+    }
+  };
+}
+
+export function filterToolRegistry(registry: ToolRegistry, filter: ToolRegistryFilter): ToolRegistry {
+  const allowed = filter.allowedTools && filter.allowedTools.length > 0 ? new Set(filter.allowedTools) : null;
+  const disabled = new Set(filter.disabledTools ?? []);
+  const names = new Set(
+    registry.definitions
+      .map((definition) => definition.function.name)
+      .filter((name) => (allowed ? allowed.has(name) : true))
+      .filter((name) => !disabled.has(name))
+  );
+  return {
+    definitions: registry.definitions.filter((definition) => names.has(definition.function.name)),
+    async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
+      if (!names.has(toolCall.function.name)) {
+        return { ok: false, content: `Unknown or disabled tool: ${toolCall.function.name}` };
+      }
+      return await registry.execute(toolCall, context);
+    },
+    async close(): Promise<void> {
+      await registry.close?.();
     }
   };
 }

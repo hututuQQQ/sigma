@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderName } from "agent-ai";
-import type { AgentHarnessValidationMode, PermissionMode } from "agent-core";
+import type { AgentHarnessValidationMode, ContextMode, PermissionMode } from "agent-core";
 
 export interface ParsedArgs {
   flags: Record<string, string | boolean>;
@@ -33,6 +33,14 @@ export interface CliConfig {
   harnessTimeoutSec?: number;
   retryMinBudgetSec?: number;
   attemptsDir?: string;
+  allowedTools: string[];
+  disabledTools: string[];
+  noProjectInstructions: boolean;
+  projectDocMaxBytes: number;
+  contextMode: ContextMode;
+  repoMapMaxChars: number;
+  enableMcp: boolean;
+  mcpConfig?: string;
   noStreamUi: boolean;
 }
 
@@ -43,7 +51,10 @@ const DEFAULTS = {
   permissionMode: "ask" as PermissionMode,
   maxToolOutputChars: 12000,
   messageHistoryRetain: 24,
-  compactionSummaryChars: 30000
+  compactionSummaryChars: 30000,
+  projectDocMaxBytes: 32768,
+  contextMode: "repo-map" as ContextMode,
+  repoMapMaxChars: 20000
 };
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -137,6 +148,11 @@ function validationModeValue(value: unknown): AgentHarnessValidationMode {
   throw new Error(`Unsupported validation mode '${String(value)}'. Use off or auto.`);
 }
 
+function contextModeValue(value: unknown): ContextMode {
+  if (value === "off" || value === "repo-map") return value;
+  throw new Error(`Unsupported context mode '${String(value)}'. Use off or repo-map.`);
+}
+
 function stringListValue(value: unknown): string[] {
   if (typeof value !== "string") return [];
   return value.split(",").map((item) => item.trim()).filter(Boolean);
@@ -177,6 +193,13 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     process.env.AGENT_SESSION_JSONL ??
     stringValue(config.session_jsonl) ??
     path.join(workspace, ".agent", "session.jsonl");
+  const configuredNoStreamUi = boolValue(process.env.AGENT_NO_STREAM_UI ?? config.no_stream_ui, false);
+  const configuredStreamUi =
+    flags["stream-ui"] !== undefined
+      ? true
+      : flags["no-stream-ui"] !== undefined
+        ? false
+        : boolValue(process.env.AGENT_STREAM_UI ?? config.stream_ui, !configuredNoStreamUi);
 
   return {
     workspace,
@@ -267,6 +290,31 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       stringValue(flags["attempts-dir"]) ??
       process.env.AGENT_ATTEMPTS_DIR ??
       stringValue(config.attempts_dir),
-    noStreamUi: boolValue(flags["no-stream-ui"], false)
+    allowedTools: stringListValue(flags["allowed-tools"] ?? process.env.AGENT_ALLOWED_TOOLS ?? config.allowed_tools),
+    disabledTools: stringListValue(flags["disabled-tools"] ?? process.env.AGENT_DISABLED_TOOLS ?? config.disabled_tools),
+    noProjectInstructions: boolValue(
+      flags["no-project-instructions"] ?? process.env.AGENT_NO_PROJECT_INSTRUCTIONS ?? config.no_project_instructions,
+      false
+    ),
+    projectDocMaxBytes: numberValue(
+      flags["project-doc-max-bytes"] ?? process.env.AGENT_PROJECT_DOC_MAX_BYTES ?? config.project_doc_max_bytes,
+      DEFAULTS.projectDocMaxBytes
+    ),
+    contextMode: contextModeValue(
+      stringValue(flags["context-mode"]) ??
+        process.env.AGENT_CONTEXT_MODE ??
+        stringValue(config.context_mode) ??
+        DEFAULTS.contextMode
+    ),
+    repoMapMaxChars: numberValue(
+      flags["repo-map-max-chars"] ?? process.env.AGENT_REPO_MAP_MAX_CHARS ?? config.repo_map_max_chars,
+      DEFAULTS.repoMapMaxChars
+    ),
+    enableMcp: boolValue(flags["enable-mcp"] ?? process.env.AGENT_ENABLE_MCP ?? config.enable_mcp, false),
+    mcpConfig:
+      stringValue(flags["mcp-config"]) ??
+      process.env.AGENT_MCP_CONFIG ??
+      stringValue(config.mcp_config),
+    noStreamUi: !configuredStreamUi
   };
 }

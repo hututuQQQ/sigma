@@ -2,9 +2,20 @@ import { readFile } from "node:fs/promises";
 import { stdin as processStdin } from "node:process";
 import type { ModelClient, ProviderName, ProviderOptions } from "agent-ai";
 import { createModelClient } from "agent-ai";
-import { runAgent, runAgentHarness } from "agent-core";
+import {
+  AgentEventBus,
+  createDefaultToolRegistry,
+  createMcpToolRegistry,
+  mergeToolRegistries,
+  runAgent,
+  runAgentHarness,
+  type McpServerRunSummary,
+  type ToolRegistry
+} from "agent-core";
 import { loadCliConfig, parseArgs } from "../config.js";
 import { printRunResult } from "../output.js";
+import { createInteractivePermissionDecider } from "../permission.js";
+import { attachStreamUi } from "../stream-ui.js";
 
 export interface SolveCommandDeps {
   modelClientFactory?: (provider: ProviderName, options: ProviderOptions) => ModelClient;
@@ -55,14 +66,36 @@ function shouldUseHarness(cliConfig: ReturnType<typeof loadCliConfig>): boolean 
 }
 
 export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
+  const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
+  const stdin = deps.stdin ?? processStdin;
   const factory = deps.modelClientFactory ?? createModelClient;
+  let detachStreamUi: (() => void) | undefined;
 
   try {
     const { flags } = parseArgs(argv);
     const cliConfig = loadCliConfig(flags);
     const instruction = await resolveInstruction(flags, deps);
     const modelClient = factory(cliConfig.provider, { model: cliConfig.model });
+    const eventBus = new AgentEventBus();
+    detachStreamUi = cliConfig.noStreamUi ? undefined : attachStreamUi(eventBus, stderr);
+    const permissionDecider = cliConfig.permissionMode === "ask"
+      ? createInteractivePermissionDecider({
+          stdin,
+          stdout: stdout as NodeJS.WritableStream & { isTTY?: boolean },
+          stderr
+        })
+      : undefined;
+    let toolRegistry: ToolRegistry | undefined;
+    let mcpServers: McpServerRunSummary[] | undefined;
+    if (cliConfig.enableMcp) {
+      const mcp = await createMcpToolRegistry({
+        workspacePath: cliConfig.workspace,
+        configPath: cliConfig.mcpConfig
+      });
+      mcpServers = mcp.servers;
+      toolRegistry = mergeToolRegistries([createDefaultToolRegistry(), mcp.registry]);
+    }
 
     const runConfig = {
       instruction,
@@ -78,7 +111,17 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
       maxToolOutputChars: cliConfig.maxToolOutputChars,
       maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
       messageHistoryRetain: cliConfig.messageHistoryRetain,
-      compactionSummaryChars: cliConfig.compactionSummaryChars
+      compactionSummaryChars: cliConfig.compactionSummaryChars,
+      allowedTools: cliConfig.allowedTools,
+      disabledTools: cliConfig.disabledTools,
+      permissionDecider,
+      projectInstructionsEnabled: !cliConfig.noProjectInstructions,
+      projectDocMaxBytes: cliConfig.projectDocMaxBytes,
+      contextMode: cliConfig.contextMode,
+      repoMapMaxChars: cliConfig.repoMapMaxChars,
+      eventBus,
+      ...(toolRegistry ? { toolRegistry } : {}),
+      ...(mcpServers ? { mcpServers } : {})
     };
 
     const result = shouldUseHarness(cliConfig)
@@ -96,9 +139,11 @@ export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {
         })
       : await runAgent(runConfig);
 
-    printRunResult(result);
+    detachStreamUi?.();
+    printRunResult(result, stdout);
     return result.status === "error" ? 1 : 0;
   } catch (error) {
+    detachStreamUi?.();
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }

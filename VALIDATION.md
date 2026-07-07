@@ -1,45 +1,22 @@
 # Validation
 
-Date: 2026-07-06
+Date: 2026-07-07
 
 ## Commands Run
 
 | Command | Status |
 | --- | --- |
-| `pnpm install` | PASS |
 | `pnpm build` | PASS |
-| `pnpm test` | PASS: 45 Vitest tests and 16 Python Harbor tests |
+| `pnpm test` | PASS: Vitest suite and `python -m unittest tests.test_harbor_agent` |
 | `pnpm lint` | PASS |
-| `pnpm exec vitest run tests/bench-common.test.ts tests/agent-core.loop.test.ts` | PASS: 27 focused Vitest tests |
-| `python -m unittest tests.test_harbor_agent` | PASS: 16 Python Harbor tests |
-| `pnpm package:agent-cli` | PASS |
 | `pnpm smoke:local:fake` | PASS |
-| `tar -tzf .artifacts/agent-cli-linux-x64.tgz \| grep 'bin/agent'` | PASS via PowerShell `Select-String` |
-| `tar -tzf .artifacts/agent-cli-linux-x64.tgz \| grep 'bin/node'` | PASS via PowerShell `Select-String` |
-| Debian container with no system `node`: `/usr/local/bin/agent --help` | PASS |
-| `AGENT_PROVIDER=deepseek AGENT_MODEL=deepseek-v4-pro DEEPSEEK_API_KEY=... pnpm bench:tb:task -- --task-id <task-id>` | PASS setup/runtime startup in manual task-mode checks |
+| `node packages\agent-cli\dist\index.js --help` | PASS |
+| `node packages\agent-cli\dist\index.js doctor --workspace .` | PASS |
+| `node packages\agent-cli\dist\index.js replay --trace-jsonl .artifacts\smoke-local\create-file\trace.jsonl` | PASS |
 
-## Artifact
+## Smoke Tasks
 
-`pnpm package:agent-cli` created `.artifacts/agent-cli-linux-x64.tgz`.
-
-The tarball contains:
-
-- `agent-cli-linux-x64/bin/agent`
-- `agent-cli-linux-x64/bin/node`
-- `agent-cli-linux-x64/packages/agent-cli/dist/index.js`
-- `agent-cli-linux-x64/node_modules/agent-ai/`
-- `agent-cli-linux-x64/node_modules/agent-core/`
-
-The bundled Node runtime came from `.artifacts/cache/node-v22.16.0-linux-x64.tar.xz`. If that cache file is absent, set `NODE_RUNTIME_TARBALL` to a pre-downloaded Linux Node tarball before running `pnpm package:agent-cli`.
-
-## Container Startup
-
-Docker validation used `debian:bookworm-slim`, which had no `node` on PATH. The artifact was extracted to `/opt/agent-cli`, `/opt/agent-cli/bin/agent` was linked to `/usr/local/bin/agent`, `command -v node` still failed, and `/usr/local/bin/agent --help` printed the CLI help successfully through the bundled runtime.
-
-## Local Smoke Tasks
-
-Fake-provider smoke passed all tasks through `runAgent` and the normal workspace tools:
+`pnpm smoke:local:fake` passed all deterministic local tasks:
 
 | Task | Status |
 | --- | --- |
@@ -50,13 +27,25 @@ Fake-provider smoke passed all tasks through `runAgent` and the normal workspace
 
 Artifacts were written under `.artifacts/smoke-local/`.
 
-## Harness Validation Loop
+## Feature Coverage
 
-The Harbor adapter now supports a generic `agent run -> harness validation -> optional retry -> official verifier` loop for Terminal-Bench runs. It records `/app` manifests around each agent attempt, executes summary-declared `validation_commands`, falls back to syntax checks for changed `.py`, `.sh`, and `.js` files, and short-runs changed `check_*`, `verify_*`, `validate_*`, and `test_*` scripts. Failure feedback includes the validation command, exit code, stdout/stderr tails, related files, prior summary, and trace tail.
+This validation covers:
 
-The report classifier now treats `max_wall_time_sec` as configuration text, not a timeout signal, and extracts verifier errors such as `ModuleNotFoundError: No module named 'cryptography'` as `missing_python_module:cryptography`.
+- Extensible tool registry injection, merging, filtering, and duplicate-name rejection.
+- New tools: `list`, `glob`, `grep`, `git_status`, `git_diff`, `apply_patch`, and `todo`.
+- Permission decider behavior for `ask`, `yolo`, denial, allow, and per-run `always_allow`.
+- Project instruction loading from AGENTS/SIGMA-style files.
+- Deterministic repo-map prompt context.
+- Live stderr stream UI and `--no-stream-ui`.
+- CLI config flags/env/config plumbing for tools, context, MCP, and stream UI.
+- Stdio MCP v0 with fake server lifecycle, tool listing, tool calls, timeouts, filtering, disabled servers, and approval policy.
+- Summary JSON optional fields for tools, changed files, todos, project instruction sources, context mode, repo-map size, and MCP servers.
+- Secret redaction for traces, summaries, stream UI, final output, and approval prompts.
+- Existing Harbor unit tests and fake-provider smoke tasks.
 
 ## Known Limitations
 
-- The generic harness validation loop has unit coverage but has not yet been re-run manually against a live selected task after this change.
-- The package script intentionally does not download Node on demand. It uses `NODE_RUNTIME_TARBALL` or the documented `.artifacts/cache/` file and fails clearly when neither exists.
+- MCP v0 supports local stdio servers only; HTTP/OAuth MCP is future work.
+- Repo maps are static, deterministic context blocks. They do not use embeddings or a vector database.
+- Stream UI is event-based and does not require provider token streaming. Provider SSE streaming remains optional future work.
+- Config TOML parsing remains intentionally minimal: top-level scalar values and comma-separated list strings.

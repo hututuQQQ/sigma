@@ -1,12 +1,12 @@
-# Sigma Agent MVP
+# Sigma Agent Runtime
 
-A small coding-agent monorepo inspired by Pi with only three layers:
+A small coding-agent monorepo inspired by Pi with three layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
-- `packages/agent-core`: autonomous loop, benchmark harness, JSONL tracing, session records, and workspace tools
+- `packages/agent-core`: autonomous loop, extensible tool registry, repo-aware context, benchmark harness, JSONL tracing, session records, MCP bridge, and workspace tools
 - `packages/agent-cli`: plain terminal CLI with `solve`, `chat`, `doctor`, and `replay`
 
-There is intentionally no TUI, MCP, sub-agent system, web UI, plugin marketplace, long-term memory, or complex sandboxing.
+Sigma keeps the CLI and harness portable while adding repo instructions, deterministic repo maps, live stderr progress, approval-gated mutating tools, and stdio MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
 
 ## Install And Build
 
@@ -209,6 +209,15 @@ Current limitations:
 --harness-timeout-sec <number>
 --retry-min-budget-sec <number>
 --attempts-dir <path>
+--allowed-tools <comma-separated-tools>
+--disabled-tools <comma-separated-tools>
+--no-project-instructions
+--project-doc-max-bytes <number>
+--context-mode <off|repo-map>
+--repo-map-max-chars <number>
+--enable-mcp
+--mcp-config <path>
+--stream-ui
 --no-stream-ui
 ```
 
@@ -216,16 +225,114 @@ Config precedence is CLI flags, environment variables, `.agent/config.toml`, `~/
 
 Local `agent solve` defaults to `--validation-mode off`. Benchmark runners pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those harness behaviors are wanted.
 
-## Tools
+Environment variables mirror the new flags:
 
-The core loop exposes four tools to the model:
+```text
+AGENT_ALLOWED_TOOLS
+AGENT_DISABLED_TOOLS
+AGENT_NO_PROJECT_INSTRUCTIONS
+AGENT_PROJECT_DOC_MAX_BYTES
+AGENT_CONTEXT_MODE
+AGENT_REPO_MAP_MAX_CHARS
+AGENT_ENABLE_MCP
+AGENT_MCP_CONFIG
+AGENT_STREAM_UI
+AGENT_NO_STREAM_UI
+```
 
-- `bash`: runs `bash -lc` in the workspace, captures stdout/stderr/exit code/duration, times out safely, and truncates large output with a head/tail strategy.
+`agent solve` prints live progress to stderr by default and keeps the final status summary on stdout. Use `--no-stream-ui` for quiet machine-driven runs. `scripts/smoke-local.mjs` already passes `--no-stream-ui` for real CLI smoke tasks.
+
+## Tools And Permissions
+
+The default tool registry is extensible and can be injected, merged, filtered, or configured with `--allowed-tools` and `--disabled-tools`. Tool names must be unique; duplicate names fail clearly unless an internal override path is used.
+
+The core loop exposes these default tools:
+
+- `bash`: runs `bash -lc` in the workspace, captures stdout/stderr/exit code/duration, times out safely, and truncates large output with a head/tail strategy. Commands that look mutating require approval in `ask`.
+- `service`: starts, inspects, logs, and stops long-running services. Default logs are workspace-contained under `.agent/services/`.
 - `read`: reads workspace files with optional offset and limit; binary files return metadata instead of raw bytes.
 - `write`: writes UTF-8 files inside the workspace.
 - `edit`: exact string replacement with optional `expectedReplacements`.
+- `list`: lists workspace files/directories with `path`, `depth`, `includeHidden`, and `maxEntries`.
+- `glob`: finds files with simple `*`, `**`, and `?` patterns.
+- `grep`: searches text files, preferring `rg` when available and falling back to Node.
+- `git_status`: read-only `git status`.
+- `git_diff`: read-only `git diff` or `git diff --staged`.
+- `apply_patch`: validates and applies safe unified diffs to workspace-relative files.
+- `todo`: maintains run-scoped todo state for the agent.
 
-Paths are resolved relative to the workspace and rejected if they escape it. In non-interactive `ask` mode, mutating tools are rejected with a clear error. Benchmarks should use `--permission-mode yolo`.
+Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and remains the expected mode for automated benchmarks.
+
+Interactive approval prompt:
+
+```text
+Tool: apply_patch
+Risk: write
+Summary: Apply patch to src/index.ts
+Allow? [y]es / [n]o / [a]lways for this tool
+```
+
+## Project Context
+
+Project instructions are loaded by default before the user task. Sigma checks these files with same-directory precedence:
+
+```text
+AGENTS.override.md
+AGENTS.md
+SIGMA.md
+.agent/instructions.md
+```
+
+The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
+
+Local `agent solve` defaults to `--context-mode repo-map`. The repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+
+## MCP V0
+
+Sigma can load tools from local stdio MCP servers when `--enable-mcp` is set. HTTP/OAuth MCP support is future work.
+
+Default config path:
+
+```text
+.agent/mcp.json
+```
+
+Custom config:
+
+```bash
+pnpm --filter agent-cli start -- solve \
+  --workspace . \
+  --instruction "Use the local MCP echo tool" \
+  --provider deepseek \
+  --enable-mcp \
+  --mcp-config .agent/mcp.json
+```
+
+Example `.agent/mcp.json`:
+
+```json
+{
+  "servers": {
+    "local": {
+      "command": "node",
+      "args": [".agent/servers/echo.mjs"],
+      "env": { "EXAMPLE": "value" },
+      "enabled": true,
+      "startupTimeoutSec": 10,
+      "toolTimeoutSec": 60,
+      "enabledTools": ["echo"],
+      "disabledTools": [],
+      "approvalMode": "prompt"
+    }
+  }
+}
+```
+
+MCP tool names are exposed as `mcp_<server>_<tool>` after sanitization, for example `mcp_local_echo`. `approvalMode` can be:
+
+- `prompt`: ask in `permission-mode ask`.
+- `approve`: allow configured tools.
+- `auto`: allow only tools with MCP `annotations.readOnlyHint`; otherwise ask or deny based on permission mode.
 
 ## Summary JSON
 
@@ -247,6 +354,25 @@ Paths are resolved relative to the workspace and rejected if they escape it. In 
   "duration_ms": 123456,
   "last_error": null,
   "validation_commands": ["python check_cert.py"],
+  "tools_available": ["bash", "read", "write"],
+  "changed_files": ["src/index.ts"],
+  "todo_items": [
+    {
+      "id": "1",
+      "text": "Run validation",
+      "status": "done"
+    }
+  ],
+  "project_instruction_sources": ["AGENTS.md"],
+  "context_mode": "repo-map",
+  "repo_map_chars": 14200,
+  "mcp_servers": [
+    {
+      "name": "local",
+      "enabled": true,
+      "tools_loaded": 1
+    }
+  ],
   "harness": {
     "attempts": [
       {
@@ -266,6 +392,8 @@ Paths are resolved relative to the workspace and rejected if they escape it. In 
 ```
 
 When the harness performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory.
+
+The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers.
 
 ## Harbor And Terminal-Bench 2.0
 
@@ -320,9 +448,9 @@ grep -R "sigma_harbor_agent:SigmaCliHarborAgent" .artifacts/harbor-runtime/jobco
 
 The adapter forwards `DEEPSEEK_API_KEY`, `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`, `DEEPSEEK_BASE_URL`, `GLM_BASE_URL`, and `ZAI_BASE_URL` into the task container.
 
-## TODOs And MVP Limits
+## Current Limits
 
-- Streaming is not implemented yet; non-streaming chat completions are the supported path.
 - Config TOML parsing supports simple top-level scalar keys only.
+- MCP v0 supports local stdio servers only.
+- Repo maps are deterministic static context, not embeddings or a vector database.
 - The bundled Harbor artifact contains a Linux Node runtime when `NODE_RUNTIME_TARBALL` or the documented cache file is available at package time.
-- Permission mode `ask` is non-interactive and conservative; it rejects mutating tools instead of prompting.

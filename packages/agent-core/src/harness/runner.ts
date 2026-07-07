@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { runAgent } from "../agent.js";
 import type {
   AgentHarnessConfig,
@@ -14,9 +15,26 @@ import { runPreVerifierCleanup } from "./cleanup.js";
 import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } from "./summary.js";
 import { runHarnessCommand, validationCommandSpecs } from "./validation.js";
 import { cleanupServicesBeforeVerifier } from "../tools/service.js";
+import { redactSecrets } from "../redaction.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
 const DEFAULT_PRECHECK_TIMEOUT_SEC = 60;
+
+function emitHarnessEvent(
+  config: AgentHarnessConfig,
+  type: "harness_check_start" | "harness_check_end",
+  metadata: Record<string, unknown>
+): void {
+  config.eventBus?.emit(redactSecrets({
+    id: randomUUID(),
+    timestamp: new Date().toISOString(),
+    type,
+    runId: "harness",
+    provider: config.modelClient.provider,
+    model: config.modelClient.model,
+    metadata
+  }));
+}
 
 async function readTraceTail(tracePath: string, maxBytes = 16000): Promise<string> {
   try {
@@ -71,32 +89,56 @@ async function runChecks(options: {
     const afterManifest = await listWorkspaceManifest(workspacePath);
     const changedFiles = options.beforeManifest ? changedWorkspaceFiles(options.beforeManifest, afterManifest) : [];
     for (const spec of validationCommandSpecs(options.attemptSummary, changedFiles)) {
-      results.push(
-        await runHarnessCommand({
-          kind: "validation",
-          source: spec.source,
-          command: spec.command,
-          workspacePath,
-          attempt: options.attempt,
-          timeoutSec: validationTimeoutSec,
-          relatedFiles: spec.relatedFiles
-        })
-      );
+      emitHarnessEvent(options.config, "harness_check_start", {
+        kind: "validation",
+        source: spec.source,
+        attempt: options.attempt,
+        command: spec.command
+      });
+      const result = await runHarnessCommand({
+        kind: "validation",
+        source: spec.source,
+        command: spec.command,
+        workspacePath,
+        attempt: options.attempt,
+        timeoutSec: validationTimeoutSec,
+        relatedFiles: spec.relatedFiles
+      });
+      emitHarnessEvent(options.config, "harness_check_end", {
+        kind: "validation",
+        source: spec.source,
+        attempt: options.attempt,
+        exitCode: result.exit_code,
+        durationMs: result.duration_ms
+      });
+      results.push(result);
     }
   }
 
   if (options.config.precheckCommand?.trim()) {
-    results.push(
-      await runHarnessCommand({
-        kind: "precheck",
-        source: "precheck",
-        command: options.config.precheckCommand,
-        workspacePath,
-        attempt: options.attempt,
-        timeoutSec: options.config.precheckTimeoutSec ?? DEFAULT_PRECHECK_TIMEOUT_SEC,
-        relatedFiles: []
-      })
-    );
+    emitHarnessEvent(options.config, "harness_check_start", {
+      kind: "precheck",
+      source: "precheck",
+      attempt: options.attempt,
+      command: options.config.precheckCommand
+    });
+    const result = await runHarnessCommand({
+      kind: "precheck",
+      source: "precheck",
+      command: options.config.precheckCommand,
+      workspacePath,
+      attempt: options.attempt,
+      timeoutSec: options.config.precheckTimeoutSec ?? DEFAULT_PRECHECK_TIMEOUT_SEC,
+      relatedFiles: []
+    });
+    emitHarnessEvent(options.config, "harness_check_end", {
+      kind: "precheck",
+      source: "precheck",
+      attempt: options.attempt,
+      exitCode: result.exit_code,
+      durationMs: result.duration_ms
+    });
+    results.push(result);
   }
 
   const traceTail = await readTraceTail(options.attemptTracePath);
@@ -137,7 +179,14 @@ function finalResultForHarness(options: {
     durationMs: aggregate.durationMs,
     lastError: options.failureMessage ?? options.finalAttempt.lastError,
     finalMessage: options.finalAttempt.finalMessage,
-    harness: options.harness
+    harness: options.harness,
+    toolsAvailable: options.finalAttempt.toolsAvailable,
+    changedFiles: options.finalAttempt.changedFiles,
+    todoItems: options.finalAttempt.todoItems,
+    projectInstructionSources: options.finalAttempt.projectInstructionSources,
+    contextMode: options.finalAttempt.contextMode,
+    repoMapChars: options.finalAttempt.repoMapChars,
+    mcpServers: options.finalAttempt.mcpServers
   };
 }
 
@@ -153,7 +202,7 @@ async function writeHarnessSummary(result: AgentRunResult, summaryJsonPath?: str
   }
   const resolved = path.resolve(summaryJsonPath);
   await mkdir(path.dirname(resolved), { recursive: true });
-  await writeFile(resolved, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+  await writeFile(resolved, `${JSON.stringify(redactSecrets(summary), null, 2)}\n`, "utf8");
 }
 
 export async function runAgentHarness(config: AgentHarnessConfig): Promise<AgentRunResult> {

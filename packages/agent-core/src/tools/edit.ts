@@ -1,7 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
-import { resolveWorkspacePath } from "../policy.js";
+import { requestToolPermission, resolveWorkspacePath, workspaceRelativePath } from "../policy.js";
 
 interface EditArgs {
   path?: unknown;
@@ -23,13 +22,6 @@ function countOccurrences(source: string, needle: string): number {
 }
 
 export async function executeEditTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
-  if (context.permissionMode !== "yolo") {
-    return {
-      ok: false,
-      content: "Permission mode 'ask' is non-interactive in this MVP; edit is rejected."
-    };
-  }
-
   const parsed = (args && typeof args === "object" ? args : {}) as EditArgs;
   if (typeof parsed.path !== "string" || parsed.path.length === 0) {
     return { ok: false, content: "edit requires a path string" };
@@ -47,6 +39,15 @@ export async function executeEditTool(args: unknown, context: ToolExecutionConte
   } catch (error) {
     return { ok: false, content: error instanceof Error ? error.message : String(error) };
   }
+  const relativePath = workspaceRelativePath(context.workspacePath, filePath);
+
+  const denied = await requestToolPermission(context, {
+    toolName: "edit",
+    arguments: args,
+    risk: "write",
+    reason: `Replace text in ${relativePath}`
+  });
+  if (denied) return denied;
 
   try {
     const original = await readFile(filePath, "utf8");
@@ -72,10 +73,11 @@ export async function executeEditTool(args: unknown, context: ToolExecutionConte
 
     const updated = original.split(parsed.oldString).join(parsed.newString);
     await writeFile(filePath, updated, "utf8");
+    context.runState.changedFiles.add(relativePath);
     return {
       ok: true,
-      content: `Edited ${path.relative(context.workspacePath, filePath)} (${replacements} replacement(s))`,
-      metadata: { path: filePath, replacements }
+      content: `Edited ${relativePath} (${replacements} replacement(s))`,
+      metadata: { path: filePath, relativePath, replacements }
     };
   } catch (error) {
     return { ok: false, content: error instanceof Error ? error.message : String(error) };

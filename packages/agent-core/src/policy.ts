@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { PermissionRequest, ToolExecutionContext, ToolResult, ToolRisk } from "./types.js";
 
 export function isPathInside(parentPath: string, candidatePath: string): boolean {
   const parent = path.resolve(parentPath);
@@ -30,4 +31,38 @@ export function isProbablyMutatingCommand(command: string): boolean {
     />\s*[^&]|\btee\b|\bsed\s+-i\b/
   ];
   return patterns.some((pattern) => pattern.test(command));
+}
+
+export function permissionDeniedResult(toolName: string, risk: ToolRisk): ToolResult {
+  return {
+    ok: false,
+    content: `Permission denied for ${toolName} (${risk}). Mutating or risky tools require yolo mode or explicit approval.`
+  };
+}
+
+export async function requestToolPermission(
+  context: ToolExecutionContext,
+  request: Omit<PermissionRequest, "workspacePath">
+): Promise<ToolResult | null> {
+  if (request.risk === "read") return null;
+  if (context.permissionMode === "yolo") return null;
+  if (context.alwaysAllowTools.has(request.toolName)) return null;
+  if (!context.permissionDecider) {
+    return permissionDeniedResult(request.toolName, request.risk);
+  }
+
+  const decision = await context.permissionDecider.decide({
+    ...request,
+    workspacePath: context.workspacePath
+  });
+  if (decision === "allow") return null;
+  if (decision === "always_allow") {
+    context.alwaysAllowTools.add(request.toolName);
+    return null;
+  }
+  return permissionDeniedResult(request.toolName, request.risk);
+}
+
+export function workspaceRelativePath(workspacePath: string, candidatePath: string): string {
+  return path.relative(path.resolve(workspacePath), path.resolve(candidatePath)).split(path.sep).join("/");
 }

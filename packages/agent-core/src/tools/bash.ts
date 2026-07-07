@@ -1,6 +1,6 @@
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { truncateMiddle } from "../compaction.js";
-import { isProbablyMutatingCommand, resolveWorkspacePath } from "../policy.js";
+import { isProbablyMutatingCommand, requestToolPermission, resolveWorkspacePath } from "../policy.js";
 import { runBashCommand } from "../command-runner.js";
 
 interface BashArgs {
@@ -30,11 +30,14 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
     return { ok: false, content: "bash requires a non-empty command string" };
   }
 
-  if (context.permissionMode === "ask" && isProbablyMutatingCommand(command)) {
-    return {
-      ok: false,
-      content: "Permission mode 'ask' is non-interactive in this MVP; mutating bash commands are rejected."
-    };
+  if (isProbablyMutatingCommand(command)) {
+    const denied = await requestToolPermission(context, {
+      toolName: "bash",
+      arguments: args,
+      risk: "execute",
+      reason: `Command appears to mutate files, install packages, change git state, or execute arbitrary code: ${command}`
+    });
+    if (denied) return denied;
   }
 
   let cwd: string;
