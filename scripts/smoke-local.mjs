@@ -8,7 +8,7 @@ import { runAgent } from "../packages/agent-core/dist/index.js";
 import { SmokeFakeModel } from "./smoke-fake-model.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tasksDir = path.join(rootDir, "examples", "smoke-tasks");
+const tasksDir = path.join(rootDir, "test-fixtures", "smoke-tasks");
 const artifactsRoot = path.join(rootDir, ".artifacts", "smoke-local");
 const taskNames = ["create-file", "edit-file", "fix-test", "inspect-and-summarize"];
 
