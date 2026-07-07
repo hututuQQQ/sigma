@@ -13,7 +13,12 @@ import {
   fileMentionSuggestions,
   insertFileMention
 } from "../packages/agent-tui/src/file-mentions.js";
-import { resolveLocalWorkspaceInput } from "../packages/agent-tui/src/workspace-command.js";
+import {
+  listWorkspaceEntries,
+  resolveLocalTerminalInput,
+  resolveLocalWorkspaceInput,
+  SHELL_COMMAND_HINT
+} from "../packages/agent-tui/src/workspace-command.js";
 
 describe("agent-tui commands and mention palettes", () => {
   it("resolves aliases to canonical commands", () => {
@@ -74,6 +79,37 @@ describe("agent-tui commands and mention palettes", () => {
         ok: true,
         workspace: child
       });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies common terminal commands before model submission", () => {
+    expect(resolveLocalTerminalInput("pwd")).toMatchObject({ handled: true, action: "pwd" });
+    expect(resolveLocalTerminalInput("ls")).toMatchObject({ handled: true, action: "list" });
+    expect(resolveLocalTerminalInput("dir")).toMatchObject({ handled: true, action: "list" });
+    expect(resolveLocalTerminalInput("clear")).toMatchObject({ handled: true, action: "clear" });
+    expect(resolveLocalTerminalInput("cls")).toMatchObject({ handled: true, action: "clear" });
+    expect(resolveLocalTerminalInput("pnpm test")).toEqual({
+      handled: true,
+      action: "hint",
+      message: SHELL_COMMAND_HINT
+    });
+    expect(resolveLocalTerminalInput("fix the tests")).toEqual({ handled: false });
+  });
+
+  it("lists workspace entries compactly with a bound", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-list-"));
+    try {
+      fs.mkdirSync(path.join(root, "src"));
+      fs.writeFileSync(path.join(root, "README.md"), "");
+      fs.writeFileSync(path.join(root, "package.json"), "");
+
+      const listing = listWorkspaceEntries(root, 2);
+
+      expect(listing[0]).toBe("workspace entries (showing 2 of 3):");
+      expect(listing).toContain("  src/");
+      expect(listing).toHaveLength(3);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

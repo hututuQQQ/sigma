@@ -14,6 +14,7 @@ import {
   toolNameFromEvent,
   truncate
 } from "./components/formatting.js";
+import { glyphs } from "./ui/theme.js";
 
 export type TranscriptEntry =
   | { kind: "system"; text: string; timestamp?: string }
@@ -39,6 +40,14 @@ function eventTime(event: AgentEvent): string {
 
 function workspaceName(value: string): string {
   return path.basename(value) || redactSecretText(value);
+}
+
+function logoLockup(): string[] {
+  const g = glyphs();
+  return [
+    `${g.sigma} Sigma`,
+    `  sum the repo ${g.separator} ship the patch`
+  ];
 }
 
 function resultStatus(result: { ok?: boolean } | undefined): "ok" | "failed" {
@@ -164,9 +173,16 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
   }
   if (entries.length === 0) {
     const workspace = workspaceName(options.workspacePath);
+    for (const line of logoLockup()) {
+      entries.push({
+        kind: "system",
+        text: line,
+        timestamp: new Date(0).toISOString()
+      });
+    }
     entries.push({
       kind: "system",
-      text: `\u2211 Ready in ${workspace}`,
+      text: `Ready in ${workspace}`,
       timestamp: new Date(0).toISOString()
     });
     entries.push({

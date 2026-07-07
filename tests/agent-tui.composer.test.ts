@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   createComposerState,
   deleteBackward,
@@ -16,6 +16,19 @@ import {
   yank
 } from "../packages/agent-tui/src/composer-state.js";
 import { renderComposer } from "../packages/agent-tui/src/render/composer.js";
+
+const savedEnv = {
+  SIGMA_ASCII: process.env.SIGMA_ASCII,
+  SIGMA_FORCE_UNICODE: process.env.SIGMA_FORCE_UNICODE,
+  TERM: process.env.TERM
+};
+
+afterEach(() => {
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 describe("agent-tui composer editor", () => {
   it("inserts text at the cursor and supports backspace/delete", () => {
@@ -125,5 +138,25 @@ describe("agent-tui composer editor", () => {
       queued › run the focused tests
       enter queue · ctrl+j newline · tab plan/build · / commands · @ files · ! shell"
     `);
+  });
+
+  it("renders exactly one fake cursor glyph in composer text", () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    delete process.env.SIGMA_ASCII;
+    const state = createComposerState("fix tests");
+    state.cursor = 3;
+
+    const rendered = renderComposer({
+      state,
+      mode: "build",
+      running: false,
+      approvalPending: false,
+      width: 80,
+      color: false,
+      compact: true
+    });
+
+    expect(rendered.match(/\u258c/g)?.length ?? 0).toBe(1);
+    expect(rendered).toContain("fix\u258c tests");
   });
 });

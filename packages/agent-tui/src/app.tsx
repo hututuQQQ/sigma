@@ -57,11 +57,22 @@ import { mergeDisabledToolsForMode, type TuiRunMode } from "./mode.js";
 import { TuiPermissionController } from "./permission.js";
 import { renderCommandPaletteOverlay, renderFileMentionPalette, renderFocusOverlay } from "./render/palette.js";
 import { renderScreen } from "./render/screen.js";
-import { streamColorEnabled } from "./render/theme.js";
+import { streamColorEnabled, streamGlyphs } from "./render/theme.js";
 import { buildTranscript, type TranscriptEntry } from "./view-model.js";
 import { runSession } from "./run-session.js";
 import { truncateToWidth, wrapText } from "./ui/theme.js";
-import { resolveLocalWorkspaceInput, resolveWorkspaceTarget, type WorkspaceChangeResult } from "./workspace-command.js";
+import {
+  listWorkspaceEntries,
+  resolveLocalTerminalInput,
+  resolveLocalWorkspaceInput,
+  resolveWorkspaceTarget,
+  type LocalTerminalInputResult,
+  type WorkspaceChangeResult
+} from "./workspace-command.js";
+
+export const HIDE_CURSOR = "\x1b[?25l";
+export const SHOW_CURSOR = "\x1b[?25h";
+export type TuiSessionRunner = typeof runSession;
 
 const execFileAsync = promisify(execFile);
 
@@ -195,7 +206,7 @@ async function runLocalShellCommand(command: string, cwd: string, timeoutSec: nu
   }
 }
 
-class TuiApp {
+export class TuiApp {
   private readonly composer: ComposerState = createComposerState();
   private readonly permissionController = new TuiPermissionController();
   private readonly colorEnabled: boolean;
@@ -217,23 +228,29 @@ class TuiApp {
   constructor(
     private readonly options: TuiAppOptions,
     private readonly stdin: NodeJS.ReadStream,
-    private readonly stdout: NodeJS.WriteStream
+    private readonly stdout: NodeJS.WriteStream,
+    private readonly sessionRunner: TuiSessionRunner = runSession
   ) {
     this.colorEnabled = streamColorEnabled(stdout);
   }
 
   async start(): Promise<void> {
-    this.filePaths = listWorkspaceFiles(this.options.workspace);
-    readline.emitKeypressEvents(this.stdin);
-    this.permissionController.onChange(() => this.render());
-    if (this.stdin.isTTY) this.stdin.setRawMode(true);
-    this.stdin.resume();
-    this.stdin.on("keypress", this.handleKeypress);
-    this.stdout.write("\x1b[?25h");
-    this.render();
-    await new Promise<void>((resolve) => {
-      this.resolveExit = resolve;
-    });
+    this.stdout.write(HIDE_CURSOR);
+    try {
+      this.filePaths = listWorkspaceFiles(this.options.workspace);
+      readline.emitKeypressEvents(this.stdin);
+      this.permissionController.onChange(() => this.render());
+      if (this.stdin.isTTY) this.stdin.setRawMode(true);
+      this.stdin.resume();
+      this.stdin.on("keypress", this.handleKeypress);
+      this.render();
+      await new Promise<void>((resolve) => {
+        this.resolveExit = resolve;
+      });
+    } catch (error) {
+      this.stdout.write(SHOW_CURSOR);
+      throw error;
+    }
   }
 
   private resolveExit: (() => void) | null = null;
@@ -470,6 +487,11 @@ class TuiApp {
       this.applyWorkspaceChange(workspaceInput);
       return;
     }
+    const terminalInput = resolveLocalTerminalInput(value);
+    if (terminalInput.handled) {
+      this.applyLocalTerminalInput(terminalInput);
+      return;
+    }
     if (this.running) {
       this.queuedInstruction = value;
       this.message = "Queued one follow-up task for the next run.";
@@ -614,6 +636,32 @@ class TuiApp {
     this.render();
   }
 
+  private applyLocalTerminalInput(result: LocalTerminalInputResult): void {
+    if (!result.handled) return;
+    if (result.action === "clear") {
+      this.clearTranscript("Cleared.");
+      return;
+    }
+    const timestamp = nowIso();
+    if (result.action === "pwd") {
+      const text = `workspace: ${this.options.workspace}`;
+      this.localEntries.push({ kind: "system", text, timestamp });
+      this.message = "Workspace printed.";
+      this.render();
+      return;
+    }
+    if (result.action === "list") {
+      const listing = listWorkspaceEntries(this.options.workspace, 80);
+      this.localEntries.push({ kind: "system", text: listing.join("\n"), timestamp });
+      this.message = "Workspace entries listed.";
+      this.render();
+      return;
+    }
+    this.localEntries.push({ kind: "system", text: result.message, timestamp });
+    this.message = result.message;
+    this.render();
+  }
+
   private clearTranscript(message: string): void {
     this.events = [];
     this.result = null;
@@ -662,7 +710,7 @@ class TuiApp {
     this.message = "Run started.";
     this.render();
     try {
-      const result = await runSession({
+      const result = await this.sessionRunner({
         instruction,
         workspacePath: this.options.workspace,
         provider: this.options.provider,
@@ -808,7 +856,7 @@ class TuiApp {
       height: rows,
       color: this.colorEnabled
     });
-    this.stdout.write(`\x1b[2J\x1b[H${screen}`);
+    this.stdout.write(`${HIDE_CURSOR}\x1b[2J\x1b[H${screen}`);
   }
 
   private focusTitle(): string {
@@ -909,15 +957,20 @@ class TuiApp {
   }
 
   private helpLines(width: number): string[] {
+    const g = streamGlyphs();
     const commandLines = COMMANDS.map((command) => {
       const aliases = command.aliases.length > 0 ? ` ${command.aliases.join(", ")}` : "";
       return truncateToWidth(`${command.usage.padEnd(20)}${aliases.padEnd(10)}${command.description}`, width);
     });
     return [
+      `${g.sigma} Sigma`,
+      `  sum the repo ${g.separator} ship the patch`,
+      "",
       "Shortcuts",
       "Enter send   Ctrl+J newline   Tab plan/build   Esc close/clear   Ctrl+L redraw/clear",
       "Left/Right move cursor   Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
       "Ctrl+D diff   Ctrl+T tools   F1 help   @ file mention   !command shell",
+      "Local: cd <path>, pwd, ls/dir, clear/cls",
       "",
       "Commands",
       ...commandLines
@@ -992,12 +1045,16 @@ class TuiApp {
   private stop(): void {
     this.stdin.off("keypress", this.handleKeypress);
     if (this.stdin.isTTY) this.stdin.setRawMode(false);
-    this.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
+    this.stdout.write(`${SHOW_CURSOR}\x1b[2J\x1b[H`);
     this.resolveExit?.();
   }
 }
 
 export async function runTuiApp(options: TuiAppOptions): Promise<void> {
   const app = new TuiApp(options, process.stdin, process.stdout);
-  await app.start();
+  try {
+    await app.start();
+  } finally {
+    process.stdout.write(SHOW_CURSOR);
+  }
 }

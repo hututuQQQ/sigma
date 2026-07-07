@@ -48,6 +48,17 @@ function wrapIndented(text: string, width: number, indent = "  "): string[] {
   return wrapText(text, Math.max(10, width - indent.length)).map((line) => `${indent}${line}`);
 }
 
+function systemLines(text: string, width: number, color: boolean): string[] {
+  const g = streamGlyphs();
+  const lines = text.split(/\r?\n/);
+  if (text.startsWith(g.sigma) || text.startsWith("Try:") || text.startsWith("  ")) return lines;
+  const [first = "", ...rest] = lines;
+  return [
+    `${muted(g.info, color)} ${truncateToWidth(first, Math.max(1, width - 2))}`,
+    ...rest.map((line) => `  ${truncateToWidth(line.trimEnd(), Math.max(1, width - 2))}`)
+  ];
+}
+
 function entryLines(entry: TranscriptEntry, width: number, color: boolean): string[] {
   const g = streamGlyphs();
   if (entry.kind === "tool") {
@@ -84,8 +95,7 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
     return lines.map((line, index) => index === 0 ? `${g.pointer} ${line}` : `  ${line}`);
   }
   const text = redactSecretText(entry.text);
-  if (text.startsWith(g.sigma) || text.startsWith("Try:") || text.startsWith("  ")) return [text];
-  return [`${muted(g.info, color)} ${text}`];
+  return systemLines(text, width, color);
 }
 
 export function renderTranscript(entries: TranscriptEntry[], width: number, height: number, color = false): string {

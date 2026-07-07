@@ -68,7 +68,9 @@ describe("agent-tui stream rendering", () => {
     });
 
     expect(rendered).toContain("\u2211 Sigma agent-tui");
-    expect(rendered).toContain("\u2211 Ready in agent-tui");
+    expect(rendered).toContain("\u2211 Sigma");
+    expect(rendered).toContain("sum the repo \u00b7 ship the patch");
+    expect(rendered).toContain("Ready in agent-tui");
     expect(rendered).toContain("/mode plan inspect this package");
     expect(rendered).toContain("@src/app.tsx explain rendering");
     expect(rendered).toContain("!pnpm test");
@@ -174,8 +176,56 @@ describe("agent-tui stream rendering", () => {
     });
 
     expect(rendered).toContain("S Sigma");
+    expect(rendered).toContain("sum the repo | ship the patch");
+    expect(rendered).not.toContain("\u2211 Sigma");
     expect(rendered).not.toContain("+---");
     expect(assertWithinWidth(rendered, 54)).toBe(true);
+  });
+
+  it("respects SIGMA_ASCII while SIGMA_FORCE_UNICODE overrides dumb terminals", () => {
+    process.env.TERM = "xterm-256color";
+    process.env.SIGMA_ASCII = "1";
+    delete process.env.SIGMA_FORCE_UNICODE;
+    const ascii = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "glm",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: null,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries: buildTranscript({ workspacePath: "/tmp/sigma", events: [], result: null }),
+      width: 80,
+      height: 16,
+      color: false
+    });
+
+    expect(ascii).toContain("S Sigma");
+    expect(ascii).not.toContain("\u2211 Sigma");
+
+    process.env.TERM = "dumb";
+    delete process.env.SIGMA_ASCII;
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const forced = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "glm",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: null,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries: buildTranscript({ workspacePath: "/tmp/sigma", events: [], result: null }),
+      width: 80,
+      height: 16,
+      color: false
+    });
+
+    expect(forced).toContain("\u2211 Sigma");
+    expect(forced).not.toContain("S Sigma");
   });
 
   it("turns raw events into product-level transcript entries", () => {
