@@ -86,12 +86,12 @@ describe("agent-core tools", () => {
     expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 
-  it("truncates large bash output with head and tail", async () => {
+  it("returns complete large bash output for runtime budgeting", async () => {
     const { context } = await workspace();
     context.maxToolOutputChars = 80;
     const result = await executeBashTool({ command: "printf 'abcdef%.0s' {1..80}" }, context);
-    expect(result.metadata?.truncated).toBe(true);
-    expect(result.content).toContain("[truncated]");
+    expect(result.metadata?.truncated).toBe(false);
+    expect(result.content).toContain("abcdef".repeat(80));
   });
 
   it("reads a relative file", async () => {

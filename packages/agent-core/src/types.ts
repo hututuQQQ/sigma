@@ -5,6 +5,70 @@ export type PermissionMode = "ask" | "yolo";
 
 export type ToolRisk = "read" | "write" | "execute" | "network" | "unknown";
 
+export type ToolApprovalMode = "auto" | "prompt" | "deny";
+export type ToolSandboxMode = "default" | "policy_only" | "bypass";
+
+export interface ToolRuntimeMetadata {
+  readOnly?: boolean;
+  supportsParallel?: boolean;
+  waitsForCancellation?: boolean;
+  approval?: ToolApprovalMode;
+  sandbox?: ToolSandboxMode;
+  outputBudget?: number;
+}
+
+export interface ExecPolicyRule {
+  match: string | string[];
+  action: "allow" | "prompt" | "deny";
+  reason?: string;
+}
+
+export interface ExecPolicyConfig {
+  defaultAction?: "allow" | "prompt" | "deny";
+  allowReadOnlyCommands?: boolean;
+  rules?: ExecPolicyRule[];
+}
+
+export interface ExecIntentSummary {
+  command: string;
+  risk: ToolRisk;
+  mutatesWorkspace: boolean;
+  usesNetwork: boolean;
+  changesGitState: boolean;
+  executesCode: boolean;
+  matchedRule?: string;
+  action: "allow" | "prompt" | "deny";
+  reason: string;
+}
+
+export interface SandboxConfig {
+  mode?: "disabled" | "policy_only";
+  network?: "default" | "restricted";
+  filesystem?: "workspace_write" | "read_only";
+}
+
+export interface SandboxExecRequest {
+  toolName: string;
+  command: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  policy: ExecIntentSummary;
+  sandbox?: SandboxConfig;
+}
+
+export interface SandboxExecDecision {
+  allowed: boolean;
+  reason?: string;
+  command?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SandboxAdapter {
+  prepareExec(request: SandboxExecRequest): Promise<SandboxExecDecision>;
+}
+
 export interface PermissionRequest {
   toolName: string;
   arguments: unknown;
@@ -180,6 +244,8 @@ export interface ToolExecutionContext {
   permissionMode: PermissionMode;
   commandTimeoutSec: number;
   maxToolOutputChars: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   permissionDecider?: PermissionDecider;
   runState: AgentRunState;
   alwaysAllowTools: Set<string>;
@@ -192,6 +258,9 @@ export interface ToolExecutionContext {
   model?: string;
   subagentsEnabled?: boolean;
   subagentDepth?: number;
+  execPolicy?: ExecPolicyConfig;
+  sandbox?: SandboxConfig;
+  sandboxAdapter?: SandboxAdapter;
 }
 
 export interface ToolHandler {
@@ -202,11 +271,13 @@ export interface RegisteredTool {
   definition: ToolDefinition;
   execute: ToolHandler;
   risk?: ToolRisk;
+  runtime?: ToolRuntimeMetadata;
 }
 
 export interface ToolRegistry {
   definitions: ToolDefinition[];
   execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult>;
+  getTool?(name: string): RegisteredTool | undefined;
   close?(): Promise<void>;
 }
 
@@ -239,6 +310,7 @@ export interface AgentRunState {
   changedFiles: Set<string>;
   contextIndexes?: Map<string, unknown>;
   contextIndexVersion?: number;
+  toolArtifacts?: ToolArtifactSummary[];
 }
 
 export type ContextMode = "off" | "repo-map";
@@ -262,6 +334,36 @@ export interface ContextCompactionSummary {
   fallback_used: boolean;
   duration_ms: number;
   error?: string;
+}
+
+export interface ContextBudgetSummary {
+  estimated_tokens: number;
+  message_count: number;
+  tool_count: number;
+  max_message_history_chars?: number;
+  repo_map_chars?: number;
+  skills_chars?: number;
+}
+
+export interface ToolRuntimeSummary {
+  queued: number;
+  started: number;
+  completed: number;
+  aborted: number;
+  failed: number;
+  parallel_batches: number;
+  serial_batches: number;
+  artifacts: ToolArtifactSummary[];
+}
+
+export interface ToolArtifactSummary {
+  id: string;
+  tool_call_id: string;
+  tool_name: string;
+  path: string;
+  bytes: number;
+  original_chars: number;
+  retained_chars: number;
 }
 
 export interface CodeIndexSummary {
@@ -293,6 +395,8 @@ export interface AgentRunConfig {
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
   maxToolOutputChars?: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
@@ -329,6 +433,9 @@ export interface AgentRunConfig {
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  execPolicy?: ExecPolicyConfig;
+  sandbox?: SandboxConfig;
+  sandboxAdapter?: SandboxAdapter;
   abortSignal?: AbortSignal;
 }
 
@@ -359,11 +466,16 @@ export interface AgentEvent {
     | "tool_call_delta"
     | "model_heartbeat"
     | "run_abort"
+    | "turn_start"
+    | "context_budget"
     | "model_start"
     | "model_end"
     | "assistant_message"
+    | "tool_queued"
     | "tool_start"
+    | "tool_progress"
     | "tool_end"
+    | "tool_aborted"
     | "context_compaction_start"
     | "context_compaction_end"
     | "context_compaction_error"
@@ -425,6 +537,8 @@ export interface AgentRunResult {
   codeIndex?: CodeIndexSummary;
   subagentRuns?: SubagentRunSummary[];
   reviewFindings?: ReviewGateSummary[];
+  toolRuntime?: ToolRuntimeSummary;
+  contextBudget?: ContextBudgetSummary;
 }
 
 export interface WorkspaceManifestEntry {
@@ -537,6 +651,8 @@ export interface SummaryJson {
   code_index?: CodeIndexSummary;
   subagent_runs?: SubagentRunSummary[];
   review_findings?: ReviewGateSummary[];
+  tool_runtime?: ToolRuntimeSummary;
+  context_budget?: ContextBudgetSummary;
 }
 
 export function addUsage(total: TokenTotals, usage: Usage | undefined): void {

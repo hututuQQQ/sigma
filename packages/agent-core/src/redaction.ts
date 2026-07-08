@@ -1,4 +1,4 @@
-const SECRET_KEY_PATTERN = /(api[_-]?key|token|secret|password|passwd|authorization|credential)/i;
+const SECRET_KEY_PATTERN = /(api[_-]?key|secret|password|passwd|authorization|credential|(?:^|[_-])token(?:$|[_-])|(?:^|[_-])access[_-]?token(?:$|[_-])|(?:^|[_-])auth[_-]?token(?:$|[_-]))/i;
 const STATIC_PATTERNS: Array<[RegExp, string]> = [
   [/(authorization\s*[:=]\s*bearer\s+)[^\s"',;]+/gi, "$1[REDACTED]"],
   [/((?:api[_-]?key|token|secret|password|passwd|credential)\s*[:=]\s*["']?)[^"'\s,;]+/gi, "$1[REDACTED]"],
@@ -49,4 +49,3 @@ export function redactSecrets<T>(value: T): T {
 
   return visit(value) as T;
 }
-

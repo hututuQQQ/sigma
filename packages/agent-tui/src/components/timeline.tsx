@@ -44,16 +44,26 @@ export function formatTimelineEvent(event: AgentEvent): string {
   }
   if (event.type === "model_start") return prefix(g.running, `model turn ${meta.turn ?? "?"} started`);
   if (event.type === "model_end") return prefix(g.ok, joinDetails([`model turn ${meta.turn ?? "?"} ended`, formatUsage(eventUsage(event))]));
+  if (event.type === "context_budget") {
+    const budget = meta.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
+    return prefix(g.info, joinDetails([`context turn ${meta.turn ?? "?"}`, `${budget?.estimated_tokens ?? "?"} est tokens`, `${budget?.message_count ?? "?"} messages`, `${budget?.tool_count ?? "?"} tools`]));
+  }
   if (event.type === "assistant_message") {
     const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
     if (toolCalls > 0) return prefix(g.info, `assistant proposed ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`);
     const content = typeof meta.content === "string" ? oneLine(redactSecretText(meta.content)) : "";
     return prefix(g.info, `assistant ${truncate(content || "(message)", 130)}`);
   }
+  if (event.type === "tool_queued") {
+    return prefix(g.info, `${meta.toolName ?? "tool"} queued`);
+  }
   if (event.type === "tool_start") {
     const toolName = toolNameFromEvent(event);
     const detail = summarizeToolArguments(toolName, toolArgsFromEvent(event));
     return prefix(g.running, joinDetails([`${toolName} started`, detail]));
+  }
+  if (event.type === "tool_aborted") {
+    return prefix(g.fail, joinDetails([`${meta.toolName ?? "tool"} aborted`, truncate(oneLine(redactSecretText(String(meta.reason ?? ""))), 90)]));
   }
   if (event.type === "tool_end") {
     const result = meta.result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined;

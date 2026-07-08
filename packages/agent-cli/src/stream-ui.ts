@@ -55,14 +55,24 @@ export function formatAgentEvent(event: AgentEvent): string | null {
   switch (event.type) {
     case "run_start":
       return `[sigma] run_start provider=${event.provider ?? "unknown"} model=${event.model ?? "unknown"}`;
+    case "turn_start":
+      return `[sigma] turn_start turn=${String(event.metadata?.turn ?? "?")}`;
+    case "context_budget": {
+      const budget = event.metadata?.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
+      return `[sigma] context_budget turn=${String(event.metadata?.turn ?? "?")} estimated_tokens=${String(budget?.estimated_tokens ?? "?")} messages=${String(budget?.message_count ?? "?")} tools=${String(budget?.tool_count ?? "?")}`;
+    }
     case "model_start":
       return `[sigma] model_start turn=${String(event.metadata?.turn ?? "?")}`;
     case "model_end":
       return `[sigma] model_end turn=${String(event.metadata?.turn ?? "?")} ${usageSummary(event.metadata?.usage)}`;
     case "assistant_message":
       return `[sigma] assistant ${assistantSummary(event)}`;
+    case "tool_queued":
+      return `[sigma] tool_queued ${String(event.metadata?.toolName ?? "tool")}`;
     case "tool_start":
       return `[sigma] tool_start ${toolDetailFromEvent(event)}`;
+    case "tool_aborted":
+      return `[sigma] tool_aborted ${String(event.metadata?.toolName ?? "tool")} reason=${truncateMiddle(redactSecretText(String(event.metadata?.reason ?? "")).replace(/\s+/g, " "), 120).text}`;
     case "tool_end": {
       const result = event.metadata?.result as { ok?: unknown; content?: unknown; metadata?: Record<string, unknown> } | undefined;
       const duration = typeof result?.metadata?.durationMs === "number" ? ` duration_ms=${result.metadata.durationMs}` : "";

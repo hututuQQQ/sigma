@@ -337,7 +337,9 @@ function finalResultForHarness(options: {
     validationPlan: options.validationPlan ?? options.finalAttempt.validationPlan,
     codeIndex: options.finalAttempt.codeIndex,
     subagentRuns: options.finalAttempt.subagentRuns,
-    reviewFindings: options.reviewFindings ?? options.finalAttempt.reviewFindings
+    reviewFindings: options.reviewFindings ?? options.finalAttempt.reviewFindings,
+    toolRuntime: options.finalAttempt.toolRuntime,
+    contextBudget: options.finalAttempt.contextBudget
   };
 }
 
@@ -432,6 +434,9 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     const attemptDir = path.join(attemptsDir, `attempt-${attempt}`);
     const attemptSummaryPath = path.join(attemptDir, "summary.json");
     const attemptTracePath = path.join(attemptDir, "trace.jsonl");
+    const attemptToolArtifactRootDir = config.toolArtifactRootDir
+      ? path.join(path.resolve(config.toolArtifactRootDir), `attempt-${attempt}`)
+      : path.join(attemptDir, "artifacts");
     await mkdir(attemptDir, { recursive: true });
     activeAttemptForEvents = attempt;
     const precheck = await runPrecheckBeforeAttempt({ config: controllerConfig, attempt });
@@ -451,6 +456,7 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       instruction: activeInstruction,
       summaryJsonPath: attemptSummaryPath,
       traceJsonlPath: attemptTracePath,
+      toolArtifactRootDir: attemptToolArtifactRootDir,
       durableSession: false
     });
     const attemptCancelled = rawAttemptResult.finishReason === "cancelled" || config.abortSignal?.aborted === true;

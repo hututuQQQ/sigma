@@ -474,6 +474,12 @@ OpenAI-compatible providers support SSE model streaming. The core run loop prefe
 
 The default tool registry is extensible and can be injected, merged, filtered, or configured with `--allowed-tools` and `--disabled-tools`. Tool names must be unique; duplicate names fail clearly unless an internal override path is used.
 
+Tool calls are dispatched through the core tool runtime. Read-only tools that declare `supportsParallel` can run together within a single model turn; write, shell, service, validation, and subagent tools remain serial barriers. The runtime emits `tool_queued`, `tool_start`, `tool_progress`, `tool_end`, and `tool_aborted` events, returns tool results to the model in the original tool-call order, and records a `tool_runtime` summary in `summary.json`.
+
+Each turn also emits `turn_start` and `context_budget`. The budget is an estimate of current model-visible messages, tool definitions, repo map, and selected skills. Oversized runtime tool output can be saved under `.agent/artifacts/<run-id>/`, with the model receiving a bounded preview plus an artifact reference.
+
+Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Policy rules can allow, prompt, or deny command prefixes; the default remains conservative in `ask` and permissive in `yolo`. A policy-only sandbox adapter is included for filesystem/network intent checks, with the interface left open for stronger OS-backed adapters later.
+
 The core loop exposes these default tools:
 
 - `bash`: runs `bash -lc` in the workspace, captures stdout/stderr/exit code/duration, times out safely, and truncates large output with a head/tail strategy. Commands that look mutating require approval in `ask`.

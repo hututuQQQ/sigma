@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentEvent, AgentRunResult, PermissionRequest } from "../packages/agent-core/src/index.js";
 import { approvalPromptLines } from "../packages/agent-tui/src/components/approval-prompt.js";
 import { renderDiffLines } from "../packages/agent-tui/src/components/diff-panel.js";
+import { ToolPanel } from "../packages/agent-tui/src/components/tool-panel.js";
 import { createComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { mergeDisabledToolsForMode, PLAN_DISABLED_TOOLS } from "../packages/agent-tui/src/mode.js";
 import { renderScreen } from "../packages/agent-tui/src/render/screen.js";
@@ -381,6 +382,59 @@ describe("agent-tui stream rendering", () => {
       status: "ok",
       durationMs: 18
     }));
+  });
+
+  it("renders queued, aborted, and context budget events", () => {
+    const queued = event("tool_queued", { toolCallId: "call-1", toolName: "read" });
+    const aborted = event("tool_aborted", { toolCallId: "call-2", toolName: "bash", reason: "abort signal" });
+    const contextBudget = event("context_budget", {
+      budget: { estimated_tokens: 123, message_count: 4, tool_count: 12 }
+    });
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [queued, aborted, contextBudget],
+      result: null
+    });
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "read", status: "queued" }));
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "bash", status: "aborted" }));
+    expect(entries.some((entry) => entry.kind === "system" && entry.text.includes("123 est tokens"))).toBe(true);
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [queued, aborted, contextBudget],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      width: 96,
+      height: 18,
+      color: false
+    });
+    expect(rendered).toContain("read");
+    expect(rendered).toContain("context 123 est tokens");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
+  it("dedupes terminal tool events in the tool panel", () => {
+    const start = event("tool_start", {
+      toolCall: { id: "call-1", function: { name: "bash", arguments: { command: "sleep 5" } } },
+      toolCallId: "call-1",
+      toolName: "bash"
+    });
+    const aborted = event("tool_aborted", { toolCallId: "call-1", toolName: "bash", reason: "abort_signal" }, start.id);
+    const end = event("tool_end", {
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { ok: false, content: "Tool call cancelled.", metadata: { cancelled: true } }
+    }, start.id);
+
+    const rendered = ToolPanel([start, aborted, end], null, 96, undefined, false);
+
+    expect(rendered.match(/bash aborted/g)).toHaveLength(1);
   });
 
   it("redacts approval details and truncates diff output with color disabled", () => {

@@ -21,9 +21,12 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
+  ExecPolicyConfig,
   McpServerRunSummary,
   PermissionDecider,
   PermissionMode,
+  SandboxAdapter,
+  SandboxConfig,
   ToolRegistry
 } from "./types.js";
 
@@ -47,6 +50,8 @@ export interface RunConfiguredAgentOptions {
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
   maxToolOutputChars?: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
@@ -85,6 +90,9 @@ export interface RunConfiguredAgentOptions {
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  execPolicy?: ExecPolicyConfig;
+  sandbox?: SandboxConfig;
+  sandboxAdapter?: SandboxAdapter;
   enableMcp?: boolean;
   mcpConfig?: string;
   eventBus?: AgentEventBusLike;
@@ -158,6 +166,8 @@ function baseRunConfig(
     ...(defined(options.sessionJsonlPath) ? { sessionJsonlPath: options.sessionJsonlPath } : {}),
     ...(defined(options.summaryJsonPath) ? { summaryJsonPath: options.summaryJsonPath } : {}),
     ...(defined(options.maxToolOutputChars) ? { maxToolOutputChars: options.maxToolOutputChars } : {}),
+    ...(defined(options.maxParallelToolCalls) ? { maxParallelToolCalls: options.maxParallelToolCalls } : {}),
+    ...(defined(options.toolArtifactRootDir) ? { toolArtifactRootDir: options.toolArtifactRootDir } : {}),
     maxMessageHistoryChars: resolved.maxMessageHistoryChars,
     ...(defined(options.messageHistoryRetain) ? { messageHistoryRetain: options.messageHistoryRetain } : {}),
     ...(defined(options.compactionSummaryChars) ? { compactionSummaryChars: options.compactionSummaryChars } : {}),
@@ -190,6 +200,9 @@ function baseRunConfig(
     finalEvidenceMode: resolved.finalEvidenceMode,
     ...(defined(options.skillsMode) ? { skillsMode: options.skillsMode } : {}),
     ...(defined(options.skillsMaxChars) ? { skillsMaxChars: options.skillsMaxChars } : {}),
+    ...(defined(options.execPolicy) ? { execPolicy: options.execPolicy } : {}),
+    ...(defined(options.sandbox) ? { sandbox: options.sandbox } : {}),
+    ...(defined(options.sandboxAdapter) ? { sandboxAdapter: options.sandboxAdapter } : {}),
     ...(defined(options.eventBus) ? { eventBus: options.eventBus } : {}),
     ...(defined(options.abortSignal) ? { abortSignal: options.abortSignal } : {})
   };
