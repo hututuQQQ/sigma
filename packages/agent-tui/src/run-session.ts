@@ -43,6 +43,9 @@ export interface RunSessionOptions {
   traceJsonlPath?: string;
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
+  parentSessionId?: string;
+  forkedFromSessionId?: string;
+  abortSignal?: AbortSignal;
   permissionController: TuiPermissionController;
   onEvent(event: AgentEvent): void;
 }
@@ -85,9 +88,11 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       traceJsonlPath: options.traceJsonlPath,
       sessionJsonlPath: options.sessionJsonlPath,
       summaryJsonPath: options.summaryJsonPath,
+      parentSessionId: options.parentSessionId,
+      forkedFromSessionId: options.forkedFromSessionId,
       permissionDecider: options.permissionMode === "ask" ? options.permissionController : undefined,
-      eventBus
-      // TODO: when agent-core emits assistant delta events from modelClient.stream, render token-level updates here.
+      eventBus,
+      abortSignal: options.abortSignal
     });
     return result;
   } finally {

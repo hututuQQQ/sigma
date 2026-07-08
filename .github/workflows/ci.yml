@@ -20,7 +20,25 @@ jobs:
           cache: pnpm
       - name: Install
         run: pnpm install --frozen-lockfile
+      - name: Prepare package Node runtime
+        run: |
+          NODE_DIR="node-$(node --version)-linux-x64"
+          mkdir -p ".artifacts/ci-node-runtime/${NODE_DIR}/bin"
+          cp "$(command -v node)" ".artifacts/ci-node-runtime/${NODE_DIR}/bin/node"
+          chmod +x ".artifacts/ci-node-runtime/${NODE_DIR}/bin/node"
+          tar -cJf ".artifacts/ci-node-runtime.tar.xz" -C ".artifacts/ci-node-runtime" "${NODE_DIR}"
+          echo "NODE_RUNTIME_TARBALL=${GITHUB_WORKSPACE}/.artifacts/ci-node-runtime.tar.xz" >> "$GITHUB_ENV"
       - name: Build
         run: pnpm build
+      - name: Lint
+        run: pnpm lint
       - name: Test
         run: pnpm test
+      - name: Harbor tests
+        run: pnpm test:harbor
+      - name: Local fake smoke
+        run: pnpm smoke:local:fake
+      - name: Package agent CLI
+        run: pnpm package:agent-cli
+      - name: Package Harbor runtime
+        run: pnpm package:harbor-runtime

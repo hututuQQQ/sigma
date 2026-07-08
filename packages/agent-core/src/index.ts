@@ -52,8 +52,11 @@ export {
   listCheckpoints,
   loadCheckpoint,
   restoreCheckpoint,
-  GitCheckpointManager
+  FileBackedCheckpointManager,
+  GitCheckpointManager,
+  HybridCheckpointManager
 } from "./session/checkpoints.js";
+export type { CheckpointManager } from "./session/checkpoints.js";
 export type {
   CheckpointRecord,
   CheckpointRestoreResult,
@@ -86,6 +89,7 @@ export {
   executeValidateTool,
   executeListTool,
   executeReadTool,
+  executeReadManyTool,
   executeServiceTool,
   executeShellSessionTool,
   finalizeManagedServices,

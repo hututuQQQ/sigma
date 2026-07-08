@@ -103,9 +103,11 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const toolEndsByParent = new Map<string, AgentEvent>();
   const checkEndsByParent = new Map<string, AgentEvent>();
+  let latestAssistantDelta: AgentEvent | null = null;
   for (const event of events) {
     if (event.type === "tool_end" && event.parentId) toolEndsByParent.set(event.parentId, event);
     if (event.type === "harness_check_end" && event.parentId) checkEndsByParent.set(event.parentId, event);
+    if (event.type === "assistant_delta") latestAssistantDelta = event;
   }
 
   for (const event of events) {
@@ -116,6 +118,7 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       continue;
     }
     if (event.type === "assistant_message") {
+      latestAssistantDelta = null;
       const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
       const text = typeof meta.content === "string" && meta.content.trim()
         ? redactSecretText(meta.content.trim())
@@ -141,6 +144,16 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
     if (event.type === "error") {
       entries.push({ kind: "summary", status: "error", text: redactSecretText(String(meta.message ?? "")), timestamp: eventTime(event) });
       continue;
+    }
+  }
+  if (latestAssistantDelta) {
+    const text = typeof latestAssistantDelta.metadata?.content === "string"
+      ? latestAssistantDelta.metadata.content
+      : typeof latestAssistantDelta.metadata?.delta === "string"
+        ? latestAssistantDelta.metadata.delta
+        : "";
+    if (text.trim()) {
+      entries.push({ kind: "assistant", text: redactSecretText(text), timestamp: eventTime(latestAssistantDelta) });
     }
   }
   return entries;

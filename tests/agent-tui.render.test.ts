@@ -154,7 +154,7 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("Changes");
     expect(rendered).toContain("packages/agent-tui/src/app.tsx");
     expect(rendered).toContain("Tool calls");
-    expect(rendered).toContain("Benchmark");
+    expect(rendered).toContain("Checks");
     expect(rendered).toContain("tokens      input=10 output=5 total=15");
     expect(rendered).toContain("read path=package.json");
     expect(rendered).toContain("ctx input=10/output=5/total=15");

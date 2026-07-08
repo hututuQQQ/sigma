@@ -11,6 +11,7 @@ import {
 import {
   runAgentHarness,
   runAgentWithController,
+  AgentEventBus,
   listSessions,
   type AgentRunControllerConfig,
   type AgentRunControllerSummary,
@@ -55,8 +56,68 @@ function writeResponse(filePath: string, content: string): ModelResponse {
   };
 }
 
+function bashResponse(command: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      toolCalls: [
+        {
+          id: `bash-${Math.random()}`,
+          type: "function",
+          function: { name: "bash", arguments: { command } }
+        }
+      ]
+    }
+  };
+}
+
+class AbortStreamingModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-abort-stream-model";
+  readonly requests: ModelRequest[] = [];
+
+  constructor(private readonly controller: AbortController) {}
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    throw new Error("complete should not be called when stream is available");
+  }
+
+  async *stream(req: ModelRequest) {
+    this.requests.push(req);
+    yield { type: "message_delta" as const, data: { delta: "partial" } };
+    this.controller.abort();
+    yield { type: "message_delta" as const, data: { delta: " ignored" } };
+  }
+}
+
+class AwaitEventModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-event-model";
+
+  constructor(private readonly ready: () => Promise<void>) {}
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    await this.ready();
+    return finalResponse("events written");
+  }
+}
+
 async function tempWorkspace(): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), "agent-run-controller-"));
+}
+
+async function waitForFileContaining(filePath: string, needle: string, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      if ((await readFile(filePath, "utf8")).includes(needle)) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${needle} in ${filePath}: ${lastError instanceof Error ? lastError.message : ""}`);
 }
 
 function acceptRunControllerAliases(
@@ -211,6 +272,59 @@ describe("agent-core harness", () => {
     );
   });
 
+  it("keeps stream cancellation from being overwritten by validation or retry", async () => {
+    const dir = await tempWorkspace();
+    const controller = new AbortController();
+
+    const result = await runAgentHarness({
+      instruction: "abort stream",
+      workspacePath: dir,
+      modelClient: new AbortStreamingModel(controller),
+      validationMode: "auto",
+      validationCommands: ["node -e \"process.exit(1)\""],
+      validationRetryLimit: 1,
+      validationTimeoutSec: 5,
+      permissionMode: "yolo",
+      abortSignal: controller.signal
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("cancelled");
+    expect(result.harness?.attempts).toHaveLength(1);
+    expect(result.harness?.validation_results).toEqual([]);
+    expect(result.harness?.retry_decisions).toEqual([]);
+  });
+
+  it("keeps tool cancellation from being overwritten by validation or retry", async () => {
+    const dir = await tempWorkspace();
+    const controller = new AbortController();
+    const eventBus = new AgentEventBus();
+    eventBus.on((event) => {
+      if (event.type === "tool_start") controller.abort();
+    });
+    const model = new SequenceModel([bashResponse("node -e \"setTimeout(() => {}, 5000)\"")]);
+
+    const result = await runAgentHarness({
+      instruction: "abort tool",
+      workspacePath: dir,
+      modelClient: model,
+      validationMode: "auto",
+      validationCommands: ["node -e \"process.exit(1)\""],
+      validationRetryLimit: 1,
+      validationTimeoutSec: 5,
+      commandTimeoutSec: 10,
+      permissionMode: "yolo",
+      eventBus,
+      abortSignal: controller.signal
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("cancelled");
+    expect(result.harness?.attempts).toHaveLength(1);
+    expect(result.harness?.validation_results).toEqual([]);
+    expect(result.harness?.retry_decisions).toEqual([]);
+  });
+
   it("retries after validation failure and preserves attempt artifacts", async () => {
     const dir = await tempWorkspace();
     const summaryPath = path.join(dir, "summary.json");
@@ -305,6 +419,55 @@ describe("agent-core harness", () => {
         ]
       }
     });
+    const eventsText = await readFile(sessions[0].eventsPath, "utf8");
+    expect(eventsText).toContain("\"attempt\":1");
+    expect(eventsText).toContain("harness_check_start");
+    expect(eventsText).toContain("run_start");
+  });
+
+  it("appends parent durable events while the attempt is still running", async () => {
+    const dir = await tempWorkspace();
+    const sessionRootDir = path.join(dir, ".agent", "sessions");
+    const eventBus = new AgentEventBus();
+    let resolveRunStart!: () => void;
+    let rejectRunStart!: (error: unknown) => void;
+    const runStartWritten = new Promise<void>((resolve, reject) => {
+      resolveRunStart = resolve;
+      rejectRunStart = reject;
+    });
+    let armed = false;
+    eventBus.on((event) => {
+      if (armed || event.type !== "run_start" || !event.sessionId) return;
+      armed = true;
+      const eventsPath = path.join(sessionRootDir, event.sessionId, "events.jsonl");
+      void waitForFileContaining(eventsPath, "\"type\":\"run_start\"").then(resolveRunStart, rejectRunStart);
+    });
+
+    const result = await runAgentHarness({
+      instruction: "finish after parent event write",
+      workspacePath: dir,
+      sessionRootDir,
+      modelClient: new AwaitEventModel(() => runStartWritten),
+      validationMode: "auto",
+      validationCommands: ["node -e \"process.exit(0)\""],
+      validationRetryLimit: 0,
+      validationTimeoutSec: 5,
+      permissionMode: "yolo",
+      eventBus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.sessionId).toEqual(expect.any(String));
+    const eventsPath = path.join(sessionRootDir, result.sessionId ?? "", "events.jsonl");
+    const events = (await readFile(eventsPath, "utf8"))
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type: string; metadata?: { attempt?: number } });
+    expect(events.filter((event) => event.type === "run_start")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "harness_check_start")).toHaveLength(1);
+    expect(events.find((event) => event.type === "run_start")?.metadata?.attempt).toBe(1);
+    expect(events.find((event) => event.type === "harness_check_start")?.metadata?.attempt).toBe(1);
   });
 
   it("records precheck failure as the final durable session status", async () => {
@@ -324,6 +487,7 @@ describe("agent-core harness", () => {
 
     expect(result.status).toBe("error");
     expect(result.finishReason).toBe("precheck_failed");
+    expect(model.requests).toHaveLength(0);
 
     const sessions = await listSessions({ workspacePath: dir });
     expect(sessions).toHaveLength(1);
@@ -333,6 +497,7 @@ describe("agent-core harness", () => {
       finishReason: "precheck_failed"
     });
     const summary = JSON.parse(await readFile(sessions[0].summaryPath, "utf8"));
+    expect(summary.harness.attempts).toEqual([]);
     expect(summary.harness.precheck_results).toEqual([
       expect.objectContaining({
         kind: "precheck",
@@ -341,9 +506,9 @@ describe("agent-core harness", () => {
     ]);
   });
 
-  it("adds precheck failure details to retry feedback", async () => {
+  it("runs a passing precheck before the agent attempt", async () => {
     const dir = await tempWorkspace();
-    const model = new SequenceModel([finalResponse("first"), finalResponse("second")]);
+    const model = new SequenceModel([finalResponse("first")]);
 
     const result = await runAgentHarness({
       instruction: "finish",
@@ -351,16 +516,16 @@ describe("agent-core harness", () => {
       modelClient: model,
       validationMode: "off",
       validationRetryLimit: 1,
-      precheckCommand: "if [ -f pass ]; then exit 0; else echo missing >&2; touch pass; exit 1; fi",
+      precheckCommand: "node -e \"process.exit(0)\"",
       precheckTimeoutSec: 5,
       permissionMode: "yolo"
     });
 
     expect(result.status).toBe("completed");
-    const retryRequest = model.requests.find((request) =>
-      request.messages.some((message) => message.role === "user" && String(message.content).includes("Precheck failure 1"))
-    );
-    expect(retryRequest).toBeTruthy();
+    expect(model.requests).toHaveLength(1);
+    expect(result.harness?.precheck_results).toEqual([
+      expect.objectContaining({ kind: "precheck", exit_code: 0, attempt: 1 })
+    ]);
   });
 
   it("runs post-run cleanup and records warnings separately from success", async () => {

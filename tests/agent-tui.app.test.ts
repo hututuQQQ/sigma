@@ -137,6 +137,49 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     }
   });
 
+  it("cancels an active run on first Ctrl+C and exits on the next", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-cancel-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    let aborted = false;
+    const result: AgentRunResult = {
+      status: "stopped",
+      finishReason: "cancelled",
+      toolCalls: 0,
+      turns: 1,
+      usage: { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 }
+    };
+    const runner: TuiSessionRunner = async (runOptions) => {
+      await new Promise<void>((resolve) => {
+        runOptions.abortSignal?.addEventListener("abort", () => {
+          aborted = true;
+          resolve();
+        }, { once: true });
+      });
+      return result;
+    };
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, "long task");
+      const submitted = target.submitInput();
+      await Promise.resolve();
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await submitted;
+      expect(aborted).toBe(true);
+      expect(stripAnsi(stdout.last())).toContain("cancelled");
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+      expect(stdin.rawModes).toEqual([true, false]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("handles pwd, ls, dir, clear, and cls without calling the model", async () => {
     process.env.SIGMA_FORCE_UNICODE = "1";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-local-"));
@@ -192,7 +235,37 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(stdout.last()).toContain("\u2211 Workbench");
       expect(stdout.last()).toContain("Files");
       expect(stdout.last()).toContain("README.md");
-      expect(stdout.last()).toContain("Benchmark");
+      expect(stdout.last()).toContain("Checks");
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("selects multiple file mention top matches before inserting them", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-mentions-"));
+    fs.mkdirSync(path.join(root, "src"));
+    fs.writeFileSync(path.join(root, "src", "a.ts"), "");
+    fs.writeFileSync(path.join(root, "src", "alpha.ts"), "");
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, "open @src/a");
+      stdin.emit("keypress", " ", { name: "space" });
+
+      expect(stripAnsi(stdout.last())).toContain("selected: @src/a.ts");
+
+      stdin.emit("keypress", "l", { name: "l" });
+      stdin.emit("keypress", " ", { name: "space" });
+      stdin.emit("keypress", "", { name: "return" });
+
+      expect(target.composer.text).toBe("open @src/a.ts @src/alpha.ts");
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
     } finally {

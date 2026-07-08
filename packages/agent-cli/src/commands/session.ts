@@ -110,18 +110,24 @@ async function runSessionShow(argv: string[], deps: SolveCommandDeps): Promise<n
   }
   const events = (await readSessionEventsText(meta.eventsPath)).trim().split(/\r?\n/).filter(Boolean);
   const summaryText = await readSessionSummaryText(meta.summaryPath);
+  const summary = parseJsonOrNull(summaryText) as { harness?: { attempts?: unknown[] } } | null;
+  const recentEvents = events.slice(-12).map((line) => {
+    try {
+      const parsed = JSON.parse(line) as { type?: string; timestamp?: string; metadata?: unknown };
+      return { type: parsed.type, timestamp: parsed.timestamp, metadata: parsed.metadata };
+    } catch {
+      return { raw: line };
+    }
+  });
   const payload = {
     meta,
     eventCount: events.length,
-    recentEvents: events.slice(-12).map((line) => {
-      try {
-        const parsed = JSON.parse(line) as { type?: string; timestamp?: string; metadata?: unknown };
-        return { type: parsed.type, timestamp: parsed.timestamp, metadata: parsed.metadata };
-      } catch {
-        return { raw: line };
-      }
-    }),
-    summary: parseJsonOrNull(summaryText)
+    recentEvents,
+    recentControllerEvents: recentEvents.filter((item) =>
+      "type" in item && (item.type === "harness_check_start" || item.type === "harness_check_end" || item.type === "run_start" || item.type === "run_end")
+    ),
+    attemptSummaries: Array.isArray(summary?.harness?.attempts) ? summary.harness.attempts : [],
+    summary
   };
   if (flags.json) {
     writeJson(payload, deps);
@@ -243,8 +249,11 @@ async function runCheckpointShow(argv: string[], deps: SolveCommandDeps): Promis
   if (flags.json) writeJson(record, deps);
   else {
     stdout(deps).write(`${record.id}  ${record.toolName}  ${compactDate(record.createdAt)}\n`);
+    stdout(deps).write(`  mode: ${record.mode ?? (record.patchPath ? "git" : "file")}\n`);
     stdout(deps).write(`  changed: ${record.changedFiles.join(", ") || "(none)"}\n`);
-    stdout(deps).write(`  patch: ${record.patchPath}\n`);
+    if (record.patchPath) stdout(deps).write(`  patch: ${record.patchPath}\n`);
+    if (record.fileSnapshotPath) stdout(deps).write(`  snapshot: ${record.fileSnapshotPath}\n`);
+    if (record.skippedFiles && record.skippedFiles.length > 0) stdout(deps).write(`  skipped: ${record.skippedFiles.join(", ")}\n`);
     stdout(deps).write(`  result: ${record.resultSummary}\n`);
   }
   return 0;
@@ -258,7 +267,7 @@ async function runCheckpointRestore(argv: string[], deps: SolveCommandDeps): Pro
     return 1;
   }
   const config = loadCliConfig(flags);
-  const result = await restoreCheckpoint({ sessionId, checkpointId, workspacePath: config.workspace });
+  const result = await restoreCheckpoint({ sessionId, checkpointId, workspacePath: config.workspace, force: flags.force === true });
   if (flags.json) writeJson(result, deps);
   else {
     stdout(deps).write(`${result.ok ? "restored" : "restore failed"} checkpoint=${result.checkpointId} exitCode=${result.exitCode}\n`);

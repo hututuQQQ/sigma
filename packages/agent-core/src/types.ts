@@ -26,6 +26,7 @@ export type AgentFinishReason =
   | "max_wall_time"
   | "validation_failed"
   | "precheck_failed"
+  | "cancelled"
   | "error";
 
 export type AgentHarnessValidationMode = "off" | "auto";
@@ -146,6 +147,7 @@ export type ContextMode = "off" | "repo-map";
 export interface McpServerRunSummary {
   name: string;
   enabled: boolean;
+  transport?: "stdio" | "http";
   tools_loaded: number;
   error?: string;
 }
@@ -286,6 +288,7 @@ export interface HarnessCommandResult {
   timeout_sec: number;
   duration_ms: number;
   timed_out?: boolean;
+  cancelled?: boolean;
   settled_on?: string;
   signal?: string | null;
   message: string;

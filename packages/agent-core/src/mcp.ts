@@ -10,9 +10,13 @@ import { redactSecretText } from "./redaction.js";
 type McpApprovalMode = "prompt" | "auto" | "approve";
 
 interface McpServerConfig {
+  transport?: unknown;
   command?: unknown;
   args?: unknown;
   env?: unknown;
+  url?: unknown;
+  headers?: unknown;
+  bearerTokenEnv?: unknown;
   enabled?: unknown;
   startupTimeoutSec?: unknown;
   toolTimeoutSec?: unknown;
@@ -38,6 +42,22 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface McpJsonRpcClient {
+  request(method: string, params: unknown, timeoutMs: number, abortSignal?: AbortSignal): Promise<unknown>;
+  notify(method: string, params: unknown): void;
+  close(): Promise<void>;
+  errorTail?(): string;
+}
+
+class McpRequestError extends Error {
+  constructor(
+    message: string,
+    readonly metadata: { cancelled?: boolean; timedOut?: boolean } = {}
+  ) {
+    super(message);
+  }
+}
+
 export interface CreateMcpToolRegistryOptions {
   workspacePath: string;
   configPath?: string;
@@ -61,6 +81,10 @@ function stringList(value: unknown): string[] | undefined {
 
 function approvalMode(value: unknown): McpApprovalMode {
   return value === "approve" || value === "auto" || value === "prompt" ? value : "prompt";
+}
+
+function transportValue(value: unknown): "stdio" | "http" {
+  return value === "http" ? "http" : "stdio";
 }
 
 function sanitizeName(value: string): string {
@@ -152,7 +176,7 @@ class StdioMcpClient {
     }
   }
 
-  request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+  request(method: string, params: unknown, timeoutMs: number, _abortSignal?: AbortSignal): Promise<unknown> {
     if (!this.child || !this.child.stdin.writable) {
       return Promise.reject(new Error(`MCP server ${this.name} is not running`));
     }
@@ -178,6 +202,10 @@ class StdioMcpClient {
     return this.stderrBuffer.trim();
   }
 
+  errorTail(): string {
+    return this.stderrTail();
+  }
+
   async close(): Promise<void> {
     if (!this.child) return;
     try {
@@ -191,7 +219,115 @@ class StdioMcpClient {
   }
 }
 
-async function initializeClient(client: StdioMcpClient, timeoutMs: number): Promise<McpTool[]> {
+class HttpMcpClient implements McpJsonRpcClient {
+  private nextId = 1;
+  private closed = false;
+  private lastError = "";
+
+  constructor(
+    private readonly name: string,
+    private readonly config: Required<Pick<McpServerConfig, "url">> & McpServerConfig
+  ) {}
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.config.headers && typeof this.config.headers === "object") {
+      for (const [key, value] of Object.entries(this.config.headers as Record<string, unknown>)) {
+        if (typeof value === "string") headers[key] = value;
+      }
+    }
+    if (typeof this.config.bearerTokenEnv === "string" && this.config.bearerTokenEnv.length > 0) {
+      const token = process.env[this.config.bearerTokenEnv];
+      if (token) headers.Authorization = `Bearer ${token}`;
+    }
+    return headers;
+  }
+
+  async request(method: string, params: unknown, timeoutMs: number, abortSignal?: AbortSignal): Promise<unknown> {
+    if (this.closed) throw new Error(`MCP server ${this.name} is closed`);
+    const controller = new AbortController();
+    let timedOut = false;
+    let cancelled = abortSignal?.aborted === true;
+    const abortFromContext = (): void => {
+      cancelled = true;
+      controller.abort();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, timeoutMs));
+    timer.unref();
+    if (cancelled) {
+      controller.abort();
+    } else {
+      abortSignal?.addEventListener("abort", abortFromContext, { once: true });
+    }
+    const id = this.nextId++;
+    try {
+      const response = await fetch(String(this.config.url), {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        signal: controller.signal
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(`HTTP MCP request failed with ${response.status}: ${text.slice(0, 500)}`);
+      }
+      const message = text ? JSON.parse(text) as { id?: unknown; result?: unknown; error?: { message?: unknown } } : {};
+      if (message.error) throw new Error(String(message.error.message ?? "MCP request failed"));
+      return message.result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = redactSecretText(message);
+      if (error instanceof Error && error.name === "AbortError") {
+        if (cancelled && !timedOut) {
+          const cancelledMessage = `MCP request cancelled: ${method}`;
+          this.lastError = cancelledMessage;
+          throw new McpRequestError(cancelledMessage, { cancelled: true });
+        }
+        const timeoutMessage = `MCP request timed out: ${method}`;
+        this.lastError = timeoutMessage;
+        throw new McpRequestError(timeoutMessage, { timedOut: true });
+      }
+      throw new Error(this.lastError);
+    } finally {
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", abortFromContext);
+    }
+  }
+
+  notify(method: string, params: unknown): void {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1000);
+    timer.unref();
+    void fetch(String(this.config.url), {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ jsonrpc: "2.0", method, params }),
+      signal: controller.signal
+    }).catch(() => undefined).finally(() => clearTimeout(timer));
+  }
+
+  errorTail(): string {
+    return this.lastError;
+  }
+
+  async close(): Promise<void> {
+    try {
+      await this.request("shutdown", {}, 1000);
+    } catch {
+      try {
+        await this.request("close", {}, 1000);
+      } catch {
+        // Best-effort close.
+      }
+    }
+    this.closed = true;
+  }
+}
+
+async function initializeClient(client: McpJsonRpcClient, timeoutMs: number): Promise<McpTool[]> {
   await client.request(
     "initialize",
     {
@@ -237,7 +373,7 @@ function registeredMcpTool(options: {
   serverName: string;
   tool: McpTool;
   sigmaName: string;
-  client: StdioMcpClient;
+  client: McpJsonRpcClient;
   serverConfig: McpServerConfig;
 }): RegisteredTool {
   const mode = approvalMode(options.serverConfig.approvalMode);
@@ -267,14 +403,22 @@ function registeredMcpTool(options: {
         const result = await options.client.request(
           "tools/call",
           { name: options.tool.name, arguments: args },
-          timeoutSec * 1000
+          timeoutSec * 1000,
+          context.abortSignal
         );
         return mcpToolContent(result);
       } catch (error) {
+        const requestError = error instanceof McpRequestError ? error : null;
         return {
           ok: false,
           content: error instanceof Error ? error.message : String(error),
-          metadata: { mcp: true, server: options.serverName, tool: options.tool.name }
+          metadata: {
+            mcp: true,
+            server: options.serverName,
+            tool: options.tool.name,
+            ...(requestError?.metadata.cancelled ? { cancelled: true } : {}),
+            ...(requestError?.metadata.timedOut ? { timedOut: true } : {})
+          }
         };
       }
     }
@@ -288,7 +432,7 @@ export async function createMcpToolRegistry(
   const config = await loadMcpConfig(workspacePath, options.configPath);
   const summaries: McpServerRunSummary[] = [];
   const tools: RegisteredTool[] = [];
-  const clients: StdioMcpClient[] = [];
+  const clients: McpJsonRpcClient[] = [];
   const seenToolNames = new Set<string>();
   if (!config?.servers || typeof config.servers !== "object") {
     return { registry: createToolRegistryFromTools([]), servers: summaries };
@@ -296,17 +440,24 @@ export async function createMcpToolRegistry(
 
   for (const [serverName, serverConfig] of Object.entries(config.servers)) {
     const enabled = serverConfig.enabled !== false;
-    const summary: McpServerRunSummary = { name: serverName, enabled, tools_loaded: 0 };
+    const transport = transportValue(serverConfig.transport);
+    const summary: McpServerRunSummary = { name: serverName, enabled, transport, tools_loaded: 0 };
     summaries.push(summary);
     if (!enabled) continue;
-    if (typeof serverConfig.command !== "string" || serverConfig.command.length === 0) {
-      summary.error = "MCP server command must be a non-empty string";
+    if (transport === "stdio" && (typeof serverConfig.command !== "string" || serverConfig.command.length === 0)) {
+      summary.error = "MCP stdio server command must be a non-empty string";
+      continue;
+    }
+    if (transport === "http" && (typeof serverConfig.url !== "string" || serverConfig.url.length === 0)) {
+      summary.error = "MCP HTTP server url must be a non-empty string";
       continue;
     }
 
-    const client = new StdioMcpClient(serverName, serverConfig as Required<Pick<McpServerConfig, "command">>, workspacePath);
+    const client: McpJsonRpcClient = transport === "http"
+      ? new HttpMcpClient(serverName, serverConfig as Required<Pick<McpServerConfig, "url">>)
+      : new StdioMcpClient(serverName, serverConfig as Required<Pick<McpServerConfig, "command">>, workspacePath);
     try {
-      await client.start();
+      if (client instanceof StdioMcpClient) await client.start();
       const startupTimeoutSec = numberOrDefault(serverConfig.startupTimeoutSec, 10, 1, 120);
       const listedTools = await initializeClient(client, startupTimeoutSec * 1000);
       const serverPrefix = sanitizeName(serverName);
@@ -325,7 +476,7 @@ export async function createMcpToolRegistry(
       clients.push(client);
     } catch (error) {
       summary.error = redactSecretText(
-        `${error instanceof Error ? error.message : String(error)}${client.stderrTail() ? `; stderr: ${client.stderrTail()}` : ""}`
+        `${error instanceof Error ? error.message : String(error)}${client.errorTail?.() ? `; detail: ${client.errorTail?.()}` : ""}`
       );
       await client.close();
     }

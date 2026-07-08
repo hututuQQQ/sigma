@@ -1,14 +1,16 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, cp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const pinnedNodeVersion = "v22.16.0";
 export const supportedTargetArchitectures = new Set(["x64", "arm64"]);
+const require = createRequire(import.meta.url);
 
-const packages = ["agent-ai", "agent-core", "agent-cli"];
+const packages = ["agent-ai", "agent-core", "agent-tui", "agent-cli"];
 
 export function normalizeTargetArch(value = "x64") {
   const targetArch = String(value || "x64").trim();
@@ -30,6 +32,10 @@ export function defaultNodeRuntimeTarballPath(artifactsDir, targetArch = "x64") 
   return path.join(artifactsDir, "cache", nodeRuntimeTarballName(targetArch));
 }
 
+export function nodeRuntimeDownloadUrl(targetArch = "x64") {
+  return `https://nodejs.org/dist/${pinnedNodeVersion}/${nodeRuntimeTarballName(targetArch)}`;
+}
+
 function assertBuiltPackage(rootDir, packageName) {
   const distDir = path.join(rootDir, "packages", packageName, "dist");
   if (!existsSync(distDir)) {
@@ -43,6 +49,45 @@ async function copyRuntimePackage(rootDir, packageName, targetRoot) {
   await mkdir(targetDir, { recursive: true });
   await cp(path.join(sourceRoot, "dist"), path.join(targetDir, "dist"), { recursive: true });
   await cp(path.join(sourceRoot, "package.json"), path.join(targetDir, "package.json"));
+}
+
+function workspaceDependencyName(value) {
+  return typeof value === "string" && value.startsWith("workspace:");
+}
+
+async function runtimeExternalDependencies(rootDir) {
+  const names = new Set();
+  for (const packageName of packages) {
+    const packageJson = JSON.parse(await readFile(path.join(rootDir, "packages", packageName, "package.json"), "utf8"));
+    for (const [name, version] of Object.entries(packageJson.dependencies ?? {})) {
+      if (!workspaceDependencyName(version)) names.add(name);
+    }
+  }
+  return [...names].sort((a, b) => a.localeCompare(b, "en"));
+}
+
+async function copyNodeModule(rootDir, packageName, targetNodeModules) {
+  const resolvePaths = [rootDir, path.join(rootDir, "packages", "agent-cli"), path.join(rootDir, "packages", "agent-core")];
+  let packageJsonPath;
+  try {
+    packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: resolvePaths });
+  } catch {
+    let cursor = path.dirname(require.resolve(packageName, { paths: resolvePaths }));
+    while (cursor !== path.dirname(cursor)) {
+      const candidate = path.join(cursor, "package.json");
+      if (existsSync(candidate)) {
+        packageJsonPath = candidate;
+        break;
+      }
+      cursor = path.dirname(cursor);
+    }
+  }
+  if (!packageJsonPath) throw new Error(`Could not locate package root for dependency ${packageName}`);
+  const sourceDir = path.dirname(packageJsonPath);
+  const targetDir = path.join(targetNodeModules, packageName);
+  await rm(targetDir, { recursive: true, force: true });
+  await mkdir(path.dirname(targetDir), { recursive: true });
+  await cp(sourceDir, targetDir, { recursive: true });
 }
 
 function runTar(args, errorMessage, cwd) {
@@ -78,33 +123,51 @@ function tarEntryToLocalPath(extractDir, entry) {
   return path.join(extractDir, ...normalized.split("/"));
 }
 
-function resolveNodeRuntimeTarball(rootDir, artifactsDir, targetArch, env) {
+async function defaultDownloader(url, destination) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`download failed with HTTP ${response.status}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  await mkdir(path.dirname(destination), { recursive: true });
+  await writeFile(destination, buffer);
+}
+
+async function resolveNodeRuntimeTarball(rootDir, artifactsDir, targetArch, env, downloader = defaultDownloader) {
   if (env.NODE_RUNTIME_TARBALL) {
     const configuredPath = path.resolve(rootDir, env.NODE_RUNTIME_TARBALL);
     if (!existsSync(configuredPath)) {
       throw new Error(`NODE_RUNTIME_TARBALL does not exist: ${configuredPath}`);
     }
-    return configuredPath;
+    return { runtimeTarball: configuredPath, cachePath: configuredPath, runtimeUrl: null, downloaded: false, source: "env" };
   }
 
   const cachedPath = defaultNodeRuntimeTarballPath(artifactsDir, targetArch);
   if (existsSync(cachedPath)) {
-    return cachedPath;
+    return { runtimeTarball: cachedPath, cachePath: cachedPath, runtimeUrl: nodeRuntimeDownloadUrl(targetArch), downloaded: false, source: "cache" };
   }
 
-  const runtimeName = nodeRuntimeTarballName(targetArch);
-  const runtimeUrl = `https://nodejs.org/dist/${pinnedNodeVersion}/${runtimeName}`;
-  throw new Error(
-    [
-      `NODE_RUNTIME_TARBALL is required to build the self-contained Linux agent artifact.`,
-      `Download ${runtimeUrl} to ${cachedPath}, or set NODE_RUNTIME_TARBALL to a pre-downloaded Node Linux tarball.`,
-      `Set AGENT_TARGET_ARCH=x64 or AGENT_TARGET_ARCH=arm64 to choose the Linux runtime architecture.`
-    ].join("\n")
-  );
+  const runtimeUrl = nodeRuntimeDownloadUrl(targetArch);
+  try {
+    await downloader(runtimeUrl, cachedPath, { targetArch, pinnedNodeVersion });
+  } catch (error) {
+    throw new Error(
+      [
+        `Failed to download Node runtime ${runtimeUrl} to ${cachedPath}.`,
+        `${error instanceof Error ? error.message : String(error)}`,
+        `Set NODE_RUNTIME_TARBALL to a pre-downloaded Linux Node tarball or pre-fill the cache for offline packaging.`
+      ].join("\n")
+    );
+  }
+  if (!existsSync(cachedPath)) {
+    throw new Error(`Downloader completed but did not create ${cachedPath}`);
+  }
+  return { runtimeTarball: cachedPath, cachePath: cachedPath, runtimeUrl, downloaded: true, source: "download" };
 }
 
-async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetArch, env) {
-  const runtimeTarball = resolveNodeRuntimeTarball(rootDir, artifactsDir, targetArch, env);
+async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetArch, env, downloader) {
+  const resolvedRuntime = await resolveNodeRuntimeTarball(rootDir, artifactsDir, targetArch, env, downloader);
+  const runtimeTarball = resolvedRuntime.runtimeTarball;
   const extractDir = path.join(artifactsDir, `.node-runtime-${targetArch}-${process.pid}`);
   await rm(extractDir, { recursive: true, force: true });
   await mkdir(extractDir, { recursive: true });
@@ -124,7 +187,15 @@ async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetArch, env
     const bundledNodePath = path.join(bundleDir, "bin", "node");
     await cp(nodePath, bundledNodePath);
     await chmod(bundledNodePath, 0o755).catch(() => undefined);
-    return { runtimeTarball, bundledNodePath };
+    let nodeVersionOutput = null;
+    if (process.platform !== "win32") {
+      const version = spawnSync(bundledNodePath, ["--version"], { encoding: "utf8" });
+      if (version.status !== 0) {
+        throw new Error(`bundled node did not run --version: ${version.stderr || version.stdout}`);
+      }
+      nodeVersionOutput = (version.stdout || version.stderr).trim();
+    }
+    return { ...resolvedRuntime, bundledNodePath, nodeVersionOutput };
   } finally {
     await rm(extractDir, { recursive: true, force: true });
   }
@@ -180,8 +251,12 @@ export async function packageAgentCli(options = {}) {
 
   await copyRuntimePackage(rootDir, "agent-ai", path.join(bundleDir, "node_modules"));
   await copyRuntimePackage(rootDir, "agent-core", path.join(bundleDir, "node_modules"));
+  await copyRuntimePackage(rootDir, "agent-tui", path.join(bundleDir, "node_modules"));
+  for (const dependency of await runtimeExternalDependencies(rootDir)) {
+    await copyNodeModule(rootDir, dependency, path.join(bundleDir, "node_modules"));
+  }
 
-  const nodeRuntime = await copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetArch, env);
+  const nodeRuntime = await copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetArch, env, options.downloader);
 
   await writeFile(
     path.join(bundleDir, "package.json"),
@@ -208,6 +283,26 @@ export async function packageAgentCli(options = {}) {
   await writeFile(
     path.join(bundleDir, "README.md"),
     "Bundled Sigma agent CLI artifact for Linux Harbor task containers. Extract it and run bin/agent.\n",
+    "utf8"
+  );
+  await writeFile(
+    path.join(bundleDir, "package-metadata.json"),
+    `${JSON.stringify(
+      {
+        targetArch,
+        node: {
+          version: pinnedNodeVersion,
+          runtimeUrl: nodeRuntime.runtimeUrl,
+          cachePath: nodeRuntime.cachePath,
+          runtimeTarball: nodeRuntime.runtimeTarball,
+          downloaded: nodeRuntime.downloaded,
+          source: nodeRuntime.source,
+          versionOutput: nodeRuntime.nodeVersionOutput
+        }
+      },
+      null,
+      2
+    )}\n`,
     "utf8"
   );
 

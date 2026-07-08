@@ -8,8 +8,16 @@ export function renderCommandPaletteOverlay(buffer: string, width: number, maxRo
   return lines.map((line) => fitStreamLine(line, width)).join("\n");
 }
 
-export function renderFileMentionPalette(prefix: string, suggestions: FileMentionSuggestion[], width: number, maxRows = 8, color = false): string {
+export function renderFileMentionPalette(
+  prefix: string,
+  suggestions: FileMentionSuggestion[],
+  width: number,
+  maxRows = 8,
+  color = false,
+  selectedPaths: Iterable<string> = []
+): string {
   const g = streamGlyphs();
+  const selected = [...selectedPaths];
   const lines = [roleColor("accent", `files @${prefix}`, color)];
   if (suggestions.length === 0) {
     lines.push("  no matching files");
@@ -20,7 +28,10 @@ export function renderFileMentionPalette(prefix: string, suggestions: FileMentio
       lines.push(`${prefixText}${truncateToWidth(suggestion.path, Math.max(8, width - visibleWidth(prefixText)))}`);
     }
   }
-  lines.push(muted("  Tab/Enter inserts the top match", color));
+  if (selected.length > 0) {
+    lines.push(muted(`  selected: ${selected.map((item) => `@${item}`).join(" ")}`, color));
+  }
+  lines.push(muted("  Space selects, Tab/Enter inserts", color));
   return lines.map((line) => fitStreamLine(line, width)).join("\n");
 }
 

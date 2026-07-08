@@ -203,7 +203,12 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
   const deadline = Date.now() + timeoutSec * 1000;
   let exitCode: number | undefined;
   let found = false;
+  let cancelled = false;
   while (Date.now() <= deadline) {
+    if (context.abortSignal?.aborted) {
+      cancelled = true;
+      break;
+    }
     const extracted = extractMarker(session.stdout, marker);
     if (extracted.found) {
       session.stdout = extracted.stdout;
@@ -220,19 +225,21 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
     store.sessions.delete(id);
   }
   const content = [
-    formatOutput(output.stdout, output.stderr, exitCode, !found),
-    !found ? "sessionState: stopped_after_timeout" : ""
+    formatOutput(output.stdout, output.stderr, exitCode, !found && !cancelled),
+    cancelled ? "cancelled: true" : "",
+    !found ? `sessionState: ${cancelled ? "stopped_after_cancel" : "stopped_after_timeout"}` : ""
   ].filter(Boolean).join("\n");
   const maxOutputChars = numberValue(args.maxOutputChars, context.maxToolOutputChars, 200, 50000);
   const truncated = truncateMiddle(content, maxOutputChars);
   return {
-    ok: found && exitCode === 0,
+    ok: found && !cancelled && exitCode === 0,
     content: truncated.text,
     metadata: {
       sessionId: id,
       exitCode,
-      timedOut: !found,
-      sessionState: found ? "idle" : "stopped_after_timeout",
+      timedOut: !found && !cancelled,
+      cancelled,
+      sessionState: found ? "idle" : cancelled ? "stopped_after_cancel" : "stopped_after_timeout",
       truncated: truncated.truncated
     }
   };

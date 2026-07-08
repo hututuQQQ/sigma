@@ -10,6 +10,7 @@ export interface CommandResult {
   stderr: Buffer;
   durationMs: number;
   timedOut: boolean;
+  cancelled?: boolean;
   settledOn: CommandSettledOn;
   error?: Error;
 }
@@ -28,6 +29,7 @@ export interface RunCommandOptions {
   termToKillMs?: number;
   detachedProcessGroup?: boolean;
   windowsHide?: boolean;
+  abortSignal?: AbortSignal;
 }
 
 export interface RunBashCommandOptions {
@@ -39,6 +41,7 @@ export interface RunBashCommandOptions {
   killSettleMs?: number;
   termToKillMs?: number;
   detachedProcessGroup?: boolean;
+  abortSignal?: AbortSignal;
 }
 
 export function bashExecutable(): string {
@@ -98,10 +101,25 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
   const termToKillMs = Math.max(1, Math.min(killSettleMs, Math.floor(options.termToKillMs ?? 500)));
   const detachedProcessGroup = options.detachedProcessGroup ?? process.platform !== "win32";
 
+  if (options.abortSignal?.aborted) {
+    return {
+      exitCode: null,
+      signal: "SIGTERM",
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+      durationMs: 0,
+      timedOut: false,
+      cancelled: true,
+      settledOn: "error",
+      error: new Error("Command cancelled before start")
+    };
+  }
+
   return await new Promise<CommandResult>((resolve) => {
     let child: ChildProcessWithoutNullStreams | undefined;
     let settled = false;
     let timedOut = false;
+    let cancelled = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | string | null = null;
     let sentSignal: NodeJS.Signals | null = null;
@@ -109,6 +127,7 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
     let escalationTimer: ReturnType<typeof setTimeout> | undefined;
     let hardSettleTimer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
 
     function finish(settledOn: CommandSettledOn, error?: Error): void {
       if (settled) return;
@@ -117,6 +136,7 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
       clearTimer(drainTimer);
       clearTimer(escalationTimer);
       clearTimer(hardSettleTimer);
+      if (abortListener && options.abortSignal) options.abortSignal.removeEventListener("abort", abortListener);
 
       if (child) {
         child.stdout.destroy();
@@ -131,6 +151,7 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
         stderr: Buffer.concat(stderrChunks),
         durationMs: Date.now() - startedAt,
         timedOut,
+        cancelled,
         settledOn,
         error
       });
@@ -156,6 +177,25 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     }
 
     const runningChild = child;
+    function cancelProcess(): void {
+      if (settled) return;
+      cancelled = true;
+      sentSignal = "SIGTERM";
+      clearTimer(timeoutTimer);
+      killProcessTree(runningChild, "SIGTERM");
+      escalationTimer = setTimeout(() => {
+        if (settled) return;
+        sentSignal = "SIGKILL";
+        killProcessTree(runningChild, "SIGKILL");
+      }, termToKillMs);
+      escalationTimer.unref();
+      hardSettleTimer = setTimeout(() => finish("timeout"), killSettleMs);
+      hardSettleTimer.unref();
+    }
+    if (options.abortSignal) {
+      abortListener = cancelProcess;
+      options.abortSignal.addEventListener("abort", abortListener, { once: true });
+    }
     runningChild.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
     runningChild.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
     runningChild.stdin.on("error", () => {
@@ -209,6 +249,7 @@ export async function runBashCommand(options: RunBashCommandOptions): Promise<Ba
     killSettleMs: options.killSettleMs,
     termToKillMs: options.termToKillMs,
     detachedProcessGroup: options.detachedProcessGroup,
-    windowsHide: true
+    windowsHide: true,
+    abortSignal: options.abortSignal
   });
 }

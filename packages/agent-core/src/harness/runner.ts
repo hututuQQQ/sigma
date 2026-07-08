@@ -6,6 +6,7 @@ import { createSessionManager } from "../session/session-manager.js";
 import type {
   AgentHarnessConfig,
   AgentHarnessSummary,
+  AgentEvent,
   AgentRunResult,
   EvidenceRecord,
   HarnessCommandResult,
@@ -18,7 +19,7 @@ import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } fro
 import { runHarnessCommand } from "./validation.js";
 import { planValidationCommandSpecs } from "./validation-planner.js";
 import { finalizeManagedServices } from "../tools/service.js";
-import { redactSecrets } from "../redaction.js";
+import { redactSecrets, redactSecretText } from "../redaction.js";
 import { evidenceKindForCommand } from "../controller/evidence.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
@@ -125,7 +126,8 @@ async function runChecks(options: {
         workspacePath,
         attempt: options.attempt,
         timeoutSec: validationTimeoutSec,
-        relatedFiles: spec.relatedFiles
+        relatedFiles: spec.relatedFiles,
+        abortSignal: options.config.abortSignal
       });
       emitHarnessEvent(options.config, "harness_check_end", {
         kind: "validation",
@@ -138,32 +140,6 @@ async function runChecks(options: {
     }
   }
 
-  if (options.config.precheckCommand?.trim()) {
-    emitHarnessEvent(options.config, "harness_check_start", {
-      kind: "precheck",
-      source: "precheck",
-      attempt: options.attempt,
-      command: options.config.precheckCommand
-    });
-    const result = await runHarnessCommand({
-      kind: "precheck",
-      source: "precheck",
-      command: options.config.precheckCommand,
-      workspacePath,
-      attempt: options.attempt,
-      timeoutSec: options.config.precheckTimeoutSec ?? DEFAULT_PRECHECK_TIMEOUT_SEC,
-      relatedFiles: []
-    });
-    emitHarnessEvent(options.config, "harness_check_end", {
-      kind: "precheck",
-      source: "precheck",
-      attempt: options.attempt,
-      exitCode: result.exit_code,
-      durationMs: result.duration_ms
-    });
-    results.push(result);
-  }
-
   const traceTail = await readTraceTail(options.attemptTracePath);
   const feedbackSummary = summaryFeedback(options.attemptSummary);
   for (const result of results) {
@@ -172,6 +148,38 @@ async function runChecks(options: {
   }
 
   return { results, traceTail };
+}
+
+async function runPrecheckBeforeAttempt(options: {
+  config: AgentHarnessConfig;
+  attempt: number;
+}): Promise<HarnessCommandResult | null> {
+  if (!options.config.precheckCommand?.trim()) return null;
+  const command = options.config.precheckCommand;
+  emitHarnessEvent(options.config, "harness_check_start", {
+    kind: "precheck",
+    source: "precheck",
+    attempt: options.attempt,
+    command
+  });
+  const result = await runHarnessCommand({
+    kind: "precheck",
+    source: "precheck",
+    command,
+    workspacePath: path.resolve(options.config.workspacePath),
+    attempt: options.attempt,
+    timeoutSec: options.config.precheckTimeoutSec ?? DEFAULT_PRECHECK_TIMEOUT_SEC,
+    relatedFiles: [],
+    abortSignal: options.config.abortSignal
+  });
+  emitHarnessEvent(options.config, "harness_check_end", {
+    kind: "precheck",
+    source: "precheck",
+    attempt: options.attempt,
+    exitCode: result.exit_code,
+    durationMs: result.duration_ms
+  });
+  return result;
 }
 
 function finalResultForHarness(options: {
@@ -261,6 +269,35 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
         parentSessionId: config.parentSessionId,
         forkedFromSessionId: config.forkedFromSessionId
       });
+  const pendingEventWrites: Promise<void>[] = [];
+  const parentEventWriteErrors: string[] = [];
+  let activeAttemptForEvents: number | null = null;
+  const enqueueParentEventWrite = (agentEvent: AgentEvent): void => {
+    if (!durableSession) return;
+    const write = durableSession.appendEvent(agentEvent).catch((error) => {
+      parentEventWriteErrors.push(redactSecretText(error instanceof Error ? error.message : String(error)));
+    });
+    pendingEventWrites.push(write);
+  };
+  const settleParentEventWrites = async (): Promise<void> => {
+    if (pendingEventWrites.length === 0) return;
+    await Promise.allSettled(pendingEventWrites.splice(0));
+  };
+  const controllerEventBus = {
+    emit(agentEvent: AgentEvent): void {
+      const enriched: AgentEvent = {
+        ...agentEvent,
+        ...(durableSession?.sessionId ? { sessionId: durableSession.sessionId } : {}),
+        metadata: {
+          ...(agentEvent.metadata ?? {}),
+          ...(activeAttemptForEvents !== null ? { attempt: activeAttemptForEvents } : {})
+        }
+      };
+      enqueueParentEventWrite(enriched);
+      config.eventBus?.emit(enriched);
+    }
+  };
+  const controllerConfig: AgentHarnessConfig = { ...config, eventBus: controllerEventBus };
 
   const attempts: AgentRunResult[] = [];
   const validationResults: HarnessCommandResult[] = [];
@@ -286,15 +323,35 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     const attemptSummaryPath = path.join(attemptDir, "summary.json");
     const attemptTracePath = path.join(attemptDir, "trace.jsonl");
     await mkdir(attemptDir, { recursive: true });
+    activeAttemptForEvents = attempt;
+    const precheck = await runPrecheckBeforeAttempt({ config: controllerConfig, attempt });
+    if (precheck) {
+      precheckResults.push(precheck);
+      if (precheck.exit_code !== 0) {
+        lastFailed = [precheck];
+        failureMessage = precheck.message;
+        break;
+      }
+    }
+
     const beforeManifest = config.validationMode === "auto" ? await listWorkspaceManifest(config.workspacePath) : null;
 
-    const attemptResult = await runAgent({
-      ...config,
+    const rawAttemptResult = await runAgent({
+      ...controllerConfig,
       instruction: activeInstruction,
       summaryJsonPath: attemptSummaryPath,
       traceJsonlPath: attemptTracePath,
       durableSession: false
     });
+    const attemptCancelled = rawAttemptResult.finishReason === "cancelled" || config.abortSignal?.aborted === true;
+    const attemptResult: AgentRunResult = attemptCancelled && rawAttemptResult.finishReason !== "cancelled"
+      ? {
+          ...rawAttemptResult,
+          status: "stopped",
+          finishReason: "cancelled",
+          lastError: rawAttemptResult.lastError ?? "Run cancelled."
+        }
+      : rawAttemptResult;
     attempts.push(attemptResult);
     finalTracePath = attemptTracePath;
     finalAttemptSummary = summaryFromAttempt(attemptResult);
@@ -306,13 +363,19 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       trace_path: relativeArtifactPath(attemptTracePath, summaryDir)
     });
 
+    if (attemptCancelled) {
+      failureMessage = attemptResult.lastError ?? "Run cancelled.";
+      lastFailed = [];
+      break;
+    }
+
     if (attemptResult.status === "error") {
       failureMessage = attemptResult.lastError;
       break;
     }
 
     const { results, traceTail } = await runChecks({
-      config,
+      config: controllerConfig,
       attempt,
       beforeManifest,
       attemptSummary: finalAttemptSummary,
@@ -353,10 +416,32 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       traceTail
     });
   }
+  activeAttemptForEvents = null;
 
   harness.managed_service_finalization = await finalizeManagedServices();
   harness.post_run_cleanup = await runPostRunCleanup(config.postRunCleanupGlobs ?? []);
-  const finalAttempt = attempts[attempts.length - 1];
+  const fallbackAttempt: AgentRunResult = {
+    sessionId: durableSession?.sessionId,
+    status: "error",
+    finishReason: "precheck_failed",
+    turns: 0,
+    toolCalls: 0,
+    commandsExecuted: 0,
+    usage: { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 },
+    provider: config.modelClient.provider,
+    model: config.modelClient.model,
+    durationMs: Date.now() - startedAtMs,
+    lastError: failureMessage,
+    toolsAvailable: [],
+    changedFiles: [],
+    todoItems: [],
+    projectInstructionSources: [],
+    contextMode: config.contextMode,
+    mcpServers: config.mcpServers,
+    evidenceRecords: [],
+    selectedSkills: []
+  };
+  const finalAttempt = attempts[attempts.length - 1] ?? fallbackAttempt;
   const finalResult = finalResultForHarness({
     attempts,
     finalAttempt,
@@ -371,6 +456,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     await mkdir(path.dirname(path.resolve(config.traceJsonlPath)), { recursive: true });
     await copyFile(finalTracePath, config.traceJsonlPath);
   }
+  await settleParentEventWrites();
+  void parentEventWriteErrors;
   await durableSession?.complete(finalResult, summaryJsonFromRunResult(finalResult));
 
   return finalResult;

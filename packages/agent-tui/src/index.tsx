@@ -13,6 +13,8 @@ import { runTuiApp, type TuiAppOptions } from "./app.js";
 
 type CliOptions = TuiAppOptions;
 
+export { runTuiApp, type TuiAppOptions } from "./app.js";
+
 function printHelp(): void {
   process.stdout.write(`agent-tui [flags]
 
@@ -57,6 +59,12 @@ Inside the TUI:
   /context (/c)
   /files (/f)
   /tools (/t)
+  /sessions
+  /session <id>
+  /resume <id> <instruction>
+  /fork <id> <instruction>
+  /search <query>
+  /history <query>
   /diff (/d)
   /diff stat (/ds)
   /diff patch (/dp)
