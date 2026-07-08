@@ -43,10 +43,19 @@ interface PendingRequest {
 }
 
 interface McpJsonRpcClient {
-  request(method: string, params: unknown, timeoutMs: number): Promise<unknown>;
+  request(method: string, params: unknown, timeoutMs: number, abortSignal?: AbortSignal): Promise<unknown>;
   notify(method: string, params: unknown): void;
   close(): Promise<void>;
   errorTail?(): string;
+}
+
+class McpRequestError extends Error {
+  constructor(
+    message: string,
+    readonly metadata: { cancelled?: boolean; timedOut?: boolean } = {}
+  ) {
+    super(message);
+  }
 }
 
 export interface CreateMcpToolRegistryOptions {
@@ -167,7 +176,7 @@ class StdioMcpClient {
     }
   }
 
-  request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+  request(method: string, params: unknown, timeoutMs: number, _abortSignal?: AbortSignal): Promise<unknown> {
     if (!this.child || !this.child.stdin.writable) {
       return Promise.reject(new Error(`MCP server ${this.name} is not running`));
     }
@@ -234,11 +243,25 @@ class HttpMcpClient implements McpJsonRpcClient {
     return headers;
   }
 
-  async request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+  async request(method: string, params: unknown, timeoutMs: number, abortSignal?: AbortSignal): Promise<unknown> {
     if (this.closed) throw new Error(`MCP server ${this.name} is closed`);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+    let timedOut = false;
+    let cancelled = abortSignal?.aborted === true;
+    const abortFromContext = (): void => {
+      cancelled = true;
+      controller.abort();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, timeoutMs));
     timer.unref();
+    if (cancelled) {
+      controller.abort();
+    } else {
+      abortSignal?.addEventListener("abort", abortFromContext, { once: true });
+    }
     const id = this.nextId++;
     try {
       const response = await fetch(String(this.config.url), {
@@ -258,11 +281,19 @@ class HttpMcpClient implements McpJsonRpcClient {
       const message = error instanceof Error ? error.message : String(error);
       this.lastError = redactSecretText(message);
       if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`MCP request timed out: ${method}`);
+        if (cancelled && !timedOut) {
+          const cancelledMessage = `MCP request cancelled: ${method}`;
+          this.lastError = cancelledMessage;
+          throw new McpRequestError(cancelledMessage, { cancelled: true });
+        }
+        const timeoutMessage = `MCP request timed out: ${method}`;
+        this.lastError = timeoutMessage;
+        throw new McpRequestError(timeoutMessage, { timedOut: true });
       }
       throw new Error(this.lastError);
     } finally {
       clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", abortFromContext);
     }
   }
 
@@ -372,14 +403,22 @@ function registeredMcpTool(options: {
         const result = await options.client.request(
           "tools/call",
           { name: options.tool.name, arguments: args },
-          timeoutSec * 1000
+          timeoutSec * 1000,
+          context.abortSignal
         );
         return mcpToolContent(result);
       } catch (error) {
+        const requestError = error instanceof McpRequestError ? error : null;
         return {
           ok: false,
           content: error instanceof Error ? error.message : String(error),
-          metadata: { mcp: true, server: options.serverName, tool: options.tool.name }
+          metadata: {
+            mcp: true,
+            server: options.serverName,
+            tool: options.tool.name,
+            ...(requestError?.metadata.cancelled ? { cancelled: true } : {}),
+            ...(requestError?.metadata.timedOut ? { timedOut: true } : {})
+          }
         };
       }
     }

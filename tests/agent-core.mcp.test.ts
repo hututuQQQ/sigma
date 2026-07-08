@@ -81,7 +81,7 @@ async function startHttpMcpServer(handler: (message: Record<string, unknown>, re
       return;
     }
     const result = await handler(message, req, res);
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !res.destroyed) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
     }
@@ -266,6 +266,67 @@ describe("MCP stdio bridge", () => {
       await mcp.registry.close?.();
     } finally {
       delete process.env.SIGMA_MCP_TOKEN;
+      await server.close();
+    }
+  });
+
+  it("cancels blocking HTTP MCP tool calls from the run abort signal", async () => {
+    const { dir, context } = await workspace();
+    const controller = new AbortController();
+    context.abortSignal = controller.signal;
+    let resolveToolStarted!: () => void;
+    const toolStarted = new Promise<void>((resolve) => {
+      resolveToolStarted = resolve;
+    });
+    const server = await startHttpMcpServer(async (message, req) => {
+      if (message.method === "initialize") return { protocolVersion: "2024-11-05", capabilities: {} };
+      if (message.method === "tools/list") {
+        return {
+          tools: [
+            {
+              name: "slow",
+              description: "Slow tool",
+              inputSchema: { type: "object" },
+              annotations: { readOnlyHint: true }
+            }
+          ]
+        };
+      }
+      if (message.method === "tools/call") {
+        resolveToolStarted();
+        await new Promise<void>((resolve) => req.on("close", resolve));
+        return { content: [{ type: "text", text: "late" }] };
+      }
+      return {};
+    });
+    try {
+      await writeMcpConfig(dir, {
+        servers: {
+          remote: {
+            transport: "http",
+            url: server.url,
+            approvalMode: "auto",
+            toolTimeoutSec: 5
+          }
+        }
+      });
+
+      const mcp = await createMcpToolRegistry({ workspacePath: dir });
+      const startedAt = Date.now();
+      const pending = mcp.registry.execute(
+        { id: "http-abort", type: "function", function: { name: "mcp_remote_slow", arguments: {} } },
+        context
+      );
+      await toolStarted;
+      controller.abort();
+      const result = await pending;
+
+      expect(Date.now() - startedAt).toBeLessThan(1500);
+      expect(result.ok).toBe(false);
+      expect(result.content).toContain("cancelled");
+      expect(result.metadata).toMatchObject({ mcp: true, server: "remote", tool: "slow", cancelled: true });
+      await mcp.registry.close?.();
+    } finally {
       await server.close();
     }
   });

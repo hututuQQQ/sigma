@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { TuiAppOptions } from "agent-tui";
 import { runChatCommand } from "./commands/chat.js";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runReplayCommand } from "./commands/replay.js";
@@ -9,6 +12,11 @@ import {
   runSessionsCommand
 } from "./commands/session.js";
 import { runRunCommand, runSolveCommand } from "./commands/solve.js";
+import { loadCliConfig, parseArgs, type CliConfig } from "./config.js";
+
+export interface AgentCliMainOptions {
+  tuiRunner?: (options: TuiAppOptions) => Promise<void>;
+}
 
 function printHelp(): void {
   process.stdout.write(`agent <command> [flags]
@@ -127,8 +135,58 @@ _agent "$@"
   throw new Error("completion shell must be bash, zsh, or fish");
 }
 
-async function main(): Promise<number> {
-  const args = process.argv.slice(2);
+function tuiOptionsFromCliConfig(config: CliConfig): TuiAppOptions {
+  return {
+    workspace: config.workspace,
+    provider: config.provider,
+    model: config.model,
+    permissionMode: config.permissionMode,
+    maxTurns: config.maxTurns,
+    maxWallTimeSec: config.maxWallTimeSec,
+    commandTimeoutSec: config.commandTimeoutSec,
+    validationMode: config.validationMode,
+    validationCommands: config.validationCommands,
+    validationRetryLimit: config.validationRetryLimit,
+    validationTimeoutSec: config.validationTimeoutSec,
+    precheckCommand: config.precheckCommand,
+    precheckTimeoutSec: config.precheckTimeoutSec,
+    postRunCleanupGlobs: config.postRunCleanupGlobs,
+    harnessTimeoutSec: config.harnessTimeoutSec,
+    retryMinBudgetSec: config.retryMinBudgetSec,
+    attemptsDir: config.attemptsDir,
+    allowedTools: config.allowedTools,
+    disabledTools: config.disabledTools,
+    contextMode: config.contextMode,
+    repoMapMaxChars: config.repoMapMaxChars,
+    finalEvidenceMode: config.finalEvidenceMode,
+    skillsMode: config.skillsMode,
+    skillsMaxChars: config.skillsMaxChars,
+    enableMcp: config.enableMcp,
+    mcpConfig: config.mcpConfig,
+    traceJsonl: config.traceJsonl,
+    sessionJsonl: config.sessionJsonl,
+    summaryJson: config.summaryJson
+  };
+}
+
+async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Promise<number> {
+  if (argv.includes("--help") || argv.includes("-h")) {
+    const tui = await import("agent-tui");
+    return await tui.main(argv);
+  }
+  const { flags } = parseArgs(argv);
+  const cliConfig = loadCliConfig(flags);
+  const tuiOptions = tuiOptionsFromCliConfig(cliConfig);
+  if (options.tuiRunner) {
+    await options.tuiRunner(tuiOptions);
+  } else {
+    const tui = await import("agent-tui");
+    await tui.runTuiApp(tuiOptions);
+  }
+  return 0;
+}
+
+export async function runAgentCommand(args = process.argv.slice(2), options: AgentCliMainOptions = {}): Promise<number> {
   if (args[0] === "--") {
     args.shift();
   }
@@ -140,10 +198,7 @@ async function main(): Promise<number> {
 
   if (command === "run") return await runRunCommand(rest);
   if (command === "solve") return await runSolveCommand(rest);
-  if (command === "tui") {
-    const tui = await import("agent-tui");
-    return await tui.main(rest);
-  }
+  if (command === "tui") return await runTuiCommand(rest, options);
   if (command === "chat") return await runChatCommand(rest);
   if (command === "sessions" || command === "history") return await runSessionsCommand(rest);
   if (command === "session") return await runSessionCommand(rest);
@@ -161,11 +216,13 @@ async function main(): Promise<number> {
   return 1;
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  runAgentCommand()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    });
+}

@@ -5,6 +5,7 @@ import { Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
+import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runRunCommand, runSolveCommand } from "../packages/agent-cli/src/commands/solve.js";
 
 class FinalModel implements ModelClient {
@@ -232,6 +233,53 @@ describe("agent-cli solve", () => {
       enableMcp: true,
       mcpConfig: ".agent/mcp.json",
       noStreamUi: false
+    });
+  });
+
+  it("applies root CLI config precedence to agent tui dispatch", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-tui-config-${Date.now()}`), { recursive: true });
+    await mkdir(path.join(dir, ".agent"), { recursive: true });
+    await writeFile(
+      path.join(dir, ".agent", "config.toml"),
+      [
+        "[run]",
+        'provider = "glm"',
+        'permission_mode = "yolo"',
+        "",
+        "[validation]",
+        'mode = "auto"'
+      ].join("\n"),
+      "utf8"
+    );
+    const calls: Array<{ provider: string; permissionMode: string; validationMode?: string; workspace: string }> = [];
+
+    await expect(
+      runAgentCommand(["tui", "--workspace", dir], {
+        tuiRunner: async (options) => {
+          calls.push(options);
+        }
+      })
+    ).resolves.toBe(0);
+
+    expect(calls[0]).toMatchObject({
+      workspace: dir,
+      provider: "glm",
+      permissionMode: "yolo",
+      validationMode: "auto"
+    });
+
+    await expect(
+      runAgentCommand(["tui", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "ask", "--validation-mode", "off"], {
+        tuiRunner: async (options) => {
+          calls.push(options);
+        }
+      })
+    ).resolves.toBe(0);
+
+    expect(calls[1]).toMatchObject({
+      provider: "deepseek",
+      permissionMode: "ask",
+      validationMode: "off"
     });
   });
 

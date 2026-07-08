@@ -1056,7 +1056,14 @@ export class TuiApp {
     }
     const { mention, suggestions } = this.currentFileSuggestions();
     if (mention) {
-      return renderFileMentionPalette(mention.prefix, suggestions, width, Math.min(8, rows), this.colorEnabled);
+      return renderFileMentionPalette(
+        mention.prefix,
+        suggestions,
+        width,
+        Math.min(8, rows),
+        this.colorEnabled,
+        this.selectedFileMentions
+      );
     }
     return undefined;
   }

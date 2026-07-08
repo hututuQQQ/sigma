@@ -12,7 +12,8 @@ import { renderFileMentionPalette } from "../packages/agent-tui/src/render/palet
 import {
   activeFileMention,
   fileMentionSuggestions,
-  insertFileMention
+  insertFileMention,
+  insertFileMentions
 } from "../packages/agent-tui/src/file-mentions.js";
 import { assertWithinWidth } from "../packages/agent-tui/src/ui/layout.js";
 import {
@@ -68,14 +69,19 @@ describe("agent-tui commands and mention palettes", () => {
       text: "open @src/app.tsx",
       cursor: "open @src/app.tsx".length
     });
+    expect(insertFileMentions("open @src/ap", mention, ["src/app.tsx", "README.md"])).toEqual({
+      text: "open @src/app.tsx @README.md",
+      cursor: "open @src/app.tsx @README.md".length
+    });
 
     const palette = renderFileMentionPalette("src/", [
       { path: "src/app.tsx", score: 100 },
       { path: "src/render/screen-with-a-very-long-name.ts", score: 80 }
-    ], 28, 4, false);
+    ], 38, 4, false, ["src/app.tsx"]);
     expect(palette).toContain("\u203a src/app.tsx");
+    expect(palette).toContain("selected: @src/app.tsx");
     expect(palette).toContain("Space selects");
-    expect(assertWithinWidth(palette, 28)).toBe(true);
+    expect(assertWithinWidth(palette, 38)).toBe(true);
   });
 
   it("classifies cd as a local workspace switch before model submission", () => {

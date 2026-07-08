@@ -19,7 +19,7 @@ import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } fro
 import { runHarnessCommand } from "./validation.js";
 import { planValidationCommandSpecs } from "./validation-planner.js";
 import { finalizeManagedServices } from "../tools/service.js";
-import { redactSecrets } from "../redaction.js";
+import { redactSecrets, redactSecretText } from "../redaction.js";
 import { evidenceKindForCommand } from "../controller/evidence.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
@@ -269,8 +269,20 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
         parentSessionId: config.parentSessionId,
         forkedFromSessionId: config.forkedFromSessionId
       });
-  const parentEvents: AgentEvent[] = [];
+  const pendingEventWrites: Promise<void>[] = [];
+  const parentEventWriteErrors: string[] = [];
   let activeAttemptForEvents: number | null = null;
+  const enqueueParentEventWrite = (agentEvent: AgentEvent): void => {
+    if (!durableSession) return;
+    const write = durableSession.appendEvent(agentEvent).catch((error) => {
+      parentEventWriteErrors.push(redactSecretText(error instanceof Error ? error.message : String(error)));
+    });
+    pendingEventWrites.push(write);
+  };
+  const settleParentEventWrites = async (): Promise<void> => {
+    if (pendingEventWrites.length === 0) return;
+    await Promise.allSettled(pendingEventWrites.splice(0));
+  };
   const controllerEventBus = {
     emit(agentEvent: AgentEvent): void {
       const enriched: AgentEvent = {
@@ -281,7 +293,7 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
           ...(activeAttemptForEvents !== null ? { attempt: activeAttemptForEvents } : {})
         }
       };
-      parentEvents.push(enriched);
+      enqueueParentEventWrite(enriched);
       config.eventBus?.emit(enriched);
     }
   };
@@ -324,13 +336,22 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
 
     const beforeManifest = config.validationMode === "auto" ? await listWorkspaceManifest(config.workspacePath) : null;
 
-    const attemptResult = await runAgent({
+    const rawAttemptResult = await runAgent({
       ...controllerConfig,
       instruction: activeInstruction,
       summaryJsonPath: attemptSummaryPath,
       traceJsonlPath: attemptTracePath,
       durableSession: false
     });
+    const attemptCancelled = rawAttemptResult.finishReason === "cancelled" || config.abortSignal?.aborted === true;
+    const attemptResult: AgentRunResult = attemptCancelled && rawAttemptResult.finishReason !== "cancelled"
+      ? {
+          ...rawAttemptResult,
+          status: "stopped",
+          finishReason: "cancelled",
+          lastError: rawAttemptResult.lastError ?? "Run cancelled."
+        }
+      : rawAttemptResult;
     attempts.push(attemptResult);
     finalTracePath = attemptTracePath;
     finalAttemptSummary = summaryFromAttempt(attemptResult);
@@ -341,6 +362,12 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       summary_path: relativeArtifactPath(attemptSummaryPath, summaryDir),
       trace_path: relativeArtifactPath(attemptTracePath, summaryDir)
     });
+
+    if (attemptCancelled) {
+      failureMessage = attemptResult.lastError ?? "Run cancelled.";
+      lastFailed = [];
+      break;
+    }
 
     if (attemptResult.status === "error") {
       failureMessage = attemptResult.lastError;
@@ -429,9 +456,8 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     await mkdir(path.dirname(path.resolve(config.traceJsonlPath)), { recursive: true });
     await copyFile(finalTracePath, config.traceJsonlPath);
   }
-  for (const agentEvent of parentEvents) {
-    await durableSession?.appendEvent(agentEvent);
-  }
+  await settleParentEventWrites();
+  void parentEventWriteErrors;
   await durableSession?.complete(finalResult, summaryJsonFromRunResult(finalResult));
 
   return finalResult;

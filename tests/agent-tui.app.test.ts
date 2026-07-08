@@ -243,6 +243,36 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     }
   });
 
+  it("selects multiple file mention top matches before inserting them", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-mentions-"));
+    fs.mkdirSync(path.join(root, "src"));
+    fs.writeFileSync(path.join(root, "src", "a.ts"), "");
+    fs.writeFileSync(path.join(root, "src", "alpha.ts"), "");
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, "open @src/a");
+      stdin.emit("keypress", " ", { name: "space" });
+
+      expect(stripAnsi(stdout.last())).toContain("selected: @src/a.ts");
+
+      stdin.emit("keypress", "l", { name: "l" });
+      stdin.emit("keypress", " ", { name: "space" });
+      stdin.emit("keypress", "", { name: "return" });
+
+      expect(target.composer.text).toBe("open @src/a.ts @src/alpha.ts");
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("shows a shell hint for shell-like input without calling the model", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-shell-hint-"));
     const stdout = new FakeStdout();

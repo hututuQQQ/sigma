@@ -138,6 +138,8 @@ function flattenConfig(parsed: unknown): ConfigValues {
     if (!isRecord(value)) result[key] = value;
   }
   addSection("run", {
+    provider: "provider",
+    model: "model",
     max_turns: "max_turns",
     max_wall_time_sec: "max_wall_time_sec",
     command_timeout_sec: "command_timeout_sec",
