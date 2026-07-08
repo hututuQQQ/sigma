@@ -50,9 +50,66 @@ export interface ToolRuntimeMetadata {
   readOnly?: boolean;
   supportsParallel?: boolean;
   waitsForCancellation?: boolean;
+  cancellable?: boolean;
+  longRunning?: boolean;
+  progressKind?: "none" | "message" | "percent" | "stream" | "grouped";
   approval?: ToolApprovalMode;
   sandbox?: ToolSandboxMode;
   outputBudget?: number;
+}
+
+export type ToolUiRenderKind = "text" | "command" | "file_change" | "artifact" | "question" | "custom";
+export type ToolProgressPhase = "queued" | "running" | "progress" | "completed" | "failed" | "aborted";
+export type ToolResourceKind = "file" | "workspace" | "shell" | "network" | "mcp" | "memory" | "artifact" | "unknown";
+export type ToolPermissionRisk = ToolRisk | "memory" | "artifact";
+
+export interface ToolResourceDescriptor {
+  kind: ToolResourceKind;
+  path?: string;
+  host?: string;
+  command?: string;
+  mode?: "read" | "write" | "execute" | "network";
+  description?: string;
+}
+
+export interface ToolUiDescriptor {
+  label?: string;
+  group?: string;
+  icon?: string;
+  renderKind?: ToolUiRenderKind;
+  order?: number;
+}
+
+export interface ToolPermissionDescriptor {
+  risk?: ToolPermissionRisk;
+  approval?: ToolApprovalMode;
+  sandbox?: ToolSandboxMode;
+  resources?: ToolResourceDescriptor[];
+  reason?: string;
+}
+
+export interface ToolResultDescriptor {
+  outputSchema?: Record<string, unknown>;
+  modelProjection?: "content" | "structured" | "none";
+  uiProjection?: ToolUiRenderKind;
+  artifactPolicy?: "none" | "on_truncate" | "always";
+  modelVisibleFields?: string[];
+  privateFields?: string[];
+}
+
+export interface ToolLifecycleDescriptor {
+  defer?: boolean;
+  hooks?: string[];
+  cancellable?: boolean;
+}
+
+export interface ToolDescriptor {
+  model: ToolDefinition;
+  ui?: ToolUiDescriptor;
+  permission?: ToolPermissionDescriptor;
+  runtime?: ToolRuntimeMetadata;
+  result?: ToolResultDescriptor;
+  lifecycle?: ToolLifecycleDescriptor;
 }
 
 export interface ExecPolicyRule {
@@ -128,6 +185,7 @@ export interface PermissionRequest {
   risk: ToolRisk;
   reason: string;
   workspacePath: string;
+  resources?: ToolResourceDescriptor[];
 }
 
 export type PermissionDecision = "allow" | "deny" | "always_allow";
@@ -288,8 +346,41 @@ export interface SelectedSkillSummary {
 
 export interface ToolResult {
   ok: boolean;
-  content: string;
+  modelContent?: string;
+  uiContent?: string;
+  structured?: unknown;
+  modelMetadata?: Record<string, unknown>;
+  privateMetadata?: Record<string, unknown>;
+  artifacts?: ToolArtifactSummary[];
+  groups?: ToolResultGroup[];
+  actualResources?: ToolResourceDescriptor[];
+  content?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface ToolResultGroup {
+  id: string;
+  title: string;
+  items: unknown[];
+  modelVisible?: boolean;
+}
+
+export interface ToolProgressUpdate {
+  phase: ToolProgressPhase;
+  message?: string;
+  percent?: number;
+  groupId?: string;
+  data?: unknown;
+}
+
+export interface ToolArtifactInput {
+  kind?: ToolArtifactSummary["kind"];
+  title?: string;
+  mimeType?: string;
+  content: string | Uint8Array;
+  extension?: string;
+  modelVisible?: boolean;
+  preview?: string;
 }
 
 export interface ToolExecutionContext {
@@ -314,6 +405,11 @@ export interface ToolExecutionContext {
   execPolicy?: ExecPolicyConfig;
   sandbox?: SandboxConfig;
   sandboxAdapter?: SandboxAdapter;
+  declaredResources?: ToolResourceDescriptor[];
+  actualResources?: ToolResourceDescriptor[];
+  reportProgress?: (update: ToolProgressUpdate) => void | Promise<void>;
+  createArtifact?: (artifact: ToolArtifactInput) => Promise<ToolArtifactSummary>;
+  groupResult?: (group: ToolResultGroup) => void | Promise<void>;
 }
 
 export interface ToolHandler {
@@ -321,6 +417,7 @@ export interface ToolHandler {
 }
 
 export interface RegisteredTool {
+  descriptor?: ToolDescriptor;
   definition: ToolDefinition;
   execute: ToolHandler;
   risk?: ToolRisk;
@@ -328,9 +425,11 @@ export interface RegisteredTool {
 }
 
 export interface ToolRegistry {
+  descriptors?: ToolDescriptor[];
   definitions: ToolDefinition[];
   execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult>;
   getTool?(name: string): RegisteredTool | undefined;
+  getDescriptor?(name: string): ToolDescriptor | undefined;
   close?(): Promise<void>;
 }
 
@@ -396,6 +495,8 @@ export interface ContextBudgetSummary {
   max_message_history_chars?: number;
   repo_map_chars?: number;
   skills_chars?: number;
+  source_map?: ContextSourceMap;
+  pressure?: "low" | "medium" | "high" | "critical";
 }
 
 export interface ToolRuntimeSummary {
@@ -417,6 +518,76 @@ export interface ToolArtifactSummary {
   bytes: number;
   original_chars: number;
   retained_chars: number;
+  kind?: "text" | "json" | "patch" | "image" | "binary" | "log";
+  title?: string;
+  mime_type?: string;
+  preview?: string;
+  model_visible?: boolean;
+  absolute_path?: string;
+}
+
+export type ContextSourceKind =
+  | "system"
+  | "project_instructions"
+  | "tool_definitions"
+  | "repo_map"
+  | "semantic_index"
+  | "diff"
+  | "memory"
+  | "skills"
+  | "messages"
+  | "compaction"
+  | "validation";
+
+export interface ContextSourceEntry {
+  id: string;
+  kind: ContextSourceKind;
+  label: string;
+  estimated_tokens: number;
+  chars: number;
+  cache_key?: string;
+  cacheable?: boolean;
+  truncated?: boolean;
+  model_visible?: boolean;
+  activation_reason?: string;
+  path?: string;
+  authority?: "system" | "project" | "tool" | "memory" | "runtime";
+}
+
+export interface ContextSourceMap {
+  entries: ContextSourceEntry[];
+  total_estimated_tokens: number;
+  generated_at: string;
+}
+
+export type ThreadItemKind =
+  | "command_execution"
+  | "mcp_tool_call"
+  | "dynamic_tool_call"
+  | "file_change"
+  | "artifact"
+  | "context_compaction"
+  | "subagent_activity"
+  | "message";
+
+export type ThreadItemStatus = "queued" | "running" | "completed" | "failed" | "aborted" | "info";
+
+export interface ThreadItem {
+  id: string;
+  kind: ThreadItemKind;
+  status: ThreadItemStatus;
+  title: string;
+  created_at: string;
+  updated_at?: string;
+  parent_id?: string;
+  tool_call_id?: string;
+  tool_name?: string;
+  input?: unknown;
+  result?: ToolResult;
+  progress?: ToolProgressUpdate;
+  artifacts?: ToolArtifactSummary[];
+  resources?: ToolResourceDescriptor[];
+  summary?: string;
 }
 
 export interface CodeIndexSummary {
@@ -550,6 +721,7 @@ export interface AgentEvent {
   provider?: string;
   model?: string;
   metadata?: Record<string, unknown>;
+  threadItem?: ThreadItem;
 }
 
 export interface TokenTotals {
@@ -715,4 +887,88 @@ export function addUsage(total: TokenTotals, usage: Usage | undefined): void {
   total.outputTokens += usage.outputTokens ?? 0;
   total.cacheTokens += usage.cacheTokens ?? 0;
   total.totalTokens += usage.totalTokens ?? 0;
+}
+
+export function normalizeToolResult(result: ToolResult): ToolResult {
+  const modelContent = result.modelContent ?? result.content ?? "";
+  const uiContent = result.uiContent ?? result.content ?? modelContent;
+  const modelMetadata = result.modelMetadata ?? result.metadata ?? {};
+  return {
+    ...result,
+    modelContent,
+    uiContent,
+    modelMetadata,
+    content: result.content ?? modelContent,
+    metadata: result.metadata ?? modelMetadata,
+    artifacts: result.artifacts ?? [],
+    groups: result.groups ?? []
+  };
+}
+
+export function toolModelContent(result: ToolResult): string {
+  return normalizeToolResult(result).modelContent ?? "";
+}
+
+export function toolUiContent(result: ToolResult): string {
+  return normalizeToolResult(result).uiContent ?? "";
+}
+
+export function toolModelMetadata(result: ToolResult): Record<string, unknown> {
+  return normalizeToolResult(result).modelMetadata ?? {};
+}
+
+export function toolPrivateMetadata(result: ToolResult): Record<string, unknown> {
+  return result.privateMetadata ?? {};
+}
+
+export function toolAllMetadata(result: ToolResult): Record<string, unknown> {
+  return {
+    ...toolModelMetadata(result),
+    ...toolPrivateMetadata(result)
+  };
+}
+
+export function toolDescriptorFromDefinition(
+  definition: ToolDefinition,
+  options: {
+    risk?: ToolRisk;
+    runtime?: ToolRuntimeMetadata;
+    ui?: ToolUiDescriptor;
+    permission?: ToolPermissionDescriptor;
+    result?: ToolResultDescriptor;
+    lifecycle?: ToolLifecycleDescriptor;
+  } = {}
+): ToolDescriptor {
+  return {
+    model: definition,
+    runtime: options.runtime,
+    ui: {
+      label: definition.function.name,
+      group: options.risk === "read" ? "read" : options.risk ? "action" : "tool",
+      renderKind: definition.function.name === "bash" || definition.function.name === "shell_session" || definition.function.name === "service"
+        ? "command"
+        : "text",
+      ...options.ui
+    },
+    permission: {
+      risk: options.risk,
+      approval: options.runtime?.approval,
+      sandbox: options.runtime?.sandbox,
+      ...options.permission
+    },
+    result: {
+      modelProjection: "content",
+      uiProjection: options.ui?.renderKind ?? "text",
+      artifactPolicy: "on_truncate",
+      ...options.result
+    },
+    lifecycle: {
+      cancellable: options.runtime?.cancellable ?? options.runtime?.waitsForCancellation ?? false,
+      ...options.lifecycle
+    }
+  };
+}
+
+export function lowerToolDescriptorForModel(descriptor: ToolDescriptor): ToolDefinition {
+  return descriptor.model;
 }

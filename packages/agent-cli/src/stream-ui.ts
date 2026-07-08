@@ -13,6 +13,7 @@ function argsObject(args: unknown): Record<string, unknown> | null {
 }
 
 function toolNameFromEvent(event: AgentEvent): string {
+  if (typeof event.threadItem?.tool_name === "string") return event.threadItem.tool_name;
   const toolCall = event.metadata?.toolCall as { function?: { name?: unknown } } | undefined;
   const direct = event.metadata?.toolName;
   if (typeof direct === "string") return direct;
@@ -23,7 +24,7 @@ function toolNameFromEvent(event: AgentEvent): string {
 function toolDetailFromEvent(event: AgentEvent): string {
   const toolCall = event.metadata?.toolCall as { function?: { name?: unknown; arguments?: unknown } } | undefined;
   const name = toolNameFromEvent(event);
-  const args = argsObject(toolCall?.function?.arguments);
+  const args = argsObject(event.threadItem?.input ?? toolCall?.function?.arguments);
   if (!args) return name;
   const stringArg = (key: string) => (typeof args[key] === "string" ? redactSecretText(args[key] as string) : undefined);
   const command = stringArg("command") ?? stringArg("input");
@@ -33,6 +34,25 @@ function toolDetailFromEvent(event: AgentEvent): string {
   const path = stringArg("path") ?? stringArg("cwd") ?? stringArg("pattern") ?? stringArg("glob") ?? stringArg("query");
   if (path) return `${name} target=${truncateMiddle(path.replace(/\s+/g, " "), 120).text}`;
   return name;
+}
+
+function toolResultFromEvent(event: AgentEvent): { ok?: unknown; content?: string; metadata?: Record<string, unknown> } | undefined {
+  const result = event.threadItem?.result ?? event.metadata?.result;
+  if (!result || typeof result !== "object") return undefined;
+  const record = result as Record<string, unknown>;
+  const modelMetadata = record.modelMetadata && typeof record.modelMetadata === "object" ? record.modelMetadata as Record<string, unknown> : undefined;
+  const legacyMetadata = record.metadata && typeof record.metadata === "object" ? record.metadata as Record<string, unknown> : undefined;
+  return {
+    ok: record.ok,
+    content: typeof record.uiContent === "string"
+      ? record.uiContent
+      : typeof record.modelContent === "string"
+        ? record.modelContent
+        : typeof record.content === "string"
+          ? record.content
+          : undefined,
+    metadata: { ...(legacyMetadata ?? {}), ...(modelMetadata ?? {}) }
+  };
 }
 
 function assistantSummary(event: AgentEvent): string {
@@ -83,7 +103,7 @@ export function formatAgentEvent(event: AgentEvent): string | null {
     case "tool_aborted":
       return `[sigma] tool_aborted ${String(event.metadata?.toolName ?? "tool")} reason=${truncateMiddle(redactSecretText(String(event.metadata?.reason ?? "")).replace(/\s+/g, " "), 120).text}`;
     case "tool_end": {
-      const result = event.metadata?.result as { ok?: unknown; content?: unknown; metadata?: Record<string, unknown> } | undefined;
+      const result = toolResultFromEvent(event);
       const duration = typeof result?.metadata?.durationMs === "number" ? ` duration_ms=${result.metadata.durationMs}` : "";
       const warning = sandboxWarning(result?.metadata);
       const tail = typeof result?.content === "string" && result.content.trim()

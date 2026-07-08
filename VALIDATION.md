@@ -1,22 +1,16 @@
 # Validation
 
-Date: 2026-07-08
+Date: 2026-07-09
 
 ## Commands Run
 
 | Command | Status |
 | --- | --- |
-| `pnpm build` | PASS |
 | `pnpm lint` | PASS |
 | `pnpm test` | PASS |
-| `pnpm test:harbor` | PASS: `Ran 8 tests` |
-| `pnpm --filter agent-tui build` | PASS |
-| `pnpm --filter agent-tui start -- --help` | PASS: printed TUI usage and commands |
-| `pnpm package:harbor-runtime` | PASS: created `.artifacts\harbor-runtime` |
-| `rg -n "harness validation\|failed harness validation\|previous attempt failed harness\|verifier\|evaluator\|terminal-bench\|harbor" packages/agent-core packages/agent-tui` | PASS: no matches |
-| `rg -n "agent-tui\|packages/agent-tui\|workspacePackages" scripts/package-agent-cli.mjs tests/package-agent-cli.test.ts` | PASS: no matches |
-| `Get-ChildItem scripts -Filter 'bench-*'` | PASS: `bench-common.mjs`, `bench-report.mjs`, and `bench-terminal-bench.mjs` are present |
-| `node -e "const p=require('./package.json'); for (const k of ['bench:tb:smoke','bench:tb:k','bench:tb:task','package:harbor-runtime','test:harbor']) console.log(k+'='+p.scripts[k])"` | PASS: benchmark, packaging, and Harbor test scripts still exist |
+| `pnpm build` | PASS |
+| `pnpm smoke:local:fake` | PASS: create-file, edit-file, fix-test, inspect-and-summarize |
+| `pnpm test -- tests/agent-core.loop.test.ts tests/agent-core.tools.test.ts tests/agent-core.code-graph-index.test.ts tests/agent-core.context.test.ts tests/agent-core.tool-runtime.test.ts tests/product-benchmark-boundary.test.ts tests/agent-tui.render.test.ts tests/agent-tui.formatters.test.ts` | PASS |
 
 ## Coverage Notes
 
@@ -25,7 +19,11 @@ Date: 2026-07-08
 - Harbor adapter tests cover canonical run-controller kwargs and assert `/usr/local/bin/agent run` is used.
 - Product packages do not expose evaluator/verifier/Terminal-Bench/Harbor terms in `packages/agent-core` or `packages/agent-tui`.
 - The Harbor/Terminal-Bench adapter files and benchmark npm scripts remain in place. `package-agent-cli.mjs` still has no `agent-tui` package inclusion.
+- Tool protocol tests now cover descriptor-derived tool schemas, typed thread items, output artifacts, cancellation metadata, and private metadata not being serialized into model-visible tool messages.
+- Context tests now cover `ContextSourceMap`, prompt-cache hints, deterministic/model compaction behavior, diff/memory injection, and Tree-sitter-backed graph indexing for TS/TSX/JS/Python/Go/Rust.
+- Memory tests cover local `.agent/memory` write/search/read flows and keep memory content out of static repo facts.
 
 ## Known Limitations
 
-- TUI updates are event-based at turn/tool granularity, not token delta streaming. Core has run-controller event types and a pre-model abort check, but provider token streaming, TUI token rendering, mid-model cancellation, and mid-tool cancellation are future work.
+- The Tree-sitter Node binding is pinned to the `0.22.x` runtime series with compatible grammar package versions because `tree-sitter@0.25.x` failed native compilation on Node 24/MSBuild in this environment.
+- TUI rendering consumes typed thread items for tool name/input/result, while older event metadata remains present for trace readability and external replay compatibility.

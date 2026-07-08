@@ -9,6 +9,7 @@ import {
   summarizeToolArguments,
   toolArgsFromEvent,
   toolNameFromEvent,
+  toolResultFromEvent,
   truncate
 } from "./formatting.js";
 
@@ -66,7 +67,7 @@ export function formatTimelineEvent(event: AgentEvent): string {
     return prefix(g.fail, joinDetails([`${meta.toolName ?? "tool"} aborted`, truncate(oneLine(redactSecretText(String(meta.reason ?? ""))), 90)]));
   }
   if (event.type === "tool_end") {
-    const result = meta.result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined;
+    const result = toolResultFromEvent(event);
     const status = result?.ok ? "ok" : "failed";
     const duration = typeof result?.metadata?.durationMs === "number" ? `${result.metadata.durationMs}ms` : "";
     const outputSize = formatBytes(result?.metadata?.sizeBytes);

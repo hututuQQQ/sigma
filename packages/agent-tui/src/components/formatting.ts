@@ -79,6 +79,7 @@ export function summarizeToolArguments(toolName: string, argsValue: unknown): st
 }
 
 export function toolNameFromEvent(event: AgentEvent): string {
+  if (typeof event.threadItem?.tool_name === "string") return event.threadItem.tool_name;
   const direct = event.metadata?.toolName;
   if (typeof direct === "string") return direct;
   const toolCall = event.metadata?.toolCall as { function?: { name?: unknown } } | undefined;
@@ -86,8 +87,32 @@ export function toolNameFromEvent(event: AgentEvent): string {
 }
 
 export function toolArgsFromEvent(event: AgentEvent): unknown {
+  if (event.threadItem?.input !== undefined) return event.threadItem.input;
   const toolCall = event.metadata?.toolCall as { function?: { arguments?: unknown } } | undefined;
   return toolCall?.function?.arguments;
+}
+
+export function toolResultFromEvent(event: AgentEvent): { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined {
+  const result = event.threadItem?.result ?? event.metadata?.result;
+  if (!result || typeof result !== "object") return undefined;
+  const record = result as Record<string, unknown>;
+  const modelMetadata = record.modelMetadata && typeof record.modelMetadata === "object"
+    ? record.modelMetadata as Record<string, unknown>
+    : undefined;
+  const legacyMetadata = record.metadata && typeof record.metadata === "object"
+    ? record.metadata as Record<string, unknown>
+    : undefined;
+  return {
+    ok: typeof record.ok === "boolean" ? record.ok : undefined,
+    content: typeof record.uiContent === "string"
+      ? record.uiContent
+      : typeof record.modelContent === "string"
+        ? record.modelContent
+        : typeof record.content === "string"
+          ? record.content
+          : undefined,
+    metadata: { ...(legacyMetadata ?? {}), ...(modelMetadata ?? {}) }
+  };
 }
 
 export function formatUsage(usage: Partial<TokenTotals> | undefined): string {

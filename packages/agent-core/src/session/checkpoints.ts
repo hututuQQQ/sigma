@@ -7,6 +7,7 @@ import { truncateMiddle } from "../compaction.js";
 import { runCommand } from "../command-runner.js";
 import { resolveWorkspacePath } from "../policy.js";
 import type { ToolResult, WorkspaceManifest } from "../types.js";
+import { toolAllMetadata, toolModelContent } from "../types.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifest.js";
 import { gitCommandSpec } from "../tools/git-command.js";
 import type { CheckpointRecord, CheckpointRestoreResult } from "./session-types.js";
@@ -148,7 +149,7 @@ async function snapshotFile(workspacePath: string, relativePath: string, capture
 }
 
 function resultChangedFiles(result: ToolResult): string[] {
-  const metadata = result.metadata ?? {};
+  const metadata = toolAllMetadata(result);
   const changedFiles = metadata.changedFiles;
   if (Array.isArray(changedFiles)) {
     return changedFiles.filter((file): file is string => typeof file === "string" && file.length > 0);
@@ -286,7 +287,7 @@ export class GitCheckpointManager {
       patchPath,
       beforeTree: pending.before.tree,
       afterTree: after.tree,
-      resultSummary: truncateMiddle(result.content.replace(/\s+/g, " ").trim(), 500).text
+      resultSummary: truncateMiddle(toolModelContent(result).replace(/\s+/g, " ").trim(), 500).text
     };
     await writeFile(patchPath, patch, "utf8");
     await writeFile(metaPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
@@ -356,7 +357,7 @@ export class FileBackedCheckpointManager {
       changedFiles: entries.map((entry) => entry.path),
       fileSnapshotPath: snapshotPath,
       skippedFiles,
-      resultSummary: truncateMiddle(result.content.replace(/\s+/g, " ").trim(), 500).text
+      resultSummary: truncateMiddle(toolModelContent(result).replace(/\s+/g, " ").trim(), 500).text
     };
     await writeFile(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
     await writeFile(metaPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");

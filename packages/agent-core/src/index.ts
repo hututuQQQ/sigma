@@ -173,7 +173,32 @@ export {
 export type { EffectiveSandboxConfig } from "./sandbox.js";
 export { ToolRuntime } from "./tool-runtime.js";
 export type { ToolRuntimeCallbacks, ToolRuntimeExecution } from "./tool-runtime.js";
+export {
+  lowerToolDescriptorForModel,
+  normalizeToolResult,
+  toolAllMetadata,
+  toolDescriptorFromDefinition,
+  toolModelContent,
+  toolModelMetadata,
+  toolPrivateMetadata,
+  toolUiContent
+} from "./types.js";
 export { summarizeContextBudget } from "./context/token-budget.js";
+export {
+  buildContextSourceMap,
+  contextCacheKey,
+  contextPressure,
+  contextSourceEntry,
+  estimateContextTokens
+} from "./context/source-map.js";
+export {
+  formatMemorySnippet,
+  listMemories,
+  readMemory,
+  searchMemories,
+  writeMemory
+} from "./memory/local-memory.js";
+export type { MemoryKind, MemoryRecord, MemorySearchResult } from "./memory/local-memory.js";
 export { estimateValidationCost, withEstimatedCost } from "./validation/command-cost.js";
 export { discoverProjects } from "./validation/project-discovery.js";
 export { createValidationPlan } from "./validation/validation-planner.js";
@@ -212,6 +237,7 @@ export {
   executeRepoQueryTool,
   executeSymbolSearchTool,
   executeValidateTool,
+  executeMemoryTool,
   executeListTool,
   executeReadTool,
   executeReadManyTool,
@@ -244,6 +270,9 @@ export type {
   CompactionMode,
   ContextCompactionSummary,
   ContextBudgetSummary,
+  ContextSourceEntry,
+  ContextSourceKind,
+  ContextSourceMap,
   EvidenceKind,
   EvidenceRecord,
   ExecIntentSummary,
@@ -291,12 +320,23 @@ export type {
   TokenTotals,
   ToolExecutionContext,
   ToolHandler,
+  ToolDescriptor,
+  ToolLifecycleDescriptor,
+  ToolPermissionDescriptor,
+  ToolProgressUpdate,
+  ToolResourceDescriptor,
+  ToolResultDescriptor,
+  ToolResultGroup,
+  ToolUiDescriptor,
   ToolRegistryFilter,
   ToolRegistryOptions,
   ToolRegistry,
   ToolRuntimeMetadata,
   ToolRuntimeSummary,
   ToolArtifactSummary,
+  ThreadItem,
+  ThreadItemKind,
+  ThreadItemStatus,
   ToolApprovalMode,
   ToolSandboxMode,
   ToolRisk,

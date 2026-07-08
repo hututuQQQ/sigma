@@ -34,6 +34,7 @@ import {
   toolArgsFromEvent,
   toolArgsObject,
   toolNameFromEvent,
+  toolResultFromEvent,
   truncate
 } from "./components/formatting.js";
 import { usageFromEvents } from "./components/status-bar.js";
@@ -1230,7 +1231,7 @@ export class TuiApp {
     ];
     if (toolEnds.length === 0) lines.push("No tool calls yet.");
     for (const event of toolEnds) {
-      const result = event.metadata?.result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined;
+      const result = toolResultFromEvent(event);
       const start = event.parentId ? startsById.get(event.parentId) : undefined;
       const name = typeof event.metadata?.toolName === "string" ? event.metadata.toolName : toolNameFromEvent(start ?? event);
       const detail = start ? summarizeToolArguments(name, toolArgsFromEvent(start)) : "";

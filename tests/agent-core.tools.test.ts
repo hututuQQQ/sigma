@@ -9,6 +9,7 @@ import {
   executeReadTool,
   finalizeManagedServices,
   executeServiceTool,
+  executeMemoryTool,
   executeWriteTool,
   type ToolExecutionContext
 } from "../packages/agent-core/src/index.js";
@@ -130,6 +131,27 @@ describe("agent-core tools", () => {
     const result = await executeWriteTool({ path: "nested/hello.txt", content: "hello", createDirs: true }, context);
     expect(result.ok).toBe(true);
     await expect(readFile(path.join(dir, "nested", "hello.txt"), "utf8")).resolves.toBe("hello");
+  });
+
+  it("writes, searches, and reads local memories", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "feedback",
+      title: "Prefer focused validation",
+      content: "When tests are expensive, run the narrowest changed-file validation first.",
+      tags: ["validation"]
+    }, context);
+    expect(saved.ok).toBe(true);
+    expect(saved.modelMetadata?.kind).toBe("feedback");
+
+    const search = await executeMemoryTool({ action: "search", query: "focused validation", limit: 3 }, context);
+    expect(search.ok).toBe(true);
+    expect(search.modelContent).toContain("Prefer focused validation");
+
+    const read = await executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context);
+    expect(read.ok).toBe(true);
+    expect(read.modelContent).toContain("narrowest changed-file validation");
   });
 
   it("edits exact replacements", async () => {

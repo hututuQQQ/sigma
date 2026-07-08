@@ -1,5 +1,6 @@
 import { truncateMiddle } from "../compaction.js";
 import type { EvidenceKind, EvidenceRecord, ToolResult } from "../types.js";
+import { toolAllMetadata, toolModelContent } from "../types.js";
 
 function textArg(args: unknown, key: string): string | undefined {
   if (!args || typeof args !== "object") return undefined;
@@ -8,7 +9,7 @@ function textArg(args: unknown, key: string): string | undefined {
 }
 
 function numberMetadata(result: ToolResult, key: string): number | null | undefined {
-  const value = result.metadata?.[key];
+  const value = toolAllMetadata(result)[key];
   if (typeof value === "number") return value;
   if (value === null) return null;
   return undefined;
@@ -32,7 +33,7 @@ export function commandLooksExecutableVerification(command: string): boolean {
 }
 
 function summarizeResult(result: ToolResult): string {
-  return truncateMiddle(result.content.replace(/\s+/g, " ").trim(), 300).text;
+  return truncateMiddle(toolModelContent(result).replace(/\s+/g, " ").trim(), 300).text;
 }
 
 export function inferEvidenceRecord(options: {
@@ -112,15 +113,16 @@ export function inferEvidenceRecord(options: {
   }
 
   if (options.toolName === "validate") {
-    const command = typeof options.result.metadata?.command === "string" ? options.result.metadata.command : undefined;
+    const metadata = toolAllMetadata(options.result);
+    const command = typeof metadata.command === "string" ? metadata.command : undefined;
     return {
       kind: command ? evidenceKindForCommand(command) : "unknown",
       toolName: options.toolName,
       ok: true,
       executable: true,
       command,
-      relatedFiles: Array.isArray(options.result.metadata?.relatedFiles)
-        ? options.result.metadata.relatedFiles.filter((item): item is string => typeof item === "string")
+      relatedFiles: Array.isArray(metadata.relatedFiles)
+        ? metadata.relatedFiles.filter((item): item is string => typeof item === "string")
         : undefined,
       exitCode: numberMetadata(options.result, "exitCode"),
       summary: summarizeResult(options.result),

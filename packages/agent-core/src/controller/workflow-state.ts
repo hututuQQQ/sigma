@@ -9,6 +9,7 @@ import type {
   WorkflowPhase,
   WorkflowStateSummary
 } from "../types.js";
+import { toolModelContent } from "../types.js";
 
 export interface WorkflowState {
   phase: WorkflowPhase;
@@ -76,7 +77,7 @@ function recordFailurePattern(options: {
     last_tool_name: options.toolName,
     ...(options.command ? { last_command: compactLargeCommand(options.command, 1200).text } : {}),
     ...(options.analysis.exitCode !== undefined ? { last_exit_code: options.analysis.exitCode } : {}),
-    last_summary: compactSummary(options.analysis.primaryMessage || options.result.content),
+    last_summary: compactSummary(options.analysis.primaryMessage || toolModelContent(options.result)),
     suggested_next_action: options.analysis.suggestedNextAction,
     confidence: options.analysis.confidence,
     ...(options.analysis.diagnostics.length > 0 ? { diagnostics: options.analysis.diagnostics } : {}),

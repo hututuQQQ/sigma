@@ -104,9 +104,12 @@ export function isProbablyMutatingCommand(command: string): boolean {
 }
 
 export function permissionDeniedResult(toolName: string, risk: ToolRisk): ToolResult {
+  const message = `Permission denied for ${toolName} (${risk}). Mutating or risky tools require yolo mode or explicit approval.`;
   return {
     ok: false,
-    content: `Permission denied for ${toolName} (${risk}). Mutating or risky tools require yolo mode or explicit approval.`
+    modelContent: message,
+    content: message,
+    modelMetadata: { denied: true, risk }
   };
 }
 

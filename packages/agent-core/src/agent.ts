@@ -11,6 +11,7 @@ import { CompactionService } from "./context/compaction-service.js";
 import { ContextManager } from "./context/context-manager.js";
 import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
 import { summarizeContextBudget } from "./context/token-budget.js";
+import { memoryContextBlock, recentDiffBlock, staticContextBlocks, type ContextAssemblyBlock } from "./context/context-assembly.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 import { DEFAULT_COMPACTION_MODE, DEFAULT_FINAL_EVIDENCE_MODE, DEFAULT_SUBAGENTS_ENABLED } from "./defaults.js";
@@ -42,9 +43,10 @@ import type {
   ToolExecutionContext,
   ToolRuntimeMetadata,
   ToolRegistry,
-  ToolResult
+  ToolResult,
+  ContextSourceEntry
 } from "./types.js";
-import { addUsage } from "./types.js";
+import { addUsage, normalizeToolResult, toolAllMetadata, toolModelContent, toolModelMetadata } from "./types.js";
 
 const DEFAULT_MAX_TURNS = 20;
 const DEFAULT_MAX_WALL_TIME_SEC = 900;
@@ -69,6 +71,9 @@ function event(
   parentId?: string,
   sessionId?: string
 ): AgentEvent {
+  const eventMetadata = metadata ? { ...metadata } : undefined;
+  const rawThreadItem = eventMetadata?.threadItem;
+  if (eventMetadata && "threadItem" in eventMetadata) delete eventMetadata.threadItem;
   return {
     id: randomUUID(),
     timestamp: nowIso(),
@@ -78,15 +83,20 @@ function event(
     parentId,
     provider,
     model,
-    metadata
+    metadata: eventMetadata,
+    ...(rawThreadItem && typeof rawThreadItem === "object" ? { threadItem: rawThreadItem as AgentEvent["threadItem"] } : {})
   };
 }
 
 function stringifyToolResult(result: ToolResult): string {
+  const normalized = normalizeToolResult(result);
   return JSON.stringify({
-    ok: result.ok,
-    content: result.content,
-    metadata: result.metadata ?? {}
+    ok: normalized.ok,
+    content: toolModelContent(normalized),
+    metadata: toolModelMetadata(normalized),
+    structured: normalized.structured ?? null,
+    artifacts: (normalized.artifacts ?? []).filter((artifact) => artifact.model_visible === true),
+    groups: (normalized.groups ?? []).filter((group) => group.modelVisible === true)
   });
 }
 
@@ -183,10 +193,15 @@ function compactAssistantMessageForHistory(message: AgentMessage): AgentMessage 
 }
 
 function compactEventForTrace(agentEvent: AgentEvent): AgentEvent {
-  if (!agentEvent.metadata) return agentEvent;
+  if (!agentEvent.metadata && !agentEvent.threadItem) return agentEvent;
   return {
     ...agentEvent,
-    metadata: compactUnknownForTrace(agentEvent.metadata, "event metadata", EVENT_METADATA_MAX_CHARS) as Record<string, unknown>
+    ...(agentEvent.metadata
+      ? { metadata: compactUnknownForTrace(agentEvent.metadata, "event metadata", EVENT_METADATA_MAX_CHARS) as Record<string, unknown> }
+      : {}),
+    ...(agentEvent.threadItem
+      ? { threadItem: compactUnknownForTrace(agentEvent.threadItem, "thread item", EVENT_METADATA_MAX_CHARS) as AgentEvent["threadItem"] }
+      : {})
   };
 }
 
@@ -402,12 +417,22 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       : new ContextManager({ compactionService })
   );
 
-  const requestModel = async (turn: number, requestMessages: AgentMessage[], tools: ToolDefinition[]): Promise<ModelResponse> => {
+  const requestModel = async (
+    turn: number,
+    requestMessages: AgentMessage[],
+    tools: ToolDefinition[],
+    sourceEntries: ContextSourceEntry[] = []
+  ): Promise<ModelResponse> => {
+    const cacheHints = sourceEntries
+      .filter((entry) => entry.cacheable && entry.cache_key)
+      .map((entry) => ({ key: entry.cache_key as string, kind: entry.kind, label: entry.label }));
     if (!config.modelClient.stream) {
       return await config.modelClient.complete({
         messages: requestMessages,
         tools,
         toolChoice: "auto",
+        metadata: { sigma_turn: String(turn) },
+        cacheHints,
         abortSignal: config.abortSignal
       });
     }
@@ -422,6 +447,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         messages: requestMessages,
         tools,
         toolChoice: "auto",
+        metadata: { sigma_turn: String(turn) },
+        cacheHints,
         abortSignal: config.abortSignal
       })) {
         if (config.abortSignal?.aborted) {
@@ -493,15 +520,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         maxChars: config.repoMapMaxChars ?? DEFAULT_REPO_MAP_MAX_CHARS
       })
     : null;
-  const systemSections = [DEFAULT_SYSTEM_PROMPT];
+  const registry = await resolveRunToolRegistry(config);
+  const toolsAvailable = registry.definitions.map((definition) => definition.function.name).sort((a, b) => a.localeCompare(b, "en"));
   const projectInstructionsBlock = formatProjectInstructionsBlock(loadedProjectInstructions);
-  if (projectInstructionsBlock) {
-    systemSections.push(projectInstructionsBlock);
-  }
-  if (repoMap) {
-    systemSections.push(formatRepoMapBlock(repoMap));
-  }
+  const repoMapBlock = repoMap ? formatRepoMapBlock(repoMap) : "";
   let selectedSkills: AgentSkill[] = [];
+  let skillsBlock = "";
   if ((config.skillsMode ?? "auto") === "auto") {
     const discovery = await discoverProjects({ workspacePath: context.workspacePath });
     const allSkills = await loadAllSkills(context.workspacePath);
@@ -509,16 +533,24 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       instruction: config.instruction,
       projectHints: projectHintsFromDiscovery(discovery)
     });
-    const skillsBlock = formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS);
-    if (skillsBlock) systemSections.push(skillsBlock);
+    skillsBlock = formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS);
   }
+  const staticBlocks = staticContextBlocks({
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    projectInstructions: projectInstructionsBlock,
+    repoMap: repoMapBlock,
+    skills: skillsBlock,
+    tools: registry.definitions
+  });
+  const staticSourceEntries = staticBlocks.map((item) => item.source);
+  const systemSections = staticBlocks
+    .filter((item) => item.id !== "tool_definitions_static")
+    .map((item) => item.content);
   const messages: AgentMessage[] = [
     { role: "system", content: systemSections.join("\n\n") },
     { role: "user", content: config.instruction }
   ];
-  const registry = await resolveRunToolRegistry(config);
   const toolRuntime = new ToolRuntime(registry, context);
-  const toolsAvailable = registry.definitions.map((definition) => definition.function.name).sort((a, b) => a.localeCompare(b, "en"));
   let turns = 0;
   let toolCalls = 0;
   let commandsExecuted = 0;
@@ -531,7 +563,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     tools: registry.definitions,
     maxMessageHistoryChars: config.maxMessageHistoryChars,
     repoMapChars: repoMap?.chars,
-    skillsChars: selectedSkills.length > 0 ? formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS).length : 0
+    skillsChars: skillsBlock.length || undefined,
+    sourceEntries: staticSourceEntries
   });
 
   await recordEvent(
@@ -595,12 +628,32 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (preparedMessages.messages !== messages) {
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
+      const dynamicBlocks = (
+        await Promise.all([
+          recentDiffBlock(context.workspacePath),
+          memoryContextBlock({
+            workspacePath: context.workspacePath,
+            query: [config.instruction, changedFilesForContext.join(" ")].filter(Boolean).join("\n"),
+            maxItems: 5,
+            maxChars: 6000
+          })
+        ])
+      ).filter((item): item is ContextAssemblyBlock => Boolean(item));
+      const dynamicSourceEntries: ContextSourceEntry[] = dynamicBlocks.map((item) => item.source);
+      const runtimeContextMessage: AgentMessage | null = dynamicBlocks.length > 0
+        ? {
+            role: "user",
+            content: `Runtime context update for this turn:\n\n${dynamicBlocks.map((item) => item.content).join("\n\n")}`
+          }
+        : null;
+      const requestMessages = runtimeContextMessage ? [...messages, runtimeContextMessage] : messages;
       lastContextBudget = summarizeContextBudget({
-        messages,
+        messages: requestMessages,
         tools: registry.definitions,
         maxMessageHistoryChars: config.maxMessageHistoryChars,
         repoMapChars: repoMap?.chars,
-        skillsChars: selectedSkills.length > 0 ? formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS).length : 0
+        skillsChars: skillsBlock.length || undefined,
+        sourceEntries: [...staticSourceEntries, ...dynamicSourceEntries]
       });
       await recordEvent(event(runId, "context_budget", provider, model, { turn: turns, turnId, budget: lastContextBudget }, undefined, durableSession?.sessionId));
       if (config.abortSignal?.aborted) {
@@ -611,7 +664,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       await recordEvent(event(runId, "model_start", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
-      const response = await requestModel(turns, messages, registry.definitions);
+      const response = await requestModel(turns, requestMessages, registry.definitions, [...staticSourceEntries, ...dynamicSourceEntries]);
       addUsage(usage, response.usage);
       await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       if (response.usage) {
@@ -676,7 +729,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             lastError = "Run cancelled before tool execution.";
             await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, turnId, toolName: call.function.name }, undefined, durableSession?.sessionId));
             return {
-              result: { ok: false, content: "Tool call cancelled before execution.", metadata: { cancelled: true } },
+              result: { ok: false, modelContent: "Tool call cancelled before execution.", modelMetadata: { cancelled: true } },
               value: {}
             };
           }
@@ -692,7 +745,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           } catch (error) {
             result = {
               ok: false,
-              content: error instanceof Error ? error.message : String(error)
+              modelContent: error instanceof Error ? error.message : String(error)
             };
           }
           const checkpoint = await durableSession?.checkpoints.afterTool(pendingCheckpoint, result) ?? null;
@@ -707,8 +760,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       for (const execution of executions as Array<ToolRuntimeExecution<ToolExecutionValue>>) {
         const call = execution.call;
         const result = execution.result;
-        if (isSubagentRunSummary(result.metadata?.subagentRun)) {
-          subagentRuns.push(result.metadata.subagentRun);
+        const resultMetadata = toolAllMetadata(result);
+        if (isSubagentRunSummary(resultMetadata.subagentRun)) {
+          subagentRuns.push(resultMetadata.subagentRun);
         }
         const evidence = inferEvidenceRecord({
           toolName: call.function.name,
