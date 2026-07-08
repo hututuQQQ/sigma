@@ -1,6 +1,6 @@
 # Validation
 
-Date: 2026-07-07
+Date: 2026-07-08
 
 ## Commands Run
 
@@ -22,10 +22,10 @@ Date: 2026-07-07
 
 - Retry feedback sent to the next model attempt now says "post-run checks" and the agent-core test asserts the generated retry instruction does not contain the old term.
 - `agent-core` exports run-controller aliases while retaining the existing harness-named API for adapters and scripts.
-- Harbor adapter tests cover canonical run-controller kwargs and still assert `/usr/local/bin/agent solve` is used.
+- Harbor adapter tests cover canonical run-controller kwargs and assert `/usr/local/bin/agent run` is used.
 - Product packages do not expose evaluator/verifier/Terminal-Bench/Harbor terms in `packages/agent-core` or `packages/agent-tui`.
 - The Harbor/Terminal-Bench adapter files and benchmark npm scripts remain in place. `package-agent-cli.mjs` still has no `agent-tui` package inclusion.
 
 ## Known Limitations
 
-- TUI updates are event-based at turn/tool granularity, not token delta streaming. Core has compatibility event types and a pre-model abort check, but provider token streaming, TUI token rendering, mid-model cancellation, and mid-tool cancellation are future work.
+- TUI updates are event-based at turn/tool granularity, not token delta streaming. Core has run-controller event types and a pre-model abort check, but provider token streaming, TUI token rendering, mid-model cancellation, and mid-tool cancellation are future work.

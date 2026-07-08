@@ -1,6 +1,8 @@
 import path from "node:path";
 import type { ProviderName } from "agent-ai";
 import {
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_VALIDATION_MODE,
   redactSecretText,
   type AgentEvent,
   type AgentFinalEvidenceMode,
@@ -61,7 +63,7 @@ function validationState(props: StatusBarProps): string {
       .some((item) => item.exit_code !== 0);
     return failed ? "failed" : "ok";
   }
-  return props.validationMode ?? "off";
+  return props.validationMode ?? DEFAULT_VALIDATION_MODE;
 }
 
 function mcpState(result: AgentRunResult | null, enabled?: boolean): string {
@@ -86,7 +88,7 @@ export function StatusBar(props: StatusBarProps): string {
   const workspace = redactSecretText(props.workspacePath);
   const model = props.model ?? props.result?.model ?? "default";
   const validation = validationState(props);
-  const evidence = props.result?.finalGate?.status ?? props.finalEvidenceMode ?? "off";
+  const evidence = props.result?.finalGate?.status ?? props.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   const queue = props.queuedInstruction
     ? `queued ${g.pointer} ${truncateToWidth(oneLine(redactSecretText(props.queuedInstruction)), 64)}`
     : "queue empty";

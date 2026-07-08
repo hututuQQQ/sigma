@@ -29,7 +29,7 @@ export interface DurableSessionMeta {
   checkpointsDir: string;
   traceJsonlPath?: string;
   sessionJsonlPath?: string;
-  compatibilitySummaryPath?: string;
+  runSummaryJsonPath?: string;
   parentSessionId?: string;
   forkedFromSessionId?: string;
   finalMessage?: string;

@@ -1,12 +1,13 @@
 import type { AgentMessage } from "agent-ai";
 import { truncateMiddle } from "../compaction.js";
-import type { EvidenceRecord, TodoItem, WorkflowStateSummary } from "../types.js";
+import { redactSecretText } from "../redaction.js";
+import type { CompactionFallbackMode, CompactionMode, EvidenceRecord, TodoItem, WorkflowStateSummary } from "../types.js";
 
 export const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
 export const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
 export const COMPACTION_MARKER = "Previous agent conversation compacted by the run controller.";
 
-export type CompactionStrategyName = "deterministic" | "model_sub_session";
+export type CompactionStrategyName = CompactionMode;
 
 export interface CompactionArtifact {
   objective: string;
@@ -48,6 +49,8 @@ export interface CompactionResult {
   compacted: boolean;
   strategy: CompactionStrategyName;
   artifact: CompactionArtifact | null;
+  fallbackUsed?: boolean;
+  error?: string;
 }
 
 export interface CompactionStrategy {
@@ -60,6 +63,13 @@ interface CompactionWindow {
   protectedMessages: AgentMessage[];
   compactedMessages: AgentMessage[];
   tailMessages: AgentMessage[];
+}
+
+export interface CompactionPlan {
+  shouldCompact: boolean;
+  beforeMessageCount: number;
+  compactedMessageCount: number;
+  retainedTailMessageCount: number;
 }
 
 function firstUserContent(messages: AgentMessage[]): string {
@@ -208,6 +218,35 @@ function compactionWindow(request: CompactionRequest): CompactionWindow {
   };
 }
 
+export function planCompaction(request: CompactionRequest): CompactionPlan {
+  const window = compactionWindow(request);
+  return {
+    shouldCompact: window.shouldCompact,
+    beforeMessageCount: request.messages.length,
+    compactedMessageCount: window.compactedMessages.length,
+    retainedTailMessageCount: window.tailMessages.length
+  };
+}
+
+export function compactErrorSummary(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return truncateMiddle(redactSecretText(message.replace(/\s+/g, " ").trim()), 600).text;
+}
+
+export class NoopCompactionStrategy implements CompactionStrategy {
+  readonly name = "off" as const;
+
+  compact(request: CompactionRequest): CompactionResult {
+    return {
+      messages: request.messages,
+      compacted: false,
+      strategy: this.name,
+      artifact: null,
+      fallbackUsed: false
+    };
+  }
+}
+
 export class DeterministicCompactionStrategy implements CompactionStrategy {
   readonly name = "deterministic" as const;
 
@@ -218,7 +257,8 @@ export class DeterministicCompactionStrategy implements CompactionStrategy {
         messages: request.messages,
         compacted: false,
         strategy: this.name,
-        artifact: null
+        artifact: null,
+        fallbackUsed: false
       };
     }
 
@@ -235,7 +275,8 @@ export class DeterministicCompactionStrategy implements CompactionStrategy {
       messages: [...window.protectedMessages, summary, ...window.tailMessages],
       compacted: true,
       strategy: this.name,
-      artifact
+      artifact,
+      fallbackUsed: false
     };
   }
 }
@@ -245,10 +286,26 @@ function formatArtifactSummary(artifact: CompactionArtifact, maxChars: number): 
   return `${COMPACTION_MARKER}\n\nStructured compaction artifact:\n${truncateMiddle(body, Math.max(1, maxChars)).text}`;
 }
 
+export interface ModelSubSessionCompactionStrategyOptions {
+  provider: ModelCompactionProvider;
+  fallback?: CompactionFallbackMode;
+}
+
 export class ModelSubSessionCompactionStrategy implements CompactionStrategy {
   readonly name = "model_sub_session" as const;
+  private readonly provider: ModelCompactionProvider;
+  private readonly fallback: CompactionFallbackMode;
+  private readonly deterministic = new DeterministicCompactionStrategy();
 
-  constructor(private readonly provider: ModelCompactionProvider) {}
+  constructor(providerOrOptions: ModelCompactionProvider | ModelSubSessionCompactionStrategyOptions) {
+    if ("compact" in providerOrOptions) {
+      this.provider = providerOrOptions;
+      this.fallback = "deterministic";
+    } else {
+      this.provider = providerOrOptions.provider;
+      this.fallback = providerOrOptions.fallback ?? "deterministic";
+    }
+  }
 
   async compact(request: CompactionRequest): Promise<CompactionResult> {
     const window = compactionWindow(request);
@@ -257,18 +314,35 @@ export class ModelSubSessionCompactionStrategy implements CompactionStrategy {
         messages: request.messages,
         compacted: false,
         strategy: this.name,
-        artifact: null
+        artifact: null,
+        fallbackUsed: false
       };
     }
 
     const fallbackArtifact = createDeterministicCompactionArtifact(request);
-    const artifact = await this.provider.compact({
-      ...request,
-      protectedMessages: window.protectedMessages,
-      compactedMessages: window.compactedMessages,
-      tailMessages: window.tailMessages,
-      fallbackArtifact
-    });
+    let artifact: CompactionArtifact;
+    try {
+      artifact = await this.provider.compact({
+        ...request,
+        protectedMessages: window.protectedMessages,
+        compactedMessages: window.compactedMessages,
+        tailMessages: window.tailMessages,
+        fallbackArtifact
+      });
+    } catch (error) {
+      const summary = compactErrorSummary(error);
+      if (this.fallback === "fail") {
+        throw new Error(`Model compaction failed: ${summary}`);
+      }
+      const fallbackResult = this.deterministic.compact(request);
+      return {
+        ...fallbackResult,
+        strategy: this.name,
+        artifact: fallbackResult.artifact ?? fallbackArtifact,
+        fallbackUsed: true,
+        error: summary
+      };
+    }
     const summary: AgentMessage = {
       role: "user",
       content: formatArtifactSummary(artifact, request.compactionSummaryChars ?? DEFAULT_COMPACTION_SUMMARY_CHARS)
@@ -278,23 +352,45 @@ export class ModelSubSessionCompactionStrategy implements CompactionStrategy {
       messages: [...window.protectedMessages, summary, ...window.tailMessages],
       compacted: true,
       strategy: this.name,
-      artifact
+      artifact,
+      fallbackUsed: false
     };
   }
 }
 
 export interface CompactionServiceOptions {
   strategy?: CompactionStrategy;
+  mode?: CompactionMode;
+  modelProvider?: ModelCompactionProvider;
+  fallback?: CompactionFallbackMode;
 }
 
 export class CompactionService {
   private readonly strategy: CompactionStrategy;
 
   constructor(options: CompactionServiceOptions = {}) {
-    this.strategy = options.strategy ?? new DeterministicCompactionStrategy();
+    this.strategy = options.strategy ?? this.strategyFromOptions(options);
+  }
+
+  get strategyName(): CompactionStrategyName {
+    return this.strategy.name;
   }
 
   async compact(request: CompactionRequest): Promise<CompactionResult> {
     return await this.strategy.compact(request);
+  }
+
+  private strategyFromOptions(options: CompactionServiceOptions): CompactionStrategy {
+    if (options.mode === "off") return new NoopCompactionStrategy();
+    if (options.mode === "model_sub_session") {
+      if (!options.modelProvider) {
+        throw new Error("model_sub_session compaction requires a modelProvider.");
+      }
+      return new ModelSubSessionCompactionStrategy({
+        provider: options.modelProvider,
+        fallback: options.fallback
+      });
+    }
+    return new DeterministicCompactionStrategy();
   }
 }

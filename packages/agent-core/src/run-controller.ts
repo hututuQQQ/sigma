@@ -4,6 +4,13 @@ import { AgentEventBus } from "./events.js";
 import { runAgentHarness } from "./harness/index.js";
 import { createMcpToolRegistry } from "./mcp.js";
 import { createDefaultToolRegistry, mergeToolRegistries } from "./tools/index.js";
+import {
+  DEFAULT_COMPACTION_MODE,
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+  DEFAULT_SUBAGENTS_ENABLED,
+  DEFAULT_VALIDATION_MODE
+} from "./defaults.js";
 import type {
   AgentEventBusLike,
   AgentFinalEvidenceMode,
@@ -11,6 +18,8 @@ import type {
   AgentHarnessValidationMode,
   AgentRunResult,
   AgentSkillsMode,
+  CompactionFallbackMode,
+  CompactionMode,
   ContextMode,
   McpServerRunSummary,
   PermissionDecider,
@@ -41,6 +50,22 @@ export interface RunConfiguredAgentOptions {
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
+  compactionMode?: CompactionMode;
+  compactionModel?: string;
+  compactionProvider?: ProviderName;
+  compactionMaxInputChars?: number;
+  compactionMaxOutputChars?: number;
+  compactionTimeoutSec?: number;
+  compactionFallback?: CompactionFallbackMode;
+  compactionModelClient?: ModelClient;
+  contextManager?: import("./context/context-manager.js").ContextManager;
+  contextManagerFactory?: AgentHarnessConfig["contextManagerFactory"];
+  compactionService?: import("./context/compaction-service.js").CompactionService;
+  failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
+  subagentsEnabled?: boolean;
+  subagentMaxTurns?: number;
+  subagentMaxOutputChars?: number;
+  reviewAntiGaming?: boolean;
   validationMode?: AgentHarnessValidationMode;
   validationCommands?: string[];
   validationRetryLimit?: number;
@@ -84,9 +109,12 @@ export function shouldUseAgentRunController(options: {
   harnessTimeoutSec?: number;
   retryMinBudgetSec?: number;
   attemptsDir?: string;
+  finalEvidenceMode?: AgentFinalEvidenceMode;
+  reviewAntiGaming?: boolean;
 }): boolean {
   return (
     options.validationMode === "auto" ||
+    (options.reviewAntiGaming !== false && options.finalEvidenceMode === "auto") ||
     (options.validationCommands?.length ?? 0) > 0 ||
     (options.validationRetryLimit ?? 0) > 0 ||
     Boolean(options.precheckCommand?.trim()) ||
@@ -101,7 +129,18 @@ function defined<T>(value: T | undefined): value is T {
   return value !== undefined;
 }
 
-function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelClient): AgentHarnessConfig {
+function baseRunConfig(
+  options: RunConfiguredAgentOptions,
+  modelClient: ModelClient,
+  resolved: {
+    compactionMode: CompactionMode;
+    validationMode: AgentHarnessValidationMode;
+    finalEvidenceMode: AgentFinalEvidenceMode;
+    subagentsEnabled: boolean;
+    reviewAntiGaming: boolean;
+    maxMessageHistoryChars: number;
+  }
+): AgentHarnessConfig {
   return {
     instruction: options.instruction,
     workspacePath: options.workspacePath,
@@ -119,9 +158,25 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     ...(defined(options.sessionJsonlPath) ? { sessionJsonlPath: options.sessionJsonlPath } : {}),
     ...(defined(options.summaryJsonPath) ? { summaryJsonPath: options.summaryJsonPath } : {}),
     ...(defined(options.maxToolOutputChars) ? { maxToolOutputChars: options.maxToolOutputChars } : {}),
-    ...(defined(options.maxMessageHistoryChars) ? { maxMessageHistoryChars: options.maxMessageHistoryChars } : {}),
+    maxMessageHistoryChars: resolved.maxMessageHistoryChars,
     ...(defined(options.messageHistoryRetain) ? { messageHistoryRetain: options.messageHistoryRetain } : {}),
     ...(defined(options.compactionSummaryChars) ? { compactionSummaryChars: options.compactionSummaryChars } : {}),
+    compactionMode: resolved.compactionMode,
+    ...(defined(options.compactionModel) ? { compactionModel: options.compactionModel } : {}),
+    ...(defined(options.compactionProvider) ? { compactionProvider: options.compactionProvider } : {}),
+    ...(defined(options.compactionMaxInputChars) ? { compactionMaxInputChars: options.compactionMaxInputChars } : {}),
+    ...(defined(options.compactionMaxOutputChars) ? { compactionMaxOutputChars: options.compactionMaxOutputChars } : {}),
+    ...(defined(options.compactionTimeoutSec) ? { compactionTimeoutSec: options.compactionTimeoutSec } : {}),
+    ...(defined(options.compactionFallback) ? { compactionFallback: options.compactionFallback } : {}),
+    ...(defined(options.compactionModelClient) ? { compactionModelClient: options.compactionModelClient } : {}),
+    ...(defined(options.contextManager) ? { contextManager: options.contextManager } : {}),
+    ...(defined(options.contextManagerFactory) ? { contextManagerFactory: options.contextManagerFactory } : {}),
+    ...(defined(options.compactionService) ? { compactionService: options.compactionService } : {}),
+    ...(defined(options.failureAnalyzer) ? { failureAnalyzer: options.failureAnalyzer } : {}),
+    subagentsEnabled: resolved.subagentsEnabled,
+    ...(defined(options.subagentMaxTurns) ? { subagentMaxTurns: options.subagentMaxTurns } : {}),
+    ...(defined(options.subagentMaxOutputChars) ? { subagentMaxOutputChars: options.subagentMaxOutputChars } : {}),
+    reviewAntiGaming: resolved.reviewAntiGaming,
     ...(defined(options.allowedTools) ? { allowedTools: options.allowedTools } : {}),
     ...(defined(options.disabledTools) ? { disabledTools: options.disabledTools } : {}),
     ...(defined(options.permissionDecider) ? { permissionDecider: options.permissionDecider } : {}),
@@ -131,7 +186,8 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     ...(defined(options.projectDocMaxBytes) ? { projectDocMaxBytes: options.projectDocMaxBytes } : {}),
     ...(defined(options.contextMode) ? { contextMode: options.contextMode } : {}),
     ...(defined(options.repoMapMaxChars) ? { repoMapMaxChars: options.repoMapMaxChars } : {}),
-    ...(defined(options.finalEvidenceMode) ? { finalEvidenceMode: options.finalEvidenceMode } : {}),
+    validationMode: resolved.validationMode,
+    finalEvidenceMode: resolved.finalEvidenceMode,
     ...(defined(options.skillsMode) ? { skillsMode: options.skillsMode } : {}),
     ...(defined(options.skillsMaxChars) ? { skillsMaxChars: options.skillsMaxChars } : {}),
     ...(defined(options.eventBus) ? { eventBus: options.eventBus } : {}),
@@ -143,9 +199,22 @@ export async function runConfiguredAgent(
   options: RunConfiguredAgentOptions
 ): Promise<RunConfiguredAgentResult> {
   const eventBus = options.eventBus ?? new AgentEventBus();
+  const compactionMode = options.compactionMode ?? DEFAULT_COMPACTION_MODE;
+  const validationMode = options.validationMode ?? DEFAULT_VALIDATION_MODE;
+  const finalEvidenceMode = options.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
+  const subagentsEnabled = options.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
+  const reviewAntiGaming = options.reviewAntiGaming ?? true;
+  const maxMessageHistoryChars = options.maxMessageHistoryChars ?? DEFAULT_MAX_MESSAGE_HISTORY_CHARS;
   const modelClient = options.modelClient ?? (options.modelClientFactory ?? createModelClient)(options.provider, {
     model: options.model
   });
+  const compactionModelClient = options.compactionModelClient ?? (
+    compactionMode === "model_sub_session" && (options.compactionModel || options.compactionProvider)
+      ? (options.modelClientFactory ?? createModelClient)(options.compactionProvider ?? options.provider, {
+          model: options.compactionModel
+        })
+      : undefined
+  );
   let toolRegistry = options.toolRegistry;
   let mcpServers: McpServerRunSummary[] = [];
 
@@ -160,10 +229,20 @@ export async function runConfiguredAgent(
   }
 
   const runConfig: AgentHarnessConfig = {
-    ...baseRunConfig({ ...options, eventBus }, modelClient),
+    ...baseRunConfig(
+      { ...options, eventBus, compactionModelClient },
+      modelClient,
+      {
+        compactionMode,
+        validationMode,
+        finalEvidenceMode,
+        subagentsEnabled,
+        reviewAntiGaming,
+        maxMessageHistoryChars
+      }
+    ),
     ...(toolRegistry ? { toolRegistry } : {}),
     ...(mcpServers.length > 0 ? { mcpServers } : {}),
-    ...(defined(options.validationMode) ? { validationMode: options.validationMode } : {}),
     ...(defined(options.validationCommands) ? { validationCommands: options.validationCommands } : {}),
     ...(defined(options.validationRetryLimit) ? { validationRetryLimit: options.validationRetryLimit } : {}),
     ...(defined(options.validationTimeoutSec) ? { validationTimeoutSec: options.validationTimeoutSec } : {}),
@@ -175,7 +254,12 @@ export async function runConfiguredAgent(
     ...(defined(options.attemptsDir) ? { attemptsDir: options.attemptsDir } : {})
   };
 
-  const result = shouldUseAgentRunController(options)
+  const result = shouldUseAgentRunController({
+    ...options,
+    validationMode,
+    finalEvidenceMode,
+    reviewAntiGaming
+  })
     ? await runAgentHarness(runConfig)
     : await runAgent(runConfig);
   return { result, eventBus, mcpServers };

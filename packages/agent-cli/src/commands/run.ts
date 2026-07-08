@@ -71,11 +71,10 @@ function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.W
   }
 }
 
-function printNonInteractiveHelp(commandName: "run" | "solve", stdout: NodeJS.WritableStream): void {
-  const aliasNote = commandName === "solve" ? "Compatibility alias for agent run." : "Run the autonomous coding agent once.";
-  stdout.write(`${commandName === "solve" ? "agent solve" : "agent run"} [instruction] [flags]
+function printNonInteractiveHelp(stdout: NodeJS.WritableStream): void {
+  stdout.write(`agent run [instruction] [flags]
 
-${aliasNote}
+Run the autonomous coding agent once.
 
 Instruction input:
   agent run "Fix failing tests"
@@ -109,9 +108,23 @@ Context and tool flags:
   --disabled-tools <comma-separated>
   --context-mode <off|repo-map>
   --repo-map-max-chars <number>
+  --max-message-history-chars <number>
+  --message-history-retain <number>
+  --compaction-summary-chars <number>
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
   --skills-max-chars <number>
+  --no-subagents
+  --subagent-max-turns <number>
+  --subagent-max-output-chars <number>
+  --review-anti-gaming / --no-review-anti-gaming
+  --compaction-mode <off|deterministic|model-sub-session>
+  --compaction-model <model>
+  --compaction-provider <deepseek|glm>
+  --compaction-max-input-chars <number>
+  --compaction-max-output-chars <number>
+  --compaction-timeout-sec <number>
+  --compaction-fallback <deterministic|fail>
   --enable-mcp
   --mcp-config <path>
 
@@ -129,7 +142,6 @@ Output flags:
 async function runNonInteractiveCommand(
   argv: string[],
   deps: SolveCommandDeps,
-  commandName: "run" | "solve",
   overrides: RunCommandOverrides = {}
 ): Promise<number> {
   const stdout = deps.stdout ?? process.stdout;
@@ -141,7 +153,7 @@ async function runNonInteractiveCommand(
 
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
-      printNonInteractiveHelp(commandName, stdout);
+      printNonInteractiveHelp(stdout);
       return 0;
     }
 
@@ -181,6 +193,13 @@ async function runNonInteractiveCommand(
       maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
       messageHistoryRetain: cliConfig.messageHistoryRetain,
       compactionSummaryChars: cliConfig.compactionSummaryChars,
+      compactionMode: cliConfig.compactionMode,
+      compactionModel: cliConfig.compactionModel,
+      compactionProvider: cliConfig.compactionProvider,
+      compactionMaxInputChars: cliConfig.compactionMaxInputChars,
+      compactionMaxOutputChars: cliConfig.compactionMaxOutputChars,
+      compactionTimeoutSec: cliConfig.compactionTimeoutSec,
+      compactionFallback: cliConfig.compactionFallback,
       validationMode: cliConfig.validationMode,
       validationCommands: cliConfig.validationCommands,
       validationRetryLimit: cliConfig.validationRetryLimit,
@@ -201,6 +220,10 @@ async function runNonInteractiveCommand(
       finalEvidenceMode: cliConfig.finalEvidenceMode,
       skillsMode: cliConfig.skillsMode,
       skillsMaxChars: cliConfig.skillsMaxChars,
+      subagentsEnabled: cliConfig.subagentsEnabled,
+      subagentMaxTurns: cliConfig.subagentMaxTurns,
+      subagentMaxOutputChars: cliConfig.subagentMaxOutputChars,
+      reviewAntiGaming: cliConfig.reviewAntiGaming,
       enableMcp: cliConfig.enableMcp,
       mcpConfig: cliConfig.mcpConfig,
       eventBus,
@@ -226,11 +249,7 @@ async function runNonInteractiveCommand(
 }
 
 export async function runRunCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
-  return await runNonInteractiveCommand(argv, deps, "run");
-}
-
-export async function runSolveCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
-  return await runNonInteractiveCommand(argv, deps, "solve");
+  return await runNonInteractiveCommand(argv, deps);
 }
 
 export async function runRunCommandWithOverrides(
@@ -238,5 +257,5 @@ export async function runRunCommandWithOverrides(
   deps: SolveCommandDeps = {},
   overrides: RunCommandOverrides = {}
 ): Promise<number> {
-  return await runNonInteractiveCommand(argv, deps, "run", overrides);
+  return await runNonInteractiveCommand(argv, deps, overrides);
 }

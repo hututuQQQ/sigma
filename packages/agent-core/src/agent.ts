@@ -7,14 +7,17 @@ import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
 import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
+import { CompactionService } from "./context/compaction-service.js";
 import { ContextManager } from "./context/context-manager.js";
+import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
-import { detectProjectProfile } from "./harness/project-detector.js";
+import { DEFAULT_COMPACTION_MODE, DEFAULT_FINAL_EVIDENCE_MODE, DEFAULT_SUBAGENTS_ENABLED } from "./defaults.js";
 import { formatSelectedSkills } from "./skills/format-skills.js";
 import { loadAllSkills } from "./skills/load-skills.js";
-import { projectHintsFromProfile, retrieveSkills } from "./skills/retrieve-skills.js";
+import { projectHintsFromDiscovery, retrieveSkills } from "./skills/retrieve-skills.js";
 import type { AgentSkill } from "./skills/types.js";
+import { discoverProjects } from "./validation/project-discovery.js";
 import { inferEvidenceRecord } from "./controller/evidence.js";
 import { createInitialFinalGateStatus, finalGateNudge } from "./controller/final-gate.js";
 import {
@@ -29,6 +32,8 @@ import type {
   AgentFinishReason,
   AgentRunConfig,
   AgentRunResult,
+  ContextCompactionSummary,
+  SubagentRunSummary,
   SummaryJson,
   TokenTotals,
   ToolExecutionContext,
@@ -185,11 +190,32 @@ async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegis
   if (config.toolRegistry && config.toolRegistryFactory) {
     throw new Error("Configure either toolRegistry or toolRegistryFactory, not both.");
   }
-  const registry = config.toolRegistry ?? (config.toolRegistryFactory ? await config.toolRegistryFactory() : createDefaultToolRegistry());
+  const registry = config.toolRegistry ?? (
+    config.toolRegistryFactory
+      ? await config.toolRegistryFactory()
+      : createDefaultToolRegistry({
+        subagents: {
+            enabled: config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED,
+            defaultMaxTurns: config.subagentMaxTurns,
+            defaultMaxOutputChars: config.subagentMaxOutputChars
+          }
+        })
+  );
   return filterToolRegistry(registry, {
     allowedTools: config.allowedTools,
     disabledTools: config.disabledTools
   });
+}
+
+function isSubagentRunSummary(value: unknown): value is SubagentRunSummary {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    (record.subagent_type === "investigator" || record.subagent_type === "reviewer") &&
+    (record.status === "ok" || record.status === "error") &&
+    typeof record.summary === "string"
+  );
 }
 
 export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
@@ -248,6 +274,24 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.selectedSkills && result.selectedSkills.length > 0) {
     summary.selected_skills = result.selectedSkills;
   }
+  if (result.contextCompactions && result.contextCompactions.length > 0) {
+    summary.context_compactions = result.contextCompactions;
+  }
+  if (result.failureAnalyses && result.failureAnalyses.length > 0) {
+    summary.failure_analyses = result.failureAnalyses;
+  }
+  if (result.validationPlan) {
+    summary.validation_plan = result.validationPlan;
+  }
+  if (result.codeIndex) {
+    summary.code_index = result.codeIndex;
+  }
+  if (result.subagentRuns && result.subagentRuns.length > 0) {
+    summary.subagent_runs = result.subagentRuns;
+  }
+  if (result.reviewFindings && result.reviewFindings.length > 0) {
+    summary.review_findings = result.reviewFindings;
+  }
   return summary;
 }
 
@@ -264,6 +308,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   const model = config.modelClient.model;
   const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
   const maxWallTimeSec = config.maxWallTimeSec ?? DEFAULT_MAX_WALL_TIME_SEC;
+  const compactionMode = config.compactionMode ?? DEFAULT_COMPACTION_MODE;
+  const subagentsEnabled = config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
   const context: ToolExecutionContext = {
     workspacePath: path.resolve(config.workspacePath),
     permissionMode: config.permissionMode ?? "ask",
@@ -277,6 +323,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       contextIndexes: new Map<string, unknown>()
     },
     alwaysAllowTools: new Set<string>(),
+    modelClient: config.modelClient,
+    runId,
+    provider,
+    model,
+    subagentsEnabled,
+    subagentDepth: 0,
     ...(config.abortSignal ? { abortSignal: config.abortSignal } : {})
   };
   const traceStore = config.traceJsonlPath ? new JsonlSessionStore(config.traceJsonlPath) : undefined;
@@ -298,10 +350,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         forkedFromSessionId: config.forkedFromSessionId
       });
   const workflow = createWorkflowState();
-  const contextManager = new ContextManager();
-  const finalEvidenceMode = config.finalEvidenceMode ?? "off";
+  const finalEvidenceMode = config.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
+  const contextCompactions: ContextCompactionSummary[] = [];
+  const subagentRuns: SubagentRunSummary[] = [];
 
   const recordEvent = async (agentEvent: AgentEvent): Promise<void> => {
     const safeEvent = compactEventForTrace(redactSecrets(agentEvent));
@@ -312,6 +365,27 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     }
     await durableSession?.appendEvent(safeEvent);
   };
+  context.emitEvent = recordEvent;
+  if (durableSession?.sessionId) context.sessionId = durableSession.sessionId;
+
+  const compactionService = config.compactionService ?? new CompactionService({
+    mode: compactionMode,
+    fallback: config.compactionFallback,
+    modelProvider: compactionMode === "model_sub_session"
+      ? new ModelSubSessionCompactionProvider({
+          modelClient: config.compactionModelClient ?? config.modelClient,
+          maxInputChars: config.compactionMaxInputChars,
+          maxOutputChars: config.compactionMaxOutputChars,
+          timeoutSec: config.compactionTimeoutSec,
+          abortSignal: config.abortSignal
+        })
+      : undefined
+  });
+  const contextManager = config.contextManager ?? (
+    config.contextManagerFactory
+      ? await config.contextManagerFactory({ config, compactionService })
+      : new ContextManager({ compactionService })
+  );
 
   const requestModel = async (turn: number, requestMessages: AgentMessage[], tools: ToolDefinition[]): Promise<ModelResponse> => {
     if (!config.modelClient.stream) {
@@ -414,11 +488,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   }
   let selectedSkills: AgentSkill[] = [];
   if ((config.skillsMode ?? "auto") === "auto") {
-    const profile = await detectProjectProfile(context.workspacePath);
+    const discovery = await discoverProjects({ workspacePath: context.workspacePath });
     const allSkills = await loadAllSkills(context.workspacePath);
     selectedSkills = retrieveSkills(allSkills, {
       instruction: config.instruction,
-      projectHints: projectHintsFromProfile(profile)
+      projectHints: projectHintsFromDiscovery(discovery)
     });
     const skillsBlock = formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS);
     if (skillsBlock) systemSections.push(skillsBlock);
@@ -450,7 +524,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       projectInstructionSources: loadedProjectInstructions.sources,
       contextMode: config.contextMode,
       repoMapChars: repoMap?.chars,
-      selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
+      compactionMode,
+      compactionModel: config.compactionModel,
+        selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
     }, undefined, durableSession?.sessionId)
   );
 
@@ -473,7 +549,23 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         workflow: summarizeWorkflowState(workflow, changedFilesForContext),
         evidenceRecords: workflow.evidenceRecords,
         changedFiles: changedFilesForContext,
-        todos: context.runState.todos
+        todos: context.runState.todos,
+        emitEvent: async (contextEvent) => {
+          await recordEvent(event(
+            runId,
+            contextEvent.type,
+            provider,
+            model,
+            contextEvent.metadata as unknown as Record<string, unknown>,
+            undefined,
+            durableSession?.sessionId
+          ));
+          if (contextEvent.type === "context_compaction_end" || !contextEvent.metadata.fallback_used) {
+            if (contextEvent.type !== "context_compaction_start") {
+              contextCompactions.push(contextEvent.metadata);
+            }
+          }
+        }
       });
       if (preparedMessages.messages !== messages) {
         messages.splice(0, messages.length, ...preparedMessages.messages);
@@ -569,18 +661,37 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             durableSession?.sessionId
           )
         );
+        if (isSubagentRunSummary(result.metadata?.subagentRun)) {
+          subagentRuns.push(result.metadata.subagentRun);
+        }
         const evidence = inferEvidenceRecord({
           toolName: call.function.name,
           args: call.function.arguments,
           result
         });
+        const failureAnalysisStart = workflow.failureAnalyses.length;
         const failurePattern = recordToolInWorkflow({
           workflow,
           toolName: call.function.name,
           args: call.function.arguments,
           result,
-          evidence
+          evidence,
+          failureAnalyzer: config.failureAnalyzer
         });
+        const failureAnalysis = workflow.failureAnalyses.length > failureAnalysisStart
+          ? workflow.failureAnalyses[workflow.failureAnalyses.length - 1]
+          : null;
+        if (failureAnalysis) {
+          await recordEvent(event(
+            runId,
+            "failure_analysis",
+            provider,
+            model,
+            { turn: turns, toolName: call.function.name, analysis: failureAnalysis },
+            toolStart.id,
+            durableSession?.sessionId
+          ));
+        }
         const nudge = workflowFailureNudge(workflow, failurePattern);
         if (nudge) workflowNudges.push(nudge);
         messages.push({
@@ -638,11 +749,15 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     projectInstructionSources: loadedProjectInstructions.sources,
     contextMode: config.contextMode,
     repoMapChars: repoMap?.chars,
+    codeIndex: repoMap?.codeIndex,
     mcpServers: config.mcpServers,
     workflow: summarizeWorkflowState(workflow, changedFiles),
     evidenceRecords: workflow.evidenceRecords,
     finalGate: finalGateStatus,
-    selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
+    selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source })),
+    contextCompactions,
+    failureAnalyses: workflow.failureAnalyses,
+    subagentRuns
   };
 
   await recordEvent(event(runId, "run_end", provider, model, { result }, undefined, durableSession?.sessionId));

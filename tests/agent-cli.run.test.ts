@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
-import { runRunCommand, runSolveCommand } from "../packages/agent-cli/src/commands/solve.js";
+import { runRunCommand } from "../packages/agent-cli/src/commands/run.js";
 
 class FinalModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -97,7 +97,7 @@ function ttyReadable(input: string): NodeJS.ReadableStream & { isTTY?: boolean }
   return stream;
 }
 
-describe("agent-cli solve", () => {
+describe("agent-cli run", () => {
   it("parses harness flags", () => {
     const config = loadCliConfig({
       workspace: "work",
@@ -138,9 +138,20 @@ describe("agent-cli solve", () => {
       "project-doc-max-bytes": "1234",
       "context-mode": "off",
       "repo-map-max-chars": "5678",
+      "compaction-mode": "model-sub-session",
+      "compaction-model": "compact-model",
+      "compaction-provider": "glm",
+      "compaction-max-input-chars": "1111",
+      "compaction-max-output-chars": "2222",
+      "compaction-timeout-sec": "42",
+      "compaction-fallback": "fail",
       "final-evidence-mode": "auto",
       "skills-mode": "off",
       "skills-max-chars": "123",
+      "no-subagents": true,
+      "subagent-max-turns": "3",
+      "subagent-max-output-chars": "4567",
+      "no-review-anti-gaming": true,
       "enable-mcp": true,
       "mcp-config": ".agent/custom-mcp.json",
       "no-stream-ui": true
@@ -153,9 +164,20 @@ describe("agent-cli solve", () => {
       projectDocMaxBytes: 1234,
       contextMode: "off",
       repoMapMaxChars: 5678,
+      compactionMode: "model_sub_session",
+      compactionModel: "compact-model",
+      compactionProvider: "glm",
+      compactionMaxInputChars: 1111,
+      compactionMaxOutputChars: 2222,
+      compactionTimeoutSec: 42,
+      compactionFallback: "fail",
       finalEvidenceMode: "auto",
       skillsMode: "off",
       skillsMaxChars: 123,
+      subagentsEnabled: false,
+      subagentMaxTurns: 3,
+      subagentMaxOutputChars: 4567,
+      reviewAntiGaming: false,
       enableMcp: true,
       mcpConfig: ".agent/custom-mcp.json",
       noStreamUi: true
@@ -179,9 +201,20 @@ describe("agent-cli solve", () => {
     });
   });
 
-  it("defaults final evidence mode to auto only when validation is auto", () => {
-    expect(loadCliConfig({ workspace: "work", provider: "deepseek" }).finalEvidenceMode).toBe("off");
-    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "validation-mode": "auto" }).finalEvidenceMode).toBe("auto");
+  it("defaults MVP capability layers on and supports explicit off switches", () => {
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek" })).toMatchObject({
+      compactionMode: "model_sub_session",
+      maxMessageHistoryChars: 120000,
+      validationMode: "auto",
+      finalEvidenceMode: "auto",
+      subagentsEnabled: true
+    });
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "compaction-mode": "deterministic" }).compactionMode).toBe("deterministic");
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "compaction-mode": "off" }).compactionMode).toBe("off");
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "max-message-history-chars": "0" }).maxMessageHistoryChars).toBe(0);
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "validation-mode": "off" }).validationMode).toBe("off");
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "final-evidence-mode": "off" }).finalEvidenceMode).toBe("off");
+    expect(loadCliConfig({ workspace: "work", provider: "deepseek", "no-subagents": true }).subagentsEnabled).toBe(false);
   });
 
   it("loads sectioned TOML config with arrays, booleans, and numbers", async () => {
@@ -190,10 +223,9 @@ describe("agent-cli solve", () => {
     await writeFile(
       path.join(dir, ".agent", "config.toml"),
       [
+        "[run]",
         'provider = "glm"',
         'model = "glm-config"',
-        "",
-        "[run]",
         "max_turns = 30",
         "max_wall_time_sec = 1800",
         'permission_mode = "yolo"',
@@ -202,6 +234,17 @@ describe("agent-cli solve", () => {
         'mode = "auto"',
         "retry_limit = 1",
         'commands = ["pnpm test", "pnpm lint"]',
+        "",
+        "[context]",
+        'compaction_mode = "off"',
+        "compaction_timeout_sec = 7",
+        "",
+        "[subagents]",
+        "enabled = true",
+        "max_turns = 2",
+        "",
+        "[review]",
+        "anti_gaming = false",
         "",
         "[tools]",
         'allowed = ["read", "write"]',
@@ -228,6 +271,11 @@ describe("agent-cli solve", () => {
       validationMode: "auto",
       validationRetryLimit: 1,
       validationCommands: ["pnpm test", "pnpm lint"],
+      compactionMode: "off",
+      compactionTimeoutSec: 7,
+      subagentsEnabled: true,
+      subagentMaxTurns: 2,
+      reviewAntiGaming: false,
       allowedTools: ["read", "write"],
       disabledTools: ["bash"],
       enableMcp: true,
@@ -283,7 +331,7 @@ describe("agent-cli solve", () => {
     });
   });
 
-  it("keeps top-level config compatibility and lets env and CLI override it", async () => {
+  it("ignores top-level config keys and keeps env and CLI precedence", async () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-config-legacy-${Date.now()}`), { recursive: true });
     await mkdir(path.join(dir, ".agent"), { recursive: true });
     await writeFile(
@@ -300,10 +348,10 @@ describe("agent-cli solve", () => {
     process.env.AGENT_MODEL = "from-env";
     try {
       expect(loadCliConfig({ workspace: dir })).toMatchObject({
-        provider: "glm",
+        provider: "deepseek",
         model: "from-env",
-        maxTurns: 11,
-        allowedTools: ["read"]
+        maxTurns: 20,
+        allowedTools: []
       });
       expect(loadCliConfig({ workspace: dir, model: "from-cli", "max-turns": "22" })).toMatchObject({
         model: "from-cli",
@@ -320,7 +368,7 @@ describe("agent-cli solve", () => {
     const summaryPath = path.join(dir, "summary.json");
     const tracePath = path.join(dir, "trace.jsonl");
 
-    const code = await runSolveCommand(
+    const code = await runRunCommand(
       [
         "--workspace",
         dir,
@@ -330,6 +378,10 @@ describe("agent-cli solve", () => {
         "deepseek",
         "--permission-mode",
         "yolo",
+        "--validation-mode",
+        "off",
+        "--final-evidence-mode",
+        "off",
         "--summary-json",
         summaryPath,
         "--trace-jsonl",
@@ -477,16 +529,30 @@ describe("agent-cli solve", () => {
     expect(stderr.text()).toContain("[sigma] run_start");
   });
 
-  it("prints help for run and solve entrypoints", async () => {
+  it("prints run help and rejects removed command aliases", async () => {
     const runStdout = new MemoryWritable();
     await expect(runRunCommand(["--help"], { stdout: runStdout })).resolves.toBe(0);
     expect(runStdout.text()).toContain("agent run [instruction] [flags]");
     expect(runStdout.text()).toContain("Run the autonomous coding agent once.");
 
-    const solveStdout = new MemoryWritable();
-    await expect(runSolveCommand(["--help"], { stdout: solveStdout })).resolves.toBe(0);
-    expect(solveStdout.text()).toContain("agent solve [instruction] [flags]");
-    expect(solveStdout.text()).toContain("Compatibility alias for agent run.");
+    const stdout = new MemoryWritable();
+    const stderr = new MemoryWritable();
+    const previousWrite = process.stdout.write;
+    const previousErrorWrite = process.stderr.write;
+    try {
+      process.stdout.write = stdout.write.bind(stdout) as typeof process.stdout.write;
+      process.stderr.write = stderr.write.bind(stderr) as typeof process.stderr.write;
+      await expect(runAgentCommand(["solve", "--help"], { tuiRunner: async () => {} })).resolves.toBe(1);
+      await expect(runAgentCommand(["history"], { tuiRunner: async () => {} })).resolves.toBe(1);
+      await expect(runAgentCommand(["completion", "bash"])).resolves.toBe(0);
+    } finally {
+      process.stdout.write = previousWrite;
+      process.stderr.write = previousErrorWrite;
+    }
+    expect(stderr.text()).toContain("Unknown command: solve");
+    expect(stderr.text()).toContain("Unknown command: history");
+    expect(stdout.text()).not.toContain("solve");
+    expect(stdout.text()).toContain('compgen -W "run tui chat sessions session checkpoints checkpoint completion doctor replay"');
   });
 
   it("prints only the final message in quiet text mode", async () => {
@@ -510,7 +576,7 @@ describe("agent-cli solve", () => {
     const stderr = new MemoryWritable();
     const stdout = new MemoryWritable();
 
-    const code = await runSolveCommand(
+    const code = await runRunCommand(
       ["--workspace", dir, "--instruction", "finish immediately", "--provider", "deepseek", "--permission-mode", "yolo"],
       {
         stdout,
@@ -526,7 +592,7 @@ describe("agent-cli solve", () => {
     const quietStderr = new MemoryWritable();
     const quietStdout = new MemoryWritable();
     const quietDir = await mkdir(path.join(os.tmpdir(), `agent-cli-no-stream-${Date.now()}`), { recursive: true });
-    await runSolveCommand(
+    await runRunCommand(
       [
         "--workspace",
         quietDir,
@@ -551,7 +617,7 @@ describe("agent-cli solve", () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-harness-${Date.now()}`), { recursive: true });
     const summaryPath = path.join(dir, "summary.json");
 
-    const code = await runSolveCommand(
+    const code = await runRunCommand(
       [
         "--workspace",
         dir,
@@ -601,7 +667,7 @@ describe("agent-cli solve", () => {
 
     const stdout = new MemoryWritable();
     const stderr = new MemoryWritable();
-    const code = await runSolveCommand(
+    const code = await runRunCommand(
       [
         "--workspace",
         dir,
@@ -644,7 +710,7 @@ describe("agent-cli solve", () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-harness-fail-${Date.now()}`), { recursive: true });
     const summaryPath = path.join(dir, "summary.json");
 
-    const code = await runSolveCommand(
+    const code = await runRunCommand(
       [
         "--workspace",
         dir,

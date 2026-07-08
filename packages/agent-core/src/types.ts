@@ -1,4 +1,5 @@
-import type { ModelClient, ToolCall, ToolDefinition, Usage } from "agent-ai";
+import type { ModelClient, ProviderName, ToolCall, ToolDefinition, Usage } from "agent-ai";
+import type { ValidationPlan } from "./validation/validation-types.js";
 
 export type PermissionMode = "ask" | "yolo";
 
@@ -60,6 +61,27 @@ export interface WorkflowFailurePatternSummary {
   last_summary: string;
   suggested_next_action?: string;
   diagnostics?: string[];
+  confidence?: number;
+  related_files?: string[];
+  failing_test_names?: string[];
+  first_actionable_line?: string;
+  rerun_command_suggestion?: string;
+  should_avoid_repeating_command?: boolean;
+}
+
+export interface FailureAnalysisSummary {
+  category: WorkflowFailureCategory;
+  confidence: number;
+  primaryMessage: string;
+  relatedCommand?: string;
+  relatedFiles?: string[];
+  failingTestNames?: string[];
+  firstActionableLine?: string;
+  exitCode?: number | null;
+  suggestedNextAction: string;
+  diagnostics?: string[];
+  rerunCommandSuggestion?: string;
+  shouldAvoidRepeatingCommand?: boolean;
 }
 
 export type EvidenceKind =
@@ -91,6 +113,50 @@ export interface FinalGateStatus {
   reason?: string;
 }
 
+export type SubagentType = "investigator" | "reviewer";
+
+export interface SubagentFinding {
+  title: string;
+  detail: string;
+  severity?: "info" | "low" | "medium" | "high";
+  file?: string;
+}
+
+export interface SubagentRunSummary {
+  id: string;
+  subagent_type: SubagentType;
+  description: string;
+  status: "ok" | "error";
+  summary: string;
+  findings: SubagentFinding[];
+  relevant_files: string[];
+  validation_suggestions: string[];
+  risks: string[];
+  tool_calls: number;
+  duration_ms: number;
+  error?: string;
+}
+
+export type ReviewGateStatus = "clean" | "suspicious" | "blocked";
+
+export interface ReviewGateFinding {
+  rule_id: string;
+  severity: "low" | "medium" | "high";
+  message: string;
+  path?: string;
+  line?: number;
+  snippet?: string;
+}
+
+export interface ReviewGateSummary {
+  gate: "anti_gaming";
+  status: ReviewGateStatus;
+  findings: ReviewGateFinding[];
+  suggested_fixes: string[];
+  scanned_files: string[];
+  duration_ms: number;
+}
+
 export interface WorkflowStateSummary {
   phase: WorkflowPhase;
   commands_tried: string[];
@@ -118,6 +184,14 @@ export interface ToolExecutionContext {
   runState: AgentRunState;
   alwaysAllowTools: Set<string>;
   abortSignal?: AbortSignal;
+  modelClient?: ModelClient;
+  emitEvent?: (event: AgentEvent) => void | Promise<void>;
+  runId?: string;
+  sessionId?: string;
+  provider?: string;
+  model?: string;
+  subagentsEnabled?: boolean;
+  subagentDepth?: number;
 }
 
 export interface ToolHandler {
@@ -138,6 +212,11 @@ export interface ToolRegistry {
 
 export interface ToolRegistryOptions {
   allowOverrides?: boolean;
+  subagents?: {
+    enabled?: boolean;
+    defaultMaxTurns?: number;
+    defaultMaxOutputChars?: number;
+  };
 }
 
 export interface ToolRegistryFilter {
@@ -163,12 +242,37 @@ export interface AgentRunState {
 }
 
 export type ContextMode = "off" | "repo-map";
+export type CompactionMode = "off" | "deterministic" | "model_sub_session";
+export type CompactionFallbackMode = "deterministic" | "fail";
 
 export interface McpServerRunSummary {
   name: string;
   enabled: boolean;
   transport?: "stdio" | "http";
   tools_loaded: number;
+  error?: string;
+}
+
+export interface ContextCompactionSummary {
+  strategy: CompactionMode;
+  before_message_count: number;
+  after_message_count: number;
+  compacted_message_count: number;
+  artifact?: unknown;
+  fallback_used: boolean;
+  duration_ms: number;
+  error?: string;
+}
+
+export interface CodeIndexSummary {
+  file_count: number;
+  symbol_count: number;
+  definition_count: number;
+  dependency_edge_count: number;
+  test_to_source_count: number;
+  config_files: string[];
+  truncated: boolean;
+  degraded?: boolean;
   error?: string;
 }
 
@@ -192,6 +296,25 @@ export interface AgentRunConfig {
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
+  compactionMode?: CompactionMode;
+  compactionModel?: string;
+  compactionProvider?: ProviderName;
+  compactionModelClient?: ModelClient;
+  compactionMaxInputChars?: number;
+  compactionMaxOutputChars?: number;
+  compactionTimeoutSec?: number;
+  compactionFallback?: CompactionFallbackMode;
+  contextManager?: import("./context/context-manager.js").ContextManager;
+  contextManagerFactory?: (options: {
+    config: AgentRunConfig;
+    compactionService?: import("./context/compaction-service.js").CompactionService;
+  }) => import("./context/context-manager.js").ContextManager | Promise<import("./context/context-manager.js").ContextManager>;
+  compactionService?: import("./context/compaction-service.js").CompactionService;
+  failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
+  subagentsEnabled?: boolean;
+  subagentMaxTurns?: number;
+  subagentMaxOutputChars?: number;
+  reviewAntiGaming?: boolean;
   eventBus?: AgentEventBusLike;
   toolRegistry?: ToolRegistry;
   toolRegistryFactory?: () => ToolRegistry | Promise<ToolRegistry>;
@@ -241,6 +364,16 @@ export interface AgentEvent {
     | "assistant_message"
     | "tool_start"
     | "tool_end"
+    | "context_compaction_start"
+    | "context_compaction_end"
+    | "context_compaction_error"
+    | "failure_analysis"
+    | "validation_plan_created"
+    | "subagent_start"
+    | "subagent_end"
+    | "subagent_error"
+    | "review_gate_start"
+    | "review_gate_end"
     | "harness_check_start"
     | "harness_check_end"
     | "usage"
@@ -286,6 +419,12 @@ export interface AgentRunResult {
   evidenceRecords?: EvidenceRecord[];
   finalGate?: FinalGateStatus;
   selectedSkills?: SelectedSkillSummary[];
+  contextCompactions?: ContextCompactionSummary[];
+  failureAnalyses?: FailureAnalysisSummary[];
+  validationPlan?: ValidationPlan;
+  codeIndex?: CodeIndexSummary;
+  subagentRuns?: SubagentRunSummary[];
+  reviewFindings?: ReviewGateSummary[];
 }
 
 export interface WorkspaceManifestEntry {
@@ -392,6 +531,12 @@ export interface SummaryJson {
   evidence?: EvidenceRecord[];
   final_gate?: FinalGateStatus;
   selected_skills?: SelectedSkillSummary[];
+  context_compactions?: ContextCompactionSummary[];
+  failure_analyses?: FailureAnalysisSummary[];
+  validation_plan?: ValidationPlan;
+  code_index?: CodeIndexSummary;
+  subagent_runs?: SubagentRunSummary[];
+  review_findings?: ReviewGateSummary[];
 }
 
 export function addUsage(total: TokenTotals, usage: Usage | undefined): void {

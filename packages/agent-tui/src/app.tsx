@@ -9,6 +9,8 @@ import {
   type AgentHarnessValidationMode,
   type AgentRunResult,
   type AgentSkillsMode,
+  type CompactionFallbackMode,
+  type CompactionMode,
   type ContextMode,
   type PermissionMode,
   type PermissionRequest,
@@ -107,9 +109,23 @@ export interface TuiAppOptions {
   disabledTools?: string[];
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
+  maxMessageHistoryChars?: number;
+  messageHistoryRetain?: number;
+  compactionSummaryChars?: number;
+  compactionMode?: CompactionMode;
+  compactionModel?: string;
+  compactionProvider?: ProviderName;
+  compactionMaxInputChars?: number;
+  compactionMaxOutputChars?: number;
+  compactionTimeoutSec?: number;
+  compactionFallback?: CompactionFallbackMode;
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  subagentsEnabled?: boolean;
+  subagentMaxTurns?: number;
+  subagentMaxOutputChars?: number;
+  reviewAntiGaming?: boolean;
   enableMcp?: boolean;
   mcpConfig?: string;
   traceJsonl?: string;
@@ -964,9 +980,23 @@ export class TuiApp {
         disabledTools: mergeDisabledToolsForMode(this.mode, this.options.disabledTools),
         contextMode: this.options.contextMode,
         repoMapMaxChars: this.options.repoMapMaxChars,
+        maxMessageHistoryChars: this.options.maxMessageHistoryChars,
+        messageHistoryRetain: this.options.messageHistoryRetain,
+        compactionSummaryChars: this.options.compactionSummaryChars,
+        compactionMode: this.options.compactionMode,
+        compactionModel: this.options.compactionModel,
+        compactionProvider: this.options.compactionProvider,
+        compactionMaxInputChars: this.options.compactionMaxInputChars,
+        compactionMaxOutputChars: this.options.compactionMaxOutputChars,
+        compactionTimeoutSec: this.options.compactionTimeoutSec,
+        compactionFallback: this.options.compactionFallback,
         finalEvidenceMode: this.options.finalEvidenceMode,
         skillsMode: this.options.skillsMode,
         skillsMaxChars: this.options.skillsMaxChars,
+        subagentsEnabled: this.options.subagentsEnabled,
+        subagentMaxTurns: this.options.subagentMaxTurns,
+        subagentMaxOutputChars: this.options.subagentMaxOutputChars,
+        reviewAntiGaming: this.options.reviewAntiGaming,
         enableMcp: this.options.enableMcp,
         mcpConfig: this.options.mcpConfig,
         traceJsonlPath: this.options.traceJsonl,

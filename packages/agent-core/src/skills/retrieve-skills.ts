@@ -1,4 +1,4 @@
-import type { ProjectProfile } from "../harness/project-detector.js";
+import type { ProjectDiscoveryResult } from "../validation/validation-types.js";
 import type { AgentSkill, SkillRetrievalInput } from "./types.js";
 
 const MAX_SELECTED_SKILLS = 3;
@@ -13,19 +13,25 @@ function tokenize(text: string): Set<string> {
   );
 }
 
-export function projectHintsFromProfile(profile: ProjectProfile): string[] {
+export function projectHintsFromDiscovery(discovery: ProjectDiscoveryResult): string[] {
   const hints: string[] = [];
-  if (profile.node.hasPackageJson) hints.push("node", "package.json", profile.node.packageManager);
-  if (profile.node.hasTypeScript) hints.push("typescript", "tsconfig");
-  if (profile.python.hasPython) hints.push("python");
-  if (profile.python.pytestLikely) hints.push("pytest");
-  if (profile.python.prefersUv) hints.push("uv");
-  if (profile.hasGoMod) hints.push("go.mod", "go");
-  if (profile.hasCargoToml) hints.push("Cargo.toml", "rust", "cargo");
-  if (profile.hasPomXml) hints.push("pom.xml", "java", "maven");
-  if (profile.hasGradle) hints.push("gradle", "java");
-  if (profile.hasMakefile) hints.push("makefile", "make");
-  return hints;
+  for (const root of discovery.roots) {
+    hints.push(root.type, ...root.markerFiles);
+    if (root.packageManager) hints.push(root.packageManager);
+    if (root.scripts?.test) hints.push("test");
+    if (root.scripts?.build) hints.push("build");
+    if (root.scripts?.lint) hints.push("lint");
+    if (root.scripts?.typecheck || root.scripts?.["type-check"] || root.scripts?.tsc) hints.push("typescript", "tsconfig");
+    if (root.type === "python" && root.markerFiles.some((file) => file === "pytest.ini" || file === "pyproject.toml")) {
+      hints.push("pytest");
+    }
+    if (root.markerFiles.includes("uv.lock")) hints.push("uv");
+    if (root.type === "go") hints.push("go.mod");
+    if (root.type === "rust") hints.push("Cargo.toml", "cargo");
+    if (root.type === "maven" || root.type === "gradle") hints.push("java");
+    if (root.type === "make") hints.push("makefile");
+  }
+  return [...new Set(hints)];
 }
 
 function scoreSkill(skill: AgentSkill, input: SkillRetrievalInput): number {

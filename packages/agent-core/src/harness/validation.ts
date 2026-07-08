@@ -1,4 +1,3 @@
-import path from "node:path";
 import type { HarnessCommandResult } from "../types.js";
 import { runBashCommand } from "../command-runner.js";
 
@@ -6,74 +5,11 @@ export interface ValidationCommandSpec {
   source: string;
   command: string;
   relatedFiles: string[];
+  cwd?: string;
 }
 
 function tailText(text: string, limit = 4000): string {
   return text.length <= limit ? text : text.slice(-limit);
-}
-
-export function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_./:=+-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function scriptRunCommand(filePath: string): string | null {
-  const base = path.posix.basename(filePath);
-  if (!/^(check|verify|validate|test)(?:[_\-.].*|$)/.test(base)) return null;
-  const quoted = shellQuote(filePath);
-  if (filePath.endsWith(".py")) return `python ${quoted}`;
-  if (filePath.endsWith(".sh")) return `bash ${quoted}`;
-  if (filePath.endsWith(".js") || filePath.endsWith(".mjs") || filePath.endsWith(".cjs")) {
-    return `if command -v node >/dev/null 2>&1; then node ${quoted}; else echo 'node not found for validation' >&2; exit 127; fi`;
-  }
-  return null;
-}
-
-export function explicitValidationCommandSpecs(commands: string[] = []): ValidationCommandSpec[] {
-  return commands
-    .map((command) => command.trim())
-    .filter((command, index, list) => command.length > 0 && list.indexOf(command) === index)
-    .map((command) => ({ source: "configured", command, relatedFiles: [] }));
-}
-
-export function genericValidationCommandSpecs(changedFiles: string[]): ValidationCommandSpec[] {
-  const specs: ValidationCommandSpec[] = [];
-  for (const filePath of changedFiles) {
-    const quoted = shellQuote(filePath);
-    if (filePath.endsWith(".py")) {
-      specs.push({ source: "changed-file", command: `python -m py_compile ${quoted}`, relatedFiles: [filePath] });
-    } else if (filePath.endsWith(".sh")) {
-      specs.push({ source: "changed-file", command: `bash -n ${quoted}`, relatedFiles: [filePath] });
-    } else if (filePath.endsWith(".js") || filePath.endsWith(".mjs") || filePath.endsWith(".cjs")) {
-      specs.push({
-        source: "changed-file",
-        command: `if command -v node >/dev/null 2>&1; then node --check ${quoted}; else echo 'node not found for validation' >&2; exit 127; fi`,
-        relatedFiles: [filePath]
-      });
-    }
-
-    const scriptCommand = scriptRunCommand(filePath);
-    if (scriptCommand) {
-      specs.push({ source: "changed-script", command: scriptCommand, relatedFiles: [filePath] });
-    }
-  }
-  return specs;
-}
-
-export function validationCommandSpecs(
-  configuredCommands: string[] = [],
-  changedFiles: string[]
-): ValidationCommandSpec[] {
-  const specs = [
-    ...explicitValidationCommandSpecs(configuredCommands),
-    ...genericValidationCommandSpecs(changedFiles)
-  ];
-  const seen = new Set<string>();
-  return specs.filter((spec) => {
-    if (seen.has(spec.command)) return false;
-    seen.add(spec.command);
-    return true;
-  });
 }
 
 export async function runHarnessCommand(options: {

@@ -1,10 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { truncateMiddle } from "../compaction.js";
 import {
-  getCodeIndexForTool,
-  type CodeIndexFile,
   type CodeSymbol
 } from "../context/code-index.js";
+import { getCodeGraphIndexForTool, type CodeGraphFile, type CodeGraphIndex } from "../context/code-graph-index.js";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 
 type RepoQueryKind = "text" | "symbol" | "test" | "config" | "path";
@@ -23,6 +22,8 @@ export interface RepoQueryMatch {
   lineEnd: number;
   score: number;
   reasons: string[];
+  graphSignals: string[];
+  why_this_file: string;
   snippet: string;
 }
 
@@ -80,9 +81,34 @@ function symbolScore(symbol: CodeSymbol, tokens: string[]): { score: number; rea
   return { score, reasons };
 }
 
-function fileBaseScore(file: CodeIndexFile, tokens: string[], mentions: string[], kind: RepoQueryKind): {
+function graphSignalsForFile(file: CodeGraphFile, graph: CodeGraphIndex, tokens: string[], mentions: string[], changedFiles: Set<string>): string[] {
+  const signals: string[] = [];
+  const lowerPath = file.path.toLowerCase();
+  if (changedFiles.has(file.path)) signals.push("changed-file");
+  if (file.exports.some((item) => tokens.some((token) => item.toLowerCase().includes(token)))) signals.push("exported-symbol");
+  if (file.resolvedImports.some((item) => tokens.some((token) => item.source.toLowerCase().includes(token)))) signals.push("import");
+  if (file.references.some((item) => tokens.some((token) => item.symbol.toLowerCase().includes(token)))) signals.push("reference");
+  if (graph.dependencyEdges.some((edge) => edge.to === file.path && mentions.some((mention) => edge.from.toLowerCase().includes(mention)))) signals.push("dependency-target");
+  if (graph.testToSource.some((edge) => edge.from === file.path || edge.to === file.path)) signals.push("test-source-relation");
+  if (mentions.some((mention) => lowerPath.includes(mention))) signals.push("file-mention");
+  return [...new Set(signals)];
+}
+
+function whyThisFile(file: CodeGraphFile, reasons: string[], graphSignals: string[]): string {
+  const pieces = [
+    ...reasons.map((reason) => `matched ${reason}`),
+    ...graphSignals.map((signal) => `graph signal ${signal}`)
+  ];
+  if (file.isTest) pieces.push("file is a test");
+  if (file.isConfig) pieces.push("file is project/config metadata");
+  if (file.exports.length > 0) pieces.push(`exports ${file.exports.slice(0, 4).join(", ")}`);
+  return pieces.length > 0 ? pieces.join("; ") : "Matched the query text.";
+}
+
+function fileBaseScore(file: CodeGraphFile, graph: CodeGraphIndex, tokens: string[], mentions: string[], kind: RepoQueryKind, changedFiles: Set<string>): {
   score: number;
   reasons: string[];
+  graphSignals: string[];
 } {
   let score = 0;
   const reasons: string[] = [];
@@ -107,7 +133,11 @@ function fileBaseScore(file: CodeIndexFile, tokens: string[], mentions: string[]
     score += 24;
     reasons.push("config-file");
   }
-  return { score, reasons: [...new Set(reasons)] };
+  const graphSignals = graphSignalsForFile(file, graph, tokens, mentions, changedFiles);
+  score += graphSignals.length * 10;
+  if (graphSignals.includes("dependency-target")) score += 18;
+  if (graphSignals.includes("changed-file")) score += 12;
+  return { score, reasons: [...new Set(reasons)], graphSignals };
 }
 
 function snippetForLines(lines: string[], index: number, radius: number): { lineStart: number; lineEnd: number; snippet: string } {
@@ -120,7 +150,7 @@ function snippetForLines(lines: string[], index: number, radius: number): { line
   };
 }
 
-function pathOnlyMatch(file: CodeIndexFile, base: { score: number; reasons: string[] }): RepoQueryMatch | null {
+function pathOnlyMatch(file: CodeGraphFile, base: { score: number; reasons: string[]; graphSignals: string[] }): RepoQueryMatch | null {
   if (base.score <= 0) return null;
   return {
     path: file.path,
@@ -128,15 +158,18 @@ function pathOnlyMatch(file: CodeIndexFile, base: { score: number; reasons: stri
     lineEnd: 1,
     score: base.score,
     reasons: base.reasons,
+    graphSignals: base.graphSignals,
+    why_this_file: whyThisFile(file, base.reasons, base.graphSignals),
     snippet: file.path
   };
 }
 
 async function textMatches(options: {
-  file: CodeIndexFile;
+  file: CodeGraphFile;
   tokens: string[];
   baseScore: number;
   baseReasons: string[];
+  baseGraphSignals: string[];
   kind: RepoQueryKind;
 }): Promise<RepoQueryMatch[]> {
   if (options.file.size > MAX_FILE_BYTES) return [];
@@ -163,6 +196,8 @@ async function textMatches(options: {
       lineEnd: snippet.lineEnd,
       score,
       reasons: [...new Set(reasons)],
+      graphSignals: options.baseGraphSignals,
+      why_this_file: whyThisFile(options.file, reasons, options.baseGraphSignals),
       snippet: snippet.snippet
     });
   }
@@ -170,10 +205,11 @@ async function textMatches(options: {
 }
 
 function symbolMatches(options: {
-  file: CodeIndexFile;
+  file: CodeGraphFile;
   tokens: string[];
   baseScore: number;
   baseReasons: string[];
+  baseGraphSignals: string[];
   kind: RepoQueryKind;
 }): RepoQueryMatch[] {
   const matches: RepoQueryMatch[] = [];
@@ -188,6 +224,8 @@ function symbolMatches(options: {
       lineEnd: symbol.line,
       score: options.baseScore + scored.score,
       reasons: [...new Set(reasons)],
+      graphSignals: options.baseGraphSignals,
+      why_this_file: whyThisFile(options.file, reasons, options.baseGraphSignals),
       snippet: `${symbol.exported ? "export " : ""}${symbol.kind} ${symbol.name}`
     });
   }
@@ -195,10 +233,11 @@ function symbolMatches(options: {
 }
 
 function importReferenceMatches(options: {
-  file: CodeIndexFile;
+  file: CodeGraphFile;
   tokens: string[];
   baseScore: number;
   baseReasons: string[];
+  baseGraphSignals: string[];
 }): RepoQueryMatch[] {
   const matches: RepoQueryMatch[] = [];
   const imports = options.file.imports.filter((item) => tokenHits(item, options.tokens) > 0);
@@ -209,8 +248,36 @@ function importReferenceMatches(options: {
     lineEnd: 1,
     score: options.baseScore + imports.length * 14,
     reasons: [...new Set([...options.baseReasons, "import/reference"])],
+    graphSignals: options.baseGraphSignals,
+    why_this_file: whyThisFile(options.file, [...options.baseReasons, "import/reference"], options.baseGraphSignals),
     snippet: `imports: ${imports.join(", ")}`
   });
+  return matches;
+}
+
+function testSourceMatches(graph: CodeGraphIndex, mentions: string[], tokens: string[]): RepoQueryMatch[] {
+  const matches: RepoQueryMatch[] = [];
+  for (const edge of graph.testToSource) {
+    const lowerFrom = edge.from.toLowerCase();
+    const lowerTo = edge.to.toLowerCase();
+    const mentioned = mentions.some((mention) => lowerFrom.includes(mention) || lowerTo.includes(mention));
+    const tokenHit = tokens.some((token) => lowerFrom.includes(token) || lowerTo.includes(token));
+    if (!mentioned && !tokenHit) continue;
+    const source = graph.files.find((file) => file.path === edge.to);
+    if (!source) continue;
+    const graphSignals = ["test-source-relation"];
+    const reasons = ["related-source"];
+    matches.push({
+      path: source.path,
+      lineStart: 1,
+      lineEnd: 1,
+      score: 42,
+      reasons,
+      graphSignals,
+      why_this_file: `Related source for test ${edge.from}.`,
+      snippet: `${edge.from} -> ${edge.to}`
+    });
+  }
   return matches;
 }
 
@@ -230,22 +297,23 @@ export async function executeRepoQueryTool(args: unknown, context: ToolExecution
   }
 
   try {
-    const index = await getCodeIndexForTool(context, {
+    const index = await getCodeGraphIndexForTool(context, {
       path: requestedPath,
       maxFiles: MAX_FILES,
       maxFileBytes: MAX_FILE_BYTES
     });
-    const matches: RepoQueryMatch[] = [];
+    const matches: RepoQueryMatch[] = testSourceMatches(index, mentions, tokens);
+    const changedFiles = new Set([...context.runState.changedFiles].map((file) => file.replace(/\\/g, "/")));
     for (const file of index.files) {
-      const base = fileBaseScore(file, tokens, mentions, kind);
+      const base = fileBaseScore(file, index, tokens, mentions, kind, changedFiles);
       if (kind === "path") {
         const pathMatch = pathOnlyMatch(file, base);
         if (pathMatch) matches.push(pathMatch);
         continue;
       }
-      matches.push(...symbolMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons, kind }));
-      matches.push(...importReferenceMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons }));
-      matches.push(...(await textMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons, kind })));
+      matches.push(...symbolMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons, baseGraphSignals: base.graphSignals, kind }));
+      matches.push(...importReferenceMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons, baseGraphSignals: base.graphSignals }));
+      matches.push(...(await textMatches({ file, tokens, baseScore: base.score, baseReasons: base.reasons, baseGraphSignals: base.graphSignals, kind })));
     }
     matches.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path, "en") || a.lineStart - b.lineStart);
     const selected: RepoQueryMatch[] = [];

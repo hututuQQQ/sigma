@@ -6,8 +6,17 @@ import type {
   AgentFinalEvidenceMode,
   AgentHarnessValidationMode,
   AgentSkillsMode,
+  CompactionFallbackMode,
+  CompactionMode,
   ContextMode,
   PermissionMode
+} from "agent-core";
+import {
+  DEFAULT_COMPACTION_MODE,
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+  DEFAULT_SUBAGENTS_ENABLED,
+  DEFAULT_VALIDATION_MODE
 } from "agent-core";
 import { runTuiApp, type TuiAppOptions } from "./app.js";
 
@@ -16,7 +25,7 @@ type CliOptions = TuiAppOptions;
 export { runTuiApp, type TuiAppOptions } from "./app.js";
 
 function printHelp(): void {
-  process.stdout.write(`agent-tui [flags]
+  process.stdout.write(`agent tui [flags]
 
 Flags:
   --workspace <path>             Workspace directory (default: current directory)
@@ -41,9 +50,22 @@ Flags:
   --disabled-tools <comma-separated-tools>
   --context-mode <off|repo-map>
   --repo-map-max-chars <number>
+  --max-message-history-chars <number>
+  --message-history-retain <number>
+  --compaction-summary-chars <number>
+  --compaction-mode <off|deterministic|model-sub-session>
+  --compaction-model <model>
+  --compaction-provider <deepseek|glm>
+  --compaction-max-input-chars <number>
+  --compaction-max-output-chars <number>
+  --compaction-timeout-sec <number>
+  --compaction-fallback <deterministic|fail>
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
   --skills-max-chars <number>
+  --no-subagents
+  --subagent-max-turns <number>
+  --subagent-max-output-chars <number>
   --enable-mcp
   --mcp-config <path>
   --trace-jsonl <path>
@@ -124,13 +146,13 @@ function permissionModeValue(value: string | true | undefined): PermissionMode {
 }
 
 function validationModeValue(value: string | true | undefined): AgentHarnessValidationMode | undefined {
-  if (value === undefined || value === true) return undefined;
+  if (value === undefined || value === true) return DEFAULT_VALIDATION_MODE;
   if (value === "off" || value === "auto") return value;
   throw new Error("Unsupported validation mode. Use off or auto.");
 }
 
 function evidenceModeValue(value: string | true | undefined): AgentFinalEvidenceMode | undefined {
-  if (value === undefined || value === true) return undefined;
+  if (value === undefined || value === true) return DEFAULT_FINAL_EVIDENCE_MODE;
   if (value === "off" || value === "auto") return value;
   throw new Error("Unsupported final evidence mode. Use off or auto.");
 }
@@ -145,6 +167,19 @@ function contextModeValue(value: string | true | undefined): ContextMode | undef
   if (value === undefined || value === true) return undefined;
   if (value === "off" || value === "repo-map") return value;
   throw new Error("Unsupported context mode. Use off or repo-map.");
+}
+
+function compactionModeValue(value: string | true | undefined): CompactionMode | undefined {
+  if (value === undefined || value === true) return DEFAULT_COMPACTION_MODE;
+  if (value === "off" || value === "deterministic") return value;
+  if (value === "model-sub-session" || value === "model_sub_session") return "model_sub_session";
+  throw new Error("Unsupported compaction mode. Use off, deterministic, or model-sub-session.");
+}
+
+function compactionFallbackValue(value: string | true | undefined): CompactionFallbackMode | undefined {
+  if (value === undefined || value === true) return undefined;
+  if (value === "deterministic" || value === "fail") return value;
+  throw new Error("Unsupported compaction fallback. Use deterministic or fail.");
 }
 
 function validationCommands(flags: Map<string, string | true>): string[] | undefined {
@@ -206,9 +241,24 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
     disabledTools: stringList(flags.get("disabled-tools")),
     contextMode: contextModeValue(flags.get("context-mode")),
     repoMapMaxChars: numberFlag(flags, "repo-map-max-chars"),
+    maxMessageHistoryChars: numberFlag(flags, "max-message-history-chars") ?? DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+    messageHistoryRetain: numberFlag(flags, "message-history-retain"),
+    compactionSummaryChars: numberFlag(flags, "compaction-summary-chars"),
+    compactionMode: compactionModeValue(flags.get("compaction-mode")),
+    compactionModel: typeof flags.get("compaction-model") === "string" ? flags.get("compaction-model") as string : undefined,
+    compactionProvider: typeof flags.get("compaction-provider") === "string"
+      ? providerValue(flags.get("compaction-provider"))
+      : undefined,
+    compactionMaxInputChars: numberFlag(flags, "compaction-max-input-chars"),
+    compactionMaxOutputChars: numberFlag(flags, "compaction-max-output-chars"),
+    compactionTimeoutSec: numberFlag(flags, "compaction-timeout-sec"),
+    compactionFallback: compactionFallbackValue(flags.get("compaction-fallback")),
     finalEvidenceMode: evidenceModeValue(flags.get("final-evidence-mode")),
     skillsMode: skillsModeValue(flags.get("skills-mode")),
     skillsMaxChars: numberFlag(flags, "skills-max-chars"),
+    subagentsEnabled: flags.has("no-subagents") ? false : DEFAULT_SUBAGENTS_ENABLED,
+    subagentMaxTurns: numberFlag(flags, "subagent-max-turns"),
+    subagentMaxOutputChars: numberFlag(flags, "subagent-max-output-chars"),
     enableMcp: flags.has("enable-mcp"),
     mcpConfig: typeof flags.get("mcp-config") === "string" ? flags.get("mcp-config") as string : undefined,
     traceJsonl: typeof flags.get("trace-jsonl") === "string" ? flags.get("trace-jsonl") as string : undefined,

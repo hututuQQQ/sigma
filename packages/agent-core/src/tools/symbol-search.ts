@@ -1,5 +1,6 @@
 import { truncateMiddle } from "../compaction.js";
-import { getCodeIndexForTool, type CodeSymbol } from "../context/code-index.js";
+import { type CodeSymbol } from "../context/code-index.js";
+import { getCodeGraphIndexForTool } from "../context/code-graph-index.js";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 
 interface SymbolSearchArgs {
@@ -54,7 +55,7 @@ export async function executeSymbolSearchTool(args: unknown, context: ToolExecut
   const maxChars = numberOrDefault(parsed.maxChars, context.maxToolOutputChars, 500, 50000);
 
   try {
-    const index = await getCodeIndexForTool(context, { path: requestedPath });
+    const index = await getCodeGraphIndexForTool(context, { path: requestedPath });
     const matches: SymbolSearchMatch[] = [];
     for (const file of index.files) {
       for (const symbol of file.symbols) {

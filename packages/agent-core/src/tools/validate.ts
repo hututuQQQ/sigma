@@ -4,6 +4,7 @@ import { planValidationCommandSpecs } from "../harness/validation-planner.js";
 import { runHarnessCommand } from "../harness/validation.js";
 import { requestToolPermission } from "../policy.js";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
+import { parseValidationDiagnostics } from "../validation/validation-result-parser.js";
 
 type ValidateKind = "auto" | "test" | "lint" | "typecheck" | "build";
 type ValidateScope = "changed" | "project" | "file";
@@ -14,14 +15,6 @@ interface ValidateArgs {
   path?: unknown;
   command?: unknown;
   timeoutSec?: unknown;
-}
-
-interface Diagnostic {
-  file?: string;
-  line?: number;
-  column?: number;
-  severity: "error" | "warning" | "info";
-  message: string;
 }
 
 function kindValue(value: unknown): ValidateKind {
@@ -47,33 +40,6 @@ function projectScopeSeedFiles(kind: ValidateKind): string[] {
   return ["package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml", "build.gradle"];
 }
 
-function parseDiagnostics(text: string): Diagnostic[] {
-  const diagnostics: Diagnostic[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    const ts = line.match(/^(.+?)\((\d+),(\d+)\):\s+(error|warning)\s+([^:]+):\s+(.+)$/);
-    if (ts) {
-      diagnostics.push({
-        file: ts[1],
-        line: Number(ts[2]),
-        column: Number(ts[3]),
-        severity: ts[4] === "warning" ? "warning" : "error",
-        message: `${ts[5]}: ${ts[6]}`
-      });
-      continue;
-    }
-    const pytest = line.match(/^(.+?):(\d+):\s*(.+)$/);
-    if (pytest && /(failed|error|assert|syntaxerror|traceback)/i.test(line)) {
-      diagnostics.push({
-        file: pytest[1],
-        line: Number(pytest[2]),
-        severity: "error",
-        message: pytest[3]
-      });
-    }
-  }
-  return diagnostics.slice(0, 50);
-}
-
 function commandMatchesKind(command: string, kind: ValidateKind): boolean {
   if (kind === "auto") return true;
   return evidenceKindForCommand(command) === kind;
@@ -84,7 +50,7 @@ async function inferCommand(options: {
   kind: ValidateKind;
   scope: ValidateScope;
   context: ToolExecutionContext;
-}): Promise<{ command: string; source: string; relatedFiles: string[] } | null> {
+}): Promise<{ command: string; source: string; relatedFiles: string[]; cwd?: string } | null> {
   const changedFiles = options.scope === "file"
     ? typeof options.args.path === "string" ? [options.args.path] : []
     : options.scope === "project"
@@ -135,7 +101,7 @@ export async function executeValidateTool(args: unknown, context: ToolExecutionC
     kind: "validation",
     source: inferred.source,
     command: inferred.command,
-    workspacePath: context.workspacePath,
+    workspacePath: inferred.cwd ?? context.workspacePath,
     attempt: 1,
     timeoutSec,
     relatedFiles: inferred.relatedFiles,
@@ -143,7 +109,7 @@ export async function executeValidateTool(args: unknown, context: ToolExecutionC
   });
   const stdoutTail = tailText(result.stdout_tail);
   const stderrTail = tailText(result.stderr_tail);
-  const diagnostics = parseDiagnostics(`${stdoutTail}\n${stderrTail}`);
+  const diagnostics = parseValidationDiagnostics(`${stdoutTail}\n${stderrTail}`);
   const payload = {
     ok: result.exit_code === 0,
     command: result.command,

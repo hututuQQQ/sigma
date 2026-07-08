@@ -8,10 +8,10 @@ A small coding-agent monorepo inspired by Pi with four layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
 - `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, durable sessions, checkpoints, JSONL tracing, MCP bridge, and workspace tools
-- `packages/agent-cli`: plain terminal CLI with `run`, `solve` compatibility alias, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
+- `packages/agent-cli`: plain terminal CLI with `run`, `tui`, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
 - `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
-Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, and stdio/HTTP MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
+Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, read-only task subagents, and stdio/HTTP MCP tools. There is intentionally no large web UI, plugin marketplace, long-term memory, or Docker sandbox in this repo.
 
 ## Install And Build
 
@@ -35,8 +35,6 @@ The interactive TUI is available through the root `agent tui` command after buil
 ```bash
 pnpm --filter agent-cli start -- tui --help
 ```
-
-The `agent-tui` binary remains as a compatibility and development entrypoint.
 
 ## Local Usage
 
@@ -80,12 +78,12 @@ Type a task and press Enter to start one run. The TUI opens as a transcript-firs
   ███████████
   ██              ∑ Sigma Code v0.1.0
     ██            DeepSeek · deepseek-v4-pro
-      ██          ./agent-tui
+      ██          agent tui
     ██
   ██
   ███████████
 
-* Ready in agent-tui
+* Ready in Sigma Code
 ----------------------------------------
 > fix the failing tests|
 ----------------------------------------
@@ -96,7 +94,7 @@ Windows PowerShell uses Unicode by default in normal terminals:
 
 ```powershell
 $env:DEEPSEEK_API_KEY='sk-...'
-pnpm --filter agent-tui start -- --workspace . --provider deepseek
+pnpm --filter agent-cli start -- tui --workspace . --provider deepseek
 # Unicode terminals show the pixel Sigma welcome mark.
 ```
 
@@ -140,7 +138,7 @@ Programmatic product integrations should prefer the run-controller API names:
 import { runConfiguredAgent, runAgentWithController, type AgentRunControllerConfig } from "agent-core";
 ```
 
-The older `runAgentHarness` and `AgentHarnessConfig` exports remain available for compatibility with existing adapters and scripts.
+The `runAgentHarness` and `AgentHarnessConfig` exports remain available as harness-named API for adapter and script callers.
 
 GLM/Zhipu example:
 
@@ -160,7 +158,7 @@ Instruction input can come from a positional string, `--instruction`, `--instruc
 ```bash
 pnpm --filter agent-cli start -- run "Fix the failing tests" --workspace .
 
-printf "Fix the failing tests" | pnpm --filter agent-cli start -- solve \
+printf "Fix the failing tests" | pnpm --filter agent-cli start -- run \
   --workspace . \
   --provider deepseek \
   --permission-mode yolo
@@ -176,7 +174,7 @@ pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl --timeline
 ```
 
-Durable sessions are recorded by default under `.agent/sessions/` while the compatibility files `.agent/trace.jsonl`, `.agent/session.jsonl`, and `.agent/summary.json` continue to be written:
+Durable sessions are recorded by default under `.agent/sessions/`; `.agent/trace.jsonl`, `.agent/session.jsonl`, and `.agent/summary.json` are also written when configured:
 
 ```text
 .agent/sessions/index.jsonl
@@ -190,7 +188,6 @@ Session commands:
 
 ```bash
 pnpm --filter agent-cli start -- sessions --workspace .
-pnpm --filter agent-cli start -- history --workspace .
 pnpm --filter agent-cli start -- session show <session-id> --workspace .
 pnpm --filter agent-cli start -- session search "parser error" --workspace .
 pnpm --filter agent-cli start -- session resume <session-id> "continue the fix" --workspace .
@@ -300,7 +297,7 @@ Failure categories are rule based and intentionally small: `host_proxy_error`, `
 
 Benchmark reports include `suggested_owner` for each task to guide follow-up fixes. Unless it points to `portable/harbor` or `scripts/bench`, do not prioritize changes to Harbor adapter plumbing.
 
-Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent solve` run-controller flags. The portable Harbor runtime only forwards explicit adapter kwargs to the CLI and mirrors artifacts; it must not feed verifier failures or benchmark identity back into the solving agent.
+Validation, retry, precheck, cleanup, and attempt summaries are owned by `packages/agent-core` and exposed through `agent run` run-controller flags. The portable Harbor runtime only forwards explicit adapter kwargs to the CLI and mirrors artifacts; it must not feed verifier failures or benchmark identity back into the solving agent.
 
 Harbor executable resolution is explicit and recorded in `config.json`: set `HARBOR_BIN` to force a specific CLI path; otherwise the runner checks common Windows uv/local install paths before falling back to `harbor` on PATH.
 
@@ -314,7 +311,7 @@ Adapter report notes:
 
 ## CLI Flags
 
-`agent run` supports the non-interactive coding-agent flow. `agent solve` remains a compatibility alias with the same flags:
+`agent run` supports the non-interactive coding-agent flow:
 
 ```text
 --workspace <path>
@@ -336,6 +333,13 @@ Adapter report notes:
 --max-message-history-chars <number>
 --message-history-retain <number>
 --compaction-summary-chars <number>
+--compaction-mode <off|deterministic|model-sub-session>
+--compaction-model <model>
+--compaction-provider <deepseek|glm>
+--compaction-max-input-chars <number>
+--compaction-max-output-chars <number>
+--compaction-timeout-sec <number>
+--compaction-fallback <deterministic|fail>
 --validation-mode <off|auto>
 --validation-retry-limit <number>
 --validation-timeout-sec <number>
@@ -344,7 +348,7 @@ Adapter report notes:
 --validation-command <command>
 --validation-commands <comma-separated-commands>
 --post-run-cleanup-globs <comma-separated-globs>
---harness-timeout-sec <number>      Legacy-compatible spelling for the run-controller timeout
+--harness-timeout-sec <number>
 --retry-min-budget-sec <number>
 --attempts-dir <path>
 --allowed-tools <comma-separated-tools>
@@ -356,27 +360,47 @@ Adapter report notes:
 --final-evidence-mode <off|auto>
 --skills-mode <off|auto>
 --skills-max-chars <number>
+--no-subagents
+--subagent-max-turns <number>
+--subagent-max-output-chars <number>
+--review-anti-gaming / --no-review-anti-gaming
 --enable-mcp
 --mcp-config <path>
 --stream-ui
 --no-stream-ui
 ```
 
-Config precedence is CLI flags, environment variables, workspace `.agent/config.toml`, home `~/.agent/config.toml`, then defaults. Top-level keys remain supported, and sectioned TOML can group related settings:
+Config precedence is CLI flags, environment variables, workspace `.agent/config.toml`, home `~/.agent/config.toml`, then defaults. TOML config uses sectioned keys:
 
 ```toml
+[run]
 provider = "deepseek"
 model = "deepseek-v4-pro"
-
-[run]
 max_turns = 30
 max_wall_time_sec = 1800
 permission_mode = "ask"
+run_controller_timeout_sec = 900
 
 [validation]
 mode = "auto"
+final_evidence_mode = "auto"
 retry_limit = 1
 commands = ["pnpm test", "pnpm lint"]
+
+[context]
+max_message_history_chars = 120000
+message_history_retain = 24
+compaction_mode = "model_sub_session"
+compaction_fallback = "deterministic"
+compaction_timeout_sec = 60
+
+[subagents]
+enabled = true
+max_turns = 4
+max_output_chars = 12000
+
+[review]
+anti_gaming = true
 
 [tools]
 allowed = ["read", "write", "edit", "bash", "validate"]
@@ -390,13 +414,15 @@ config = ".agent/mcp.json"
 stream_ui = true
 ```
 
-Local `agent run` and `agent solve` default to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
+Local `agent run` defaults to `--validation-mode auto` and `--final-evidence-mode auto`. Validation commands come only from explicit CLI/config settings or the discovery-driven changed-file strategy; assistant final text is never parsed for validation commands. Use `--validation-mode off` to skip automatic post-run validation for a run.
+
+Validation planning is discovery-driven. When auto validation is enabled, Sigma first runs user-configured validation commands, then cheap changed-file syntax checks, focused tests for changed test files, package-level checks for the most specific affected package/root, and finally broader project checks only when changed metadata gives a reason. Each planned candidate records command, cwd, scope, kind, cost, related files, reason, timeout, and analyzer hints in `validation_plan`.
 
 `--precheck-command` runs before each agent attempt. A failing precheck records `precheck_failed` and stops before the model is called.
 
-`--validation-mode auto` also defaults `--final-evidence-mode auto`, which gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. Set `--final-evidence-mode off` to preserve the older stop behavior. When skills are enabled, selected skill names and sources are recorded in summary JSON.
+`--final-evidence-mode auto` gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. In either auto mode, the generic anti-gaming review gate scans the local diff for hardcoded task identity, evaluator probing, fake validation, and product-core scoring hooks. Suspicious findings trigger one generic repair nudge; blocked findings are recorded in `review_findings`. Set `--final-evidence-mode off` to skip final evidence nudges, and set `--no-review-anti-gaming` to disable that gate for local runs. When skills are enabled, selected skill names and sources are recorded in summary JSON.
 
-Environment variables mirror the new flags. `AGENT_HARNESS_TIMEOUT_SEC` is the compatibility spelling for the run-controller timeout:
+Environment variables mirror the flags:
 
 ```text
 AGENT_VALIDATION_MODE
@@ -407,7 +433,7 @@ AGENT_VALIDATION_TIMEOUT_SEC
 AGENT_PRECHECK_COMMAND
 AGENT_PRECHECK_TIMEOUT_SEC
 AGENT_POST_RUN_CLEANUP_GLOBS
-AGENT_HARNESS_TIMEOUT_SEC
+AGENT_RUN_CONTROLLER_TIMEOUT_SEC
 AGENT_RETRY_MIN_BUDGET_SEC
 AGENT_ALLOWED_TOOLS
 AGENT_DISABLED_TOOLS
@@ -415,9 +441,23 @@ AGENT_NO_PROJECT_INSTRUCTIONS
 AGENT_PROJECT_DOC_MAX_BYTES
 AGENT_CONTEXT_MODE
 AGENT_REPO_MAP_MAX_CHARS
+AGENT_MAX_MESSAGE_HISTORY_CHARS
+AGENT_MESSAGE_HISTORY_RETAIN
+AGENT_COMPACTION_SUMMARY_CHARS
+AGENT_COMPACTION_MODE
+AGENT_COMPACTION_MODEL
+AGENT_COMPACTION_PROVIDER
+AGENT_COMPACTION_MAX_INPUT_CHARS
+AGENT_COMPACTION_MAX_OUTPUT_CHARS
+AGENT_COMPACTION_TIMEOUT_SEC
+AGENT_COMPACTION_FALLBACK
 AGENT_FINAL_EVIDENCE_MODE
 AGENT_SKILLS_MODE
 AGENT_SKILLS_MAX_CHARS
+AGENT_SUBAGENTS_ENABLED
+AGENT_SUBAGENT_MAX_TURNS
+AGENT_SUBAGENT_MAX_OUTPUT_CHARS
+AGENT_REVIEW_ANTI_GAMING
 AGENT_ENABLE_MCP
 AGENT_MCP_CONFIG
 AGENT_OUTPUT_FORMAT
@@ -452,6 +492,7 @@ The core loop exposes these default tools:
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `validate`: runs an explicit validation command or infers one for changed files, a file, or the project. It returns structured `ok`, `command`, `kind`, `exitCode`, output tails, related files, and best-effort diagnostics.
 - `todo`: maintains run-scoped todo state for the agent.
+- `task` / `subtask`: runs a foreground read-only investigator or reviewer subagent and returns a structured JSON report. Child subagents receive only `read`, `list`, `glob`, `grep`, `repo_query`, `symbol_search`, `git_status`, and `git_diff`; they cannot write files, run shells, start services, or spawn nested subagents.
 - `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
 Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and is intended only for trusted unattended automation.
@@ -478,11 +519,19 @@ SIGMA.md
 
 The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
 
-Local `agent run` and `agent solve` default to `--context-mode repo-map`. The startup repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+Local `agent run` defaults to `--context-mode repo-map`. The startup repo map uses the v2 project discovery and graph index by default; it includes discovered roots, important config files, package scripts, ranked source files, exported symbols, tests, dependency edges, and a small git state summary. If v2 indexing fails or times out, Sigma returns an explicit degraded repo map with `RepoMap v2 failed`, a redacted error summary, minimal file tree/config metadata, and `code_index.degraded = true`. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+
+Conversation compaction defaults to `model-sub-session` with `--max-message-history-chars 120000`, so long sessions automatically compact. The sub-session request is read-only, uses `toolChoice: "none"` with no tools, receives clipped structured history instead of raw large tool output, and falls back to deterministic compaction with `context_compaction_error`, `context_compaction_end`, `fallback_used: true`, and a redacted error summary. Set `--compaction-fallback fail` to fail the run on model compaction errors. Set `--compaction-mode deterministic`, `--compaction-mode off`, or `--max-message-history-chars 0` to explicitly change or disable the default.
 
 Repo map generation, `repo_query`, `symbol_search`, and `read_many` share the same workspace path safety and ignore behavior. The walker honors built-in skips plus workspace `.gitignore` and `.agentignore`. `repo_query` and `symbol_search` use a lightweight code index during tool calls; mutating tools invalidate that index after detected changes so subsequent lookups see fresh files.
 
+Repo map v2 and `repo_query` use a lightweight graph index by default. It records symbols, definitions, imports, exports, references, config files, dependency edges, and test-to-source relations without requiring native parser dependencies. `repo_query` results keep the old fields and add `graphSignals` plus `why_this_file` to explain why a file ranked highly.
+
 Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
+
+Read-only subagents are enabled by default through the `task` and `subtask` tools. `investigator` is intended for locating files, reading failure logs, and suggesting validation plans. `reviewer` is intended for diff review, unrelated-change checks, validation gaps, and generic integrity concerns. Child agents can use only read/list/glob/grep/repo_query/symbol_search/git_status/git_diff, and recursive subagents are disabled. Parent runs receive only the compact JSON report in the `task`/`subtask` tool result and `subagent_runs`; child transcripts are not inherited by the parent model. Use `--no-subagents`, `AGENT_SUBAGENTS_ENABLED=false`, or `[subagents].enabled = false` to disable them.
+
+The anti-gaming review gate is generic policy infrastructure, not a benchmark shortcut. It scans added diff lines for patterns such as hardcoded task IDs, evaluator environment/path probes, fake validation results, scoring control flow, and product-core evaluator terminology. External adapter paths under `portable/harbor` and `scripts/bench-*` may contain adapter vocabulary, but product packages must remain free of task/verifier/scoring-specific behavior.
 
 ## MCP Tools
 
@@ -550,7 +599,7 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
 
 ## Summary JSON
 
-`agent run` and the compatibility `agent solve` command write:
+`agent run` writes:
 
 ```json
 {
@@ -567,7 +616,7 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
   "model": "deepseek-v4-pro",
   "duration_ms": 123456,
   "last_error": null,
-  "tools_available": ["bash", "read", "write"],
+  "tools_available": ["bash", "read", "task", "subtask", "write"],
   "changed_files": ["src/index.ts"],
   "todo_items": [
     {
@@ -579,6 +628,43 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
   "project_instruction_sources": ["AGENTS.md"],
   "context_mode": "repo-map",
   "repo_map_chars": 14200,
+  "context_compactions": [
+    {
+      "strategy": "deterministic",
+      "before_message_count": 30,
+      "after_message_count": 12,
+      "compacted_message_count": 18,
+      "fallback_used": false,
+      "duration_ms": 8
+    }
+  ],
+  "validation_plan": {
+    "workspacePath": "/repo",
+    "candidates": [
+      {
+        "command": "python -m py_compile app.py",
+        "cwd": "/repo",
+        "scope": "syntax",
+        "kind": "compile",
+        "cost": "cheap",
+        "relatedFiles": ["app.py"],
+        "reason": "Changed Python file can be bytecode-compiled cheaply.",
+        "timeoutSec": 60,
+        "analyzerHints": ["python", "compile"],
+        "source": "changed-file"
+      }
+    ],
+    "skipped": []
+  },
+  "code_index": {
+    "file_count": 120,
+    "symbol_count": 380,
+    "definition_count": 260,
+    "dependency_edge_count": 190,
+    "test_to_source_count": 42,
+    "config_files": ["package.json", "tsconfig.json"],
+    "truncated": false
+  },
   "mcp_servers": [
     {
       "name": "local",
@@ -592,6 +678,14 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
     "commands_tried": ["pnpm test"],
     "changed_files": ["src/index.ts"]
   },
+  "failure_analyses": [
+    {
+      "category": "test_failure",
+      "confidence": 0.84,
+      "primaryMessage": "FAILED tests/app.test.ts::test_total - AssertionError",
+      "suggestedNextAction": "Use the failing test assertion or test name as the repair target, make one focused change, then rerun the same test or a narrower related test."
+    }
+  ],
   "evidence": [
     {
       "kind": "test",
@@ -611,6 +705,31 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
     {
       "name": "node-typescript",
       "source": "built-in"
+    }
+  ],
+  "subagent_runs": [
+    {
+      "id": "8e0c...",
+      "subagent_type": "reviewer",
+      "description": "Review the diff",
+      "status": "ok",
+      "summary": "The diff is focused and validation is covered.",
+      "findings": [],
+      "relevant_files": ["src/index.ts"],
+      "validation_suggestions": ["pnpm test"],
+      "risks": [],
+      "tool_calls": 2,
+      "duration_ms": 950
+    }
+  ],
+  "review_findings": [
+    {
+      "gate": "anti_gaming",
+      "status": "clean",
+      "findings": [],
+      "suggested_fixes": [],
+      "scanned_files": ["src/index.ts"],
+      "duration_ms": 12
     }
   ],
   "harness": {
@@ -634,7 +753,7 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
 
 When the run controller performs multiple attempts, the top-level count and token fields are aggregated across attempts. Per-attempt summaries and traces are preserved under the configured `attempts` directory. The parent durable session records attempt events and controller check events with `metadata.attempt`, and `agent session show <id> --json` exposes `attemptSummaries` plus recent controller events.
 
-The newer fields are optional. They appear when relevant and preserve existing summary keys for downstream consumers. The summary object key is still `harness` for compatibility; product code should treat it as run-controller metadata.
+The newer fields are optional. They appear when relevant and preserve the summary object's stable `harness` key; product code should treat it as run-controller metadata.
 
 ## Harbor And Terminal-Bench 2.0
 
@@ -665,7 +784,7 @@ Harbor benchmark execution uses the portable runtime generated under `.artifacts
 
 Generated JobConfigs import `sigma_harbor_agent:SigmaCliHarborAgent` and include an absolute `agent_cli_tarball` path such as `.artifacts/agent-cli-linux-x64.tgz`. They require the portable runtime directory on `PYTHONPATH`; they do not require the repo root.
 
-The portable Python adapter depends only on the Python standard library and Harbor. It uploads the agent CLI tarball, extracts it to `/opt/agent-cli`, symlinks `/usr/local/bin/agent`, runs `/usr/local/bin/agent solve`, forwards provider env keys, downloads `/tmp/agent/summary.json`, `/tmp/agent/trace.jsonl`, and best-effort `/tmp/agent/attempts/**`, and fills Harbor context fields. Validation, retry, precheck, and cleanup behavior lives in `agent-core` and is controlled through CLI flags.
+The portable Python adapter depends only on the Python standard library and Harbor. It uploads the agent CLI tarball, extracts it to `/opt/agent-cli`, symlinks `/usr/local/bin/agent`, runs `/usr/local/bin/agent run`, forwards provider env keys, downloads `/tmp/agent/summary.json`, `/tmp/agent/trace.jsonl`, and best-effort `/tmp/agent/attempts/**`, and fills Harbor context fields. Validation, retry, precheck, and cleanup behavior lives in `agent-core` and is controlled through CLI flags.
 
 The convenience benchmark commands still work and now default to the portable runtime:
 

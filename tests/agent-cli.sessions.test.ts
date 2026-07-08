@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadSessionMeta } from "../packages/agent-core/src/index.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
-import { runRunCommand } from "../packages/agent-cli/src/commands/solve.js";
+import { runRunCommand } from "../packages/agent-cli/src/commands/run.js";
 
 class FinalModel implements ModelClient {
   readonly provider = "deepseek" as const;

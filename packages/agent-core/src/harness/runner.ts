@@ -10,6 +10,7 @@ import type {
   AgentRunResult,
   EvidenceRecord,
   HarnessCommandResult,
+  ReviewGateSummary,
   SummaryJson
 } from "../types.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "./manifest.js";
@@ -17,17 +18,19 @@ import { retryBudgetDecision, retryTrigger, instructionWithRetryFeedback } from 
 import { runPostRunCleanup } from "./cleanup.js";
 import { aggregateAttemptResults, relativeArtifactPath, summaryFromAttempt } from "./summary.js";
 import { runHarnessCommand } from "./validation.js";
-import { planValidationCommandSpecs } from "./validation-planner.js";
+import { planValidation, validationPlanToCommandSpecs } from "./validation-planner.js";
 import { finalizeManagedServices } from "../tools/service.js";
 import { redactSecrets, redactSecretText } from "../redaction.js";
 import { evidenceKindForCommand } from "../controller/evidence.js";
+import type { ValidationPlan } from "../validation/validation-types.js";
+import { reviewAntiGamingWorkspace } from "../review/anti-gaming.js";
 
 const DEFAULT_VALIDATION_TIMEOUT_SEC = 60;
 const DEFAULT_PRECHECK_TIMEOUT_SEC = 60;
 
 function emitHarnessEvent(
   config: AgentHarnessConfig,
-  type: "harness_check_start" | "harness_check_end",
+  type: "harness_check_start" | "harness_check_end" | "review_gate_start" | "review_gate_end",
   metadata: Record<string, unknown>
 ): void {
   config.eventBus?.emit(redactSecrets({
@@ -87,11 +90,90 @@ function evidenceRecordsFromHarnessResults(results: HarnessCommandResult[]): Evi
 function harnessEnabled(config: AgentHarnessConfig): boolean {
   return (
     config.validationMode === "auto" ||
+    (config.reviewAntiGaming !== false && config.finalEvidenceMode === "auto") ||
     Boolean(config.precheckCommand?.trim()) ||
     (config.postRunCleanupGlobs?.length ?? 0) > 0 ||
     (config.validationRetryLimit ?? 0) > 0 ||
     Boolean(config.attemptsDir)
   );
+}
+
+function reviewGateEnabled(config: AgentHarnessConfig): boolean {
+  return config.reviewAntiGaming !== false && (config.validationMode === "auto" || config.finalEvidenceMode === "auto");
+}
+
+function reviewGateFailureResult(review: ReviewGateSummary, attempt: number): HarnessCommandResult {
+  return {
+    kind: "validation",
+    source: "review-gate",
+    command: "anti-gaming review gate",
+    attempt,
+    exit_code: review.status === "blocked" ? 2 : 1,
+    stdout_tail: JSON.stringify({
+      status: review.status,
+      findings: review.findings.slice(0, 10),
+      suggested_fixes: review.suggested_fixes
+    }, null, 2),
+    stderr_tail: "",
+    related_files: review.findings.map((finding) => finding.path).filter((file): file is string => Boolean(file)),
+    timeout_sec: 0,
+    duration_ms: review.duration_ms,
+    message: `anti-gaming review gate reported ${review.status}`
+  };
+}
+
+function instructionWithReviewGateFeedback(options: {
+  originalInstruction: string;
+  review: ReviewGateSummary;
+  previousAttemptSummary: SummaryJson;
+}): string {
+  const lines = [
+    options.originalInstruction,
+    "",
+    "A generic integrity review found suspicious diff patterns. Fix the issue generally; do not add evaluation-suite-, task-, checker-, or outcome-specific behavior."
+  ];
+  for (const finding of options.review.findings.slice(0, 8)) {
+    lines.push("");
+    lines.push(`Review finding (${finding.severity}) ${finding.rule_id}: ${finding.message}`);
+    if (finding.path) lines.push(`Path: ${finding.path}${finding.line ? `:${finding.line}` : ""}`);
+    if (finding.snippet) lines.push(`Snippet: ${finding.snippet}`);
+  }
+  if (options.review.suggested_fixes.length > 0) {
+    lines.push("");
+    lines.push("Suggested fixes:");
+    for (const fix of options.review.suggested_fixes) lines.push(`- ${fix}`);
+  }
+  lines.push("");
+  lines.push("Previous attempt summary:");
+  lines.push(JSON.stringify({
+    status: options.previousAttemptSummary.status,
+    finish_reason: options.previousAttemptSummary.finish_reason,
+    turns: options.previousAttemptSummary.turns,
+    commands_executed: options.previousAttemptSummary.commands_executed
+  }, null, 2));
+  return lines.join("\n");
+}
+
+async function runReviewGate(options: {
+  config: AgentHarnessConfig;
+  attempt: number;
+  workspacePath: string;
+}): Promise<ReviewGateSummary | null> {
+  if (!reviewGateEnabled(options.config)) return null;
+  emitHarnessEvent(options.config, "review_gate_start", {
+    gate: "anti_gaming",
+    attempt: options.attempt
+  });
+  const review = await reviewAntiGamingWorkspace({ workspacePath: options.workspacePath });
+  emitHarnessEvent(options.config, "review_gate_end", {
+    gate: "anti_gaming",
+    attempt: options.attempt,
+    status: review.status,
+    findings: review.findings,
+    suggestedFixes: review.suggested_fixes,
+    durationMs: review.duration_ms
+  });
+  return review;
 }
 
 async function runChecks(options: {
@@ -100,30 +182,46 @@ async function runChecks(options: {
   beforeManifest: Awaited<ReturnType<typeof listWorkspaceManifest>> | null;
   attemptSummary: SummaryJson;
   attemptTracePath: string;
-}): Promise<{ results: HarnessCommandResult[]; traceTail: string }> {
+}): Promise<{ results: HarnessCommandResult[]; traceTail: string; validationPlan?: ValidationPlan }> {
   const results: HarnessCommandResult[] = [];
   const workspacePath = path.resolve(options.config.workspacePath);
   const validationTimeoutSec = options.config.validationTimeoutSec ?? DEFAULT_VALIDATION_TIMEOUT_SEC;
+  let validationPlan: ValidationPlan | undefined;
 
   if (options.config.validationMode === "auto") {
     const afterManifest = await listWorkspaceManifest(workspacePath);
     const changedFiles = options.beforeManifest ? changedWorkspaceFiles(options.beforeManifest, afterManifest) : [];
-    for (const spec of await planValidationCommandSpecs({
+    validationPlan = await planValidation({
       workspacePath,
       configuredCommands: options.config.validationCommands ?? [],
-      changedFiles
-    })) {
+      changedFiles,
+      timeoutSec: validationTimeoutSec
+    });
+    options.config.eventBus?.emit(redactSecrets({
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      type: "validation_plan_created",
+      runId: "harness",
+      provider: options.config.modelClient.provider,
+      model: options.config.modelClient.model,
+      metadata: {
+        attempt: options.attempt,
+        validationPlan
+      }
+    }));
+    for (const spec of validationPlanToCommandSpecs(validationPlan)) {
       emitHarnessEvent(options.config, "harness_check_start", {
         kind: "validation",
         source: spec.source,
         attempt: options.attempt,
-        command: spec.command
+        command: spec.command,
+        cwd: spec.cwd ?? workspacePath
       });
       const result = await runHarnessCommand({
         kind: "validation",
         source: spec.source,
         command: spec.command,
-        workspacePath,
+        workspacePath: spec.cwd ?? workspacePath,
         attempt: options.attempt,
         timeoutSec: validationTimeoutSec,
         relatedFiles: spec.relatedFiles,
@@ -134,7 +232,8 @@ async function runChecks(options: {
         source: spec.source,
         attempt: options.attempt,
         exitCode: result.exit_code,
-        durationMs: result.duration_ms
+        durationMs: result.duration_ms,
+        cwd: spec.cwd ?? workspacePath
       });
       results.push(result);
     }
@@ -147,7 +246,7 @@ async function runChecks(options: {
     result.trace_tail = traceTail;
   }
 
-  return { results, traceTail };
+  return { results, traceTail, validationPlan };
 }
 
 async function runPrecheckBeforeAttempt(options: {
@@ -189,6 +288,8 @@ function finalResultForHarness(options: {
   failed: HarnessCommandResult[];
   failureMessage: string | null;
   sessionId?: string;
+  validationPlan?: ValidationPlan;
+  reviewFindings?: ReviewGateSummary[];
 }): AgentRunResult {
   const aggregate = aggregateAttemptResults(options.attempts);
   const firstFailure = options.failed[0];
@@ -230,7 +331,13 @@ function finalResultForHarness(options: {
     workflow: options.finalAttempt.workflow,
     evidenceRecords,
     finalGate: options.finalAttempt.finalGate,
-    selectedSkills: options.finalAttempt.selectedSkills
+    selectedSkills: options.finalAttempt.selectedSkills,
+    contextCompactions: options.finalAttempt.contextCompactions,
+    failureAnalyses: options.finalAttempt.failureAnalyses,
+    validationPlan: options.validationPlan ?? options.finalAttempt.validationPlan,
+    codeIndex: options.finalAttempt.codeIndex,
+    subagentRuns: options.finalAttempt.subagentRuns,
+    reviewFindings: options.reviewFindings ?? options.finalAttempt.reviewFindings
   };
 }
 
@@ -315,6 +422,9 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
   let activeInstruction = config.instruction;
   let finalAttemptSummary: SummaryJson | null = null;
   let finalTracePath = "";
+  let finalValidationPlan: ValidationPlan | undefined;
+  const reviewFindings: ReviewGateSummary[] = [];
+  let reviewGateNudged = false;
   let lastFailed: HarnessCommandResult[] = [];
   let failureMessage: string | null = null;
 
@@ -374,13 +484,52 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
       break;
     }
 
-    const { results, traceTail } = await runChecks({
+    const review = await runReviewGate({
+      config: controllerConfig,
+      attempt,
+      workspacePath
+    });
+    if (review) {
+      reviewFindings.push(review);
+      if (review.status !== "clean") {
+        if (!reviewGateNudged) {
+          const decision = retryBudgetDecision({
+            retryNumber: attempt,
+            startedAtMs,
+            harnessTimeoutSec: config.harnessTimeoutSec,
+            retryMinBudgetSec: config.retryMinBudgetSec,
+            commandTimeoutSec: config.commandTimeoutSec,
+            validationTimeoutSec: config.validationTimeoutSec,
+            precheckTimeoutSec: config.precheckTimeoutSec,
+            trigger: "harness"
+          });
+          harness.retry_decisions.push(decision);
+          if (decision.action === "started") {
+            reviewGateNudged = true;
+            activeInstruction = instructionWithReviewGateFeedback({
+              originalInstruction: config.instruction,
+              review,
+              previousAttemptSummary: finalAttemptSummary
+            });
+            continue;
+          }
+        }
+        if (review.status === "blocked") {
+          lastFailed = [reviewGateFailureResult(review, attempt)];
+          failureMessage = lastFailed[0]?.message ?? "anti-gaming review gate blocked the run";
+          break;
+        }
+      }
+    }
+
+    const { results, traceTail, validationPlan } = await runChecks({
       config: controllerConfig,
       attempt,
       beforeManifest,
       attemptSummary: finalAttemptSummary,
       attemptTracePath
     });
+    finalValidationPlan = validationPlan;
     validationResults.push(...results.filter((result) => result.kind === "validation"));
     precheckResults.push(...results.filter((result) => result.kind === "precheck"));
     lastFailed = failedResults(results);
@@ -448,7 +597,9 @@ export async function runAgentHarness(config: AgentHarnessConfig): Promise<Agent
     harness,
     failed: lastFailed,
     failureMessage,
-    sessionId: durableSession?.sessionId
+    sessionId: durableSession?.sessionId,
+    validationPlan: finalValidationPlan,
+    reviewFindings
   });
 
   await writeHarnessSummary(finalResult, config.summaryJsonPath);

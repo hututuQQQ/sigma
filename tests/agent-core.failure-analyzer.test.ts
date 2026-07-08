@@ -33,6 +33,22 @@ describe("FailureAnalyzer", () => {
       exitCode: 2
     });
     expect(analysis?.primaryMessage).toContain("TS2322");
+    expect(analysis?.confidence).toBeGreaterThan(0.9);
+    expect(analysis?.relatedFiles).toContain("src/index.ts");
+  });
+
+  it("classifies TypeScript module resolution diagnostics", () => {
+    const analysis = analyzeFailure({
+      ok: false,
+      command: "pnpm exec tsc --noEmit",
+      stderr: "src/app.ts(2,22): error TS2307: Cannot find module './missing' or its corresponding type declarations.",
+      exitCode: 2
+    });
+
+    expect(analysis).toMatchObject({
+      category: "compile_error",
+      firstActionableLine: expect.stringContaining("TS2307")
+    });
   });
 
   it("classifies pytest assertion output as test failure", () => {
@@ -45,6 +61,19 @@ describe("FailureAnalyzer", () => {
 
     expect(analysis?.category).toBe("test_failure");
     expect(analysis?.suggestedNextAction).toContain("failing test");
+    expect(analysis?.failingTestNames).toContain("tests/test_app.py::test_total");
+  });
+
+  it("classifies pytest import errors", () => {
+    const analysis = analyzeFailure({
+      ok: false,
+      command: "pytest",
+      stderr: "ImportError while importing test module 'tests/test_app.py'.\nModuleNotFoundError: No module named 'app'",
+      exitCode: 2
+    });
+
+    expect(analysis?.category).toBe("test_failure");
+    expect(analysis?.primaryMessage).toContain("ImportError");
   });
 
   it("classifies go test failures", () => {
@@ -67,6 +96,36 @@ describe("FailureAnalyzer", () => {
     });
 
     expect(analysis?.category).toBe("test_failure");
+  });
+
+  it("classifies cargo panic and compile errors", () => {
+    expect(analyzeFailure({
+      ok: false,
+      command: "cargo test",
+      stderr: "thread 'tests::total' panicked at src/lib.rs:10: expected 3",
+      exitCode: 101
+    })?.category).toBe("test_failure");
+
+    const compile = analyzeFailure({
+      ok: false,
+      command: "cargo test",
+      stderr: "error[E0308]: mismatched types\n --> src/lib.rs:3:5",
+      exitCode: 101
+    });
+    expect(compile?.category).toBe("compile_error");
+    expect(compile?.primaryMessage).toContain("E0308");
+  });
+
+  it("classifies node, vitest, and jest style failures", () => {
+    const analysis = analyzeFailure({
+      ok: false,
+      command: "pnpm vitest run",
+      stdout: "FAIL tests/app.test.ts > total\nAssertionError: expected 2 to be 3",
+      exitCode: 1
+    });
+
+    expect(analysis?.category).toBe("test_failure");
+    expect(analysis?.relatedFiles).toContain("tests/app.test.ts");
   });
 
   it("classifies timeouts, missing commands, and segmentation faults", () => {
@@ -106,5 +165,17 @@ describe("FailureAnalyzer", () => {
 
     expect(analysis?.category).toBe("unknown");
     expect(analysis?.suggestedNextAction).toContain("Inspect the command output");
+  });
+
+  it("chooses the highest-confidence analyzer and records candidates", () => {
+    const analysis = analyzeFailure({
+      ok: false,
+      command: "pnpm test",
+      stderr: "src/index.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.\nFAIL tests/app.test.ts",
+      exitCode: 1
+    });
+
+    expect(analysis?.category).toBe("compile_error");
+    expect(analysis?.diagnostics.some((diagnostic) => diagnostic.includes("candidate"))).toBe(true);
   });
 });

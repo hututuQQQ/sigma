@@ -21,6 +21,64 @@ class FakeModel implements ModelClient {
   }
 }
 
+class DefaultCompactionModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-default-compaction-model";
+  readonly requests: ModelRequest[] = [];
+  private mainIndex = 0;
+
+  async complete(req: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(req);
+    if (req.toolChoice === "none") {
+      return {
+        message: {
+          role: "assistant",
+          content: JSON.stringify({
+            objective: "compact objective",
+            current_plan: ["continue"],
+            changed_files: [],
+            key_decisions: ["kept tail"],
+            failed_attempts: [],
+            validation_evidence: [],
+            unresolved_questions: [],
+            next_actions: ["finish"]
+          })
+        }
+      };
+    }
+    const responses: ModelResponse[] = [
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-1",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-2",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ];
+    const response = responses[Math.min(this.mainIndex, responses.length - 1)];
+    this.mainIndex += 1;
+    return response;
+  }
+}
+
 class StreamingModel implements ModelClient {
   readonly provider = "deepseek" as const;
   readonly model = "fake-stream-model";
@@ -98,6 +156,10 @@ describe("agent loop", () => {
 
   it("records generic failure patterns and nudges the next turn toward repair", async () => {
     const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const eventBus = new AgentEventBus();
+    const events: string[] = [];
+    eventBus.on((event) => events.push(event.type));
     const model = new FakeModel([
       {
         message: {
@@ -118,13 +180,19 @@ describe("agent loop", () => {
       instruction: "debug a failing command",
       workspacePath: dir,
       modelClient: model,
-      permissionMode: "yolo"
+      permissionMode: "yolo",
+      eventBus,
+      summaryJsonPath: summaryPath
     });
 
     expect(result.status).toBe("completed");
+    expect(events).toContain("failure_analysis");
+    expect(result.failureAnalyses?.[0]).toMatchObject({ category: "segmentation_fault", confidence: expect.any(Number) });
     expect(result.workflow?.failure_patterns).toEqual([
       expect.objectContaining({ category: "segmentation_fault", count: 1, last_exit_code: 139 })
     ]);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.failure_analyses[0]).toMatchObject({ category: "segmentation_fault" });
     expect(
       model.requests[1].messages.some(
         (message) => message.role === "user" && message.content.includes("Workflow repair signal")
@@ -244,6 +312,10 @@ describe("agent loop", () => {
 
   it("compacts old messages without leaving an orphan tool message at the retained tail", async () => {
     const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const eventBus = new AgentEventBus();
+    const events: string[] = [];
+    eventBus.on((event) => events.push(event.type));
     const model = new FakeModel([
       {
         message: {
@@ -280,10 +352,22 @@ describe("agent loop", () => {
       maxTurns: 3,
       maxMessageHistoryChars: 1000,
       messageHistoryRetain: 2,
-      compactionSummaryChars: 500
+      compactionSummaryChars: 500,
+      compactionMode: "deterministic",
+      eventBus,
+      summaryJsonPath: summaryPath
     });
 
     expect(result.status).toBe("completed");
+    expect(events).toEqual(expect.arrayContaining(["context_compaction_start", "context_compaction_end"]));
+    expect(result.contextCompactions?.[0]).toMatchObject({
+      strategy: "deterministic",
+      before_message_count: expect.any(Number),
+      compacted_message_count: expect.any(Number),
+      fallback_used: false
+    });
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.context_compactions[0]).toMatchObject({ strategy: "deterministic" });
     const thirdRequestMessages = model.requests[2].messages;
     expect(thirdRequestMessages[0].role).toBe("system");
     expect(thirdRequestMessages[1]).toMatchObject({ role: "user", content: "make lots of output" });
@@ -292,6 +376,30 @@ describe("agent loop", () => {
       "Previous agent conversation compacted by the run controller."
     );
     expect(thirdRequestMessages[3].role).toBe("assistant");
+  });
+
+  it("uses model sub-session compaction by default with no tools", async () => {
+    const dir = await tempWorkspace();
+    const model = new DefaultCompactionModel();
+
+    const result = await runAgent({
+      instruction: "make lots of output",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 3,
+      maxMessageHistoryChars: 1000,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 500
+    });
+
+    expect(result.status).toBe("completed");
+    const compactionRequest = model.requests.find((request) => request.toolChoice === "none");
+    expect(compactionRequest).toMatchObject({ tools: [], toolChoice: "none" });
+    expect(result.contextCompactions?.[0]).toMatchObject({
+      strategy: "model_sub_session",
+      fallback_used: false
+    });
   });
 
   it("uses streaming model deltas and emits token-level events", async () => {

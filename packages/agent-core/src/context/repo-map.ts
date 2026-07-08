@@ -1,25 +1,47 @@
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { truncateMiddle } from "../compaction.js";
-import { workspaceRelativePath } from "../policy.js";
+import { redactSecretText } from "../redaction.js";
 import { comparePath, walkFiles } from "../tools/workspace-utils.js";
+import { generateRepoMapV2 } from "./repo-map-v2.js";
+import type { CodeIndexSummary } from "../types.js";
 
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
+const DEGRADED_TREE_MAX_FILES = 250;
+const CONFIG_BASE_NAMES = new Set([
+  "package.json",
+  "pnpm-workspace.yaml",
+  "tsconfig.json",
+  "jsconfig.json",
+  "pyproject.toml",
+  "requirements.txt",
+  "setup.py",
+  "pytest.ini",
+  "go.mod",
+  "Cargo.toml",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "Makefile",
+  "makefile",
+  "eslint.config.js",
+  "vite.config.ts",
+  "vitest.config.ts"
+]);
 
 export interface RepoMapOptions {
   workspacePath: string;
   maxChars?: number;
+  maxFiles?: number;
+  maxFileBytes?: number;
+  maxIndexDurationMs?: number;
 }
 
 export interface GeneratedRepoMap {
   content: string;
   chars: number;
-}
-
-interface SourceSymbols {
-  path: string;
-  symbols: string[];
+  codeIndex?: CodeIndexSummary;
 }
 
 function runGit(args: string[], cwd: string): Promise<string | null> {
@@ -34,7 +56,15 @@ function runGit(args: string[], cwd: string): Promise<string | null> {
   });
 }
 
-async function fileTree(workspacePath: string, maxDepth = 3, maxFiles = 250): Promise<{ lines: string[]; truncated: boolean }> {
+async function safe<T>(operation: Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await operation;
+  } catch {
+    return fallback;
+  }
+}
+
+async function fileTree(workspacePath: string, maxDepth = 3, maxFiles = DEGRADED_TREE_MAX_FILES): Promise<{ lines: string[]; truncated: boolean; fileCount: number }> {
   const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
   const entries = new Set<string>();
   for (const file of walked.files) {
@@ -49,7 +79,7 @@ async function fileTree(workspacePath: string, maxDepth = 3, maxFiles = 250): Pr
     .sort(comparePath)
     .slice(0, maxFiles)
     .map((entry) => `${"  ".repeat(Math.max(0, entry.split("/").length - 1))}- ${entry}`);
-  return { lines, truncated: walked.truncated || entries.size > lines.length };
+  return { lines, truncated: walked.truncated || entries.size > lines.length, fileCount: walked.files.length };
 }
 
 async function readJson(filePath: string): Promise<Record<string, unknown> | null> {
@@ -81,85 +111,24 @@ async function packageMetadata(workspacePath: string): Promise<string[]> {
   } catch {
     // pnpm workspaces are optional.
   }
-  try {
-    const tsconfig = await readJson(path.join(workspacePath, "tsconfig.json"));
-    const references = Array.isArray(tsconfig?.references)
-      ? tsconfig.references
-          .map((ref) => (ref && typeof ref === "object" ? (ref as { path?: unknown }).path : undefined))
-          .filter((value): value is string => typeof value === "string")
-      : [];
-    if (references.length > 0) lines.push(`- TypeScript references: ${references.join(", ")}`);
-  } catch {
-    // Optional.
-  }
   return lines;
 }
 
-function tsSymbols(content: string): string[] {
-  const symbols = new Set<string>();
-  const regex = /\bexport\s+(?:declare\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|var|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g;
-  for (let match = regex.exec(content); match !== null; match = regex.exec(content)) {
-    symbols.add(match[1]);
-  }
-  const namedExport = /\bexport\s*\{([^}]+)\}/g;
-  for (let match = namedExport.exec(content); match !== null; match = namedExport.exec(content)) {
-    for (const piece of match[1].split(",")) {
-      const name = piece.trim().split(/\s+as\s+/i)[0]?.trim();
-      if (name) symbols.add(name);
-    }
-  }
-  return [...symbols].sort((a, b) => a.localeCompare(b, "en")).slice(0, 30);
+function isConfigFile(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  const base = normalized.split("/").pop() ?? normalized;
+  return CONFIG_BASE_NAMES.has(base) ||
+    /(^|\/)\.(github|agent|vscode|config)(\/|$)/.test(normalized) ||
+    /(^|\/)(eslint|prettier|vitest|vite|webpack|rollup|babel|jest|mocha|pytest|ruff|mypy|tsup|turbo|nx)\.config\./i.test(normalized);
 }
 
-function pythonSymbols(content: string): string[] {
-  const symbols = new Set<string>();
-  const regex = /^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
-  for (let match = regex.exec(content); match !== null; match = regex.exec(content)) {
-    symbols.add(match[1]);
-  }
-  return [...symbols].sort((a, b) => a.localeCompare(b, "en")).slice(0, 30);
-}
-
-function shellSymbols(content: string): string[] {
-  const symbols = new Set<string>();
-  const regex = /^(?:function\s+([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))/gm;
-  for (let match = regex.exec(content); match !== null; match = regex.exec(content)) {
-    symbols.add(match[1] ?? match[2]);
-  }
-  return [...symbols].sort((a, b) => a.localeCompare(b, "en")).slice(0, 30);
-}
-
-async function collectSourceSymbols(workspacePath: string, maxFiles = 120): Promise<SourceSymbols[]> {
-  const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
-  const files = walked.files
-    .filter((file) => /\.(ts|tsx|js|jsx|mjs|cjs|py|sh|bash)$/.test(file.relativePath) && !file.relativePath.endsWith(".d.ts"))
-    .map((file) => file.absolutePath)
-    .slice(0, maxFiles);
-
-  const result: SourceSymbols[] = [];
-  for (const file of files) {
-    const info = await stat(file);
-    if (info.size > 200000) continue;
-    const content = await readFile(file, "utf8");
-    const symbols = /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file)
-      ? tsSymbols(content)
-      : /\.py$/.test(file)
-        ? pythonSymbols(content)
-        : shellSymbols(content);
-    if (symbols.length > 0) {
-      result.push({ path: workspaceRelativePath(workspacePath, file), symbols });
-    }
-  }
-  return result;
-}
-
-async function testFiles(workspacePath: string, maxFiles = 120): Promise<string[]> {
+async function configFiles(workspacePath: string, maxFiles = DEGRADED_TREE_MAX_FILES): Promise<string[]> {
   const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
   return walked.files
     .map((file) => file.relativePath)
-    .filter((relative) => /(\.test\.|\.spec\.|__tests__|^tests\/)/.test(relative))
-    .sort((a, b) => a.localeCompare(b, "en"))
-    .slice(0, maxFiles);
+    .filter(isConfigFile)
+    .sort(comparePath)
+    .slice(0, 80);
 }
 
 async function gitSummary(workspacePath: string): Promise<string[]> {
@@ -172,51 +141,76 @@ async function gitSummary(workspacePath: string): Promise<string[]> {
   ];
 }
 
-export async function generateRepoMap(options: RepoMapOptions): Promise<GeneratedRepoMap> {
+function repoMapErrorSummary(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return truncateMiddle(redactSecretText(message.replace(/\s+/g, " ").trim()), 600).text;
+}
+
+async function generateDegradedRepoMap(options: RepoMapOptions, error: unknown): Promise<GeneratedRepoMap> {
   const workspacePath = path.resolve(options.workspacePath);
   const maxChars = Math.max(1, Math.floor(options.maxChars ?? DEFAULT_REPO_MAP_MAX_CHARS));
-  const tree = await fileTree(workspacePath);
-  const packageLines = await packageMetadata(workspacePath);
-  const symbols = await collectSourceSymbols(workspacePath);
-  const tests = await testFiles(workspacePath);
-  const git = await gitSummary(workspacePath);
-
+  const errorSummary = repoMapErrorSummary(error);
+  const [tree, packages, configs, git] = await Promise.all([
+    safe(fileTree(workspacePath), { lines: [], truncated: true, fileCount: 0 }),
+    safe(packageMetadata(workspacePath), []),
+    safe(configFiles(workspacePath), []),
+    safe(gitSummary(workspacePath), ["- unavailable"])
+  ]);
   const lines = [
-    "Repository map generated by Sigma",
-    "This map is deterministic and may be incomplete; use tools to verify before editing.",
+    "Repository map generated by Sigma (v2 degraded)",
+    "RepoMap v2 failed; this emergency map is intentionally minimal and may omit source graph details.",
+    `Error summary: ${errorSummary || "unknown error"}`,
     "",
     "File tree:",
-    ...(tree.lines.length > 0 ? tree.lines : ["- (empty workspace)"]),
+    ...(tree.lines.length > 0 ? tree.lines : ["- (unavailable)"]),
     ...(tree.truncated ? ["- [tree truncated]"] : []),
     "",
+    "Important config files:",
+    ...(configs.length > 0 ? configs.map((file) => `- ${file}`) : ["- none found"]),
+    "",
     "Package metadata:",
-    ...(packageLines.length > 0 ? packageLines : ["- no package metadata found"]),
-    "",
-    "Key source symbols:",
-    ...(symbols.length > 0 ? symbols.map((entry) => `- ${entry.path}: ${entry.symbols.join(", ")}`) : ["- no exported symbols found"]),
-    "",
-    "Test files:",
-    ...(tests.length > 0 ? tests.map((file) => `- ${file}`) : ["- no test files found"]),
-    "",
-    "Agent config:",
-    "- .agent/config.toml checked",
+    ...(packages.length > 0 ? packages : ["- no package metadata found"]),
     "",
     "Git state:",
     ...git
   ];
+  const truncated = truncateMiddle(lines.join("\n"), maxChars);
+  return {
+    content: truncated.text,
+    chars: truncated.text.length,
+    codeIndex: {
+      file_count: tree.fileCount,
+      symbol_count: 0,
+      definition_count: 0,
+      dependency_edge_count: 0,
+      test_to_source_count: 0,
+      config_files: configs,
+      truncated: true,
+      degraded: true,
+      error: errorSummary
+    }
+  };
+}
 
+export async function generateRepoMap(options: RepoMapOptions): Promise<GeneratedRepoMap> {
   try {
-    await stat(path.join(workspacePath, ".agent", "config.toml"));
-    const index = lines.indexOf("- .agent/config.toml checked");
-    if (index !== -1) lines[index] = "- .agent/config.toml present";
-  } catch {
-    const index = lines.indexOf("- .agent/config.toml checked");
-    if (index !== -1) lines[index] = "- .agent/config.toml absent";
+    const v2 = await generateRepoMapV2(options);
+    return {
+      content: v2.content,
+      chars: v2.chars,
+      codeIndex: {
+        file_count: v2.graph.files.length,
+        symbol_count: v2.graph.files.reduce((total, file) => total + file.symbols.length, 0),
+        definition_count: v2.graph.files.reduce((total, file) => total + file.definitions.length, 0),
+        dependency_edge_count: v2.graph.dependencyEdges.length,
+        test_to_source_count: v2.graph.testToSource.length,
+        config_files: v2.graph.configFiles.slice(0, 50),
+        truncated: v2.graph.truncated
+      }
+    };
+  } catch (error) {
+    return await generateDegradedRepoMap(options, error);
   }
-
-  const raw = lines.join("\n");
-  const truncated = truncateMiddle(raw, maxChars);
-  return { content: truncated.text, chars: truncated.text.length };
 }
 
 export function formatRepoMapBlock(repoMap: GeneratedRepoMap): string {

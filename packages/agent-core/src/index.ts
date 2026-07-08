@@ -1,4 +1,11 @@
 export { runAgent, summaryJsonFromRunResult, writeRunSummary } from "./agent.js";
+export {
+  DEFAULT_COMPACTION_MODE,
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+  DEFAULT_SUBAGENTS_ENABLED,
+  DEFAULT_VALIDATION_MODE
+} from "./defaults.js";
 export { runAgentHarness, runAgentHarness as runAgentWithController } from "./harness/index.js";
 export {
   runConfiguredAgent,
@@ -22,24 +29,33 @@ export {
   DEFAULT_MESSAGE_HISTORY_RETAIN,
   DeterministicCompactionStrategy,
   ModelSubSessionCompactionStrategy,
+  NoopCompactionStrategy,
+  compactErrorSummary,
   createDeterministicCompactionArtifact,
   compactMessageForSummary,
   messageHistoryChars,
+  planCompaction,
   summarizeMessages
 } from "./context/compaction-service.js";
 export type {
   CompactionArtifact,
+  CompactionPlan,
   CompactionRequest,
   CompactionResult,
   CompactionServiceOptions,
   CompactionStrategy,
   CompactionStrategyName,
   ModelCompactionProvider,
-  ModelCompactionRequest
+  ModelCompactionRequest,
+  ModelSubSessionCompactionStrategyOptions
 } from "./context/compaction-service.js";
+export { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
+export type { ModelSubSessionCompactionProviderOptions } from "./context/model-compaction-provider.js";
 export { ContextManager } from "./context/context-manager.js";
 export type {
+  ContextManagerEvent,
   ContextManagerOptions,
+  ContextSnapshot,
   PrepareMessagesRequest,
   PrepareMessagesResult
 } from "./context/context-manager.js";
@@ -56,6 +72,23 @@ export type {
   CodeSymbol,
   CodeSymbolKind
 } from "./context/code-index.js";
+export {
+  buildCodeGraphIndex,
+  getCodeGraphIndexForTool,
+  relatedSourceForTest
+} from "./context/code-graph-index.js";
+export type {
+  BuildCodeGraphIndexOptions,
+  CodeGraphDefinition,
+  CodeGraphDependencyEdge,
+  CodeGraphFile,
+  CodeGraphImport,
+  CodeGraphIndex,
+  CodeGraphParserProvider,
+  CodeGraphReference
+} from "./context/code-graph-index.js";
+export { formatRepoMapV2Block, generateRepoMapV2 } from "./context/repo-map-v2.js";
+export type { GeneratedRepoMapV2, RepoMapV2Options } from "./context/repo-map-v2.js";
 export { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
 export { redactSecrets, redactSecretText } from "./redaction.js";
 export { AgentEventBus } from "./events.js";
@@ -97,10 +130,20 @@ export { truncateMiddle } from "./compaction.js";
 export {
   analyzeFailure,
   BuiltInFailureAnalyzer,
+  CargoFailureAnalyzer,
   defaultFailureAnalyzer,
+  defaultFailureAnalyzers,
   failureInputFromHarnessResult,
   failureInputFromToolResult,
-  suggestedNextActionForFailure
+  GenericFailureAnalyzer,
+  GoTestFailureAnalyzer,
+  MissingToolFailureAnalyzer,
+  NodeTestFailureAnalyzer,
+  PytestFailureAnalyzer,
+  SegmentationFaultFailureAnalyzer,
+  suggestedNextActionForFailure,
+  TimeoutFailureAnalyzer,
+  TypeScriptFailureAnalyzer
 } from "./workflow/failure-analyzer.js";
 export type {
   FailureAnalysis,
@@ -115,6 +158,31 @@ export {
   resolveWorkspacePath,
   workspaceRelativePath
 } from "./policy.js";
+export { estimateValidationCost, withEstimatedCost } from "./validation/command-cost.js";
+export { discoverProjects } from "./validation/project-discovery.js";
+export { createValidationPlan } from "./validation/validation-planner.js";
+export { parseValidationDiagnostics } from "./validation/validation-result-parser.js";
+export type {
+  DiscoveredProjectRoot,
+  ProjectDiscoveryResult,
+  SkippedValidationCandidate,
+  ValidationCandidate,
+  ValidationCost,
+  ValidationKind,
+  ValidationPlan,
+  ValidationPlannerOptions,
+  ValidationScope
+} from "./validation/validation-types.js";
+export { reviewAntiGamingDiff, reviewAntiGamingWorkspace } from "./review/anti-gaming.js";
+export type { AntiGamingReviewOptions, AntiGamingWorkspaceOptions } from "./review/anti-gaming.js";
+export { READ_ONLY_SUBAGENT_TOOLS, runSubagent } from "./subagents/subagent-runner.js";
+export { createSubtaskTool, executeSubtaskTool } from "./subagents/subtask-tool.js";
+export type {
+  SubagentExecution,
+  SubagentRunRequest,
+  SubagentRunnerOptions,
+  SubagentToolOptions
+} from "./subagents/subagent-types.js";
 export {
   createDefaultToolRegistry,
   createToolRegistryFromTools,
@@ -155,8 +223,13 @@ export type {
   AgentRunResult,
   AgentRunStatus,
   AgentSkillsMode,
+  CodeIndexSummary,
+  CompactionFallbackMode,
+  CompactionMode,
+  ContextCompactionSummary,
   EvidenceKind,
   EvidenceRecord,
+  FailureAnalysisSummary,
   FinalGateStatus,
   HarnessAttemptSummary,
   HarnessCleanupResult,
@@ -169,11 +242,17 @@ export type {
   PermissionDecision,
   PermissionMode,
   PermissionRequest,
+  ReviewGateFinding,
+  ReviewGateStatus,
+  ReviewGateSummary,
   RegisteredTool,
   RunControllerCleanupResult,
   RunControllerCommandResult,
   RunControllerRetryDecision,
   RunControllerServiceCleanupResult,
+  SubagentFinding,
+  SubagentRunSummary,
+  SubagentType,
   SummaryJson,
   TodoItem,
   TodoStatus,

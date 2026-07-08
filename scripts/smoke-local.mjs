@@ -112,7 +112,7 @@ async function runRealAgent(taskName, taskDir, workspace, artifactDir) {
   const provider = selectedProvider();
   const args = [
     cliEntry,
-    "solve",
+    "run",
     "--workspace",
     workspace,
     "--instruction-file",
