@@ -16,6 +16,34 @@ export {
 } from "./context/project-instructions.js";
 export { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 export {
+  COMPACTION_MARKER,
+  CompactionService,
+  DEFAULT_COMPACTION_SUMMARY_CHARS,
+  DEFAULT_MESSAGE_HISTORY_RETAIN,
+  DeterministicCompactionStrategy,
+  ModelSubSessionCompactionStrategy,
+  createDeterministicCompactionArtifact,
+  compactMessageForSummary,
+  messageHistoryChars,
+  summarizeMessages
+} from "./context/compaction-service.js";
+export type {
+  CompactionArtifact,
+  CompactionRequest,
+  CompactionResult,
+  CompactionServiceOptions,
+  CompactionStrategy,
+  CompactionStrategyName,
+  ModelCompactionProvider,
+  ModelCompactionRequest
+} from "./context/compaction-service.js";
+export { ContextManager } from "./context/context-manager.js";
+export type {
+  ContextManagerOptions,
+  PrepareMessagesRequest,
+  PrepareMessagesResult
+} from "./context/context-manager.js";
+export {
   buildCodeIndex,
   getCodeIndexForTool,
   invalidateContextIndexes,
@@ -66,6 +94,19 @@ export type {
   SessionSearchResult
 } from "./session/session-types.js";
 export { truncateMiddle } from "./compaction.js";
+export {
+  analyzeFailure,
+  BuiltInFailureAnalyzer,
+  defaultFailureAnalyzer,
+  failureInputFromHarnessResult,
+  failureInputFromToolResult,
+  suggestedNextActionForFailure
+} from "./workflow/failure-analyzer.js";
+export type {
+  FailureAnalysis,
+  FailureAnalyzer,
+  FailureAnalyzerInput
+} from "./workflow/failure-analyzer.js";
 export {
   isPathInside,
   isProbablyMutatingCommand,

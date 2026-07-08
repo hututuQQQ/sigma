@@ -3,10 +3,11 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
-import { compactLargeText, truncateMiddle } from "./compaction.js";
+import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
 import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
+import { ContextManager } from "./context/context-manager.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 import { detectProjectProfile } from "./harness/project-detector.js";
@@ -40,12 +41,9 @@ const DEFAULT_MAX_TURNS = 20;
 const DEFAULT_MAX_WALL_TIME_SEC = 900;
 const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000;
-const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
-const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
 const DEFAULT_PROJECT_DOC_MAX_BYTES = 32768;
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 const DEFAULT_SKILLS_MAX_CHARS = 8000;
-const COMPACTION_MARKER = "Previous agent conversation compacted by the run controller.";
 const TOOL_ARGUMENT_HISTORY_MAX_CHARS = 4000;
 const EVENT_METADATA_MAX_CHARS = 6000;
 
@@ -183,70 +181,6 @@ function compactEventForTrace(agentEvent: AgentEvent): AgentEvent {
   };
 }
 
-function messageHistoryChars(messages: AgentMessage[]): number {
-  return messages.reduce((total, message) => total + JSON.stringify(message).length, 0);
-}
-
-function compactMessageForSummary(message: AgentMessage): string {
-  if (message.role === "assistant") {
-    const pieces = ["assistant:"];
-    if (message.reasoningContent) pieces.push(`reasoning=${truncateMiddle(message.reasoningContent, 600).text}`);
-    if (message.content) pieces.push(`content=${truncateMiddle(message.content, 600).text}`);
-    if (message.toolCalls && message.toolCalls.length > 0) {
-      const calls = message.toolCalls.map((call) => `${call.function.name}(${JSON.stringify(call.function.arguments)})`);
-      pieces.push(`tool_calls=${truncateMiddle(calls.join("; "), 1200).text}`);
-    }
-    return pieces.join(" ");
-  }
-
-  if (message.role === "tool") {
-    return `tool ${message.name ?? message.toolCallId}: ${truncateMiddle(message.content, 1200).text}`;
-  }
-
-  return `${message.role}: ${truncateMiddle(message.content, 1200).text}`;
-}
-
-function summarizeMessages(messages: AgentMessage[], maxChars: number): string {
-  const body = messages.map(compactMessageForSummary).join("\n\n");
-  return `${COMPACTION_MARKER}\n\n${truncateMiddle(body, Math.max(1, maxChars)).text}`;
-}
-
-function compactMessagesIfNeeded(
-  messages: AgentMessage[],
-  options: {
-    maxMessageHistoryChars?: number;
-    messageHistoryRetain?: number;
-    compactionSummaryChars?: number;
-  }
-): AgentMessage[] {
-  const maxChars = options.maxMessageHistoryChars;
-  if (!maxChars || maxChars <= 0 || messageHistoryChars(messages) <= maxChars || messages.length <= 3) {
-    return messages;
-  }
-
-  const retainCount = Math.max(0, Math.floor(options.messageHistoryRetain ?? DEFAULT_MESSAGE_HISTORY_RETAIN));
-  let tailStart = Math.max(2, messages.length - retainCount);
-  while (tailStart < messages.length && messages[tailStart].role === "tool") {
-    tailStart += 1;
-  }
-
-  if (tailStart <= 2 || tailStart >= messages.length) {
-    return messages;
-  }
-
-  const protectedMessages = messages.slice(0, 2);
-  const compactedMessages = messages.slice(2, tailStart);
-  const tailMessages = messages.slice(tailStart);
-  const summary: AgentMessage = {
-    role: "user",
-    content: summarizeMessages(
-      compactedMessages,
-      options.compactionSummaryChars ?? DEFAULT_COMPACTION_SUMMARY_CHARS
-    )
-  };
-  return [...protectedMessages, summary, ...tailMessages];
-}
-
 async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegistry> {
   if (config.toolRegistry && config.toolRegistryFactory) {
     throw new Error("Configure either toolRegistry or toolRegistryFactory, not both.");
@@ -364,6 +298,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         forkedFromSessionId: config.forkedFromSessionId
       });
   const workflow = createWorkflowState();
+  const contextManager = new ContextManager();
   const finalEvidenceMode = config.finalEvidenceMode ?? "off";
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
@@ -528,13 +463,20 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       turns += 1;
-      const compactedMessages = compactMessagesIfNeeded(messages, {
+      const changedFilesForContext = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+      const preparedMessages = await contextManager.prepareMessages({
+        messages,
         maxMessageHistoryChars: config.maxMessageHistoryChars,
         messageHistoryRetain: config.messageHistoryRetain,
-        compactionSummaryChars: config.compactionSummaryChars
+        compactionSummaryChars: config.compactionSummaryChars,
+        objective: config.instruction,
+        workflow: summarizeWorkflowState(workflow, changedFilesForContext),
+        evidenceRecords: workflow.evidenceRecords,
+        changedFiles: changedFilesForContext,
+        todos: context.runState.todos
       });
-      if (compactedMessages !== messages) {
-        messages.splice(0, messages.length, ...compactedMessages);
+      if (preparedMessages.messages !== messages) {
+        messages.splice(0, messages.length, ...preparedMessages.messages);
       }
       if (config.abortSignal?.aborted) {
         finishReason = "cancelled";

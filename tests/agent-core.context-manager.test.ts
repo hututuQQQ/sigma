@@ -1,0 +1,171 @@
+import { describe, expect, it } from "vitest";
+import type { AgentMessage } from "../packages/agent-ai/src/index.js";
+import {
+  COMPACTION_MARKER,
+  CompactionService,
+  ContextManager,
+  DeterministicCompactionStrategy,
+  ModelSubSessionCompactionStrategy,
+  type CompactionArtifact
+} from "../packages/agent-core/src/index.js";
+
+function messagesWithHistory(): AgentMessage[] {
+  return [
+    { role: "system", content: "system rules" },
+    { role: "user", content: "fix the project" },
+    { role: "assistant", content: `old reasoning ${"a".repeat(1200)}` },
+    { role: "tool", name: "bash", toolCallId: "old-tool", content: `old output ${"b".repeat(1200)}` },
+    { role: "assistant", content: "recent decision" },
+    { role: "tool", name: "bash", toolCallId: "recent-tool", content: "recent output" }
+  ];
+}
+
+describe("ContextManager compaction", () => {
+  it("does not compact when history is below the threshold", async () => {
+    const messages: AgentMessage[] = [
+      { role: "system", content: "system" },
+      { role: "user", content: "hello" }
+    ];
+    const result = await new ContextManager().prepareMessages({
+      messages,
+      maxMessageHistoryChars: 10000
+    });
+
+    expect(result.compacted).toBe(false);
+    expect(result.artifact).toBeNull();
+    expect(result.messages).toBe(messages);
+  });
+
+  it("compacts while preserving the initial system/user messages", async () => {
+    const messages = messagesWithHistory();
+    const result = await new ContextManager().prepareMessages({
+      messages,
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 600,
+      objective: "fix the project"
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(result.messages[0]).toBe(messages[0]);
+    expect(result.messages[1]).toBe(messages[1]);
+    expect(result.messages[2]).toMatchObject({ role: "user" });
+    expect(result.messages[2].content).toContain(COMPACTION_MARKER);
+  });
+
+  it("keeps a retained tail without starting on an orphan tool message", async () => {
+    const messages = messagesWithHistory();
+    const result = await new ContextManager().prepareMessages({
+      messages,
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 3,
+      compactionSummaryChars: 600
+    });
+
+    expect(result.messages.slice(3)).toEqual(messages.slice(4));
+    expect(result.messages[3].role).toBe("assistant");
+    expect(result.messages[4].role).toBe("tool");
+  });
+
+  it("generates a structured compaction artifact", async () => {
+    const messages = messagesWithHistory();
+    const result = await new ContextManager().prepareMessages({
+      messages,
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      objective: "ship the refactor",
+      changedFiles: ["src/app.ts"],
+      todos: [{ id: "1", text: "rerun tests", status: "pending" }],
+      workflow: {
+        phase: "repair",
+        commands_tried: ["pnpm test"],
+        changed_files: ["src/app.ts"],
+        failure_patterns: [
+          {
+            category: "test_failure",
+            count: 1,
+            last_tool_name: "bash",
+            last_command: "pnpm test",
+            last_summary: "AssertionError"
+          }
+        ]
+      },
+      evidenceRecords: [
+        {
+          kind: "test",
+          toolName: "bash",
+          ok: false,
+          executable: true,
+          command: "pnpm test",
+          summary: "AssertionError",
+          exitCode: 1,
+          timestamp: "2026-01-01T00:00:00.000Z"
+        }
+      ]
+    });
+
+    expect(result.artifact).toMatchObject({
+      objective: "ship the refactor",
+      changed_files: ["src/app.ts"],
+      current_plan: ["pending: rerun tests"]
+    });
+    expect(result.artifact?.failed_attempts[0]).toContain("test_failure x1");
+    expect(result.artifact?.validation_evidence[0]).toContain("failed: test");
+    expect(result.artifact?.next_actions[0]).toContain("rerun tests");
+  });
+
+  it("keeps deterministic fallback output stable", async () => {
+    const service = new CompactionService({ strategy: new DeterministicCompactionStrategy() });
+    const request = {
+      messages: messagesWithHistory(),
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 600,
+      objective: "fix the project"
+    };
+
+    const first = await service.compact(request);
+    const second = await service.compact(request);
+
+    expect(first.messages).toEqual(second.messages);
+    expect(first.artifact).toEqual(second.artifact);
+  });
+
+  it("allows model sub-session strategies to receive full compaction context", async () => {
+    let capturedChangedFiles: string[] = [];
+    const artifact: CompactionArtifact = {
+      objective: "model objective",
+      current_plan: ["plan"],
+      changed_files: ["src/app.ts"],
+      key_decisions: ["decision"],
+      failed_attempts: ["failure"],
+      validation_evidence: ["evidence"],
+      unresolved_questions: [],
+      next_actions: ["next"]
+    };
+    const service = new CompactionService({
+      strategy: new ModelSubSessionCompactionStrategy({
+        async compact(request) {
+          capturedChangedFiles = request.changedFiles ?? [];
+          expect(request.compactedMessages.length).toBeGreaterThan(0);
+          expect(request.tailMessages.length).toBeGreaterThan(0);
+          expect(request.traceTail).toBe("trace");
+          return artifact;
+        }
+      })
+    });
+
+    const result = await service.compact({
+      messages: messagesWithHistory(),
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      changedFiles: ["src/app.ts"],
+      traceTail: "trace"
+    });
+
+    expect(capturedChangedFiles).toEqual(["src/app.ts"]);
+    expect(result.strategy).toBe("model_sub_session");
+    expect(result.artifact).toEqual(artifact);
+    expect(result.messages[2].content).toContain("Structured compaction artifact");
+  });
+});
