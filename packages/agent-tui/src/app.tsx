@@ -12,7 +12,14 @@ import {
   type ContextMode,
   type PermissionMode,
   type PermissionRequest,
-  type TokenTotals
+  type TokenTotals,
+  buildResumeInstruction,
+  listSessions,
+  loadSessionMeta,
+  loadSessionResumeContext,
+  readSessionEventsText,
+  searchSessions,
+  truncateMiddle
 } from "agent-core";
 import { approvalPromptLines } from "./components/approval-prompt.js";
 import { COMMANDS, commandSuggestions, resolveCommand } from "./components/commands.js";
@@ -50,6 +57,7 @@ import {
   activeFileMention,
   fileMentionSuggestions,
   insertFileMention,
+  insertFileMentions,
   listWorkspaceFiles,
   type FileMentionSuggestion
 } from "./file-mentions.js";
@@ -214,6 +222,8 @@ export class TuiApp {
   private readonly localEntries: TranscriptEntry[] = [];
   private mode: TuiRunMode = "build";
   private running = false;
+  private cancelling = false;
+  private abortController: AbortController | null = null;
   private exitAfterRun = false;
   private events: AgentEvent[] = [];
   private result: AgentRunResult | null = null;
@@ -224,6 +234,7 @@ export class TuiApp {
   private localCommandSnapshot: LocalCommandSnapshot | null = null;
   private queuedInstruction: string | null = null;
   private filePaths: string[] = [];
+  private selectedFileMentions = new Set<string>();
   private paletteHidden = false;
   private workbenchOpen = false;
   private changePromptDismissed = false;
@@ -260,6 +271,13 @@ export class TuiApp {
 
   private readonly handleKeypress = (text: string, key: readline.Key): void => {
     if (key.ctrl && key.name === "c") {
+      if (this.running && !this.cancelling) {
+        this.cancelling = true;
+        this.abortController?.abort();
+        this.message = "Cancelling active run.";
+        this.render();
+        return;
+      }
       this.stop();
       return;
     }
@@ -372,6 +390,7 @@ export class TuiApp {
       void this.submitInput();
       return;
     }
+    if (key.name === "space" && this.toggleFileMentionSelection()) return;
     if (!key.ctrl && !key.meta && text.toLowerCase() === "d" && this.handleChangePromptKey("d")) return;
     if (text && !key.ctrl && !key.meta && text >= " ") {
       insertText(this.composer, text);
@@ -446,8 +465,27 @@ export class TuiApp {
     const { mention, suggestions } = this.currentFileSuggestions();
     const first = suggestions[0];
     if (!mention || !first) return false;
-    const next = insertFileMention(this.composer.text, mention, first.path);
+    const selected = [...this.selectedFileMentions];
+    const next = selected.length > 0
+      ? insertFileMentions(this.composer.text, mention, selected)
+      : insertFileMention(this.composer.text, mention, first.path);
+    this.selectedFileMentions.clear();
     setComposerText(this.composer, next.text, next.cursor);
+    this.render();
+    return true;
+  }
+
+  private toggleFileMentionSelection(): boolean {
+    const { mention, suggestions } = this.currentFileSuggestions();
+    const first = suggestions[0];
+    if (!mention || !first) return false;
+    if (this.selectedFileMentions.has(first.path)) {
+      this.selectedFileMentions.delete(first.path);
+      this.message = `Unselected ${first.path}.`;
+    } else {
+      this.selectedFileMentions.add(first.path);
+      this.message = `Selected ${this.selectedFileMentions.size} file${this.selectedFileMentions.size === 1 ? "" : "s"}.`;
+    }
     this.render();
     return true;
   }
@@ -559,6 +597,26 @@ export class TuiApp {
       await this.openWorkbench("Workbench opened.");
       return;
     }
+    if (name === "/sessions") {
+      await this.showSessions();
+      return;
+    }
+    if (name === "/session") {
+      await this.showSession(value);
+      return;
+    }
+    if (name === "/search") {
+      this.searchTranscript(value);
+      return;
+    }
+    if (name === "/history") {
+      await this.searchHistory(value);
+      return;
+    }
+    if (name === "/resume" || name === "/fork") {
+      await this.resumeOrFork(value, name === "/fork" ? "fork" : "resume");
+      return;
+    }
     if (name === "/mode plan" || name === "/mode build") {
       this.mode = name === "/mode plan" ? "plan" : "build";
       this.message = `Mode set to ${this.mode}.`;
@@ -623,6 +681,112 @@ export class TuiApp {
       await this.runLocalCommand(value, "shell");
       return;
     }
+  }
+
+  private pushSystem(text: string, message: string): void {
+    this.localEntries.push({ kind: "system", text, timestamp: nowIso() });
+    this.message = message;
+    this.render();
+  }
+
+  private async showSessions(): Promise<void> {
+    const sessions = await listSessions({ workspacePath: this.options.workspace, limit: 12 });
+    if (sessions.length === 0) {
+      this.pushSystem("No sessions found.", "Sessions opened.");
+      return;
+    }
+    this.pushSystem(
+      sessions.map((session) =>
+        `${session.sessionId}  ${session.status}${session.finishReason ? ` ${session.finishReason}` : ""}  ${truncateMiddle(session.title, 70).text}`
+      ).join("\n"),
+      "Sessions opened."
+    );
+  }
+
+  private async showSession(sessionId: string): Promise<void> {
+    if (!sessionId) {
+      this.pushSystem("Usage: /session <id>", "Session command needs an id.");
+      return;
+    }
+    const meta = await loadSessionMeta({ sessionId, workspacePath: this.options.workspace });
+    if (!meta) {
+      this.pushSystem(`Session not found: ${sessionId}`, "Session not found.");
+      return;
+    }
+    const events = (await readSessionEventsText(meta.eventsPath)).trim().split(/\r?\n/).filter(Boolean);
+    this.pushSystem(
+      [
+        meta.sessionId,
+        `title: ${meta.title}`,
+        `status: ${meta.status}${meta.finishReason ? ` ${meta.finishReason}` : ""}`,
+        `model: ${meta.provider}/${meta.model}`,
+        `events: ${events.length}`,
+        meta.finalMessage ? `final: ${truncateMiddle(meta.finalMessage, 240).text}` : ""
+      ].filter(Boolean).join("\n"),
+      "Session opened."
+    );
+  }
+
+  private searchTranscript(query: string): void {
+    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) {
+      this.pushSystem("Usage: /search <query>", "Search command needs a query.");
+      return;
+    }
+    const lines = buildTranscript({
+      workspacePath: this.options.workspace,
+      provider: this.options.provider,
+      model: this.options.model ?? this.result?.model,
+      events: this.events,
+      result: this.result,
+      localEntries: this.localEntries
+    }).map((entry) => JSON.stringify(entry));
+    const matches = lines.filter((line) => {
+      const lower = line.toLowerCase();
+      return tokens.every((token) => lower.includes(token));
+    }).slice(0, 12);
+    this.pushSystem(matches.length > 0 ? matches.join("\n") : "No transcript matches.", "Transcript search complete.");
+  }
+
+  private async searchHistory(query: string): Promise<void> {
+    if (!query.trim()) {
+      this.pushSystem("Usage: /history <query>", "History command needs a query.");
+      return;
+    }
+    const results = await searchSessions({ query, workspacePath: this.options.workspace, limit: 10 });
+    if (results.length === 0) {
+      this.pushSystem("No matching sessions found.", "History search complete.");
+      return;
+    }
+    this.pushSystem(
+      results.map((result) => `${result.session.sessionId}  rank=${result.score}  ${truncateMiddle(result.session.title, 70).text}\n  ${result.matches.slice(0, 2).join("\n  ")}`).join("\n"),
+      "History search complete."
+    );
+  }
+
+  private async resumeOrFork(value: string, mode: "resume" | "fork"): Promise<void> {
+    const [sessionId, ...instructionParts] = value.split(/\s+/);
+    const instruction = instructionParts.join(" ").trim();
+    if (!sessionId || !instruction) {
+      this.pushSystem(`Usage: /${mode} <id> <instruction>`, `${mode} command needs an id and instruction.`);
+      return;
+    }
+    if (this.running) {
+      this.message = `Wait for the active run to finish before /${mode}.`;
+      this.render();
+      return;
+    }
+    const context = await loadSessionResumeContext({ sessionId, workspacePath: this.options.workspace });
+    if (!context) {
+      this.pushSystem(`Session not found: ${sessionId}`, "Session not found.");
+      return;
+    }
+    const nextInstruction = buildResumeInstruction({ context, instruction, mode });
+    this.localEntries.push({ kind: "user", text: `/${mode} ${sessionId} ${instruction}`, timestamp: nowIso() });
+    await this.startRun(nextInstruction, {
+      parentSessionId: context.session.sessionId,
+      forkedFromSessionId: mode === "fork" ? context.session.sessionId : undefined
+    });
   }
 
   private applyWorkspaceChange(result: WorkspaceChangeResult): void {
@@ -767,8 +931,10 @@ export class TuiApp {
     this.render();
   }
 
-  private async startRun(instruction: string): Promise<void> {
+  private async startRun(instruction: string, links: { parentSessionId?: string; forkedFromSessionId?: string } = {}): Promise<void> {
     this.running = true;
+    this.cancelling = false;
+    this.abortController = new AbortController();
     this.result = null;
     this.focusMode = "none";
     this.changePromptDismissed = false;
@@ -806,6 +972,9 @@ export class TuiApp {
         traceJsonlPath: this.options.traceJsonl,
         sessionJsonlPath: this.options.sessionJsonl,
         summaryJsonPath: this.options.summaryJson,
+        parentSessionId: links.parentSessionId,
+        forkedFromSessionId: links.forkedFromSessionId,
+        abortSignal: this.abortController.signal,
         permissionController: this.permissionController,
         onEvent: (event) => {
           this.events.push(event);
@@ -820,6 +989,8 @@ export class TuiApp {
       this.message = `Run failed: ${message}`;
     } finally {
       this.running = false;
+      this.cancelling = false;
+      this.abortController = null;
       const next = this.queuedInstruction;
       if (next && !this.exitAfterRun) {
         this.queuedInstruction = null;

@@ -159,11 +159,12 @@ function connectPort(port: number): Promise<boolean> {
   });
 }
 
-async function readinessPassed(record: ServiceRecord, timeoutSec: number): Promise<boolean> {
-  if (!record.port && !record.readinessCommand) return true;
+async function readinessPassed(record: ServiceRecord, timeoutSec: number, abortSignal?: AbortSignal): Promise<"ready" | "not_ready" | "cancelled"> {
+  if (!record.port && !record.readinessCommand) return "ready";
   const deadline = Date.now() + Math.max(1, Math.floor(timeoutSec * 1000));
   while (Date.now() <= deadline) {
-    if (!isAlive(record.pid)) return false;
+    if (abortSignal?.aborted) return "cancelled";
+    if (!isAlive(record.pid)) return "not_ready";
     const portReady = record.port ? await connectPort(record.port) : true;
     let commandReady = true;
     if (record.readinessCommand) {
@@ -172,14 +173,16 @@ async function readinessPassed(record: ServiceRecord, timeoutSec: number): Promi
         cwd: record.cwd,
         env: process.env,
         timeoutMs: 2000,
-        detachedProcessGroup: false
+        detachedProcessGroup: false,
+        abortSignal
       });
+      if (result.cancelled) return "cancelled";
       commandReady = !result.timedOut && result.exitCode === 0;
     }
-    if (portReady && commandReady) return true;
+    if (portReady && commandReady) return "ready";
     await sleep(100);
   }
-  return false;
+  return "not_ready";
 }
 
 async function stopRecord(record: ServiceRecord): Promise<"stopped" | "missing"> {
@@ -205,6 +208,9 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
   const command = asString(args.command);
   if (!name || !command) {
     return { ok: false, content: "service.start requires name and command" };
+  }
+  if (context.abortSignal?.aborted) {
+    return { ok: false, content: "service.start cancelled before start", metadata: { cancelled: true } };
   }
 
   const denied = await requestToolPermission(context, {
@@ -280,14 +286,14 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
   await writeRegistry(services);
 
   const timeoutSec = asNumber(args.readinessTimeoutSec) ?? DEFAULT_READINESS_TIMEOUT_SEC;
-  const ready = await readinessPassed(record, timeoutSec);
-  if (!ready) {
+  const ready = await readinessPassed(record, timeoutSec, context.abortSignal);
+  if (ready !== "ready") {
     await stopRecord(record);
     await writeRegistry((await readRegistry()).filter((service) => service.name !== name));
     return {
       ok: false,
-      content: `service ${name} did not become ready within ${timeoutSec}s; log: ${logPath}`,
-      metadata: { ...record, ready: false, readinessTimeoutSec: timeoutSec }
+      content: ready === "cancelled" ? `service ${name} startup cancelled; log: ${logPath}` : `service ${name} did not become ready within ${timeoutSec}s; log: ${logPath}`,
+      metadata: { ...record, ready: false, cancelled: ready === "cancelled", readinessTimeoutSec: timeoutSec }
     };
   }
 

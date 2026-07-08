@@ -20,6 +20,8 @@
   },
   "dependencies": {
     "agent-ai": "workspace:*",
-    "agent-core": "workspace:*"
+    "agent-core": "workspace:*",
+    "agent-tui": "workspace:*",
+    "smol-toml": "^1.7.0"
   }
 }

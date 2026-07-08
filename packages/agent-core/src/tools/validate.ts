@@ -138,7 +138,8 @@ export async function executeValidateTool(args: unknown, context: ToolExecutionC
     workspacePath: context.workspacePath,
     attempt: 1,
     timeoutSec,
-    relatedFiles: inferred.relatedFiles
+    relatedFiles: inferred.relatedFiles,
+    abortSignal: context.abortSignal
   });
   const stdoutTail = tailText(result.stdout_tail);
   const stderrTail = tailText(result.stderr_tail);
@@ -150,6 +151,7 @@ export async function executeValidateTool(args: unknown, context: ToolExecutionC
     scope,
     exitCode: result.exit_code,
     durationMs: result.duration_ms,
+    cancelled: result.cancelled,
     stdoutTail,
     stderrTail,
     relatedFiles: result.related_files,

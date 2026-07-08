@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { truncateMiddle } from "../compaction.js";
 import { workspaceRelativePath } from "../policy.js";
-import { comparePath, DEFAULT_IGNORED_NAMES, shouldSkipName } from "../tools/workspace-utils.js";
+import { comparePath, walkFiles } from "../tools/workspace-utils.js";
 
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 
@@ -35,32 +35,21 @@ function runGit(args: string[], cwd: string): Promise<string | null> {
 }
 
 async function fileTree(workspacePath: string, maxDepth = 3, maxFiles = 250): Promise<{ lines: string[]; truncated: boolean }> {
-  const lines: string[] = [];
-  let visited = 0;
-  let truncated = false;
-
-  async function visit(dirPath: string, depth: number): Promise<void> {
-    if (depth > maxDepth || visited >= maxFiles) {
-      truncated = true;
-      return;
-    }
-    const entries = (await readdir(dirPath, { withFileTypes: true })).sort((a, b) => comparePath(a.name, b.name));
-    for (const entry of entries) {
-      if (visited >= maxFiles) {
-        truncated = true;
-        return;
-      }
-      if (shouldSkipName(entry.name, false, false)) continue;
-      const absolutePath = path.join(dirPath, entry.name);
-      const relative = workspaceRelativePath(workspacePath, absolutePath);
-      lines.push(`${"  ".repeat(depth)}- ${relative}${entry.isDirectory() ? "/" : ""}`);
-      visited += 1;
-      if (entry.isDirectory()) await visit(absolutePath, depth + 1);
+  const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
+  const entries = new Set<string>();
+  for (const file of walked.files) {
+    const parts = file.relativePath.split("/");
+    for (let index = 0; index < parts.length; index += 1) {
+      if (index + 1 > maxDepth) break;
+      const item = parts.slice(0, index + 1).join("/");
+      entries.add(index === parts.length - 1 ? item : `${item}/`);
     }
   }
-
-  await visit(workspacePath, 0);
-  return { lines, truncated };
+  const lines = [...entries]
+    .sort(comparePath)
+    .slice(0, maxFiles)
+    .map((entry) => `${"  ".repeat(Math.max(0, entry.split("/").length - 1))}- ${entry}`);
+  return { lines, truncated: walked.truncated || entries.size > lines.length };
 }
 
 async function readJson(filePath: string): Promise<Record<string, unknown> | null> {
@@ -141,24 +130,11 @@ function shellSymbols(content: string): string[] {
 }
 
 async function collectSourceSymbols(workspacePath: string, maxFiles = 120): Promise<SourceSymbols[]> {
-  const files: string[] = [];
-  async function visit(dirPath: string): Promise<void> {
-    if (files.length >= maxFiles) return;
-    const entries = (await readdir(dirPath, { withFileTypes: true })).sort((a, b) => comparePath(a.name, b.name));
-    for (const entry of entries) {
-      if (files.length >= maxFiles) return;
-      if (shouldSkipName(entry.name, false, false)) continue;
-      const absolutePath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        await visit(absolutePath);
-        continue;
-      }
-      if (/\.(ts|tsx|js|jsx|mjs|cjs|py|sh|bash)$/.test(entry.name) && !entry.name.endsWith(".d.ts")) {
-        files.push(absolutePath);
-      }
-    }
-  }
-  await visit(workspacePath);
+  const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
+  const files = walked.files
+    .filter((file) => /\.(ts|tsx|js|jsx|mjs|cjs|py|sh|bash)$/.test(file.relativePath) && !file.relativePath.endsWith(".d.ts"))
+    .map((file) => file.absolutePath)
+    .slice(0, maxFiles);
 
   const result: SourceSymbols[] = [];
   for (const file of files) {
@@ -178,24 +154,12 @@ async function collectSourceSymbols(workspacePath: string, maxFiles = 120): Prom
 }
 
 async function testFiles(workspacePath: string, maxFiles = 120): Promise<string[]> {
-  const files: string[] = [];
-  async function visit(dirPath: string): Promise<void> {
-    if (files.length >= maxFiles) return;
-    const entries = (await readdir(dirPath, { withFileTypes: true })).sort((a, b) => comparePath(a.name, b.name));
-    for (const entry of entries) {
-      if (files.length >= maxFiles) return;
-      if (shouldSkipName(entry.name, false, false)) continue;
-      const absolutePath = path.join(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        await visit(absolutePath);
-      } else {
-        const relative = workspaceRelativePath(workspacePath, absolutePath);
-        if (/(\.test\.|\.spec\.|__tests__|^tests\/)/.test(relative)) files.push(relative);
-      }
-    }
-  }
-  await visit(workspacePath);
-  return files.sort((a, b) => a.localeCompare(b, "en"));
+  const walked = await walkFiles({ workspacePath, rootPath: workspacePath, maxFiles });
+  return walked.files
+    .map((file) => file.relativePath)
+    .filter((relative) => /(\.test\.|\.spec\.|__tests__|^tests\/)/.test(relative))
+    .sort((a, b) => a.localeCompare(b, "en"))
+    .slice(0, maxFiles);
 }
 
 async function gitSummary(workspacePath: string): Promise<string[]> {
@@ -235,7 +199,7 @@ export async function generateRepoMap(options: RepoMapOptions): Promise<Generate
     ...(tests.length > 0 ? tests.map((file) => `- ${file}`) : ["- no test files found"]),
     "",
     "Agent config:",
-    DEFAULT_IGNORED_NAMES.has(".agent") ? "- .agent/config.toml presence not checked" : "- .agent/config.toml checked",
+    "- .agent/config.toml checked",
     "",
     "Git state:",
     ...git
@@ -258,4 +222,3 @@ export async function generateRepoMap(options: RepoMapOptions): Promise<Generate
 export function formatRepoMapBlock(repoMap: GeneratedRepoMap): string {
   return repoMap.content;
 }
-

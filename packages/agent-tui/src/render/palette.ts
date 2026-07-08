@@ -20,7 +20,7 @@ export function renderFileMentionPalette(prefix: string, suggestions: FileMentio
       lines.push(`${prefixText}${truncateToWidth(suggestion.path, Math.max(8, width - visibleWidth(prefixText)))}`);
     }
   }
-  lines.push(muted("  Tab/Enter inserts the top match", color));
+  lines.push(muted("  Space selects, Tab/Enter inserts", color));
   return lines.map((line) => fitStreamLine(line, width)).join("\n");
 }
 

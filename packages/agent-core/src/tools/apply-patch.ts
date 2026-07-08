@@ -17,6 +17,7 @@ interface ProcessResult {
   stderr: string;
   durationMs: number;
   timedOut: boolean;
+  cancelled?: boolean;
   settledOn: string;
 }
 
@@ -27,14 +28,15 @@ interface ParsedPathToken {
 
 const OUTPUT_TAIL_CHARS = 4000;
 
-async function runGitApply(args: string[], patch: string, cwd: string, timeoutSec: number): Promise<ProcessResult> {
+async function runGitApply(args: string[], patch: string, cwd: string, timeoutSec: number, abortSignal?: AbortSignal): Promise<ProcessResult> {
   const git = gitCommandSpec();
   const result = await runCommand({
     command: git.command,
     args: [...git.argsPrefix, "apply", ...args],
     cwd,
     stdin: patch,
-    timeoutMs: Math.max(1, Math.floor(timeoutSec)) * 1000
+    timeoutMs: Math.max(1, Math.floor(timeoutSec)) * 1000,
+    abortSignal
   });
   return {
     exitCode: result.error ? 127 : result.exitCode,
@@ -43,6 +45,7 @@ async function runGitApply(args: string[], patch: string, cwd: string, timeoutSe
     stderr: result.error ? result.error.message : result.stderr.toString("utf8"),
     durationMs: result.durationMs,
     timedOut: result.timedOut,
+    cancelled: result.cancelled,
     settledOn: result.settledOn
   };
 }
@@ -54,7 +57,8 @@ function textTail(value: string): string {
 function timeoutMetadata(result: ProcessResult, extra: Record<string, unknown>): Record<string, unknown> {
   return {
     ...extra,
-    timedOut: true,
+    timedOut: result.timedOut,
+    cancelled: result.cancelled,
     exitCode: result.exitCode,
     signal: result.signal,
     durationMs: result.durationMs,
@@ -239,11 +243,11 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
   }
 
   const timeoutSec = Math.max(1, Math.floor(context.commandTimeoutSec));
-  const check = await runGitApply(["--check", "--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec);
-  if (check.timedOut) {
+  const check = await runGitApply(["--check", "--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec, context.abortSignal);
+  if (check.timedOut || check.cancelled) {
     return {
       ok: false,
-      content: timeoutContent("git apply --check", timeoutSec),
+      content: check.cancelled ? "git apply --check cancelled" : timeoutContent("git apply --check", timeoutSec),
       metadata: timeoutMetadata(check, { changedFiles, checkOnly: parsed.checkOnly === true })
     };
   }
@@ -255,11 +259,11 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
     };
   }
 
-  const numstat = await runGitApply(["--numstat"], parsed.patch, context.workspacePath, timeoutSec);
-  if (numstat.timedOut) {
+  const numstat = await runGitApply(["--numstat"], parsed.patch, context.workspacePath, timeoutSec, context.abortSignal);
+  if (numstat.timedOut || numstat.cancelled) {
     return {
       ok: false,
-      content: timeoutContent("git apply --numstat", timeoutSec),
+      content: numstat.cancelled ? "git apply --numstat cancelled" : timeoutContent("git apply --numstat", timeoutSec),
       metadata: timeoutMetadata(numstat, { changedFiles, checkOnly: parsed.checkOnly === true })
     };
   }
@@ -281,11 +285,11 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
   });
   if (denied) return denied;
 
-  const applied = await runGitApply(["--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec);
-  if (applied.timedOut) {
+  const applied = await runGitApply(["--whitespace=nowarn"], parsed.patch, context.workspacePath, timeoutSec, context.abortSignal);
+  if (applied.timedOut || applied.cancelled) {
     return {
       ok: false,
-      content: timeoutContent("git apply", timeoutSec),
+      content: applied.cancelled ? "git apply cancelled" : timeoutContent("git apply", timeoutSec),
       metadata: timeoutMetadata(applied, { changedFiles, stats })
     };
   }

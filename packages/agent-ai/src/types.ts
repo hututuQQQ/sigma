@@ -62,6 +62,7 @@ export interface ModelRequest {
     effort?: "high" | "max";
   };
   metadata?: Record<string, string>;
+  abortSignal?: AbortSignal;
 }
 
 export interface ModelResponse {
@@ -71,7 +72,7 @@ export interface ModelResponse {
 }
 
 export interface ModelEvent {
-  type: "message_delta" | "tool_call_delta" | "usage" | "done" | "error";
+  type: "message_delta" | "reasoning_delta" | "tool_call_delta" | "usage" | "done" | "error";
   data?: unknown;
 }
 

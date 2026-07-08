@@ -13,9 +13,10 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function formatOutput(exitCode: number | null, stdout: string, stderr: string, timedOut: boolean): string {
+function formatOutput(exitCode: number | null, stdout: string, stderr: string, timedOut: boolean, cancelled?: boolean): string {
   const parts = [`exitCode: ${exitCode === null ? "null" : exitCode}`];
   if (timedOut) parts.push("timedOut: true");
+  if (cancelled) parts.push("cancelled: true");
   parts.push("stdout:");
   parts.push(stdout);
   parts.push("stderr:");
@@ -75,7 +76,8 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
     command,
     cwd,
     env: process.env,
-    timeoutMs
+    timeoutMs,
+    abortSignal: context.abortSignal
   });
 
   if (result.error) {
@@ -87,6 +89,7 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
         settledOn: result.settledOn,
         signal: result.signal,
         timedOut: result.timedOut,
+        cancelled: result.cancelled,
         truncated: false
       }
     };
@@ -96,11 +99,12 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
     result.exitCode,
     result.stdout.toString("utf8"),
     result.stderr.toString("utf8"),
-    result.timedOut
+    result.timedOut,
+    result.cancelled
   );
   const truncated = truncateMiddle(content, context.maxToolOutputChars);
   return {
-    ok: !result.timedOut && result.exitCode === 0,
+    ok: !result.timedOut && !result.cancelled && result.exitCode === 0,
     content: truncated.text,
     metadata: {
       exitCode: result.exitCode,
@@ -110,7 +114,8 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
       truncated: truncated.truncated,
       settledOn: result.settledOn,
       signal: result.signal,
-      timedOut: result.timedOut
+      timedOut: result.timedOut,
+      cancelled: result.cancelled
     }
   };
 }

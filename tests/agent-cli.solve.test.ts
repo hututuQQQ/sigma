@@ -183,6 +183,90 @@ describe("agent-cli solve", () => {
     expect(loadCliConfig({ workspace: "work", provider: "deepseek", "validation-mode": "auto" }).finalEvidenceMode).toBe("auto");
   });
 
+  it("loads sectioned TOML config with arrays, booleans, and numbers", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-config-${Date.now()}`), { recursive: true });
+    await mkdir(path.join(dir, ".agent"), { recursive: true });
+    await writeFile(
+      path.join(dir, ".agent", "config.toml"),
+      [
+        'provider = "glm"',
+        'model = "glm-config"',
+        "",
+        "[run]",
+        "max_turns = 30",
+        "max_wall_time_sec = 1800",
+        'permission_mode = "yolo"',
+        "",
+        "[validation]",
+        'mode = "auto"',
+        "retry_limit = 1",
+        'commands = ["pnpm test", "pnpm lint"]',
+        "",
+        "[tools]",
+        'allowed = ["read", "write"]',
+        'disabled = ["bash"]',
+        "",
+        "[mcp]",
+        "enabled = true",
+        'config = ".agent/mcp.json"',
+        "",
+        "[tui]",
+        "stream_ui = true"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const config = loadCliConfig({ workspace: dir });
+
+    expect(config).toMatchObject({
+      provider: "glm",
+      model: "glm-config",
+      maxTurns: 30,
+      maxWallTimeSec: 1800,
+      permissionMode: "yolo",
+      validationMode: "auto",
+      validationRetryLimit: 1,
+      validationCommands: ["pnpm test", "pnpm lint"],
+      allowedTools: ["read", "write"],
+      disabledTools: ["bash"],
+      enableMcp: true,
+      mcpConfig: ".agent/mcp.json",
+      noStreamUi: false
+    });
+  });
+
+  it("keeps top-level config compatibility and lets env and CLI override it", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-config-legacy-${Date.now()}`), { recursive: true });
+    await mkdir(path.join(dir, ".agent"), { recursive: true });
+    await writeFile(
+      path.join(dir, ".agent", "config.toml"),
+      [
+        'provider = "glm"',
+        'model = "from-config"',
+        "max_turns = 11",
+        'allowed_tools = ["read"]'
+      ].join("\n"),
+      "utf8"
+    );
+    const previousModel = process.env.AGENT_MODEL;
+    process.env.AGENT_MODEL = "from-env";
+    try {
+      expect(loadCliConfig({ workspace: dir })).toMatchObject({
+        provider: "glm",
+        model: "from-env",
+        maxTurns: 11,
+        allowedTools: ["read"]
+      });
+      expect(loadCliConfig({ workspace: dir, model: "from-cli", "max-turns": "22" })).toMatchObject({
+        model: "from-cli",
+        maxTurns: 22
+      });
+    } finally {
+      if (previousModel === undefined) delete process.env.AGENT_MODEL;
+      else process.env.AGENT_MODEL = previousModel;
+    }
+  });
+
   it("runs with an injected fake provider and writes summary JSON", async () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-${Date.now()}`), { recursive: true });
     const summaryPath = path.join(dir, "summary.json");
@@ -501,6 +585,7 @@ describe("agent-cli solve", () => {
       expect.objectContaining({
         name: "local",
         enabled: true,
+        transport: "stdio",
         tools_loaded: 0,
         error: expect.any(String)
       })

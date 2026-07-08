@@ -57,6 +57,12 @@ Inside the TUI:
   /context (/c)
   /files (/f)
   /tools (/t)
+  /sessions
+  /session <id>
+  /resume <id> <instruction>
+  /fork <id> <instruction>
+  /search <query>
+  /history <query>
   /diff (/d)
   /diff stat (/ds)
   /diff patch (/dp)

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 import type { ProviderName } from "agent-ai";
 import type {
   AgentFinalEvidenceMode,
@@ -116,28 +117,87 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return { flags, positionals };
 }
 
-function parseTomlScalar(raw: string): string | number | boolean {
-  const trimmed = raw.trim();
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
-  const quoted = trimmed.match(/^["'](.*)["']$/);
-  return quoted ? quoted[1] : trimmed;
+type ConfigValues = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function loadSimpleToml(filePath: string): Record<string, string | number | boolean> {
-  if (!existsSync(filePath)) return {};
-  const result: Record<string, string | number | boolean> = {};
-  const lines = readFileSync(filePath, "utf8").split(/\r?\n/);
-  for (const line of lines) {
-    const withoutComment = line.replace(/#.*$/, "").trim();
-    if (!withoutComment || withoutComment.startsWith("[")) continue;
-    const match = withoutComment.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
-    if (match) {
-      result[match[1]] = parseTomlScalar(match[2]);
+function flattenConfig(parsed: unknown): ConfigValues {
+  if (!isRecord(parsed)) return {};
+  const result: ConfigValues = {};
+  const addSection = (section: string, mapping: Record<string, string>) => {
+    const value = parsed[section];
+    if (!isRecord(value)) return;
+    for (const [key, configKey] of Object.entries(mapping)) {
+      if (value[key] !== undefined) result[configKey] = value[key];
     }
+  };
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!isRecord(value)) result[key] = value;
   }
+  addSection("run", {
+    max_turns: "max_turns",
+    max_wall_time_sec: "max_wall_time_sec",
+    command_timeout_sec: "command_timeout_sec",
+    permission_mode: "permission_mode",
+    output_format: "output_format",
+    quiet: "quiet"
+  });
+  addSection("validation", {
+    mode: "validation_mode",
+    command: "validation_command",
+    commands: "validation_command_list",
+    retry_limit: "validation_retry_limit",
+    timeout_sec: "validation_timeout_sec",
+    final_evidence_mode: "final_evidence_mode"
+  });
+  addSection("precheck", {
+    command: "precheck_command",
+    timeout_sec: "precheck_timeout_sec"
+  });
+  addSection("cleanup", {
+    globs: "post_run_cleanup_globs"
+  });
+  addSection("tools", {
+    allowed: "allowed_tools",
+    disabled: "disabled_tools"
+  });
+  addSection("context", {
+    mode: "context_mode",
+    repo_map_max_chars: "repo_map_max_chars",
+    project_doc_max_bytes: "project_doc_max_bytes",
+    no_project_instructions: "no_project_instructions"
+  });
+  addSection("skills", {
+    mode: "skills_mode",
+    max_chars: "skills_max_chars"
+  });
+  addSection("mcp", {
+    enabled: "enable_mcp",
+    config: "mcp_config"
+  });
+  addSection("tui", {
+    stream_ui: "stream_ui",
+    no_stream_ui: "no_stream_ui"
+  });
+  addSection("paths", {
+    trace_jsonl: "trace_jsonl",
+    summary_json: "summary_json",
+    session_jsonl: "session_jsonl",
+    attempts_dir: "attempts_dir"
+  });
   return result;
+}
+
+function loadTomlConfig(filePath: string): ConfigValues {
+  if (!existsSync(filePath)) return {};
+  try {
+    return flattenConfig(parseToml(readFileSync(filePath, "utf8")));
+  } catch (error) {
+    throw new Error(`Failed to parse TOML config ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -198,6 +258,9 @@ function contextModeValue(value: unknown): ContextMode {
 }
 
 function stringListValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+  }
   if (typeof value !== "string") return [];
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -228,9 +291,14 @@ function optionalNumberValue(value: unknown): number | undefined {
 }
 
 export function loadCliConfig(flags: Record<string, string | boolean>): CliConfig {
-  const cwdConfig = loadSimpleToml(path.join(process.cwd(), ".agent", "config.toml"));
-  const homeConfig = loadSimpleToml(path.join(os.homedir(), ".agent", "config.toml"));
-  const config = { ...homeConfig, ...cwdConfig };
+  const homeConfig = loadTomlConfig(path.join(os.homedir(), ".agent", "config.toml"));
+  const preliminaryWorkspace =
+    stringValue(flags.workspace) ??
+    process.env.AGENT_WORKSPACE ??
+    stringValue(homeConfig.workspace) ??
+    process.cwd();
+  const workspaceConfig = loadTomlConfig(path.join(path.resolve(preliminaryWorkspace), ".agent", "config.toml"));
+  const config = { ...homeConfig, ...workspaceConfig };
 
   const workspace =
     stringValue(flags.workspace) ??

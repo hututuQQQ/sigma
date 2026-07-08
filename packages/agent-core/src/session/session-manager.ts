@@ -12,7 +12,7 @@ import {
   sessionIndexRecordFromMeta
 } from "./session-index.js";
 import type { DurableSessionMeta, SessionPaths } from "./session-types.js";
-import { GitCheckpointManager } from "./checkpoints.js";
+import { HybridCheckpointManager, type CheckpointManager } from "./checkpoints.js";
 
 export interface CreateSessionManagerOptions {
   sessionId?: string;
@@ -65,7 +65,7 @@ export class SessionManager {
   readonly sessionId: string;
   readonly paths: SessionPaths;
   readonly eventStore: JsonlSessionStore;
-  readonly checkpoints: GitCheckpointManager;
+  readonly checkpoints: CheckpointManager;
   private meta: DurableSessionMeta;
 
   private constructor(meta: DurableSessionMeta, paths: SessionPaths) {
@@ -73,7 +73,7 @@ export class SessionManager {
     this.paths = paths;
     this.meta = meta;
     this.eventStore = new JsonlSessionStore(paths.eventsPath);
-    this.checkpoints = new GitCheckpointManager({
+    this.checkpoints = new HybridCheckpointManager({
       sessionId: meta.sessionId,
       workspacePath: meta.workspacePath,
       checkpointsDir: paths.checkpointsDir

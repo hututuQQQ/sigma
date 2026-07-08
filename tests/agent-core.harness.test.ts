@@ -305,6 +305,10 @@ describe("agent-core harness", () => {
         ]
       }
     });
+    const eventsText = await readFile(sessions[0].eventsPath, "utf8");
+    expect(eventsText).toContain("\"attempt\":1");
+    expect(eventsText).toContain("harness_check_start");
+    expect(eventsText).toContain("run_start");
   });
 
   it("records precheck failure as the final durable session status", async () => {
@@ -324,6 +328,7 @@ describe("agent-core harness", () => {
 
     expect(result.status).toBe("error");
     expect(result.finishReason).toBe("precheck_failed");
+    expect(model.requests).toHaveLength(0);
 
     const sessions = await listSessions({ workspacePath: dir });
     expect(sessions).toHaveLength(1);
@@ -333,6 +338,7 @@ describe("agent-core harness", () => {
       finishReason: "precheck_failed"
     });
     const summary = JSON.parse(await readFile(sessions[0].summaryPath, "utf8"));
+    expect(summary.harness.attempts).toEqual([]);
     expect(summary.harness.precheck_results).toEqual([
       expect.objectContaining({
         kind: "precheck",
@@ -341,9 +347,9 @@ describe("agent-core harness", () => {
     ]);
   });
 
-  it("adds precheck failure details to retry feedback", async () => {
+  it("runs a passing precheck before the agent attempt", async () => {
     const dir = await tempWorkspace();
-    const model = new SequenceModel([finalResponse("first"), finalResponse("second")]);
+    const model = new SequenceModel([finalResponse("first")]);
 
     const result = await runAgentHarness({
       instruction: "finish",
@@ -351,16 +357,16 @@ describe("agent-core harness", () => {
       modelClient: model,
       validationMode: "off",
       validationRetryLimit: 1,
-      precheckCommand: "if [ -f pass ]; then exit 0; else echo missing >&2; touch pass; exit 1; fi",
+      precheckCommand: "node -e \"process.exit(0)\"",
       precheckTimeoutSec: 5,
       permissionMode: "yolo"
     });
 
     expect(result.status).toBe("completed");
-    const retryRequest = model.requests.find((request) =>
-      request.messages.some((message) => message.role === "user" && String(message.content).includes("Precheck failure 1"))
-    );
-    expect(retryRequest).toBeTruthy();
+    expect(model.requests).toHaveLength(1);
+    expect(result.harness?.precheck_results).toEqual([
+      expect.objectContaining({ kind: "precheck", exit_code: 0, attempt: 1 })
+    ]);
   });
 
   it("runs post-run cleanup and records warnings separately from success", async () => {

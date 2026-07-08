@@ -81,13 +81,16 @@ export interface CheckpointRecord {
   sequence: number;
   createdAt: string;
   workspacePath: string;
+  mode?: "git" | "file";
   toolName: string;
   toolCallId: string;
   ok: boolean;
   changedFiles: string[];
-  patchPath: string;
-  beforeTree: string;
-  afterTree: string;
+  patchPath?: string;
+  fileSnapshotPath?: string;
+  skippedFiles?: string[];
+  beforeTree?: string;
+  afterTree?: string;
   resultSummary: string;
 }
 

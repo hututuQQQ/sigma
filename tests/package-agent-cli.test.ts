@@ -44,7 +44,7 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
 
 async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
-  for (const packageName of ["agent-ai", "agent-core", "agent-cli"]) {
+  for (const packageName of ["agent-ai", "agent-core", "agent-tui", "agent-cli"]) {
     await writeBuiltPackage(rootDir, packageName);
   }
   return rootDir;
@@ -82,9 +82,45 @@ describe("package-agent-cli", () => {
     expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-core/package.json");
   });
 
-  it("fails clearly when no Node runtime tarball is provided or cached", async () => {
+  it("uses a cached Node runtime tarball when env override is absent", async () => {
     const rootDir = await writePackageFixture();
+    const artifactsDir = path.join(rootDir, ".artifacts");
+    const cacheDir = path.join(artifactsDir, "cache");
+    await mkdir(cacheDir, { recursive: true });
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    await writeFile(path.join(cacheDir, `node-${pinnedNodeVersion}-linux-x64.tar.xz`), await readFile(runtimeTarball));
 
-    await expect(packageAgentCli({ rootDir, env: {} })).rejects.toThrow(/NODE_RUNTIME_TARBALL is required/);
+    const result = await packageAgentCli({ rootDir, env: {}, artifactsDir });
+
+    expect(result.source).toBe("cache");
+    expect(result.downloaded).toBe(false);
+    await expect(stat(path.join(result.bundleDir, "bin", "node"))).resolves.toBeTruthy();
+  });
+
+  it("auto-downloads the Node runtime tarball into cache when missing", async () => {
+    const rootDir = await writePackageFixture();
+    const sourceTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const downloads: Array<{ url: string; destination: string }> = [];
+
+    const result = await packageAgentCli({
+      rootDir,
+      env: {},
+      downloader: async (url: string, destination: string) => {
+        downloads.push({ url, destination });
+        await mkdir(path.dirname(destination), { recursive: true });
+        await writeFile(destination, await readFile(sourceTarball));
+      }
+    });
+
+    expect(result.source).toBe("download");
+    expect(result.downloaded).toBe(true);
+    expect(downloads[0].url).toContain(`node-${pinnedNodeVersion}-linux-x64.tar.xz`);
+    expect(downloads[0].destination).toContain(path.join(".artifacts", "cache"));
+    const metadata = JSON.parse(await readFile(path.join(result.bundleDir, "package-metadata.json"), "utf8"));
+    expect(metadata.node).toMatchObject({
+      downloaded: true,
+      source: "download",
+      version: pinnedNodeVersion
+    });
   });
 });

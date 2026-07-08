@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentMessage, ToolCall } from "agent-ai";
+import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
 import { truncateMiddle } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
@@ -78,6 +78,34 @@ function stringifyToolResult(result: ToolResult): string {
     content: result.content,
     metadata: result.metadata ?? {}
   });
+}
+
+function eventDelta(eventData: unknown): string {
+  if (typeof eventData === "string") return eventData;
+  if (eventData && typeof eventData === "object") {
+    const data = eventData as Record<string, unknown>;
+    if (typeof data.delta === "string") return data.delta;
+    if (typeof data.contentDelta === "string") return data.contentDelta;
+    if (typeof data.reasoningDelta === "string") return data.reasoningDelta;
+  }
+  return "";
+}
+
+function eventToolCall(eventData: unknown): ToolCall | null {
+  if (!eventData || typeof eventData !== "object") return null;
+  const data = eventData as Record<string, unknown>;
+  const raw = data.toolCall && typeof data.toolCall === "object" ? data.toolCall as Record<string, unknown> : data;
+  const fn = raw.function && typeof raw.function === "object" ? raw.function as Record<string, unknown> : {};
+  const name = typeof fn.name === "string" ? fn.name : typeof raw.name === "string" ? raw.name : "";
+  if (!name) return null;
+  return {
+    id: typeof raw.id === "string" ? raw.id : `call_${String(data.index ?? 0)}`,
+    type: "function",
+    function: {
+      name,
+      arguments: parseToolArguments(fn.arguments ?? raw.arguments)
+    }
+  };
 }
 
 function toolArgumentsObject(args: unknown): Record<string, unknown> | null {
@@ -292,6 +320,85 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     await durableSession?.appendEvent(safeEvent);
   };
 
+  const requestModel = async (turn: number, requestMessages: AgentMessage[], tools: ToolDefinition[]): Promise<ModelResponse> => {
+    if (!config.modelClient.stream) {
+      return await config.modelClient.complete({
+        messages: requestMessages,
+        tools,
+        toolChoice: "auto",
+        abortSignal: config.abortSignal
+      });
+    }
+
+    let content = "";
+    let reasoningContent = "";
+    let usage: ModelResponse["usage"];
+    let rawDoneMessage: ModelResponse | null = null;
+    const toolCallsById = new Map<string, ToolCall>();
+    try {
+      for await (const modelEvent of config.modelClient.stream({
+        messages: requestMessages,
+        tools,
+        toolChoice: "auto",
+        abortSignal: config.abortSignal
+      })) {
+        if (config.abortSignal?.aborted) {
+          throw new Error("Run cancelled during model stream.");
+        }
+        if (modelEvent.type === "message_delta") {
+          const delta = eventDelta(modelEvent.data);
+          if (!delta) continue;
+          content += delta;
+          await recordEvent(event(runId, "assistant_delta", provider, model, { turn, delta, content }, undefined, durableSession?.sessionId));
+          continue;
+        }
+        if (modelEvent.type === "reasoning_delta") {
+          const delta = eventDelta(modelEvent.data);
+          if (!delta) continue;
+          reasoningContent += delta;
+          await recordEvent(event(runId, "reasoning_delta", provider, model, { turn, delta, reasoningContent }, undefined, durableSession?.sessionId));
+          continue;
+        }
+        if (modelEvent.type === "tool_call_delta") {
+          const toolCall = eventToolCall(modelEvent.data);
+          if (toolCall) toolCallsById.set(toolCall.id, toolCall);
+          await recordEvent(event(runId, "tool_call_delta", provider, model, { turn, data: modelEvent.data }, undefined, durableSession?.sessionId));
+          continue;
+        }
+        if (modelEvent.type === "usage") {
+          usage = modelEvent.data && typeof modelEvent.data === "object" ? modelEvent.data as ModelResponse["usage"] : usage;
+          continue;
+        }
+        if (modelEvent.type === "error") {
+          const message = modelEvent.data && typeof modelEvent.data === "object"
+            ? String((modelEvent.data as Record<string, unknown>).message ?? "model stream failed")
+            : String(modelEvent.data ?? "model stream failed");
+          throw new Error(message);
+        }
+        if (modelEvent.type === "done" && modelEvent.data && typeof modelEvent.data === "object") {
+          rawDoneMessage = modelEvent.data as ModelResponse;
+        }
+      }
+    } catch (error) {
+      if (config.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw new Error("Run cancelled during model stream.");
+      }
+      throw error;
+    }
+
+    if (rawDoneMessage?.message) return rawDoneMessage;
+    const toolCalls = [...toolCallsById.values()];
+    return {
+      message: {
+        role: "assistant",
+        ...(content ? { content } : {}),
+        ...(reasoningContent ? { reasoningContent } : {}),
+        ...(toolCalls.length > 0 ? { toolCalls } : {})
+      },
+      usage
+    };
+  };
+
   const usage: TokenTotals = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0 };
   const loadedProjectInstructions = await loadProjectInstructions({
     workspacePath: context.workspacePath,
@@ -372,18 +479,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         messages.splice(0, messages.length, ...compactedMessages);
       }
       if (config.abortSignal?.aborted) {
-        finishReason = "error";
-        lastError = "Run aborted before model request.";
+        finishReason = "cancelled";
+        lastError = "Run cancelled before model request.";
         await recordEvent(event(runId, "run_abort", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
         break;
       }
 
       await recordEvent(event(runId, "model_start", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
-      const response = await config.modelClient.complete({
-        messages,
-        tools: registry.definitions,
-        toolChoice: "auto"
-      });
+      const response = await requestModel(turns, messages, registry.definitions);
       addUsage(usage, response.usage);
       await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       if (response.usage) {
@@ -427,6 +530,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       for (const call of calls) {
+        if (config.abortSignal?.aborted) {
+          finishReason = "cancelled";
+          lastError = "Run cancelled before tool execution.";
+          await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, toolName: call.function.name }, undefined, durableSession?.sessionId));
+          break;
+        }
         const toolStart = event(runId, "tool_start", provider, model, { toolCall: call }, undefined, durableSession?.sessionId);
         await recordEvent(toolStart);
         toolCalls += 1;
@@ -477,15 +586,28 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           name: call.function.name,
           content: stringifyToolResult(result)
         });
+        if (config.abortSignal?.aborted) {
+          finishReason = "cancelled";
+          lastError = "Run cancelled during tool execution.";
+          await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, toolName: call.function.name }, undefined, durableSession?.sessionId));
+          break;
+        }
       }
+      if (finishReason === "cancelled") break;
     }
 
     if (!stoppedByAssistant && turns >= maxTurns && finishReason === "assistant_stop") {
       finishReason = "max_turns";
     }
   } catch (error) {
-    finishReason = "error";
-    lastError = error instanceof Error ? error.message : String(error);
+    if (config.abortSignal?.aborted || (error instanceof Error && /cancelled|aborted/i.test(error.message))) {
+      finishReason = "cancelled";
+      lastError = error instanceof Error ? error.message : "Run cancelled.";
+      await recordEvent(event(runId, "run_abort", provider, model, { message: lastError }, undefined, durableSession?.sessionId));
+    } else {
+      finishReason = "error";
+      lastError = error instanceof Error ? error.message : String(error);
+    }
     await recordEvent(event(runId, "error", provider, model, { message: lastError }, undefined, durableSession?.sessionId));
   }
 

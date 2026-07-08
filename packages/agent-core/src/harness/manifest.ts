@@ -1,38 +1,25 @@
-import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { stat } from "node:fs/promises";
 import type { WorkspaceManifest } from "../types.js";
-
-const SKIP_DIRS = new Set([".git", "node_modules"]);
+import { walkFiles } from "../tools/workspace-utils.js";
 
 function toManifestPath(workspacePath: string, filePath: string): string {
   return path.relative(workspacePath, filePath).split(path.sep).join("/");
 }
 
-async function walk(workspacePath: string, currentPath: string, manifest: WorkspaceManifest): Promise<void> {
-  const entries = await readdir(currentPath, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue;
-    const entryPath = path.join(currentPath, entry.name);
-    if (entry.isDirectory()) {
-      await walk(workspacePath, entryPath, manifest);
-      continue;
-    }
-    if (!entry.isFile()) continue;
-
-    const entryStat = await stat(entryPath);
-    const manifestPath = toManifestPath(workspacePath, entryPath);
+export async function listWorkspaceManifest(workspacePath: string): Promise<WorkspaceManifest> {
+  const resolved = path.resolve(workspacePath);
+  const manifest: WorkspaceManifest = {};
+  const walked = await walkFiles({ workspacePath: resolved, rootPath: resolved, maxFiles: 50000 });
+  for (const file of walked.files) {
+    const entryStat = await stat(file.absolutePath);
+    const manifestPath = toManifestPath(resolved, file.absolutePath);
     manifest[manifestPath] = {
       path: manifestPath,
       size: entryStat.size,
       mtimeMs: Math.floor(entryStat.mtimeMs)
     };
   }
-}
-
-export async function listWorkspaceManifest(workspacePath: string): Promise<WorkspaceManifest> {
-  const resolved = path.resolve(workspacePath);
-  const manifest: WorkspaceManifest = {};
-  await walk(resolved, resolved, manifest);
   return manifest;
 }
 

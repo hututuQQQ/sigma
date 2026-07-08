@@ -141,7 +141,7 @@ function renderWorkbenchPanel(options: RenderScreenOptions, width: number, heigh
     roleColor("accent", "Tool calls", color),
     ...recentActivity(options.entries, width, color).map((line) => `  ${truncateToWidth(line, Math.max(8, width - 2))}`),
     "",
-    roleColor("accent", "Benchmark", color),
+    roleColor("accent", "Checks", color),
     panelLine("validation", validationState(options), width),
     panelLine("evidence", options.result?.finalGate?.status ?? options.finalEvidenceMode ?? "off", width),
     panelLine("tokens", usageSummary(options), width)

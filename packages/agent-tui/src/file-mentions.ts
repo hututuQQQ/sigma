@@ -104,3 +104,13 @@ export function insertFileMention(text: string, mention: ActiveFileMention, file
     cursor: mention.start + replacement.length
   };
 }
+
+export function insertFileMentions(text: string, mention: ActiveFileMention, filePaths: string[]): { text: string; cursor: number } {
+  const unique = [...new Set(filePaths)].filter(Boolean);
+  const replacement = unique.map((filePath) => `@${filePath}`).join(" ");
+  const nextText = `${text.slice(0, mention.start)}${replacement}${text.slice(mention.end)}`;
+  return {
+    text: nextText,
+    cursor: mention.start + replacement.length
+  };
+}

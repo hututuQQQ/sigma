@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { runAgent } from "../packages/agent-core/src/index.js";
+import { AgentEventBus, runAgent } from "../packages/agent-core/src/index.js";
 
 class FakeModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -18,6 +18,42 @@ class FakeModel implements ModelClient {
     const response = this.responses[Math.min(this.index, this.responses.length - 1)];
     this.index += 1;
     return response;
+  }
+}
+
+class StreamingModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-stream-model";
+  readonly requests: ModelRequest[] = [];
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    throw new Error("complete should not be called when stream is available");
+  }
+
+  async *stream(req: ModelRequest) {
+    this.requests.push(req);
+    yield { type: "message_delta" as const, data: { delta: "hello " } };
+    yield { type: "reasoning_delta" as const, data: { delta: "thinking" } };
+    yield { type: "message_delta" as const, data: { delta: "world" } };
+    yield { type: "usage" as const, data: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
+    yield { type: "done" as const };
+  }
+}
+
+class AbortStreamingModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-abort-stream-model";
+
+  constructor(private readonly controller: AbortController) {}
+
+  async complete(_req: ModelRequest): Promise<ModelResponse> {
+    throw new Error("complete should not be called");
+  }
+
+  async *stream(_req: ModelRequest) {
+    yield { type: "message_delta" as const, data: { delta: "partial" } };
+    this.controller.abort();
+    yield { type: "message_delta" as const, data: { delta: " ignored" } };
   }
 }
 
@@ -176,5 +212,97 @@ describe("agent loop", () => {
       "Previous agent conversation compacted by the run controller."
     );
     expect(thirdRequestMessages[3].role).toBe("assistant");
+  });
+
+  it("uses streaming model deltas and emits token-level events", async () => {
+    const dir = await tempWorkspace();
+    const model = new StreamingModel();
+    const controller = new AbortController();
+    const eventBus = new AgentEventBus();
+    const events: string[] = [];
+    eventBus.on((event) => events.push(event.type));
+
+    const result = await runAgent({
+      instruction: "stream",
+      workspacePath: dir,
+      modelClient: model,
+      eventBus,
+      abortSignal: controller.signal
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.finalMessage).toBe("hello world");
+    expect(result.usage).toMatchObject({ inputTokens: 1, outputTokens: 2, totalTokens: 3 });
+    expect(events).toEqual(expect.arrayContaining(["assistant_delta", "reasoning_delta", "assistant_message"]));
+    expect(model.requests[0].abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("cancels before a model request", async () => {
+    const dir = await tempWorkspace();
+    const controller = new AbortController();
+    controller.abort();
+    const model = new FakeModel([{ message: { role: "assistant", content: "should not run" } }]);
+
+    const result = await runAgent({
+      instruction: "abort",
+      workspacePath: dir,
+      modelClient: model,
+      abortSignal: controller.signal
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("cancelled");
+    expect(model.requests).toHaveLength(0);
+  });
+
+  it("cancels during a model stream", async () => {
+    const dir = await tempWorkspace();
+    const controller = new AbortController();
+
+    const result = await runAgent({
+      instruction: "abort stream",
+      workspacePath: dir,
+      modelClient: new AbortStreamingModel(controller),
+      abortSignal: controller.signal
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("cancelled");
+  });
+
+  it("cancels during a bash tool command", async () => {
+    const dir = await tempWorkspace();
+    const controller = new AbortController();
+    const eventBus = new AgentEventBus();
+    eventBus.on((event) => {
+      if (event.type === "tool_start") controller.abort();
+    });
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "slow-bash",
+              type: "function",
+              function: { name: "bash", arguments: { command: "sleep 5" } }
+            }
+          ]
+        }
+      }
+    ]);
+
+    const result = await runAgent({
+      instruction: "slow command",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      eventBus,
+      abortSignal: controller.signal,
+      commandTimeoutSec: 10
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("cancelled");
   });
 });

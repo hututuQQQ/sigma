@@ -9,7 +9,7 @@ import type {
   WorkspaceManifest
 } from "../types.js";
 import { executeBashTool } from "./bash.js";
-import { executeReadTool } from "./read.js";
+import { executeReadTool, executeReadManyTool } from "./read.js";
 import { executeWriteTool } from "./write.js";
 import { executeEditTool } from "./edit.js";
 import { executeServiceTool } from "./service.js";
@@ -119,6 +119,44 @@ const readTool: RegisteredTool = {
     }
   },
   execute: executeReadTool,
+  risk: "read"
+};
+
+const readManyTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "read_many",
+      description: "Read multiple workspace files or snippets in one call. Binary files return metadata only.",
+      parameters: {
+        type: "object",
+        properties: {
+          files: {
+            type: "array",
+            items: {
+              oneOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    path: { type: "string" },
+                    offset: { type: "number" },
+                    limit: { type: "number" }
+                  },
+                  required: ["path"],
+                  additionalProperties: false
+                }
+              ]
+            }
+          },
+          maxCharsPerFile: { type: "number" }
+        },
+        required: ["files"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeReadManyTool,
   risk: "read"
 };
 
@@ -272,7 +310,7 @@ const repoQueryTool: RegisteredTool = {
     function: {
       name: "repo_query",
       description:
-        "Search the workspace semantically by query and return compact scored file snippets. Useful for finding symbols, tests, configs, or paths.",
+        "Search the workspace with lexical, symbol, and path signals and return compact scored file snippets. Useful for finding symbols, tests, configs, or paths.",
       parameters: {
         type: "object",
         properties: {
@@ -497,6 +535,7 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
       bashTool,
       serviceTool,
       readTool,
+      readManyTool,
       writeTool,
       editTool,
       listTool,

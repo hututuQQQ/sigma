@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ToolCall } from "../packages/agent-ai/src/index.js";
 import {
   createDefaultToolRegistry,
+  executeReadManyTool,
   executeRepoQueryTool,
   executeSymbolSearchTool,
   executeValidateTool,
@@ -92,6 +93,96 @@ describe("repo context tools", () => {
       const staleResult = await executeSymbolSearchTool({ query: "oldName" }, context);
       expect(staleResult.ok).toBe(true);
       expect(staleResult.metadata?.matches).toEqual([]);
+    } finally {
+      await registry.close?.();
+    }
+  });
+
+  it("honors .gitignore and .agentignore across repo query and symbol search", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await mkdir(path.join(dir, "scratch"), { recursive: true });
+    await mkdir(path.join(dir, "local"), { recursive: true });
+    await writeFile(path.join(dir, ".gitignore"), "scratch/\n", "utf8");
+    await writeFile(path.join(dir, ".agentignore"), "local/\n", "utf8");
+    await writeFile(path.join(dir, "src", "visible.ts"), "export function visibleSymbol() { return 1; }\n", "utf8");
+    await writeFile(path.join(dir, "scratch", "ignored.ts"), "export function ignoredByGitignore() { return 1; }\n", "utf8");
+    await writeFile(path.join(dir, "local", "ignored.ts"), "export function ignoredByAgentignore() { return 1; }\n", "utf8");
+
+    const query = await executeRepoQueryTool({ query: "ignoredByGitignore ignoredByAgentignore visibleSymbol" }, context);
+    expect(query.ok).toBe(true);
+    const queryPaths = (query.metadata?.matches as Array<{ path: string }>).map((match) => match.path);
+    expect(queryPaths).toContain("src/visible.ts");
+    expect(queryPaths).not.toContain("scratch/ignored.ts");
+    expect(queryPaths).not.toContain("local/ignored.ts");
+
+    const ignoredSymbol = await executeSymbolSearchTool({ query: "ignoredByGitignore" }, context);
+    expect(ignoredSymbol.ok).toBe(true);
+    expect(ignoredSymbol.metadata?.matches).toEqual([]);
+  });
+
+  it("reads many workspace snippets and rejects escaped paths", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "a.ts"), "alpha\n", "utf8");
+    await writeFile(path.join(dir, "src", "b.ts"), "bravo\n", "utf8");
+
+    const result = await executeReadManyTool({ files: ["src/a.ts", { path: "src/b.ts", limit: 3 }] }, context);
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("--- src/a.ts ---");
+    expect(result.content).toContain("alpha");
+    expect(result.content).toContain("--- src/b.ts ---");
+    expect(result.content).toContain("bra");
+
+    const escaped = await executeReadManyTool({ files: ["../outside.txt"] }, context);
+    expect(escaped.ok).toBe(false);
+    expect(escaped.content).toContain("outside the workspace");
+  });
+
+  it("invalidates symbol_search cache after edit, apply_patch, and bash mutations", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "index.ts"), "export function beforeEdit() { return 1; }\n", "utf8");
+    const registry = createDefaultToolRegistry();
+    try {
+      await expect(executeSymbolSearchTool({ query: "beforeEdit" }, context)).resolves.toMatchObject({ ok: true });
+      await registry.execute(
+        toolCall("edit-symbol", "edit", {
+          path: "src/index.ts",
+          oldString: "beforeEdit",
+          newString: "afterEdit",
+          expectedReplacements: 1
+        }),
+        context
+      );
+      const afterEdit = await executeSymbolSearchTool({ query: "afterEdit" }, context);
+      expect((afterEdit.metadata?.matches as Array<{ name: string }>)[0]).toMatchObject({ name: "afterEdit" });
+
+      await registry.execute(
+        toolCall("patch-symbol", "apply_patch", {
+          patch: [
+            "diff --git a/src/index.ts b/src/index.ts",
+            "--- a/src/index.ts",
+            "+++ b/src/index.ts",
+            "@@ -1 +1 @@",
+            "-export function afterEdit() { return 1; }",
+            "+export function afterPatch() { return 2; }",
+            ""
+          ].join("\n")
+        }),
+        context
+      );
+      const afterPatch = await executeSymbolSearchTool({ query: "afterPatch" }, context);
+      expect((afterPatch.metadata?.matches as Array<{ name: string }>)[0]).toMatchObject({ name: "afterPatch" });
+
+      await registry.execute(
+        toolCall("bash-symbol", "bash", {
+          command: "printf 'export function afterBash() { return 3; }\\n' > src/index.ts"
+        }),
+        context
+      );
+      const afterBash = await executeSymbolSearchTool({ query: "afterBash" }, context);
+      expect((afterBash.metadata?.matches as Array<{ name: string }>)[0]).toMatchObject({ name: "afterBash" });
     } finally {
       await registry.close?.();
     }

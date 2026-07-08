@@ -74,7 +74,7 @@ describe("agent-tui commands and mention palettes", () => {
       { path: "src/render/screen-with-a-very-long-name.ts", score: 80 }
     ], 28, 4, false);
     expect(palette).toContain("\u203a src/app.tsx");
-    expect(palette).toContain("Tab/Enter inserts");
+    expect(palette).toContain("Space selects");
     expect(assertWithinWidth(palette, 28)).toBe(true);
   });
 
