@@ -204,9 +204,37 @@ export function sandboxMetadata(effective: EffectiveSandboxConfig, extra: Record
   };
 }
 
-function commandExists(command: string, args: string[] = ["--version"]): boolean {
+interface CommandProbeResult {
+  ok: boolean;
+  status?: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: string;
+}
+
+interface SandboxProbeResult {
+  available: boolean;
+  reason?: string;
+}
+
+function commandProbe(command: string, args: string[] = ["--version"]): CommandProbeResult {
   const result = spawnSync(command, args, { stdio: "ignore", windowsHide: true });
-  return !result.error && result.status === 0;
+  return {
+    ok: !result.error && result.status === 0,
+    status: result.status,
+    signal: result.signal,
+    ...(result.error ? { error: result.error.message } : {})
+  };
+}
+
+function commandExists(command: string, args: string[] = ["--version"]): boolean {
+  return commandProbe(command, args).ok;
+}
+
+function probeFailureDetail(result: CommandProbeResult): string {
+  if (result.error) return result.error;
+  if (result.status !== undefined && result.status !== null) return `exit status ${result.status}`;
+  if (result.signal) return `signal ${result.signal}`;
+  return "unknown failure";
 }
 
 function windowsSandboxHelperPath(): string {
@@ -217,12 +245,44 @@ function windowsCommandShellPath(): string {
   return process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
 }
 
-function bubblewrapAvailable(): boolean {
-  return process.platform === "linux" && commandExists("bwrap");
+function bubblewrapAvailabilityProbe(): SandboxProbeResult {
+  if (process.platform !== "linux") {
+    return { available: false, reason: "bubblewrap backend is only available on Linux." };
+  }
+  const bwrap = commandProbe("bwrap");
+  if (!bwrap.ok) {
+    return {
+      available: false,
+      reason: `bubblewrap command probe failed (${probeFailureDetail(bwrap)}). Install bubblewrap (bwrap) and make sure it is on PATH.`
+    };
+  }
+
+  const unshare = commandProbe("unshare", ["-Ur", "true"]);
+  if (unshare.ok) return { available: true };
+
+  const minimalBwrap = commandProbe("bwrap", ["--ro-bind", "/", "/", "true"]);
+  if (minimalBwrap.ok) return { available: true };
+
+  return {
+    available: false,
+    reason: `bubblewrap is installed, but Linux user namespaces are unavailable or the minimal bubblewrap probe failed (unshare -Ur true: ${probeFailureDetail(unshare)}; bwrap probe: ${probeFailureDetail(minimalBwrap)}). Enable unprivileged user namespaces or fix the bwrap installation.`
+  };
 }
 
-function seatbeltAvailable(): boolean {
-  return process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec");
+function seatbeltAvailabilityProbe(): SandboxProbeResult {
+  if (process.platform !== "darwin") {
+    return { available: false, reason: "macOS seatbelt backend is only available on macOS." };
+  }
+  if (existsSync("/usr/bin/sandbox-exec")) {
+    return {
+      available: false,
+      reason: "macOS seatbelt backend is detected but command execution is not implemented yet."
+    };
+  }
+  return {
+    available: false,
+    reason: "macOS seatbelt backend command execution is not implemented yet, and /usr/bin/sandbox-exec was not found."
+  };
 }
 
 function windowsSandboxAvailable(effective: EffectiveSandboxConfig): SandboxAvailability {
@@ -261,14 +321,14 @@ function backendAvailability(backend: EffectiveSandboxBackend, effective: Effect
       : { available: false, backend, mode: effective.mode, reason: "External sandbox backend requires external.command." };
   }
   if (backend === "bubblewrap") {
-    return bubblewrapAvailable()
+    const probe = bubblewrapAvailabilityProbe();
+    return probe.available
       ? { available: true, backend, mode: effective.mode, metadata: sandboxMetadata(effective) }
-      : { available: false, backend, mode: effective.mode, reason: "bubblewrap backend is unavailable. Install bwrap and enable user namespaces." };
+      : { available: false, backend, mode: effective.mode, reason: probe.reason };
   }
   if (backend === "seatbelt") {
-    return seatbeltAvailable()
-      ? { available: true, backend, mode: effective.mode, metadata: sandboxMetadata(effective) }
-      : { available: false, backend, mode: effective.mode, reason: "macOS seatbelt backend is unavailable." };
+    const probe = seatbeltAvailabilityProbe();
+    return { available: false, backend, mode: effective.mode, reason: probe.reason };
   }
   if (backend === "windows") {
     return windowsSandboxAvailable(effective);
