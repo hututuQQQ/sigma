@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
-import { truncateMiddle } from "./compaction.js";
+import { compactLargeText, truncateMiddle } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
 import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.js";
@@ -19,7 +19,8 @@ import { createInitialFinalGateStatus, finalGateNudge } from "./controller/final
 import {
   createWorkflowState,
   recordToolInWorkflow,
-  summarizeWorkflowState
+  summarizeWorkflowState,
+  workflowFailureNudge
 } from "./controller/workflow-state.js";
 import { redactSecrets } from "./redaction.js";
 import type {
@@ -45,6 +46,8 @@ const DEFAULT_PROJECT_DOC_MAX_BYTES = 32768;
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 const DEFAULT_SKILLS_MAX_CHARS = 8000;
 const COMPACTION_MARKER = "Previous agent conversation compacted by the run controller.";
+const TOOL_ARGUMENT_HISTORY_MAX_CHARS = 4000;
+const EVENT_METADATA_MAX_CHARS = 6000;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -123,6 +126,61 @@ function toolCallCountsAsCommand(call: ToolCall): boolean {
   if (call.function.name === "bash") return true;
   if (call.function.name !== "shell_session") return false;
   return toolArgumentsObject(call.function.arguments)?.action === "send";
+}
+
+function compactUnknownForTrace(value: unknown, label: string, maxChars: number): unknown {
+  if (typeof value === "string") {
+    return compactLargeText(value, { label, maxChars }).text;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => compactUnknownForTrace(item, `${label}[${index}]`, maxChars));
+  }
+  if (!value || typeof value !== "object") return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const compactLabels: Record<string, string> = {
+      command: "large command",
+      input: "large input",
+      content: "large content",
+      patch: "large patch",
+      arguments: "large arguments"
+    };
+    const nextLabel = compactLabels[key] ?? `${label}.${key}`;
+    result[key] = compactUnknownForTrace(item, nextLabel, maxChars);
+  }
+  return result;
+}
+
+function compactToolCallForTrace(call: ToolCall): ToolCall {
+  return {
+    ...call,
+    function: {
+      ...call.function,
+      arguments: compactUnknownForTrace(call.function.arguments, `${call.function.name} arguments`, TOOL_ARGUMENT_HISTORY_MAX_CHARS)
+    }
+  };
+}
+
+function compactAssistantMessageForHistory(message: AgentMessage): AgentMessage {
+  if (message.role !== "assistant") return message;
+  return {
+    ...message,
+    ...(message.content
+      ? { content: compactLargeText(message.content, { label: "assistant content", maxChars: 12000 }).text }
+      : {}),
+    ...(message.reasoningContent
+      ? { reasoningContent: compactLargeText(message.reasoningContent, { label: "assistant reasoning", maxChars: 12000 }).text }
+      : {}),
+    ...(message.toolCalls ? { toolCalls: message.toolCalls.map(compactToolCallForTrace) } : {})
+  };
+}
+
+function compactEventForTrace(agentEvent: AgentEvent): AgentEvent {
+  if (!agentEvent.metadata) return agentEvent;
+  return {
+    ...agentEvent,
+    metadata: compactUnknownForTrace(agentEvent.metadata, "event metadata", EVENT_METADATA_MAX_CHARS) as Record<string, unknown>
+  };
 }
 
 function messageHistoryChars(messages: AgentMessage[]): number {
@@ -311,7 +369,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   let finalGateAlreadyNudged = false;
 
   const recordEvent = async (agentEvent: AgentEvent): Promise<void> => {
-    const safeEvent = redactSecrets(agentEvent);
+    const safeEvent = compactEventForTrace(redactSecrets(agentEvent));
     config.eventBus?.emit(safeEvent);
     await traceStore?.append(safeEvent);
     if (config.sessionJsonlPath !== config.traceJsonlPath) {
@@ -493,14 +551,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         await recordEvent(event(runId, "usage", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       }
 
-      messages.push(response.message);
+      messages.push(compactAssistantMessageForHistory(response.message));
       finalMessage = response.message.content;
       await recordEvent(
         event(runId, "assistant_message", provider, model, {
           turn: turns,
           content: response.message.content,
           reasoningContent: response.message.reasoningContent,
-          toolCalls: response.message.toolCalls
+          toolCalls: response.message.toolCalls?.map(compactToolCallForTrace)
         }, undefined, durableSession?.sessionId)
       );
 
@@ -529,6 +587,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         break;
       }
 
+      const workflowNudges: string[] = [];
       for (const call of calls) {
         if (config.abortSignal?.aborted) {
           finishReason = "cancelled";
@@ -573,13 +632,15 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           args: call.function.arguments,
           result
         });
-        recordToolInWorkflow({
+        const failurePattern = recordToolInWorkflow({
           workflow,
           toolName: call.function.name,
           args: call.function.arguments,
           result,
           evidence
         });
+        const nudge = workflowFailureNudge(workflow, failurePattern);
+        if (nudge) workflowNudges.push(nudge);
         messages.push({
           role: "tool",
           toolCallId: call.id,
@@ -592,6 +653,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, toolName: call.function.name }, undefined, durableSession?.sessionId));
           break;
         }
+      }
+      if (workflowNudges.length > 0 && finishReason !== "cancelled") {
+        messages.push({ role: "user", content: [...new Set(workflowNudges)].join("\n\n") });
       }
       if (finishReason === "cancelled") break;
     }

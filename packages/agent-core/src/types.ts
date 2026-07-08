@@ -43,6 +43,21 @@ export type WorkflowPhase =
   | "review"
   | "final";
 
+export type WorkflowFailureCategory =
+  | "compile_error"
+  | "segmentation_fault"
+  | "timeout"
+  | "missing_tool";
+
+export interface WorkflowFailurePatternSummary {
+  category: WorkflowFailureCategory;
+  count: number;
+  last_tool_name: string;
+  last_command?: string;
+  last_exit_code?: number | null;
+  last_summary: string;
+}
+
 export type EvidenceKind =
   | "test"
   | "build"
@@ -76,6 +91,7 @@ export interface WorkflowStateSummary {
   phase: WorkflowPhase;
   commands_tried: string[];
   changed_files: string[];
+  failure_patterns?: WorkflowFailurePatternSummary[];
 }
 
 export interface SelectedSkillSummary {
