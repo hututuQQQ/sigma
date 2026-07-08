@@ -27,7 +27,8 @@ describe("retry feedback cards", () => {
     expect(card).toContain("- command: pnpm test");
     expect(card).toContain("- exit code: 1");
     expect(card).toContain("- related files: src/app.ts");
-    expect(card).toContain("- suspected category: test");
+    expect(card).toContain("- category: test_failure");
+    expect(card).toContain("- next action:");
     expect(card.length).toBeLessThan(2500);
   });
 

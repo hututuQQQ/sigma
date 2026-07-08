@@ -1,31 +1,27 @@
 import type { AgentRunResult, HarnessCommandResult, HarnessRetryDecision, SummaryJson } from "../types.js";
+import { analyzeFailure, failureInputFromHarnessResult } from "../workflow/failure-analyzer.js";
 
-function tailText(text: string, limit = 1600): string {
+function tailText(text: string, limit = 900): string {
   return text.length <= limit ? text : text.slice(-limit);
-}
-
-function inferFailureCategory(result: HarnessCommandResult): string {
-  const combined = `${result.command}\n${result.stdout_tail}\n${result.stderr_tail}`.toLowerCase();
-  if (result.timed_out || result.exit_code === 124 || combined.includes("timed out")) return "timeout";
-  if (/\b(tsc|typecheck|type-check)\b/.test(combined)) return "typecheck";
-  if (/\b(pytest|go test|cargo test|mvn test|gradle test|npm test|pnpm test|yarn test|bun test)\b/.test(combined)) return "test";
-  if (/\b(eslint|lint)\b/.test(combined)) return "lint";
-  if (/\b(build|compile)\b/.test(combined)) return "build";
-  if (/syntaxerror|parse error|unexpected token|unterminated|syntax error/.test(combined)) return "syntax";
-  if (/enoent|not found|command not found/.test(combined)) return "missing-tool-or-file";
-  return "unknown";
 }
 
 export function formatFailureCard(result: HarnessCommandResult, index: number): string {
   const label = result.kind === "validation" ? "Validation" : "Precheck";
+  const analysis = analyzeFailure(failureInputFromHarnessResult(result));
   const lines = [
     `${label} failure ${index + 1} card:`,
+    `- category: ${analysis?.category ?? "unknown"}`,
     `- command: ${result.command}`,
     `- exit code: ${result.exit_code}`,
-    `- suspected category: ${inferFailureCategory(result)}`
+    `- primary: ${analysis?.primaryMessage ?? result.message}`,
+    `- next action: ${analysis?.suggestedNextAction ?? "Inspect the check output, make a focused repair, then rerun the relevant check."}`
   ];
   if (result.related_files.length > 0) {
     lines.push(`- related files: ${result.related_files.join(", ")}`);
+  }
+  const agentDiagnostics = analysis?.diagnostics.filter((diagnostic) => !diagnostic.startsWith("tool=")) ?? [];
+  if (agentDiagnostics.length) {
+    lines.push(`- diagnostics: ${agentDiagnostics.slice(0, 4).join("; ")}`);
   }
   const stdout = tailText(result.stdout_tail).trim();
   const stderr = tailText(result.stderr_tail).trim();
@@ -108,10 +104,10 @@ export function instructionWithRetryFeedback(options: {
   lines.push(
     JSON.stringify(
       {
-        status: options.previousAttemptResult.status,
-        finish_reason: options.previousAttemptResult.finishReason,
-        turns: options.previousAttemptResult.turns,
-        commands_executed: options.previousAttemptResult.commandsExecuted,
+        status: options.previousAttemptSummary.status,
+        finish_reason: options.previousAttemptSummary.finish_reason,
+        turns: options.previousAttemptSummary.turns,
+        commands_executed: options.previousAttemptSummary.commands_executed,
         last_error: options.previousAttemptResult.lastError
       },
       null,
@@ -122,7 +118,7 @@ export function instructionWithRetryFeedback(options: {
   if (options.traceTail.trim()) {
     lines.push("");
     lines.push("Trace tail key events (truncated):");
-    lines.push(tailText(options.traceTail, 2000));
+    lines.push(tailText(options.traceTail, 1200));
   }
 
   return lines.join("\n");

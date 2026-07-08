@@ -47,7 +47,9 @@ export type WorkflowFailureCategory =
   | "compile_error"
   | "segmentation_fault"
   | "timeout"
-  | "missing_tool";
+  | "missing_tool"
+  | "test_failure"
+  | "unknown";
 
 export interface WorkflowFailurePatternSummary {
   category: WorkflowFailureCategory;
@@ -56,6 +58,8 @@ export interface WorkflowFailurePatternSummary {
   last_command?: string;
   last_exit_code?: number | null;
   last_summary: string;
+  suggested_next_action?: string;
+  diagnostics?: string[];
 }
 
 export type EvidenceKind =
