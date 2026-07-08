@@ -4,6 +4,11 @@ import { createDefaultSandboxAdapter, normalizeSandboxConfig, redactSecrets } fr
 import { loadCliConfig, parseArgs } from "../config.js";
 import { maskSecret } from "../output.js";
 
+function fallbackWarning(availability: { available: boolean; backend: string; reason?: string } | undefined, required: boolean): string | null {
+  if (!availability || availability.available || required) return null;
+  return `OS sandbox backend '${availability.backend}' is unavailable; commands will use policy-only checks because sandbox.required=false. Use --sandbox-required to fail closed.`;
+}
+
 function providerKeyStatus(provider: string): string {
   if (provider === "deepseek") {
     return `DEEPSEEK_API_KEY=${maskSecret(process.env.DEEPSEEK_API_KEY)}`;
@@ -43,7 +48,8 @@ export async function runDoctorCommand(argv: string[]): Promise<number> {
     providerKeys: providerKeyStatusJson(config.provider),
     sandbox: {
       effective: normalizeSandboxConfig(config.workspace, config.sandbox),
-      availability: await createDefaultSandboxAdapter().checkAvailability?.(config.sandbox, config.workspace)
+      availability: await createDefaultSandboxAdapter().checkAvailability?.(config.sandbox, config.workspace),
+      fallbackWarning: null as string | null
     },
     apiCheck: {
       requested: flags["check-api"] === true,
@@ -51,6 +57,7 @@ export async function runDoctorCommand(argv: string[]): Promise<number> {
       message: null as string | null
     }
   };
+  report.sandbox.fallbackWarning = fallbackWarning(report.sandbox.availability, report.sandbox.effective.required);
 
   lines.push(`node=${process.version}`);
   lines.push(`provider=${config.provider}`);
@@ -61,7 +68,8 @@ export async function runDoctorCommand(argv: string[]): Promise<number> {
     `sandbox=${report.sandbox.effective.mode}/${report.sandbox.effective.backend}` +
       ` network=${report.sandbox.effective.network.mode}` +
       ` available=${sandboxAvailability?.available ?? false}` +
-      `${sandboxAvailability?.reason ? ` reason=${sandboxAvailability.reason}` : ""}`
+      `${sandboxAvailability?.reason ? ` reason=${sandboxAvailability.reason}` : ""}` +
+      `${report.sandbox.fallbackWarning ? ` warning=${report.sandbox.fallbackWarning}` : ""}`
   );
 
   try {

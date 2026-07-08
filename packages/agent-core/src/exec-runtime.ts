@@ -33,6 +33,7 @@ interface ProcessSpec {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   metadata?: Record<string, unknown>;
+  cleanup?: () => Promise<void> | void;
 }
 
 function specFromDecision(originalCommand: string, decision: SandboxExecDecision, fallbackArgs?: string[]): ProcessSpec {
@@ -42,7 +43,8 @@ function specFromDecision(originalCommand: string, decision: SandboxExecDecision
       args: decision.args,
       cwd: decision.cwd ?? process.cwd(),
       env: decision.env,
-      metadata: decision.metadata
+      metadata: decision.metadata,
+      cleanup: decision.cleanup
     };
   }
   if (decision.command) {
@@ -51,7 +53,8 @@ function specFromDecision(originalCommand: string, decision: SandboxExecDecision
       args: ["-lc", decision.command],
       cwd: decision.cwd ?? process.cwd(),
       env: decision.env,
-      metadata: decision.metadata
+      metadata: decision.metadata,
+      cleanup: decision.cleanup
     };
   }
   return {
@@ -59,8 +62,31 @@ function specFromDecision(originalCommand: string, decision: SandboxExecDecision
     args: fallbackArgs ?? ["-lc", originalCommand],
     cwd: decision.cwd ?? process.cwd(),
     env: decision.env,
-    metadata: decision.metadata
+    metadata: decision.metadata,
+    cleanup: decision.cleanup
   };
+}
+
+async function runCleanup(cleanup: (() => Promise<void> | void) | undefined): Promise<void> {
+  if (!cleanup) return;
+  try {
+    await cleanup();
+  } catch {
+    // Cleanup is best-effort; command results should still describe the child.
+  }
+}
+
+function attachCleanup(child: ChildProcess, cleanup: (() => Promise<void> | void) | undefined): void {
+  if (!cleanup) return;
+  let cleaned = false;
+  const once = () => {
+    if (cleaned) return;
+    cleaned = true;
+    void runCleanup(cleanup);
+  };
+  child.once("close", once);
+  child.once("exit", once);
+  child.once("error", once);
 }
 
 async function prepareSandboxedProcess(options: PrepareOptions, fallbackArgs?: string[]): Promise<ProcessSpec | SandboxExecDecision> {
@@ -108,6 +134,8 @@ export async function runSandboxedBashCommand(
     detachedProcessGroup: options.detachedProcessGroup,
     windowsHide: true,
     abortSignal: options.abortSignal
+  }).finally(async () => {
+    await runCleanup(spec.cleanup);
   });
   return { result, sandbox: spec.metadata };
 }
@@ -139,6 +167,7 @@ export async function spawnSandboxedBashCommand(options: {
     stdio: options.stdio,
     windowsHide: true
   });
+  attachCleanup(child, spec.cleanup);
   return { child, sandbox: spec.metadata };
 }
 
@@ -165,5 +194,6 @@ export async function spawnSandboxedInteractiveShell(options: {
     detached: process.platform !== "win32",
     windowsHide: true
   }) as ChildProcessWithoutNullStreams;
+  attachCleanup(child, spec.cleanup);
   return { child, sandbox: spec.metadata };
 }

@@ -53,6 +53,13 @@ function toolDuration(result: { metadata?: Record<string, unknown> } | undefined
   return typeof result?.metadata?.durationMs === "number" ? result.metadata.durationMs : undefined;
 }
 
+function sandboxWarning(metadata: Record<string, unknown> | undefined): string {
+  const sandbox = metadata?.sandbox;
+  if (!sandbox || typeof sandbox !== "object") return "";
+  const warning = (sandbox as Record<string, unknown>).warning;
+  return typeof warning === "string" && warning ? `sandbox warning: ${truncate(oneLine(redactSecretText(warning)), 90)}` : "";
+}
+
 function formatBytes(value: unknown): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "";
   if (value < 1024) return `${value} B`;
@@ -73,12 +80,13 @@ function toolEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEn
   const detail = summarizeToolArguments(name, toolArgsFromEvent(start));
   const tail = result?.content ? truncate(oneLine(redactSecretText(result.content)), 90) : "";
   const size = formatBytes(result?.metadata?.sizeBytes);
+  const warning = sandboxWarning(result?.metadata);
   const aborted = end?.type === "tool_aborted" || result?.metadata?.cancelled === true;
   return {
     kind: "tool",
     name,
     status: end ? (aborted ? "aborted" : resultStatus(result)) : (start.type === "tool_queued" ? "queued" : "running"),
-    summary: [detail, size, tail].filter(Boolean).join("  "),
+    summary: [detail, size, warning, tail].filter(Boolean).join("  "),
     durationMs: toolDuration(result),
     timestamp: eventTime(end ?? start)
   };
@@ -90,11 +98,12 @@ function harnessEntry(start: AgentEvent, end: AgentEvent | undefined): Transcrip
   const ok = end ? meta.exitCode === 0 : false;
   const attempt = meta.attempt ? `attempt ${meta.attempt}` : "";
   const exit = end ? `exit ${meta.exitCode ?? "?"}` : "running";
+  const warning = sandboxWarning(meta);
   return {
     kind: "test",
     command,
     status: end ? (ok ? "ok" : "failed") : "running",
-    summary: [String(meta.kind ?? "validation"), attempt, exit].filter(Boolean).join("  "),
+    summary: [String(meta.kind ?? "validation"), attempt, exit, warning].filter(Boolean).join("  "),
     durationMs: typeof meta.durationMs === "number" ? meta.durationMs : undefined,
     timestamp: eventTime(end ?? start)
   };

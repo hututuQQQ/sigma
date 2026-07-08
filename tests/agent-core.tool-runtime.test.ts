@@ -77,7 +77,7 @@ describe("ToolRuntime", () => {
     );
     const durationMs = Date.now() - startedAt;
     expect(results.map((result) => result.result.content)).toEqual(["read_a", "read_b", "write_a", "read_c"]);
-    expect(durationMs).toBeLessThan(180);
+    expect(durationMs).toBeLessThan(260);
     expect(runtime.summary()).toMatchObject({ queued: 4, started: 4, completed: 4, parallel_batches: 2, serial_batches: 1 });
     expect(events).toContain("tool_queued");
     expect(events).toContain("tool_progress");

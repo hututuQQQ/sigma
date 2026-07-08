@@ -42,6 +42,21 @@ function freePort(): Promise<number> {
   });
 }
 
+async function waitForFileContaining(filePath: string, needle: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastText = "";
+  while (Date.now() <= deadline) {
+    try {
+      lastText = await readFile(filePath, "utf8");
+      if (lastText.includes(needle)) return;
+    } catch {
+      // The service may not have opened the log yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  expect(lastText).toContain(needle);
+}
+
 describe("agent-core tools", () => {
   it("runs bash successfully", async () => {
     const { context } = await workspace();
@@ -241,23 +256,33 @@ describe("agent-core tools", () => {
 
   it("fails readiness timeouts while keeping service logs", async () => {
     const { dir, context } = await workspace();
+    const previousRegistry = process.env.AGENT_SERVICE_REGISTRY;
+    const previousLogDir = process.env.AGENT_SERVICE_LOG_DIR;
     process.env.AGENT_SERVICE_REGISTRY = path.join(dir, "services.json");
+    delete process.env.AGENT_SERVICE_LOG_DIR;
     const logPath = path.join(dir, "not-ready.log");
     const port = await freePort();
 
-    const result = await executeServiceTool(
-      {
-        action: "start",
-        name: "not-ready",
-        command: "node -e \"console.error('booting'); setInterval(()=>{}, 1000)\"",
-        port,
-        logPath,
-        readinessTimeoutSec: 0.2
-      },
-      context
-    );
+    try {
+      const result = await executeServiceTool(
+        {
+          action: "start",
+          name: "not-ready",
+          command: "node -e \"console.log('booting'); setInterval(function(){}, 1000)\"",
+          port,
+          logPath,
+          readinessTimeoutSec: 3
+        },
+        context
+      );
 
-    expect(result.ok).toBe(false);
-    await expect(readFile(logPath, "utf8")).resolves.toContain("booting");
+      expect(result.ok).toBe(false);
+      await waitForFileContaining(logPath, "booting");
+    } finally {
+      if (previousRegistry === undefined) delete process.env.AGENT_SERVICE_REGISTRY;
+      else process.env.AGENT_SERVICE_REGISTRY = previousRegistry;
+      if (previousLogDir === undefined) delete process.env.AGENT_SERVICE_LOG_DIR;
+      else process.env.AGENT_SERVICE_LOG_DIR = previousLogDir;
+    }
   });
 });

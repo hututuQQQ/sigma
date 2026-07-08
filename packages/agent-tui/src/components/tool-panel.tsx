@@ -60,6 +60,13 @@ function recentTerminalToolEvents(events: AgentEvent[], limit: number): AgentEve
     .slice(-limit);
 }
 
+function sandboxWarning(metadata: Record<string, unknown> | undefined): string {
+  const sandbox = metadata?.sandbox;
+  if (!sandbox || typeof sandbox !== "object") return "";
+  const warning = (sandbox as Record<string, unknown>).warning;
+  return typeof warning === "string" && warning ? `sandbox warning: ${truncate(oneLine(redactSecretText(warning)), 70)}` : "";
+}
+
 export function ToolPanel(events: AgentEvent[], result: AgentRunResult | null, width = 80, height?: number, color = false): string {
   const g = glyphs();
   const innerWidth = Math.max(20, width - 4);
@@ -86,8 +93,9 @@ export function ToolPanel(events: AgentEvent[], result: AgentRunResult | null, w
     const marker = res?.ok ? g.ok : g.fail;
     const duration = typeof res?.metadata?.durationMs === "number" ? `${res.metadata.durationMs}ms` : "";
     const tail = res?.content ? truncate(oneLine(redactSecretText(res.content)), 70) : truncate(oneLine(redactSecretText(String(meta.reason ?? ""))), 70);
+    const warning = sandboxWarning(res?.metadata);
     const status = aborted ? "aborted" : (res?.ok ? "ok" : "failed");
-    lines.push(truncateToWidth(`${marker} ${name} ${status} ${[duration, detail, tail].filter(Boolean).join(` ${g.separator} `)}`, innerWidth));
+    lines.push(truncateToWidth(`${marker} ${name} ${status} ${[duration, detail, warning, tail].filter(Boolean).join(` ${g.separator} `)}`, innerWidth));
   }
 
   return box({

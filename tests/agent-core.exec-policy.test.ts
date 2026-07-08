@@ -80,12 +80,36 @@ describe("exec policy", () => {
       mode: "workspace-write",
       backend: "auto",
       required: false,
-      network: { mode: "restricted", allowLocalhost: true }
+      network: { mode: "restricted", allowLocalhost: true },
+      filesystem: {
+        readRoots: [ctx.workspacePath],
+        writeRoots: [ctx.workspacePath]
+      }
     });
     expect(normalizeSandboxConfig(ctx.workspacePath, { mode: "policy_only", filesystem: "read_only" })).toMatchObject({
       mode: "read-only",
-      backend: "policy-only"
+      backend: "policy-only",
+      filesystem: {
+        readRoots: [ctx.workspacePath],
+        writeRoots: []
+      }
     });
+  });
+
+  it("warns when an unavailable optional OS backend falls back to policy-only", async () => {
+    const ctx = await context();
+    ctx.permissionMode = "yolo";
+    ctx.sandbox = { mode: "workspace-write", backend: "external", required: false };
+    ctx.sandboxAdapter = createDefaultSandboxAdapter();
+    const result = await executeBashTool({ command: "echo fallback" }, ctx);
+    expect(result.ok).toBe(true);
+    expect(result.metadata?.sandbox).toMatchObject({
+      enforcement: "policy-only",
+      backendAvailable: false,
+      fallbackAllowed: true,
+      osSandbox: false
+    });
+    expect(String((result.metadata?.sandbox as Record<string, unknown> | undefined)?.warning ?? "")).toContain("policy-only");
   });
 
   it("fails closed for explicitly required Windows sandbox backend", async () => {

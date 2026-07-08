@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,6 +31,22 @@ function skip(message) {
 function commandAvailable(command, args = ["--version"]) {
   const result = spawnSync(command, args, { stdio: "ignore", windowsHide: true });
   return !result.error && result.status === 0;
+}
+
+function psSingleQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function aclSddl(target) {
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-Command", `(Get-Acl -LiteralPath ${psSingleQuote(target)}).Sddl`],
+    { encoding: "utf8", windowsHide: true }
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `Get-Acl failed for ${target}`);
+  }
+  return result.stdout.trim();
 }
 
 function baseContext(workspacePath, sandbox) {
@@ -72,6 +88,7 @@ async function verifyWindowsNative(core, workspace) {
 
   const sandbox = { mode: "workspace-write", backend: "windows", required: true, network: { mode: "default" } };
   const readOnlySandbox = { mode: "read-only", backend: "windows", required: true, network: { mode: "default" } };
+  const workspaceAclBefore = aclSddl(workspace);
 
   await expectTool(
     "windows native workspace-write allows workspace writes",
@@ -79,6 +96,31 @@ async function verifyWindowsNative(core, workspace) {
     (result) => result.ok && existsSync(path.join(workspace, "inside-windows.txt")),
     (result) => result.content
   );
+  if (aclSddl(workspace) === workspaceAclBefore) {
+    ok("windows native restores workspace ACL after execution");
+  } else {
+    fail("windows native left workspace ACL changed after execution");
+  }
+
+  const protectedFile = path.join(workspace, "protected-acl.txt");
+  const protectedDir = path.join(workspace, "protected-acl-dir");
+  await writeFile(protectedFile, "protected", "utf8");
+  await mkdir(protectedDir, { recursive: true });
+  const protectedFileAcl = aclSddl(protectedFile);
+  const protectedDirAcl = aclSddl(protectedDir);
+  const aclSandbox = {
+    mode: "workspace-write",
+    backend: "windows",
+    required: true,
+    network: { mode: "default" },
+    filesystem: { denyWrite: ["protected-acl.txt", "protected-acl-dir"] }
+  };
+  await executeBashTool({ command: "type protected-acl.txt>NUL" }, baseContext(workspace, aclSandbox));
+  if (aclSddl(protectedFile) === protectedFileAcl && aclSddl(protectedDir) === protectedDirAcl) {
+    ok("windows native restores protected path ACLs after deny rules");
+  } else {
+    fail("windows native left protected path ACL changed after deny rules");
+  }
 
   const escape = path.join(path.dirname(workspace), "windows-escape.txt");
   await rm(escape, { force: true });
@@ -93,6 +135,21 @@ async function verifyWindowsNative(core, workspace) {
     "windows native read-only blocks workspace writes",
     await executeBashTool({ command: "echo bad>readonly-windows.txt" }, baseContext(workspace, readOnlySandbox)),
     (result) => !result.ok && !existsSync(path.join(workspace, "readonly-windows.txt")),
+    (result) => result.content
+  );
+
+  await rm(path.join(workspace, ".agent"), { recursive: true, force: true });
+  await expectTool(
+    "windows native blocks missing protected agent paths",
+    await executeBashTool(
+      { command: "if not exist .agent mkdir .agent & echo bad>.agent\\config.toml & echo bad>.agent\\mcp.json & if not exist .agent\\skills mkdir .agent\\skills & echo bad>.agent\\skills\\foo" },
+      baseContext(workspace, sandbox)
+    ),
+    () => (
+      !existsSync(path.join(workspace, ".agent", "config.toml")) &&
+      !existsSync(path.join(workspace, ".agent", "mcp.json")) &&
+      !existsSync(path.join(workspace, ".agent", "skills", "foo"))
+    ),
     (result) => result.content
   );
 
@@ -150,6 +207,8 @@ async function main() {
 
   const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-sandbox-"));
   const outside = path.join(path.dirname(workspace), `${path.basename(workspace)}-outside.txt`);
+  const outsideSecret = path.join(path.dirname(workspace), `${path.basename(workspace)}-outside-secret.txt`);
+  const readRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-sandbox-readroot-"));
   const policySandbox = { mode: "policy-only", network: "restricted" };
 
   try {
@@ -199,10 +258,71 @@ async function main() {
       (result) => result.content
     );
 
+    await writeFile(outsideSecret, "OUTSIDE_SECRET", "utf8");
+    await expectTool(
+      "bubblewrap blocks reads outside workspace/readRoots",
+      await executeBashTool({ command: `cat ../${path.basename(outsideSecret)}` }, baseContext(workspace, sandbox)),
+      (result) => !result.content.includes("OUTSIDE_SECRET"),
+      (result) => result.content
+    );
+
+    const readRootFile = path.join(readRoot, "allowed.txt");
+    await writeFile(readRootFile, "READ_ROOT_SECRET", "utf8");
+    await expectTool(
+      "bubblewrap allows explicit readRoots",
+      await executeBashTool(
+        { command: `cat ${JSON.stringify(readRootFile)}` },
+        baseContext(workspace, { ...sandbox, filesystem: { readRoots: [readRoot] } })
+      ),
+      (result) => result.ok && result.content.includes("READ_ROOT_SECRET"),
+      (result) => result.content
+    );
+
+    await writeFile(path.join(workspace, "deny-secret.txt"), "DENY_READ_SECRET", "utf8");
+    await expectTool(
+      "bubblewrap blocks denyRead paths",
+      await executeBashTool(
+        { command: "cat deny-secret.txt" },
+        baseContext(workspace, { ...sandbox, filesystem: { denyRead: ["deny-secret.txt"] } })
+      ),
+      (result) => !result.content.includes("DENY_READ_SECRET"),
+      (result) => result.content
+    );
+
     await expectTool(
       "bubblewrap blocks workspace escape writes",
       await executeBashTool({ command: `${runtime.command} -c ${JSON.stringify(runtime.snippet)}` }, baseContext(workspace, sandbox)),
       () => !existsSync(path.join(path.dirname(workspace), "escape.txt")),
+      (result) => result.content
+    );
+
+    await mkdir(path.join(workspace, "writable"), { recursive: true });
+    const narrowSandbox = { ...sandbox, filesystem: { writeRoots: ["writable"] } };
+    await expectTool(
+      "bubblewrap blocks writes outside explicit writeRoots",
+      await executeBashTool({ command: "printf bad > blocked-root.txt" }, baseContext(workspace, narrowSandbox)),
+      () => !existsSync(path.join(workspace, "blocked-root.txt")),
+      (result) => result.content
+    );
+    await expectTool(
+      "bubblewrap allows writes inside explicit writeRoots",
+      await executeBashTool({ command: "printf ok > writable/ok.txt" }, baseContext(workspace, narrowSandbox)),
+      () => existsSync(path.join(workspace, "writable", "ok.txt")),
+      (result) => result.content
+    );
+
+    await rm(path.join(workspace, ".agent"), { recursive: true, force: true });
+    await expectTool(
+      "bubblewrap blocks missing protected agent paths",
+      await executeBashTool(
+        { command: "mkdir -p .agent/skills; printf bad > .agent/config.toml; printf bad > .agent/mcp.json; printf bad > .agent/skills/foo" },
+        baseContext(workspace, sandbox)
+      ),
+      () => (
+        !existsSync(path.join(workspace, ".agent", "config.toml")) &&
+        !existsSync(path.join(workspace, ".agent", "mcp.json")) &&
+        !existsSync(path.join(workspace, ".agent", "skills", "foo"))
+      ),
       (result) => result.content
     );
 
@@ -269,6 +389,8 @@ async function main() {
     await closeShellSessions().catch(() => {});
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
     await rm(outside, { force: true }).catch(() => {});
+    await rm(outsideSecret, { force: true }).catch(() => {});
+    await rm(readRoot, { recursive: true, force: true }).catch(() => {});
     await rm(path.join(path.dirname(workspace), "windows-escape.txt"), { force: true }).catch(() => {});
     await rm(path.join(path.dirname(workspace), "windows-service-escape.txt"), { force: true }).catch(() => {});
     await rm(path.join(path.dirname(workspace), "windows-session-escape.txt"), { force: true }).catch(() => {});

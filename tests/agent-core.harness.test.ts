@@ -15,7 +15,9 @@ import {
   type RunControllerCleanupResult,
   type RunControllerCommandResult,
   type RunControllerRetryDecision,
-  type RunControllerServiceCleanupResult
+  type RunControllerServiceCleanupResult,
+  type SandboxAdapter,
+  type SandboxExecRequest
 } from "../packages/agent-core/src/index.js";
 
 class SequenceModel implements ModelClient {
@@ -179,6 +181,44 @@ describe("agent-core harness", () => {
     expect(result.settled_on).toMatch(/close|exit-drain/);
     expect(result.timed_out).toBeUndefined();
     expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("runs harness commands through the sandbox adapter and records metadata", async () => {
+    const dir = await tempWorkspace();
+    const seenRequests: SandboxExecRequest[] = [];
+    const adapter: SandboxAdapter = {
+      async prepareExec(request) {
+        seenRequests.push(request);
+        return {
+          allowed: true,
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('sandboxed')"],
+          cwd: request.cwd,
+          env: request.env,
+          metadata: { enforcement: "test-sandbox", fallbackAllowed: false }
+        };
+      }
+    };
+
+    const result = await runHarnessCommand({
+      kind: "validation",
+      source: "test",
+      command: "echo should-be-transformed",
+      workspacePath: dir,
+      attempt: 1,
+      timeoutSec: 5,
+      sandbox: { mode: "workspace-write", backend: "external" },
+      sandboxAdapter: adapter
+    });
+
+    expect(result.exit_code).toBe(0);
+    expect(result.stdout_tail).toBe("sandboxed");
+    expect(result.sandbox).toMatchObject({ enforcement: "test-sandbox", fallbackAllowed: false });
+    expect(seenRequests[0]).toMatchObject({
+      toolName: "harness.validation",
+      command: "echo should-be-transformed",
+      workspacePath: dir
+    });
   });
 
   it("plans cheap syntax checks for changed files", async () => {

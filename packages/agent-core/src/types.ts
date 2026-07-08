@@ -106,6 +106,7 @@ export interface SandboxExecDecision {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   metadata?: Record<string, unknown>;
+  cleanup?: () => Promise<void> | void;
 }
 
 export interface SandboxAvailability {
@@ -616,6 +617,7 @@ export interface HarnessCommandResult {
   cancelled?: boolean;
   settled_on?: string;
   signal?: string | null;
+  sandbox?: Record<string, unknown>;
   message: string;
   agent_summary?: string;
   trace_tail?: string;

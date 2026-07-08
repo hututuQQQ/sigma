@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 
 $source = @"
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -225,32 +226,49 @@ namespace Sigma.WindowsSandbox {
       }
     }
 
-    public static int Run(string program, string[] args, string commandLine, string cwd, string capabilitySid, string[] writeRoots, string[] denyWrite) {
+    class AclBackup {
+      public string Path;
+      public bool Directory;
+      public string Sddl;
+    }
+
+    public static int Run(string program, string[] args, string commandLine, string cwd, string capabilitySid, string[] writeRoots, string[] denyWrite, string[] denyRead) {
       if (String.IsNullOrWhiteSpace(program)) throw new ArgumentException("missing program");
       if (String.IsNullOrWhiteSpace(cwd)) cwd = Directory.GetCurrentDirectory();
       SecurityIdentifier cap = new SecurityIdentifier(capabilitySid);
 
-      foreach (string root in writeRoots ?? new string[0]) {
-        if (!String.IsNullOrWhiteSpace(root) && Directory.Exists(root)) AddRule(root, cap, AccessControlType.Allow, true);
-        else if (!String.IsNullOrWhiteSpace(root) && File.Exists(root)) AddRule(root, cap, AccessControlType.Allow, false);
-      }
-      foreach (string target in denyWrite ?? new string[0]) {
-        if (!String.IsNullOrWhiteSpace(target) && Directory.Exists(target)) AddRule(target, cap, AccessControlType.Deny, true);
-        else if (!String.IsNullOrWhiteSpace(target) && File.Exists(target)) AddRule(target, cap, AccessControlType.Deny, false);
-      }
-
       IntPtr sidPtr = SidToPtr(cap);
-      IntPtr logonPtr = SidToPtr(GetLogonSid());
-      IntPtr everyonePtr = SidToPtr(new SecurityIdentifier(WellKnownSidType.WorldSid, null));
+      IntPtr logonPtr = IntPtr.Zero;
+      IntPtr everyonePtr = IntPtr.Zero;
       IntPtr restricted = IntPtr.Zero;
+      List<AclBackup> aclBackups = new List<AclBackup>();
       try {
+        foreach (string root in writeRoots ?? new string[0]) {
+          AddRuleIfExists(aclBackups, root, cap, FileSystemRights.Modify | FileSystemRights.Synchronize, AccessControlType.Allow);
+        }
+        foreach (string target in denyWrite ?? new string[0]) {
+          AddRuleIfExists(aclBackups, target, cap, FileSystemRights.Modify | FileSystemRights.Synchronize, AccessControlType.Deny);
+        }
+        foreach (string target in denyRead ?? new string[0]) {
+          AddRuleIfExists(aclBackups, target, cap, FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize, AccessControlType.Deny);
+        }
+
+        logonPtr = SidToPtr(GetLogonSid());
+        everyonePtr = SidToPtr(new SecurityIdentifier(WellKnownSidType.WorldSid, null));
         restricted = CreateRestrictedWriteToken(new [] { sidPtr, logonPtr, everyonePtr });
         return SpawnAndWait(restricted, program, args ?? new string[0], commandLine, cwd);
       } finally {
         if (restricted != IntPtr.Zero) CloseHandle(restricted);
-        Marshal.FreeHGlobal(sidPtr);
-        Marshal.FreeHGlobal(logonPtr);
-        Marshal.FreeHGlobal(everyonePtr);
+        Exception restoreError = null;
+        try {
+          RestoreAclBackups(aclBackups);
+        } catch (Exception ex) {
+          restoreError = ex;
+        }
+        if (sidPtr != IntPtr.Zero) Marshal.FreeHGlobal(sidPtr);
+        if (logonPtr != IntPtr.Zero) Marshal.FreeHGlobal(logonPtr);
+        if (everyonePtr != IntPtr.Zero) Marshal.FreeHGlobal(everyonePtr);
+        if (restoreError != null) throw restoreError;
       }
     }
 
@@ -369,8 +387,63 @@ namespace Sigma.WindowsSandbox {
       }
     }
 
-    static void AddRule(string path, SecurityIdentifier sid, AccessControlType type, bool directory) {
-      FileSystemRights rights = FileSystemRights.Modify | FileSystemRights.Synchronize;
+    static void AddRuleIfExists(List<AclBackup> backups, string path, SecurityIdentifier sid, FileSystemRights rights, AccessControlType type) {
+      if (String.IsNullOrWhiteSpace(path)) return;
+      if (Directory.Exists(path)) {
+        BackupAcl(backups, path, true);
+        AddRule(path, sid, rights, type, true);
+      } else if (File.Exists(path)) {
+        BackupAcl(backups, path, false);
+        AddRule(path, sid, rights, type, false);
+      }
+    }
+
+    static string AclBackupKey(string path, bool directory) {
+      return (directory ? "D:" : "F:") + System.IO.Path.GetFullPath(path).ToUpperInvariant();
+    }
+
+    static void BackupAcl(List<AclBackup> backups, string path, bool directory) {
+      string key = AclBackupKey(path, directory);
+      foreach (AclBackup existing in backups) {
+        if (AclBackupKey(existing.Path, existing.Directory) == key) return;
+      }
+      if (directory) {
+        DirectoryInfo info = new DirectoryInfo(path);
+        backups.Add(new AclBackup {
+          Path = path,
+          Directory = true,
+          Sddl = info.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access)
+        });
+      } else {
+        FileInfo info = new FileInfo(path);
+        backups.Add(new AclBackup {
+          Path = path,
+          Directory = false,
+          Sddl = info.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access)
+        });
+      }
+    }
+
+    static void RestoreAclBackups(List<AclBackup> backups) {
+      for (int i = backups.Count - 1; i >= 0; i--) {
+        AclBackup backup = backups[i];
+        if (backup.Directory) {
+          if (!Directory.Exists(backup.Path)) continue;
+          DirectoryInfo info = new DirectoryInfo(backup.Path);
+          DirectorySecurity security = new DirectorySecurity();
+          security.SetSecurityDescriptorSddlForm(backup.Sddl, AccessControlSections.Access);
+          info.SetAccessControl(security);
+        } else {
+          if (!File.Exists(backup.Path)) continue;
+          FileInfo info = new FileInfo(backup.Path);
+          FileSecurity security = new FileSecurity();
+          security.SetSecurityDescriptorSddlForm(backup.Sddl, AccessControlSections.Access);
+          info.SetAccessControl(security);
+        }
+      }
+    }
+
+    static void AddRule(string path, SecurityIdentifier sid, FileSystemRights rights, AccessControlType type, bool directory) {
       if (directory) {
         DirectoryInfo info = new DirectoryInfo(path);
         DirectorySecurity security = info.GetAccessControl();
@@ -380,8 +453,7 @@ namespace Sigma.WindowsSandbox {
       } else {
         FileInfo info = new FileInfo(path);
         FileSecurity security = info.GetAccessControl();
-        FileSystemAccessRule rule = new FileSystemAccessRule(sid, rights, AccessControlType.Allow);
-        if (type == AccessControlType.Deny) rule = new FileSystemAccessRule(sid, rights, AccessControlType.Deny);
+        FileSystemAccessRule rule = new FileSystemAccessRule(sid, rights, type);
         security.SetAccessRule(rule);
         info.SetAccessControl(security);
       }
@@ -462,5 +534,6 @@ exit [Sigma.WindowsSandbox.NativeRunner]::Run(
   [string]$json.cwd,
   [string]$json.capabilitySid,
   (ToStringArray $json.writeRoots),
-  (ToStringArray $json.denyWrite)
+  (ToStringArray $json.denyWrite),
+  (ToStringArray $json.denyRead)
 )

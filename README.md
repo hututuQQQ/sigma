@@ -478,7 +478,9 @@ Tool calls are dispatched through the core tool runtime. Read-only tools that de
 
 Each turn also emits `turn_start` and `context_budget`. The budget is an estimate of current model-visible messages, tool definitions, repo map, and selected skills. Oversized runtime tool output can be saved under `.agent/artifacts/<run-id>/`, with the model receiving a bounded preview plus an artifact reference.
 
-Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Policy rules can allow, prompt, or deny command prefixes; the default remains conservative in `ask` and permissive in `yolo`. A policy-only sandbox adapter is included for filesystem/network intent checks, with the interface left open for stronger OS-backed adapters later.
+Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Policy rules can allow, prompt, or deny command prefixes; the default remains conservative in `ask` and permissive in `yolo`. Sandbox-aware execution is used for bash, service, shell sessions, and harness precheck/validation commands. On Linux, the bubblewrap backend mounts only required system paths plus the workspace/read roots, overlays configured write roots, and protects `denyRead`/`denyWrite` paths where the OS can enforce them. On Windows, the native helper uses a restricted token and restores any temporary ACL changes before returning.
+
+If an OS sandbox backend is unavailable and `sandbox.required=false`, Sigma may fall back to policy-only checks. Tool metadata, harness results, stream UI, and `agent doctor` include a clear warning when this happens. Use `--sandbox-required` (or `AGENT_SANDBOX_REQUIRED=true`) for fail-closed automation, including benchmark or harness runs where policy-only fallback is not acceptable.
 
 The core loop exposes these default tools:
 

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,36 @@ const DEFAULT_PROTECTED_WRITE_PATHS = [
   ".agent/skills"
 ];
 
+const DEFAULT_BUBBLEWRAP_SYSTEM_READ_PATHS = [
+  "/usr",
+  "/bin",
+  "/sbin",
+  "/lib",
+  "/lib64",
+  "/etc/alternatives",
+  "/etc/ca-certificates",
+  "/etc/ssl",
+  "/etc/pki",
+  "/etc/ld.so.cache",
+  "/etc/nsswitch.conf",
+  "/etc/passwd",
+  "/etc/group",
+  "/etc/hosts",
+  "/etc/resolv.conf",
+  "/etc/localtime",
+  "/var/lib/ca-certificates"
+];
+
+interface PathOverlay {
+  source: string;
+  target: string;
+}
+
+interface PreparedPaths {
+  cleanup?: () => Promise<void>;
+  metadata: Record<string, unknown>;
+}
+
 function normalizeMode(value: SandboxMode | undefined): EffectiveSandboxMode {
   if (value === "policy_only") return "policy-only";
   if (value === undefined) return "workspace-write";
@@ -83,6 +113,22 @@ function resolvePathList(workspacePath: string, values: string[] | undefined): s
   return [...new Set((values ?? []).map((item) => resolveSandboxPath(workspacePath, item)))];
 }
 
+function uniquePathList(values: string[]): string[] {
+  return [...new Set(values.map((item) => path.resolve(item)))];
+}
+
+function isPathInsidePath(parentPath: string, candidatePath: string): boolean {
+  const parent = path.resolve(parentPath);
+  const candidate = path.resolve(candidatePath);
+  const normalizedParent = process.platform === "win32" ? parent.toLowerCase() : parent;
+  const normalizedCandidate = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+}
+
+function isPathInsideAny(parentPaths: string[], candidatePath: string): boolean {
+  return parentPaths.some((root) => existsSync(root) && isPathInsidePath(root, candidatePath));
+}
+
 function filesystemMode(value: SandboxConfig["filesystem"] | undefined): "read-only" | "workspace-write" | undefined {
   if (value === "read_only") return "read-only";
   if (value === "workspace_write") return "workspace-write";
@@ -109,10 +155,14 @@ export function normalizeSandboxConfig(workspacePath: string, sandbox?: SandboxC
   const backend = normalizeBackend(base.backend, mode, base.mode);
   const fsConfig = configObject(base.filesystem);
   const workspace = path.resolve(workspacePath);
+  const configuredWriteRoots = resolvePathList(workspace, fsConfig.writeRoots);
   const writeRoots = mode === "workspace-write"
     ? resolvePathList(workspace, fsConfig.writeRoots && fsConfig.writeRoots.length > 0 ? fsConfig.writeRoots : ["."])
-    : resolvePathList(workspace, fsConfig.writeRoots);
-  const readRoots = resolvePathList(workspace, fsConfig.readRoots);
+    : mode === "external"
+      ? configuredWriteRoots
+      : [];
+  const workspaceReadRoots = mode === "workspace-write" || mode === "read-only" ? [workspace] : [];
+  const readRoots = uniquePathList([...workspaceReadRoots, ...resolvePathList(workspace, fsConfig.readRoots)]);
   const denyRead = resolvePathList(workspace, fsConfig.denyRead);
   const denyWrite = resolvePathList(workspace, [
     ...DEFAULT_PROTECTED_WRITE_PATHS,
@@ -293,38 +343,153 @@ function addReadOnlyOverlays(args: string[], paths: string[]): void {
   }
 }
 
-function buildBubblewrapArgs(effective: EffectiveSandboxConfig, cwd: string, command: string[]): string[] {
+function pathType(target: string): "directory" | "file" {
+  try {
+    return statSync(target).isDirectory() ? "directory" : "file";
+  } catch {
+    return missingDenyWritePathType(target);
+  }
+}
+
+function missingDenyWritePathType(target: string): "directory" | "file" {
+  const normalized = path.resolve(target).split(path.sep).join("/");
+  if (normalized.endsWith("/.agent/skills")) return "directory";
+  if (target.endsWith(path.sep) || target.endsWith("/") || target.endsWith("\\")) return "directory";
+  return path.extname(target) ? "file" : "directory";
+}
+
+async function createParentDirs(target: string): Promise<string[]> {
+  const parent = path.dirname(path.resolve(target));
+  const created: string[] = [];
+  let cursor = parent;
+  while (!existsSync(cursor)) {
+    created.push(cursor);
+    const next = path.dirname(cursor);
+    if (next === cursor) break;
+    cursor = next;
+  }
+  await mkdir(parent, { recursive: true });
+  return created;
+}
+
+async function prepareMissingDenyWritePaths(effective: EffectiveSandboxConfig): Promise<PreparedPaths> {
+  const createdTargets: Array<{ path: string; type: "directory" | "file" }> = [];
+  const createdDirs: string[] = [];
+  const roots = uniquePathList(effective.filesystem.writeRoots);
+  for (const target of effective.filesystem.denyWrite) {
+    if (existsSync(target) || !isPathInsideAny(roots, target)) continue;
+    const type = missingDenyWritePathType(target);
+    createdDirs.push(...await createParentDirs(target));
+    if (type === "directory") {
+      await mkdir(target, { recursive: true });
+    } else {
+      await writeFile(target, "", { flag: "wx" }).catch(async (error: unknown) => {
+        if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "EEXIST") return;
+        throw error;
+      });
+      await chmod(target, 0o444).catch(() => {});
+    }
+    createdTargets.push({ path: target, type });
+  }
+  const uniqueCreatedDirs = [...new Set(createdDirs)];
+  return {
+    metadata: {
+      protectedPlaceholders: createdTargets.map((item) => item.path)
+    },
+    cleanup: async () => {
+      for (const item of [...createdTargets].reverse()) {
+        await rm(item.path, { recursive: item.type === "directory", force: true }).catch(() => {});
+      }
+      for (const dir of uniqueCreatedDirs) {
+        await rm(dir, { recursive: false, force: false }).catch(() => {});
+      }
+    }
+  };
+}
+
+async function prepareDenyReadOverlays(effective: EffectiveSandboxConfig): Promise<PreparedPaths & { overlays: PathOverlay[] }> {
+  const existing = effective.filesystem.denyRead.filter((target) => existsSync(target));
+  if (existing.length === 0) return { overlays: [], metadata: { denyReadOverlays: [] } };
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bwrap-deny-read-"));
+  const overlays: PathOverlay[] = [];
+  let index = 0;
+  for (const target of existing) {
+    const type = pathType(target);
+    const source = path.join(tempDir, `${index}-${type}`);
+    index += 1;
+    if (type === "directory") {
+      await mkdir(source, { recursive: true });
+    } else {
+      await writeFile(source, "", "utf8");
+    }
+    await chmod(source, 0).catch(() => {});
+    overlays.push({ source, target });
+  }
+  return {
+    overlays,
+    metadata: {
+      denyReadOverlays: overlays.map((item) => item.target)
+    },
+    cleanup: async () => {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+}
+
+function combineCleanups(...cleanups: Array<(() => Promise<void> | void) | undefined>): (() => Promise<void>) | undefined {
+  const filtered = cleanups.filter((cleanup): cleanup is () => Promise<void> | void => Boolean(cleanup));
+  if (filtered.length === 0) return undefined;
+  return async () => {
+    for (const cleanup of filtered) {
+      try {
+        await cleanup();
+      } catch {
+        // Keep later cleanup steps running even if one path was already removed.
+      }
+    }
+  };
+}
+
+function buildBubblewrapArgs(effective: EffectiveSandboxConfig, cwd: string, command: string[], denyReadOverlays: PathOverlay[]): string[] {
   const args = [
-    "--die-with-parent",
-    "--ro-bind", "/", "/",
-    "--proc", "/proc",
-    "--dev", "/dev",
-    "--tmpfs", "/tmp",
-    "--setenv", "TMPDIR", "/tmp"
+    "--die-with-parent"
   ];
+  addReadOnlyOverlays(args, DEFAULT_BUBBLEWRAP_SYSTEM_READ_PATHS);
+  args.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp");
   if (effective.network.mode === "restricted" || effective.network.mode === "disabled") {
     args.push("--unshare-net");
-  }
-  for (const root of effective.filesystem.writeRoots) {
-    if (existsSync(root)) args.push("--bind", root, root);
   }
   for (const root of effective.filesystem.readRoots) {
     if (existsSync(root)) args.push("--ro-bind", root, root);
   }
+  for (const root of effective.filesystem.writeRoots) {
+    if (existsSync(root)) args.push("--bind", root, root);
+  }
   addReadOnlyOverlays(args, effective.filesystem.denyWrite);
+  for (const overlay of denyReadOverlays) {
+    args.push("--ro-bind", overlay.source, overlay.target);
+  }
   args.push("--chdir", cwd, ...command);
   return args;
 }
 
-function prepareBubblewrapExec(request: SandboxExecRequest, effective: EffectiveSandboxConfig): SandboxExecDecision {
-  const args = buildBubblewrapArgs(effective, request.cwd, ["/usr/bin/env", "bash", "-lc", request.command]);
+async function prepareBubblewrapExec(request: SandboxExecRequest, effective: EffectiveSandboxConfig): Promise<SandboxExecDecision> {
+  const writePlaceholders = await prepareMissingDenyWritePaths(effective);
+  const denyRead = await prepareDenyReadOverlays(effective);
+  const args = buildBubblewrapArgs(effective, request.cwd, ["/usr/bin/env", "bash", "-lc", request.command], denyRead.overlays);
   return {
     allowed: true,
     command: "bwrap",
     args,
     cwd: request.cwd,
     env: request.env,
-    metadata: sandboxMetadata(effective, { enforcement: "bubblewrap", transformed: true })
+    metadata: sandboxMetadata(effective, {
+      enforcement: "bubblewrap",
+      transformed: true,
+      ...writePlaceholders.metadata,
+      ...denyRead.metadata
+    }),
+    cleanup: combineCleanups(denyRead.cleanup, writePlaceholders.cleanup)
   };
 }
 
@@ -376,6 +541,7 @@ async function prepareWindowsExec(request: SandboxExecRequest, effective: Effect
   const requestDir = path.join(os.tmpdir(), "sigma-windows-sandbox");
   const tempRootBase = effective.filesystem.tempRoot ?? path.join(os.tmpdir(), "sigma-windows-sandbox-tmp");
   const tempRoot = path.join(tempRootBase, randomUUID());
+  const writePlaceholders = await prepareMissingDenyWritePaths(effective);
   await mkdir(requestDir, { recursive: true });
   await mkdir(tempRoot, { recursive: true });
   const requestPath = path.join(requestDir, `${randomUUID()}.json`);
@@ -396,12 +562,13 @@ async function prepareWindowsExec(request: SandboxExecRequest, effective: Effect
       program: shell,
       args: request.toolName === "shell_session" ? ["/q"] : [],
       commandLine: request.toolName === "shell_session"
-        ? windowsArgQuote(shell)
+        ? `${windowsArgQuote(shell)} /q`
         : `${windowsArgQuote(shell)} /d /s /c ${windowsArgQuote(request.command)}`,
       cwd: request.cwd,
       capabilitySid,
       writeRoots: allowedWriteRoots,
-      denyWrite: effective.filesystem.denyWrite
+      denyWrite: effective.filesystem.denyWrite,
+      denyRead: effective.filesystem.denyRead
     })}\n`,
     "utf8"
   );
@@ -411,7 +578,20 @@ async function prepareWindowsExec(request: SandboxExecRequest, effective: Effect
     args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper, "-Request", requestPath],
     cwd: request.cwd,
     env,
-    metadata: sandboxMetadata(effective, { enforcement: "windows-restricted-token", transformed: true, capabilitySid, tempRoot, shell: "cmd.exe" })
+    metadata: sandboxMetadata(effective, {
+      enforcement: "windows-restricted-token",
+      transformed: true,
+      capabilitySid,
+      tempRoot,
+      shell: "cmd.exe",
+      ...writePlaceholders.metadata
+    }),
+    cleanup: combineCleanups(
+      writePlaceholders.cleanup,
+      async () => {
+        await rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+      }
+    )
   };
 }
 
@@ -420,16 +600,26 @@ function unavailableDecision(
   effective: EffectiveSandboxConfig,
   availability: SandboxAvailability
 ): SandboxExecDecision {
+  const unavailableReason = availability.reason ?? `Sandbox backend ${availability.backend} is unavailable.`;
   if (effective.required) {
     return {
       allowed: false,
-      reason: availability.reason ?? `Sandbox backend ${availability.backend} is unavailable.`,
-      metadata: sandboxMetadata(effective, { backendAvailable: false, reason: availability.reason })
+      reason: unavailableReason,
+      metadata: sandboxMetadata(effective, {
+        backendAvailable: false,
+        osSandbox: false,
+        fallbackAllowed: false,
+        reason: unavailableReason
+      })
     };
   }
+  const warning = `OS sandbox backend '${availability.backend}' is unavailable; running with policy-only checks because sandbox.required=false. Filesystem and network isolation are not enforced by the OS.`;
   const fallback = policyOnlyDecision(request, { ...effective, backend: "policy-only" }, {
     fallbackFrom: availability.backend,
-    fallbackReason: availability.reason
+    fallbackReason: unavailableReason,
+    fallbackAllowed: true,
+    osSandbox: false,
+    warning
   });
   return {
     ...fallback,
@@ -476,7 +666,7 @@ export class DefaultSandboxAdapter implements SandboxAdapter {
     const availability = backendAvailability(backend, effective);
     if (!availability.available) return unavailableDecision(request, effective, availability);
     if (backend === "policy-only") return policyOnlyDecision(request, effective);
-    if (backend === "bubblewrap") return prepareBubblewrapExec(request, { ...effective, backend });
+    if (backend === "bubblewrap") return await prepareBubblewrapExec(request, { ...effective, backend });
     if (backend === "windows") return await prepareWindowsExec(request, { ...effective, backend });
     if (backend === "external") return prepareExternalExec(request, { ...effective, backend });
 
