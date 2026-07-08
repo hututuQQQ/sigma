@@ -9,6 +9,7 @@ import {
   type AgentHarnessValidationMode,
   type AgentRunResult,
   type PermissionMode,
+  type SandboxConfig,
   type TokenTotals
 } from "agent-core";
 import { box } from "../ui/box.js";
@@ -20,6 +21,7 @@ export interface StatusBarProps {
   provider: ProviderName;
   model?: string;
   permissionMode: PermissionMode;
+  sandbox?: SandboxConfig;
   validationMode?: AgentHarnessValidationMode;
   finalEvidenceMode?: AgentFinalEvidenceMode;
   running: boolean;
@@ -87,6 +89,13 @@ function observedToolCalls(events: AgentEvent[]): number {
   return seen.size + anonymous;
 }
 
+function sandboxState(sandbox: SandboxConfig | undefined): string {
+  if (!sandbox) return "default";
+  const network = typeof sandbox.network === "string" ? sandbox.network : sandbox.network?.mode;
+  const backend = sandbox.backend && sandbox.backend !== "auto" ? `/${sandbox.backend}` : "";
+  return `${sandbox.mode ?? "workspace-write"}${backend}${network ? `:${network}` : ""}`;
+}
+
 export function StatusBar(props: StatusBarProps): string {
   const g = glyphs();
   const width = props.width ?? 100;
@@ -115,7 +124,7 @@ export function StatusBar(props: StatusBarProps): string {
     color: props.color,
     lines: [
       `repo ${workspaceBase} ${g.separator} path ${workspace}`,
-      `${props.provider}/${model} ${g.separator} permission ${props.permissionMode} ${g.separator} state ${state}${finish}`,
+      `${props.provider}/${model} ${g.separator} permission ${props.permissionMode} ${g.separator} sandbox ${sandboxState(props.sandbox)} ${g.separator} state ${state}${finish}`,
       `turns ${turn}${turnLimit} ${g.separator} tools ${toolCalls} ${g.separator} tokens ${usage ? formatUsage(usage) : "unknown"} ${g.separator} validation ${validation} ${g.separator} evidence ${evidence} ${g.separator} mcp ${mcpState(props.result, props.enableMcp)}`,
       `${queue} ${g.separator} ${message}`
     ]

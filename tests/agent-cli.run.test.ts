@@ -154,6 +154,14 @@ describe("agent-cli run", () => {
       "no-review-anti-gaming": true,
       "enable-mcp": true,
       "mcp-config": ".agent/custom-mcp.json",
+      "sandbox": "read-only",
+      "sandbox-backend": "bubblewrap",
+      "sandbox-required": true,
+      "sandbox-network": "disabled",
+      "sandbox-add-read": "../shared",
+      "sandbox-add-write": ".",
+      "sandbox-deny-read": "../secret.txt",
+      "sandbox-deny-write": ".agent/config.toml",
       "no-stream-ui": true
     });
 
@@ -180,6 +188,18 @@ describe("agent-cli run", () => {
       reviewAntiGaming: false,
       enableMcp: true,
       mcpConfig: ".agent/custom-mcp.json",
+      sandbox: {
+        mode: "read-only",
+        backend: "bubblewrap",
+        required: true,
+        network: { mode: "disabled" },
+        filesystem: {
+          readRoots: ["../shared"],
+          writeRoots: ["."],
+          denyRead: ["../secret.txt"],
+          denyWrite: [".agent/config.toml"]
+        }
+      },
       noStreamUi: true
     });
   });
@@ -254,6 +274,22 @@ describe("agent-cli run", () => {
         "enabled = true",
         'config = ".agent/mcp.json"',
         "",
+        "[sandbox]",
+        'mode = "workspace-write"',
+        'backend = "external"',
+        "required = true",
+        'external_command = "sandbox-wrapper"',
+        'external_args = ["--flag"]',
+        "",
+        "[sandbox.network]",
+        'mode = "restricted"',
+        "allow_localhost = false",
+        'allowed_hosts = ["registry.npmjs.org"]',
+        "",
+        "[sandbox.filesystem]",
+        'write_roots = [".", "../generated"]',
+        'deny_write = [".agent/mcp.json"]',
+        "",
         "[tui]",
         "stream_ui = true"
       ].join("\n"),
@@ -280,6 +316,24 @@ describe("agent-cli run", () => {
       disabledTools: ["bash"],
       enableMcp: true,
       mcpConfig: ".agent/mcp.json",
+      sandbox: {
+        mode: "workspace-write",
+        backend: "external",
+        required: true,
+        network: {
+          mode: "restricted",
+          allowLocalhost: false,
+          allowedHosts: ["registry.npmjs.org"]
+        },
+        filesystem: {
+          writeRoots: [".", "../generated"],
+          denyWrite: [".agent/mcp.json"]
+        },
+        external: {
+          command: "sandbox-wrapper",
+          args: ["--flag"]
+        }
+      },
       noStreamUi: false
     });
   });

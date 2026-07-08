@@ -1,6 +1,6 @@
 import { access } from "node:fs/promises";
 import { createModelClient } from "agent-ai";
-import { redactSecrets } from "agent-core";
+import { createDefaultSandboxAdapter, normalizeSandboxConfig, redactSecrets } from "agent-core";
 import { loadCliConfig, parseArgs } from "../config.js";
 import { maskSecret } from "../output.js";
 
@@ -41,6 +41,10 @@ export async function runDoctorCommand(argv: string[]): Promise<number> {
     provider: config.provider,
     model: config.model ?? null,
     providerKeys: providerKeyStatusJson(config.provider),
+    sandbox: {
+      effective: normalizeSandboxConfig(config.workspace, config.sandbox),
+      availability: await createDefaultSandboxAdapter().checkAvailability?.(config.sandbox, config.workspace)
+    },
     apiCheck: {
       requested: flags["check-api"] === true,
       status: "skipped" as "skipped" | "ok" | "failed",
@@ -52,6 +56,13 @@ export async function runDoctorCommand(argv: string[]): Promise<number> {
   lines.push(`provider=${config.provider}`);
   lines.push(`model=${config.model ?? "(provider default)"}`);
   lines.push(providerKeyStatus(config.provider));
+  const sandboxAvailability = report.sandbox.availability;
+  lines.push(
+    `sandbox=${report.sandbox.effective.mode}/${report.sandbox.effective.backend}` +
+      ` network=${report.sandbox.effective.network.mode}` +
+      ` available=${sandboxAvailability?.available ?? false}` +
+      `${sandboxAvailability?.reason ? ` reason=${sandboxAvailability.reason}` : ""}`
+  );
 
   try {
     await access(config.workspace);

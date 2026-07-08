@@ -160,7 +160,17 @@ export {
   resolveWorkspacePath,
   workspaceRelativePath
 } from "./policy.js";
-export { createPolicyOnlySandboxAdapter, PolicyOnlySandboxAdapter } from "./sandbox.js";
+export {
+  createDefaultSandboxAdapter,
+  createDefaultSandboxConfig,
+  createPolicyOnlySandboxAdapter,
+  DefaultSandboxAdapter,
+  formatSandboxShellCommand,
+  normalizeSandboxConfig,
+  PolicyOnlySandboxAdapter,
+  sandboxMetadata
+} from "./sandbox.js";
+export type { EffectiveSandboxConfig } from "./sandbox.js";
 export { ToolRuntime } from "./tool-runtime.js";
 export type { ToolRuntimeCallbacks, ToolRuntimeExecution } from "./tool-runtime.js";
 export { summarizeContextBudget } from "./context/token-budget.js";
@@ -265,9 +275,17 @@ export type {
   SubagentType,
   SummaryJson,
   SandboxAdapter,
+  SandboxAvailability,
+  SandboxBackend,
   SandboxConfig,
   SandboxExecDecision,
   SandboxExecRequest,
+  SandboxExternalConfig,
+  SandboxFilesystemConfig,
+  SandboxFilesystemMode,
+  SandboxMode,
+  SandboxNetworkConfig,
+  SandboxNetworkMode,
   TodoItem,
   TodoStatus,
   TokenTotals,

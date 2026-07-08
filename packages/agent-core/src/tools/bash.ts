@@ -1,7 +1,6 @@
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { evaluateExecPolicy, requestToolPermission, resolveWorkspacePath } from "../policy.js";
-import { runBashCommand } from "../command-runner.js";
-import { createPolicyOnlySandboxAdapter } from "../sandbox.js";
+import { runSandboxedBashCommand } from "../exec-runtime.js";
 
 interface BashArgs {
   command?: unknown;
@@ -81,33 +80,24 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
 
   const timeoutSec = asNumber(parsed.timeoutSec) ?? context.commandTimeoutSec;
   const timeoutMs = Math.max(1, Math.floor(timeoutSec * 1000));
-  const sandboxAdapter = context.sandboxAdapter ?? (
-    context.sandbox?.mode === "disabled" ? undefined : createPolicyOnlySandboxAdapter()
-  );
-  const sandboxDecision = sandboxAdapter
-    ? await sandboxAdapter.prepareExec({
-        toolName: "bash",
-        command,
-        cwd,
-        env: process.env,
-        policy,
-        sandbox: context.sandbox
-      })
-    : { allowed: true };
-  if (!sandboxDecision.allowed) {
+  const execution = await runSandboxedBashCommand({
+    toolName: "bash",
+    command,
+    cwd,
+    env: process.env,
+    timeoutMs,
+    abortSignal: context.abortSignal,
+    policy,
+    context
+  });
+  if ("allowed" in execution) {
     return {
       ok: false,
-      content: sandboxDecision.reason ?? "Command was denied by sandbox policy.",
-      metadata: { execPolicy: policy, sandbox: sandboxDecision.metadata ?? { denied: true } }
+      content: execution.reason ?? "Command was denied by sandbox policy.",
+      metadata: { execPolicy: policy, sandbox: execution.metadata ?? { denied: true } }
     };
   }
-  const result = await runBashCommand({
-    command: sandboxDecision.command ?? command,
-    cwd: sandboxDecision.cwd ?? cwd,
-    env: sandboxDecision.env ?? process.env,
-    timeoutMs,
-    abortSignal: context.abortSignal
-  });
+  const { result, sandbox } = execution;
 
   if (result.error) {
     return {
@@ -121,7 +111,7 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
         cancelled: result.cancelled,
         truncated: false,
         execPolicy: policy,
-        sandbox: sandboxDecision.metadata
+        sandbox
       }
     };
   }
@@ -147,7 +137,7 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
       timedOut: result.timedOut,
       cancelled: result.cancelled,
       execPolicy: policy,
-      sandbox: sandboxDecision.metadata
+      sandbox
     }
   };
 }

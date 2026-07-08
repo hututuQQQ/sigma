@@ -7,6 +7,44 @@ export type ToolRisk = "read" | "write" | "execute" | "network" | "unknown";
 
 export type ToolApprovalMode = "auto" | "prompt" | "deny";
 export type ToolSandboxMode = "default" | "policy_only" | "bypass";
+export type SandboxMode =
+  | "read-only"
+  | "workspace-write"
+  | "danger-full-access"
+  | "policy-only"
+  | "external"
+  | "disabled"
+  | "policy_only";
+export type SandboxBackend =
+  | "auto"
+  | "bubblewrap"
+  | "seatbelt"
+  | "windows"
+  | "external"
+  | "policy-only"
+  | "policy_only";
+export type SandboxNetworkMode = "default" | "restricted" | "disabled";
+export type SandboxFilesystemMode = "workspace_write" | "read_only";
+
+export interface SandboxFilesystemConfig {
+  readRoots?: string[];
+  writeRoots?: string[];
+  denyRead?: string[];
+  denyWrite?: string[];
+  tempRoot?: string;
+}
+
+export interface SandboxNetworkConfig {
+  mode?: SandboxNetworkMode;
+  allowedHosts?: string[];
+  deniedHosts?: string[];
+  allowLocalhost?: boolean;
+}
+
+export interface SandboxExternalConfig {
+  command?: string;
+  args?: string[];
+}
 
 export interface ToolRuntimeMetadata {
   readOnly?: boolean;
@@ -42,15 +80,19 @@ export interface ExecIntentSummary {
 }
 
 export interface SandboxConfig {
-  mode?: "disabled" | "policy_only";
-  network?: "default" | "restricted";
-  filesystem?: "workspace_write" | "read_only";
+  mode?: SandboxMode;
+  backend?: SandboxBackend;
+  required?: boolean;
+  network?: SandboxNetworkConfig | SandboxNetworkMode;
+  filesystem?: SandboxFilesystemConfig | SandboxFilesystemMode;
+  external?: SandboxExternalConfig;
 }
 
 export interface SandboxExecRequest {
   toolName: string;
   command: string;
   cwd: string;
+  workspacePath?: string;
   env?: NodeJS.ProcessEnv;
   policy: ExecIntentSummary;
   sandbox?: SandboxConfig;
@@ -60,12 +102,22 @@ export interface SandboxExecDecision {
   allowed: boolean;
   reason?: string;
   command?: string;
+  args?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   metadata?: Record<string, unknown>;
 }
 
+export interface SandboxAvailability {
+  available: boolean;
+  backend: string;
+  mode: string;
+  reason?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface SandboxAdapter {
+  checkAvailability?(sandbox: SandboxConfig | undefined, workspacePath: string): Promise<SandboxAvailability>;
   prepareExec(request: SandboxExecRequest): Promise<SandboxExecDecision>;
 }
 

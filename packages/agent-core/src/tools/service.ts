@@ -1,11 +1,10 @@
-import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
-import { bashExecutable, runBashCommand } from "../command-runner.js";
-import { requestToolPermission, resolveWorkspacePath } from "../policy.js";
+import { runSandboxedBashCommand, spawnSandboxedBashCommand } from "../exec-runtime.js";
+import { evaluateExecPolicy, requestToolPermission, resolveWorkspacePath } from "../policy.js";
 
 type ServiceAction = "start" | "status" | "logs" | "stop";
 
@@ -32,6 +31,7 @@ export interface ServiceRecord {
   logPath: string;
   keepAliveAfterRun: boolean;
   startedAt: string;
+  sandbox?: Record<string, unknown>;
 }
 
 export interface ServiceCleanupResult {
@@ -159,23 +159,30 @@ function connectPort(port: number): Promise<boolean> {
   });
 }
 
-async function readinessPassed(record: ServiceRecord, timeoutSec: number, abortSignal?: AbortSignal): Promise<"ready" | "not_ready" | "cancelled"> {
+async function readinessPassed(record: ServiceRecord, timeoutSec: number, context: ToolExecutionContext): Promise<"ready" | "not_ready" | "cancelled"> {
   if (!record.port && !record.readinessCommand) return "ready";
   const deadline = Date.now() + Math.max(1, Math.floor(timeoutSec * 1000));
   while (Date.now() <= deadline) {
-    if (abortSignal?.aborted) return "cancelled";
+    if (context.abortSignal?.aborted) return "cancelled";
     if (!isAlive(record.pid)) return "not_ready";
     const portReady = record.port ? await connectPort(record.port) : true;
     let commandReady = true;
     if (record.readinessCommand) {
-      const result = await runBashCommand({
+      const policy = evaluateExecPolicy(record.readinessCommand, context.execPolicy);
+      if (policy.action === "deny") return "not_ready";
+      const execution = await runSandboxedBashCommand({
+        toolName: "service",
         command: record.readinessCommand,
         cwd: record.cwd,
         env: process.env,
         timeoutMs: 2000,
         detachedProcessGroup: false,
-        abortSignal
+        abortSignal: context.abortSignal,
+        policy,
+        context
       });
+      if ("allowed" in execution) return "not_ready";
+      const { result } = execution;
       if (result.cancelled) return "cancelled";
       commandReady = !result.timedOut && result.exitCode === 0;
     }
@@ -213,11 +220,16 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
     return { ok: false, content: "service.start cancelled before start", metadata: { cancelled: true } };
   }
 
+  const policy = evaluateExecPolicy(command, context.execPolicy);
+  if (policy.action === "deny") {
+    return { ok: false, content: policy.reason, metadata: { execPolicy: policy } };
+  }
+
   const denied = await requestToolPermission(context, {
     toolName: "service",
     arguments: args,
-    risk: "execute",
-    reason: `Start background service ${name}`
+    risk: policy.risk === "read" ? "execute" : policy.risk,
+    reason: policy.action === "prompt" ? policy.reason : `Start background service ${name}`
   });
   if (denied) return denied;
 
@@ -240,14 +252,27 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
   await mkdir(path.dirname(logPath), { recursive: true });
   const outFd = openSync(logPath, "a");
   let pid: number | undefined;
+  let sandbox: Record<string, unknown> | undefined;
   try {
-    const child = spawn(bashExecutable(), ["-lc", command], {
+    const spawned = await spawnSandboxedBashCommand({
+      toolName: "service",
+      command,
       cwd,
       env: process.env,
+      policy,
+      context,
       detached: true,
-      stdio: ["ignore", outFd, outFd],
-      windowsHide: true
+      stdio: ["ignore", outFd, outFd]
     });
+    if ("allowed" in spawned) {
+      return {
+        ok: false,
+        content: spawned.reason ?? "Command was denied by sandbox policy.",
+        metadata: { execPolicy: policy, sandbox: spawned.metadata ?? { denied: true }, logPath }
+      };
+    }
+    const child = spawned.child;
+    sandbox = spawned.sandbox;
     child.on("error", () => {
       // Errors are reflected by readiness checks and logs; keep the detached child from emitting unhandled errors.
     });
@@ -270,7 +295,8 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
     ...(readinessCommand ? { readinessCommand } : {}),
     logPath,
     keepAliveAfterRun: defaultKeepAliveAfterRun(args, port, readinessCommand),
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    ...(sandbox ? { sandbox } : {})
   };
 
   const existingServices = await readRegistry();
@@ -286,7 +312,7 @@ async function startService(args: ServiceArgs, context: ToolExecutionContext): P
   await writeRegistry(services);
 
   const timeoutSec = asNumber(args.readinessTimeoutSec) ?? DEFAULT_READINESS_TIMEOUT_SEC;
-  const ready = await readinessPassed(record, timeoutSec, context.abortSignal);
+  const ready = await readinessPassed(record, timeoutSec, context);
   if (ready !== "ready") {
     await stopRecord(record);
     await writeRegistry((await readRegistry()).filter((service) => service.name !== name));

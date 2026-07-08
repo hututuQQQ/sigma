@@ -90,6 +90,15 @@ Core flags:
   --max-turns <number>
   --max-wall-time-sec <number>
   --command-timeout-sec <number>
+  --sandbox <read-only|workspace-write|danger-full-access|policy-only|external>
+  --sandbox-backend <auto|bubblewrap|seatbelt|windows|external|policy-only>
+  --sandbox-required
+  --sandbox-network <default|restricted|disabled>
+  --sandbox-add-read <comma-separated-paths>
+  --sandbox-add-write <comma-separated-paths>
+  --sandbox-deny-read <comma-separated-paths>
+  --sandbox-deny-write <comma-separated-paths>
+  --sandbox-external-command <command>
 
 Run-controller flags:
   --validation-mode <off|auto>
@@ -186,6 +195,7 @@ async function runNonInteractiveCommand(
       maxWallTimeSec: cliConfig.maxWallTimeSec,
       commandTimeoutSec: cliConfig.commandTimeoutSec,
       permissionMode: cliConfig.permissionMode,
+      sandbox: cliConfig.sandbox,
       traceJsonlPath: cliConfig.traceJsonl,
       sessionJsonlPath: cliConfig.sessionJsonl,
       summaryJsonPath: cliConfig.summaryJson,

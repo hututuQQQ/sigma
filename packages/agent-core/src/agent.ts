@@ -28,6 +28,7 @@ import {
   workflowFailureNudge
 } from "./controller/workflow-state.js";
 import { redactSecrets } from "./redaction.js";
+import { createDefaultSandboxConfig } from "./sandbox.js";
 import { ToolRuntime, type ToolRuntimeExecution } from "./tool-runtime.js";
 import type {
   AgentEvent,
@@ -341,7 +342,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     subagentsEnabled,
     subagentDepth: 0,
     execPolicy: config.execPolicy,
-    sandbox: config.sandbox,
+    sandbox: config.sandbox ?? createDefaultSandboxConfig(),
     sandboxAdapter: config.sandboxAdapter,
     ...(config.abortSignal ? { abortSignal: config.abortSignal } : {})
   };

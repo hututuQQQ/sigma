@@ -10,14 +10,19 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
-  PermissionMode
+  PermissionMode,
+  SandboxBackend,
+  SandboxConfig,
+  SandboxMode,
+  SandboxNetworkMode
 } from "agent-core";
 import {
   DEFAULT_COMPACTION_MODE,
   DEFAULT_FINAL_EVIDENCE_MODE,
   DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
   DEFAULT_SUBAGENTS_ENABLED,
-  DEFAULT_VALIDATION_MODE
+  DEFAULT_VALIDATION_MODE,
+  createDefaultSandboxConfig
 } from "agent-core";
 
 export interface ParsedArgs {
@@ -72,6 +77,7 @@ export interface CliConfig {
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming: boolean;
+  sandbox: SandboxConfig;
   enableMcp: boolean;
   mcpConfig?: string;
   noStreamUi: boolean;
@@ -112,6 +118,7 @@ const BOOLEAN_FLAGS = new Set([
   "no-subagents",
   "quiet",
   "review-anti-gaming",
+  "sandbox-required",
   "stream-ui"
 ]);
 
@@ -226,6 +233,31 @@ function flattenConfig(parsed: unknown): ConfigValues {
   addSection("review", {
     anti_gaming: "review_anti_gaming"
   });
+  addSection("sandbox", {
+    mode: "sandbox_mode",
+    backend: "sandbox_backend",
+    required: "sandbox_required",
+    external_command: "sandbox_external_command",
+    external_args: "sandbox_external_args"
+  });
+  const sandbox = parsed.sandbox;
+  if (isRecord(sandbox)) {
+    const network = sandbox.network;
+    if (isRecord(network)) {
+      if (network.mode !== undefined) result.sandbox_network_mode = network.mode;
+      if (network.allowed_hosts !== undefined) result.sandbox_network_allowed_hosts = network.allowed_hosts;
+      if (network.denied_hosts !== undefined) result.sandbox_network_denied_hosts = network.denied_hosts;
+      if (network.allow_localhost !== undefined) result.sandbox_network_allow_localhost = network.allow_localhost;
+    }
+    const filesystem = sandbox.filesystem;
+    if (isRecord(filesystem)) {
+      if (filesystem.read_roots !== undefined) result.sandbox_read_roots = filesystem.read_roots;
+      if (filesystem.write_roots !== undefined) result.sandbox_write_roots = filesystem.write_roots;
+      if (filesystem.deny_read !== undefined) result.sandbox_deny_read = filesystem.deny_read;
+      if (filesystem.deny_write !== undefined) result.sandbox_deny_write = filesystem.deny_write;
+      if (filesystem.temp_root !== undefined) result.sandbox_temp_root = filesystem.temp_root;
+    }
+  }
   addSection("mcp", {
     enabled: "enable_mcp",
     config: "mcp_config"
@@ -287,6 +319,43 @@ function optionalProviderValue(value: unknown): ProviderName | undefined {
 function permissionModeValue(value: unknown): PermissionMode {
   if (value === "ask" || value === "yolo") return value;
   throw new Error(`Unsupported permission mode '${String(value)}'. Use ask or yolo.`);
+}
+
+function sandboxModeValue(value: unknown): SandboxMode {
+  if (
+    value === "read-only" ||
+    value === "workspace-write" ||
+    value === "danger-full-access" ||
+    value === "policy-only" ||
+    value === "policy_only" ||
+    value === "external" ||
+    value === "disabled"
+  ) {
+    return value;
+  }
+  if (value === "read_only") return "read-only";
+  if (value === "workspace_write") return "workspace-write";
+  throw new Error(`Unsupported sandbox mode '${String(value)}'. Use read-only, workspace-write, danger-full-access, policy-only, external, or disabled.`);
+}
+
+function sandboxBackendValue(value: unknown): SandboxBackend {
+  if (
+    value === "auto" ||
+    value === "bubblewrap" ||
+    value === "seatbelt" ||
+    value === "windows" ||
+    value === "external" ||
+    value === "policy-only" ||
+    value === "policy_only"
+  ) {
+    return value;
+  }
+  throw new Error(`Unsupported sandbox backend '${String(value)}'. Use auto, bubblewrap, seatbelt, windows, external, or policy-only.`);
+}
+
+function sandboxNetworkModeValue(value: unknown): SandboxNetworkMode {
+  if (value === "default" || value === "restricted" || value === "disabled") return value;
+  throw new Error(`Unsupported sandbox network mode '${String(value)}'. Use default, restricted, or disabled.`);
 }
 
 function validationModeValue(value: unknown): AgentHarnessValidationMode {
@@ -358,6 +427,100 @@ function optionalNumberValue(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function optionalStringList(value: unknown): string[] | undefined {
+  const list = stringListValue(value);
+  return list.length > 0 ? list : undefined;
+}
+
+function sandboxConfigFromValues(
+  flags: Record<string, string | boolean>,
+  config: ConfigValues
+): SandboxConfig {
+  const defaults = createDefaultSandboxConfig();
+  const modeValue =
+    stringValue(flags.sandbox) ??
+    process.env.AGENT_SANDBOX ??
+    stringValue(config.sandbox_mode);
+  const backendValue =
+    stringValue(flags["sandbox-backend"]) ??
+    process.env.AGENT_SANDBOX_BACKEND ??
+    stringValue(config.sandbox_backend);
+  const networkModeValue =
+    stringValue(flags["sandbox-network"]) ??
+    process.env.AGENT_SANDBOX_NETWORK ??
+    stringValue(config.sandbox_network_mode);
+  const externalCommand =
+    stringValue(flags["sandbox-external-command"]) ??
+    process.env.AGENT_SANDBOX_EXTERNAL_COMMAND ??
+    stringValue(config.sandbox_external_command);
+
+  const sandbox: SandboxConfig = {
+    mode: modeValue ? sandboxModeValue(modeValue) : defaults.mode,
+    backend: backendValue ? sandboxBackendValue(backendValue) : defaults.backend,
+    required: boolValue(
+      flags["sandbox-required"] ?? process.env.AGENT_SANDBOX_REQUIRED ?? config.sandbox_required,
+      defaults.required ?? false
+    ),
+    network: {
+      mode: networkModeValue ? sandboxNetworkModeValue(networkModeValue) : "restricted",
+      allowedHosts: optionalStringList(
+        flags["sandbox-allowed-hosts"] ??
+          process.env.AGENT_SANDBOX_ALLOWED_HOSTS ??
+          config.sandbox_network_allowed_hosts
+      ),
+      deniedHosts: optionalStringList(
+        flags["sandbox-denied-hosts"] ??
+          process.env.AGENT_SANDBOX_DENIED_HOSTS ??
+          config.sandbox_network_denied_hosts
+      ),
+      allowLocalhost: boolValue(
+        flags["sandbox-allow-localhost"] ??
+          process.env.AGENT_SANDBOX_ALLOW_LOCALHOST ??
+          config.sandbox_network_allow_localhost,
+        true
+      )
+    },
+    filesystem: {
+      readRoots: optionalStringList(
+        flags["sandbox-add-read"] ??
+          process.env.AGENT_SANDBOX_ADD_READ ??
+          config.sandbox_read_roots
+      ),
+      writeRoots: optionalStringList(
+        flags["sandbox-add-write"] ??
+          process.env.AGENT_SANDBOX_ADD_WRITE ??
+          config.sandbox_write_roots
+      ),
+      denyRead: optionalStringList(
+        flags["sandbox-deny-read"] ??
+          process.env.AGENT_SANDBOX_DENY_READ ??
+          config.sandbox_deny_read
+      ),
+      denyWrite: optionalStringList(
+        flags["sandbox-deny-write"] ??
+          process.env.AGENT_SANDBOX_DENY_WRITE ??
+          config.sandbox_deny_write
+      ),
+      tempRoot:
+        stringValue(flags["sandbox-temp-root"]) ??
+        process.env.AGENT_SANDBOX_TEMP_ROOT ??
+        stringValue(config.sandbox_temp_root)
+    },
+    external: externalCommand
+      ? {
+          command: externalCommand,
+          args: optionalStringList(
+            flags["sandbox-external-args"] ??
+              process.env.AGENT_SANDBOX_EXTERNAL_ARGS ??
+              config.sandbox_external_args
+          ) ?? []
+        }
+      : defaults.external
+  };
+
+  return sandbox;
+}
+
 export function loadCliConfig(flags: Record<string, string | boolean>): CliConfig {
   const homeConfig = loadTomlConfig(path.join(os.homedir(), ".agent", "config.toml"));
   const preliminaryWorkspace =
@@ -416,6 +579,7 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       stringValue(config.validation_mode) ??
       DEFAULTS.validationMode
   );
+  const sandbox = sandboxConfigFromValues(flags, config);
 
   return {
     workspace,
@@ -438,6 +602,7 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         stringValue(config.permission_mode) ??
         DEFAULTS.permissionMode
     ),
+    sandbox,
     traceJsonl,
     summaryJson,
     sessionJsonl,
