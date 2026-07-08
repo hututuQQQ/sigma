@@ -382,7 +382,10 @@ export class CompactionService {
 
   private strategyFromOptions(options: CompactionServiceOptions): CompactionStrategy {
     if (options.mode === "off") return new NoopCompactionStrategy();
-    if (options.mode === "model_sub_session" && options.modelProvider) {
+    if (options.mode === "model_sub_session") {
+      if (!options.modelProvider) {
+        throw new Error("model_sub_session compaction requires a modelProvider.");
+      }
       return new ModelSubSessionCompactionStrategy({
         provider: options.modelProvider,
         fallback: options.fallback

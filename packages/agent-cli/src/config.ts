@@ -12,6 +12,13 @@ import type {
   ContextMode,
   PermissionMode
 } from "agent-core";
+import {
+  DEFAULT_COMPACTION_MODE,
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+  DEFAULT_SUBAGENTS_ENABLED,
+  DEFAULT_VALIDATION_MODE
+} from "agent-core";
 
 export interface ParsedArgs {
   flags: Record<string, string | boolean>;
@@ -32,7 +39,7 @@ export interface CliConfig {
   summaryJson?: string;
   sessionJsonl?: string;
   maxToolOutputChars: number;
-  maxMessageHistoryChars?: number;
+  maxMessageHistoryChars: number;
   messageHistoryRetain: number;
   compactionSummaryChars: number;
   compactionMode: CompactionMode;
@@ -78,15 +85,19 @@ const DEFAULTS = {
   commandTimeoutSec: 60,
   permissionMode: "ask" as PermissionMode,
   maxToolOutputChars: 12000,
+  maxMessageHistoryChars: DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
   messageHistoryRetain: 24,
   compactionSummaryChars: 30000,
-  compactionMode: "deterministic" as CompactionMode,
+  compactionMode: DEFAULT_COMPACTION_MODE,
   compactionTimeoutSec: 60,
   compactionFallback: "deterministic" as CompactionFallbackMode,
   projectDocMaxBytes: 32768,
   contextMode: "repo-map" as ContextMode,
   repoMapMaxChars: 20000,
   skillsMaxChars: 8000,
+  validationMode: DEFAULT_VALIDATION_MODE,
+  finalEvidenceMode: DEFAULT_FINAL_EVIDENCE_MODE,
+  subagentsEnabled: DEFAULT_SUBAGENTS_ENABLED,
   subagentMaxTurns: 4,
   subagentMaxOutputChars: 12000,
   reviewAntiGaming: true
@@ -98,10 +109,10 @@ const BOOLEAN_FLAGS = new Set([
   "no-review-anti-gaming",
   "no-project-instructions",
   "no-stream-ui",
+  "no-subagents",
   "quiet",
   "review-anti-gaming",
-  "stream-ui",
-  "subagents-enabled"
+  "stream-ui"
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -156,15 +167,14 @@ function flattenConfig(parsed: unknown): ConfigValues {
     }
   };
 
-  for (const [key, value] of Object.entries(parsed)) {
-    if (!isRecord(value)) result[key] = value;
-  }
   addSection("run", {
+    workspace: "workspace",
     provider: "provider",
     model: "model",
     max_turns: "max_turns",
     max_wall_time_sec: "max_wall_time_sec",
     command_timeout_sec: "command_timeout_sec",
+    run_controller_timeout_sec: "run_controller_timeout_sec",
     permission_mode: "permission_mode",
     output_format: "output_format",
     quiet: "quiet"
@@ -193,6 +203,9 @@ function flattenConfig(parsed: unknown): ConfigValues {
     repo_map_max_chars: "repo_map_max_chars",
     project_doc_max_bytes: "project_doc_max_bytes",
     no_project_instructions: "no_project_instructions",
+    max_message_history_chars: "max_message_history_chars",
+    message_history_retain: "message_history_retain",
+    compaction_summary_chars: "compaction_summary_chars",
     compaction_mode: "compaction_mode",
     compaction_model: "compaction_model",
     compaction_provider: "compaction_provider",
@@ -401,7 +414,7 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
     stringValue(flags["validation-mode"]) ??
       process.env.AGENT_VALIDATION_MODE ??
       stringValue(config.validation_mode) ??
-      "off"
+      DEFAULTS.validationMode
   );
 
   return {
@@ -432,17 +445,12 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       flags["max-tool-output-chars"] ?? process.env.AGENT_MAX_TOOL_OUTPUT_CHARS ?? config.max_tool_output_chars,
       DEFAULTS.maxToolOutputChars
     ),
-    maxMessageHistoryChars:
-      flags["max-message-history-chars"] !== undefined ||
-      process.env.AGENT_MAX_MESSAGE_HISTORY_CHARS !== undefined ||
-      config.max_message_history_chars !== undefined
-        ? numberValue(
-            flags["max-message-history-chars"] ??
-              process.env.AGENT_MAX_MESSAGE_HISTORY_CHARS ??
-              config.max_message_history_chars,
-            0
-          )
-        : undefined,
+    maxMessageHistoryChars: numberValue(
+      flags["max-message-history-chars"] ??
+        process.env.AGENT_MAX_MESSAGE_HISTORY_CHARS ??
+        config.max_message_history_chars,
+      DEFAULTS.maxMessageHistoryChars
+    ),
     messageHistoryRetain: numberValue(
       flags["message-history-retain"] ?? process.env.AGENT_MESSAGE_HISTORY_RETAIN ?? config.message_history_retain,
       DEFAULTS.messageHistoryRetain
@@ -522,7 +530,9 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         config.post_run_cleanup_globs
     ),
     harnessTimeoutSec: optionalNumberValue(
-      flags["harness-timeout-sec"] ?? process.env.AGENT_HARNESS_TIMEOUT_SEC ?? config.harness_timeout_sec
+      flags["harness-timeout-sec"] ??
+        process.env.AGENT_RUN_CONTROLLER_TIMEOUT_SEC ??
+        config.run_controller_timeout_sec
     ),
     retryMinBudgetSec: optionalNumberValue(
       flags["retry-min-budget-sec"] ?? process.env.AGENT_RETRY_MIN_BUDGET_SEC ?? config.retry_min_budget_sec
@@ -555,7 +565,7 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       stringValue(flags["final-evidence-mode"]) ??
         process.env.AGENT_FINAL_EVIDENCE_MODE ??
         stringValue(config.final_evidence_mode) ??
-        (validationMode === "auto" ? "auto" : "off")
+        DEFAULTS.finalEvidenceMode
     ),
     skillsMode: skillsModeValue(
       stringValue(flags["skills-mode"]) ??
@@ -568,8 +578,10 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       DEFAULTS.skillsMaxChars
     ),
     subagentsEnabled: boolValue(
-      flags["subagents-enabled"] ?? process.env.AGENT_SUBAGENTS_ENABLED ?? config.subagents_enabled,
-      false
+      flags["no-subagents"] !== undefined
+        ? false
+        : process.env.AGENT_SUBAGENTS_ENABLED ?? config.subagents_enabled,
+      DEFAULTS.subagentsEnabled
     ),
     subagentMaxTurns: optionalNumberValue(
       flags["subagent-max-turns"] ?? process.env.AGENT_SUBAGENT_MAX_TURNS ?? config.subagent_max_turns

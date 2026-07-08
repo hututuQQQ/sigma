@@ -131,4 +131,19 @@ describe("CodeGraphIndex", () => {
     expect(repoMap.content).toContain("src/thing.test.ts");
     expect(repoMap.content).toContain("Dependency graph summary:");
   });
+
+  it("returns an explicit degraded repo map when v2 fails", async () => {
+    const missingWorkspace = path.join(os.tmpdir(), `sigma-missing-${Date.now()}`);
+
+    const repoMap = await generateRepoMap({ workspacePath: missingWorkspace, maxChars: 12000 });
+
+    expect(repoMap.content).toContain("RepoMap v2 failed");
+    expect(repoMap.content).toContain("Error summary:");
+    expect(repoMap.codeIndex).toMatchObject({
+      degraded: true,
+      dependency_edge_count: 0,
+      test_to_source_count: 0,
+      error: expect.any(String)
+    });
+  });
 });

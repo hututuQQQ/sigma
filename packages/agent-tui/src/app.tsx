@@ -109,6 +109,9 @@ export interface TuiAppOptions {
   disabledTools?: string[];
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
+  maxMessageHistoryChars?: number;
+  messageHistoryRetain?: number;
+  compactionSummaryChars?: number;
   compactionMode?: CompactionMode;
   compactionModel?: string;
   compactionProvider?: ProviderName;
@@ -977,6 +980,9 @@ export class TuiApp {
         disabledTools: mergeDisabledToolsForMode(this.mode, this.options.disabledTools),
         contextMode: this.options.contextMode,
         repoMapMaxChars: this.options.repoMapMaxChars,
+        maxMessageHistoryChars: this.options.maxMessageHistoryChars,
+        messageHistoryRetain: this.options.messageHistoryRetain,
+        compactionSummaryChars: this.options.compactionSummaryChars,
         compactionMode: this.options.compactionMode,
         compactionModel: this.options.compactionModel,
         compactionProvider: this.options.compactionProvider,

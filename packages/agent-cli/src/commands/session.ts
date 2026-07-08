@@ -13,7 +13,7 @@ import {
   truncateMiddle
 } from "agent-core";
 import { loadCliConfig, parseArgs } from "../config.js";
-import { runRunCommandWithOverrides, type SolveCommandDeps } from "./solve.js";
+import { runRunCommandWithOverrides, type SolveCommandDeps } from "./run.js";
 
 function stdout(deps: SolveCommandDeps): NodeJS.WritableStream {
   return deps.stdout ?? process.stdout;

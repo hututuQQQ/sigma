@@ -11,7 +11,7 @@ import {
   runSessionCommand,
   runSessionsCommand
 } from "./commands/session.js";
-import { runRunCommand, runSolveCommand } from "./commands/solve.js";
+import { runRunCommand } from "./commands/run.js";
 import { loadCliConfig, parseArgs, type CliConfig } from "./config.js";
 
 export interface AgentCliMainOptions {
@@ -23,11 +23,9 @@ function printHelp(): void {
 
 Commands:
   run      Run the autonomous coding agent once
-  solve    Compatibility alias for run
   tui      Start the interactive terminal UI
   chat     Start a minimal plain-terminal chat session
   sessions List recent durable sessions
-  history  Compatibility alias for sessions
   session  Show, search, resume, or fork sessions
   checkpoints List checkpoints for a session
   checkpoint  Show or restore a checkpoint
@@ -47,10 +45,16 @@ Common run flags:
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
   --context-mode <off|repo-map>
+  --max-message-history-chars <number>
+  --message-history-retain <number>
   --compaction-mode <off|deterministic|model-sub-session>
+  --compaction-provider <deepseek|glm>
+  --compaction-max-input-chars <number>
+  --compaction-max-output-chars <number>
+  --compaction-fallback <deterministic|fail>
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
-  --subagents-enabled
+  --no-subagents
   --review-anti-gaming / --no-review-anti-gaming
   --enable-mcp
   --stream-ui / --no-stream-ui
@@ -60,11 +64,9 @@ Common run flags:
 function completionScript(shell: string): string {
   const commands = [
     "run",
-    "solve",
     "tui",
     "chat",
     "sessions",
-    "history",
     "session",
     "checkpoints",
     "checkpoint",
@@ -92,8 +94,15 @@ function completionScript(shell: string): string {
     "--context-mode",
     "--compaction-mode",
     "--compaction-model",
+    "--compaction-provider",
+    "--compaction-max-input-chars",
+    "--compaction-max-output-chars",
     "--compaction-timeout-sec",
-    "--subagents-enabled",
+    "--compaction-fallback",
+    "--max-message-history-chars",
+    "--message-history-retain",
+    "--final-evidence-mode",
+    "--no-subagents",
     "--subagent-max-turns",
     "--subagent-max-output-chars",
     "--review-anti-gaming",
@@ -219,10 +228,9 @@ export async function runAgentCommand(args = process.argv.slice(2), options: Age
   }
 
   if (command === "run") return await runRunCommand(rest);
-  if (command === "solve") return await runSolveCommand(rest);
   if (command === "tui") return await runTuiCommand(rest, options);
   if (command === "chat") return await runChatCommand(rest);
-  if (command === "sessions" || command === "history") return await runSessionsCommand(rest);
+  if (command === "sessions") return await runSessionsCommand(rest);
   if (command === "session") return await runSessionCommand(rest);
   if (command === "checkpoints") return await runCheckpointsCommand(rest);
   if (command === "checkpoint") return await runCheckpointCommand(rest);

@@ -7,7 +7,8 @@ import {
   DeterministicCompactionStrategy,
   ModelSubSessionCompactionProvider,
   ModelSubSessionCompactionStrategy,
-  type CompactionArtifact
+  type CompactionArtifact,
+  type ContextManagerEvent
 } from "../packages/agent-core/src/index.js";
 
 function messagesWithHistory(): AgentMessage[] {
@@ -214,6 +215,10 @@ describe("ContextManager compaction", () => {
     expect(model.requests[0].messages[1].content).toContain("compacted_message_history");
   });
 
+  it("requires a provider for model_sub_session mode", () => {
+    expect(() => new CompactionService({ mode: "model_sub_session" })).toThrow("requires a modelProvider");
+  });
+
   it("falls back to deterministic compaction when model JSON is invalid", async () => {
     const model = new CompactionJsonModel("not json");
     const service = new CompactionService({
@@ -258,6 +263,71 @@ describe("ContextManager compaction", () => {
     expect(result.fallbackUsed).toBe(true);
     expect(result.error).not.toContain("sk-test-secret");
     expect(result.artifact?.objective).toBe("fix the project");
+  });
+
+  it("records fallback error and end events when model compaction degrades", async () => {
+    const events: ContextManagerEvent[] = [];
+    const manager = new ContextManager({
+      compactionService: new CompactionService({
+        mode: "model_sub_session",
+        modelProvider: {
+          async compact() {
+            throw new Error("provider exploded with sk-test-secret");
+          }
+        }
+      })
+    });
+
+    const result = await manager.prepareMessages({
+      messages: messagesWithHistory(),
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      objective: "fix the project",
+      emitEvent: (event) => events.push(event)
+    });
+
+    expect(result.fallbackUsed).toBe(true);
+    expect(events.map((event) => event.type)).toEqual([
+      "context_compaction_start",
+      "context_compaction_error",
+      "context_compaction_end"
+    ]);
+    expect(events[1].metadata).toMatchObject({
+      strategy: "model_sub_session",
+      fallback_used: true,
+      error: expect.stringContaining("provider exploded")
+    });
+    expect(events[1].metadata.error).not.toContain("sk-test-secret");
+    expect(events[2].metadata).toMatchObject({ fallback_used: true });
+  });
+
+  it("throws and records an error event when compaction fallback is fail", async () => {
+    const events: ContextManagerEvent[] = [];
+    const manager = new ContextManager({
+      compactionService: new CompactionService({
+        mode: "model_sub_session",
+        fallback: "fail",
+        modelProvider: {
+          async compact() {
+            throw new Error("provider exploded");
+          }
+        }
+      })
+    });
+
+    await expect(manager.prepareMessages({
+      messages: messagesWithHistory(),
+      maxMessageHistoryChars: 500,
+      messageHistoryRetain: 2,
+      objective: "fix the project",
+      emitEvent: (event) => events.push(event)
+    })).rejects.toThrow("Model compaction failed");
+
+    expect(events.map((event) => event.type)).toEqual([
+      "context_compaction_start",
+      "context_compaction_error"
+    ]);
+    expect(events[1].metadata.error).toContain("Model compaction failed");
   });
 
   it("does not compact when compaction mode is off", async () => {

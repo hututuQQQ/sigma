@@ -12,11 +12,12 @@ import { ContextManager } from "./context/context-manager.js";
 import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
-import { detectProjectProfile } from "./harness/project-detector.js";
+import { DEFAULT_COMPACTION_MODE, DEFAULT_FINAL_EVIDENCE_MODE, DEFAULT_SUBAGENTS_ENABLED } from "./defaults.js";
 import { formatSelectedSkills } from "./skills/format-skills.js";
 import { loadAllSkills } from "./skills/load-skills.js";
-import { projectHintsFromProfile, retrieveSkills } from "./skills/retrieve-skills.js";
+import { projectHintsFromDiscovery, retrieveSkills } from "./skills/retrieve-skills.js";
 import type { AgentSkill } from "./skills/types.js";
+import { discoverProjects } from "./validation/project-discovery.js";
 import { inferEvidenceRecord } from "./controller/evidence.js";
 import { createInitialFinalGateStatus, finalGateNudge } from "./controller/final-gate.js";
 import {
@@ -193,8 +194,8 @@ async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegis
     config.toolRegistryFactory
       ? await config.toolRegistryFactory()
       : createDefaultToolRegistry({
-          subagents: {
-            enabled: config.subagentsEnabled === true,
+        subagents: {
+            enabled: config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED,
             defaultMaxTurns: config.subagentMaxTurns,
             defaultMaxOutputChars: config.subagentMaxOutputChars
           }
@@ -307,6 +308,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   const model = config.modelClient.model;
   const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
   const maxWallTimeSec = config.maxWallTimeSec ?? DEFAULT_MAX_WALL_TIME_SEC;
+  const compactionMode = config.compactionMode ?? DEFAULT_COMPACTION_MODE;
+  const subagentsEnabled = config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
   const context: ToolExecutionContext = {
     workspacePath: path.resolve(config.workspacePath),
     permissionMode: config.permissionMode ?? "ask",
@@ -324,7 +327,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     runId,
     provider,
     model,
-    subagentsEnabled: config.subagentsEnabled === true,
+    subagentsEnabled,
     subagentDepth: 0,
     ...(config.abortSignal ? { abortSignal: config.abortSignal } : {})
   };
@@ -347,7 +350,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         forkedFromSessionId: config.forkedFromSessionId
       });
   const workflow = createWorkflowState();
-  const finalEvidenceMode = config.finalEvidenceMode ?? "off";
+  const finalEvidenceMode = config.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
   const contextCompactions: ContextCompactionSummary[] = [];
@@ -366,9 +369,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   if (durableSession?.sessionId) context.sessionId = durableSession.sessionId;
 
   const compactionService = config.compactionService ?? new CompactionService({
-    mode: config.compactionMode ?? "deterministic",
+    mode: compactionMode,
     fallback: config.compactionFallback,
-    modelProvider: (config.compactionMode ?? "deterministic") === "model_sub_session"
+    modelProvider: compactionMode === "model_sub_session"
       ? new ModelSubSessionCompactionProvider({
           modelClient: config.compactionModelClient ?? config.modelClient,
           maxInputChars: config.compactionMaxInputChars,
@@ -485,11 +488,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   }
   let selectedSkills: AgentSkill[] = [];
   if ((config.skillsMode ?? "auto") === "auto") {
-    const profile = await detectProjectProfile(context.workspacePath);
+    const discovery = await discoverProjects({ workspacePath: context.workspacePath });
     const allSkills = await loadAllSkills(context.workspacePath);
     selectedSkills = retrieveSkills(allSkills, {
       instruction: config.instruction,
-      projectHints: projectHintsFromProfile(profile)
+      projectHints: projectHintsFromDiscovery(discovery)
     });
     const skillsBlock = formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS);
     if (skillsBlock) systemSections.push(skillsBlock);
@@ -521,7 +524,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       projectInstructionSources: loadedProjectInstructions.sources,
       contextMode: config.contextMode,
       repoMapChars: repoMap?.chars,
-      compactionMode: config.compactionMode ?? "deterministic",
+      compactionMode,
       compactionModel: config.compactionModel,
         selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
     }, undefined, durableSession?.sessionId)

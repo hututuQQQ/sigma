@@ -37,6 +37,9 @@ export interface RunSessionOptions {
   disabledTools?: string[];
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
+  maxMessageHistoryChars?: number;
+  messageHistoryRetain?: number;
+  compactionSummaryChars?: number;
   compactionMode?: CompactionMode;
   compactionModel?: string;
   compactionProvider?: ProviderName;
@@ -93,6 +96,9 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       disabledTools: options.disabledTools,
       contextMode: options.contextMode ?? "repo-map",
       repoMapMaxChars: options.repoMapMaxChars,
+      maxMessageHistoryChars: options.maxMessageHistoryChars,
+      messageHistoryRetain: options.messageHistoryRetain,
+      compactionSummaryChars: options.compactionSummaryChars,
       compactionMode: options.compactionMode,
       compactionModel: options.compactionModel,
       compactionProvider: options.compactionProvider,

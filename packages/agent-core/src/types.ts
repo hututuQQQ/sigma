@@ -272,6 +272,8 @@ export interface CodeIndexSummary {
   test_to_source_count: number;
   config_files: string[];
   truncated: boolean;
+  degraded?: boolean;
+  error?: string;
 }
 
 export interface AgentRunConfig {
@@ -309,8 +311,6 @@ export interface AgentRunConfig {
   }) => import("./context/context-manager.js").ContextManager | Promise<import("./context/context-manager.js").ContextManager>;
   compactionService?: import("./context/compaction-service.js").CompactionService;
   failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
-  validationPlanner?: unknown;
-  codeIndex?: unknown;
   subagentsEnabled?: boolean;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;

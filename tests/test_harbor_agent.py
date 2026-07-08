@@ -193,7 +193,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             await agent.run("fix the task", env, context)
 
-            main_commands = [item for item in exec_commands if "/usr/local/bin/agent solve" in item[0]]
+            main_commands = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]]
             self.assertEqual(len(main_commands), 1)
             command, kwargs = main_commands[0]
             self.assertIn("--validation-mode auto", command)
@@ -238,14 +238,14 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             await agent.run("fix the task", env, context)
 
-            command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent solve" in item[0]][0]
+            command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]][0]
             self.assertIn("--validation-mode auto", command)
             self.assertIn("--validation-retry-limit 3", command)
             self.assertIn("--validation-timeout-sec 50", command)
             self.assertIn("--harness-timeout-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)
 
-    async def test_run_uses_validation_off_by_default(self):
+    async def test_run_uses_validation_auto_by_default(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -267,8 +267,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             await agent.run("fix the task", env, context)
 
-            command = [command for command, _kwargs in exec_commands if "/usr/local/bin/agent solve" in command][0]
-            self.assertIn("--validation-mode off", command)
+            command = [command for command, _kwargs in exec_commands if "/usr/local/bin/agent run" in command][0]
+            self.assertIn("--validation-mode auto", command)
             self.assertIn("--validation-retry-limit 0", command)
 
     async def test_run_downloads_logs_populates_context_and_mirrors_harness_metadata(self):
@@ -315,7 +315,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     return SimpleNamespace(return_code=0, stdout="", stderr="")
                 if command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
-                if "/usr/local/bin/agent solve" in command:
+                if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(return_code=1, stdout="agent failed", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
 

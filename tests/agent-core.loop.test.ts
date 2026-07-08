@@ -21,6 +21,64 @@ class FakeModel implements ModelClient {
   }
 }
 
+class DefaultCompactionModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-default-compaction-model";
+  readonly requests: ModelRequest[] = [];
+  private mainIndex = 0;
+
+  async complete(req: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(req);
+    if (req.toolChoice === "none") {
+      return {
+        message: {
+          role: "assistant",
+          content: JSON.stringify({
+            objective: "compact objective",
+            current_plan: ["continue"],
+            changed_files: [],
+            key_decisions: ["kept tail"],
+            failed_attempts: [],
+            validation_evidence: [],
+            unresolved_questions: [],
+            next_actions: ["finish"]
+          })
+        }
+      };
+    }
+    const responses: ModelResponse[] = [
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-1",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-2",
+              type: "function",
+              function: { name: "bash", arguments: { command: "printf '%05000d' 0" } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ];
+    const response = responses[Math.min(this.mainIndex, responses.length - 1)];
+    this.mainIndex += 1;
+    return response;
+  }
+}
+
 class StreamingModel implements ModelClient {
   readonly provider = "deepseek" as const;
   readonly model = "fake-stream-model";
@@ -295,6 +353,7 @@ describe("agent loop", () => {
       maxMessageHistoryChars: 1000,
       messageHistoryRetain: 2,
       compactionSummaryChars: 500,
+      compactionMode: "deterministic",
       eventBus,
       summaryJsonPath: summaryPath
     });
@@ -317,6 +376,30 @@ describe("agent loop", () => {
       "Previous agent conversation compacted by the run controller."
     );
     expect(thirdRequestMessages[3].role).toBe("assistant");
+  });
+
+  it("uses model sub-session compaction by default with no tools", async () => {
+    const dir = await tempWorkspace();
+    const model = new DefaultCompactionModel();
+
+    const result = await runAgent({
+      instruction: "make lots of output",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 3,
+      maxMessageHistoryChars: 1000,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 500
+    });
+
+    expect(result.status).toBe("completed");
+    const compactionRequest = model.requests.find((request) => request.toolChoice === "none");
+    expect(compactionRequest).toMatchObject({ tools: [], toolChoice: "none" });
+    expect(result.contextCompactions?.[0]).toMatchObject({
+      strategy: "model_sub_session",
+      fallback_used: false
+    });
   });
 
   it("uses streaming model deltas and emits token-level events", async () => {

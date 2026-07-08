@@ -181,7 +181,7 @@ class SigmaCliHarborAgent(BaseAgent):
     def _resolve_validation_mode(self, validation_mode: str | None) -> str:
         if isinstance(validation_mode, str) and validation_mode.strip():
             return validation_mode.strip()
-        return "off"
+        return "auto"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
@@ -243,7 +243,7 @@ class SigmaCliHarborAgent(BaseAgent):
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         command = [
             "/usr/local/bin/agent",
-            "solve",
+            "run",
             "--workspace",
             "/app",
             "--instruction-file",

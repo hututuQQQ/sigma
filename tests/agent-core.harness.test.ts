@@ -3,11 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import {
-  genericValidationCommandSpecs,
-  runHarnessCommand,
-  validationCommandSpecs
-} from "../packages/agent-core/src/harness/validation.js";
+import { runHarnessCommand } from "../packages/agent-core/src/harness/validation.js";
+import { planValidationCommandSpecs } from "../packages/agent-core/src/harness/validation-planner.js";
 import {
   runAgentHarness,
   runAgentWithController,
@@ -184,38 +181,40 @@ describe("agent-core harness", () => {
     expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 
-  it("runs common changed validation scripts without treating ordinary files as scripts", () => {
-    const specs = genericValidationCommandSpecs([
-      "check.py",
-      "check-cert.py",
-      "check.cert.py",
-      "validate.sh",
-      "test.js",
-      "verify-log.py",
-      "main.py",
-      "parser.js"
-    ]);
+  it("plans cheap syntax checks for changed files", async () => {
+    const dir = await tempWorkspace();
+    const specs = await planValidationCommandSpecs({
+      workspacePath: dir,
+      changedFiles: [
+        "check.py",
+        "check-cert.py",
+        "check.cert.py",
+        "validate.sh",
+        "test.js",
+        "verify-log.py",
+        "main.py",
+        "parser.js"
+      ]
+    });
     const commands = specs.map((spec) => spec.command);
 
-    expect(commands).toEqual(expect.arrayContaining([
-      "python check.py",
-      "python check-cert.py",
-      "python check.cert.py",
-      "bash validate.sh",
-      "python verify-log.py"
-    ]));
-    expect(commands.some((command) => command.includes("node test.js"))).toBe(true);
+    expect(commands).toContain("python -m py_compile check.py");
+    expect(commands).toContain("python -m py_compile check-cert.py");
+    expect(commands).toContain("python -m py_compile check.cert.py");
+    expect(commands).toContain("bash -n validate.sh");
+    expect(commands).toContain("python -m py_compile verify-log.py");
     expect(commands).toContain("python -m py_compile main.py");
     expect(commands.some((command) => command.includes("node --check parser.js"))).toBe(true);
-    expect(commands).not.toContain("python main.py");
     expect(commands.some((command) => /(?:^|[ ;])node parser\.js(?:[ ;]|$)/.test(command))).toBe(false);
   });
 
-  it("combines explicitly configured validation with generic changed-file checks", () => {
-    const specs = validationCommandSpecs(
-      ["npm test"],
-      ["main.py"]
-    );
+  it("combines explicitly configured validation with v2 changed-file checks", async () => {
+    const dir = await tempWorkspace();
+    const specs = await planValidationCommandSpecs({
+      workspacePath: dir,
+      configuredCommands: ["npm test"],
+      changedFiles: ["main.py"]
+    });
 
     expect(specs.map((spec) => spec.source)).toEqual(["configured", "changed-file"]);
     expect(specs.map((spec) => spec.command)).toEqual(["npm test", "python -m py_compile main.py"]);
@@ -351,6 +350,7 @@ describe("agent-core harness", () => {
       workspacePath: dir,
       modelClient: model,
       validationMode: "auto",
+      finalEvidenceMode: "off",
       validationRetryLimit: 1,
       validationTimeoutSec: 5,
       permissionMode: "yolo",

@@ -1,5 +1,7 @@
 import type { ProviderName } from "agent-ai";
 import {
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_VALIDATION_MODE,
   redactSecretText,
   type AgentEvent,
   type AgentFinalEvidenceMode,
@@ -75,7 +77,7 @@ export function renderTopBar(options: RenderScreenOptions): string {
 }
 
 function validationState(options: RenderScreenOptions): string {
-  if (!options.result?.harness) return options.validationMode ?? "off";
+  if (!options.result?.harness) return options.validationMode ?? DEFAULT_VALIDATION_MODE;
   const failed = [...options.result.harness.validation_results, ...options.result.harness.precheck_results]
     .some((item) => item.exit_code !== 0);
   return failed ? "failed" : "ok";
@@ -143,7 +145,7 @@ function renderWorkbenchPanel(options: RenderScreenOptions, width: number, heigh
     "",
     roleColor("accent", "Checks", color),
     panelLine("validation", validationState(options), width),
-    panelLine("evidence", options.result?.finalGate?.status ?? options.finalEvidenceMode ?? "off", width),
+    panelLine("evidence", options.result?.finalGate?.status ?? options.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE, width),
     panelLine("tokens", usageSummary(options), width)
   ];
   return lines.slice(0, Math.max(1, height)).map((line) => fitStreamLine(line, width)).join("\n");

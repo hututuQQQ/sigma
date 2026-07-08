@@ -9,6 +9,9 @@ const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 export interface RepoMapV2Options {
   workspacePath: string;
   maxChars?: number;
+  maxFiles?: number;
+  maxFileBytes?: number;
+  maxIndexDurationMs?: number;
 }
 
 export interface GeneratedRepoMapV2 {
@@ -82,11 +85,33 @@ function sourceSymbolLines(graph: CodeGraphIndex): string[] {
     .map(([file, symbols]) => `- ${file}: ${[...new Set(symbols)].slice(0, 12).join(", ")}`);
 }
 
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number | undefined): Promise<T> {
+  if (!timeoutMs || timeoutMs <= 0) return await operation;
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`RepoMap v2 timed out after ${timeoutMs}ms.`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export async function generateRepoMapV2(options: RepoMapV2Options): Promise<GeneratedRepoMapV2> {
   const workspacePath = path.resolve(options.workspacePath);
   const maxChars = Math.max(1, Math.floor(options.maxChars ?? DEFAULT_REPO_MAP_MAX_CHARS));
   const [graph, discovery, git] = await Promise.all([
-    buildCodeGraphIndex({ workspacePath, maxFiles: 20000, maxFileBytes: 256000 }),
+    withTimeout(
+      buildCodeGraphIndex({
+        workspacePath,
+        maxFiles: options.maxFiles ?? 20000,
+        maxFileBytes: options.maxFileBytes ?? 256000
+      }),
+      options.maxIndexDurationMs
+    ),
     discoverProjects({ workspacePath }),
     gitSummary(workspacePath)
   ]);

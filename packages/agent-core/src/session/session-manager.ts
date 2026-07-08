@@ -102,7 +102,7 @@ export class SessionManager {
       checkpointsDir: paths.checkpointsDir,
       ...(options.traceJsonlPath ? { traceJsonlPath: path.resolve(options.traceJsonlPath) } : {}),
       ...(options.sessionJsonlPath ? { sessionJsonlPath: path.resolve(options.sessionJsonlPath) } : {}),
-      ...(options.summaryJsonPath ? { compatibilitySummaryPath: path.resolve(options.summaryJsonPath) } : {}),
+      ...(options.summaryJsonPath ? { runSummaryJsonPath: path.resolve(options.summaryJsonPath) } : {}),
       ...(options.parentSessionId ? { parentSessionId: options.parentSessionId } : {}),
       ...(options.forkedFromSessionId ? { forkedFromSessionId: options.forkedFromSessionId } : {})
     };

@@ -28,6 +28,7 @@ import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifes
 import { READ_ONLY_SUBAGENT_TOOLS } from "../subagents/subagent-runner.js";
 import { createSubtaskTool } from "../subagents/subtask-tool.js";
 import type { SubagentType } from "../types.js";
+import { DEFAULT_SUBAGENTS_ENABLED } from "../defaults.js";
 
 const FILE_MUTATING_TOOLS = new Set(["write", "edit", "apply_patch", "bash", "shell_session", "service"]);
 
@@ -548,19 +549,19 @@ function createReadOnlySubagentRegistry(_subagentType: SubagentType): ToolRegist
 }
 
 export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): ToolRegistry {
-  const subagentTools = _options.subagents?.enabled === true
+  const subagentTools = (_options.subagents?.enabled ?? DEFAULT_SUBAGENTS_ENABLED) === true
     ? [
         createSubtaskTool({
           toolName: "task",
           createToolRegistry: createReadOnlySubagentRegistry,
-          defaultMaxTurns: _options.subagents.defaultMaxTurns,
-          defaultMaxOutputChars: _options.subagents.defaultMaxOutputChars
+          defaultMaxTurns: _options.subagents?.defaultMaxTurns,
+          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars
         }),
         createSubtaskTool({
           toolName: "subtask",
           createToolRegistry: createReadOnlySubagentRegistry,
-          defaultMaxTurns: _options.subagents.defaultMaxTurns,
-          defaultMaxOutputChars: _options.subagents.defaultMaxOutputChars
+          defaultMaxTurns: _options.subagents?.defaultMaxTurns,
+          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars
         })
       ]
     : [];

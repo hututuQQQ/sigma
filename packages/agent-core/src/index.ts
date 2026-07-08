@@ -1,4 +1,11 @@
 export { runAgent, summaryJsonFromRunResult, writeRunSummary } from "./agent.js";
+export {
+  DEFAULT_COMPACTION_MODE,
+  DEFAULT_FINAL_EVIDENCE_MODE,
+  DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
+  DEFAULT_SUBAGENTS_ENABLED,
+  DEFAULT_VALIDATION_MODE
+} from "./defaults.js";
 export { runAgentHarness, runAgentHarness as runAgentWithController } from "./harness/index.js";
 export {
   runConfiguredAgent,

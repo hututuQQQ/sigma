@@ -4,6 +4,7 @@ import { AgentEventBus } from "./events.js";
 import { runAgentHarness } from "./harness/index.js";
 import { createMcpToolRegistry } from "./mcp.js";
 import { createDefaultToolRegistry, mergeToolRegistries } from "./tools/index.js";
+import { DEFAULT_COMPACTION_MODE } from "./defaults.js";
 import type {
   AgentEventBusLike,
   AgentFinalEvidenceMode,
@@ -55,8 +56,6 @@ export interface RunConfiguredAgentOptions {
   contextManagerFactory?: AgentHarnessConfig["contextManagerFactory"];
   compactionService?: import("./context/compaction-service.js").CompactionService;
   failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
-  validationPlanner?: unknown;
-  codeIndex?: unknown;
   subagentsEnabled?: boolean;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
@@ -157,8 +156,6 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     ...(defined(options.contextManagerFactory) ? { contextManagerFactory: options.contextManagerFactory } : {}),
     ...(defined(options.compactionService) ? { compactionService: options.compactionService } : {}),
     ...(defined(options.failureAnalyzer) ? { failureAnalyzer: options.failureAnalyzer } : {}),
-    ...(defined(options.validationPlanner) ? { validationPlanner: options.validationPlanner } : {}),
-    ...(defined(options.codeIndex) ? { codeIndex: options.codeIndex } : {}),
     ...(defined(options.subagentsEnabled) ? { subagentsEnabled: options.subagentsEnabled } : {}),
     ...(defined(options.subagentMaxTurns) ? { subagentMaxTurns: options.subagentMaxTurns } : {}),
     ...(defined(options.subagentMaxOutputChars) ? { subagentMaxOutputChars: options.subagentMaxOutputChars } : {}),
@@ -184,11 +181,12 @@ export async function runConfiguredAgent(
   options: RunConfiguredAgentOptions
 ): Promise<RunConfiguredAgentResult> {
   const eventBus = options.eventBus ?? new AgentEventBus();
+  const compactionMode = options.compactionMode ?? DEFAULT_COMPACTION_MODE;
   const modelClient = options.modelClient ?? (options.modelClientFactory ?? createModelClient)(options.provider, {
     model: options.model
   });
   const compactionModelClient = options.compactionModelClient ?? (
-    options.compactionMode === "model_sub_session" && (options.compactionModel || options.compactionProvider)
+    compactionMode === "model_sub_session" && (options.compactionModel || options.compactionProvider)
       ? (options.modelClientFactory ?? createModelClient)(options.compactionProvider ?? options.provider, {
           model: options.compactionModel
         })
