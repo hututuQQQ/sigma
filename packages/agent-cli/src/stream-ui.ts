@@ -51,6 +51,15 @@ function usageSummary(value: unknown): string {
   return `input=${input} output=${output} total=${total}`;
 }
 
+function sandboxWarning(metadata: Record<string, unknown> | undefined): string {
+  const sandbox = metadata?.sandbox;
+  if (!sandbox || typeof sandbox !== "object") return "";
+  const warning = (sandbox as Record<string, unknown>).warning;
+  return typeof warning === "string" && warning
+    ? ` sandbox_warning=${truncateMiddle(redactSecretText(warning.replace(/\s+/g, " ")), 140).text}`
+    : "";
+}
+
 export function formatAgentEvent(event: AgentEvent): string | null {
   switch (event.type) {
     case "run_start":
@@ -76,10 +85,11 @@ export function formatAgentEvent(event: AgentEvent): string | null {
     case "tool_end": {
       const result = event.metadata?.result as { ok?: unknown; content?: unknown; metadata?: Record<string, unknown> } | undefined;
       const duration = typeof result?.metadata?.durationMs === "number" ? ` duration_ms=${result.metadata.durationMs}` : "";
+      const warning = sandboxWarning(result?.metadata);
       const tail = typeof result?.content === "string" && result.content.trim()
         ? ` ${truncateMiddle(redactSecretText(result.content.replace(/\s+/g, " ").trim()), 120).text}`
         : "";
-      return `[sigma] tool_end ${toolNameFromEvent(event)} ${result?.ok === true ? "ok" : "failed"}${duration}${tail}`;
+      return `[sigma] tool_end ${toolNameFromEvent(event)} ${result?.ok === true ? "ok" : "failed"}${duration}${warning}${tail}`;
     }
     case "context_compaction_start":
       return `[sigma] context_compaction_start strategy=${String(event.metadata?.strategy ?? "?")} compacted_messages=${String(event.metadata?.compacted_message_count ?? "?")}`;
@@ -116,7 +126,7 @@ export function formatAgentEvent(event: AgentEvent): string | null {
     case "harness_check_start":
       return `[sigma] ${String(event.metadata?.kind ?? "check")}_start attempt=${String(event.metadata?.attempt ?? "?")} command=${truncateMiddle(redactSecretText(String(event.metadata?.command ?? "")).replace(/\s+/g, " "), 160).text}`;
     case "harness_check_end":
-      return `[sigma] ${String(event.metadata?.kind ?? "check")}_end attempt=${String(event.metadata?.attempt ?? "?")} exit=${String(event.metadata?.exitCode ?? "?")} duration_ms=${String(event.metadata?.durationMs ?? "?")}`;
+      return `[sigma] ${String(event.metadata?.kind ?? "check")}_end attempt=${String(event.metadata?.attempt ?? "?")} exit=${String(event.metadata?.exitCode ?? "?")} duration_ms=${String(event.metadata?.durationMs ?? "?")}${sandboxWarning(event.metadata)}`;
     case "usage":
       return `[sigma] usage turn=${String(event.metadata?.turn ?? "?")} ${usageSummary(event.metadata?.usage)}`;
     case "run_end": {

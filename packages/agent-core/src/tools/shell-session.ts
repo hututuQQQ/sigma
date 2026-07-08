@@ -1,9 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { truncateMiddle } from "../compaction.js";
-import { bashExecutable } from "../command-runner.js";
+import { spawnSandboxedInteractiveShell } from "../exec-runtime.js";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import {
+  evaluateExecPolicy,
   isProbablyMutatingCommand,
   requestToolPermission,
   resolveWorkspacePath,
@@ -29,6 +30,7 @@ interface ShellSessionRecord {
   stderr: string;
   startedAt: string;
   sequence: number;
+  sandbox?: Record<string, unknown>;
 }
 
 interface ShellSessionStore {
@@ -122,6 +124,18 @@ function extractMarker(stdout: string, marker: string): { found: boolean; stdout
   };
 }
 
+function isCmdSession(session: ShellSessionRecord): boolean {
+  return session.sandbox?.shell === "cmd.exe";
+}
+
+function markerCommand(session: ShellSessionRecord, input: string, marker: string): string {
+  const normalizedInput = input.endsWith("\n") ? input : `${input}\n`;
+  if (isCmdSession(session)) {
+    return `${normalizedInput}echo ${marker}:%errorlevel%\r\n`;
+  }
+  return `${normalizedInput}printf '\\n${marker}:%s\\n' "$?"\n`;
+}
+
 async function startSession(args: ShellSessionArgs, context: ToolExecutionContext, store: ShellSessionStore): Promise<ToolResult> {
   const denied = await requestToolPermission(context, {
     toolName: "shell_session",
@@ -140,12 +154,25 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
 
   const id = stringValue(args.sessionId) ?? randomUUID();
   if (store.sessions.has(id)) return { ok: false, content: `shell_session already exists: ${id}` };
-  const child = spawn(bashExecutable(), ["--noprofile", "--norc"], {
+  const policy = evaluateExecPolicy("bash --noprofile --norc", context.execPolicy);
+  if (policy.action === "deny") {
+    return { ok: false, content: policy.reason, metadata: { execPolicy: policy } };
+  }
+  const spawned = await spawnSandboxedInteractiveShell({
+    toolName: "shell_session",
     cwd,
     env: process.env,
-    detached: process.platform !== "win32",
-    windowsHide: true
+    policy,
+    context
   });
+  if ("allowed" in spawned) {
+    return {
+      ok: false,
+      content: spawned.reason ?? "Command was denied by sandbox policy.",
+      metadata: { execPolicy: policy, sandbox: spawned.metadata ?? { denied: true } }
+    };
+  }
+  const child = spawned.child;
   const session: ShellSessionRecord = {
     id,
     child,
@@ -153,7 +180,8 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
     stdout: "",
     stderr: "",
     startedAt: new Date().toISOString(),
-    sequence: 0
+    sequence: 0,
+    ...(spawned.sandbox ? { sandbox: spawned.sandbox } : {})
   };
   child.stdout.on("data", (chunk: Buffer) => {
     session.stdout = appendBounded(session.stdout, chunk.toString("utf8"));
@@ -172,7 +200,7 @@ async function startSession(args: ShellSessionArgs, context: ToolExecutionContex
   return {
     ok: true,
     content: `shell_session ${id} started cwd=${workspaceRelativePath(context.workspacePath, cwd) || "."}`,
-    metadata: { sessionId: id, cwd, startedAt: session.startedAt }
+    metadata: { sessionId: id, cwd, startedAt: session.startedAt, ...(session.sandbox ? { sandbox: session.sandbox } : {}) }
   };
 }
 
@@ -196,7 +224,7 @@ async function sendToSession(args: ShellSessionArgs, context: ToolExecutionConte
   readAndClear(session);
   session.sequence += 1;
   const marker = `__SIGMA_SESSION_DONE_${session.id.replace(/[^A-Za-z0-9_]/g, "_")}_${session.sequence}__`;
-  const command = `${input.endsWith("\n") ? input : `${input}\n`}printf '\\n${marker}:%s\\n' "$?"\n`;
+  const command = markerCommand(session, input, marker);
   session.child.stdin.write(command);
 
   const timeoutSec = numberValue(args.timeoutSec, context.commandTimeoutSec, 1, 3600);

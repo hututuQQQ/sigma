@@ -39,6 +39,9 @@ Common run flags:
   --workspace <path>
   --provider <deepseek|glm>
   --permission-mode <ask|yolo>
+  --sandbox <read-only|workspace-write|danger-full-access|policy-only|external>
+  --sandbox-required
+  --sandbox-network <default|restricted|disabled>
   --output-format <text|json|stream-json>
   --json
   --quiet
@@ -81,6 +84,16 @@ function completionScript(shell: string): string {
     "--provider",
     "--model",
     "--permission-mode",
+    "--sandbox",
+    "--sandbox-backend",
+    "--sandbox-required",
+    "--sandbox-network",
+    "--sandbox-add-read",
+    "--sandbox-add-write",
+    "--sandbox-deny-read",
+    "--sandbox-deny-write",
+    "--sandbox-external-command",
+    "--sandbox-external-args",
     "--max-turns",
     "--max-wall-time-sec",
     "--command-timeout-sec",
@@ -164,6 +177,7 @@ function tuiOptionsFromCliConfig(config: CliConfig): TuiAppOptions {
     maxTurns: config.maxTurns,
     maxWallTimeSec: config.maxWallTimeSec,
     commandTimeoutSec: config.commandTimeoutSec,
+    sandbox: config.sandbox,
     validationMode: config.validationMode,
     validationCommands: config.validationCommands,
     validationRetryLimit: config.validationRetryLimit,

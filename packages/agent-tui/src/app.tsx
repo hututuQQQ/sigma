@@ -14,6 +14,7 @@ import {
   type ContextMode,
   type PermissionMode,
   type PermissionRequest,
+  type SandboxConfig,
   type TokenTotals,
   buildResumeInstruction,
   listSessions,
@@ -95,6 +96,7 @@ export interface TuiAppOptions {
   maxTurns?: number;
   maxWallTimeSec?: number;
   commandTimeoutSec?: number;
+  sandbox?: SandboxConfig;
   validationMode?: AgentHarnessValidationMode;
   validationCommands?: string[];
   validationRetryLimit?: number;
@@ -963,6 +965,7 @@ export class TuiApp {
         provider: this.options.provider,
         model: this.options.model,
         permissionMode: this.options.permissionMode,
+        sandbox: this.options.sandbox,
         maxTurns: this.options.maxTurns,
         maxWallTimeSec: this.options.maxWallTimeSec,
         commandTimeoutSec: this.options.commandTimeoutSec,
@@ -1117,6 +1120,7 @@ export class TuiApp {
       provider: this.options.provider,
       model: this.options.model,
       permissionMode: this.options.permissionMode,
+      sandbox: this.options.sandbox,
       validationMode: this.options.validationMode,
       finalEvidenceMode: this.options.finalEvidenceMode,
       maxTurns: this.options.maxTurns,

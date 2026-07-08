@@ -221,10 +221,14 @@ async function runChecks(options: {
         kind: "validation",
         source: spec.source,
         command: spec.command,
-        workspacePath: spec.cwd ?? workspacePath,
+        workspacePath,
+        cwd: spec.cwd ?? workspacePath,
         attempt: options.attempt,
         timeoutSec: validationTimeoutSec,
         relatedFiles: spec.relatedFiles,
+        execPolicy: options.config.execPolicy,
+        sandbox: options.config.sandbox,
+        sandboxAdapter: options.config.sandboxAdapter,
         abortSignal: options.config.abortSignal
       });
       emitHarnessEvent(options.config, "harness_check_end", {
@@ -233,7 +237,8 @@ async function runChecks(options: {
         attempt: options.attempt,
         exitCode: result.exit_code,
         durationMs: result.duration_ms,
-        cwd: spec.cwd ?? workspacePath
+        cwd: spec.cwd ?? workspacePath,
+        sandbox: result.sandbox
       });
       results.push(result);
     }
@@ -266,9 +271,13 @@ async function runPrecheckBeforeAttempt(options: {
     source: "precheck",
     command,
     workspacePath: path.resolve(options.config.workspacePath),
+    cwd: path.resolve(options.config.workspacePath),
     attempt: options.attempt,
     timeoutSec: options.config.precheckTimeoutSec ?? DEFAULT_PRECHECK_TIMEOUT_SEC,
     relatedFiles: [],
+    execPolicy: options.config.execPolicy,
+    sandbox: options.config.sandbox,
+    sandboxAdapter: options.config.sandboxAdapter,
     abortSignal: options.config.abortSignal
   });
   emitHarnessEvent(options.config, "harness_check_end", {
@@ -276,7 +285,8 @@ async function runPrecheckBeforeAttempt(options: {
     source: "precheck",
     attempt: options.attempt,
     exitCode: result.exit_code,
-    durationMs: result.duration_ms
+    durationMs: result.duration_ms,
+    sandbox: result.sandbox
   });
   return result;
 }

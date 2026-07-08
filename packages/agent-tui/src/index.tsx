@@ -9,14 +9,19 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
-  PermissionMode
+  PermissionMode,
+  SandboxBackend,
+  SandboxConfig,
+  SandboxMode,
+  SandboxNetworkMode
 } from "agent-core";
 import {
   DEFAULT_COMPACTION_MODE,
   DEFAULT_FINAL_EVIDENCE_MODE,
   DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
   DEFAULT_SUBAGENTS_ENABLED,
-  DEFAULT_VALIDATION_MODE
+  DEFAULT_VALIDATION_MODE,
+  createDefaultSandboxConfig
 } from "agent-core";
 import { runTuiApp, type TuiAppOptions } from "./app.js";
 
@@ -32,6 +37,10 @@ Flags:
   --provider <deepseek|glm>      Model provider (default: deepseek)
   --model <name>                 Model name
   --permission-mode <ask|yolo>   Permission handling (default: ask)
+  --sandbox <read-only|workspace-write|danger-full-access|policy-only|external>
+  --sandbox-backend <auto|bubblewrap|seatbelt|windows|external|policy-only>
+  --sandbox-required
+  --sandbox-network <default|restricted|disabled>
   --max-turns <number>
   --max-wall-time-sec <number>
   --command-timeout-sec <number>
@@ -145,6 +154,74 @@ function permissionModeValue(value: string | true | undefined): PermissionMode {
   throw new Error("Unsupported permission mode. Use ask or yolo.");
 }
 
+function sandboxModeValue(value: string | true | undefined): SandboxMode | undefined {
+  if (value === undefined || value === true) return undefined;
+  if (
+    value === "read-only" ||
+    value === "workspace-write" ||
+    value === "danger-full-access" ||
+    value === "policy-only" ||
+    value === "policy_only" ||
+    value === "external" ||
+    value === "disabled"
+  ) return value;
+  if (value === "read_only") return "read-only";
+  if (value === "workspace_write") return "workspace-write";
+  throw new Error("Unsupported sandbox mode.");
+}
+
+function sandboxBackendValue(value: string | true | undefined): SandboxBackend | undefined {
+  if (value === undefined || value === true) return undefined;
+  if (
+    value === "auto" ||
+    value === "bubblewrap" ||
+    value === "seatbelt" ||
+    value === "windows" ||
+    value === "external" ||
+    value === "policy-only" ||
+    value === "policy_only"
+  ) return value;
+  throw new Error("Unsupported sandbox backend.");
+}
+
+function sandboxNetworkValue(value: string | true | undefined): SandboxNetworkMode | undefined {
+  if (value === undefined || value === true) return undefined;
+  if (value === "default" || value === "restricted" || value === "disabled") return value;
+  throw new Error("Unsupported sandbox network mode.");
+}
+
+function boolFlag(flags: Map<string, string | true>, name: string, fallback: boolean): boolean {
+  if (!flags.has(name)) return fallback;
+  const value = flags.get(name);
+  if (value === true) return true;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+function sandboxConfig(flags: Map<string, string | true>): SandboxConfig {
+  const defaults = createDefaultSandboxConfig();
+  const mode = sandboxModeValue(flags.get("sandbox")) ?? defaults.mode;
+  const backend = sandboxBackendValue(flags.get("sandbox-backend")) ?? defaults.backend;
+  const network = sandboxNetworkValue(flags.get("sandbox-network")) ?? "restricted";
+  const externalCommand = flags.get("sandbox-external-command");
+  return {
+    mode,
+    backend,
+    required: boolFlag(flags, "sandbox-required", defaults.required ?? false),
+    network: { mode: network, allowLocalhost: true },
+    filesystem: {
+      readRoots: stringList(flags.get("sandbox-add-read")),
+      writeRoots: stringList(flags.get("sandbox-add-write")),
+      denyRead: stringList(flags.get("sandbox-deny-read")),
+      denyWrite: stringList(flags.get("sandbox-deny-write"))
+    },
+    external: typeof externalCommand === "string"
+      ? { command: externalCommand, args: stringList(flags.get("sandbox-external-args")) }
+      : defaults.external
+  };
+}
+
 function validationModeValue(value: string | true | undefined): AgentHarnessValidationMode | undefined {
   if (value === undefined || value === true) return DEFAULT_VALIDATION_MODE;
   if (value === "off" || value === "auto") return value;
@@ -224,6 +301,7 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
     provider: providerValue(flags.get("provider")),
     model: typeof model === "string" ? model : undefined,
     permissionMode: permissionModeValue(flags.get("permission-mode")),
+    sandbox: sandboxConfig(flags),
     maxTurns: numberFlag(flags, "max-turns"),
     maxWallTimeSec: numberFlag(flags, "max-wall-time-sec"),
     commandTimeoutSec: numberFlag(flags, "command-timeout-sec"),

@@ -8,6 +8,7 @@ import {
   type AgentHarnessValidationMode,
   type AgentRunResult,
   type PermissionMode,
+  type SandboxConfig,
   type TokenTotals
 } from "agent-core";
 import { formatUsage, oneLine } from "../components/formatting.js";
@@ -27,6 +28,7 @@ export interface RenderScreenOptions {
   provider: ProviderName;
   model?: string;
   permissionMode: PermissionMode;
+  sandbox?: SandboxConfig;
   validationMode?: AgentHarnessValidationMode;
   finalEvidenceMode?: AgentFinalEvidenceMode;
   maxTurns?: number;
@@ -52,6 +54,13 @@ function stateName(options: RenderScreenOptions): string {
   return options.running ? "running" : options.result?.status ?? "idle";
 }
 
+function sandboxLabel(sandbox: SandboxConfig | undefined): string | null {
+  if (!sandbox) return null;
+  const network = typeof sandbox.network === "string" ? sandbox.network : sandbox.network?.mode;
+  const backend = sandbox.backend && sandbox.backend !== "auto" ? `/${sandbox.backend}` : "";
+  return `${sandbox.mode ?? "workspace-write"}${backend}${network ? `:${network}` : ""}`;
+}
+
 function stateRole(state: string, running: boolean): "danger" | "dim" | "success" | "warning" {
   if (running) return "warning";
   if (state === "error") return "danger";
@@ -67,9 +76,10 @@ export function renderTopBar(options: RenderScreenOptions): string {
   const state = stateName(options);
   const brand = roleColor("brand", sigmaBrandName(), options.color ?? false);
   const status = roleColor(stateRole(state, options.running), state, options.color ?? false);
+  const sandbox = sandboxLabel(options.sandbox);
   const chips = width < 72
     ? [options.mode, status]
-    : [`${options.provider}/${model}`, options.mode, options.permissionMode, status];
+    : [`${options.provider}/${model}`, options.mode, options.permissionMode, ...(sandbox ? [sandbox] : []), status];
   return fitStreamLine([
     brand,
     chips.join(` ${g.separator} `)

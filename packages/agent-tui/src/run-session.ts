@@ -10,7 +10,8 @@ import {
   type CompactionFallbackMode,
   type CompactionMode,
   type ContextMode,
-  type PermissionMode
+  type PermissionMode,
+  type SandboxConfig
 } from "agent-core";
 import type { TuiPermissionController } from "./permission.js";
 
@@ -23,6 +24,7 @@ export interface RunSessionOptions {
   maxTurns?: number;
   maxWallTimeSec?: number;
   commandTimeoutSec?: number;
+  sandbox?: SandboxConfig;
   validationMode?: AgentHarnessValidationMode;
   validationCommands?: string[];
   validationRetryLimit?: number;
@@ -82,6 +84,7 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       maxTurns: options.maxTurns,
       maxWallTimeSec: options.maxWallTimeSec,
       commandTimeoutSec: options.commandTimeoutSec,
+      sandbox: options.sandbox,
       validationMode: options.validationMode,
       validationCommands: options.validationCommands,
       validationRetryLimit: options.validationRetryLimit,
