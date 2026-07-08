@@ -98,4 +98,111 @@ describe("ToolRuntime", () => {
     expect(artifact?.path).toMatch(/\.agent\/artifacts\/runtime-test\/big_read-/);
     await expect(readFile(path.join(ctx.workspacePath, artifact?.path ?? ""), "utf8")).resolves.toBe("x".repeat(200));
   });
+
+  it("honors the default parallel tool limit for read-only batches", async () => {
+    const ctx = await context();
+    const tools = Array.from({ length: 6 }, (_, index): RegisteredTool => ({
+      definition: {
+        type: "function",
+        function: {
+          name: `read_${index}`,
+          description: "runtime test tool",
+          parameters: { type: "object", additionalProperties: false }
+        }
+      },
+      risk: "read",
+      runtime: { readOnly: true, supportsParallel: true },
+      execute: async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await sleep(40);
+        active -= 1;
+        return { ok: true, content: `read_${index}` };
+      }
+    }));
+    let active = 0;
+    let maxActive = 0;
+    const registry = createToolRegistryFromTools(tools);
+    const runtime = new ToolRuntime(registry, ctx);
+
+    await runtime.executeBatch(tools.map((registered, index) => call(String(index), registered.definition.function.name)), {
+      emit: async () => {},
+      execute: async (toolCall) => ({ result: await registry.execute(toolCall, ctx), value: {} })
+    });
+
+    expect(maxActive).toBeLessThanOrEqual(4);
+    expect(runtime.summary()).toMatchObject({ parallel_batches: 2, completed: 6 });
+  });
+
+  it("uses structured cancellation metadata instead of matching output text", async () => {
+    const ctx = await context();
+    const registry = createToolRegistryFromTools([
+      {
+        definition: {
+          type: "function",
+          function: {
+            name: "text_abort",
+            description: "returns abort-looking text",
+            parameters: { type: "object", additionalProperties: false }
+          }
+        },
+        risk: "read",
+        runtime: { readOnly: true, supportsParallel: true },
+        execute: async () => ({ ok: false, content: "operation aborted by upstream" })
+      },
+      {
+        definition: {
+          type: "function",
+          function: {
+            name: "structured_abort",
+            description: "returns cancellation metadata",
+            parameters: { type: "object", additionalProperties: false }
+          }
+        },
+        risk: "read",
+        runtime: { readOnly: true, supportsParallel: true },
+        execute: async () => ({ ok: false, content: "stopped", metadata: { cancelled: true, cancelReason: "test_cancelled" } })
+      }
+    ]);
+    const runtime = new ToolRuntime(registry, ctx);
+    const aborted: AgentEvent[] = [];
+
+    await runtime.executeBatch([call("text", "text_abort"), call("structured", "structured_abort")], {
+      emit: async (type, metadata, parentId) => {
+        const event = {
+          id: `${type}-${aborted.length}`,
+          timestamp: new Date().toISOString(),
+          type,
+          runId: "runtime-test",
+          metadata,
+          parentId
+        } as AgentEvent;
+        if (type === "tool_aborted") aborted.push(event);
+        return event;
+      },
+      execute: async (toolCall) => ({ result: await registry.execute(toolCall, ctx), value: {} })
+    });
+
+    expect(aborted).toHaveLength(1);
+    expect(aborted[0].metadata).toMatchObject({ toolCallId: "structured", reason: "test_cancelled" });
+  });
+
+  it("can write large-output artifacts outside the workspace", async () => {
+    const ctx = await context(40);
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-artifacts-"));
+    ctx.toolArtifactRootDir = artifactRoot;
+    const registry = createToolRegistryFromTools([
+      tool("big_external", { readOnly: true, output: "z".repeat(200) })
+    ]);
+    const runtime = new ToolRuntime(registry, ctx);
+    const [result] = await runtime.executeBatch([call("external-1", "big_external")], {
+      emit: async () => {},
+      execute: async (toolCall) => ({ result: await registry.execute(toolCall, ctx), value: {} })
+    });
+    const artifact = result.result.metadata?.toolArtifact as { path?: string } | undefined;
+
+    expect(artifact?.path).toContain(artifactRoot.split(path.sep).join("/"));
+    expect(artifact?.path).not.toContain(".agent/artifacts");
+    await expect(readFile(artifact?.path ?? "", "utf8")).resolves.toBe("z".repeat(200));
+  });
 });

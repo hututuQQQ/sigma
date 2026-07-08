@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ToolCall } from "agent-ai";
 import { truncateMiddle } from "./compaction.js";
+import { isPathInside } from "./policy.js";
 import type {
   AgentEvent,
   RegisteredTool,
@@ -15,12 +16,15 @@ import type {
   ToolRuntimeSummary
 } from "./types.js";
 
+const DEFAULT_PARALLEL_TOOL_LIMIT = 4;
+
 export interface ToolRuntimeExecution<T> {
   call: ToolCall;
   index: number;
   result: ToolResult;
   value: T;
   metadata: Required<Pick<ToolRuntimeMetadata, "readOnly" | "supportsParallel">> & ToolRuntimeMetadata;
+  startEventId?: string;
 }
 
 export interface ToolRuntimeCallbacks<T> {
@@ -59,11 +63,32 @@ function mergeRuntimeMetadata(tool: RegisteredTool | undefined): RuntimeCall["me
 }
 
 function isAbortResult(result: ToolResult): boolean {
-  return result.metadata?.cancelled === true || /cancelled|aborted/i.test(result.content);
+  return result.metadata?.cancelled === true || result.metadata?.aborted === true;
+}
+
+function abortReason(result: ToolResult): string {
+  const reason = result.metadata?.cancelReason ?? result.metadata?.abortReason;
+  return typeof reason === "string" && reason.trim() ? reason : "abort_signal";
+}
+
+function isAbortError(error: unknown, abortSignal?: AbortSignal): boolean {
+  return abortSignal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+}
+
+function parallelToolLimit(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_PARALLEL_TOOL_LIMIT;
+  return Math.max(1, Math.floor(value));
 }
 
 function artifactSafeName(toolName: string): string {
   return toolName.replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 48) || "tool";
+}
+
+function displayArtifactPath(workspacePath: string, artifactPath: string): string {
+  if (isPathInside(workspacePath, artifactPath)) {
+    return path.relative(workspacePath, artifactPath).split(path.sep).join("/");
+  }
+  return path.resolve(artifactPath).split(path.sep).join("/");
 }
 
 export class ToolRuntime {
@@ -117,11 +142,12 @@ export class ToolRuntime {
 
     const executions = new Array<ToolRuntimeExecution<T>>(planned.length);
     let cursor = 0;
+    const parallelLimit = parallelToolLimit(this.context.maxParallelToolCalls);
     while (cursor < planned.length) {
       const first = planned[cursor];
       if (first.metadata.supportsParallel) {
         const batch: RuntimeCall[] = [];
-        while (cursor < planned.length && planned[cursor].metadata.supportsParallel) {
+        while (cursor < planned.length && planned[cursor].metadata.supportsParallel && batch.length < parallelLimit) {
           batch.push(planned[cursor]);
           cursor += 1;
         }
@@ -129,6 +155,7 @@ export class ToolRuntime {
         await callbacks.emit("tool_progress", {
           phase: "parallel_batch_start",
           size: batch.length,
+          concurrencyLimit: parallelLimit,
           toolNames: batch.map((item) => item.call.function.name)
         });
         const batchResults = await Promise.all(batch.map((item) => this.executeOne(item, callbacks)));
@@ -183,9 +210,11 @@ export class ToolRuntime {
       value = executed.value;
       eventMetadata = executed.eventMetadata ?? {};
     } catch (error) {
+      const cancelled = isAbortError(error, this.context.abortSignal);
       result = {
         ok: false,
-        content: error instanceof Error ? error.message : String(error)
+        content: error instanceof Error ? error.message : String(error),
+        ...(cancelled ? { metadata: { cancelled: true, cancelReason: "abort_signal" } } : {})
       };
       value = undefined as T;
     }
@@ -196,7 +225,7 @@ export class ToolRuntime {
         toolCallId: item.call.id,
         toolName: item.call.function.name,
         index: item.index,
-        reason: result.content
+        reason: abortReason(result)
       }, parentId);
     }
     if (result.ok) this.completed += 1;
@@ -217,7 +246,8 @@ export class ToolRuntime {
       index: item.index,
       result,
       value,
-      metadata: item.metadata
+      metadata: item.metadata,
+      ...(parentId ? { startEventId: parentId } : {})
     };
   }
 
@@ -226,7 +256,8 @@ export class ToolRuntime {
     if (result.content.length <= budget) return result;
     const runId = this.context.runId ?? "run";
     const artifactId = randomUUID();
-    const artifactDir = path.join(this.context.workspacePath, ".agent", "artifacts", runId);
+    const artifactRoot = path.resolve(this.context.toolArtifactRootDir ?? path.join(this.context.workspacePath, ".agent", "artifacts"));
+    const artifactDir = path.join(artifactRoot, runId);
     const artifactPath = path.join(artifactDir, `${artifactSafeName(call.function.name)}-${artifactId}.txt`);
     await mkdir(artifactDir, { recursive: true });
     await writeFile(artifactPath, result.content, "utf8");
@@ -235,7 +266,7 @@ export class ToolRuntime {
       id: artifactId,
       tool_call_id: call.id,
       tool_name: call.function.name,
-      path: path.relative(this.context.workspacePath, artifactPath).split(path.sep).join("/"),
+      path: displayArtifactPath(this.context.workspacePath, artifactPath),
       bytes: Buffer.byteLength(result.content, "utf8"),
       original_chars: result.content.length,
       retained_chars: truncated.text.length

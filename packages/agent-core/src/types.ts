@@ -244,6 +244,8 @@ export interface ToolExecutionContext {
   permissionMode: PermissionMode;
   commandTimeoutSec: number;
   maxToolOutputChars: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   permissionDecider?: PermissionDecider;
   runState: AgentRunState;
   alwaysAllowTools: Set<string>;
@@ -393,6 +395,8 @@ export interface AgentRunConfig {
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
   maxToolOutputChars?: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;

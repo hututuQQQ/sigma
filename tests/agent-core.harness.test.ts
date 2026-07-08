@@ -372,6 +372,37 @@ describe("agent-core harness", () => {
     await expect(stat(path.join(attemptsDir, "attempt-2", "summary.json"))).resolves.toBeTruthy();
   });
 
+  it("stores large tool output artifacts under attempt directories", async () => {
+    const dir = await tempWorkspace();
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-harness-artifacts-"));
+    const attemptsDir = path.join(runDir, "attempts");
+    const summaryPath = path.join(runDir, "summary.json");
+    const payload = "HARNESS_FULL_OUTPUT_".repeat(80);
+    const model = new SequenceModel([
+      bashResponse(`printf '${payload}'`),
+      finalResponse("done")
+    ]);
+
+    const result = await runAgentHarness({
+      instruction: "capture large output",
+      workspacePath: dir,
+      modelClient: model,
+      validationMode: "off",
+      finalEvidenceMode: "off",
+      reviewAntiGaming: false,
+      permissionMode: "yolo",
+      maxToolOutputChars: 80,
+      summaryJsonPath: summaryPath,
+      attemptsDir
+    });
+
+    const artifact = result.toolRuntime?.artifacts[0];
+    expect(result.status).toBe("completed");
+    expect(artifact?.path).toContain(attemptsDir.split(path.sep).join("/"));
+    await expect(readFile(artifact?.path ?? "", "utf8")).resolves.toContain(payload);
+    await expect(stat(path.join(dir, ".agent", "artifacts"))).rejects.toThrow();
+  });
+
   it("returns a failed result when validation retry limit is exhausted", async () => {
     const dir = await tempWorkspace();
     const model = new SequenceModel([writeResponse("bad.js", "function nope(\n"), finalResponse()]);

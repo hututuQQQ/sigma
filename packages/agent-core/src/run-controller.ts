@@ -50,6 +50,8 @@ export interface RunConfiguredAgentOptions {
   sessionJsonlPath?: string;
   summaryJsonPath?: string;
   maxToolOutputChars?: number;
+  maxParallelToolCalls?: number;
+  toolArtifactRootDir?: string;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
@@ -164,6 +166,8 @@ function baseRunConfig(
     ...(defined(options.sessionJsonlPath) ? { sessionJsonlPath: options.sessionJsonlPath } : {}),
     ...(defined(options.summaryJsonPath) ? { summaryJsonPath: options.summaryJsonPath } : {}),
     ...(defined(options.maxToolOutputChars) ? { maxToolOutputChars: options.maxToolOutputChars } : {}),
+    ...(defined(options.maxParallelToolCalls) ? { maxParallelToolCalls: options.maxParallelToolCalls } : {}),
+    ...(defined(options.toolArtifactRootDir) ? { toolArtifactRootDir: options.toolArtifactRootDir } : {}),
     maxMessageHistoryChars: resolved.maxMessageHistoryChars,
     ...(defined(options.messageHistoryRetain) ? { messageHistoryRetain: options.messageHistoryRetain } : {}),
     ...(defined(options.compactionSummaryChars) ? { compactionSummaryChars: options.compactionSummaryChars } : {}),

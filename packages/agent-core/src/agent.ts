@@ -324,6 +324,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     permissionMode: config.permissionMode ?? "ask",
     commandTimeoutSec: config.commandTimeoutSec ?? DEFAULT_COMMAND_TIMEOUT_SEC,
     maxToolOutputChars: config.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+    ...(config.maxParallelToolCalls !== undefined ? { maxParallelToolCalls: config.maxParallelToolCalls } : {}),
+    ...(config.toolArtifactRootDir !== undefined ? { toolArtifactRootDir: config.toolArtifactRootDir } : {}),
     permissionDecider: config.permissionDecider,
     runState: {
       todos: [],
@@ -731,7 +733,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             provider,
             model,
             { turn: turns, turnId, toolName: call.function.name, analysis: failureAnalysis },
-            undefined,
+            execution.startEventId,
             durableSession?.sessionId
           ));
         }
@@ -760,7 +762,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       finishReason = "max_turns";
     }
   } catch (error) {
-    if (config.abortSignal?.aborted || (error instanceof Error && /cancelled|aborted/i.test(error.message))) {
+    if (config.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
       finishReason = "cancelled";
       lastError = error instanceof Error ? error.message : "Run cancelled.";
       await recordEvent(event(runId, "run_abort", provider, model, { message: lastError }, undefined, durableSession?.sessionId));

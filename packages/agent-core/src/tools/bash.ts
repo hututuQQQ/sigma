@@ -1,5 +1,4 @@
 import type { ToolExecutionContext, ToolResult } from "../types.js";
-import { truncateMiddle } from "../compaction.js";
 import { evaluateExecPolicy, requestToolPermission, resolveWorkspacePath } from "../policy.js";
 import { runBashCommand } from "../command-runner.js";
 import { createPolicyOnlySandboxAdapter } from "../sandbox.js";
@@ -134,16 +133,15 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
     result.timedOut,
     result.cancelled
   );
-  const truncated = truncateMiddle(content, context.maxToolOutputChars);
   return {
     ok: !result.timedOut && !result.cancelled && result.exitCode === 0,
-    content: truncated.text,
+    content,
     metadata: {
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       stdoutBytes: result.stdout.byteLength,
       stderrBytes: result.stderr.byteLength,
-      truncated: truncated.truncated,
+      truncated: false,
       settledOn: result.settledOn,
       signal: result.signal,
       timedOut: result.timedOut,

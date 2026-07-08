@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentEvent, AgentRunResult, PermissionRequest } from "../packages/agent-core/src/index.js";
 import { approvalPromptLines } from "../packages/agent-tui/src/components/approval-prompt.js";
 import { renderDiffLines } from "../packages/agent-tui/src/components/diff-panel.js";
+import { ToolPanel } from "../packages/agent-tui/src/components/tool-panel.js";
 import { createComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { mergeDisabledToolsForMode, PLAN_DISABLED_TOOLS } from "../packages/agent-tui/src/mode.js";
 import { renderScreen } from "../packages/agent-tui/src/render/screen.js";
@@ -416,6 +417,24 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("read");
     expect(rendered).toContain("context 123 est tokens");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
+  it("dedupes terminal tool events in the tool panel", () => {
+    const start = event("tool_start", {
+      toolCall: { id: "call-1", function: { name: "bash", arguments: { command: "sleep 5" } } },
+      toolCallId: "call-1",
+      toolName: "bash"
+    });
+    const aborted = event("tool_aborted", { toolCallId: "call-1", toolName: "bash", reason: "abort_signal" }, start.id);
+    const end = event("tool_end", {
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { ok: false, content: "Tool call cancelled.", metadata: { cancelled: true } }
+    }, start.id);
+
+    const rendered = ToolPanel([start, aborted, end], null, 96, undefined, false);
+
+    expect(rendered.match(/bash aborted/g)).toHaveLength(1);
   });
 
   it("redacts approval details and truncates diff output with color disabled", () => {

@@ -41,10 +41,29 @@ function groupedTools(tools: string[], width: number): string[] {
   return lines;
 }
 
+function terminalToolKey(event: AgentEvent): string {
+  const callId = event.metadata?.toolCallId;
+  if (event.parentId) return `parent:${event.parentId}`;
+  if (typeof callId === "string" && callId.length > 0) return `call:${callId}`;
+  return `event:${event.id}`;
+}
+
+function recentTerminalToolEvents(events: AgentEvent[], limit: number): AgentEvent[] {
+  const byKey = new Map<string, { event: AgentEvent; index: number }>();
+  events.forEach((event, index) => {
+    if (event.type !== "tool_end" && event.type !== "tool_aborted") return;
+    byKey.set(terminalToolKey(event), { event, index });
+  });
+  return [...byKey.values()]
+    .sort((a, b) => a.index - b.index)
+    .map((item) => item.event)
+    .slice(-limit);
+}
+
 export function ToolPanel(events: AgentEvent[], result: AgentRunResult | null, width = 80, height?: number, color = false): string {
   const g = glyphs();
   const innerWidth = Math.max(20, width - 4);
-  const toolEvents = events.filter((event) => event.type === "tool_end" || event.type === "tool_aborted").slice(-8);
+  const toolEvents = recentTerminalToolEvents(events, 8);
   const startsById = new Map(events.filter((event) => event.type === "tool_start").map((event) => [event.id, event]));
   const lines = [
     "Available",

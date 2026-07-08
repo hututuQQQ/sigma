@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { AgentEventBus, runAgent } from "../packages/agent-core/src/index.js";
+import { AgentEventBus, runAgent, type AgentEvent } from "../packages/agent-core/src/index.js";
 
 class FakeModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -159,7 +159,11 @@ describe("agent loop", () => {
     const summaryPath = path.join(dir, "summary.json");
     const eventBus = new AgentEventBus();
     const events: string[] = [];
-    eventBus.on((event) => events.push(event.type));
+    const agentEvents: AgentEvent[] = [];
+    eventBus.on((event) => {
+      events.push(event.type);
+      agentEvents.push(event);
+    });
     const model = new FakeModel([
       {
         message: {
@@ -187,6 +191,9 @@ describe("agent loop", () => {
 
     expect(result.status).toBe("completed");
     expect(events).toContain("failure_analysis");
+    const toolStart = agentEvents.find((event) => event.type === "tool_start");
+    const failureAnalysis = agentEvents.find((event) => event.type === "failure_analysis");
+    expect(failureAnalysis?.parentId).toBe(toolStart?.id);
     expect(result.failureAnalyses?.[0]).toMatchObject({ category: "segmentation_fault", confidence: expect.any(Number) });
     expect(result.workflow?.failure_patterns).toEqual([
       expect.objectContaining({ category: "segmentation_fault", count: 1, last_exit_code: 139 })
@@ -456,6 +463,41 @@ describe("agent loop", () => {
     expect(result.toolRuntime).toMatchObject({ queued: 2, completed: 2, parallel_batches: 1 });
     expect(result.contextBudget?.message_count).toBeGreaterThan(0);
     expect(events).toEqual(expect.arrayContaining(["turn_start", "context_budget", "tool_queued", "tool_start", "tool_end"]));
+  });
+
+  it("stores complete bash output artifacts through the runtime", async () => {
+    const dir = await tempWorkspace();
+    const payload = "SIGMA_FULL_OUTPUT_".repeat(80);
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-bash",
+              type: "function",
+              function: { name: "bash", arguments: { command: `printf '${payload}'` } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "capture large output",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxToolOutputChars: 80
+    });
+
+    const artifact = result.toolRuntime?.artifacts[0];
+    expect(artifact).toBeTruthy();
+    const artifactPath = path.isAbsolute(artifact?.path ?? "") ? artifact?.path ?? "" : path.join(dir, artifact?.path ?? "");
+    const artifactText = await readFile(artifactPath, "utf8");
+    expect(artifactText).toContain(payload);
+    expect(result.status).toBe("completed");
   });
 
   it("cancels before a model request", async () => {
