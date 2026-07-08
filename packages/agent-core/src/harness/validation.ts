@@ -6,6 +6,7 @@ export interface ValidationCommandSpec {
   source: string;
   command: string;
   relatedFiles: string[];
+  cwd?: string;
 }
 
 function tailText(text: string, limit = 4000): string {

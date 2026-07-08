@@ -98,6 +98,10 @@ describe("agent loop", () => {
 
   it("records generic failure patterns and nudges the next turn toward repair", async () => {
     const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const eventBus = new AgentEventBus();
+    const events: string[] = [];
+    eventBus.on((event) => events.push(event.type));
     const model = new FakeModel([
       {
         message: {
@@ -118,13 +122,19 @@ describe("agent loop", () => {
       instruction: "debug a failing command",
       workspacePath: dir,
       modelClient: model,
-      permissionMode: "yolo"
+      permissionMode: "yolo",
+      eventBus,
+      summaryJsonPath: summaryPath
     });
 
     expect(result.status).toBe("completed");
+    expect(events).toContain("failure_analysis");
+    expect(result.failureAnalyses?.[0]).toMatchObject({ category: "segmentation_fault", confidence: expect.any(Number) });
     expect(result.workflow?.failure_patterns).toEqual([
       expect.objectContaining({ category: "segmentation_fault", count: 1, last_exit_code: 139 })
     ]);
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.failure_analyses[0]).toMatchObject({ category: "segmentation_fault" });
     expect(
       model.requests[1].messages.some(
         (message) => message.role === "user" && message.content.includes("Workflow repair signal")
@@ -244,6 +254,10 @@ describe("agent loop", () => {
 
   it("compacts old messages without leaving an orphan tool message at the retained tail", async () => {
     const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const eventBus = new AgentEventBus();
+    const events: string[] = [];
+    eventBus.on((event) => events.push(event.type));
     const model = new FakeModel([
       {
         message: {
@@ -280,10 +294,21 @@ describe("agent loop", () => {
       maxTurns: 3,
       maxMessageHistoryChars: 1000,
       messageHistoryRetain: 2,
-      compactionSummaryChars: 500
+      compactionSummaryChars: 500,
+      eventBus,
+      summaryJsonPath: summaryPath
     });
 
     expect(result.status).toBe("completed");
+    expect(events).toEqual(expect.arrayContaining(["context_compaction_start", "context_compaction_end"]));
+    expect(result.contextCompactions?.[0]).toMatchObject({
+      strategy: "deterministic",
+      before_message_count: expect.any(Number),
+      compacted_message_count: expect.any(Number),
+      fallback_used: false
+    });
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.context_compactions[0]).toMatchObject({ strategy: "deterministic" });
     const thirdRequestMessages = model.requests[2].messages;
     expect(thirdRequestMessages[0].role).toBe("system");
     expect(thirdRequestMessages[1]).toMatchObject({ role: "user", content: "make lots of output" });

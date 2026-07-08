@@ -11,7 +11,7 @@ A small coding-agent monorepo inspired by Pi with four layers:
 - `packages/agent-cli`: plain terminal CLI with `run`, `solve` compatibility alias, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
 - `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
-Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, and stdio/HTTP MCP tools. There is intentionally no large web UI, sub-agent system, plugin marketplace, long-term memory, or Docker sandbox in this repo.
+Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, read-only task subagents, and stdio/HTTP MCP tools. There is intentionally no large web UI, plugin marketplace, long-term memory, or Docker sandbox in this repo.
 
 ## Install And Build
 
@@ -336,6 +336,9 @@ Adapter report notes:
 --max-message-history-chars <number>
 --message-history-retain <number>
 --compaction-summary-chars <number>
+--compaction-mode <off|deterministic|model-sub-session>
+--compaction-model <model>
+--compaction-timeout-sec <number>
 --validation-mode <off|auto>
 --validation-retry-limit <number>
 --validation-timeout-sec <number>
@@ -356,6 +359,10 @@ Adapter report notes:
 --final-evidence-mode <off|auto>
 --skills-mode <off|auto>
 --skills-max-chars <number>
+--subagents-enabled
+--subagent-max-turns <number>
+--subagent-max-output-chars <number>
+--review-anti-gaming / --no-review-anti-gaming
 --enable-mcp
 --mcp-config <path>
 --stream-ui
@@ -378,6 +385,18 @@ mode = "auto"
 retry_limit = 1
 commands = ["pnpm test", "pnpm lint"]
 
+[context]
+compaction_mode = "model_sub_session"
+compaction_timeout_sec = 60
+
+[subagents]
+enabled = true
+max_turns = 4
+max_output_chars = 12000
+
+[review]
+anti_gaming = true
+
 [tools]
 allowed = ["read", "write", "edit", "bash", "validate"]
 disabled = []
@@ -392,9 +411,11 @@ stream_ui = true
 
 Local `agent run` and `agent solve` default to `--validation-mode off`. Validation commands come only from explicit CLI/config settings or the generic changed-file strategy used by `--validation-mode auto`; assistant final text is never parsed for validation commands. External adapters may pass `--validation-mode auto` plus retry, precheck, cleanup, and attempts settings when those run-controller behaviors are wanted.
 
+Validation planning is discovery-driven. When auto validation is enabled, Sigma first runs user-configured validation commands, then cheap changed-file syntax checks, focused tests for changed test files, package-level checks for the most specific affected package/root, and finally broader project checks only when changed metadata gives a reason. Each planned candidate records command, cwd, scope, kind, cost, related files, reason, timeout, and analyzer hints in `validation_plan`.
+
 `--precheck-command` runs before each agent attempt. A failing precheck records `precheck_failed` and stops before the model is called.
 
-`--validation-mode auto` also defaults `--final-evidence-mode auto`, which gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. Set `--final-evidence-mode off` to preserve the older stop behavior. When skills are enabled, selected skill names and sources are recorded in summary JSON.
+`--validation-mode auto` also defaults `--final-evidence-mode auto`, which gives the model one extra nudge if it tries to finish a code or executable task without successful executable verification evidence. In either auto mode, the generic anti-gaming review gate scans the local diff for hardcoded task identity, evaluator probing, fake validation, and product-core scoring hooks. Suspicious findings trigger one generic repair nudge; blocked findings are recorded in `review_findings`. Set `--no-review-anti-gaming` to disable that gate for local runs. Set `--final-evidence-mode off` to preserve the older stop behavior. When skills are enabled, selected skill names and sources are recorded in summary JSON.
 
 Environment variables mirror the new flags. `AGENT_HARNESS_TIMEOUT_SEC` is the compatibility spelling for the run-controller timeout:
 
@@ -415,9 +436,20 @@ AGENT_NO_PROJECT_INSTRUCTIONS
 AGENT_PROJECT_DOC_MAX_BYTES
 AGENT_CONTEXT_MODE
 AGENT_REPO_MAP_MAX_CHARS
+AGENT_COMPACTION_MODE
+AGENT_COMPACTION_MODEL
+AGENT_COMPACTION_PROVIDER
+AGENT_COMPACTION_MAX_INPUT_CHARS
+AGENT_COMPACTION_MAX_OUTPUT_CHARS
+AGENT_COMPACTION_TIMEOUT_SEC
+AGENT_COMPACTION_FALLBACK
 AGENT_FINAL_EVIDENCE_MODE
 AGENT_SKILLS_MODE
 AGENT_SKILLS_MAX_CHARS
+AGENT_SUBAGENTS_ENABLED
+AGENT_SUBAGENT_MAX_TURNS
+AGENT_SUBAGENT_MAX_OUTPUT_CHARS
+AGENT_REVIEW_ANTI_GAMING
 AGENT_ENABLE_MCP
 AGENT_MCP_CONFIG
 AGENT_OUTPUT_FORMAT
@@ -452,6 +484,7 @@ The core loop exposes these default tools:
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `validate`: runs an explicit validation command or infers one for changed files, a file, or the project. It returns structured `ok`, `command`, `kind`, `exitCode`, output tails, related files, and best-effort diagnostics.
 - `todo`: maintains run-scoped todo state for the agent.
+- `task` / `subtask`: when `--subagents-enabled` is set, runs a foreground read-only investigator or reviewer subagent and returns a structured JSON report. Child subagents receive only `read`, `list`, `glob`, `grep`, `repo_query`, `symbol_search`, `git_status`, and `git_diff`; they cannot write files, run shells, start services, or spawn nested subagents.
 - `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
 Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and is intended only for trusted unattended automation.
@@ -480,9 +513,17 @@ The current implementation loads from the workspace root and is structured for n
 
 Local `agent run` and `agent solve` default to `--context-mode repo-map`. The startup repo map is deterministic and budgeted; it includes a bounded file tree, package scripts, pnpm workspace patterns, TypeScript references, exported TS/JS symbols, Python and shell symbols, test file paths, `.agent/config.toml` presence, and a small git state summary. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
 
+Conversation compaction defaults to deterministic local summarization for compatibility. Set `--compaction-mode model-sub-session` or `[context].compaction_mode = "model_sub_session"` to ask a model sub-session to produce the structured compaction artifact. The sub-session request is read-only, uses `toolChoice: "none"` with no tools, receives clipped structured history instead of raw large tool output, and falls back to deterministic compaction unless `compaction_fallback = "fail"` is configured. Set `--compaction-mode off` to disable history compaction entirely.
+
 Repo map generation, `repo_query`, `symbol_search`, and `read_many` share the same workspace path safety and ignore behavior. The walker honors built-in skips plus workspace `.gitignore` and `.agentignore`. `repo_query` and `symbol_search` use a lightweight code index during tool calls; mutating tools invalidate that index after detected changes so subsequent lookups see fresh files.
 
+Repo map v2 and `repo_query` use a lightweight graph index by default. It records symbols, definitions, imports, exports, references, config files, dependency edges, and test-to-source relations without requiring native parser dependencies. `repo_query` results keep the old fields and add `graphSignals` plus `why_this_file` to explain why a file ranked highly.
+
 Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
+
+Read-only subagents are opt-in with `--subagents-enabled` or `[subagents].enabled = true`. `investigator` is intended for locating files, reading failure logs, and suggesting validation plans. `reviewer` is intended for diff review, unrelated-change checks, validation gaps, and generic integrity concerns. Parent runs receive only the compact JSON report in the `task`/`subtask` tool result and `subagent_runs`; child transcripts are not inherited by the parent model.
+
+The anti-gaming review gate is generic policy infrastructure, not a benchmark shortcut. It scans added diff lines for patterns such as hardcoded task IDs, evaluator environment/path probes, fake validation results, scoring control flow, and product-core evaluator terminology. External adapter paths under `portable/harbor` and `scripts/bench-*` may contain adapter vocabulary, but product packages must remain free of task/verifier/scoring-specific behavior.
 
 ## MCP Tools
 
@@ -579,6 +620,43 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
   "project_instruction_sources": ["AGENTS.md"],
   "context_mode": "repo-map",
   "repo_map_chars": 14200,
+  "context_compactions": [
+    {
+      "strategy": "deterministic",
+      "before_message_count": 30,
+      "after_message_count": 12,
+      "compacted_message_count": 18,
+      "fallback_used": false,
+      "duration_ms": 8
+    }
+  ],
+  "validation_plan": {
+    "workspacePath": "/repo",
+    "candidates": [
+      {
+        "command": "python -m py_compile app.py",
+        "cwd": "/repo",
+        "scope": "syntax",
+        "kind": "compile",
+        "cost": "cheap",
+        "relatedFiles": ["app.py"],
+        "reason": "Changed Python file can be bytecode-compiled cheaply.",
+        "timeoutSec": 60,
+        "analyzerHints": ["python", "compile"],
+        "source": "changed-file"
+      }
+    ],
+    "skipped": []
+  },
+  "code_index": {
+    "file_count": 120,
+    "symbol_count": 380,
+    "definition_count": 260,
+    "dependency_edge_count": 190,
+    "test_to_source_count": 42,
+    "config_files": ["package.json", "tsconfig.json"],
+    "truncated": false
+  },
   "mcp_servers": [
     {
       "name": "local",
@@ -592,6 +670,14 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
     "commands_tried": ["pnpm test"],
     "changed_files": ["src/index.ts"]
   },
+  "failure_analyses": [
+    {
+      "category": "test_failure",
+      "confidence": 0.84,
+      "primaryMessage": "FAILED tests/app.test.ts::test_total - AssertionError",
+      "suggestedNextAction": "Use the failing test assertion or test name as the repair target, make one focused change, then rerun the same test or a narrower related test."
+    }
+  ],
   "evidence": [
     {
       "kind": "test",
@@ -611,6 +697,31 @@ When `--enable-mcp` is set, enabled server startup/listing failures are reported
     {
       "name": "node-typescript",
       "source": "built-in"
+    }
+  ],
+  "subagent_runs": [
+    {
+      "id": "8e0c...",
+      "subagent_type": "reviewer",
+      "description": "Review the diff",
+      "status": "ok",
+      "summary": "The diff is focused and validation is covered.",
+      "findings": [],
+      "relevant_files": ["src/index.ts"],
+      "validation_suggestions": ["pnpm test"],
+      "risks": [],
+      "tool_calls": 2,
+      "duration_ms": 950
+    }
+  ],
+  "review_findings": [
+    {
+      "gate": "anti_gaming",
+      "status": "clean",
+      "findings": [],
+      "suggested_fixes": [],
+      "scanned_files": ["src/index.ts"],
+      "duration_ms": 12
     }
   ],
   "harness": {

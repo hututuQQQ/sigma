@@ -2,7 +2,8 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { planValidationCommandSpecs } from "../packages/agent-core/src/harness/validation-planner.js";
+import { planValidation, planValidationCommandSpecs } from "../packages/agent-core/src/harness/validation-planner.js";
+import { createValidationPlan, discoverProjects } from "../packages/agent-core/src/index.js";
 
 async function tempWorkspace(): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), "sigma-validation-planner-"));
@@ -76,6 +77,36 @@ describe("validation planner", () => {
     expect(commands.join("\n")).not.toContain("npx");
   });
 
+  it("targets the nested pnpm package affected by a changed file", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n", "utf8");
+    await writeFile(path.join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+    await writeFile(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: "vitest run" } }), "utf8");
+    await mkdir(path.join(dir, "packages", "app"), { recursive: true });
+    await writeFile(
+      path.join(dir, "packages", "app", "package.json"),
+      JSON.stringify({ scripts: { test: "vitest run", typecheck: "tsc --noEmit" } }),
+      "utf8"
+    );
+
+    const plan = await createValidationPlan({ workspacePath: dir, changedFiles: ["packages/app/src/main.ts"] });
+    const commands = plan.candidates.map((candidate) => candidate.command);
+
+    expect(plan.candidates.every((candidate) => candidate.cwd === path.join(dir, "packages", "app"))).toBe(true);
+    expect(commands).toContain("if command -v pnpm >/dev/null 2>&1; then pnpm run typecheck; else echo 'pnpm not found for validation' >&2; exit 127; fi");
+    expect(commands).toContain("if command -v pnpm >/dev/null 2>&1; then pnpm test; else echo 'pnpm not found for validation' >&2; exit 127; fi");
+    expect(plan.candidates[0]).toMatchObject({
+      scope: "package",
+      kind: "typecheck",
+      cost: expect.any(String),
+      reason: expect.any(String),
+      analyzerHints: expect.arrayContaining(["typescript"])
+    });
+
+    const specs = await planValidationCommandSpecs({ workspacePath: dir, changedFiles: ["packages/app/src/main.ts"] });
+    expect(specs[0].cwd).toBe(path.join(dir, "packages", "app"));
+  });
+
   it("infers Node package manager from packageManager when no lockfile exists", async () => {
     const dir = await tempWorkspace();
     await writeFile(
@@ -133,6 +164,35 @@ describe("validation planner", () => {
 
     expect(specs[0]).toMatchObject({ source: "configured", command: "npm test" });
     expect(specs.map((spec) => spec.command).filter((command) => command === "npm test")).toHaveLength(1);
+  });
+
+  it("discovers project roots and exposes skipped fallback reasons", async () => {
+    const dir = await tempWorkspace();
+    const discovery = await discoverProjects({ workspacePath: dir, changedFiles: ["notes.txt"] });
+    const plan = await planValidation({ workspacePath: dir, changedFiles: ["notes.txt"] });
+
+    expect(discovery.roots).toEqual([]);
+    expect(plan.candidates).toEqual([]);
+    expect(plan.skipped.map((item) => item.reason).join("\n")).toContain("No project metadata discovered");
+  });
+
+  it("creates structured validation candidates with configured commands first", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "go.mod"), "module example.com/app\n", "utf8");
+
+    const plan = await createValidationPlan({
+      workspacePath: dir,
+      configuredCommands: ["make verify"],
+      changedFiles: ["main.go"]
+    });
+
+    expect(plan.candidates[0]).toMatchObject({
+      command: "make verify",
+      scope: "project",
+      kind: "manual-check",
+      reason: expect.stringContaining("User-configured")
+    });
+    expect(plan.candidates.some((candidate) => candidate.command.includes("go test ./..."))).toBe(true);
   });
 
   it("quotes changed file paths and bounds command count", async () => {

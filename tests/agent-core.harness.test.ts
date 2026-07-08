@@ -255,6 +255,16 @@ describe("agent-core harness", () => {
 
     expect(result.status).toBe("completed");
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.validation_plan.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: expect.stringContaining("node --check parser.js"),
+          scope: "syntax",
+          kind: "compile",
+          reason: expect.any(String)
+        })
+      ])
+    );
     expect(summary.harness.validation_results).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ command: expect.stringContaining("node --check parser.js"), exit_code: 0 })

@@ -108,4 +108,68 @@ describe("agent-cli replay", () => {
       output.restore();
     }
   });
+
+  it("displays context compaction events in timeline replay", async () => {
+    const tracePath = await writeTrace([
+      {
+        id: "1",
+        timestamp: "2026-07-07T00:00:00.000Z",
+        type: "context_compaction_end",
+        runId: "r1",
+        provider: "deepseek",
+        model: "fake",
+        metadata: {
+          strategy: "model_sub_session",
+          before_message_count: 30,
+          after_message_count: 12,
+          compacted_message_count: 18,
+          fallback_used: true,
+          duration_ms: 25
+        }
+      }
+    ]);
+    const output = captureProcessOutput();
+
+    try {
+      const code = await runReplayCommand(["--trace-jsonl", tracePath, "--json", "--timeline"]);
+
+      expect(code).toBe(0);
+      const report = JSON.parse(output.stdout()) as ReplayReport;
+      expect(report.counts.context_compaction_end).toBe(1);
+      expect(report.timeline).toEqual([expect.stringContaining("context_compaction_end strategy=model_sub_session")]);
+    } finally {
+      output.restore();
+    }
+  });
+
+  it("displays validation plan events in timeline replay", async () => {
+    const tracePath = await writeTrace([
+      {
+        id: "1",
+        timestamp: "2026-07-07T00:00:00.000Z",
+        type: "validation_plan_created",
+        runId: "r1",
+        provider: "deepseek",
+        model: "fake",
+        metadata: {
+          validationPlan: {
+            candidates: [{ command: "python -m py_compile app.py" }],
+            skipped: []
+          }
+        }
+      }
+    ]);
+    const output = captureProcessOutput();
+
+    try {
+      const code = await runReplayCommand(["--trace-jsonl", tracePath, "--json", "--timeline"]);
+
+      expect(code).toBe(0);
+      const report = JSON.parse(output.stdout()) as ReplayReport;
+      expect(report.counts.validation_plan_created).toBe(1);
+      expect(report.timeline).toEqual([expect.stringContaining("validation_plan_created candidates=1 skipped=0")]);
+    } finally {
+      output.restore();
+    }
+  });
 });

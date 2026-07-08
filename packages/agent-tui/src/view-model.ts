@@ -136,6 +136,44 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       entries.push(harnessEntry(event, checkEndsByParent.get(event.id)));
       continue;
     }
+    if (event.type === "subagent_start") {
+      entries.push({
+        kind: "summary",
+        text: `subagent ${String(meta.subagent_type ?? "?")} started: ${truncate(oneLine(redactSecretText(String(meta.description ?? ""))), 90)}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_end" || event.type === "subagent_error") {
+      const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
+      const status = String(report?.status ?? (event.type === "subagent_error" ? "error" : "?"));
+      const text = String(report?.error ?? report?.summary ?? "");
+      entries.push({
+        kind: "summary",
+        status,
+        text: `subagent ${status}: ${truncate(oneLine(redactSecretText(text)), 110)}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "review_gate_start") {
+      entries.push({
+        kind: "summary",
+        text: `review gate ${String(meta.gate ?? "?")} started`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "review_gate_end") {
+      const findings = Array.isArray(meta.findings) ? meta.findings.length : 0;
+      entries.push({
+        kind: "summary",
+        status: String(meta.status ?? ""),
+        text: `review gate ${String(meta.gate ?? "?")} ${String(meta.status ?? "?")} (${findings} findings)`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
     if (event.type === "usage") {
       const usage = eventUsage(event);
       if (usage) entries.push({ kind: "system", text: `usage ${formatUsage(usage)}`, timestamp: eventTime(event) });

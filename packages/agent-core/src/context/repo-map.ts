@@ -4,6 +4,8 @@ import path from "node:path";
 import { truncateMiddle } from "../compaction.js";
 import { workspaceRelativePath } from "../policy.js";
 import { comparePath, walkFiles } from "../tools/workspace-utils.js";
+import { generateRepoMapV2 } from "./repo-map-v2.js";
+import type { CodeIndexSummary } from "../types.js";
 
 const DEFAULT_REPO_MAP_MAX_CHARS = 20000;
 
@@ -15,6 +17,7 @@ export interface RepoMapOptions {
 export interface GeneratedRepoMap {
   content: string;
   chars: number;
+  codeIndex?: CodeIndexSummary;
 }
 
 interface SourceSymbols {
@@ -172,7 +175,7 @@ async function gitSummary(workspacePath: string): Promise<string[]> {
   ];
 }
 
-export async function generateRepoMap(options: RepoMapOptions): Promise<GeneratedRepoMap> {
+async function generateRepoMapLegacy(options: RepoMapOptions): Promise<GeneratedRepoMap> {
   const workspacePath = path.resolve(options.workspacePath);
   const maxChars = Math.max(1, Math.floor(options.maxChars ?? DEFAULT_REPO_MAP_MAX_CHARS));
   const tree = await fileTree(workspacePath);
@@ -217,6 +220,27 @@ export async function generateRepoMap(options: RepoMapOptions): Promise<Generate
   const raw = lines.join("\n");
   const truncated = truncateMiddle(raw, maxChars);
   return { content: truncated.text, chars: truncated.text.length };
+}
+
+export async function generateRepoMap(options: RepoMapOptions): Promise<GeneratedRepoMap> {
+  try {
+    const v2 = await generateRepoMapV2(options);
+    return {
+      content: v2.content,
+      chars: v2.chars,
+      codeIndex: {
+        file_count: v2.graph.files.length,
+        symbol_count: v2.graph.files.reduce((total, file) => total + file.symbols.length, 0),
+        definition_count: v2.graph.files.reduce((total, file) => total + file.definitions.length, 0),
+        dependency_edge_count: v2.graph.dependencyEdges.length,
+        test_to_source_count: v2.graph.testToSource.length,
+        config_files: v2.graph.configFiles.slice(0, 50),
+        truncated: v2.graph.truncated
+      }
+    };
+  } catch {
+    return await generateRepoMapLegacy(options);
+  }
 }
 
 export function formatRepoMapBlock(repoMap: GeneratedRepoMap): string {

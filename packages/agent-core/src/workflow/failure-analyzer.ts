@@ -1,166 +1,84 @@
-import { compactLargeCommand, truncateMiddle } from "../compaction.js";
-import type { HarnessCommandResult, ToolResult, WorkflowFailureCategory } from "../types.js";
+import {
+  failureInputFromHarnessResult,
+  failureInputFromToolResult,
+  suggestedNextActionForFailure,
+  type FailureAnalysis,
+  type FailureAnalyzer,
+  type FailureAnalyzerInput
+} from "./failure-analyzers/base.js";
+import { CargoFailureAnalyzer } from "./failure-analyzers/cargo.js";
+import { GenericFailureAnalyzer } from "./failure-analyzers/generic.js";
+import { GoTestFailureAnalyzer } from "./failure-analyzers/go-test.js";
+import { MissingToolFailureAnalyzer } from "./failure-analyzers/missing-tool.js";
+import { NodeTestFailureAnalyzer } from "./failure-analyzers/node-test.js";
+import { PytestFailureAnalyzer } from "./failure-analyzers/pytest.js";
+import { SegmentationFaultFailureAnalyzer } from "./failure-analyzers/segmentation-fault.js";
+import { TimeoutFailureAnalyzer } from "./failure-analyzers/timeout.js";
+import { TypeScriptFailureAnalyzer } from "./failure-analyzers/typescript.js";
 
-export interface FailureAnalyzerInput {
-  ok?: boolean;
-  toolName?: string;
-  command?: string | null;
-  output?: string;
-  stdout?: string;
-  stderr?: string;
-  exitCode?: number | null;
-  timedOut?: boolean;
-  signal?: string | null;
-}
+export type { FailureAnalysis, FailureAnalyzer, FailureAnalyzerInput } from "./failure-analyzers/base.js";
+export {
+  failureInputFromHarnessResult,
+  failureInputFromToolResult,
+  suggestedNextActionForFailure
+} from "./failure-analyzers/base.js";
+export { CargoFailureAnalyzer } from "./failure-analyzers/cargo.js";
+export { GenericFailureAnalyzer } from "./failure-analyzers/generic.js";
+export { GoTestFailureAnalyzer } from "./failure-analyzers/go-test.js";
+export { MissingToolFailureAnalyzer } from "./failure-analyzers/missing-tool.js";
+export { NodeTestFailureAnalyzer } from "./failure-analyzers/node-test.js";
+export { PytestFailureAnalyzer } from "./failure-analyzers/pytest.js";
+export { SegmentationFaultFailureAnalyzer } from "./failure-analyzers/segmentation-fault.js";
+export { TimeoutFailureAnalyzer } from "./failure-analyzers/timeout.js";
+export { TypeScriptFailureAnalyzer } from "./failure-analyzers/typescript.js";
 
-export interface FailureAnalysis {
-  category: WorkflowFailureCategory;
-  primaryMessage: string;
-  relatedCommand?: string;
-  exitCode?: number | null;
-  suggestedNextAction: string;
-  diagnostics: string[];
-}
-
-export interface FailureAnalyzer {
-  analyze(input: FailureAnalyzerInput): FailureAnalysis | null;
-}
-
-function normalizedCombined(input: FailureAnalyzerInput): string {
+export function defaultFailureAnalyzers(): FailureAnalyzer[] {
   return [
-    input.toolName ?? "",
-    input.command ?? "",
-    input.output ?? "",
-    input.stdout ?? "",
-    input.stderr ?? ""
-  ].join("\n").toLowerCase();
+    new TimeoutFailureAnalyzer(),
+    new MissingToolFailureAnalyzer(),
+    new SegmentationFaultFailureAnalyzer(),
+    new TypeScriptFailureAnalyzer(),
+    new PytestFailureAnalyzer(),
+    new GoTestFailureAnalyzer(),
+    new CargoFailureAnalyzer(),
+    new NodeTestFailureAnalyzer(),
+    new GenericFailureAnalyzer()
+  ];
 }
 
-function combinedOutput(input: FailureAnalyzerInput): string {
-  return [input.stderr ?? "", input.stdout ?? "", input.output ?? ""].filter(Boolean).join("\n");
-}
-
-function compactSingleLine(text: string, maxChars = 500): string {
-  return truncateMiddle(text.replace(/\s+/g, " ").trim(), maxChars).text;
-}
-
-function outputLines(input: FailureAnalyzerInput): string[] {
-  return combinedOutput(input)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
-function primaryMessage(input: FailureAnalyzerInput, category: WorkflowFailureCategory): string {
-  const interesting = outputLines(input).find((line) =>
-    /\b(error|failed|failure|assert|exception|panic|fatal|timeout|timed out|not found|no such file|segmentation|sigsegv|ts\d{4}|undefined|cannot)\b/i.test(line)
-  );
-  if (interesting) return compactSingleLine(interesting);
-  if (input.command) return `Command failed: ${compactSingleLine(input.command, 420)}`;
-  return `Failure categorized as ${category}.`;
-}
-
-function commandLooksCompileLike(command: string): boolean {
-  return /\b(gcc|g\+\+|clang|clang\+\+|cc|c\+\+|javac|tsc|rustc|cargo\s+(?:build|check)|go\s+build|mvn\s+(?:compile|package)|gradle\s+(?:build|compile)|make|cmake|npm\s+run\s+build|pnpm\s+(?:run\s+)?build|yarn\s+build|bun\s+run\s+build)\b/i.test(command);
-}
-
-function outputLooksCompileLike(output: string): boolean {
-  return /\b(error:|undefined reference|compilation failed|compile failed|build failed|syntaxerror|typeerror|ts\d{4}:|cannot find symbol|undefined:|expected declaration|parse error|unexpected token|unterminated)\b/i.test(output);
-}
-
-function commandLooksTestLike(command: string): boolean {
-  return /\b(pytest|go\s+test|cargo\s+test|mvn\s+test|gradle\s+test|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|vitest|jest)\b/i.test(command);
-}
-
-function outputLooksTestLike(output: string): boolean {
-  return /\b(assertionerror|failed tests?|test failed|tests? failed|failures?:|=== fail|--- fail|test result:\s*failed|not ok|expected .+ received|expected .+ got)\b/i.test(output);
-}
-
-function categoryForInput(input: FailureAnalyzerInput): WorkflowFailureCategory {
-  const exitCode = input.exitCode;
-  const signal = input.signal ?? "";
-  const combined = normalizedCombined(input);
-  const output = combinedOutput(input);
-  const normalizedOutput = output.toLowerCase();
-  const command = input.command ?? "";
-
-  if (
-    input.timedOut ||
-    exitCode === 124 ||
-    /\btimedout:\s*true\b|\btimed out\b|\btimeout\b/.test(combined)
-  ) {
-    return "timeout";
-  }
-  if (
-    exitCode === 139 ||
-    exitCode === -11 ||
-    signal === "SIGSEGV" ||
-    /\bsegmentation fault\b|\bsigsegv\b/.test(combined)
-  ) {
-    return "segmentation_fault";
-  }
-  if (
-    exitCode === 127 ||
-    /\bcommand not found\b|\bnot found for validation\b|\bno such file or directory\b|\benoent\b|\bis not recognized as an internal or external command\b/.test(normalizedOutput)
-  ) {
-    return "missing_tool";
-  }
-  if (
-    commandLooksCompileLike(command) ||
-    (outputLooksCompileLike(output) && /\b(error:|compilation failed|compile failed|build failed|syntaxerror|typeerror|cannot find symbol|ts\d{4}:|undefined:|parse error)\b/i.test(output))
-  ) {
-    return "compile_error";
-  }
-  if (commandLooksTestLike(command) || outputLooksTestLike(output)) {
-    return "test_failure";
-  }
-  return "unknown";
-}
-
-export function suggestedNextActionForFailure(category: WorkflowFailureCategory): string {
-  if (category === "compile_error") {
-    return "Use the compiler diagnostics as the repair target, fix the first concrete error, then rerun the same compile or a narrower syntax check.";
-  }
-  if (category === "test_failure") {
-    return "Use the failing test assertion or test name as the repair target, make one focused change, then rerun the same test or a narrower related test.";
-  }
-  if (category === "segmentation_fault") {
-    return "Switch to a focused crash-debug pass: isolate the smallest crashing command, inspect memory bounds and null/error returns, make one targeted change, then rerun that command.";
-  }
-  if (category === "timeout") {
-    return "Reduce the scope before continuing: use a smaller input, shorter smoke command, or log/progress probe, then repair the slow path before broad exploration.";
-  }
-  if (category === "missing_tool") {
-    return "Use an installed alternative or inspect the environment before retrying; do not repeat the same unavailable command.";
-  }
-  return "Inspect the command output, identify the first actionable diagnostic, make a focused repair, then rerun the relevant check.";
-}
-
-function diagnosticsForInput(input: FailureAnalyzerInput): string[] {
-  const diagnostics: string[] = [];
-  if (input.toolName) diagnostics.push(`tool=${input.toolName}`);
-  if (input.timedOut) diagnostics.push("timed_out=true");
-  if (input.signal) diagnostics.push(`signal=${input.signal}`);
-  if (input.exitCode !== undefined) diagnostics.push(`exit_code=${input.exitCode}`);
-  for (const line of outputLines(input).slice(0, 3)) {
-    diagnostics.push(compactSingleLine(line, 300));
-  }
-  return diagnostics;
+function withCandidateDiagnostics(best: FailureAnalysis, candidates: FailureAnalysis[]): FailureAnalysis {
+  const candidateDiagnostics = candidates
+    .filter((candidate) => candidate !== best)
+    .map((candidate) => {
+      const analyzer = candidate.diagnostics.find((diagnostic) => diagnostic.startsWith("analyzer=")) ?? "analyzer=unknown";
+      return `${analyzer}:${candidate.category}:${candidate.confidence.toFixed(2)}`;
+    });
+  if (candidateDiagnostics.length === 0) return best;
+  return {
+    ...best,
+    diagnostics: [
+      ...best.diagnostics,
+      `candidates=${candidateDiagnostics.join(",")}`
+    ]
+  };
 }
 
 export class BuiltInFailureAnalyzer implements FailureAnalyzer {
+  readonly name = "pipeline";
+  private readonly analyzers: FailureAnalyzer[];
+
+  constructor(analyzers: FailureAnalyzer[] = defaultFailureAnalyzers()) {
+    this.analyzers = analyzers;
+  }
+
   analyze(input: FailureAnalyzerInput): FailureAnalysis | null {
     if (input.ok) return null;
-    const category = categoryForInput(input);
-    const command = input.command ? compactLargeCommand(input.command, 1200).text : undefined;
-    return {
-      category,
-      primaryMessage: primaryMessage(input, category),
-      ...(command ? { relatedCommand: command } : {}),
-      ...(input.exitCode !== undefined ? { exitCode: input.exitCode } : {}),
-      suggestedNextAction: suggestedNextActionForFailure(category),
-      diagnostics: diagnosticsForInput(input)
-    };
+    const candidates = this.analyzers
+      .map((analyzer) => analyzer.analyze(input))
+      .filter((candidate): candidate is FailureAnalysis => candidate !== null)
+      .sort((a, b) => b.confidence - a.confidence || a.category.localeCompare(b.category, "en"));
+    const best = candidates[0];
+    return best ? withCandidateDiagnostics(best, candidates) : null;
   }
 }
 
@@ -168,35 +86,4 @@ export const defaultFailureAnalyzer = new BuiltInFailureAnalyzer();
 
 export function analyzeFailure(input: FailureAnalyzerInput, analyzer: FailureAnalyzer = defaultFailureAnalyzer): FailureAnalysis | null {
   return analyzer.analyze(input);
-}
-
-export function failureInputFromToolResult(options: {
-  toolName: string;
-  command: string | null;
-  result: ToolResult;
-}): FailureAnalyzerInput {
-  const exitCode = options.result.metadata?.exitCode;
-  const signal = options.result.metadata?.signal;
-  return {
-    ok: options.result.ok,
-    toolName: options.toolName,
-    command: options.command,
-    output: options.result.content,
-    exitCode: typeof exitCode === "number" || exitCode === null ? exitCode : undefined,
-    timedOut: options.result.metadata?.timedOut === true,
-    signal: typeof signal === "string" ? signal : undefined
-  };
-}
-
-export function failureInputFromHarnessResult(result: HarnessCommandResult): FailureAnalyzerInput {
-  return {
-    ok: result.exit_code === 0,
-    toolName: `harness.${result.kind}`,
-    command: result.command,
-    stdout: result.stdout_tail,
-    stderr: result.stderr_tail,
-    exitCode: result.exit_code,
-    timedOut: result.timed_out === true,
-    signal: result.signal ?? undefined
-  };
 }

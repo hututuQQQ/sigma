@@ -25,6 +25,9 @@ import { executeValidateTool } from "./validate.js";
 import { createShellSessionToolController } from "./shell-session.js";
 import { invalidateContextIndexes } from "../context/code-index.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifest.js";
+import { READ_ONLY_SUBAGENT_TOOLS } from "../subagents/subagent-runner.js";
+import { createSubtaskTool } from "../subagents/subtask-tool.js";
+import type { SubagentType } from "../types.js";
 
 const FILE_MUTATING_TOOLS = new Set(["write", "edit", "apply_patch", "bash", "shell_session", "service"]);
 
@@ -529,7 +532,38 @@ export function createToolRegistryFromTools(
   };
 }
 
+function createReadOnlySubagentRegistry(_subagentType: SubagentType): ToolRegistry {
+  const readOnlyTools = [
+    readTool,
+    listTool,
+    globTool,
+    grepTool,
+    repoQueryTool,
+    symbolSearchTool,
+    gitStatusTool,
+    gitDiffTool
+  ];
+  const allowed = new Set<string>(READ_ONLY_SUBAGENT_TOOLS);
+  return createToolRegistryFromTools(readOnlyTools.filter((tool) => allowed.has(tool.definition.function.name)));
+}
+
 export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): ToolRegistry {
+  const subagentTools = _options.subagents?.enabled === true
+    ? [
+        createSubtaskTool({
+          toolName: "task",
+          createToolRegistry: createReadOnlySubagentRegistry,
+          defaultMaxTurns: _options.subagents.defaultMaxTurns,
+          defaultMaxOutputChars: _options.subagents.defaultMaxOutputChars
+        }),
+        createSubtaskTool({
+          toolName: "subtask",
+          createToolRegistry: createReadOnlySubagentRegistry,
+          defaultMaxTurns: _options.subagents.defaultMaxTurns,
+          defaultMaxOutputChars: _options.subagents.defaultMaxOutputChars
+        })
+      ]
+    : [];
   return createToolRegistryFromTools(
     [
       bashTool,
@@ -548,6 +582,7 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
       applyPatchTool,
       validateTool,
       todoTool,
+      ...subagentTools,
       createShellSessionTool()
     ],
     _options

@@ -1,7 +1,8 @@
 import { compactLargeCommand, truncateMiddle } from "../compaction.js";
-import { analyzeFailure, failureInputFromToolResult, type FailureAnalysis } from "../workflow/failure-analyzer.js";
+import { analyzeFailure, failureInputFromToolResult, type FailureAnalysis, type FailureAnalyzer } from "../workflow/failure-analyzer.js";
 import type {
   EvidenceRecord,
+  FailureAnalysisSummary,
   ToolResult,
   WorkflowFailureCategory,
   WorkflowFailurePatternSummary,
@@ -13,6 +14,7 @@ export interface WorkflowState {
   phase: WorkflowPhase;
   commandsTried: string[];
   evidenceRecords: EvidenceRecord[];
+  failureAnalyses: FailureAnalysisSummary[];
   failurePatterns: Map<WorkflowFailureCategory, WorkflowFailurePatternSummary>;
   nudgedFailureCategories: Set<WorkflowFailureCategory>;
 }
@@ -22,8 +24,28 @@ export function createWorkflowState(): WorkflowState {
     phase: "triage",
     commandsTried: [],
     evidenceRecords: [],
+    failureAnalyses: [],
     failurePatterns: new Map(),
     nudgedFailureCategories: new Set()
+  };
+}
+
+function failureAnalysisSummary(analysis: FailureAnalysis): FailureAnalysisSummary {
+  return {
+    category: analysis.category,
+    confidence: analysis.confidence,
+    primaryMessage: analysis.primaryMessage,
+    ...(analysis.relatedCommand ? { relatedCommand: analysis.relatedCommand } : {}),
+    ...(analysis.relatedFiles.length > 0 ? { relatedFiles: analysis.relatedFiles } : {}),
+    ...(analysis.failingTestNames.length > 0 ? { failingTestNames: analysis.failingTestNames } : {}),
+    ...(analysis.firstActionableLine ? { firstActionableLine: analysis.firstActionableLine } : {}),
+    ...(analysis.exitCode !== undefined ? { exitCode: analysis.exitCode } : {}),
+    suggestedNextAction: analysis.suggestedNextAction,
+    ...(analysis.diagnostics.length > 0 ? { diagnostics: analysis.diagnostics } : {}),
+    ...(analysis.rerunCommandSuggestion ? { rerunCommandSuggestion: analysis.rerunCommandSuggestion } : {}),
+    ...(analysis.shouldAvoidRepeatingCommand !== undefined
+      ? { shouldAvoidRepeatingCommand: analysis.shouldAvoidRepeatingCommand }
+      : {})
   };
 }
 
@@ -56,7 +78,15 @@ function recordFailurePattern(options: {
     ...(options.analysis.exitCode !== undefined ? { last_exit_code: options.analysis.exitCode } : {}),
     last_summary: compactSummary(options.analysis.primaryMessage || options.result.content),
     suggested_next_action: options.analysis.suggestedNextAction,
-    ...(options.analysis.diagnostics.length > 0 ? { diagnostics: options.analysis.diagnostics } : {})
+    confidence: options.analysis.confidence,
+    ...(options.analysis.diagnostics.length > 0 ? { diagnostics: options.analysis.diagnostics } : {}),
+    ...(options.analysis.relatedFiles.length > 0 ? { related_files: options.analysis.relatedFiles } : {}),
+    ...(options.analysis.failingTestNames.length > 0 ? { failing_test_names: options.analysis.failingTestNames } : {}),
+    ...(options.analysis.firstActionableLine ? { first_actionable_line: options.analysis.firstActionableLine } : {}),
+    ...(options.analysis.rerunCommandSuggestion ? { rerun_command_suggestion: options.analysis.rerunCommandSuggestion } : {}),
+    ...(options.analysis.shouldAvoidRepeatingCommand !== undefined
+      ? { should_avoid_repeating_command: options.analysis.shouldAvoidRepeatingCommand }
+      : {})
   };
   options.workflow.failurePatterns.set(options.analysis.category, record);
   return record;
@@ -74,6 +104,7 @@ export function workflowFailureNudge(
     failure.suggested_next_action ?? "Inspect the failure summary, make a focused repair, then rerun the relevant check."
   ];
   if (failure.last_command) lines.push(`Failing command summary: ${failure.last_command}`);
+  if (failure.first_actionable_line) lines.push(`First actionable diagnostic: ${failure.first_actionable_line}`);
   lines.push(`Failure summary: ${failure.last_summary}`);
   return lines.join("\n");
 }
@@ -84,6 +115,7 @@ export function recordToolInWorkflow(options: {
   args: unknown;
   result: ToolResult;
   evidence?: EvidenceRecord | null;
+  failureAnalyzer?: FailureAnalyzer;
 }): WorkflowFailurePatternSummary | null {
   const command = commandFromArgs(options.toolName, options.args);
   if (command) options.workflow.commandsTried.push(compactLargeCommand(command, 1200).text);
@@ -93,9 +125,10 @@ export function recordToolInWorkflow(options: {
     toolName: options.toolName,
     command,
     result: options.result
-  }));
+  }), options.failureAnalyzer);
   if (failureAnalysis) {
     options.workflow.phase = "repair";
+    options.workflow.failureAnalyses.push(failureAnalysisSummary(failureAnalysis));
     return recordFailurePattern({
       workflow: options.workflow,
       toolName: options.toolName,

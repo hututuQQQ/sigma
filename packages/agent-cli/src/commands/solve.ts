@@ -112,6 +112,13 @@ Context and tool flags:
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
   --skills-max-chars <number>
+  --subagents-enabled
+  --subagent-max-turns <number>
+  --subagent-max-output-chars <number>
+  --review-anti-gaming / --no-review-anti-gaming
+  --compaction-mode <off|deterministic|model-sub-session>
+  --compaction-model <model>
+  --compaction-timeout-sec <number>
   --enable-mcp
   --mcp-config <path>
 
@@ -181,6 +188,13 @@ async function runNonInteractiveCommand(
       maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
       messageHistoryRetain: cliConfig.messageHistoryRetain,
       compactionSummaryChars: cliConfig.compactionSummaryChars,
+      compactionMode: cliConfig.compactionMode,
+      compactionModel: cliConfig.compactionModel,
+      compactionProvider: cliConfig.compactionProvider,
+      compactionMaxInputChars: cliConfig.compactionMaxInputChars,
+      compactionMaxOutputChars: cliConfig.compactionMaxOutputChars,
+      compactionTimeoutSec: cliConfig.compactionTimeoutSec,
+      compactionFallback: cliConfig.compactionFallback,
       validationMode: cliConfig.validationMode,
       validationCommands: cliConfig.validationCommands,
       validationRetryLimit: cliConfig.validationRetryLimit,
@@ -201,6 +215,10 @@ async function runNonInteractiveCommand(
       finalEvidenceMode: cliConfig.finalEvidenceMode,
       skillsMode: cliConfig.skillsMode,
       skillsMaxChars: cliConfig.skillsMaxChars,
+      subagentsEnabled: cliConfig.subagentsEnabled,
+      subagentMaxTurns: cliConfig.subagentMaxTurns,
+      subagentMaxOutputChars: cliConfig.subagentMaxOutputChars,
+      reviewAntiGaming: cliConfig.reviewAntiGaming,
       enableMcp: cliConfig.enableMcp,
       mcpConfig: cliConfig.mcpConfig,
       eventBus,

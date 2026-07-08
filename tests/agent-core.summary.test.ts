@@ -90,6 +90,12 @@ describe("summary JSON fields", () => {
     expect(summary.project_instruction_sources).toEqual(["AGENTS.md"]);
     expect(summary.context_mode).toBe("repo-map");
     expect(summary.repo_map_chars).toBeGreaterThan(0);
+    expect(summary.code_index).toMatchObject({
+      file_count: expect.any(Number),
+      symbol_count: expect.any(Number),
+      dependency_edge_count: expect.any(Number),
+      config_files: expect.any(Array)
+    });
   });
 
   it("omits empty optional fields when features are disabled or unused", async () => {

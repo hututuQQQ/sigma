@@ -7,6 +7,8 @@ import type {
   AgentFinalEvidenceMode,
   AgentHarnessValidationMode,
   AgentSkillsMode,
+  CompactionFallbackMode,
+  CompactionMode,
   ContextMode,
   PermissionMode
 } from "agent-core";
@@ -33,6 +35,13 @@ export interface CliConfig {
   maxMessageHistoryChars?: number;
   messageHistoryRetain: number;
   compactionSummaryChars: number;
+  compactionMode: CompactionMode;
+  compactionModel?: string;
+  compactionProvider?: ProviderName;
+  compactionMaxInputChars?: number;
+  compactionMaxOutputChars?: number;
+  compactionTimeoutSec: number;
+  compactionFallback: CompactionFallbackMode;
   validationMode: AgentHarnessValidationMode;
   validationCommands: string[];
   validationRetryLimit: number;
@@ -52,6 +61,10 @@ export interface CliConfig {
   finalEvidenceMode: AgentFinalEvidenceMode;
   skillsMode: AgentSkillsMode;
   skillsMaxChars: number;
+  subagentsEnabled: boolean;
+  subagentMaxTurns?: number;
+  subagentMaxOutputChars?: number;
+  reviewAntiGaming: boolean;
   enableMcp: boolean;
   mcpConfig?: string;
   noStreamUi: boolean;
@@ -67,19 +80,28 @@ const DEFAULTS = {
   maxToolOutputChars: 12000,
   messageHistoryRetain: 24,
   compactionSummaryChars: 30000,
+  compactionMode: "deterministic" as CompactionMode,
+  compactionTimeoutSec: 60,
+  compactionFallback: "deterministic" as CompactionFallbackMode,
   projectDocMaxBytes: 32768,
   contextMode: "repo-map" as ContextMode,
   repoMapMaxChars: 20000,
-  skillsMaxChars: 8000
+  skillsMaxChars: 8000,
+  subagentMaxTurns: 4,
+  subagentMaxOutputChars: 12000,
+  reviewAntiGaming: true
 };
 
 const BOOLEAN_FLAGS = new Set([
   "enable-mcp",
   "json",
+  "no-review-anti-gaming",
   "no-project-instructions",
   "no-stream-ui",
   "quiet",
-  "stream-ui"
+  "review-anti-gaming",
+  "stream-ui",
+  "subagents-enabled"
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -170,11 +192,26 @@ function flattenConfig(parsed: unknown): ConfigValues {
     mode: "context_mode",
     repo_map_max_chars: "repo_map_max_chars",
     project_doc_max_bytes: "project_doc_max_bytes",
-    no_project_instructions: "no_project_instructions"
+    no_project_instructions: "no_project_instructions",
+    compaction_mode: "compaction_mode",
+    compaction_model: "compaction_model",
+    compaction_provider: "compaction_provider",
+    compaction_max_input_chars: "compaction_max_input_chars",
+    compaction_max_output_chars: "compaction_max_output_chars",
+    compaction_timeout_sec: "compaction_timeout_sec",
+    compaction_fallback: "compaction_fallback"
   });
   addSection("skills", {
     mode: "skills_mode",
     max_chars: "skills_max_chars"
+  });
+  addSection("subagents", {
+    enabled: "subagents_enabled",
+    max_turns: "subagent_max_turns",
+    max_output_chars: "subagent_max_output_chars"
+  });
+  addSection("review", {
+    anti_gaming: "review_anti_gaming"
   });
   addSection("mcp", {
     enabled: "enable_mcp",
@@ -229,6 +266,11 @@ function providerValue(value: unknown): ProviderName {
   throw new Error(`Unsupported provider '${String(value)}'. Use deepseek or glm.`);
 }
 
+function optionalProviderValue(value: unknown): ProviderName | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  return providerValue(value);
+}
+
 function permissionModeValue(value: unknown): PermissionMode {
   if (value === "ask" || value === "yolo") return value;
   throw new Error(`Unsupported permission mode '${String(value)}'. Use ask or yolo.`);
@@ -257,6 +299,17 @@ function skillsModeValue(value: unknown): AgentSkillsMode {
 function contextModeValue(value: unknown): ContextMode {
   if (value === "off" || value === "repo-map") return value;
   throw new Error(`Unsupported context mode '${String(value)}'. Use off or repo-map.`);
+}
+
+function compactionModeValue(value: unknown): CompactionMode {
+  if (value === "off" || value === "deterministic") return value;
+  if (value === "model_sub_session" || value === "model-sub-session") return "model_sub_session";
+  throw new Error(`Unsupported compaction mode '${String(value)}'. Use off, deterministic, or model-sub-session.`);
+}
+
+function compactionFallbackValue(value: unknown): CompactionFallbackMode {
+  if (value === "deterministic" || value === "fail") return value;
+  throw new Error(`Unsupported compaction fallback '${String(value)}'. Use deterministic or fail.`);
 }
 
 function stringListValue(value: unknown): string[] {
@@ -400,6 +453,43 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         config.compaction_summary_chars,
       DEFAULTS.compactionSummaryChars
     ),
+    compactionMode: compactionModeValue(
+      stringValue(flags["compaction-mode"]) ??
+        process.env.AGENT_COMPACTION_MODE ??
+        stringValue(config.compaction_mode) ??
+        DEFAULTS.compactionMode
+    ),
+    compactionModel:
+      stringValue(flags["compaction-model"]) ??
+      process.env.AGENT_COMPACTION_MODEL ??
+      stringValue(config.compaction_model),
+    compactionProvider: optionalProviderValue(
+      stringValue(flags["compaction-provider"]) ??
+        process.env.AGENT_COMPACTION_PROVIDER ??
+        stringValue(config.compaction_provider)
+    ),
+    compactionMaxInputChars: optionalNumberValue(
+      flags["compaction-max-input-chars"] ??
+        process.env.AGENT_COMPACTION_MAX_INPUT_CHARS ??
+        config.compaction_max_input_chars
+    ),
+    compactionMaxOutputChars: optionalNumberValue(
+      flags["compaction-max-output-chars"] ??
+        process.env.AGENT_COMPACTION_MAX_OUTPUT_CHARS ??
+        config.compaction_max_output_chars
+    ),
+    compactionTimeoutSec: numberValue(
+      flags["compaction-timeout-sec"] ??
+        process.env.AGENT_COMPACTION_TIMEOUT_SEC ??
+        config.compaction_timeout_sec,
+      DEFAULTS.compactionTimeoutSec
+    ),
+    compactionFallback: compactionFallbackValue(
+      stringValue(flags["compaction-fallback"]) ??
+        process.env.AGENT_COMPACTION_FALLBACK ??
+        stringValue(config.compaction_fallback) ??
+        DEFAULTS.compactionFallback
+    ),
     validationMode,
     validationCommands: validationCommandList({
       singleValues: [flags["validation-command"], process.env.AGENT_VALIDATION_COMMAND, config.validation_command],
@@ -477,6 +567,24 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       flags["skills-max-chars"] ?? process.env.AGENT_SKILLS_MAX_CHARS ?? config.skills_max_chars,
       DEFAULTS.skillsMaxChars
     ),
+    subagentsEnabled: boolValue(
+      flags["subagents-enabled"] ?? process.env.AGENT_SUBAGENTS_ENABLED ?? config.subagents_enabled,
+      false
+    ),
+    subagentMaxTurns: optionalNumberValue(
+      flags["subagent-max-turns"] ?? process.env.AGENT_SUBAGENT_MAX_TURNS ?? config.subagent_max_turns
+    ) ?? DEFAULTS.subagentMaxTurns,
+    subagentMaxOutputChars: optionalNumberValue(
+      flags["subagent-max-output-chars"] ??
+        process.env.AGENT_SUBAGENT_MAX_OUTPUT_CHARS ??
+        config.subagent_max_output_chars
+    ) ?? DEFAULTS.subagentMaxOutputChars,
+    reviewAntiGaming: flags["no-review-anti-gaming"] !== undefined
+      ? false
+      : boolValue(
+          flags["review-anti-gaming"] ?? process.env.AGENT_REVIEW_ANTI_GAMING ?? config.review_anti_gaming,
+          DEFAULTS.reviewAntiGaming
+        ),
     enableMcp: boolValue(flags["enable-mcp"] ?? process.env.AGENT_ENABLE_MCP ?? config.enable_mcp, false),
     mcpConfig:
       stringValue(flags["mcp-config"]) ??

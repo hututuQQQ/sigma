@@ -11,6 +11,8 @@ import type {
   AgentHarnessValidationMode,
   AgentRunResult,
   AgentSkillsMode,
+  CompactionFallbackMode,
+  CompactionMode,
   ContextMode,
   McpServerRunSummary,
   PermissionDecider,
@@ -41,6 +43,24 @@ export interface RunConfiguredAgentOptions {
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
+  compactionMode?: CompactionMode;
+  compactionModel?: string;
+  compactionProvider?: ProviderName;
+  compactionMaxInputChars?: number;
+  compactionMaxOutputChars?: number;
+  compactionTimeoutSec?: number;
+  compactionFallback?: CompactionFallbackMode;
+  compactionModelClient?: ModelClient;
+  contextManager?: import("./context/context-manager.js").ContextManager;
+  contextManagerFactory?: AgentHarnessConfig["contextManagerFactory"];
+  compactionService?: import("./context/compaction-service.js").CompactionService;
+  failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
+  validationPlanner?: unknown;
+  codeIndex?: unknown;
+  subagentsEnabled?: boolean;
+  subagentMaxTurns?: number;
+  subagentMaxOutputChars?: number;
+  reviewAntiGaming?: boolean;
   validationMode?: AgentHarnessValidationMode;
   validationCommands?: string[];
   validationRetryLimit?: number;
@@ -84,9 +104,12 @@ export function shouldUseAgentRunController(options: {
   harnessTimeoutSec?: number;
   retryMinBudgetSec?: number;
   attemptsDir?: string;
+  finalEvidenceMode?: AgentFinalEvidenceMode;
+  reviewAntiGaming?: boolean;
 }): boolean {
   return (
     options.validationMode === "auto" ||
+    (options.reviewAntiGaming !== false && options.finalEvidenceMode === "auto") ||
     (options.validationCommands?.length ?? 0) > 0 ||
     (options.validationRetryLimit ?? 0) > 0 ||
     Boolean(options.precheckCommand?.trim()) ||
@@ -122,6 +145,24 @@ function baseRunConfig(options: RunConfiguredAgentOptions, modelClient: ModelCli
     ...(defined(options.maxMessageHistoryChars) ? { maxMessageHistoryChars: options.maxMessageHistoryChars } : {}),
     ...(defined(options.messageHistoryRetain) ? { messageHistoryRetain: options.messageHistoryRetain } : {}),
     ...(defined(options.compactionSummaryChars) ? { compactionSummaryChars: options.compactionSummaryChars } : {}),
+    ...(defined(options.compactionMode) ? { compactionMode: options.compactionMode } : {}),
+    ...(defined(options.compactionModel) ? { compactionModel: options.compactionModel } : {}),
+    ...(defined(options.compactionProvider) ? { compactionProvider: options.compactionProvider } : {}),
+    ...(defined(options.compactionMaxInputChars) ? { compactionMaxInputChars: options.compactionMaxInputChars } : {}),
+    ...(defined(options.compactionMaxOutputChars) ? { compactionMaxOutputChars: options.compactionMaxOutputChars } : {}),
+    ...(defined(options.compactionTimeoutSec) ? { compactionTimeoutSec: options.compactionTimeoutSec } : {}),
+    ...(defined(options.compactionFallback) ? { compactionFallback: options.compactionFallback } : {}),
+    ...(defined(options.compactionModelClient) ? { compactionModelClient: options.compactionModelClient } : {}),
+    ...(defined(options.contextManager) ? { contextManager: options.contextManager } : {}),
+    ...(defined(options.contextManagerFactory) ? { contextManagerFactory: options.contextManagerFactory } : {}),
+    ...(defined(options.compactionService) ? { compactionService: options.compactionService } : {}),
+    ...(defined(options.failureAnalyzer) ? { failureAnalyzer: options.failureAnalyzer } : {}),
+    ...(defined(options.validationPlanner) ? { validationPlanner: options.validationPlanner } : {}),
+    ...(defined(options.codeIndex) ? { codeIndex: options.codeIndex } : {}),
+    ...(defined(options.subagentsEnabled) ? { subagentsEnabled: options.subagentsEnabled } : {}),
+    ...(defined(options.subagentMaxTurns) ? { subagentMaxTurns: options.subagentMaxTurns } : {}),
+    ...(defined(options.subagentMaxOutputChars) ? { subagentMaxOutputChars: options.subagentMaxOutputChars } : {}),
+    ...(defined(options.reviewAntiGaming) ? { reviewAntiGaming: options.reviewAntiGaming } : {}),
     ...(defined(options.allowedTools) ? { allowedTools: options.allowedTools } : {}),
     ...(defined(options.disabledTools) ? { disabledTools: options.disabledTools } : {}),
     ...(defined(options.permissionDecider) ? { permissionDecider: options.permissionDecider } : {}),
@@ -146,6 +187,13 @@ export async function runConfiguredAgent(
   const modelClient = options.modelClient ?? (options.modelClientFactory ?? createModelClient)(options.provider, {
     model: options.model
   });
+  const compactionModelClient = options.compactionModelClient ?? (
+    options.compactionMode === "model_sub_session" && (options.compactionModel || options.compactionProvider)
+      ? (options.modelClientFactory ?? createModelClient)(options.compactionProvider ?? options.provider, {
+          model: options.compactionModel
+        })
+      : undefined
+  );
   let toolRegistry = options.toolRegistry;
   let mcpServers: McpServerRunSummary[] = [];
 
@@ -160,7 +208,7 @@ export async function runConfiguredAgent(
   }
 
   const runConfig: AgentHarnessConfig = {
-    ...baseRunConfig({ ...options, eventBus }, modelClient),
+    ...baseRunConfig({ ...options, eventBus, compactionModelClient }, modelClient),
     ...(toolRegistry ? { toolRegistry } : {}),
     ...(mcpServers.length > 0 ? { mcpServers } : {}),
     ...(defined(options.validationMode) ? { validationMode: options.validationMode } : {}),

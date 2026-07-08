@@ -71,6 +71,38 @@ export function formatAgentEvent(event: AgentEvent): string | null {
         : "";
       return `[sigma] tool_end ${toolNameFromEvent(event)} ${result?.ok === true ? "ok" : "failed"}${duration}${tail}`;
     }
+    case "context_compaction_start":
+      return `[sigma] context_compaction_start strategy=${String(event.metadata?.strategy ?? "?")} compacted_messages=${String(event.metadata?.compacted_message_count ?? "?")}`;
+    case "context_compaction_end":
+      return `[sigma] context_compaction_end strategy=${String(event.metadata?.strategy ?? "?")} before=${String(event.metadata?.before_message_count ?? "?")} after=${String(event.metadata?.after_message_count ?? "?")} fallback=${String(event.metadata?.fallback_used ?? false)} duration_ms=${String(event.metadata?.duration_ms ?? "?")}`;
+    case "context_compaction_error":
+      return `[sigma] context_compaction_error strategy=${String(event.metadata?.strategy ?? "?")} fallback=${String(event.metadata?.fallback_used ?? false)} error=${truncateMiddle(redactSecretText(String(event.metadata?.error ?? "unknown")), 160).text}`;
+    case "failure_analysis": {
+      const analysis = event.metadata?.analysis as { category?: unknown; confidence?: unknown; primaryMessage?: unknown } | undefined;
+      const confidence = typeof analysis?.confidence === "number" ? analysis.confidence.toFixed(2) : "?";
+      const primary = typeof analysis?.primaryMessage === "string"
+        ? ` ${truncateMiddle(redactSecretText(analysis.primaryMessage.replace(/\s+/g, " ").trim()), 120).text}`
+        : "";
+      return `[sigma] failure_analysis category=${String(analysis?.category ?? "?")} confidence=${confidence}${primary}`;
+    }
+    case "validation_plan_created": {
+      const plan = event.metadata?.validationPlan as { candidates?: unknown[]; skipped?: unknown[] } | undefined;
+      return `[sigma] validation_plan_created candidates=${String(plan?.candidates?.length ?? 0)} skipped=${String(plan?.skipped?.length ?? 0)}`;
+    }
+    case "subagent_start":
+      return `[sigma] subagent_start type=${String(event.metadata?.subagent_type ?? "?")} description=${truncateMiddle(redactSecretText(String(event.metadata?.description ?? "").replace(/\s+/g, " ")), 120).text}`;
+    case "subagent_end": {
+      const report = event.metadata?.report as { status?: unknown; summary?: unknown } | undefined;
+      return `[sigma] subagent_end status=${String(report?.status ?? "?")} summary=${truncateMiddle(redactSecretText(String(report?.summary ?? "").replace(/\s+/g, " ")), 160).text}`;
+    }
+    case "subagent_error": {
+      const report = event.metadata?.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
+      return `[sigma] subagent_error status=${String(report?.status ?? "error")} error=${truncateMiddle(redactSecretText(String(report?.error ?? report?.summary ?? "").replace(/\s+/g, " ")), 160).text}`;
+    }
+    case "review_gate_start":
+      return `[sigma] review_gate_start gate=${String(event.metadata?.gate ?? "?")}`;
+    case "review_gate_end":
+      return `[sigma] review_gate_end gate=${String(event.metadata?.gate ?? "?")} status=${String(event.metadata?.status ?? "?")} findings=${Array.isArray(event.metadata?.findings) ? event.metadata.findings.length : 0}`;
     case "harness_check_start":
       return `[sigma] ${String(event.metadata?.kind ?? "check")}_start attempt=${String(event.metadata?.attempt ?? "?")} command=${truncateMiddle(redactSecretText(String(event.metadata?.command ?? "")).replace(/\s+/g, " "), 160).text}`;
     case "harness_check_end":

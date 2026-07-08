@@ -47,8 +47,11 @@ Common run flags:
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
   --context-mode <off|repo-map>
+  --compaction-mode <off|deterministic|model-sub-session>
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
+  --subagents-enabled
+  --review-anti-gaming / --no-review-anti-gaming
   --enable-mcp
   --stream-ui / --no-stream-ui
 `);
@@ -87,6 +90,14 @@ function completionScript(shell: string): string {
     "--allowed-tools",
     "--disabled-tools",
     "--context-mode",
+    "--compaction-mode",
+    "--compaction-model",
+    "--compaction-timeout-sec",
+    "--subagents-enabled",
+    "--subagent-max-turns",
+    "--subagent-max-output-chars",
+    "--review-anti-gaming",
+    "--no-review-anti-gaming",
     "--enable-mcp",
     "--mcp-config",
     "--output-format",
@@ -158,9 +169,20 @@ function tuiOptionsFromCliConfig(config: CliConfig): TuiAppOptions {
     disabledTools: config.disabledTools,
     contextMode: config.contextMode,
     repoMapMaxChars: config.repoMapMaxChars,
+    compactionMode: config.compactionMode,
+    compactionModel: config.compactionModel,
+    compactionProvider: config.compactionProvider,
+    compactionMaxInputChars: config.compactionMaxInputChars,
+    compactionMaxOutputChars: config.compactionMaxOutputChars,
+    compactionTimeoutSec: config.compactionTimeoutSec,
+    compactionFallback: config.compactionFallback,
     finalEvidenceMode: config.finalEvidenceMode,
     skillsMode: config.skillsMode,
     skillsMaxChars: config.skillsMaxChars,
+    subagentsEnabled: config.subagentsEnabled,
+    subagentMaxTurns: config.subagentMaxTurns,
+    subagentMaxOutputChars: config.subagentMaxOutputChars,
+    reviewAntiGaming: config.reviewAntiGaming,
     enableMcp: config.enableMcp,
     mcpConfig: config.mcpConfig,
     traceJsonl: config.traceJsonl,
