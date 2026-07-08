@@ -96,6 +96,86 @@ describe("agent loop", () => {
     await expect(readFile(path.join(dir, "trace.jsonl"), "utf8")).resolves.toContain("tool_end");
   });
 
+  it("records generic failure patterns and nudges the next turn toward repair", async () => {
+    const dir = await tempWorkspace();
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "segfault-like",
+              type: "function",
+              function: { name: "bash", arguments: { command: "exit 139" } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "debug a failing command",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo"
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.workflow?.failure_patterns).toEqual([
+      expect.objectContaining({ category: "segmentation_fault", count: 1, last_exit_code: 139 })
+    ]);
+    expect(
+      model.requests[1].messages.some(
+        (message) => message.role === "user" && message.content.includes("Workflow repair signal")
+      )
+    ).toBe(true);
+  });
+
+  it("compacts large tool arguments in trace files and follow-up model context", async () => {
+    const dir = await tempWorkspace();
+    const tracePath = path.join(dir, "trace.jsonl");
+    const filler = "X".repeat(10000);
+    const command = `printf ok\n# ${filler}`;
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "large-command",
+              type: "function",
+              function: { name: "bash", arguments: { command } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    await runAgent({
+      instruction: "run a large command",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      traceJsonlPath: tracePath
+    });
+
+    const historyAssistant = model.requests[1].messages.find(
+      (message) => message.role === "assistant" && message.toolCalls?.[0]?.id === "large-command"
+    );
+    expect(historyAssistant?.role).toBe("assistant");
+    const compactedCommand = historyAssistant?.role === "assistant"
+      ? (historyAssistant.toolCalls?.[0]?.function.arguments as { command?: string }).command
+      : "";
+    expect(compactedCommand).toContain("large command compacted");
+    expect(compactedCommand?.length).toBeLessThan(4500);
+
+    const trace = await readFile(tracePath, "utf8");
+    expect(trace).toContain("large command compacted");
+    expect(trace).not.toContain(filler);
+  });
+
   it("executes write and edit tool calls", async () => {
     const dir = await tempWorkspace();
     const model = new FakeModel([
