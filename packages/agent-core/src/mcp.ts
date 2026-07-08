@@ -388,6 +388,12 @@ function registeredMcpTool(options: {
       }
     },
     risk: mode === "auto" && readOnly ? "read" : "unknown",
+    runtime: {
+      readOnly,
+      supportsParallel: readOnly,
+      approval: mode === "auto" && readOnly ? "auto" : "prompt",
+      sandbox: "bypass"
+    },
     async execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
       if (!(mode === "approve" || (mode === "auto" && readOnly))) {
         const denied = await requestToolPermission(context, {

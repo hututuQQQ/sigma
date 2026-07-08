@@ -121,7 +121,7 @@ export function createSubtaskTool(options: SubagentToolOptions): RegisteredTool 
       }
     },
     execute: async (args, context) => await executeSubtaskTool(args, context, options),
-    risk: "read"
+    risk: "read",
+    runtime: { readOnly: true, supportsParallel: false, approval: "auto", sandbox: "bypass" }
   };
 }
-

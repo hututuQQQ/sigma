@@ -1,7 +1,8 @@
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { truncateMiddle } from "../compaction.js";
-import { isProbablyMutatingCommand, requestToolPermission, resolveWorkspacePath } from "../policy.js";
+import { evaluateExecPolicy, requestToolPermission, resolveWorkspacePath } from "../policy.js";
 import { runBashCommand } from "../command-runner.js";
+import { createPolicyOnlySandboxAdapter } from "../sandbox.js";
 
 interface BashArgs {
   command?: unknown;
@@ -53,12 +54,21 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
     };
   }
 
-  if (isProbablyMutatingCommand(command)) {
+  const policy = evaluateExecPolicy(command, context.execPolicy);
+  if (policy.action === "deny") {
+    return {
+      ok: false,
+      content: policy.reason,
+      metadata: { execPolicy: policy }
+    };
+  }
+
+  if (policy.action === "prompt") {
     const denied = await requestToolPermission(context, {
       toolName: "bash",
       arguments: args,
-      risk: "execute",
-      reason: `Command appears to mutate files, install packages, change git state, or execute arbitrary code: ${command}`
+      risk: policy.risk,
+      reason: policy.reason
     });
     if (denied) return denied;
   }
@@ -72,10 +82,30 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
 
   const timeoutSec = asNumber(parsed.timeoutSec) ?? context.commandTimeoutSec;
   const timeoutMs = Math.max(1, Math.floor(timeoutSec * 1000));
+  const sandboxAdapter = context.sandboxAdapter ?? (
+    context.sandbox?.mode === "disabled" ? undefined : createPolicyOnlySandboxAdapter()
+  );
+  const sandboxDecision = sandboxAdapter
+    ? await sandboxAdapter.prepareExec({
+        toolName: "bash",
+        command,
+        cwd,
+        env: process.env,
+        policy,
+        sandbox: context.sandbox
+      })
+    : { allowed: true };
+  if (!sandboxDecision.allowed) {
+    return {
+      ok: false,
+      content: sandboxDecision.reason ?? "Command was denied by sandbox policy.",
+      metadata: { execPolicy: policy, sandbox: sandboxDecision.metadata ?? { denied: true } }
+    };
+  }
   const result = await runBashCommand({
-    command,
-    cwd,
-    env: process.env,
+    command: sandboxDecision.command ?? command,
+    cwd: sandboxDecision.cwd ?? cwd,
+    env: sandboxDecision.env ?? process.env,
     timeoutMs,
     abortSignal: context.abortSignal
   });
@@ -90,7 +120,9 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
         signal: result.signal,
         timedOut: result.timedOut,
         cancelled: result.cancelled,
-        truncated: false
+        truncated: false,
+        execPolicy: policy,
+        sandbox: sandboxDecision.metadata
       }
     };
   }
@@ -115,7 +147,9 @@ export async function executeBashTool(args: unknown, context: ToolExecutionConte
       settledOn: result.settledOn,
       signal: result.signal,
       timedOut: result.timedOut,
-      cancelled: result.cancelled
+      cancelled: result.cancelled,
+      execPolicy: policy,
+      sandbox: sandboxDecision.metadata
     }
   };
 }

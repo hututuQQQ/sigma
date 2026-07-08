@@ -4,11 +4,13 @@ import { oneLine } from "../components/formatting.js";
 import { fitStreamLine, muted, roleColor, streamGlyphs } from "./theme.js";
 import { rgb, truncateToWidth, wrapText } from "../ui/theme.js";
 
-function statusMarker(status: "running" | "ok" | "failed" | undefined, color: boolean): string {
+function statusMarker(status: "queued" | "running" | "ok" | "failed" | "aborted" | undefined, color: boolean): string {
   const g = streamGlyphs();
+  if (status === "queued") return muted(g.info, color);
   if (status === "running") return roleColor("warning", g.running, color);
   if (status === "ok") return roleColor("success", g.ok, color);
   if (status === "failed") return roleColor("danger", g.fail, color);
+  if (status === "aborted") return roleColor("warning", g.fail, color);
   return "";
 }
 

@@ -10,6 +10,7 @@ import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.
 import { CompactionService } from "./context/compaction-service.js";
 import { ContextManager } from "./context/context-manager.js";
 import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
+import { summarizeContextBudget } from "./context/token-budget.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 import { DEFAULT_COMPACTION_MODE, DEFAULT_FINAL_EVIDENCE_MODE, DEFAULT_SUBAGENTS_ENABLED } from "./defaults.js";
@@ -27,6 +28,7 @@ import {
   workflowFailureNudge
 } from "./controller/workflow-state.js";
 import { redactSecrets } from "./redaction.js";
+import { ToolRuntime, type ToolRuntimeExecution } from "./tool-runtime.js";
 import type {
   AgentEvent,
   AgentFinishReason,
@@ -37,6 +39,7 @@ import type {
   SummaryJson,
   TokenTotals,
   ToolExecutionContext,
+  ToolRuntimeMetadata,
   ToolRegistry,
   ToolResult
 } from "./types.js";
@@ -292,6 +295,12 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.reviewFindings && result.reviewFindings.length > 0) {
     summary.review_findings = result.reviewFindings;
   }
+  if (result.toolRuntime) {
+    summary.tool_runtime = result.toolRuntime;
+  }
+  if (result.contextBudget) {
+    summary.context_budget = result.contextBudget;
+  }
   return summary;
 }
 
@@ -329,6 +338,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     model,
     subagentsEnabled,
     subagentDepth: 0,
+    execPolicy: config.execPolicy,
+    sandbox: config.sandbox,
+    sandboxAdapter: config.sandboxAdapter,
     ...(config.abortSignal ? { abortSignal: config.abortSignal } : {})
   };
   const traceStore = config.traceJsonlPath ? new JsonlSessionStore(config.traceJsonlPath) : undefined;
@@ -502,6 +514,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     { role: "user", content: config.instruction }
   ];
   const registry = await resolveRunToolRegistry(config);
+  const toolRuntime = new ToolRuntime(registry, context);
   const toolsAvailable = registry.definitions.map((definition) => definition.function.name).sort((a, b) => a.localeCompare(b, "en"));
   let turns = 0;
   let toolCalls = 0;
@@ -510,6 +523,13 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   let lastError: string | null = null;
   let finalMessage: string | undefined;
   let stoppedByAssistant = false;
+  let lastContextBudget = summarizeContextBudget({
+    messages,
+    tools: registry.definitions,
+    maxMessageHistoryChars: config.maxMessageHistoryChars,
+    repoMapChars: repoMap?.chars,
+    skillsChars: selectedSkills.length > 0 ? formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS).length : 0
+  });
 
   await recordEvent(
     event(runId, "run_start", provider, model, {
@@ -539,6 +559,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       turns += 1;
+      const turnId = `${runId}:turn:${turns}`;
+      await recordEvent(event(runId, "turn_start", provider, model, { turn: turns, turnId }, undefined, durableSession?.sessionId));
       const changedFilesForContext = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
       const preparedMessages = await contextManager.prepareMessages({
         messages,
@@ -570,6 +592,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (preparedMessages.messages !== messages) {
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
+      lastContextBudget = summarizeContextBudget({
+        messages,
+        tools: registry.definitions,
+        maxMessageHistoryChars: config.maxMessageHistoryChars,
+        repoMapChars: repoMap?.chars,
+        skillsChars: selectedSkills.length > 0 ? formatSelectedSkills(selectedSkills, config.skillsMaxChars ?? DEFAULT_SKILLS_MAX_CHARS).length : 0
+      });
+      await recordEvent(event(runId, "context_budget", provider, model, { turn: turns, turnId, budget: lastContextBudget }, undefined, durableSession?.sessionId));
       if (config.abortSignal?.aborted) {
         finishReason = "cancelled";
         lastError = "Run cancelled before model request.";
@@ -622,45 +652,58 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       const workflowNudges: string[] = [];
-      for (const call of calls) {
-        if (config.abortSignal?.aborted) {
-          finishReason = "cancelled";
-          lastError = "Run cancelled before tool execution.";
-          await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, toolName: call.function.name }, undefined, durableSession?.sessionId));
-          break;
-        }
-        const toolStart = event(runId, "tool_start", provider, model, { toolCall: call }, undefined, durableSession?.sessionId);
-        await recordEvent(toolStart);
-        toolCalls += 1;
-        if (toolCallCountsAsCommand(call as ToolCall)) {
-          commandsExecuted += 1;
-        }
-
-        let result: ToolResult;
-        const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call as ToolCall) ?? null;
-        let checkpointId: string | undefined;
-        try {
-          result = await registry.execute(call as ToolCall, context);
-        } catch (error) {
-          result = {
-            ok: false,
-            content: error instanceof Error ? error.message : String(error)
-          };
-        }
-        const checkpoint = await durableSession?.checkpoints.afterTool(pendingCheckpoint, result) ?? null;
-        checkpointId = checkpoint?.id;
-
-        await recordEvent(
-          event(
+      type ToolExecutionValue = { checkpointId?: string };
+      const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
+        emit: async (type, metadata, parentId) => {
+          const agentEvent = event(
             runId,
-            "tool_end",
+            type,
             provider,
             model,
-            { toolCallId: call.id, toolName: call.function.name, result, ...(checkpointId ? { checkpointId } : {}) },
-            toolStart.id,
+            { ...metadata, turn: turns, turnId },
+            parentId,
             durableSession?.sessionId
-          )
-        );
+          );
+          await recordEvent(agentEvent);
+          return agentEvent;
+        },
+        execute: async (call: ToolCall, _metadata: Required<Pick<ToolRuntimeMetadata, "readOnly" | "supportsParallel">> & ToolRuntimeMetadata) => {
+          if (config.abortSignal?.aborted) {
+            finishReason = "cancelled";
+            lastError = "Run cancelled before tool execution.";
+            await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, turnId, toolName: call.function.name }, undefined, durableSession?.sessionId));
+            return {
+              result: { ok: false, content: "Tool call cancelled before execution.", metadata: { cancelled: true } },
+              value: {}
+            };
+          }
+          toolCalls += 1;
+          if (toolCallCountsAsCommand(call)) {
+            commandsExecuted += 1;
+          }
+
+          let result: ToolResult;
+          const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call) ?? null;
+          try {
+            result = await registry.execute(call, context);
+          } catch (error) {
+            result = {
+              ok: false,
+              content: error instanceof Error ? error.message : String(error)
+            };
+          }
+          const checkpoint = await durableSession?.checkpoints.afterTool(pendingCheckpoint, result) ?? null;
+          return {
+            result,
+            value: { ...(checkpoint?.id ? { checkpointId: checkpoint.id } : {}) },
+            eventMetadata: { ...(checkpoint?.id ? { checkpointId: checkpoint.id } : {}) }
+          };
+        }
+      });
+
+      for (const execution of executions as Array<ToolRuntimeExecution<ToolExecutionValue>>) {
+        const call = execution.call;
+        const result = execution.result;
         if (isSubagentRunSummary(result.metadata?.subagentRun)) {
           subagentRuns.push(result.metadata.subagentRun);
         }
@@ -687,8 +730,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             "failure_analysis",
             provider,
             model,
-            { turn: turns, toolName: call.function.name, analysis: failureAnalysis },
-            toolStart.id,
+            { turn: turns, turnId, toolName: call.function.name, analysis: failureAnalysis },
+            undefined,
             durableSession?.sessionId
           ));
         }
@@ -703,7 +746,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         if (config.abortSignal?.aborted) {
           finishReason = "cancelled";
           lastError = "Run cancelled during tool execution.";
-          await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, toolName: call.function.name }, undefined, durableSession?.sessionId));
+          await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, turnId, toolName: call.function.name }, undefined, durableSession?.sessionId));
           break;
         }
       }
@@ -757,7 +800,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source })),
     contextCompactions,
     failureAnalyses: workflow.failureAnalyses,
-    subagentRuns
+    subagentRuns,
+    toolRuntime: toolRuntime.summary(),
+    contextBudget: lastContextBudget
   };
 
   await recordEvent(event(runId, "run_end", provider, model, { result }, undefined, durableSession?.sessionId));

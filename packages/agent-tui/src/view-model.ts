@@ -20,7 +20,7 @@ export type TranscriptEntry =
   | { kind: "system"; text: string; timestamp?: string }
   | { kind: "user"; text: string; timestamp?: string }
   | { kind: "assistant"; text: string; toolCalls?: number; timestamp?: string }
-  | { kind: "tool"; name: string; status: "running" | "ok" | "failed"; summary: string; durationMs?: number; timestamp?: string }
+  | { kind: "tool"; name: string; status: "queued" | "running" | "ok" | "failed" | "aborted"; summary: string; durationMs?: number; timestamp?: string }
   | { kind: "approval"; toolName: string; risk: string; summary: string; timestamp?: string }
   | { kind: "diff"; mode: "stat" | "patch"; summary: string; timestamp?: string }
   | { kind: "changes"; files: string[]; timestamp?: string }
@@ -73,10 +73,11 @@ function toolEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEn
   const detail = summarizeToolArguments(name, toolArgsFromEvent(start));
   const tail = result?.content ? truncate(oneLine(redactSecretText(result.content)), 90) : "";
   const size = formatBytes(result?.metadata?.sizeBytes);
+  const aborted = end?.type === "tool_aborted" || result?.metadata?.cancelled === true;
   return {
     kind: "tool",
     name,
-    status: end ? resultStatus(result) : "running",
+    status: end ? (aborted ? "aborted" : resultStatus(result)) : (start.type === "tool_queued" ? "queued" : "running"),
     summary: [detail, size, tail].filter(Boolean).join("  "),
     durationMs: toolDuration(result),
     timestamp: eventTime(end ?? start)
@@ -102,10 +103,16 @@ function harnessEntry(start: AgentEvent, end: AgentEvent | undefined): Transcrip
 function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const toolEndsByParent = new Map<string, AgentEvent>();
+  const toolStartsByCallId = new Map<string, AgentEvent>();
+  const toolAbortsByParent = new Map<string, AgentEvent>();
+  const toolAbortsByCallId = new Map<string, AgentEvent>();
   const checkEndsByParent = new Map<string, AgentEvent>();
   let latestAssistantDelta: AgentEvent | null = null;
   for (const event of events) {
     if (event.type === "tool_end" && event.parentId) toolEndsByParent.set(event.parentId, event);
+    if (event.type === "tool_start" && typeof event.metadata?.toolCallId === "string") toolStartsByCallId.set(event.metadata.toolCallId, event);
+    if (event.type === "tool_aborted" && event.parentId) toolAbortsByParent.set(event.parentId, event);
+    if (event.type === "tool_aborted" && typeof event.metadata?.toolCallId === "string") toolAbortsByCallId.set(event.metadata.toolCallId, event);
     if (event.type === "harness_check_end" && event.parentId) checkEndsByParent.set(event.parentId, event);
     if (event.type === "assistant_delta") latestAssistantDelta = event;
   }
@@ -128,8 +135,35 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       entries.push({ kind: "assistant", text, toolCalls, timestamp: eventTime(event) });
       continue;
     }
+    if (event.type === "tool_queued") {
+      const callId = typeof meta.toolCallId === "string" ? meta.toolCallId : "";
+      if (callId && toolStartsByCallId.has(callId)) continue;
+      entries.push(toolEntry(event, callId ? toolAbortsByCallId.get(callId) : undefined));
+      continue;
+    }
     if (event.type === "tool_start") {
-      entries.push(toolEntry(event, toolEndsByParent.get(event.id)));
+      entries.push(toolEntry(event, toolAbortsByParent.get(event.id) ?? toolEndsByParent.get(event.id)));
+      continue;
+    }
+    if (event.type === "tool_aborted" && !event.parentId) {
+      const callId = typeof meta.toolCallId === "string" ? meta.toolCallId : "";
+      if (callId && toolStartsByCallId.has(callId)) continue;
+      entries.push({
+        kind: "tool",
+        name: typeof meta.toolName === "string" ? meta.toolName : "tool",
+        status: "aborted",
+        summary: truncate(oneLine(redactSecretText(String(meta.reason ?? ""))), 90),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "context_budget") {
+      const budget = meta.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
+      entries.push({
+        kind: "system",
+        text: `context ${budget?.estimated_tokens ?? "?"} est tokens  ${budget?.message_count ?? "?"} messages  ${budget?.tool_count ?? "?"} tools`,
+        timestamp: eventTime(event)
+      });
       continue;
     }
     if (event.type === "harness_check_start") {

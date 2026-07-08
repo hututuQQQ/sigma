@@ -32,6 +32,14 @@ import { DEFAULT_SUBAGENTS_ENABLED } from "../defaults.js";
 
 const FILE_MUTATING_TOOLS = new Set(["write", "edit", "apply_patch", "bash", "shell_session", "service"]);
 
+function readonlyRuntime(): RegisteredTool["runtime"] {
+  return { readOnly: true, supportsParallel: true, approval: "auto", sandbox: "bypass" };
+}
+
+function serialRuntime(): RegisteredTool["runtime"] {
+  return { readOnly: false, supportsParallel: false, approval: "prompt", sandbox: "default" };
+}
+
 function resultChangedFiles(result: ToolResult): string[] {
   const metadata = result.metadata ?? {};
   if (metadata.checkOnly === true) return [];
@@ -101,7 +109,8 @@ const bashTool: RegisteredTool = {
     }
   },
   execute: executeBashTool,
-  risk: "execute"
+  risk: "execute",
+  runtime: serialRuntime()
 };
 
 const readTool: RegisteredTool = {
@@ -123,7 +132,8 @@ const readTool: RegisteredTool = {
     }
   },
   execute: executeReadTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const readManyTool: RegisteredTool = {
@@ -161,7 +171,8 @@ const readManyTool: RegisteredTool = {
     }
   },
   execute: executeReadManyTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const writeTool: RegisteredTool = {
@@ -183,7 +194,8 @@ const writeTool: RegisteredTool = {
     }
   },
   execute: executeWriteTool,
-  risk: "write"
+  risk: "write",
+  runtime: serialRuntime()
 };
 
 const editTool: RegisteredTool = {
@@ -206,7 +218,8 @@ const editTool: RegisteredTool = {
     }
   },
   execute: executeEditTool,
-  risk: "write"
+  risk: "write",
+  runtime: serialRuntime()
 };
 
 const serviceTool: RegisteredTool = {
@@ -236,7 +249,8 @@ const serviceTool: RegisteredTool = {
     }
   },
   execute: executeServiceTool,
-  risk: "execute"
+  risk: "execute",
+  runtime: serialRuntime()
 };
 
 const listTool: RegisteredTool = {
@@ -258,7 +272,8 @@ const listTool: RegisteredTool = {
     }
   },
   execute: executeListTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const globTool: RegisteredTool = {
@@ -280,7 +295,8 @@ const globTool: RegisteredTool = {
     }
   },
   execute: executeGlobTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const grepTool: RegisteredTool = {
@@ -305,7 +321,8 @@ const grepTool: RegisteredTool = {
     }
   },
   execute: executeGrepTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const repoQueryTool: RegisteredTool = {
@@ -330,7 +347,8 @@ const repoQueryTool: RegisteredTool = {
     }
   },
   execute: executeRepoQueryTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const symbolSearchTool: RegisteredTool = {
@@ -355,7 +373,8 @@ const symbolSearchTool: RegisteredTool = {
     }
   },
   execute: executeSymbolSearchTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const validateTool: RegisteredTool = {
@@ -379,7 +398,8 @@ const validateTool: RegisteredTool = {
     }
   },
   execute: executeValidateTool,
-  risk: "execute"
+  risk: "execute",
+  runtime: serialRuntime()
 };
 
 function createShellSessionTool(): RegisteredTool & { registryClose: ToolRegistry["close"] } {
@@ -408,6 +428,7 @@ function createShellSessionTool(): RegisteredTool & { registryClose: ToolRegistr
     },
     execute: controller.execute,
     risk: "execute",
+    runtime: serialRuntime(),
     registryClose: controller.close
   };
 }
@@ -429,7 +450,8 @@ const gitStatusTool: RegisteredTool = {
     }
   },
   execute: executeGitStatusTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const gitDiffTool: RegisteredTool = {
@@ -450,7 +472,8 @@ const gitDiffTool: RegisteredTool = {
     }
   },
   execute: executeGitDiffTool,
-  risk: "read"
+  risk: "read",
+  runtime: readonlyRuntime()
 };
 
 const applyPatchTool: RegisteredTool = {
@@ -472,7 +495,8 @@ const applyPatchTool: RegisteredTool = {
     }
   },
   execute: executeApplyPatchTool,
-  risk: "write"
+  risk: "write",
+  runtime: serialRuntime()
 };
 
 const todoTool: RegisteredTool = {
@@ -497,7 +521,8 @@ const todoTool: RegisteredTool = {
     }
   },
   execute: executeTodoTool,
-  risk: "read"
+  risk: "read",
+  runtime: { readOnly: false, supportsParallel: false, approval: "auto", sandbox: "bypass" }
 };
 
 export function createToolRegistryFromTools(
@@ -515,6 +540,9 @@ export function createToolRegistryFromTools(
 
   return {
     definitions: Array.from(toolMap.values(), (tool) => tool.definition),
+    getTool(name: string): RegisteredTool | undefined {
+      return toolMap.get(name);
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       const tool = toolMap.get(toolCall.function.name);
       if (!tool) {
@@ -603,6 +631,10 @@ export function mergeToolRegistries(registries: ToolRegistry[], options: ToolReg
   }
   return {
     definitions: [...definitionsByName.values()].map((entry) => entry.definition),
+    getTool(name: string): RegisteredTool | undefined {
+      const entry = definitionsByName.get(name);
+      return entry?.registry.getTool?.(name);
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       const entry = definitionsByName.get(toolCall.function.name);
       if (!entry) return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
@@ -625,6 +657,9 @@ export function filterToolRegistry(registry: ToolRegistry, filter: ToolRegistryF
   );
   return {
     definitions: registry.definitions.filter((definition) => names.has(definition.function.name)),
+    getTool(name: string): RegisteredTool | undefined {
+      return names.has(name) ? registry.getTool?.(name) : undefined;
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       if (!names.has(toolCall.function.name)) {
         return { ok: false, content: `Unknown or disabled tool: ${toolCall.function.name}` };

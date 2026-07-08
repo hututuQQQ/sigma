@@ -151,6 +151,8 @@ export type {
   FailureAnalyzerInput
 } from "./workflow/failure-analyzer.js";
 export {
+  classifyShellCommand,
+  evaluateExecPolicy,
   isPathInside,
   isProbablyMutatingCommand,
   permissionDeniedResult,
@@ -158,6 +160,10 @@ export {
   resolveWorkspacePath,
   workspaceRelativePath
 } from "./policy.js";
+export { createPolicyOnlySandboxAdapter, PolicyOnlySandboxAdapter } from "./sandbox.js";
+export { ToolRuntime } from "./tool-runtime.js";
+export type { ToolRuntimeCallbacks, ToolRuntimeExecution } from "./tool-runtime.js";
+export { summarizeContextBudget } from "./context/token-budget.js";
 export { estimateValidationCost, withEstimatedCost } from "./validation/command-cost.js";
 export { discoverProjects } from "./validation/project-discovery.js";
 export { createValidationPlan } from "./validation/validation-planner.js";
@@ -227,8 +233,12 @@ export type {
   CompactionFallbackMode,
   CompactionMode,
   ContextCompactionSummary,
+  ContextBudgetSummary,
   EvidenceKind,
   EvidenceRecord,
+  ExecIntentSummary,
+  ExecPolicyConfig,
+  ExecPolicyRule,
   FailureAnalysisSummary,
   FinalGateStatus,
   HarnessAttemptSummary,
@@ -254,6 +264,10 @@ export type {
   SubagentRunSummary,
   SubagentType,
   SummaryJson,
+  SandboxAdapter,
+  SandboxConfig,
+  SandboxExecDecision,
+  SandboxExecRequest,
   TodoItem,
   TodoStatus,
   TokenTotals,
@@ -262,6 +276,11 @@ export type {
   ToolRegistryFilter,
   ToolRegistryOptions,
   ToolRegistry,
+  ToolRuntimeMetadata,
+  ToolRuntimeSummary,
+  ToolArtifactSummary,
+  ToolApprovalMode,
+  ToolSandboxMode,
   ToolRisk,
   ToolResult,
   WorkflowPhase,

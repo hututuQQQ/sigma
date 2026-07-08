@@ -75,6 +75,18 @@ function mcpState(result: AgentRunResult | null, enabled?: boolean): string {
   return enabled ? "enabled" : "off";
 }
 
+function observedToolCalls(events: AgentEvent[]): number {
+  const seen = new Set<string>();
+  let anonymous = 0;
+  for (const event of events) {
+    if (event.type !== "tool_queued" && event.type !== "tool_start") continue;
+    const callId = typeof event.metadata?.toolCallId === "string" ? event.metadata.toolCallId : "";
+    if (callId) seen.add(callId);
+    else anonymous += 1;
+  }
+  return seen.size + anonymous;
+}
+
 export function StatusBar(props: StatusBarProps): string {
   const g = glyphs();
   const width = props.width ?? 100;
@@ -82,7 +94,7 @@ export function StatusBar(props: StatusBarProps): string {
   const finish = props.result ? ` ${props.result.finishReason}` : "";
   const turn = props.result?.turns ?? lastTurn(props.events) ?? 0;
   const turnLimit = props.maxTurns ? `/${props.maxTurns}` : "";
-  const toolCalls = props.result?.toolCalls ?? props.events.filter((event) => event.type === "tool_start").length;
+  const toolCalls = props.result?.toolCalls ?? observedToolCalls(props.events);
   const usage = props.result?.usage ?? usageFromEvents(props.events);
   const workspaceBase = path.basename(props.workspacePath) || props.workspacePath;
   const workspace = redactSecretText(props.workspacePath);

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -423,6 +423,39 @@ describe("agent loop", () => {
     expect(result.usage).toMatchObject({ inputTokens: 1, outputTokens: 2, totalTokens: 3 });
     expect(events).toEqual(expect.arrayContaining(["assistant_delta", "reasoning_delta", "assistant_message"]));
     expect(model.requests[0].abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("dispatches tool calls through the runtime and records context budget", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "a.txt"), "alpha", "utf8");
+    await writeFile(path.join(dir, "b.txt"), "bravo", "utf8");
+    const events: string[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event.type));
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            { id: "read-a", type: "function", function: { name: "read", arguments: { path: "a.txt" } } },
+            { id: "read-b", type: "function", function: { name: "read", arguments: { path: "b.txt" } } }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "read files",
+      workspacePath: dir,
+      modelClient: model,
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.toolRuntime).toMatchObject({ queued: 2, completed: 2, parallel_batches: 1 });
+    expect(result.contextBudget?.message_count).toBeGreaterThan(0);
+    expect(events).toEqual(expect.arrayContaining(["turn_start", "context_budget", "tool_queued", "tool_start", "tool_end"]));
   });
 
   it("cancels before a model request", async () => {

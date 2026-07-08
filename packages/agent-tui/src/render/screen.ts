@@ -88,11 +88,13 @@ function usageSummary(options: RenderScreenOptions): string {
   return usage ? formatUsage(usage) : "unknown";
 }
 
-function statusMarker(status: "running" | "ok" | "failed" | undefined, color: boolean): string {
+function statusMarker(status: "queued" | "running" | "ok" | "failed" | "aborted" | undefined, color: boolean): string {
   const g = streamGlyphs();
+  if (status === "queued") return roleColor("dim", g.info, color);
   if (status === "running") return roleColor("warning", g.running, color);
   if (status === "ok") return roleColor("success", g.ok, color);
   if (status === "failed") return roleColor("danger", g.fail, color);
+  if (status === "aborted") return roleColor("warning", g.fail, color);
   return roleColor("dim", g.info, color);
 }
 
@@ -156,12 +158,19 @@ function shouldUseWorkbench(options: RenderScreenOptions, mainHeight: number): b
 }
 
 function runningTools(events: AgentEvent[]): number {
+  const queued = new Set<string>();
   const running = new Set<string>();
   for (const event of events) {
-    if (event.type === "tool_start") running.add(event.id);
-    if (event.type === "tool_end" && event.parentId) running.delete(event.parentId);
+    const callId = typeof event.metadata?.toolCallId === "string" ? event.metadata.toolCallId : "";
+    if (event.type === "tool_queued" && callId) queued.add(callId);
+    if (event.type === "tool_start") {
+      running.add(event.id);
+      if (callId) queued.delete(callId);
+    }
+    if ((event.type === "tool_end" || event.type === "tool_aborted") && event.parentId) running.delete(event.parentId);
+    if ((event.type === "tool_end" || event.type === "tool_aborted") && callId) queued.delete(callId);
   }
-  return running.size;
+  return running.size + queued.size;
 }
 
 function renderBottomStatus(options: RenderScreenOptions): string {

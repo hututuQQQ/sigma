@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { runAgent } from "../packages/agent-core/src/index.js";
+import { redactSecrets, runAgent } from "../packages/agent-core/src/index.js";
 
 class SecretModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -17,6 +17,21 @@ class SecretModel implements ModelClient {
 }
 
 describe("secret redaction", () => {
+  it("keeps token usage counters while redacting real token fields", () => {
+    const redacted = redactSecrets({
+      input_tokens: 12,
+      output_tokens: 5,
+      token: "sigma-secret-value-abcdef",
+      nested: { auth_token: "sigma-secret-value-ghijkl" }
+    });
+    expect(redacted).toMatchObject({
+      input_tokens: 12,
+      output_tokens: 5,
+      token: "[REDACTED]",
+      nested: { auth_token: "[REDACTED]" }
+    });
+  });
+
   it("redacts env-shaped secrets from summaries and traces", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-redaction-"));
     const secret = "sigma-secret-value-123456";
@@ -43,4 +58,3 @@ describe("secret redaction", () => {
     }
   });
 });
-

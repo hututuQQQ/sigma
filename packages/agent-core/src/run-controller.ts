@@ -21,9 +21,12 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
+  ExecPolicyConfig,
   McpServerRunSummary,
   PermissionDecider,
   PermissionMode,
+  SandboxAdapter,
+  SandboxConfig,
   ToolRegistry
 } from "./types.js";
 
@@ -85,6 +88,9 @@ export interface RunConfiguredAgentOptions {
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  execPolicy?: ExecPolicyConfig;
+  sandbox?: SandboxConfig;
+  sandboxAdapter?: SandboxAdapter;
   enableMcp?: boolean;
   mcpConfig?: string;
   eventBus?: AgentEventBusLike;
@@ -190,6 +196,9 @@ function baseRunConfig(
     finalEvidenceMode: resolved.finalEvidenceMode,
     ...(defined(options.skillsMode) ? { skillsMode: options.skillsMode } : {}),
     ...(defined(options.skillsMaxChars) ? { skillsMaxChars: options.skillsMaxChars } : {}),
+    ...(defined(options.execPolicy) ? { execPolicy: options.execPolicy } : {}),
+    ...(defined(options.sandbox) ? { sandbox: options.sandbox } : {}),
+    ...(defined(options.sandboxAdapter) ? { sandboxAdapter: options.sandboxAdapter } : {}),
     ...(defined(options.eventBus) ? { eventBus: options.eventBus } : {}),
     ...(defined(options.abortSignal) ? { abortSignal: options.abortSignal } : {})
   };

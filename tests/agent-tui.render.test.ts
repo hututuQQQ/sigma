@@ -383,6 +383,41 @@ describe("agent-tui stream rendering", () => {
     }));
   });
 
+  it("renders queued, aborted, and context budget events", () => {
+    const queued = event("tool_queued", { toolCallId: "call-1", toolName: "read" });
+    const aborted = event("tool_aborted", { toolCallId: "call-2", toolName: "bash", reason: "abort signal" });
+    const contextBudget = event("context_budget", {
+      budget: { estimated_tokens: 123, message_count: 4, tool_count: 12 }
+    });
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [queued, aborted, contextBudget],
+      result: null
+    });
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "read", status: "queued" }));
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "bash", status: "aborted" }));
+    expect(entries.some((entry) => entry.kind === "system" && entry.text.includes("123 est tokens"))).toBe(true);
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [queued, aborted, contextBudget],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      width: 96,
+      height: 18,
+      color: false
+    });
+    expect(rendered).toContain("read");
+    expect(rendered).toContain("context 123 est tokens");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
   it("redacts approval details and truncates diff output with color disabled", () => {
     const request: PermissionRequest = {
       toolName: "bash",
