@@ -17,7 +17,6 @@ import {
 } from "../packages/agent-tui/src/app.js";
 import { setComposerText, type ComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { stripAnsi } from "../packages/agent-tui/src/ui/theme.js";
-import { SHELL_COMMAND_HINT } from "../packages/agent-tui/src/workspace-command.js";
 
 const savedEnv = {
   SIGMA_ASCII: process.env.SIGMA_ASCII,
@@ -446,17 +445,31 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     }
   });
 
-  it("shows a shell hint for shell-like input without calling the model", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-shell-hint-"));
+  it("submits command-like text to the model unless shell execution is explicit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-command-like-prompt-"));
     const stdout = new FakeStdout();
     const { runner, calls } = runnerSpy();
     const app = new TuiApp(options(root), new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
     try {
       await submit(app, "pnpm test");
 
-      expect(calls).toHaveLength(0);
-      expect(stdout.last()).toContain(SHELL_COMMAND_HINT);
+      expect(calls).toEqual([{ instruction: "pnpm test" }]);
       expect(stdout.last()).not.toContain("Missing DEEPSEEK_API_KEY");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("submits markdown prompts with backticks instead of treating them as shell commands", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-markdown-prompt-"));
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const instruction = "Fix the `pnpm test` failure.\nKeep `README.md` accurate.";
+      await submit(app, instruction);
+
+      expect(calls).toEqual([{ instruction }]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
