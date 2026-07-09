@@ -50,6 +50,8 @@ import {
   killToEnd,
   killToStart,
   moveCursorEnd,
+  moveCursorLineDown,
+  moveCursorLineUp,
   moveCursorLeft,
   moveCursorRight,
   moveCursorStart,
@@ -476,11 +478,6 @@ export class TuiApp {
       this.afterComposerEdit();
       return;
     }
-    if (key.name === "enter") {
-      insertText(this.composer, "\n");
-      this.afterComposerEdit();
-      return;
-    }
     if (key.name === "escape") {
       this.handleEscape();
       return;
@@ -514,12 +511,24 @@ export class TuiApp {
       return;
     }
     if (key.name === "up") {
+      if (this.composer.text.includes("\n")) {
+        moveCursorLineUp(this.composer);
+        this.paletteHidden = false;
+        this.render();
+        return;
+      }
       recallHistory(this.composer, "up");
       this.paletteHidden = false;
       this.render();
       return;
     }
     if (key.name === "down") {
+      if (this.composer.text.includes("\n")) {
+        moveCursorLineDown(this.composer);
+        this.paletteHidden = false;
+        this.render();
+        return;
+      }
       recallHistory(this.composer, "down");
       this.paletteHidden = false;
       this.render();
@@ -534,7 +543,7 @@ export class TuiApp {
       void this.toggleWorkbench();
       return;
     }
-    if (key.name === "return") {
+    if (key.name === "return" || key.name === "enter") {
       if (this.acceptFileMention()) return;
       if (this.handleChangePromptKey("return")) return;
       void this.submitInput();

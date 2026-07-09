@@ -65,6 +65,39 @@ export function moveCursorRight(state: ComposerState): void {
   state.cursor = Math.min(state.text.length, state.cursor + 1);
 }
 
+function lineBoundsAt(text: string, cursor: number): { start: number; end: number; column: number } {
+  const safeCursor = Math.min(Math.max(0, cursor), text.length);
+  const start = text.lastIndexOf("\n", Math.max(0, safeCursor - 1)) + 1;
+  const nextBreak = text.indexOf("\n", safeCursor);
+  const end = nextBreak === -1 ? text.length : nextBreak;
+  return {
+    start,
+    end,
+    column: safeCursor - start
+  };
+}
+
+export function moveCursorLineUp(state: ComposerState): boolean {
+  clampCursor(state);
+  const current = lineBoundsAt(state.text, state.cursor);
+  if (current.start === 0) return false;
+  const previousEnd = current.start - 1;
+  const previousStart = state.text.lastIndexOf("\n", Math.max(0, previousEnd - 1)) + 1;
+  state.cursor = Math.min(previousStart + current.column, previousEnd);
+  return true;
+}
+
+export function moveCursorLineDown(state: ComposerState): boolean {
+  clampCursor(state);
+  const current = lineBoundsAt(state.text, state.cursor);
+  if (current.end >= state.text.length) return false;
+  const nextStart = current.end + 1;
+  const nextBreak = state.text.indexOf("\n", nextStart);
+  const nextEnd = nextBreak === -1 ? state.text.length : nextBreak;
+  state.cursor = Math.min(nextStart + current.column, nextEnd);
+  return true;
+}
+
 export function moveCursorStart(state: ComposerState): void {
   state.cursor = 0;
 }

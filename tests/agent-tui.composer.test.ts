@@ -8,6 +8,8 @@ import {
   killToEnd,
   killToStart,
   moveCursorEnd,
+  moveCursorLineDown,
+  moveCursorLineUp,
   moveCursorLeft,
   moveCursorRight,
   moveCursorStart,
@@ -91,6 +93,20 @@ describe("agent-tui composer editor", () => {
     insertText(state, "\nsecond");
     expect(state.text).toBe("first\nsecond");
     expect(state.cursor).toBe("first\nsecond".length);
+  });
+
+  it("moves the cursor vertically through multiline drafts", () => {
+    const state = createComposerState("one\ntwo longer\nthree");
+    state.cursor = "one\ntwo lo".length;
+
+    expect(moveCursorLineUp(state)).toBe(true);
+    expect(state.cursor).toBe("one".length);
+
+    expect(moveCursorLineDown(state)).toBe(true);
+    expect(state.cursor).toBe("one\ntwo".length);
+
+    expect(moveCursorLineDown(state)).toBe(true);
+    expect(state.cursor).toBe("one\ntwo longer\nthr".length);
   });
 
   it("cycles history up and down without losing the current draft", () => {

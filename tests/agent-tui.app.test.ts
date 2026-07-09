@@ -152,11 +152,38 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(target.composer.text).toBe("first\nsecond\nthird");
       expect(calls).toHaveLength(0);
 
-      stdin.emit("keypress", "", { name: "return" });
+      stdin.emit("keypress", "", { name: "enter" });
       await Promise.resolve();
       await Promise.resolve();
 
       expect(calls).toEqual([{ instruction: "first\nsecond\nthird" }]);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses Up and Down to navigate long multiline composer drafts", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-multiline-nav-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"));
+
+      stdin.emit("keypress", "", { name: "up" });
+      expect(target.composer.cursor).toBe("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11".length);
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { name: "down" });
+      expect(target.composer.cursor).toBe(target.composer.text.length);
+      expect(calls).toHaveLength(0);
 
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
