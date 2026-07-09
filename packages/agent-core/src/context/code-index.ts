@@ -8,6 +8,7 @@ import {
   walkFiles,
   type WalkFile
 } from "../tools/workspace-utils.js";
+import { parseWithTreeSitter } from "./tree-sitter-provider.js";
 
 export type CodeSymbolKind = "function" | "class" | "interface" | "type" | "const" | "method" | "test" | "unknown";
 
@@ -124,7 +125,9 @@ function pushSymbol(symbols: CodeSymbol[], match: RegExpMatchArray | null, kind:
   });
 }
 
-function parseSymbolsAndImports(text: string, language: string): { symbols: CodeSymbol[]; imports: string[] } {
+function parseSymbolsAndImports(text: string, language: string, filePath = ""): { symbols: CodeSymbol[]; imports: string[] } {
+  const treeSitterParsed = parseWithTreeSitter({ filePath, language, text });
+  if (treeSitterParsed) return treeSitterParsed;
   const symbols: CodeSymbol[] = [];
   const imports = new Set<string>();
   const lines = text.split(/\r?\n/);
@@ -172,7 +175,7 @@ async function indexFile(file: WalkFile, maxFileBytes: number): Promise<CodeInde
   if (info.size <= maxFileBytes) {
     const buffer = await readFile(file.absolutePath);
     if (!isBinary(buffer)) {
-      const parsed = parseSymbolsAndImports(buffer.toString("utf8"), language);
+      const parsed = parseSymbolsAndImports(buffer.toString("utf8"), language, file.relativePath);
       symbols = parsed.symbols;
       imports = parsed.imports;
     }

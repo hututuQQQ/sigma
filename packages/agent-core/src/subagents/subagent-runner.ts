@@ -10,6 +10,7 @@ import type {
   ToolExecutionContext,
   ToolResult
 } from "../types.js";
+import { toolModelContent, toolModelMetadata } from "../types.js";
 import { investigatorSystemPrompt } from "./investigator-agent.js";
 import { reviewerSystemPrompt } from "./reviewer-agent.js";
 import type { SubagentExecution, SubagentRunRequest } from "./subagent-types.js";
@@ -210,8 +211,8 @@ function toolResultMessage(call: ToolCall, result: ToolResult, maxOutputChars: n
     name: call.function.name,
     content: JSON.stringify({
       ok: result.ok,
-      content: truncateMiddle(result.content, maxOutputChars).text,
-      metadata: result.metadata ?? {}
+      content: truncateMiddle(toolModelContent(result), maxOutputChars).text,
+      metadata: toolModelMetadata(result)
     })
   };
 }

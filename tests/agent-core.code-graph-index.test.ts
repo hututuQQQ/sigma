@@ -73,6 +73,21 @@ describe("CodeGraphIndex", () => {
     ]));
   });
 
+  it("indexes TSX and Rust symbols through Tree-sitter", async () => {
+    const { dir } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "view.tsx"), "export const Widget = () => <div />;\n", "utf8");
+    await writeFile(path.join(dir, "src", "lib.rs"), "pub fn run_task() {}\npub struct Runner;\n", "utf8");
+
+    const graph = await buildCodeGraphIndex({ workspacePath: dir });
+
+    expect(graph.definitions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "src/view.tsx", symbol: "Widget", exported: true }),
+      expect.objectContaining({ path: "src/lib.rs", symbol: "run_task", exported: true }),
+      expect.objectContaining({ path: "src/lib.rs", symbol: "Runner", exported: true })
+    ]));
+  });
+
   it("invalidates graph cache after mutation", async () => {
     const { dir, context } = await workspace();
     await mkdir(path.join(dir, "src"), { recursive: true });

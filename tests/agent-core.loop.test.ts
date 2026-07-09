@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { AgentEventBus, runAgent, type AgentEvent } from "../packages/agent-core/src/index.js";
+import { AgentEventBus, createToolRegistryFromTools, runAgent, type AgentEvent } from "../packages/agent-core/src/index.js";
 
 class FakeModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -463,6 +463,60 @@ describe("agent loop", () => {
     expect(result.toolRuntime).toMatchObject({ queued: 2, completed: 2, parallel_batches: 1 });
     expect(result.contextBudget?.message_count).toBeGreaterThan(0);
     expect(events).toEqual(expect.arrayContaining(["turn_start", "context_budget", "tool_queued", "tool_start", "tool_end"]));
+  });
+
+  it("sends only model-visible tool result fields back to the model", async () => {
+    const dir = await tempWorkspace();
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "secret-call",
+              type: "function",
+              function: { name: "secret_tool", arguments: {} }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+    const registry = createToolRegistryFromTools([
+      {
+        definition: {
+          type: "function",
+          function: {
+            name: "secret_tool",
+            description: "visibility test tool",
+            parameters: { type: "object", additionalProperties: false }
+          }
+        },
+        risk: "read",
+        runtime: { readOnly: true, supportsParallel: true },
+        execute: async () => ({
+          ok: true,
+          modelContent: "visible output",
+          uiContent: "visible ui output",
+          modelMetadata: { safe: true },
+          privateMetadata: { hiddenToken: "do-not-send" }
+        })
+      }
+    ]);
+
+    await runAgent({
+      instruction: "call secret",
+      workspacePath: dir,
+      modelClient: model,
+      toolRegistry: registry
+    });
+
+    const toolMessage = model.requests[1].messages.find((message) => message.role === "tool");
+    expect(toolMessage?.role).toBe("tool");
+    expect(toolMessage?.content).toContain("visible output");
+    expect(toolMessage?.content).toContain("\"safe\":true");
+    expect(toolMessage?.content).not.toContain("do-not-send");
+    expect(toolMessage?.content).not.toContain("hiddenToken");
   });
 
   it("stores complete bash output artifacts through the runtime", async () => {

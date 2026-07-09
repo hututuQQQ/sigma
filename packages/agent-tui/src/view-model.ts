@@ -11,6 +11,7 @@ import {
   summarizeToolArguments,
   toolArgsFromEvent,
   toolNameFromEvent,
+  toolResultFromEvent,
   truncate
 } from "./components/formatting.js";
 import { sigmaWelcome } from "./ui/brand.js";
@@ -68,10 +69,7 @@ function formatBytes(value: unknown): string {
 }
 
 function eventResult(event: AgentEvent): { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined {
-  const result = event.metadata?.result;
-  return result && typeof result === "object"
-    ? result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> }
-    : undefined;
+  return toolResultFromEvent(event);
 }
 
 function toolEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEntry {

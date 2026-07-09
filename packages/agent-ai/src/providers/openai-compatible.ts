@@ -11,6 +11,7 @@ export interface OpenAICompatibleProviderOptions {
   model: string;
   maxRetries?: number;
   fetchImpl?: typeof fetch;
+  promptCacheMetadata?: boolean;
 }
 
 const DEFAULT_MAX_RETRIES = 3;
@@ -63,6 +64,7 @@ export class OpenAICompatibleProvider implements ModelClient {
   private readonly apiKeyEnvName: string;
   private readonly maxRetries: number;
   private readonly fetchImpl: typeof fetch;
+  readonly supportsPromptCacheMetadata: boolean;
 
   constructor(options: OpenAICompatibleProviderOptions) {
     this.provider = options.provider;
@@ -72,6 +74,7 @@ export class OpenAICompatibleProvider implements ModelClient {
     this.apiKeyEnvName = options.apiKeyEnvName;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.supportsPromptCacheMetadata = options.promptCacheMetadata === true;
   }
 
   async complete(req: ModelRequest): Promise<ModelResponse> {
@@ -95,6 +98,12 @@ export class OpenAICompatibleProvider implements ModelClient {
     if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.reasoning?.enabled) {
       body.reasoning_effort = req.reasoning.effort ?? "high";
+    }
+    if (this.supportsPromptCacheMetadata && (req.metadata || req.cacheHints?.length)) {
+      body.metadata = {
+        ...(req.metadata ?? {}),
+        ...(req.cacheHints?.length ? { sigma_prompt_cache_keys: req.cacheHints.map((hint) => hint.key).join(",") } : {})
+      };
     }
 
     const raw = await this.postWithRetry(body, req.abortSignal);
@@ -126,6 +135,12 @@ export class OpenAICompatibleProvider implements ModelClient {
     if (req.maxTokens !== undefined) body.max_tokens = req.maxTokens;
     if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.reasoning?.enabled) body.reasoning_effort = req.reasoning.effort ?? "high";
+    if (this.supportsPromptCacheMetadata && (req.metadata || req.cacheHints?.length)) {
+      body.metadata = {
+        ...(req.metadata ?? {}),
+        ...(req.cacheHints?.length ? { sigma_prompt_cache_keys: req.cacheHints.map((hint) => hint.key).join(",") } : {})
+      };
+    }
 
     const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
       method: "POST",

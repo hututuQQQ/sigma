@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { RegisteredTool, ToolExecutionContext, ToolRegistry, ToolResult, McpServerRunSummary } from "./types.js";
+import { normalizeToolResult, toolDescriptorFromDefinition } from "./types.js";
 import { requestToolPermission, resolveWorkspacePath } from "./policy.js";
 import { createToolRegistryFromTools } from "./tools/registry.js";
 import { redactSecretText } from "./redaction.js";
@@ -364,9 +365,9 @@ function mcpToolContent(result: unknown): ToolResult {
         return JSON.stringify(part);
       })
       .join("\n");
-    return { ok: !isError, content: text, metadata: { mcp: true, isError } };
+    return normalizeToolResult({ ok: !isError, modelContent: text, modelMetadata: { mcp: true, isError } });
   }
-  return { ok: !isError, content: JSON.stringify(result), metadata: { mcp: true, isError } };
+  return normalizeToolResult({ ok: !isError, modelContent: JSON.stringify(result), modelMetadata: { mcp: true, isError } });
 }
 
 function registeredMcpTool(options: {
@@ -378,22 +379,34 @@ function registeredMcpTool(options: {
 }): RegisteredTool {
   const mode = approvalMode(options.serverConfig.approvalMode);
   const readOnly = options.tool.annotations?.readOnlyHint === true;
-  return {
-    definition: {
+  const definition: RegisteredTool["definition"] = {
       type: "function",
       function: {
         name: options.sigmaName,
         description: `MCP tool ${options.serverName}/${options.tool.name}. ${options.tool.description ?? ""}`.trim(),
         parameters: options.tool.inputSchema ?? { type: "object", additionalProperties: true }
       }
-    },
+    };
+  const runtime: RegisteredTool["runtime"] = {
+    readOnly,
+    supportsParallel: readOnly,
+    approval: mode === "auto" && readOnly ? "auto" : "prompt",
+    sandbox: "bypass",
+    cancellable: true,
+    progressKind: "message"
+  };
+  return {
+    definition,
+    descriptor: toolDescriptorFromDefinition(definition, {
+      risk: mode === "auto" && readOnly ? "read" : "unknown",
+      runtime,
+      ui: { group: "mcp", renderKind: "text", label: `${options.serverName}/${options.tool.name}` },
+      permission: {
+        resources: [{ kind: "mcp", description: `${options.serverName}/${options.tool.name}` }]
+      }
+    }),
     risk: mode === "auto" && readOnly ? "read" : "unknown",
-    runtime: {
-      readOnly,
-      supportsParallel: readOnly,
-      approval: mode === "auto" && readOnly ? "auto" : "prompt",
-      sandbox: "bypass"
-    },
+    runtime,
     async execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
       if (!(mode === "approve" || (mode === "auto" && readOnly))) {
         const denied = await requestToolPermission(context, {
@@ -417,8 +430,8 @@ function registeredMcpTool(options: {
         const requestError = error instanceof McpRequestError ? error : null;
         return {
           ok: false,
-          content: error instanceof Error ? error.message : String(error),
-          metadata: {
+          modelContent: error instanceof Error ? error.message : String(error),
+          modelMetadata: {
             mcp: true,
             server: options.serverName,
             tool: options.tool.name,

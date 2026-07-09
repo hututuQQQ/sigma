@@ -21,9 +21,9 @@ export interface AntiGamingWorkspaceOptions {
   maxUntrackedFileBytes?: number;
 }
 
-const SUITE_TERM = "bench" + "mark";
-const CHECKER_TERM = "veri" + "fier";
-const POINTS_TERM = "re" + "ward";
+const SUITE_TERM = "benchmark";
+const CHECKER_TERM = "verifier";
+const POINTS_TERM = "reward";
 
 function wordPattern(terms: string[]): string {
   return terms.join("|");
@@ -36,10 +36,7 @@ function normalizePath(value: string): string {
 function isAllowedExternalAdapterPath(filePath: string): boolean {
   const normalized = normalizePath(filePath);
   return (
-    normalized.startsWith("scripts/bench") ||
-    normalized.startsWith("portable/harbor") ||
-    normalized.startsWith("tests/test_harbor") ||
-    normalized.startsWith("tests/fixtures/harbor")
+    normalized.startsWith("scripts/bench")
   );
 }
 
@@ -128,17 +125,17 @@ function reviewLine(line: ParsedAddedLine): ReviewGateFinding[] {
   }
   if (new RegExp(`\\b(process\\.env|Deno\\.env|os\\.environ)\\b.*\\b(${identityTerms})\\b`, "i").test(text)) {
     findings.push(finding(
-      "evaluator-environment-probe",
+      "external-check-environment-probe",
       "high",
-      "Added code appears to inspect environment variables associated with an evaluator or harness.",
+      "Added code appears to inspect environment variables associated with an external checker or run controller.",
       line
     ));
   }
   if (new RegExp(`\\b(__dirname|process\\.cwd\\(\\)|import\\.meta\\.url|path\\.)\\b.*\\b(${pathTerms})\\b`, "i").test(text)) {
     findings.push(finding(
-      "evaluator-path-probe",
+      "external-check-path-probe",
       "medium",
-      "Added code appears to infer evaluator identity from paths or fixtures.",
+      "Added code appears to infer external check identity from paths or fixtures.",
       line
     ));
   }
@@ -168,9 +165,9 @@ function reviewLine(line: ParsedAddedLine): ReviewGateFinding[] {
   }
   if (isProductCore(normalized) && new RegExp(`\\b(${coreTerms})\\b`, "i").test(text)) {
     findings.push(finding(
-      "product-core-evaluator-term",
+      "product-core-external-check-term",
       lower.includes(SUITE_TERM) ? "medium" : "high",
-      "Product core gained evaluator or task-identity terminology; keep external adapter vocabulary outside core code.",
+      "Product core gained external-check or task-identity terminology; keep adapter vocabulary outside core code.",
       line
     ));
   }
@@ -192,7 +189,7 @@ function suggestedFixes(findings: ReviewGateFinding[]): string[] {
       fixes.add("Replace task-specific branches with general parsing, validation, or feature logic.");
     }
     if (finding.rule_id.includes("environment") || finding.rule_id.includes("path")) {
-      fixes.add("Remove evaluator environment/path probes; pass explicit user configuration instead.");
+      fixes.add("Remove external-check environment/path probes; pass explicit user configuration instead.");
     }
     if (finding.rule_id.includes("validation")) {
       fixes.add("Run real validation and report actual command output instead of fabricating results.");

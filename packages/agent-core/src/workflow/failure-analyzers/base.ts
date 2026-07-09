@@ -1,5 +1,6 @@
 import { compactLargeCommand, truncateMiddle } from "../../compaction.js";
 import type { HarnessCommandResult, ToolResult, WorkflowFailureCategory } from "../../types.js";
+import { toolAllMetadata, toolModelContent } from "../../types.js";
 
 export interface FailureAnalyzerInput {
   ok?: boolean;
@@ -185,15 +186,16 @@ export function failureInputFromToolResult(options: {
   command: string | null;
   result: ToolResult;
 }): FailureAnalyzerInput {
-  const exitCode = options.result.metadata?.exitCode;
-  const signal = options.result.metadata?.signal;
+  const metadata = toolAllMetadata(options.result);
+  const exitCode = metadata.exitCode;
+  const signal = metadata.signal;
   return {
     ok: options.result.ok,
     toolName: options.toolName,
     command: options.command,
-    output: options.result.content,
+    output: toolModelContent(options.result),
     exitCode: typeof exitCode === "number" || exitCode === null ? exitCode : undefined,
-    timedOut: options.result.metadata?.timedOut === true,
+    timedOut: metadata.timedOut === true,
     signal: typeof signal === "string" ? signal : undefined
   };
 }

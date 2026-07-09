@@ -12,6 +12,7 @@ export { executeValidateTool } from "./validate.js";
 export { executeGitStatusTool, executeGitDiffTool } from "./git.js";
 export { executeApplyPatchTool } from "./apply-patch.js";
 export { executeTodoTool } from "./todo.js";
+export { executeMemoryTool } from "./memory.js";
 export { closeShellSessions, executeShellSessionTool } from "./shell-session.js";
 export { createSubtaskTool, executeSubtaskTool } from "../subagents/subtask-tool.js";
 export {

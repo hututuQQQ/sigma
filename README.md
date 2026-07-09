@@ -11,7 +11,7 @@ A small coding-agent monorepo inspired by Pi with four layers:
 - `packages/agent-cli`: plain terminal CLI with `run`, `tui`, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
 - `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
-Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, live progress, approval-gated mutating tools, read-only task subagents, and stdio/HTTP MCP tools. There is intentionally no large web UI, plugin marketplace, long-term memory, or Docker sandbox in this repo.
+Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, semantic code indexing, live progress, approval-gated mutating tools, read-only task subagents, local long-term memory, and stdio/HTTP MCP tools. There is intentionally no large web UI, plugin marketplace, or Docker sandbox in this repo.
 
 ## Install And Build
 
@@ -474,7 +474,9 @@ OpenAI-compatible providers support SSE model streaming. The core run loop prefe
 
 The default tool registry is extensible and can be injected, merged, filtered, or configured with `--allowed-tools` and `--disabled-tools`. Tool names must be unique; duplicate names fail clearly unless an internal override path is used.
 
-Tool calls are dispatched through the core tool runtime. Read-only tools that declare `supportsParallel` can run together within a single model turn; write, shell, service, validation, and subagent tools remain serial barriers. The runtime emits `tool_queued`, `tool_start`, `tool_progress`, `tool_end`, and `tool_aborted` events, returns tool results to the model in the original tool-call order, and records a `tool_runtime` summary in `summary.json`.
+Tool calls are described by `ToolDescriptor`, which separates provider schema, UI hints, runtime behavior, permission resources, result projection, and lifecycle details. Provider-facing tool definitions are derived from that descriptor. Tool results separate `modelContent`, `uiContent`, structured data, model-visible metadata, private metadata, artifacts, result groups, and actual resources. Only model-visible fields are serialized back into tool messages.
+
+Tool calls are dispatched through the core tool runtime. Read-only tools that declare `supportsParallel` can run together within a single model turn; write, shell, service, validation, memory writes, and subagent tools remain serial barriers. The runtime emits `tool_queued`, `tool_start`, `tool_progress`, `tool_end`, and `tool_aborted` events with typed thread items such as command executions, MCP tool calls, dynamic tool calls, file changes, artifacts, context compactions, and subagent activity. It returns tool results to the model in the original tool-call order and records a `tool_runtime` summary in `summary.json`.
 
 Each turn also emits `turn_start` and `context_budget`. The budget is an estimate of current model-visible messages, tool definitions, repo map, and selected skills. Oversized runtime tool output can be saved under `.agent/artifacts/<run-id>/`, with the model receiving a bounded preview plus an artifact reference.
 
@@ -500,6 +502,7 @@ The core loop exposes these default tools:
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `validate`: runs an explicit validation command or infers one for changed files, a file, or the project. It returns structured `ok`, `command`, `kind`, `exitCode`, output tails, related files, and best-effort diagnostics.
 - `todo`: maintains run-scoped todo state for the agent.
+- `memory`: lists, reads, searches, and writes durable local memories in `.agent/memory` for user preferences, feedback, project notes, and reference notes. Memories are selected by relevance and should not duplicate code facts that current files can provide.
 - `task` / `subtask`: runs a foreground read-only investigator or reviewer subagent and returns a structured JSON report. Child subagents receive only `read`, `list`, `glob`, `grep`, `repo_query`, `symbol_search`, `git_status`, and `git_diff`; they cannot write files, run shells, start services, or spawn nested subagents.
 - `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
@@ -527,11 +530,13 @@ SIGMA.md
 
 The current implementation loads from the workspace root and is structured for nested working directories later. Use `--no-project-instructions` to disable loading and `--project-doc-max-bytes <number>` to change the default 32768-byte limit.
 
-Local `agent run` defaults to `--context-mode repo-map`. The startup repo map uses the v2 project discovery and graph index by default; it includes discovered roots, important config files, package scripts, ranked source files, exported symbols, tests, dependency edges, and a small git state summary. If v2 indexing fails or times out, Sigma returns an explicit degraded repo map with `RepoMap v2 failed`, a redacted error summary, minimal file tree/config metadata, and `code_index.degraded = true`. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+Local `agent run` defaults to `--context-mode repo-map`. The startup repo map uses the v2 project discovery and graph index by default; it includes discovered roots, important config files, package scripts, ranked source files, exported symbols, tests, dependency edges, and a small git state summary. The graph index uses built-in Tree-sitter parsers for TS/TSX/JS/JSX/Python/Go/Rust and falls back to regex extraction if parsing fails. If v2 indexing fails or times out, Sigma returns an explicit degraded repo map with `RepoMap v2 failed`, a redacted error summary, minimal file tree/config metadata, and `code_index.degraded = true`. Use `--context-mode off` to disable it or `--repo-map-max-chars <number>` to change the default 20000-character budget.
+
+Each model turn records a `ContextSourceMap` under `context_budget.source_map`. It attributes estimated tokens to system prompt, project instructions, tool definitions, repo map, selected skills, conversation messages, recent diff, memory snippets, and compaction summaries. Stable blocks carry cache keys as prompt-cache hints; providers that ignore those hints receive the same plain messages. Recent diff and relevant memories are injected as per-turn runtime context so the long-lived conversation history stays normalized.
 
 Conversation compaction defaults to `model-sub-session` with `--max-message-history-chars 120000`, so long sessions automatically compact. The sub-session request is read-only, uses `toolChoice: "none"` with no tools, receives clipped structured history instead of raw large tool output, and falls back to deterministic compaction with `context_compaction_error`, `context_compaction_end`, `fallback_used: true`, and a redacted error summary. Set `--compaction-fallback fail` to fail the run on model compaction errors. Set `--compaction-mode deterministic`, `--compaction-mode off`, or `--max-message-history-chars 0` to explicitly change or disable the default.
 
-Repo map generation, `repo_query`, `symbol_search`, and `read_many` share the same workspace path safety and ignore behavior. The walker honors built-in skips plus workspace `.gitignore` and `.agentignore`. `repo_query` and `symbol_search` use a lightweight code index during tool calls; mutating tools invalidate that index after detected changes so subsequent lookups see fresh files.
+Repo map generation, `repo_query`, `symbol_search`, and `read_many` share the same workspace path safety and ignore behavior. The walker honors built-in skips plus workspace `.gitignore` and `.agentignore`. `repo_query` and `symbol_search` use the semantic graph index during tool calls; mutating tools invalidate that index after detected changes so subsequent lookups see fresh files.
 
 Repo map v2 and `repo_query` use a lightweight graph index by default. It records symbols, definitions, imports, exports, references, config files, dependency edges, and test-to-source relations without requiring native parser dependencies. `repo_query` results keep the old fields and add `graphSignals` plus `why_this_file` to explain why a file ranked highly.
 
@@ -539,7 +544,7 @@ Generic coding skills are loaded in `--skills-mode auto` by default. Built-in sk
 
 Read-only subagents are enabled by default through the `task` and `subtask` tools. `investigator` is intended for locating files, reading failure logs, and suggesting validation plans. `reviewer` is intended for diff review, unrelated-change checks, validation gaps, and generic integrity concerns. Child agents can use only read/list/glob/grep/repo_query/symbol_search/git_status/git_diff, and recursive subagents are disabled. Parent runs receive only the compact JSON report in the `task`/`subtask` tool result and `subagent_runs`; child transcripts are not inherited by the parent model. Use `--no-subagents`, `AGENT_SUBAGENTS_ENABLED=false`, or `[subagents].enabled = false` to disable them.
 
-The anti-gaming review gate is generic policy infrastructure, not a benchmark shortcut. It scans added diff lines for patterns such as hardcoded task IDs, evaluator environment/path probes, fake validation results, scoring control flow, and product-core evaluator terminology. External adapter paths under `portable/harbor` and `scripts/bench-*` may contain adapter vocabulary, but product packages must remain free of task/verifier/scoring-specific behavior.
+The anti-gaming review gate is generic policy infrastructure, not a benchmark shortcut. It scans added diff lines for patterns such as hardcoded task IDs, evaluator environment/path probes, fake validation results, scoring control flow, and product-core evaluator terminology. External adapter paths under `portable/harbor` and `scripts/bench-*` may contain adapter vocabulary. Product packages must remain free of task/verifier/scoring-specific behavior, with `packages/agent-core/src/review/anti-gaming.ts` as the single explicit exception because it owns the generic detection rules.
 
 ## MCP Tools
 

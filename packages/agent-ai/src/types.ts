@@ -62,6 +62,11 @@ export interface ModelRequest {
     effort?: "high" | "max";
   };
   metadata?: Record<string, string>;
+  cacheHints?: Array<{
+    key: string;
+    kind: string;
+    label: string;
+  }>;
   abortSignal?: AbortSignal;
 }
 
@@ -79,6 +84,7 @@ export interface ModelEvent {
 export interface ModelClient {
   readonly provider: ProviderName;
   readonly model: string;
+  readonly supportsPromptCacheMetadata?: boolean;
   complete(req: ModelRequest): Promise<ModelResponse>;
   stream?(req: ModelRequest): AsyncIterable<ModelEvent>;
 }

@@ -8,6 +8,12 @@ import type {
   ToolResult,
   WorkspaceManifest
 } from "../types.js";
+import {
+  lowerToolDescriptorForModel,
+  normalizeToolResult,
+  toolAllMetadata,
+  toolDescriptorFromDefinition
+} from "../types.js";
 import { executeBashTool } from "./bash.js";
 import { executeReadTool, executeReadManyTool } from "./read.js";
 import { executeWriteTool } from "./write.js";
@@ -22,6 +28,7 @@ import { executeTodoTool } from "./todo.js";
 import { executeRepoQueryTool } from "./repo-query.js";
 import { executeSymbolSearchTool } from "./symbol-search.js";
 import { executeValidateTool } from "./validate.js";
+import { executeMemoryTool } from "./memory.js";
 import { createShellSessionToolController } from "./shell-session.js";
 import { invalidateContextIndexes } from "../context/code-index.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifest.js";
@@ -41,12 +48,28 @@ function serialRuntime(): RegisteredTool["runtime"] {
 }
 
 function resultChangedFiles(result: ToolResult): string[] {
-  const metadata = result.metadata ?? {};
+  const metadata = toolAllMetadata(result);
   if (metadata.checkOnly === true) return [];
   const changedFiles = metadata.changedFiles;
   if (Array.isArray(changedFiles)) return changedFiles.filter((file): file is string => typeof file === "string" && file.length > 0);
   if (typeof metadata.relativePath === "string" && metadata.relativePath.length > 0) return [metadata.relativePath];
   return [];
+}
+
+function normalizeRegisteredTool(tool: RegisteredTool): RegisteredTool {
+  const descriptor = tool.descriptor ?? toolDescriptorFromDefinition(tool.definition, {
+    risk: tool.risk,
+    runtime: tool.runtime
+  });
+  return {
+    ...tool,
+    descriptor,
+    definition: lowerToolDescriptorForModel(descriptor),
+    runtime: {
+      ...descriptor.runtime,
+      ...tool.runtime
+    }
+  };
 }
 
 function contextIndexCacheActive(context: ToolExecutionContext): boolean {
@@ -525,12 +548,44 @@ const todoTool: RegisteredTool = {
   runtime: { readOnly: false, supportsParallel: false, approval: "auto", sandbox: "bypass" }
 };
 
+const memoryTool: RegisteredTool = {
+  definition: {
+    type: "function",
+    function: {
+      name: "memory",
+      description:
+        "List, read, search, or write durable local memories in .agent/memory. Store user preferences, feedback, project notes, or reference notes; do not store code facts that can be derived from current files.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "read", "search", "write"] },
+          id: { type: "string" },
+          kind: { type: "string", enum: ["user", "feedback", "project", "reference"] },
+          title: { type: "string" },
+          content: { type: "string" },
+          query: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+          limit: { type: "number" },
+          maxChars: { type: "number" }
+        },
+        required: ["action"],
+        additionalProperties: false
+      }
+    }
+  },
+  execute: executeMemoryTool,
+  risk: "write",
+  runtime: { readOnly: false, supportsParallel: false, approval: "auto", sandbox: "bypass" },
+  descriptor: undefined
+};
+
 export function createToolRegistryFromTools(
   registeredTools: RegisteredTool[],
   options: ToolRegistryOptions = {}
 ): ToolRegistry {
   const toolMap = new Map<string, RegisteredTool>();
-  for (const tool of registeredTools) {
+  for (const rawTool of registeredTools) {
+    const tool = normalizeRegisteredTool(rawTool);
     const name = tool.definition.function.name;
     if (toolMap.has(name) && options.allowOverrides !== true) {
       throw new Error(`Duplicate tool name: ${name}`);
@@ -539,16 +594,20 @@ export function createToolRegistryFromTools(
   }
 
   return {
+    descriptors: Array.from(toolMap.values(), (tool) => tool.descriptor ?? toolDescriptorFromDefinition(tool.definition, { risk: tool.risk, runtime: tool.runtime })),
     definitions: Array.from(toolMap.values(), (tool) => tool.definition),
     getTool(name: string): RegisteredTool | undefined {
       return toolMap.get(name);
     },
+    getDescriptor(name: string) {
+      return toolMap.get(name)?.descriptor;
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       const tool = toolMap.get(toolCall.function.name);
       if (!tool) {
-        return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
+        return { ok: false, modelContent: `Unknown tool: ${toolCall.function.name}` };
       }
-      return await executeWithContextIndexInvalidation(tool, toolCall, context);
+      return normalizeToolResult(await executeWithContextIndexInvalidation(tool, toolCall, context));
     },
     async close(): Promise<void> {
       const closers = new Set<ToolRegistry["close"]>();
@@ -611,6 +670,7 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
       applyPatchTool,
       validateTool,
       todoTool,
+      memoryTool,
       ...subagentTools,
       createShellSessionTool()
     ],
@@ -619,26 +679,30 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
 }
 
 export function mergeToolRegistries(registries: ToolRegistry[], options: ToolRegistryOptions = {}): ToolRegistry {
-  const definitionsByName = new Map<string, { registry: ToolRegistry; definition: ToolRegistry["definitions"][number] }>();
+  const definitionsByName = new Map<string, { registry: ToolRegistry; definition: ToolRegistry["definitions"][number]; descriptor: RegisteredTool["descriptor"] }>();
   for (const registry of registries) {
     for (const definition of registry.definitions) {
       const name = definition.function.name;
       if (definitionsByName.has(name) && options.allowOverrides !== true) {
         throw new Error(`Duplicate tool name: ${name}`);
       }
-      definitionsByName.set(name, { registry, definition });
+      definitionsByName.set(name, { registry, definition, descriptor: registry.getDescriptor?.(name) ?? registry.getTool?.(name)?.descriptor });
     }
   }
   return {
+    descriptors: [...definitionsByName.values()].map((entry) => entry.descriptor ?? toolDescriptorFromDefinition(entry.definition)),
     definitions: [...definitionsByName.values()].map((entry) => entry.definition),
     getTool(name: string): RegisteredTool | undefined {
       const entry = definitionsByName.get(name);
       return entry?.registry.getTool?.(name);
     },
+    getDescriptor(name: string) {
+      return definitionsByName.get(name)?.descriptor;
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       const entry = definitionsByName.get(toolCall.function.name);
-      if (!entry) return { ok: false, content: `Unknown tool: ${toolCall.function.name}` };
-      return await entry.registry.execute(toolCall, context);
+      if (!entry) return { ok: false, modelContent: `Unknown tool: ${toolCall.function.name}` };
+      return normalizeToolResult(await entry.registry.execute(toolCall, context));
     },
     async close(): Promise<void> {
       await Promise.all(registries.map((registry) => registry.close?.()));
@@ -656,15 +720,20 @@ export function filterToolRegistry(registry: ToolRegistry, filter: ToolRegistryF
       .filter((name) => !disabled.has(name))
   );
   return {
+    descriptors: (registry.descriptors ?? registry.definitions.map((definition) => toolDescriptorFromDefinition(definition)))
+      .filter((descriptor) => names.has(descriptor.model.function.name)),
     definitions: registry.definitions.filter((definition) => names.has(definition.function.name)),
     getTool(name: string): RegisteredTool | undefined {
       return names.has(name) ? registry.getTool?.(name) : undefined;
     },
+    getDescriptor(name: string) {
+      return names.has(name) ? registry.getDescriptor?.(name) : undefined;
+    },
     async execute(toolCall: ToolCall, context: ToolExecutionContext): Promise<ToolResult> {
       if (!names.has(toolCall.function.name)) {
-        return { ok: false, content: `Unknown or disabled tool: ${toolCall.function.name}` };
+        return { ok: false, modelContent: `Unknown or disabled tool: ${toolCall.function.name}` };
       }
-      return await registry.execute(toolCall, context);
+      return normalizeToolResult(await registry.execute(toolCall, context));
     },
     async close(): Promise<void> {
       await registry.close?.();

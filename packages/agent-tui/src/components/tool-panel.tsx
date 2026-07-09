@@ -6,6 +6,7 @@ import {
   summarizeToolArguments,
   toolArgsFromEvent,
   toolNameFromEvent,
+  toolResultFromEvent,
   truncate
 } from "./formatting.js";
 
@@ -88,7 +89,7 @@ export function ToolPanel(events: AgentEvent[], result: AgentRunResult | null, w
     const start = event.parentId ? startsById.get(event.parentId) : undefined;
     const name = typeof meta.toolName === "string" ? meta.toolName : toolNameFromEvent(start ?? event);
     const detail = start ? summarizeToolArguments(name, toolArgsFromEvent(start)) : "";
-    const res = meta.result as { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined;
+    const res = toolResultFromEvent(event);
     const aborted = event.type === "tool_aborted" || res?.metadata?.cancelled === true;
     const marker = res?.ok ? g.ok : g.fail;
     const duration = typeof res?.metadata?.durationMs === "number" ? `${res.metadata.durationMs}ms` : "";
