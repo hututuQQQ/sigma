@@ -124,6 +124,7 @@ const DEFAULTS = {
 
 const BOOLEAN_FLAGS = new Set([
   "enable-mcp",
+  "instruction-clipboard",
   "json",
   "no-review-anti-gaming",
   "no-project-instructions",

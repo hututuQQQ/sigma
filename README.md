@@ -153,10 +153,15 @@ ZAI_API_KEY=... pnpm --filter agent-cli start -- run \
   --summary-json ./summary.json
 ```
 
-Instruction input can come from a positional string, `--instruction`, `--instruction-file`, or stdin:
+Instruction input can come from a positional string, `--instruction`, `--instruction-file`, `--instruction-clipboard`, or stdin:
 
 ```bash
 pnpm --filter agent-cli start -- run "Fix the failing tests" --workspace .
+
+pnpm --filter agent-cli start -- run \
+  --workspace . \
+  --provider deepseek \
+  --instruction-clipboard
 
 printf "Fix the failing tests" | pnpm --filter agent-cli start -- run \
   --workspace . \
@@ -347,6 +352,7 @@ Adapter report notes:
 --workspace <path>
 --instruction "..."
 --instruction-file <path>
+--instruction-clipboard
 --provider <deepseek|glm>
 --model <model>
 --max-turns <number>

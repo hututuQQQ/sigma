@@ -90,6 +90,8 @@ export const HIDE_CURSOR = "\x1b[?25l";
 export const SHOW_CURSOR = "\x1b[?25h";
 export const ENTER_ALT_SCREEN = "\x1b[?1049h";
 export const EXIT_ALT_SCREEN = "\x1b[?1049l";
+export const ENABLE_BRACKETED_PASTE = "\x1b[?2004h";
+export const DISABLE_BRACKETED_PASTE = "\x1b[?2004l";
 export type TuiSessionRunner = typeof runSession;
 
 const execFileAsync = promisify(execFile);
@@ -369,6 +371,8 @@ export class TuiApp {
   private workbenchOpen = false;
   private changePromptDismissed = false;
   private transcriptScrollOffset = 0;
+  private pasteMode = false;
+  private pasteBuffer = "";
 
   constructor(
     private readonly options: TuiAppOptions,
@@ -380,7 +384,7 @@ export class TuiApp {
   }
 
   async start(): Promise<void> {
-    this.stdout.write(`${ENTER_ALT_SCREEN}${HIDE_CURSOR}`);
+    this.stdout.write(`${ENTER_ALT_SCREEN}${ENABLE_BRACKETED_PASTE}${HIDE_CURSOR}`);
     try {
       this.filePaths = listWorkspaceFiles(this.options.workspace);
       readline.emitKeypressEvents(this.stdin);
@@ -393,7 +397,7 @@ export class TuiApp {
         this.resolveExit = resolve;
       });
     } catch (error) {
-      this.stdout.write(`${SHOW_CURSOR}${EXIT_ALT_SCREEN}`);
+      this.stdout.write(`${SHOW_CURSOR}${DISABLE_BRACKETED_PASTE}${EXIT_ALT_SCREEN}`);
       throw error;
     }
   }
@@ -401,6 +405,8 @@ export class TuiApp {
   private resolveExit: (() => void) | null = null;
 
   private readonly handleKeypress = (text: string, key: readline.Key): void => {
+    if (this.handlePasteKeypress(text, key)) return;
+
     if (key.ctrl && key.name === "c") {
       if (this.running && !this.cancelling) {
         this.cancelling = true;
@@ -466,6 +472,11 @@ export class TuiApp {
       return;
     }
     if (key.ctrl && key.name === "j") {
+      insertText(this.composer, "\n");
+      this.afterComposerEdit();
+      return;
+    }
+    if (key.name === "enter") {
       insertText(this.composer, "\n");
       this.afterComposerEdit();
       return;
@@ -536,6 +547,29 @@ export class TuiApp {
       this.afterComposerEdit();
     }
   };
+
+  private handlePasteKeypress(text: string, key: readline.Key): boolean {
+    if (key.name === "paste-start") {
+      this.pasteMode = true;
+      this.pasteBuffer = "";
+      return true;
+    }
+    if (!this.pasteMode) return false;
+    if (key.name === "paste-end") {
+      const normalized = this.pasteBuffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      this.pasteMode = false;
+      this.pasteBuffer = "";
+      if (normalized.length > 0) {
+        insertText(this.composer, normalized);
+        this.afterComposerEdit();
+      }
+      return true;
+    }
+    if (typeof text === "string" && text.length > 0) {
+      this.pasteBuffer += text;
+    }
+    return true;
+  }
 
   private handleApprovalKey(text: string, key: readline.Key, pending: PermissionRequest): void {
     const normalized = key.name === "escape" ? "escape" : text.trim().toLowerCase();
@@ -1611,7 +1645,9 @@ export class TuiApp {
   private stop(): void {
     this.stdin.off("keypress", this.handleKeypress);
     if (this.stdin.isTTY) this.stdin.setRawMode(false);
-    this.stdout.write(`${SHOW_CURSOR}\x1b[2J\x1b[H${EXIT_ALT_SCREEN}`);
+    this.pasteMode = false;
+    this.pasteBuffer = "";
+    this.stdout.write(`${SHOW_CURSOR}${DISABLE_BRACKETED_PASTE}\x1b[2J\x1b[H${EXIT_ALT_SCREEN}`);
     this.resolveExit?.();
   }
 }
@@ -1621,6 +1657,6 @@ export async function runTuiApp(options: TuiAppOptions): Promise<void> {
   try {
     await app.start();
   } finally {
-    process.stdout.write(`${SHOW_CURSOR}${EXIT_ALT_SCREEN}`);
+    process.stdout.write(`${SHOW_CURSOR}${DISABLE_BRACKETED_PASTE}${EXIT_ALT_SCREEN}`);
   }
 }

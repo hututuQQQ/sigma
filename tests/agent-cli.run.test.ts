@@ -210,6 +210,8 @@ describe("agent-cli run", () => {
     const flagFirst = parseArgs(["--json", "Fix failing tests"]);
     expect(flagFirst.flags.json).toBe(true);
     expect(flagFirst.positionals).toEqual(["Fix failing tests"]);
+    const clipboard = parseArgs(["--instruction-clipboard", "--workspace", "work"]);
+    expect(clipboard.flags["instruction-clipboard"]).toBe(true);
     expect(loadCliConfig({ workspace: "work", provider: "deepseek", "output-format": "stream-json" })).toMatchObject({
       outputFormat: "stream-json",
       noStreamUi: true
@@ -467,6 +469,32 @@ describe("agent-cli run", () => {
 
     expect(code).toBe(0);
     expect(stdout.text()).toContain("status=completed");
+  });
+
+  it("supports agent run with a clipboard instruction", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-clipboard-${Date.now()}`), { recursive: true });
+    const requests: ModelRequest[] = [];
+
+    const code = await runRunCommand(
+      ["--instruction-clipboard", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "yolo", "--no-stream-ui"],
+      {
+        clipboardReader: async () => "first line\r\nsecond line",
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => ({
+          provider: "deepseek",
+          model: "fake-cli-model",
+          async complete(req: ModelRequest): Promise<ModelResponse> {
+            requests.push(req);
+            return {
+              message: { role: "assistant", content: "all set" },
+              usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }
+            };
+          }
+        })
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(JSON.stringify(requests[0]?.messages)).toContain("first line\\nsecond line");
   });
 
   it("prints exactly one parseable JSON result in json mode", async () => {

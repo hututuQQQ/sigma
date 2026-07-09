@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRunResult } from "../packages/agent-core/src/index.js";
 import {
+  DISABLE_BRACKETED_PASTE,
+  ENABLE_BRACKETED_PASTE,
   ENTER_ALT_SCREEN,
   EXIT_ALT_SCREEN,
   HIDE_CURSOR,
@@ -112,15 +114,52 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       const started = app.start();
       await Promise.resolve();
 
-      expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${HIDE_CURSOR}`);
+      expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${ENABLE_BRACKETED_PASTE}${HIDE_CURSOR}`);
       expect(stdout.text()).toContain(`${HIDE_CURSOR}\x1b[2J\x1b[H`);
 
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
 
       expect(stdout.last()).toContain(SHOW_CURSOR);
+      expect(stdout.last()).toContain(DISABLE_BRACKETED_PASTE);
       expect(stdout.last()).toContain(EXIT_ALT_SCREEN);
       expect(stdin.rawModes).toEqual([true, false]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps bracketed pasted multiline text in the composer until explicit submit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-paste-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+
+      stdin.emit("keypress", "", { name: "paste-start" });
+      stdin.emit("keypress", "first", { name: "f" });
+      stdin.emit("keypress", "\r", { name: "return" });
+      stdin.emit("keypress", "\n", { name: "enter" });
+      stdin.emit("keypress", "second", { name: "s" });
+      stdin.emit("keypress", "\r", { name: "return" });
+      stdin.emit("keypress", "third", { name: "t" });
+      stdin.emit("keypress", "", { name: "paste-end" });
+
+      expect(target.composer.text).toBe("first\nsecond\nthird");
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { name: "return" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(calls).toEqual([{ instruction: "first\nsecond\nthird" }]);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
