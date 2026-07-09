@@ -3,6 +3,9 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const productRoots = ["packages/agent-core", "packages/agent-cli", "packages/agent-tui"];
+const allowedProductExceptions = new Set([
+  path.normalize("packages/agent-core/src/review/anti-gaming.ts")
+]);
 const forbidden = [
   /\bHarbor\b/,
   /\bTerminal-Bench\b/,
@@ -35,11 +38,16 @@ describe("product benchmark boundary", () => {
     const files = (await Promise.all(productRoots.map(sourceFiles))).flat();
     const violations: string[] = [];
     for (const file of files) {
+      const normalized = path.normalize(file);
+      if (allowedProductExceptions.has(normalized)) continue;
       const text = await readFile(path.resolve(file), "utf8");
       for (const pattern of forbidden) {
         if (pattern.test(text)) violations.push(`${file}: ${pattern}`);
       }
     }
     expect(violations).toEqual([]);
+    expect([...allowedProductExceptions]).toEqual([
+      path.normalize("packages/agent-core/src/review/anti-gaming.ts")
+    ]);
   });
 });

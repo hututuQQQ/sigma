@@ -21,9 +21,9 @@ export interface AntiGamingWorkspaceOptions {
   maxUntrackedFileBytes?: number;
 }
 
-const SUITE_TERM = "bench" + "mark";
-const CHECKER_TERM = "veri" + "fier";
-const POINTS_TERM = "re" + "ward";
+const SUITE_TERM = "benchmark";
+const CHECKER_TERM = "verifier";
+const POINTS_TERM = "reward";
 
 function wordPattern(terms: string[]): string {
   return terms.join("|");
