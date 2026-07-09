@@ -4,14 +4,18 @@ import { fileURLToPath } from "node:url";
 import type { TuiAppOptions } from "agent-tui";
 import { runChatCommand } from "./commands/chat.js";
 import { runDoctorCommand } from "./commands/doctor.js";
+import { runInitCommand } from "./commands/init.js";
 import { runReplayCommand } from "./commands/replay.js";
 import {
+  runArtifactsCommand,
   runCheckpointCommand,
   runCheckpointsCommand,
+  runJobsCommand,
   runSessionCommand,
   runSessionsCommand
 } from "./commands/session.js";
 import { runRunCommand } from "./commands/run.js";
+import { runVersionCommand } from "./commands/version.js";
 import { loadCliConfig, parseArgs, type CliConfig } from "./config.js";
 
 export interface AgentCliMainOptions {
@@ -23,12 +27,17 @@ function printHelp(): void {
 
 Commands:
   run      Run the autonomous coding agent once
+  init     Create a workspace .agent/config.toml
   tui      Start the interactive terminal UI
   chat     Start a minimal plain-terminal chat session
   sessions List recent durable sessions
   session  Show, search, resume, or fork sessions
+  inspect  Inspect latest or selected session evidence
+  jobs     Summarize recent session jobs
+  artifacts Show artifacts for latest or selected session
   checkpoints List checkpoints for a session
   checkpoint  Show or restore a checkpoint
+  version  Print CLI version and runtime metadata
   completion Generate shell completion for bash, zsh, or fish
   doctor   Check local configuration
   replay   Summarize a trace JSONL file
@@ -72,18 +81,26 @@ Common run flags:
 function completionScript(shell: string): string {
   const commands = [
     "run",
+    "init",
     "tui",
     "chat",
     "sessions",
     "session",
+    "inspect",
+    "jobs",
+    "artifacts",
     "checkpoints",
     "checkpoint",
+    "version",
     "completion",
     "doctor",
     "replay"
   ];
   const flags = [
     "--workspace",
+    "--limit",
+    "--check-api",
+    "--strict",
     "--instruction",
     "--instruction-file",
     "--provider",
@@ -249,23 +266,35 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   return 0;
 }
 
+function inspectArgs(argv: string[]): string[] {
+  const parsed = parseArgs(argv);
+  const hasTarget = parsed.positionals.length > 0 || parsed.flags.latest === true;
+  return ["show", ...(hasTarget ? argv : ["--latest", ...argv])];
+}
+
 export async function runAgentCommand(args = process.argv.slice(2), options: AgentCliMainOptions = {}): Promise<number> {
   if (args[0] === "--") {
     args.shift();
   }
   const [command, ...rest] = args;
+  if (command === "--version" || command === "-v") return await runVersionCommand([]);
   if (!command || command === "--help" || command === "-h") {
     printHelp();
     return 0;
   }
 
   if (command === "run") return await runRunCommand(rest);
+  if (command === "init") return await runInitCommand(rest);
   if (command === "tui") return await runTuiCommand(rest, options);
   if (command === "chat") return await runChatCommand(rest);
   if (command === "sessions") return await runSessionsCommand(rest);
   if (command === "session") return await runSessionCommand(rest);
+  if (command === "inspect") return await runSessionCommand(inspectArgs(rest));
+  if (command === "jobs") return await runJobsCommand(rest);
+  if (command === "artifacts") return await runArtifactsCommand(rest);
   if (command === "checkpoints") return await runCheckpointsCommand(rest);
   if (command === "checkpoint") return await runCheckpointCommand(rest);
+  if (command === "version") return await runVersionCommand(rest);
   if (command === "completion") {
     process.stdout.write(completionScript(rest[0] ?? ""));
     return 0;

@@ -8,7 +8,7 @@ A small coding-agent monorepo inspired by Pi with four layers:
 
 - `packages/agent-ai`: provider-agnostic model interface for DeepSeek and GLM/Zhipu
 - `packages/agent-core`: agent run controller, validation and retry controller, extensible tool registry, repo-aware context, durable sessions, checkpoints, JSONL tracing, MCP bridge, and workspace tools
-- `packages/agent-cli`: plain terminal CLI with `run`, `tui`, `sessions`, `session`, checkpoint commands, `chat`, `doctor`, and `replay`
+- `packages/agent-cli`: plain terminal CLI with `init`, `run`, `tui`, `inspect`, `jobs`, `artifacts`, durable session/checkpoint commands, `chat`, `doctor`, and `replay`
 - `packages/agent-tui`: interactive terminal product entry that drives the shared `agent-core` run path
 
 Sigma keeps the product runtime portable while adding repo instructions, deterministic repo maps, semantic code indexing, live progress, approval-gated mutating tools, read-only task subagents, local long-term memory, and stdio/HTTP MCP tools. There is intentionally no large web UI, plugin marketplace, or Docker sandbox in this repo.
@@ -167,8 +167,10 @@ printf "Fix the failing tests" | pnpm --filter agent-cli start -- run \
 Useful checks:
 
 ```bash
+pnpm --filter agent-cli start -- version --json
 pnpm --filter agent-cli start -- doctor --workspace .
 pnpm --filter agent-cli start -- doctor --workspace . --json
+pnpm --filter agent-cli start -- doctor --workspace . --json --strict
 pnpm --filter agent-cli start -- doctor --workspace . --provider glm --check-api
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl
 pnpm --filter agent-cli start -- replay --trace-jsonl ./trace.jsonl --timeline
@@ -179,10 +181,13 @@ Durable sessions are recorded by default under `.agent/sessions/`; `.agent/trace
 ```text
 .agent/sessions/index.jsonl
 .agent/sessions/<session-id>/meta.json
+.agent/sessions/<session-id>/artifacts.json
 .agent/sessions/<session-id>/events.jsonl
 .agent/sessions/<session-id>/summary.json
 .agent/sessions/<session-id>/checkpoints/
 ```
+
+`artifacts.json` is the stable per-session artifact manifest for product surfaces. It records the canonical paths, changed files, and compact evidence counts used by `agent inspect`, `agent jobs`, `agent artifacts`, and the TUI.
 
 Session commands:
 
@@ -229,18 +234,39 @@ export ZAI_API_KEY=...
 AGENT_PROVIDER=glm AGENT_MODEL=glm-5.2 pnpm smoke:local
 ```
 
+Product readiness smoke exercises the user-facing CLI path, session evidence, and artifact inspection without benchmark identity:
+
+```bash
+pnpm smoke:product
+pnpm smoke:tui-product
+pnpm verify:product
+```
+
+The Public MVP product bundle is a self-contained Windows x64 zip. Packaging downloads the pinned Windows Node runtime into `.artifacts/cache/` when needed; offline environments can pre-fill that cache or set `NODE_RUNTIME_ARCHIVE`.
+
+```bash
+pnpm package:agent-cli:windows
+pnpm verify:package:agent-cli:windows
+```
+
+After extracting `.artifacts/agent-cli-win32-x64.zip`, the bundled wrapper runs through `agent.cmd`:
+
+```powershell
+.\bin\agent.cmd version --json
+.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict
+.\bin\agent.cmd tui --workspace D:\path\to\repo --provider deepseek
+```
+
+## External Benchmark Adapters
+
+Harbor and Terminal-Bench support lives at the edge of the repo in `portable/harbor` and `scripts/bench-*`. Those files are external adapters and reporting tools. They may package and launch Sigma, but product core code must not depend on Harbor task identity, verifier output, benchmark names, or scoring details.
+
 Harbor smoke builds the CLI tarball, verifies Terminal-Bench with the oracle, then runs one custom-agent job:
 
 ```bash
 export DEEPSEEK_API_KEY=...
 AGENT_PROVIDER=deepseek pnpm smoke:harbor
 ```
-
-The Harbor artifact is a self-contained Linux bundle. Packaging downloads the pinned Linux Node runtime into `.artifacts/cache/` when needed; offline environments can pre-fill that cache or set `NODE_RUNTIME_TARBALL`.
-
-## External Benchmark Adapters
-
-Harbor and Terminal-Bench support lives at the edge of the repo in `portable/harbor` and `scripts/bench-*`. Those files are external adapters and reporting tools. They may package and launch Sigma, but product core code must not depend on Harbor task identity, verifier output, benchmark names, or scoring details.
 
 Terminal-Bench benchmark runs use Harbor, package the Sigma CLI first, and save artifacts under `.artifacts/bench/<run-id>/`. The run id is `YYYYMMDD-HHMMSS-provider-model`.
 
@@ -506,7 +532,7 @@ Each turn also emits `turn_start` and `context_budget`. The budget is an estimat
 
 Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Execution policy rules can allow, prompt, or deny command prefixes; permission rules can allow, ask, or deny tools and declared resources, with deny taking precedence and denied tools hidden from the model tool catalog. The default remains conservative in `ask` and permissive in `yolo`. Sandbox-aware execution is used for bash, service, shell sessions, and harness precheck/validation commands. On Linux, the bubblewrap backend mounts only required system paths plus the workspace/read roots, overlays configured write roots, and protects `denyRead`/`denyWrite` paths where the OS can enforce them. On Windows, the native helper uses a restricted token and restores any temporary ACL changes before returning.
 
-If an OS sandbox backend is unavailable and `sandbox.required=false`, Sigma may fall back to policy-only checks. Tool metadata, harness results, stream UI, and `agent doctor` include a clear warning when this happens. Use `--sandbox-required` (or `AGENT_SANDBOX_REQUIRED=true`) for fail-closed automation, including benchmark or harness runs where policy-only fallback is not acceptable.
+If an OS sandbox backend is unavailable and `sandbox.required=false`, Sigma may fall back to policy-only checks. Tool metadata, harness results, stream UI, and `agent doctor` include a clear warning when this happens. Use `--sandbox-required` (or `AGENT_SANDBOX_REQUIRED=true`) for fail-closed automation, including benchmark or harness runs where policy-only fallback is not acceptable. Use `agent doctor --json --strict` as a release or CI readiness gate when warnings should fail the check.
 
 The core loop exposes these default tools:
 
@@ -795,6 +821,25 @@ When the run controller performs multiple attempts, the top-level count and toke
 
 The newer fields are optional. They appear when relevant and preserve the summary object's stable `harness` key; product code should treat it as run-controller metadata.
 
+## Sigma Code Product Bundle
+
+`pnpm package:agent-cli:windows` bundles the pinned Windows Node runtime and creates `.artifacts/agent-cli-win32-x64.zip`. Set `NODE_RUNTIME_ARCHIVE` to use a pre-downloaded Node zip, or let the package script use `.artifacts/cache/node-v22.16.0-win-x64.zip` / nodejs.org. The bundle writes `package-metadata.json` with the runtime URL, platform, architecture, cache path, source, and download status.
+
+`pnpm verify:package:agent-cli:windows` checks the zip structure, README product boundary, `agent.cmd`, metadata, host CLI startup, and `.\bin\agent.cmd version --json` through the bundled `node.exe`. The older `pnpm package:agent-cli` / `pnpm verify:package:agent-cli` Linux tarball path remains available for external adapters and later Linux release validation.
+
+Product readiness:
+
+```bash
+pnpm verify:product
+pnpm smoke:tui-product
+pnpm verify:package:agent-cli:windows
+pnpm product:readiness
+pnpm verify:release:windows
+pnpm smoke:provider -- --provider deepseek
+```
+
+`pnpm product:readiness` writes `.artifacts/product-readiness.json` and `.artifacts/product-readiness.md`, aggregating CLI smoke, TUI smoke, package verification, optional live-provider smoke, and remaining release-hardening gaps. See `docs/PRODUCT_READINESS_CHECKLIST.md` for the full evidence contract.
+
 ## Harbor And Terminal-Bench 2.0
 
 The portable Harbor runtime is built from `packages/agent-ai`, `packages/agent-core`, and `packages/agent-cli`. `pnpm package:agent-cli` turns the CLI packages into a portable Linux tarball for task containers. `pnpm package:harbor-runtime` then creates the host-side portable Harbor runtime and JobConfigs in:
@@ -835,14 +880,10 @@ pnpm bench:tb:deepseek:task -- --task-id <task-id>
 
 During these runs, `scripts/bench-terminal-bench.mjs` packages the agent CLI, packages the Harbor runtime, puts `.artifacts/harbor-runtime` on `PYTHONPATH`, writes a portable JobConfig, runs Harbor, and collects reports.
 
-`pnpm package:agent-cli` bundles the pinned Linux Node runtime. By default packaging targets `x64`; set `AGENT_TARGET_ARCH=arm64` for an arm64 artifact. If `NODE_RUNTIME_TARBALL` is set, that tarball is used. Otherwise the package script uses `.artifacts/cache/node-v22.16.0-linux-<arch>.tar.xz` or downloads it from nodejs.org into that cache. The bundle writes `package-metadata.json` with the runtime URL, version, target architecture, cache path, source, and download status.
-
-Artifact checks:
+Benchmark adapter checks:
 
 ```bash
-pnpm package:agent-cli
-tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/agent'
-tar -tzf .artifacts/agent-cli-linux-x64.tgz | grep 'bin/node'
+pnpm verify:package:agent-cli
 grep -R "sigma_harbor_agent:SigmaCliHarborAgent" .artifacts/harbor-runtime/jobconfig*.json
 ```
 

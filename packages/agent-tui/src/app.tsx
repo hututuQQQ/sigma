@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import readline from "node:readline";
+import path from "node:path";
 import type { ProviderName } from "agent-ai";
 import {
+  defaultSessionRootDir,
   redactSecretText,
   type AgentEvent,
   type AgentFinalEvidenceMode,
@@ -34,11 +36,7 @@ import { parseDiffMode, renderDiffLines, type DiffMode } from "./components/diff
 import {
   formatUsage,
   oneLine,
-  summarizeToolArguments,
-  toolArgsFromEvent,
   toolArgsObject,
-  toolNameFromEvent,
-  toolResultFromEvent,
   truncate
 } from "./components/formatting.js";
 import { usageFromEvents } from "./components/status-bar.js";
@@ -74,8 +72,9 @@ import { TuiPermissionController } from "./permission.js";
 import { renderCommandPaletteOverlay, renderFileMentionPalette, renderFocusOverlay } from "./render/palette.js";
 import { renderScreen } from "./render/screen.js";
 import { streamColorEnabled } from "./render/theme.js";
+import { buildTuiRunState, type TuiRunState } from "./run-state.js";
 import { sigmaTagline, sigmaWelcome } from "./ui/brand.js";
-import { buildTranscript, type TranscriptEntry } from "./view-model.js";
+import { buildActivity, buildTranscript, type ActivityItem, type TranscriptEntry } from "./view-model.js";
 import { runSession } from "./run-session.js";
 import { truncateToWidth, wrapText } from "./ui/theme.js";
 import {
@@ -162,7 +161,19 @@ interface LocalCommandSnapshot {
   result: CommandResult;
 }
 
-type FocusMode = "none" | "status" | "tokens" | "context" | "tools" | "diff" | "test" | "help";
+type FocusMode =
+  | "none"
+  | "status"
+  | "settings"
+  | "permissions"
+  | "jobs"
+  | "artifacts"
+  | "tokens"
+  | "context"
+  | "tools"
+  | "diff"
+  | "test"
+  | "help";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -186,6 +197,28 @@ function listValue(value: string[] | undefined, empty = "none"): string {
 
 function field(label: string, value: string | number | undefined | null, width: number): string[] {
   return wrapText(`${label}: ${value ?? "default"}`, width);
+}
+
+function redactedField(label: string, value: string | number | undefined | null, width: number): string[] {
+  return field(label, typeof value === "string" ? redactSecretText(value) : value, width);
+}
+
+function middleTruncateOneLine(value: string, maxChars: number): string {
+  const text = oneLine(redactSecretText(value));
+  if (text.length <= maxChars) return text;
+  const marker = " ... ";
+  if (maxChars <= marker.length + 2) return truncateToWidth(text, maxChars);
+  const remaining = maxChars - marker.length;
+  const head = Math.ceil(remaining / 2);
+  const tail = Math.floor(remaining / 2);
+  return `${text.slice(0, head)}${marker}${text.slice(Math.max(0, text.length - tail))}`;
+}
+
+function compactRedactedField(label: string, value: string | number | undefined | null, width: number): string[] {
+  if (typeof value !== "string") return field(label, value, width);
+  const prefix = `${label}: `;
+  const available = Math.max(8, width - prefix.length);
+  return [truncateToWidth(`${prefix}${middleTruncateOneLine(value, available)}`, width)];
 }
 
 function commandLineFromRequest(request: PermissionRequest): string | null {
@@ -215,6 +248,72 @@ function latestToolsAvailable(events: AgentEvent[]): string[] {
     if (Array.isArray(tools) && tools.every((tool): tool is string => typeof tool === "string")) return tools;
   }
   return [];
+}
+
+function sessionArtifactPaths(workspacePath: string, result: AgentRunResult | null, options: TuiAppOptions): Record<string, string> {
+  if (!result?.sessionId) {
+    return {
+      manifest: "after first run",
+      meta: "after first run",
+      summary: options.summaryJson ?? "workspace .agent/summary.json",
+      events: "after first run",
+      checkpoints: "after first run",
+      trace: options.traceJsonl ?? "workspace .agent/trace.jsonl",
+      sessionJsonl: options.sessionJsonl ?? "workspace .agent/session.jsonl",
+      runSummary: options.summaryJson ?? "workspace .agent/summary.json",
+      attempts: options.attemptsDir ?? "not configured"
+    };
+  }
+  const sessionDir = path.join(defaultSessionRootDir(workspacePath), result.sessionId);
+  return {
+    manifest: path.join(sessionDir, "artifacts.json"),
+    meta: path.join(sessionDir, "meta.json"),
+    summary: path.join(sessionDir, "summary.json"),
+    events: path.join(sessionDir, "events.jsonl"),
+    checkpoints: path.join(sessionDir, "checkpoints"),
+    trace: options.traceJsonl ?? path.join(workspacePath, ".agent", "trace.jsonl"),
+    sessionJsonl: options.sessionJsonl ?? path.join(workspacePath, ".agent", "session.jsonl"),
+    runSummary: options.summaryJson ?? path.join(workspacePath, ".agent", "summary.json"),
+    attempts: options.attemptsDir ?? "not configured"
+  };
+}
+
+function countFailedExit(results: Array<{ exit_code?: unknown }>): number {
+  return results.filter((item) => item.exit_code !== 0).length;
+}
+
+function compactCheckSummary(total: number, failed: number): string {
+  if (total === 0) return "none";
+  return `${total - failed}/${total} passed${failed > 0 ? ` (${failed} failed)` : ""}`;
+}
+
+function validationSummary(result: AgentRunResult | null): string {
+  const validation = result?.harness?.validation_results ?? [];
+  return compactCheckSummary(validation.length, countFailedExit(validation));
+}
+
+function precheckSummary(result: AgentRunResult | null): string {
+  const precheck = result?.harness?.precheck_results ?? [];
+  return compactCheckSummary(precheck.length, countFailedExit(precheck));
+}
+
+function activityLine(item: ActivityItem, width: number): string {
+  const duration = typeof item.durationMs === "number" ? `${item.durationMs}ms` : "";
+  return truncateToWidth([
+    item.kind,
+    item.status,
+    item.label,
+    duration,
+    item.detail
+  ].filter(Boolean).join("  "), width);
+}
+
+function sandboxSummary(sandbox: SandboxConfig | undefined): string {
+  if (!sandbox) return "default";
+  const network = typeof sandbox.network === "string" ? sandbox.network : sandbox.network?.mode;
+  const backend = sandbox.backend && sandbox.backend !== "auto" ? `/${sandbox.backend}` : "";
+  const required = sandbox.required ? " required" : "";
+  return `${sandbox.mode ?? "workspace-write"}${backend}${network ? `:${network}` : ""}${required}`;
 }
 
 async function runLocalShellCommand(command: string, cwd: string, timeoutSec: number): Promise<CommandResult> {
@@ -612,6 +711,22 @@ export class TuiApp {
       this.openFocus("status", "Status opened.");
       return;
     }
+    if (name === "/settings") {
+      this.openFocus("settings", "Settings opened.");
+      return;
+    }
+    if (name === "/permissions") {
+      this.openFocus("permissions", "Permissions opened.");
+      return;
+    }
+    if (name === "/jobs") {
+      this.openFocus("jobs", "Jobs opened.");
+      return;
+    }
+    if (name === "/artifacts") {
+      this.openFocus("artifacts", "Artifacts opened.");
+      return;
+    }
     if (name === "/tokens") {
       this.openFocus("tokens", "Token usage opened.");
       return;
@@ -919,7 +1034,7 @@ export class TuiApp {
   }
 
   private changePromptActive(): boolean {
-    return !this.running
+    return !this.currentRunState().active
       && !this.changePromptDismissed
       && this.composer.text.length === 0
       && (this.result?.changedFiles?.length ?? 0) > 0;
@@ -1087,6 +1202,16 @@ export class TuiApp {
     return usageFromEvents(this.events) ?? null;
   }
 
+  private currentRunState(): TuiRunState {
+    return buildTuiRunState({
+      running: this.running,
+      cancelling: this.cancelling,
+      result: this.result,
+      queuedInstruction: this.queuedInstruction,
+      pendingApproval: this.permissionController.pending
+    });
+  }
+
   private overlay(width: number, rows: number): string | undefined {
     const pending = this.permissionController.pending;
     if (pending) {
@@ -1132,6 +1257,12 @@ export class TuiApp {
       localEntries: this.localEntries,
       pendingApproval: this.permissionController.pending
     });
+    const activityItems = buildActivity({
+      events: this.events,
+      result: this.result,
+      pendingApproval: this.permissionController.pending
+    });
+    const runState = this.currentRunState();
     const overlay = this.overlay(width, Math.floor(rows * 0.4));
     const palette = this.palette(width, Math.floor(rows * 0.35));
     const screen = renderScreen({
@@ -1146,11 +1277,13 @@ export class TuiApp {
       mode: this.mode,
       running: this.running,
       result: this.result,
+      runState,
       events: this.events,
       message: this.message,
-      queuedInstruction: this.queuedInstruction,
+      queuedInstruction: runState.queuedInstruction,
       composer: this.composer,
       entries,
+      activityItems,
       workbenchOpen: this.workbenchOpen,
       filePaths: this.filePaths,
       diffText: this.diffText,
@@ -1165,6 +1298,10 @@ export class TuiApp {
 
   private focusTitle(): string {
     if (this.focusMode === "help") return "help";
+    if (this.focusMode === "settings") return "settings";
+    if (this.focusMode === "permissions") return "permissions";
+    if (this.focusMode === "jobs") return "jobs";
+    if (this.focusMode === "artifacts") return "artifacts";
     if (this.focusMode === "tokens") return "tokens";
     if (this.focusMode === "context") return "context";
     if (this.focusMode === "tools") return "tools";
@@ -1176,6 +1313,10 @@ export class TuiApp {
   private focusLines(width: number): string[] {
     const innerWidth = Math.max(20, width - 2);
     if (this.focusMode === "help") return this.helpLines(innerWidth);
+    if (this.focusMode === "settings") return this.settingsLines(innerWidth);
+    if (this.focusMode === "permissions") return this.permissionsLines(innerWidth);
+    if (this.focusMode === "jobs") return this.jobsLines(innerWidth);
+    if (this.focusMode === "artifacts") return this.artifactsLines(innerWidth);
     if (this.focusMode === "tokens") return this.tokensLines(innerWidth);
     if (this.focusMode === "context") return this.contextLines(innerWidth);
     if (this.focusMode === "tools") return this.toolsLines(innerWidth);
@@ -1186,12 +1327,13 @@ export class TuiApp {
 
   private statusLines(width: number): string[] {
     const result = this.result;
+    const runState = this.currentRunState();
     const validationFailed = result?.harness
       ? [...result.harness.validation_results, ...result.harness.precheck_results].some((item) => item.exit_code !== 0)
       : false;
     const validation = result?.harness ? (validationFailed ? "failed" : "ok") : this.options.validationMode ?? "off";
     return [
-      ...field("state", this.running ? "running" : result?.status ?? "idle", width),
+      ...field("state", runState.label, width),
       ...field("workspace", redactSecretText(this.options.workspace), width),
       ...field("provider/model", `${this.options.provider}/${this.options.model ?? result?.model ?? "default"}`, width),
       ...field("permission", this.options.permissionMode, width),
@@ -1202,8 +1344,100 @@ export class TuiApp {
       ...field("mcp", result?.mcpServers ? `${result.mcpServers.reduce((sum, server) => sum + server.tools_loaded, 0)} tools` : this.options.enableMcp ? "enabled" : "off", width),
       ...field("allowed tools", listValue(this.options.allowedTools), width),
       ...field("disabled tools", listValue(mergeDisabledToolsForMode(this.mode, this.options.disabledTools)), width),
-      ...field("queued", this.queuedInstruction ? truncate(oneLine(redactSecretText(this.queuedInstruction)), 120) : "none", width),
-      ...field("last result", result ? `${result.status} ${result.finishReason}` : "none", width)
+      ...field("queued", runState.queuedInstruction ? truncate(oneLine(redactSecretText(runState.queuedInstruction)), 120) : "none", width),
+      ...field("input mode", runState.composerPrompt, width),
+      ...field("last result", runState.lastResult ?? "none", width)
+    ];
+  }
+
+  private settingsLines(width: number): string[] {
+    return [
+      ...field("workspace", redactSecretText(this.options.workspace), width),
+      ...field("provider/model", `${this.options.provider}/${this.options.model ?? this.result?.model ?? "default"}`, width),
+      ...field("mode", this.mode, width),
+      ...field("permission", this.options.permissionMode, width),
+      ...field("sandbox", sandboxSummary(this.options.sandbox), width),
+      ...field("validation", this.options.validationMode ?? "off", width),
+      ...field("final evidence", this.options.finalEvidenceMode ?? "off", width),
+      ...field("context mode", this.options.contextMode ?? this.result?.contextMode ?? "repo-map", width),
+      ...field("skills mode", this.options.skillsMode ?? "auto", width),
+      ...field("mcp", this.options.enableMcp ? this.options.mcpConfig ? `enabled ${this.options.mcpConfig}` : "enabled" : "off", width)
+    ];
+  }
+
+  private permissionsLines(width: number): string[] {
+    const pending = this.permissionController.pending;
+    const rules = this.options.permissionRules ?? [];
+    return [
+      ...field("permission mode", this.options.permissionMode, width),
+      ...field("sandbox", sandboxSummary(this.options.sandbox), width),
+      ...field("allowed tools", listValue(this.options.allowedTools), width),
+      ...field("disabled tools", listValue(mergeDisabledToolsForMode(this.mode, this.options.disabledTools)), width),
+      ...field("rules", rules.length > 0 ? `${rules.length}` : "none", width),
+      ...field("pending approval", pending ? `${pending.toolName} ${pending.risk}` : "none", width),
+      ...(pending ? field("pending reason", pending.reason, width) : []),
+      ...(rules.length > 0 ? ["", "rules", ...rules.slice(0, 6).map((rule, index) => truncateToWidth(`  ${index + 1}. ${redactSecretText(JSON.stringify(rule))}`, width))] : [])
+    ];
+  }
+
+  private jobsLines(width: number): string[] {
+    const runState = this.currentRunState();
+    const activity = buildActivity({
+      events: this.events,
+      result: this.result,
+      pendingApproval: this.permissionController.pending
+    });
+    const active = activity.filter((item) => item.status === "queued" || item.status === "running" || item.status === "waiting");
+    const paths = sessionArtifactPaths(this.options.workspace, this.result, this.options);
+    const lines = [
+      ...field("run state", runState.label, width),
+      ...field("session id", this.result?.sessionId ?? "not started", width),
+      ...compactRedactedField("manifest", paths.manifest, width),
+      ...field("queued input", runState.queuedInstruction ? truncate(oneLine(redactSecretText(runState.queuedInstruction)), 120) : "none", width),
+      ...field("validation", validationSummary(this.result), width),
+      ...field("precheck", precheckSummary(this.result), width),
+      ...field("active items", active.length, width),
+      ""
+    ];
+    if (active.length === 0) lines.push("No active jobs.");
+    for (const item of active.slice(-10)) {
+      lines.push(activityLine(item, width));
+    }
+    if (activity.length > active.length) {
+      lines.push("");
+      lines.push("recent completed");
+      for (const item of activity.filter((candidate) => candidate.status !== "queued" && candidate.status !== "running" && candidate.status !== "waiting").slice(-5)) {
+        lines.push(activityLine(item, width));
+      }
+    }
+    return lines;
+  }
+
+  private artifactsLines(width: number): string[] {
+    const result = this.result;
+    const changed = result?.changedFiles ?? [];
+    const paths = sessionArtifactPaths(this.options.workspace, result, this.options);
+    return [
+      ...field("session id", result?.sessionId ?? "not started", width),
+      ...compactRedactedField("manifest", paths.manifest, width),
+      ...field("changed files", changed.length, width),
+      ...field("validation", validationSummary(result), width),
+      ...field("precheck", precheckSummary(result), width),
+      ...field("evidence records", result?.evidenceRecords?.length ?? 0, width),
+      ...field("final gate", result?.finalGate?.status ?? "not run", width),
+      ...compactRedactedField("cli inspect", result?.sessionId ? `agent inspect ${result.sessionId} --workspace ${this.options.workspace}` : "agent inspect --workspace <workspace>", width),
+      ...compactRedactedField("cli artifacts", result?.sessionId ? `agent artifacts ${result.sessionId} --workspace ${this.options.workspace} --json` : "agent artifacts --workspace <workspace> --json", width),
+      "",
+      ...compactRedactedField("meta json", paths.meta, width),
+      ...compactRedactedField("summary json", paths.summary, width),
+      ...compactRedactedField("events jsonl", paths.events, width),
+      ...compactRedactedField("checkpoints", paths.checkpoints, width),
+      ...compactRedactedField("trace jsonl", paths.trace, width),
+      ...compactRedactedField("session jsonl", paths.sessionJsonl, width),
+      ...compactRedactedField("run summary", paths.runSummary, width),
+      ...compactRedactedField("attempts dir", paths.attempts, width),
+      ...(changed.length > 0 ? ["", ...changed.slice(0, 8).map((file) => truncateToWidth(`  ${redactSecretText(file)}`, width))] : []),
+      ...(this.diffText.trim() ? ["", "diff preview", ...this.diffText.split(/\r?\n/).slice(0, 4).map((line) => truncateToWidth(`  ${redactSecretText(line)}`, width))] : [])
     ];
   }
 
@@ -1239,23 +1473,20 @@ export class TuiApp {
   }
 
   private toolsLines(width: number): string[] {
-    const toolEnds = this.events.filter((event) => event.type === "tool_end").slice(-8);
-    const startsById = new Map(this.events.filter((event) => event.type === "tool_start").map((event) => [event.id, event]));
     const available = this.result?.toolsAvailable ?? latestToolsAvailable(this.events);
+    const activity = buildActivity({
+      events: this.events,
+      result: this.result,
+      pendingApproval: this.permissionController.pending
+    }).filter((item) => item.kind === "tool" || item.kind === "check" || item.kind === "approval" || item.kind === "subagent" || item.kind === "review");
     const lines = [
       `available: ${available.length > 0 ? available.join(", ") : "after first run"}`,
       "",
-      "recent calls"
+      "recent activity"
     ];
-    if (toolEnds.length === 0) lines.push("No tool calls yet.");
-    for (const event of toolEnds) {
-      const result = toolResultFromEvent(event);
-      const start = event.parentId ? startsById.get(event.parentId) : undefined;
-      const name = typeof event.metadata?.toolName === "string" ? event.metadata.toolName : toolNameFromEvent(start ?? event);
-      const detail = start ? summarizeToolArguments(name, toolArgsFromEvent(start)) : "";
-      const duration = typeof result?.metadata?.durationMs === "number" ? `${result.metadata.durationMs}ms` : "";
-      const tail = result?.content ? truncate(oneLine(redactSecretText(result.content)), 70) : "";
-      lines.push(truncateToWidth(`${name} ${result?.ok ? "ok" : "failed"}  ${[duration, detail, tail].filter(Boolean).join("  ")}`, width));
+    if (activity.length === 0) lines.push("No activity yet.");
+    for (const item of activity.slice(-10)) {
+      lines.push(activityLine(item, width));
     }
     return lines;
   }

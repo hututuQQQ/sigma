@@ -252,6 +252,104 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     }
   });
 
+  it("opens product inspection panels without calling the model", async () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-panels-"));
+    const stdout = new FakeStdout();
+    stdout.rows = 32;
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp({
+      ...options(root),
+      sandbox: { mode: "workspace-write", backend: "auto", required: true, network: { mode: "restricted" } },
+      traceJsonl: path.join(root, ".agent", "trace.jsonl"),
+      sessionJsonl: path.join(root, ".agent", "session.jsonl"),
+      summaryJson: path.join(root, ".agent", "summary.json"),
+      attemptsDir: path.join(root, ".agent", "attempts")
+    }, new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      await submit(app, "/settings");
+      expect(stripAnsi(stdout.last())).toContain("settings");
+      expect(stripAnsi(stdout.last())).toContain("provider/model: deepseek/default");
+
+      await submit(app, "/permissions");
+      expect(stripAnsi(stdout.last())).toContain("permissions");
+      expect(stripAnsi(stdout.last())).toContain("permission mode: ask");
+      expect(stripAnsi(stdout.last())).toContain("sandbox: workspace-write:restricted required");
+
+      await submit(app, "/jobs");
+      expect(stripAnsi(stdout.last())).toContain("jobs");
+      expect(stripAnsi(stdout.last())).toContain("manifest: after first run");
+      expect(stripAnsi(stdout.last())).toContain("No active jobs.");
+
+      await submit(app, "/artifacts");
+      expect(stripAnsi(stdout.last())).toContain("artifacts");
+      expect(stripAnsi(stdout.last())).toContain("manifest: after first run");
+      expect(stripAnsi(stdout.last())).toContain("cli artifacts: agent artifacts --workspace <workspace> --json");
+      expect(calls).toHaveLength(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows durable session manifest and evidence hints after a run", async () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-artifacts-"));
+    const stdout = new FakeStdout();
+    stdout.rows = 36;
+    stdout.columns = 132;
+    const result: AgentRunResult = {
+      status: "completed",
+      finishReason: "assistant_stop",
+      sessionId: "20260709T100000Z-tui12345",
+      toolCalls: 1,
+      turns: 2,
+      commandsExecuted: 1,
+      provider: "deepseek",
+      model: "fake-tui-model",
+      durationMs: 1200,
+      lastError: null,
+      usage: { inputTokens: 10, outputTokens: 5, cacheTokens: 0, totalTokens: 15 },
+      changedFiles: ["src/app.ts"],
+      harness: {
+        attempts: [],
+        validation_results: [{ command: "pnpm test", exit_code: 0, stdout: "", stderr: "", duration_ms: 10 }],
+        precheck_results: [],
+        retry_decisions: [],
+        post_run_cleanup: null
+      },
+      evidenceRecords: [{
+        kind: "test",
+        toolName: "bash",
+        ok: true,
+        executable: true,
+        command: "pnpm test",
+        timestamp: "2026-07-09T10:00:00.000Z"
+      }],
+      finalGate: { mode: "auto", nudged: false, status: "satisfied" }
+    };
+    const calls: string[] = [];
+    const app = new TuiApp(options(root), new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, async (runOptions) => {
+      calls.push(runOptions.instruction);
+      return result;
+    });
+    try {
+      await submit(app, "ship it");
+      await submit(app, "/artifacts");
+
+      const plain = stripAnsi(stdout.last());
+      expect(calls).toEqual(["ship it"]);
+      expect(plain).toContain("session id: 20260709T100000Z-tui12345");
+      expect(plain).toContain(path.join(".agent", "sessions", "20260709T100000Z-tui12345", "artifacts.json"));
+      expect(plain).toContain("changed files: 1");
+      expect(plain).toContain("validation: 1/1 passed");
+      expect(plain).toContain("evidence records: 1");
+      expect(plain).toContain("final gate: satisfied");
+      expect(plain).toContain("agent artifacts 20260709T100000Z-tui12345");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("selects multiple file mention top matches before inserting them", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-mentions-"));
     fs.mkdirSync(path.join(root, "src"));

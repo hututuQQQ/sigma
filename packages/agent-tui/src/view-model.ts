@@ -28,6 +28,20 @@ export type TranscriptEntry =
   | { kind: "test"; command: string; status: "running" | "ok" | "failed"; summary: string; durationMs?: number; timestamp?: string }
   | { kind: "summary"; text: string; status?: string; timestamp?: string };
 
+export type ActivityStatus = "queued" | "running" | "ok" | "failed" | "aborted" | "waiting" | "info";
+
+type ToolTranscriptEntry = Extract<TranscriptEntry, { kind: "tool" }>;
+type TestTranscriptEntry = Extract<TranscriptEntry, { kind: "test" }>;
+
+export interface ActivityItem {
+  kind: "tool" | "check" | "approval" | "subagent" | "review" | "context" | "usage" | "error";
+  status: ActivityStatus;
+  label: string;
+  detail: string;
+  durationMs?: number;
+  timestamp?: string;
+}
+
 export interface BuildTranscriptOptions {
   workspacePath: string;
   provider?: string;
@@ -35,6 +49,12 @@ export interface BuildTranscriptOptions {
   events: AgentEvent[];
   result: AgentRunResult | null;
   localEntries?: TranscriptEntry[];
+  pendingApproval?: PermissionRequest | null;
+}
+
+export interface BuildActivityOptions {
+  events: AgentEvent[];
+  result: AgentRunResult | null;
   pendingApproval?: PermissionRequest | null;
 }
 
@@ -72,7 +92,7 @@ function eventResult(event: AgentEvent): { ok?: boolean; content?: string; metad
   return toolResultFromEvent(event);
 }
 
-function toolEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEntry {
+function toolEntry(start: AgentEvent, end: AgentEvent | undefined): ToolTranscriptEntry {
   const result = end ? eventResult(end) : undefined;
   const name = end && typeof end.metadata?.toolName === "string" ? end.metadata.toolName : toolNameFromEvent(start);
   const detail = summarizeToolArguments(name, toolArgsFromEvent(start));
@@ -90,7 +110,19 @@ function toolEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEn
   };
 }
 
-function harnessEntry(start: AgentEvent, end: AgentEvent | undefined): TranscriptEntry {
+function toolActivity(start: AgentEvent, end: AgentEvent | undefined): ActivityItem {
+  const entry = toolEntry(start, end);
+  return {
+    kind: "tool",
+    status: entry.status,
+    label: entry.name,
+    detail: entry.summary,
+    durationMs: entry.durationMs,
+    timestamp: entry.timestamp
+  };
+}
+
+function harnessEntry(start: AgentEvent, end: AgentEvent | undefined): TestTranscriptEntry {
   const meta = end?.metadata ?? start.metadata ?? {};
   const command = typeof start.metadata?.command === "string" ? redactSecretText(start.metadata.command) : String(start.metadata?.kind ?? "check");
   const ok = end ? meta.exitCode === 0 : false;
@@ -105,6 +137,175 @@ function harnessEntry(start: AgentEvent, end: AgentEvent | undefined): Transcrip
     durationMs: typeof meta.durationMs === "number" ? meta.durationMs : undefined,
     timestamp: eventTime(end ?? start)
   };
+}
+
+function harnessActivity(start: AgentEvent, end: AgentEvent | undefined): ActivityItem {
+  const entry = harnessEntry(start, end);
+  return {
+    kind: "check",
+    status: entry.status,
+    label: oneLine(redactSecretText(entry.command)),
+    detail: entry.summary,
+    durationMs: entry.durationMs,
+    timestamp: entry.timestamp
+  };
+}
+
+function activityFromEvents(events: AgentEvent[]): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  const toolEndsByParent = new Map<string, AgentEvent>();
+  const toolStartsByCallId = new Map<string, AgentEvent>();
+  const toolAbortsByParent = new Map<string, AgentEvent>();
+  const toolAbortsByCallId = new Map<string, AgentEvent>();
+  const checkEndsByParent = new Map<string, AgentEvent>();
+  for (const event of events) {
+    if (event.type === "tool_end" && event.parentId) toolEndsByParent.set(event.parentId, event);
+    if (event.type === "tool_start" && typeof event.metadata?.toolCallId === "string") toolStartsByCallId.set(event.metadata.toolCallId, event);
+    if (event.type === "tool_aborted" && event.parentId) toolAbortsByParent.set(event.parentId, event);
+    if (event.type === "tool_aborted" && typeof event.metadata?.toolCallId === "string") toolAbortsByCallId.set(event.metadata.toolCallId, event);
+    if (event.type === "harness_check_end" && event.parentId) checkEndsByParent.set(event.parentId, event);
+  }
+
+  for (const event of events) {
+    const meta = event.metadata ?? {};
+    if (event.type === "tool_queued") {
+      const callId = typeof meta.toolCallId === "string" ? meta.toolCallId : "";
+      if (callId && toolStartsByCallId.has(callId)) continue;
+      items.push(toolActivity(event, callId ? toolAbortsByCallId.get(callId) : undefined));
+      continue;
+    }
+    if (event.type === "tool_start") {
+      items.push(toolActivity(event, toolAbortsByParent.get(event.id) ?? toolEndsByParent.get(event.id)));
+      continue;
+    }
+    if (event.type === "tool_aborted" && !event.parentId) {
+      const callId = typeof meta.toolCallId === "string" ? meta.toolCallId : "";
+      if (callId && toolStartsByCallId.has(callId)) continue;
+      items.push({
+        kind: "tool",
+        status: "aborted",
+        label: typeof meta.toolName === "string" ? meta.toolName : "tool",
+        detail: truncate(oneLine(redactSecretText(String(meta.reason ?? ""))), 90),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "harness_check_start") {
+      items.push(harnessActivity(event, checkEndsByParent.get(event.id)));
+      continue;
+    }
+    if (event.type === "context_budget") {
+      const budget = meta.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
+      items.push({
+        kind: "context",
+        status: "info",
+        label: `context turn ${String(meta.turn ?? "?")}`,
+        detail: `${String(budget?.estimated_tokens ?? "?")} est tokens  ${String(budget?.message_count ?? "?")} messages  ${String(budget?.tool_count ?? "?")} tools`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "usage") {
+      const usage = eventUsage(event);
+      if (usage) {
+        items.push({
+          kind: "usage",
+          status: "info",
+          label: `usage turn ${String(meta.turn ?? "?")}`,
+          detail: formatUsage(usage),
+          timestamp: eventTime(event)
+        });
+      }
+      continue;
+    }
+    if (event.type === "subagent_start") {
+      items.push({
+        kind: "subagent",
+        status: "running",
+        label: `subagent ${String(meta.subagent_type ?? "?")}`,
+        detail: truncate(oneLine(redactSecretText(String(meta.description ?? ""))), 90),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_job_created") {
+      const job = meta.job as { job_id?: unknown; subagent_type?: unknown; description?: unknown } | undefined;
+      items.push({
+        kind: "subagent",
+        status: "queued",
+        label: `job ${String(job?.job_id ?? "?")} ${String(job?.subagent_type ?? "?")}`,
+        detail: truncate(oneLine(redactSecretText(String(job?.description ?? ""))), 90),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_progress") {
+      items.push({
+        kind: "subagent",
+        status: String(meta.status ?? "") === "failed" ? "failed" : "running",
+        label: `job ${String(meta.job_id ?? "?")}`,
+        detail: String(meta.status ?? "progress"),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_job_closed") {
+      const job = meta.job as { job_id?: unknown; status?: unknown } | undefined;
+      const status = String(job?.status ?? "closed");
+      items.push({
+        kind: "subagent",
+        status: status === "failed" || status === "error" ? "failed" : "ok",
+        label: `job ${String(job?.job_id ?? "?")}`,
+        detail: status,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_end" || event.type === "subagent_error") {
+      const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
+      const status = String(report?.status ?? (event.type === "subagent_error" ? "error" : "?"));
+      items.push({
+        kind: "subagent",
+        status: event.type === "subagent_error" || status === "failed" || status === "error" ? "failed" : "ok",
+        label: `subagent ${status}`,
+        detail: truncate(oneLine(redactSecretText(String(report?.error ?? report?.summary ?? ""))), 110),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "review_gate_start") {
+      items.push({
+        kind: "review",
+        status: "running",
+        label: `review ${String(meta.gate ?? "?")}`,
+        detail: "started",
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "review_gate_end") {
+      const status = String(meta.status ?? "");
+      const findings = Array.isArray(meta.findings) ? meta.findings.length : 0;
+      items.push({
+        kind: "review",
+        status: status === "failed" || status === "error" ? "failed" : "ok",
+        label: `review ${String(meta.gate ?? "?")}`,
+        detail: `${status || "done"} (${findings} findings)`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "error") {
+      items.push({
+        kind: "error",
+        status: "failed",
+        label: "error",
+        detail: truncate(oneLine(redactSecretText(String(meta.message ?? ""))), 120),
+        timestamp: eventTime(event)
+      });
+    }
+  }
+  return items;
 }
 
 function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
@@ -164,15 +365,7 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       });
       continue;
     }
-    if (event.type === "context_budget") {
-      const budget = meta.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
-      entries.push({
-        kind: "system",
-        text: `context ${budget?.estimated_tokens ?? "?"} est tokens  ${budget?.message_count ?? "?"} messages  ${budget?.tool_count ?? "?"} tools`,
-        timestamp: eventTime(event)
-      });
-      continue;
-    }
+    if (event.type === "context_budget") continue;
     if (event.type === "harness_check_start") {
       entries.push(harnessEntry(event, checkEndsByParent.get(event.id)));
       continue;
@@ -260,11 +453,7 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       });
       continue;
     }
-    if (event.type === "usage") {
-      const usage = eventUsage(event);
-      if (usage) entries.push({ kind: "system", text: `usage ${formatUsage(usage)}`, timestamp: eventTime(event) });
-      continue;
-    }
+    if (event.type === "usage") continue;
     if (event.type === "error") {
       entries.push({ kind: "summary", status: "error", text: redactSecretText(String(meta.message ?? "")), timestamp: eventTime(event) });
       continue;
@@ -288,6 +477,43 @@ function sortEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
     .map((entry, index) => ({ entry, index }))
     .sort((a, b) => (a.entry.timestamp ?? "").localeCompare(b.entry.timestamp ?? "") || a.index - b.index)
     .map((item) => item.entry);
+}
+
+function sortActivity(items: ActivityItem[]): ActivityItem[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (a.item.timestamp ?? "").localeCompare(b.item.timestamp ?? "") || a.index - b.index)
+    .map((item) => item.item);
+}
+
+export function buildActivity(options: BuildActivityOptions): ActivityItem[] {
+  const items = activityFromEvents(options.events);
+  if (options.pendingApproval) {
+    const summary = summarizeToolArguments(options.pendingApproval.toolName, options.pendingApproval.arguments)
+      || options.pendingApproval.reason;
+    items.push({
+      kind: "approval",
+      status: "waiting",
+      label: options.pendingApproval.toolName,
+      detail: `${options.pendingApproval.risk}  ${summary}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+  if (options.result?.harness) {
+    const failed = [...options.result.harness.validation_results, ...options.result.harness.precheck_results]
+      .filter((item) => item.exit_code !== 0).length;
+    const total = options.result.harness.validation_results.length + options.result.harness.precheck_results.length;
+    if (total > 0) {
+      items.push({
+        kind: "check",
+        status: failed > 0 ? "failed" : "ok",
+        label: "validation evidence",
+        detail: failed > 0 ? `${failed}/${total} checks failed` : `${total} checks passed`,
+        timestamp: new Date(Date.now() + 1).toISOString()
+      });
+    }
+  }
+  return sortActivity(items);
 }
 
 export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntry[] {

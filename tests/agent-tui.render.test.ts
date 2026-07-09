@@ -6,7 +6,7 @@ import { ToolPanel } from "../packages/agent-tui/src/components/tool-panel.js";
 import { createComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { mergeDisabledToolsForMode, PLAN_DISABLED_TOOLS } from "../packages/agent-tui/src/mode.js";
 import { renderScreen } from "../packages/agent-tui/src/render/screen.js";
-import { buildTranscript } from "../packages/agent-tui/src/view-model.js";
+import { buildActivity, buildTranscript } from "../packages/agent-tui/src/view-model.js";
 import { assertWithinWidth, splitLines } from "../packages/agent-tui/src/ui/layout.js";
 
 const savedEnv = {
@@ -60,7 +60,7 @@ describe("agent-tui stream rendering", () => {
       running: false,
       result: null,
       events: [],
-      message: null,
+      message: "Ready now",
       composer,
       entries,
       width: 96,
@@ -68,6 +68,9 @@ describe("agent-tui stream rendering", () => {
       color: false
     });
 
+    expect(rendered).toContain("\u2211 sigma");
+    expect(rendered).toContain("deepseek/default \u00b7 build \u00b7 ask \u00b7 idle");
+    expect(rendered).toContain("notice \u203a Ready now");
     expect(rendered).toContain("Sigma Code v0.1.0");
     expect(rendered).toContain("\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588");
     expect(rendered).toContain("\u2588\u2588              \u2211 Sigma Code v0.1.0");
@@ -125,6 +128,10 @@ describe("agent-tui stream rendering", () => {
       events: [start, end],
       result
     });
+    const activityItems = buildActivity({
+      events: [start, end],
+      result
+    });
 
     const rendered = renderScreen({
       workspacePath: "/tmp/sigma",
@@ -141,6 +148,7 @@ describe("agent-tui stream rendering", () => {
       message: null,
       composer: createComposerState(),
       entries,
+      activityItems,
       workbenchOpen: true,
       filePaths: ["package.json", "packages/agent-tui/src/app.tsx"],
       diffText: " packages/agent-tui/src/app.tsx | 24 ++++++++++----",
@@ -154,12 +162,51 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("package.json");
     expect(rendered).toContain("Changes");
     expect(rendered).toContain("packages/agent-tui/src/app.tsx");
-    expect(rendered).toContain("Tool calls");
+    expect(rendered).toContain("Activity");
     expect(rendered).toContain("Checks");
     expect(rendered).toContain("tokens      input=10 output=5 total=15");
     expect(rendered).toContain("read path=package.json");
     expect(rendered).toContain("ctx input=10/output=5/total=15");
     expect(assertWithinWidth(rendered, 124)).toBe(true);
+  });
+
+  it("uses the shared run state for approval screens", () => {
+    const pendingApproval: PermissionRequest = {
+      toolName: "bash",
+      arguments: { command: "pnpm test" },
+      risk: "execute",
+      reason: "Run tests",
+      workspacePath: "/tmp/sigma"
+    };
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [],
+      result: null,
+      pendingApproval
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [],
+      message: null,
+      queuedInstruction: "summarize the result",
+      composer: createComposerState("allow"),
+      entries,
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(rendered).toContain("deepseek/default \u00b7 build \u00b7 ask \u00b7 approval");
+    expect(rendered).toContain("approval > allow");
+    expect(rendered).toContain("build \u00b7 deepseek/default \u00b7 ask \u00b7 approval");
+    expect(rendered).toContain("queued 1");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
   });
 
   it("falls back to metadata result when persisted thread item result is circular", () => {
@@ -421,20 +468,30 @@ describe("agent-tui stream rendering", () => {
     }));
   });
 
-  it("renders queued, aborted, and context budget events", () => {
+  it("keeps queued and aborted tools visible while telemetry stays out of the transcript", () => {
     const queued = event("tool_queued", { toolCallId: "call-1", toolName: "read" });
     const aborted = event("tool_aborted", { toolCallId: "call-2", toolName: "bash", reason: "abort signal" });
     const contextBudget = event("context_budget", {
       budget: { estimated_tokens: 123, message_count: 4, tool_count: 12 }
     });
+    const usage = event("usage", {
+      usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 }
+    });
     const entries = buildTranscript({
       workspacePath: "/tmp/sigma",
-      events: [queued, aborted, contextBudget],
+      events: [queued, aborted, contextBudget, usage],
+      result: null
+    });
+    const activityItems = buildActivity({
+      events: [queued, aborted, contextBudget, usage],
       result: null
     });
     expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "read", status: "queued" }));
     expect(entries).toContainEqual(expect.objectContaining({ kind: "tool", name: "bash", status: "aborted" }));
-    expect(entries.some((entry) => entry.kind === "system" && entry.text.includes("123 est tokens"))).toBe(true);
+    expect(entries.some((entry) => entry.kind === "system" && entry.text.includes("123 est tokens"))).toBe(false);
+    expect(entries.some((entry) => entry.kind === "system" && entry.text.includes("usage input=2"))).toBe(false);
+    expect(activityItems).toContainEqual(expect.objectContaining({ kind: "context", label: "context turn ?" }));
+    expect(activityItems).toContainEqual(expect.objectContaining({ kind: "usage", detail: "input=2 output=3 total=5" }));
 
     const rendered = renderScreen({
       workspacePath: "/tmp/sigma",
@@ -443,16 +500,18 @@ describe("agent-tui stream rendering", () => {
       mode: "build",
       running: true,
       result: null,
-      events: [queued, aborted, contextBudget],
+      events: [queued, aborted, contextBudget, usage],
       message: null,
       composer: createComposerState(),
       entries,
+      activityItems,
       width: 96,
-      height: 18,
+      height: 24,
       color: false
     });
     expect(rendered).toContain("read");
-    expect(rendered).toContain("context 123 est tokens");
+    expect(rendered).not.toContain("context 123 est tokens");
+    expect(rendered).toContain("ctx input=2/output=3/total=5");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
   });
 

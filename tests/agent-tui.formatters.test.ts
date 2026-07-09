@@ -53,6 +53,13 @@ describe("agent-tui formatting helpers", () => {
     ]);
   });
 
+  it("suggests product workbench commands", () => {
+    expect(commandSuggestions("/permis").map((command) => command.usage)[0]).toBe("/permissions");
+    expect(commandSuggestions("/art").map((command) => command.usage)).toEqual(["/artifacts"]);
+    expect(commandSuggestions("/job").map((command) => command.usage)).toEqual(["/jobs"]);
+    expect(commandSuggestions("/sett").map((command) => command.usage)).toContain("/settings");
+  });
+
   it("shows bash command, workspace, risk, and redacts secrets in approval prompts", () => {
     const request: PermissionRequest = {
       toolName: "bash",

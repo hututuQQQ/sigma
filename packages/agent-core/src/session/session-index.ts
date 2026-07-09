@@ -3,6 +3,7 @@ import path from "node:path";
 import { redactSecrets, redactSecretText } from "../redaction.js";
 import type {
   DurableSessionMeta,
+  SessionArtifactManifest,
   SessionIndexRecord,
   SessionResumeContext,
   SessionSearchResult
@@ -95,6 +96,17 @@ export async function readSessionSummaryText(summaryPath: string): Promise<strin
   } catch {
     return "";
   }
+}
+
+export async function loadSessionArtifactManifest(options: {
+  sessionId: string;
+  workspacePath?: string;
+  sessionRootDir?: string;
+}): Promise<SessionArtifactManifest | null> {
+  const meta = await loadSessionMeta(options);
+  if (!meta) return null;
+  const manifestPath = meta.artifactManifestPath ?? path.join(path.dirname(meta.summaryPath), "artifacts.json");
+  return await readJsonFile<SessionArtifactManifest>(manifestPath);
 }
 
 function compactText(value: string, maxChars: number): string {
@@ -235,6 +247,7 @@ export function sessionIndexRecordFromMeta(meta: DurableSessionMeta): SessionInd
     updatedAt: meta.updatedAt,
     ...(meta.durationMs !== undefined ? { durationMs: meta.durationMs } : {}),
     changedFiles: meta.changedFiles,
+    ...(meta.artifactManifestPath ? { artifactManifestPath: meta.artifactManifestPath } : {}),
     summaryPath: meta.summaryPath,
     eventsPath: meta.eventsPath,
     ...(meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),

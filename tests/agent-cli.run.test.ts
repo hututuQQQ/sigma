@@ -606,7 +606,7 @@ describe("agent-cli run", () => {
     expect(stderr.text()).toContain("Unknown command: solve");
     expect(stderr.text()).toContain("Unknown command: history");
     expect(stdout.text()).not.toContain("solve");
-    expect(stdout.text()).toContain('compgen -W "run tui chat sessions session checkpoints checkpoint completion doctor replay"');
+    expect(stdout.text()).toContain('compgen -W "run init tui chat sessions session inspect jobs artifacts checkpoints checkpoint version completion doctor replay"');
   });
 
   it("prints only the final message in quiet text mode", async () => {
