@@ -158,7 +158,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("usage blew up", str(raised.exception))
             self.assertIn("missing runtime", str(raised.exception))
 
-    async def test_run_forwards_run_controller_kwargs_as_cli_flags(self):
+    async def test_run_forwards_only_v2_runtime_flags(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -180,15 +180,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             context = SimpleNamespace(task_id="task-a")
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
-                validation_mode="auto",
-                validation_timeout_sec=45,
-                precheck_command="pytest",
-                precheck_timeout_sec=30,
-                validation_retry_limit=2,
-                post_run_cleanup_globs="/tmp/cache*.tmp",
-                harness_timeout_sec=600,
+                max_wall_time_sec=600,
                 agent_timeout_grace_sec=15,
-                retry_min_budget_sec=90,
             )
 
             await agent.run("fix the task", env, context)
@@ -196,20 +189,18 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             main_commands = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]]
             self.assertEqual(len(main_commands), 1)
             command, kwargs = main_commands[0]
-            self.assertIn("--validation-mode auto", command)
-            self.assertIn("--validation-retry-limit 2", command)
-            self.assertIn("--validation-timeout-sec 45", command)
-            self.assertIn("--precheck-command pytest", command)
-            self.assertIn("--precheck-timeout-sec 30", command)
-            self.assertIn("--post-run-cleanup-globs '/tmp/cache*.tmp'", command)
-            self.assertIn("--harness-timeout-sec 600", command)
-            self.assertIn("--retry-min-budget-sec 90", command)
-            self.assertIn("--attempts-dir /tmp/agent/attempts", command)
+            self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
+            self.assertIn("--run-deadline-sec 600", command)
+            self.assertIn("--permission-mode auto", command)
+            self.assertIn("--output-format json", command)
+            self.assertNotIn("--validation", command)
+            self.assertNotIn("--retry", command)
+            self.assertNotIn("--attempts-dir", command)
             self.assertEqual(kwargs["timeout_sec"], 615)
             self.assertFalse(any("sigma-precheck" in command for command, _kwargs in exec_commands))
             self.assertFalse(any("sigma-validation" in command for command, _kwargs in exec_commands))
 
-    async def test_run_forwards_canonical_run_controller_kwargs(self):
+    async def test_run_forwards_provider_model_and_deadline(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -229,23 +220,21 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             context = SimpleNamespace(task_id="task-a")
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
-                validation_mode="auto",
-                validation_retry_limit=3,
-                validation_timeout_sec=50,
-                harness_timeout_sec=700,
+                provider="glm",
+                model="glm-test",
+                max_wall_time_sec=700,
                 agent_timeout_grace_sec=20,
             )
 
             await agent.run("fix the task", env, context)
 
             command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]][0]
-            self.assertIn("--validation-mode auto", command)
-            self.assertIn("--validation-retry-limit 3", command)
-            self.assertIn("--validation-timeout-sec 50", command)
-            self.assertIn("--harness-timeout-sec 700", command)
+            self.assertIn("--provider glm", command)
+            self.assertIn("--model glm-test", command)
+            self.assertIn("--run-deadline-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)
 
-    async def test_run_uses_validation_auto_by_default(self):
+    async def test_run_has_no_legacy_controller_flags_by_default(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             exec_commands = []
@@ -268,94 +257,45 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             await agent.run("fix the task", env, context)
 
             command = [command for command, _kwargs in exec_commands if "/usr/local/bin/agent run" in command][0]
-            self.assertIn("--validation-mode auto", command)
-            self.assertIn("--validation-retry-limit 0", command)
+            self.assertIn("--run-deadline-sec 7200", command)
+            self.assertNotIn("--validation", command)
+            self.assertNotIn("--retry", command)
 
-    async def test_run_downloads_logs_populates_context_and_mirrors_harness_metadata(self):
+    async def test_run_collects_result_without_feeding_evaluation_back(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
             os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
             logs_dir = Path(tmp) / "logs"
-            summary_json = {
-                "status": "error",
-                "finish_reason": "validation_failed",
-                "commands_executed": 7,
-                "input_tokens": 11,
-                "output_tokens": 13,
-                "cache_tokens": 2,
-                "cost_usd": 0.123,
-                "last_error": "validation command failed with exit code 1",
-                "harness": {
-                    "attempts": [
-                        {
-                            "attempt": 1,
-                            "status": "completed",
-                            "finish_reason": "assistant_stop",
-                            "summary_path": "attempts/attempt-1/summary.json",
-                            "trace_path": "attempts/attempt-1/trace.jsonl",
-                        }
-                    ],
-                    "validation_results": [
-                        {
-                            "kind": "validation",
-                            "command": "python check.py",
-                            "exit_code": 1,
-                            "related_files": ["check.py"],
-                        }
-                    ],
-                    "precheck_results": [],
-                    "retry_decisions": [{"action": "skipped", "trigger": "validation"}],
-                    "post_run_cleanup": {"patterns": ["/tmp/cache*.tmp"], "exit_code": 1, "warning": "cleanup failed"},
-                },
-            }
+            result_json = {"status": "completed", "finishReason": "completed", "sessionId": "session-v2", "finalMessage": "done"}
 
             async def exec_side_effect(command, **kwargs):
-                if command.startswith("test -f "):
-                    return SimpleNamespace(return_code=0, stdout="", stderr="")
-                if command.startswith("test -d "):
-                    return SimpleNamespace(return_code=1, stdout="", stderr="")
                 if "/usr/local/bin/agent run" in command:
-                    return SimpleNamespace(return_code=1, stdout="agent failed", stderr="")
+                    return SimpleNamespace(return_code=0, stdout=json.dumps(result_json) + "\n", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
-
-            async def download_side_effect(source_path, target_path):
-                target = Path(target_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if source_path.endswith("summary.json"):
-                    target.write_text(json.dumps(summary_json), encoding="utf-8")
-                else:
-                    target.write_text('{"type":"run_end"}\n', encoding="utf-8")
 
             try:
                 env = SimpleNamespace(
                     exec=AsyncMock(side_effect=exec_side_effect),
                     upload_file=AsyncMock(),
                     upload_dir=AsyncMock(),
-                    download_file=AsyncMock(side_effect=download_side_effect),
+                    download_file=AsyncMock(),
                 )
                 context = SimpleNamespace(task_id="service-task")
                 agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
 
                 await agent.run("fix the task", env, context)
 
-                env.download_file.assert_any_await("/tmp/agent/summary.json", logs_dir / "summary.json")
-                env.download_file.assert_any_await("/tmp/agent/trace.jsonl", logs_dir / "trace.jsonl")
-                self.assertEqual(context.exit_code, 1)
-                self.assertEqual(context.commands_executed, 7)
-                self.assertEqual(context.n_input_tokens, 11)
-                self.assertEqual(context.n_output_tokens, 13)
-                self.assertEqual(context.n_cache_tokens, 2)
-                self.assertEqual(context.cost_usd, 0.123)
+                env.download_file.assert_not_awaited()
+                self.assertEqual(context.exit_code, 0)
+                self.assertEqual(context.commands_executed, 0)
 
                 metadata = json.loads(
                     (Path(tmp) / "tasks" / "service-task" / "metadata.json").read_text(encoding="utf-8")
                 )
-                self.assertEqual(metadata["validation_results"][0]["command"], "python check.py")
-                self.assertEqual(metadata["post_run_cleanup"]["warning"], "cleanup failed")
-                self.assertIn("validation_failed", metadata["failure_signals"])
-                self.assertIn("retry_cut_short_by_budget", metadata["failure_signals"])
-                self.assertIn("post_run_cleanup_warning", metadata["failure_signals"])
+                self.assertEqual(metadata["exit_code"], 0)
+                self.assertEqual(metadata["failure_signals"], ["agent_setup_ok"])
+                self.assertTrue((Path(tmp) / "tasks" / "service-task" / "agent.log").is_file())
             finally:
                 if old_run_dir is None:
                     os.environ.pop("SIGMA_BENCH_RUN_DIR", None)

@@ -1,0 +1,219 @@
+import type { AgentEventEnvelope, AgentEventType, JsonValue } from "agent-protocol";
+import type { ActivityItem, ApprovalItem, PresentationState, TranscriptItem } from "./view-state.js";
+
+function payload(event: AgentEventEnvelope): Record<string, JsonValue> {
+  return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+    ? event.payload as Record<string, JsonValue>
+    : {};
+}
+
+function text(value: JsonValue | undefined): string {
+  return typeof value === "string" ? value : "";
+}
+
+function upsertActivity(items: ActivityItem[], item: ActivityItem): ActivityItem[] {
+  const index = items.findIndex((candidate) => candidate.id === item.id);
+  if (index === -1) return [...items, item].slice(-1_000);
+  const next = [...items];
+  next[index] = { ...items[index], ...item };
+  return next;
+}
+
+function itemId(event: AgentEventEnvelope, data: Record<string, JsonValue>): string {
+  const turn = typeof data.turnId === "number" || typeof data.turnId === "string" ? String(data.turnId) : "default";
+  return `${event.runId}:${turn}`;
+}
+
+function appendDelta(items: TranscriptItem[], event: AgentEventEnvelope, data: Record<string, JsonValue>, delta: string): TranscriptItem[] {
+  const id = `assistant:${itemId(event, data)}`;
+  const index = items.findIndex((item) => item.id === id && item.streaming);
+  if (index === -1) {
+    const item: TranscriptItem = { id, role: "assistant", text: delta, streaming: true, occurredAt: event.occurredAt };
+    return [...items, item].slice(-2_000);
+  }
+  const next = [...items];
+  next[index] = { ...items[index], text: `${items[index].text}${delta}` };
+  return next;
+}
+
+type EventProjector = (
+  state: PresentationState,
+  event: AgentEventEnvelope,
+  data: Record<string, JsonValue>
+) => PresentationState;
+
+const withStatus = (status: PresentationState["status"]): EventProjector => (state) => ({ ...state, status });
+
+const projectUserInput: EventProjector = (state, event, data) => {
+  const item: TranscriptItem = {
+    id: event.eventId,
+    role: "user",
+    text: text(data.text),
+    streaming: false,
+    occurredAt: event.occurredAt
+  };
+  return { ...state, transcript: [...state.transcript, item].slice(-2_000) };
+};
+
+const projectFollowUp: EventProjector = (state, event, data) => {
+  const queueId = text(data.queueId);
+  if (!queueId) return projectUserInput(state, event, data);
+  const id = `follow-up:${queueId}`;
+  const index = state.transcript.findIndex((item) => item.id === id);
+  if (index >= 0) return state;
+  const item: TranscriptItem = {
+    id,
+    role: "user",
+    text: text(data.text),
+    streaming: false,
+    occurredAt: event.occurredAt
+  };
+  return { ...state, transcript: [...state.transcript, item].slice(-2_000) };
+};
+
+const projectModelStarted: EventProjector = (state, event, data) => ({
+  ...state,
+  activity: upsertActivity(state.activity, {
+    id: `model:${itemId(event, data)}`,
+    kind: "model",
+    title: text(data.model) || "model",
+    detail: "Generating response",
+    status: "running",
+    occurredAt: event.occurredAt
+  })
+});
+
+const projectModelCompleted: EventProjector = (state, event, data) => {
+  const streamId = `assistant:${itemId(event, data)}`;
+  const streamIndex = state.transcript.findIndex((item) => item.id === streamId && item.streaming);
+  const transcript = [...state.transcript];
+  if (streamIndex >= 0) transcript[streamIndex] = { ...transcript[streamIndex], streaming: false };
+  else if (text(data.text)) {
+    transcript.push({
+      id: event.eventId,
+      role: "assistant",
+      text: text(data.text),
+      streaming: false,
+      occurredAt: event.occurredAt
+    });
+  }
+  return {
+    ...state,
+    transcript: transcript.slice(-2_000),
+    activity: upsertActivity(state.activity, {
+      id: `model:${itemId(event, data)}`,
+      kind: "model",
+      title: text(data.model) || "model",
+      detail: text(data.finishReason),
+      status: "completed",
+      occurredAt: event.occurredAt
+    })
+  };
+};
+
+function toolStatus(type: AgentEventType): ActivityItem["status"] {
+  if (type === "tool.requested") return "queued";
+  if (type === "tool.started") return "running";
+  return type === "tool.completed" ? "completed" : "failed";
+}
+
+const projectToolActivity: EventProjector = (state, event, data) => {
+  const callId = text(data.callId) || event.eventId;
+  return {
+    ...state,
+    activity: upsertActivity(state.activity, {
+      id: `tool:${callId}`,
+      kind: "tool",
+      title: text(data.name) || "tool",
+      detail: text(data.output) || text(data.message),
+      status: toolStatus(event.type),
+      occurredAt: event.occurredAt
+    })
+  };
+};
+
+const projectApprovalRequested: EventProjector = (state, _event, data) => ({
+  ...state,
+  status: "needs_input",
+  approvals: [...state.approvals.filter((item) => item.requestId !== text(data.requestId)), {
+    requestId: text(data.requestId),
+    toolName: text(data.toolName),
+    reason: text(data.reason),
+    status: "pending"
+  }]
+});
+
+const projectApprovalResolved: EventProjector = (state, _event, data) => {
+  const approvals: ApprovalItem[] = state.approvals.map((item) => item.requestId === text(data.requestId)
+    ? { ...item, status: data.decision === "allow" || data.decision === "always_allow" ? "allowed" as const : "denied" as const }
+    : item);
+  return {
+    ...state,
+    status: approvals.some((item) => item.status === "pending") ? "needs_input" : "running",
+    approvals
+  };
+};
+
+const projectChild: EventProjector = (state, event, data) => {
+  const childId = text(data.childId) || event.eventId;
+  const detail = data.payload && typeof data.payload === "object" && !Array.isArray(data.payload)
+    ? data.payload as Record<string, JsonValue> : {};
+  const status: ActivityItem["status"] = event.type === "child.completed"
+    ? detail.status === "completed" ? "completed" : detail.status === "cancelled" ? "cancelled" : "failed"
+    : event.type === "child.spawned" ? "queued" : "running";
+  return {
+    ...state,
+    activity: upsertActivity(state.activity, {
+      id: `child:${childId}`,
+      kind: "child",
+      title: `agent ${childId.slice(0, 8)}`,
+      detail: text(detail.kind) || text(detail.error) || text(detail.intent) || status,
+      status,
+      occurredAt: event.occurredAt
+    })
+  };
+};
+
+const projectors: Partial<Record<AgentEventType, EventProjector>> = {
+  "run.started": withStatus("running"),
+  "user.message": projectUserInput,
+  "user.steer": projectUserInput,
+  "user.follow_up": projectFollowUp,
+  "model.started": projectModelStarted,
+  "model.delta": (state, event, data) => ({
+    ...state,
+    transcript: appendDelta(state.transcript, event, data, text(data.delta))
+  }),
+  "model.completed": projectModelCompleted,
+  "tool.requested": projectToolActivity,
+  "tool.started": projectToolActivity,
+  "tool.completed": projectToolActivity,
+  "tool.failed": projectToolActivity,
+  "tool.approval_requested": projectApprovalRequested,
+  "tool.approval_resolved": projectApprovalResolved,
+  "child.spawned": projectChild,
+  "child.message": projectChild,
+  "child.completed": projectChild,
+  "run.suspended": withStatus("needs_input"),
+  "run.completed": withStatus("completed"),
+  "run.cancelled": withStatus("cancelled"),
+  "run.failed": withStatus("failed")
+};
+
+export function projectEvent(previous: PresentationState, event: AgentEventEnvelope): PresentationState {
+  if (event.seq <= previous.lastSeq) return previous;
+  const state: PresentationState = {
+    ...previous,
+    sessionId: event.sessionId,
+    runId: event.runId,
+    lastSeq: event.seq
+  };
+  const projector = projectors[event.type];
+  return projector ? projector(state, event, payload(event)) : state;
+}
+
+export function replayPresentation(events: Iterable<AgentEventEnvelope>, initial: PresentationState): PresentationState {
+  let state = initial;
+  for (const event of events) state = projectEvent(state, event);
+  return state;
+}

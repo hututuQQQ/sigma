@@ -1,0 +1,67 @@
+import type { JsonValue, ModelMessage, RunMode, RunOutcome, ToolRequest, ToolReceipt } from "agent-protocol";
+
+export type KernelPhase =
+  | "idle"
+  | "ready_model"
+  | "model_in_flight"
+  | "tool_pending"
+  | "tool_in_flight"
+  | "needs_input"
+  | "outcome_pending"
+  | "terminal";
+
+export interface PendingTool {
+  request: ToolRequest;
+  approval: "not_required" | "pending" | "allowed" | "denied";
+  started: boolean;
+}
+
+export interface KernelState {
+  schemaVersion: 2;
+  sessionId: string;
+  runId: string;
+  mode: RunMode;
+  phase: KernelPhase;
+  revision: number;
+  lastSeq: number;
+  startedAt: string;
+  deadlineAt: string;
+  messages: ModelMessage[];
+  pendingTools: PendingTool[];
+  receipts: ToolReceipt[];
+  evidence: JsonValue[];
+  childIds: string[];
+  proposedOutcome?: RunOutcome;
+  outcome?: RunOutcome;
+}
+
+export interface CreateKernelStateOptions {
+  sessionId: string;
+  runId: string;
+  mode: RunMode;
+  startedAt: string;
+  deadlineAt: string;
+}
+
+export function createKernelState(options: CreateKernelStateOptions): KernelState {
+  return {
+    schemaVersion: 2,
+    sessionId: options.sessionId,
+    runId: options.runId,
+    mode: options.mode,
+    phase: "idle",
+    revision: 0,
+    lastSeq: 0,
+    startedAt: options.startedAt,
+    deadlineAt: options.deadlineAt,
+    messages: [],
+    pendingTools: [],
+    receipts: [],
+    evidence: [],
+    childIds: []
+  };
+}
+
+export function isTerminal(state: KernelState): boolean {
+  return state.phase === "terminal";
+}

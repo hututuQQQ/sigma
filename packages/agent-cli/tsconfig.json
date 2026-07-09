@@ -8,8 +8,10 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
-    { "path": "../agent-ai" },
-    { "path": "../agent-core" },
+    { "path": "../agent-config" },
+    { "path": "../agent-presentation" },
+    { "path": "../agent-protocol" },
+    { "path": "../agent-runtime" },
     { "path": "../agent-tui" }
   ]
 }

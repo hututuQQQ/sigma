@@ -4,8 +4,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runAgent } from "../packages/agent-core/dist/index.js";
-import { SmokeFakeModel } from "./smoke-fake-model.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tasksDir = path.join(rootDir, "test-fixtures", "smoke-tasks");
@@ -39,7 +37,6 @@ function argValue(name) {
 }
 
 function selectedProvider() {
-  if (process.argv.includes("--fake")) return "fake";
   return argValue("--provider") ?? process.env.AGENT_PROVIDER ?? "deepseek";
 }
 
@@ -115,25 +112,16 @@ async function runRealAgent(taskName, taskDir, workspace, artifactDir) {
     "run",
     "--workspace",
     workspace,
-    "--instruction-file",
+    "--prompt-file",
     path.join(taskDir, "instruction.md"),
     "--provider",
     provider,
-    "--max-turns",
-    "20",
-    "--command-timeout-sec",
-    "60",
-    "--max-wall-time-sec",
+    "--run-deadline-sec",
     "300",
     "--permission-mode",
-    "yolo",
-    "--trace-jsonl",
-    path.join(artifactDir, "trace.jsonl"),
-    "--summary-json",
-    path.join(artifactDir, "summary.json"),
-    "--session-jsonl",
-    path.join(artifactDir, "session.jsonl"),
-    "--no-stream-ui"
+    "auto",
+    "--output-format",
+    "json"
   ];
   if (process.env.AGENT_MODEL) {
     args.splice(8, 0, "--model", process.env.AGENT_MODEL);
@@ -145,25 +133,7 @@ async function runRealAgent(taskName, taskDir, workspace, artifactDir) {
   });
 }
 
-async function runFakeAgent(taskName, taskDir, workspace, artifactDir) {
-  const instruction = await readFile(path.join(taskDir, "instruction.md"), "utf8");
-  const result = await runAgent({
-    instruction,
-    workspacePath: workspace,
-    modelClient: new SmokeFakeModel(taskName),
-    maxTurns: 8,
-    maxWallTimeSec: 300,
-    commandTimeoutSec: 60,
-    permissionMode: "yolo",
-    traceJsonlPath: path.join(artifactDir, "trace.jsonl"),
-    sessionJsonlPath: path.join(artifactDir, "session.jsonl"),
-    summaryJsonPath: path.join(artifactDir, "summary.json")
-  });
-  await writeFile(path.join(artifactDir, "agent.log"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
-  return { exitCode: result.status === "error" ? 1 : 0 };
-}
-
-async function runTask(taskName, provider) {
+async function runTask(taskName) {
   const taskDir = path.join(tasksDir, taskName);
   const artifactDir = path.join(artifactsRoot, taskName);
   const workspace = path.join(artifactDir, "workspace");
@@ -178,10 +148,7 @@ async function runTask(taskName, provider) {
     }
   }
 
-  const agent =
-    provider === "fake"
-      ? await runFakeAgent(taskName, taskDir, workspace, artifactDir)
-      : await runRealAgent(taskName, taskDir, workspace, artifactDir);
+  const agent = await runRealAgent(taskName, taskDir, workspace, artifactDir);
   if (agent.exitCode !== 0) {
     return { taskName, ok: false, reason: "agent failed" };
   }
@@ -200,7 +167,7 @@ async function main() {
   const results = [];
 
   for (const taskName of taskNames) {
-    const result = await runTask(taskName, provider);
+    const result = await runTask(taskName);
     results.push(result);
     process.stdout.write(`${result.ok ? "PASS" : "FAIL"} ${taskName}`);
     if (!result.ok) process.stdout.write(` (${result.reason})`);

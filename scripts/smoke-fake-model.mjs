@@ -1,86 +1,71 @@
-function toolCall(id, name, args) {
+export const fakeToolCall = (id, name, args) => ({ id, name, arguments: args });
+
+export function fakeToolTurn(toolCalls) {
   return {
-    id,
-    type: "function",
-    function: {
-      name,
-      arguments: args
-    }
+    message: { role: "assistant", content: "", toolCalls },
+    finishReason: "tool_calls",
+    inputTokens: 1,
+    outputTokens: 1
   };
 }
 
-const TEST_COMMAND =
-  "if [ -n \"${PYTHON_BIN:-}\" ]; then \"$PYTHON_BIN\" -m unittest -q; " +
-  "elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then python3 -m unittest -q; " +
-  "elif command -v python >/dev/null 2>&1 && python -c 'import sys' >/dev/null 2>&1; then python -m unittest -q; " +
-  "elif command -v py >/dev/null 2>&1; then py -3 -m unittest -q; " +
-  "else echo 'Python 3 is required to run this smoke task.' >&2; exit 127; fi";
+export function fakeFinalTurn(content = "done", evidenceCallIds = []) {
+  const hasEvidence = evidenceCallIds.length > 0;
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [fakeToolCall("complete-smoke", "complete_task", {
+        summary: content,
+        criteria: [{
+          criterion: "The requested smoke workflow completed.",
+          status: hasEvidence ? "met" : "not_applicable",
+          evidenceCallIds,
+          rationale: hasEvidence ? "Cited receipts demonstrate the result." : "This scripted protocol check requires no repository evidence."
+        }]
+      })]
+    },
+    finishReason: "tool_calls",
+    inputTokens: 1,
+    outputTokens: 1
+  };
+}
 
-const PLANS = {
-  "create-file": [
-    [toolCall("create-file-write", "write", { path: "hello.txt", content: "hello world", createDirs: true })]
-  ],
-  "edit-file": [
-    [toolCall("edit-file-read", "read", { path: "app.txt" })],
-    [
-      toolCall("edit-file-edit", "edit", {
-        path: "app.txt",
-        oldString: "color=red",
-        newString: "color=blue",
-        expectedReplacements: 1
-      })
-    ]
-  ],
-  "fix-test": [
-    [toolCall("fix-test-read", "read", { path: "math_utils.py" })],
-    [
-      toolCall("fix-test-edit", "edit", {
-        path: "math_utils.py",
-        oldString: "return a - b",
-        newString: "return a + b",
-        expectedReplacements: 1
-      })
-    ],
-    [toolCall("fix-test-unittest", "bash", { command: TEST_COMMAND, timeoutSec: 30 })]
-  ],
-  "inspect-and-summarize": [
-    [toolCall("inspect-read", "read", { path: "data/input.txt" })],
-    [toolCall("inspect-write", "write", { path: "result.txt", content: "3", createDirs: true })]
-  ]
-};
-
-export const smokeTaskNames = Object.freeze(Object.keys(PLANS));
-
-export class SmokeFakeModel {
+export class SmokeFakeGateway {
   provider = "fake";
   model = "smoke-fake-model";
+  capabilities = {
+    contextWindowTokens: 16_000,
+    maxOutputTokens: 2_000,
+    tools: true,
+    parallelTools: true,
+    reasoning: false,
+    structuredOutput: false,
+    promptCache: false,
+    tokenizer: "approximate"
+  };
 
-  constructor(taskName) {
-    if (!Object.hasOwn(PLANS, taskName)) {
-      throw new Error(`No fake smoke plan exists for task '${taskName}'.`);
-    }
-    this.taskName = taskName;
-    this.turn = 0;
+  constructor(responses = [fakeFinalTurn()]) {
+    this.responses = [...responses];
+    this.requests = [];
   }
 
-  async complete(_req) {
-    const calls = PLANS[this.taskName][this.turn];
-    this.turn += 1;
+  async complete(request) {
+    this.requests.push(request);
+    const response = this.responses.shift();
+    if (!response) throw new Error("The generic fake gateway has no scripted response remaining.");
+    return response;
+  }
 
-    if (!calls) {
-      return {
-        message: { role: "assistant", content: "done" },
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }
-      };
-    }
+  async *stream(request) {
+    const response = await this.complete(request);
+    if (response.message.content) yield { type: "content", delta: response.message.content };
+    yield { type: "done", response };
+  }
 
-    return {
-      message: {
-        role: "assistant",
-        content: "",
-        toolCalls: calls
-      },
-      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }
-    };
+  async countTokens(messages, tools = []) {
+    return Math.ceil(JSON.stringify({ messages, tools }).length / 4);
   }
 }
+
+export const SmokeFakeModel = SmokeFakeGateway;

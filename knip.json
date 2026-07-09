@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "include": ["files", "dependencies", "unlisted", "binaries"],
+  "ignoreBinaries": ["python", "taskkill.exe"],
+  "workspaces": {
+    ".": {
+      "entry": [
+        "scripts/*.mjs",
+        "tests/**/*.{ts,tsx}"
+      ],
+      "project": [
+        "scripts/**/*.mjs",
+        "tests/**/*.{ts,tsx}",
+        "*.{js,mjs,cjs,ts}"
+      ]
+    },
+    "packages/*": {
+      "entry": ["src/index.{ts,tsx}"],
+      "project": ["src/**/*.{ts,tsx}"]
+    }
+  }
+}

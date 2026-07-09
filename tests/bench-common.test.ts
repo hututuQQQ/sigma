@@ -70,15 +70,7 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "max_wall_time_sec:int=7200",
       "--ak",
-      "harness_timeout_sec:int=14610",
-      "--ak",
-      "validation_mode:str=auto",
-      "--ak",
-      "validation_retry_limit:int=1",
-      "--ak",
-      "validation_timeout_sec:int=45",
-      "--ak",
-      "precheck_timeout_sec:int=45"
+      "harness_timeout_sec:int=7320"
     ]);
   });
 
@@ -109,7 +101,7 @@ describe("Terminal-Bench command construction", () => {
       "-l",
       "5",
       "--agent-timeout-multiplier",
-      "8.12",
+      "4.07",
       "--ak",
       `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
@@ -123,15 +115,7 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "max_wall_time_sec=7200",
       "--ak",
-      "harness_timeout_sec=14610",
-      "--ak",
-      "validation_mode=auto",
-      "--ak",
-      "validation_retry_limit=1",
-      "--ak",
-      "validation_timeout_sec=45",
-      "--ak",
-      "precheck_timeout_sec=45"
+      "harness_timeout_sec=7320"
     ]);
   });
 
@@ -164,12 +148,9 @@ describe("Terminal-Bench command construction", () => {
 
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 2700,
-      retry_budget_sec: 2700,
-      precheck_timeout_sec: 45,
-      validation_retry_limit: 1,
-      harness_timeout_sec: 5610,
-      effective_harness_timeout_sec: 5610,
-      agent_timeout_multiplier: "3.12",
+      harness_timeout_sec: 2820,
+      effective_harness_timeout_sec: 2820,
+      agent_timeout_multiplier: "1.57",
       source: "harbor_task_metadata"
     });
     expect(
@@ -200,11 +181,8 @@ describe("Terminal-Bench command construction", () => {
 
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 9000,
-      retry_budget_sec: 9000,
-      precheck_timeout_sec: 45,
-      validation_retry_limit: 1,
-      harness_timeout_sec: 18210,
-      agent_timeout_multiplier: "3.04",
+      harness_timeout_sec: 9120,
+      agent_timeout_multiplier: "1.52",
       leniency_multiplier: 1.5,
       leniency_min_extra_sec: 600
     });
@@ -224,9 +202,8 @@ describe("Terminal-Bench command construction", () => {
 
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 6000,
-      retry_budget_sec: 6000,
-      harness_timeout_sec: 12210,
-      agent_timeout_multiplier: "6.79",
+      harness_timeout_sec: 6120,
+      agent_timeout_multiplier: "3.4",
       source: "explicit_max_wall_time"
     });
   });
@@ -338,24 +315,20 @@ describe("Terminal-Bench command construction", () => {
 
     expect(config.datasets).toBeUndefined();
     expect(config.tasks).toEqual([{ name: "terminal-bench/long-runtime-task" }]);
-    expect(config.agent_timeout_multiplier).toBe(3.12);
+    expect(config.agent_timeout_multiplier).toBe(1.57);
     expect(config.agents[0].name).toBe(portableAgentImportPath);
     expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
-      max_turns: 540,
-      max_wall_time_sec: 2700,
-      harness_timeout_sec: 5610,
-      validation_retry_limit: 1,
-      precheck_timeout_sec: 45,
-      validation_mode: "auto",
-      validation_timeout_sec: 45
+      max_wall_time_sec: 2700
     });
+    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
+    expect(config.agents[0].kwargs.validation_retry_limit).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
     expect(config.agents[0].kwargs.post_run_cleanup_globs).toBeUndefined();
   });
 
-  it("enables generic validation retry budget for ordinary Terminal-Bench tasks", () => {
+  it("keeps external timeout planning out of solver kwargs", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
       tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
@@ -378,34 +351,36 @@ describe("Terminal-Bench command construction", () => {
 
     expect(timeoutPlan).toMatchObject({
       agent_wall_time_sec: 2700,
-      retry_budget_sec: 2700,
-      validation_retry_limit: 1,
-      precheck_timeout_sec: 45,
-      validation_mode: "auto"
+      harness_timeout_sec: 2820
     });
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
-      validation_mode: "auto",
-      validation_timeout_sec: 45,
-      validation_retry_limit: 1,
-      precheck_timeout_sec: 45
+      max_wall_time_sec: 2700
     });
+    expect(config.agents[0].kwargs.validation_mode).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
   });
 
-  it("keeps the default validation retry when validationRetryLimit is unset or null", () => {
+  it("does not expose legacy validation or retry controls", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
       tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
       max_agent_timeout_sec: 1800
     };
 
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe).validation_retry_limit).toBe(1);
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, validationRetryLimit: null }, timeoutProbe).validation_retry_limit).toBe(1);
-    expect(computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120, validationRetryLimit: 0 }, timeoutProbe).validation_retry_limit).toBe(0);
+    const plan = computeHarborTimeoutPlan({
+      agentTimeoutGraceSec: 120,
+      validationRetryLimit: 99,
+      validationMode: "auto",
+      precheckTimeoutSec: 999
+    }, timeoutProbe);
+    expect(plan).not.toHaveProperty("validation_retry_limit");
+    expect(plan).not.toHaveProperty("validation_mode");
+    expect(plan).not.toHaveProperty("precheck_timeout_sec");
+    expect(plan).toMatchObject({ agent_wall_time_sec: 2700, harness_timeout_sec: 2820 });
   });
 
-  it("preserves explicit max turns in resolved JobConfig", () => {
+  it("does not expose fixed turn limits to the solver", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
       tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
@@ -427,7 +402,7 @@ describe("Terminal-Bench command construction", () => {
       timeoutProbe
     );
 
-    expect(config.agents[0].kwargs.max_turns).toBe(200);
+    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
   });
 
   it("rejects removed Harbor import paths", () => {
@@ -543,12 +518,12 @@ describe("failure classifier", () => {
     expect(suggestedOwnerForFailureCategory("harbor_cli_error")).toBe("scripts/bench");
     expect(suggestedOwnerForFailureCategory("node_missing")).toBe("package-agent-cli");
     expect(suggestedOwnerForFailureCategory("agent_setup_failed")).toBe("portable/harbor");
-    expect(suggestedOwnerForFailureCategory("api_error")).toBe("agent-ai");
-    expect(suggestedOwnerForFailureCategory("agent_timeout")).toBe("agent-core");
-    expect(suggestedOwnerForFailureCategory("max_turns")).toBe("agent-core");
-    expect(suggestedOwnerForFailureCategory("tool_timeout")).toBe("agent-core");
-    expect(suggestedOwnerForFailureCategory("verifier_failed")).toBe("agent-core");
-    expect(suggestedOwnerForFailureCategory("agent_crashed")).toBe("agent-core");
+    expect(suggestedOwnerForFailureCategory("api_error")).toBe("agent-model");
+    expect(suggestedOwnerForFailureCategory("agent_timeout")).toBe("agent-runtime");
+    expect(suggestedOwnerForFailureCategory("max_turns")).toBe("agent-runtime");
+    expect(suggestedOwnerForFailureCategory("tool_timeout")).toBe("agent-tools");
+    expect(suggestedOwnerForFailureCategory("verifier_failed")).toBe("agent-runtime");
+    expect(suggestedOwnerForFailureCategory("agent_crashed")).toBe("agent-runtime");
     expect(suggestedOwnerForFailureCategory("unknown")).toBe("inspect");
     expect(suggestedOwnerForFailureCategory("new-category")).toBe("inspect");
   });
@@ -581,7 +556,7 @@ describe("markdown report formatting", () => {
           task_id: "terminal-bench/task-a",
           status: "failed",
           failure_category: "verifier_failed",
-          suggested_owner: "agent-core",
+          suggested_owner: "agent-runtime",
           failure_signals: ["agent_completed_but_verifier_failed"],
           commands_executed: 2,
           input_tokens: 3,
@@ -598,7 +573,7 @@ describe("markdown report formatting", () => {
 
     expect(markdown).toContain("| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals |");
     expect(markdown).toContain(
-      "| terminal-bench/task-a | failed | verifier_failed | agent-core | 0 |  | agent_completed_but_verifier_failed |"
+      "| terminal-bench/task-a | failed | verifier_failed | agent-runtime | 0 |  | agent_completed_but_verifier_failed |"
     );
     expect(markdown).toContain("## Ownership Guidance");
     expect(markdown).toContain("If `suggested_owner` is not `portable/harbor` or `scripts/bench`");
@@ -658,13 +633,13 @@ describe("benchmark report generation", () => {
     expect(report.counts.api_error).toBe(1);
     expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
-    expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
+    expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
     const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
     const jsonReport = JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8"));
     expect(markdown).toContain("# Terminal-Bench Run synthetic-run");
     expect(markdown).toContain("| task | status | failure_category | suggested_owner |");
     expect(jsonReport.counts.api_error).toBe(1);
-    expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-ai");
+    expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
   });
 
   it("uses Harbor verifier reward to mark completed agents as failed", async () => {
@@ -1142,9 +1117,9 @@ describe("benchmark report generation", () => {
     expect(report.tasks[0].failure_signals).toEqual(
       expect.arrayContaining(["agent_completed_but_verifier_failed", "service_stopped_before_verifier"])
     );
-    expect(report.tasks[0].suggested_owner).toBe("agent-core/tools/service");
+    expect(report.tasks[0].suggested_owner).toBe("agent-tools/service");
     expect(markdown).toContain("service_stopped_before_verifier");
-    expect(markdown).toContain("agent-core/tools/service");
+    expect(markdown).toContain("agent-tools/service");
   });
 
   it("marks stale running runs as incomplete with missing file details", async () => {

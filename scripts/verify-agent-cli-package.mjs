@@ -9,7 +9,8 @@ import {
   defaultRootDir,
   normalizeTargetPlatform,
   pinnedNodeVersion,
-  normalizeTargetArch
+  normalizeTargetArch,
+  workspaceRuntimePackages
 } from "./package-agent-cli.mjs";
 
 function tarEntries(tarball, spawn = spawnSync) {
@@ -114,7 +115,7 @@ function runHostCliVersion(bundleDir, spawn = spawnSync) {
   try {
     parsed = JSON.parse(result.stdout);
   } catch (error) {
-    throw new Error(`host Node CLI smoke did not print JSON: ${error instanceof Error ? error.message : String(error)}\n${result.stdout}`);
+    throw new Error(`host Node CLI smoke did not print JSON: ${error instanceof Error ? error.message : String(error)}\n${result.stdout}`, { cause: error });
   }
   if (parsed?.product !== "Sigma Code" || parsed?.package?.name !== "agent-cli") {
     throw new Error(`host Node CLI smoke returned unexpected version payload:\n${result.stdout}`);
@@ -497,23 +498,22 @@ export async function verifyAgentCliPackage(options = {}) {
     throw new Error(`agent CLI bundle not found: ${archive}\nRun pnpm package:agent-cli first.`);
   }
 
+  const workspacePackages = await workspaceRuntimePackages(rootDir);
   const requiredEntries = [
     targetPlatform === "win32" ? `${bundleName}/bin/agent.cmd` : `${bundleName}/bin/agent`,
     targetPlatform === "win32" ? `${bundleName}/bin/node.exe` : `${bundleName}/bin/node`,
     `${bundleName}/README.md`,
     `${bundleName}/package.json`,
     `${bundleName}/package-metadata.json`,
-    `${bundleName}/packages/agent-ai/dist/index.js`,
-    `${bundleName}/packages/agent-core/dist/index.js`,
-    `${bundleName}/packages/agent-tui/dist/index.js`,
-    `${bundleName}/packages/agent-cli/dist/index.js`,
-    `${bundleName}/node_modules/agent-ai/package.json`,
-    `${bundleName}/node_modules/agent-core/package.json`,
-    `${bundleName}/node_modules/agent-tui/package.json`
+    ...workspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
+    ...workspacePackages.filter((name) => name !== "agent-cli").map((name) => `${bundleName}/node_modules/${name}/package.json`)
   ];
   const spawn = options.spawnSync ?? spawnSync;
   const entries = targetPlatform === "win32" ? zipEntries(archive, spawn) : tarEntries(archive, spawn);
   requireEntries(entries, requiredEntries);
+  if (entries.some((entry) => entry.includes("agent-core") || entry.includes("agent-ai"))) {
+    throw new Error("Legacy agent-core/agent-ai content must not be present in the v2 bundle.");
+  }
 
   await mkdir(artifactsDir, { recursive: true });
   const tempDir = await mkdtemp(path.join(artifactsDir, ".agent-cli-verify-"));
@@ -569,6 +569,9 @@ export async function verifyAgentCliPackage(options = {}) {
           targetWrapper.stderr ? `stderr:\n${targetWrapper.stderr}` : null
         ].filter(Boolean).join("\n")
       );
+    }
+    if (targetWrapper.ok && targetWrapper.version?.runtime?.node !== pinnedNodeVersion) {
+      throw new Error(`target wrapper node=${String(targetWrapper.version?.runtime?.node)} expected ${pinnedNodeVersion}`);
     }
 
     return {

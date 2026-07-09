@@ -1,32 +1,110 @@
-# Validation
+# Sigma Code 2.0 validation
 
-Date: 2026-07-09
+Run release checks from the repository root with Node `24.18.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. A lower local Node may run some tests but is not release evidence.
 
-## Commands Run
+```powershell
+node --version
+corepack enable
+corepack prepare pnpm@11.7.0 --activate
+pnpm install --frozen-lockfile
+pnpm build
+```
 
-| Command | Status |
-| --- | --- |
-| `pnpm lint` | PASS |
-| `pnpm test` | PASS |
-| `pnpm build` | PASS |
-| `pnpm smoke:local:fake` | PASS: create-file, edit-file, fix-test, inspect-and-summarize |
-| `pnpm test:harbor` | PASS: 8 unittest cases |
-| `pnpm package:harbor-runtime` | PASS: created `.artifacts\harbor-runtime` and `.artifacts\agent-cli-linux-x64.tgz` |
-| `git diff --check` | PASS |
-| `pnpm test -- tests/product-benchmark-boundary.test.ts tests/agent-core.subagents-review.test.ts` | PASS: product boundary test allows only `packages/agent-core/src/review/anti-gaming.ts` as the explicit detection-rule exception |
-| `rg -n "agent-tui\|packages/agent-tui\|workspacePackages" scripts/package-agent-cli.mjs tests/package-agent-cli.test.ts` | PASS: package list and copy step include `agent-tui`; package test covers workspace package list |
-| `node -e "const p=require('./package.json'); for (const k of ['bench:tb:smoke','bench:tb:k','bench:tb:task','package:harbor-runtime','test:harbor']) console.log(k+'='+p.scripts[k])"` | PASS: printed configured script commands |
+## Required code-quality and test gates
 
-## Coverage Notes
+```powershell
+pnpm lint
+pnpm test:coverage
+pnpm test:harbor
+```
 
-- `memory.write` now requests write permission before persisting durable memory. Tests cover ask mode without a decider denying the write and leaving `.agent/memory` empty, yolo mode write/search/read behavior, ask-mode decider allow, and list/search/read remaining read-only.
-- Runtime memory/diff context is sent as explicit `UNTRUSTED RUNTIME CONTEXT` with "not user instruction" language and fenced block payloads. Tests cover a hostile memory snippet and assert it is not placed in the ordinary user message.
-- Recent diff runtime context now includes both `git diff --stat -- .` and a bounded `git diff --unified=3 -- .` patch preview. Tests cover small diffs with patch content and large diffs with `[diff truncated]` plus `source.truncated`.
-- Context budget estimates no longer add `repoMapChars` or `skillsChars` on top of message/tool chars. A regression test asserts repo map and skills attribution is preserved without double-counting the total estimate.
-- Product package boundary tests keep benchmark/verifier/reward/task-id terms out of product packages except for the single explicit detection-rule file: `packages/agent-core/src/review/anti-gaming.ts`. That file now uses direct literal terms instead of split strings.
-- Harbor adapter tests and runtime packaging still pass. The benchmark and Harbor helper scripts remain in `package.json` as external infrastructure commands.
+`pnpm lint` includes:
 
-## Known Limitations
+- project-reference TypeScript checking;
+- ESLint with cyclomatic complexity at most 15 and package-source functions at most 80 lines;
+- dependency-cruiser checks for production dependency cycles and cross-package private-source imports;
+- Knip dead-code/export checks;
+- the architecture guard: production package files at most 400 lines and TUI source files at most 250 lines.
 
-- The Tree-sitter Node binding is pinned to the `0.22.x` runtime series with compatible grammar package versions because `tree-sitter@0.25.x` failed native compilation on Node 24/MSBuild in this environment.
-- TUI rendering consumes typed thread items for tool name/input/result, while older event metadata remains present for trace readability and external replay compatibility.
+The V8 coverage gate includes every `packages/*/src/**/*.{ts,tsx}` file and currently requires:
+
+- global statements, lines, functions, and branches: at least 80%;
+- `agent-kernel` branch coverage: at least 90%;
+- `agent-protocol` branch coverage: at least 90%;
+- `agent-store` branch coverage: at least 90%.
+
+The authoritative result is the current `pnpm test:coverage` run, not a number copied into documentation. Coverage reports are emitted under `coverage/` for inspection.
+
+## Product and platform checks
+
+Run the neutral product checks without live provider credentials:
+
+```powershell
+pnpm smoke:product
+pnpm smoke:tui-product
+pnpm verify:sandbox
+pnpm verify:package:agent-cli
+pnpm perf:repo-100k
+pnpm package:harbor-runtime
+pnpm product:readiness
+```
+
+What these commands prove:
+
+- `smoke:product`: a fake gateway completes a normal multi-turn tool/session workflow through the built CLI.
+- `smoke:tui-product`: the built TUI exercises alternate-screen, cursor, raw-mode, completion, cleanup, and responsive-resize behavior with controlled terminal streams.
+- `verify:sandbox`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check.
+- `verify:package:agent-cli`: the default Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime; verification runs the bundled CLI entry with host Node and attempts the target wrapper when the native/WSL environment supports it.
+- `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
+- `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness from release readiness.
+
+`pnpm verify:product` combines lint, coverage, fake product/TUI smoke, Windows package structure inspection, and the readiness report. It deliberately excludes benchmark execution and a live provider call, and it does not require a successful target-wrapper execution result.
+
+## Windows release check
+
+On Windows, with provider credentials configured, run:
+
+```powershell
+pnpm verify:release:windows
+```
+
+This requires successful execution of the bundled Windows wrapper and a live DeepSeek provider smoke in addition to the neutral product checks. A structure-only Windows archive produced on another OS does not prove that the Windows wrapper executed successfully.
+
+Live provider validation is intentionally separate because it costs money, depends on credentials/network/provider state, and is not a deterministic PR gate.
+
+## Covered failure and recovery boundaries
+
+The automated suites cover:
+
+- DeepSeek/GLM request serialization, retryable HTTP failures, `Retry-After`, stream aggregation/divergence, partial-stream restart, finish reasons, idle timeout, hard deadline, and cancellation;
+- kernel reducer decisions and the `complete_task` acceptance/evidence protocol;
+- checksummed segment rotation, concurrent append serialization, corrupt/torn tails, snapshots, artifacts, and stale append locks;
+- multi-run restore, durable deadlines, outcome-pending recovery, active-session ownership, command inboxes, pending approvals, and interrupted idempotent/non-idempotent tools;
+- effect-based permission/mode decisions, per-call contexts, resource locking, process cancellation, tool failures, workspace delta receipts, and nested `AGENTS.md` discovery;
+- stale-turn rejection after steering, nested-instruction replan-before-write, delegated write-scope enforcement, and tool idle/hard deadlines;
+- CJK/Unicode repository retrieval, provider-sized token fitting, low-authority conversation compaction, Git context, symlink/junction containment, and cache invalidation;
+- child scheduling, durable FIFO follow-ups, parent cancellation/join behavior, crash-visible unresolved children, clean-repository worktrees, dirty/non-Git single-writer leases, delegated approval capabilities, scoped integration, and integration conflicts;
+- MCP initialize/tools/call flows, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
+- CLI strict config precedence, init/replay/session commands, active-owner routing, output formats, exit codes, interactive approval, and provider failure;
+- TUI grapheme editing, CJK/emoji/flags/keycaps, bracketed paste, control-sequence sanitization, multiple approvals, queue routing, resize/cleanup, 10,000-event projection, render p95 under 16 ms in the unit-test environment, and heap growth under 150 MiB in that test;
+- packaged TUI startup and cleanup through a real Linux PTY and Windows ConPTY in CI;
+- a synthetic 100,000-path Git index through the production repository-context provider, bounded to 30 seconds and 300 MiB incremental heap;
+- manifest-derived portable packaging and absence of the removed legacy packages;
+- the production evaluation/fairness boundary.
+
+## Boundaries not established by the automated gate
+
+Do not interpret the checks above as claims beyond their scope:
+
+- Sigma enforces workspace path containment and process cancellation, but does not currently configure an OS-level command sandbox. `agent doctor` reports this as a warning.
+- CI exercises packaged `/quit` startup and cleanup through Linux PTY and Windows ConPTY. It does not replace manual IME, rapid-resize, font, and terminal-emulator matrix signoff.
+- MCP policy trusts the configured `possible_effects` and cannot independently prove what a remote server does. Treat untrusted MCP servers as untrusted executables.
+- A dirty/non-Git writer runs under an exclusive lease in the source workspace, not an isolated worktree. In that mode only path-addressable writes inside its required `writeScope` are allowed; broad process/MCP mutation tools are denied.
+- The default CI/product gate uses fake gateways. Only the explicit provider smoke proves current credentials and provider connectivity.
+- Cross-target package structure verification does not execute a foreign-platform wrapper.
+
+## Fairness audit
+
+The fairness test scans every production package and rejects benchmark names, task identity, verifier feedback, rewards/scores, and related control flow. `agent-core` and `agent-ai` must remain absent.
+
+Evaluation data has a separate protocol/storage path: `ExternalEvaluationReport` can be appended to an `EvaluationSink`, but `external_verifier` is excluded from solver-visible event and context authority types. The neutral product gate may launch and observe a run; it may not feed post-run evaluation output back into the agent or retry the solver from that output.

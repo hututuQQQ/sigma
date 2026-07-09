@@ -20,8 +20,6 @@ export const defaultAgentTimeoutFallbackSec = 1800;
 export const defaultAgentTimeoutGraceSec = 120;
 export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
 export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
-export const defaultPrecheckTimeoutSec = 45;
-export const defaultPrecheckRetryLimit = 1;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 
@@ -46,12 +44,12 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["harbor_cli_error", "scripts/bench"],
   ["node_missing", "package-agent-cli"],
   ["agent_setup_failed", "portable/harbor"],
-  ["api_error", "agent-ai"],
-  ["agent_timeout", "agent-core"],
-  ["max_turns", "agent-core"],
-  ["tool_timeout", "agent-core"],
-  ["verifier_failed", "agent-core"],
-  ["agent_crashed", "agent-core"],
+  ["api_error", "agent-model"],
+  ["agent_timeout", "agent-runtime"],
+  ["max_turns", "agent-runtime"],
+  ["tool_timeout", "agent-tools"],
+  ["verifier_failed", "agent-runtime"],
+  ["agent_crashed", "agent-runtime"],
   ["unknown", "inspect"]
 ]);
 
@@ -62,7 +60,7 @@ export function suggestedOwnerForFailureCategory(failureCategory) {
 
 function suggestedOwnerForTask(status, failureCategory, failureSignals = []) {
   if (status !== "passed" && Array.isArray(failureSignals) && failureSignals.includes("service_stopped_before_verifier")) {
-    return "agent-core/tools/service";
+    return "agent-tools/service";
   }
   return status === "passed" ? null : suggestedOwnerForFailureCategory(failureCategory);
 }
@@ -206,21 +204,6 @@ function asOptionalPositiveInt(value, name) {
   return parsed;
 }
 
-function asOptionalNonNegativeInt(value, name) {
-  if (value === undefined || value === null || value === true || value === "") return null;
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`${name} must be a non-negative integer.`);
-  }
-  return parsed;
-}
-
-function asValidationMode(value, fallback = "auto") {
-  const text = String(value ?? fallback).trim().toLowerCase();
-  if (text === "auto" || text === "off") return text;
-  throw new Error("AGENT_VALIDATION_MODE must be auto or off.");
-}
-
 export function resolveRunOptions(argv, env = process.env) {
   const flags = parseArgs(argv);
   const mode = flags.smoke ? "smoke" : asString(flags.mode, "k");
@@ -252,17 +235,7 @@ export function resolveRunOptions(argv, env = process.env) {
       env.AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC,
       defaultAgentTimeoutLeniencyMinExtraSec,
       "AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC"
-    ),
-    precheckTimeoutSec: asPositiveInt(
-      env.AGENT_PRECHECK_TIMEOUT_SEC,
-      defaultPrecheckTimeoutSec,
-      "AGENT_PRECHECK_TIMEOUT_SEC"
-    ),
-    validationRetryLimit: asOptionalNonNegativeInt(
-      env.AGENT_VALIDATION_RETRY_LIMIT,
-      "AGENT_VALIDATION_RETRY_LIMIT"
-    ),
-    validationMode: asValidationMode(env.AGENT_VALIDATION_MODE, "auto")
+    )
   };
 }
 
@@ -378,29 +351,8 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     0,
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
-  const validationRetryLimitWasProvided =
-    options.validationRetryLimit !== undefined && options.validationRetryLimit !== null && options.validationRetryLimit !== "";
-  const requestedValidationRetryLimit = validationRetryLimitWasProvided && Number.isFinite(Number(options.validationRetryLimit))
-    ? Math.max(0, Math.ceil(Number(options.validationRetryLimit)))
-    : null;
-  const validationMode = options.mode === "smoke" ? "off" : asValidationMode(options.validationMode, "auto");
-  const validationEnabled = validationMode === "auto";
-  const defaultRetryLimit =
-    options.mode === "smoke"
-      ? 0
-      : validationEnabled
-        ? defaultPrecheckRetryLimit
-        : 0;
-  const validationRetryLimit = requestedValidationRetryLimit ?? defaultRetryLimit;
-  const precheckTimeoutSec = validationRetryLimit > 0 || validationEnabled
-    ? Math.max(1, Math.ceil(asFinitePositiveNumber(options.precheckTimeoutSec) ?? defaultPrecheckTimeoutSec))
-    : 0;
-  const retryBudgetSec = validationRetryLimit * agentWallTimeSec;
-  const precheckBudgetSec = precheckTimeoutSec > 0
-    ? (validationRetryLimit + (validationEnabled ? 1 : 0)) * precheckTimeoutSec
-    : 0;
   const cleanupGraceSec = graceSec;
-  const harnessTimeoutSec = agentWallTimeSec + retryBudgetSec + precheckBudgetSec + cleanupGraceSec;
+  const harnessTimeoutSec = agentWallTimeSec + cleanupGraceSec;
   const agentTimeoutMultiplier =
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
@@ -410,12 +362,6 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     agent_wall_time_sec: agentWallTimeSec,
     agent_timeout_grace_sec: graceSec,
     cleanup_grace_sec: cleanupGraceSec,
-    retry_budget_sec: retryBudgetSec,
-    precheck_timeout_sec: precheckTimeoutSec,
-    validation_retry_limit: validationRetryLimit,
-    precheck_budget_sec: precheckBudgetSec,
-    validation_mode: validationMode,
-    validation_timeout_sec: precheckTimeoutSec,
     harness_timeout_sec: harnessTimeoutSec,
     effective_harness_timeout_sec: harnessTimeoutSec,
     leniency_multiplier: leniencyMultiplier,
@@ -455,20 +401,10 @@ function selectedTaskRecords(timeoutProbe) {
     .filter(Boolean);
 }
 
-function benchmarkMaxTurns(options, timeoutPlan = null) {
-  if (options.maxTurnsExplicit) return options.maxTurns;
-  const wallTimeSec = asFinitePositiveNumber(timeoutPlan?.agent_wall_time_sec);
-  if (wallTimeSec === null) return options.maxTurns;
-  const byCadence = Math.ceil(wallTimeSec / defaultBenchmarkTurnCadenceSec);
-  return Math.min(defaultBenchmarkMaxTurnsCap, Math.max(options.maxTurns, byCadence));
-}
-
-function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) {
+function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
-    provider: options.provider,
-    max_turns: benchmarkMaxTurns(options, timeoutPlan),
-    command_timeout_sec: options.commandTimeoutSec
+    provider: options.provider
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -477,17 +413,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null, timeoutProbe = null) 
   if (timeoutPlan?.agent_wall_time_sec) {
     agentKwargs.max_wall_time_sec = timeoutPlan.agent_wall_time_sec;
   }
-  if (timeoutPlan?.effective_harness_timeout_sec) {
-    agentKwargs.harness_timeout_sec = timeoutPlan.effective_harness_timeout_sec;
-  }
   if (timeoutPlan?.cleanup_grace_sec !== undefined) {
     agentKwargs.agent_timeout_grace_sec = timeoutPlan.cleanup_grace_sec;
   }
-
-  agentKwargs.validation_mode = timeoutPlan?.validation_mode ?? asValidationMode(options.validationMode, "auto");
-  agentKwargs.validation_timeout_sec = timeoutPlan?.validation_timeout_sec ?? defaultPrecheckTimeoutSec;
-  agentKwargs.validation_retry_limit = timeoutPlan?.validation_retry_limit ?? defaultPrecheckRetryLimit;
-  agentKwargs.precheck_timeout_sec = timeoutPlan?.precheck_timeout_sec ?? defaultPrecheckTimeoutSec;
   return agentKwargs;
 }
 
@@ -497,7 +425,7 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
     : assertSupportedHarborAgentImportPath(
         options.agentImportPath ?? resolveHarborAgentImportPath(options.env ?? process.env)
       );
-  const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan, timeoutProbe);
+  const agentKwargs = options.mode === "smoke" ? {} : benchmarkAgentKwargs(options, timeoutPlan);
 
   const config = {
     jobs_dir: jobsDir,
@@ -629,10 +557,6 @@ export function buildHarborArgs(options) {
   args.push("--ak", formatAgentKwarg("command_timeout_sec", "int", options.commandTimeoutSec, capabilities));
   args.push("--ak", formatAgentKwarg("max_wall_time_sec", "int", timeoutPlan.agent_wall_time_sec, capabilities));
   args.push("--ak", formatAgentKwarg("harness_timeout_sec", "int", timeoutPlan.effective_harness_timeout_sec, capabilities));
-  args.push("--ak", formatAgentKwarg("validation_mode", "str", timeoutPlan.validation_mode, capabilities));
-  args.push("--ak", formatAgentKwarg("validation_retry_limit", "int", timeoutPlan.validation_retry_limit, capabilities));
-  args.push("--ak", formatAgentKwarg("validation_timeout_sec", "int", timeoutPlan.validation_timeout_sec, capabilities));
-  args.push("--ak", formatAgentKwarg("precheck_timeout_sec", "int", timeoutPlan.precheck_timeout_sec, capabilities));
   return args;
 }
 
@@ -1463,8 +1387,6 @@ export function formatMarkdownReport(report) {
     `- Source: ${report.timeout_plan?.source ?? "unknown"}`,
     `- Recommended agent timeout sec: ${report.timeout_plan?.recommended_agent_timeout_sec ?? "unknown"}`,
     `- Agent wall time sec: ${report.timeout_plan?.agent_wall_time_sec ?? "unknown"}`,
-    `- Retry budget sec: ${report.timeout_plan?.retry_budget_sec ?? "unknown"}`,
-    `- Precheck timeout sec: ${report.timeout_plan?.precheck_timeout_sec ?? "unknown"}`,
     `- Harness timeout sec: ${report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
     `- Effective harness timeout sec: ${report.timeout_plan?.effective_harness_timeout_sec ?? report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
     `- Agent timeout multiplier: ${report.timeout_plan?.agent_timeout_multiplier ?? "none"}`,
@@ -1548,7 +1470,7 @@ export function formatMarkdownReport(report) {
     "",
     "- If `suggested_owner` is not `portable/harbor` or `scripts/bench`, do not start by changing Harbor adapter plumbing.",
     "- The portable Harbor runtime is an adapter layer, not the agent harness itself.",
-    "- Benchmark solving quality issues should start in `agent-core`, tools, prompts, or CLI behavior."
+    "- Solving quality issues should start in `agent-runtime`, `agent-model`, `agent-tools`, context, or CLI behavior."
   );
 
   lines.push("");

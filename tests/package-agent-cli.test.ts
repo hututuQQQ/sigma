@@ -6,13 +6,13 @@ import { describe, expect, it } from "vitest";
 import { packageAgentCli, pinnedNodeVersion } from "../scripts/package-agent-cli.mjs";
 import { runTargetWrapperVersion, verifyAgentCliPackage } from "../scripts/verify-agent-cli-package.mjs";
 
-async function writeBuiltPackage(rootDir: string, packageName: string) {
+async function writeBuiltPackage(rootDir: string, packageName: string, dependencies: Record<string, string> = {}) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
   const distIndex = packageName === "agent-cli"
     ? [
         "if (process.argv[2] === 'version' && process.argv.includes('--json')) {",
-        "  process.stdout.write(JSON.stringify({ product: 'Sigma Code', package: { name: 'agent-cli', version: '0.1.0' }, runtime: { node: process.version } }) + '\\n');",
+        "  process.stdout.write(JSON.stringify({ product: 'Sigma Code', package: { name: 'agent-cli', version: '2.0.0' }, runtime: { node: process.version } }) + '\\n');",
         "}",
         "export {};",
         ""
@@ -24,9 +24,10 @@ async function writeBuiltPackage(rootDir: string, packageName: string) {
     `${JSON.stringify(
       {
         name: packageName,
-        version: "0.1.0",
+        version: "2.0.0",
         type: "module",
-        main: "./dist/index.js"
+        main: "./dist/index.js",
+        dependencies
       },
       null,
       2
@@ -41,7 +42,11 @@ async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const runtimeDir = path.join(runtimeRoot, runtimeDirName);
   await mkdir(path.join(runtimeDir, "bin"), { recursive: true });
   const nodePath = path.join(runtimeDir, "bin", "node");
-  await writeFile(nodePath, "#!/usr/bin/env sh\necho fake-node\n", "utf8");
+  await writeFile(nodePath, `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then echo "${pinnedNodeVersion}"; exit 0; fi
+if [ "$2" = "version" ]; then echo '{"product":"Sigma Code","package":{"name":"agent-cli","version":"2.0.0"},"runtime":{"node":"${pinnedNodeVersion}"}}'; exit 0; fi
+exec "${process.execPath}" "$@"
+`, "utf8");
   await chmod(nodePath, 0o755);
 
   const tarball = path.join(tmpDir, "node-runtime.tgz");
@@ -108,9 +113,10 @@ async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
 
 async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
-  for (const packageName of ["agent-ai", "agent-core", "agent-tui", "agent-cli"]) {
-    await writeBuiltPackage(rootDir, packageName);
-  }
+  await writeBuiltPackage(rootDir, "agent-protocol");
+  await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" });
+  await writeBuiltPackage(rootDir, "agent-tui", { "agent-protocol": "workspace:*" });
+  await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*", "agent-tui": "workspace:*" });
   return rootDir;
 }
 
@@ -143,7 +149,9 @@ describe("package-agent-cli", () => {
     expect(listing.stdout).toContain("agent-cli-linux-x64/bin/agent");
     expect(listing.stdout).toContain("agent-cli-linux-x64/bin/node");
     expect(listing.stdout).toContain("agent-cli-linux-x64/packages/agent-cli/dist/index.js");
-    expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-core/package.json");
+    expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-runtime/package.json");
+    expect(listing.stdout).toContain("agent-cli-linux-x64/node_modules/agent-protocol/package.json");
+    expect(listing.stdout).not.toContain("agent-core");
 
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
     expect(readme).toContain("Sigma Code CLI Bundle");
@@ -151,8 +159,7 @@ describe("package-agent-cli", () => {
     expect(readme).toContain("./bin/agent version --json");
     expect(readme).toContain("./bin/agent doctor --workspace /path/to/repo --json --strict");
     expect(readme).toContain("./bin/agent inspect");
-    expect(readme).toContain("./bin/agent jobs");
-    expect(readme).toContain("./bin/agent artifacts");
+    expect(readme).toContain("./bin/agent sessions");
     expect(readme).toContain("Product Boundary");
     expect(readme).toContain("`version`, `init`, `doctor`");
     expect(readme).not.toContain("Harbor task containers");
@@ -238,7 +245,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "2.0.0"
         }
       },
       metadata: {
@@ -265,6 +272,7 @@ describe("package-agent-cli", () => {
     const result = await packageAgentCli({
       rootDir,
       artifactsDir,
+      nodeVersionProbe: async () => pinnedNodeVersion,
       env: {
         NODE_RUNTIME_ARCHIVE: runtimeArchive,
         AGENT_TARGET_PLATFORM: "win32",
@@ -364,7 +372,7 @@ describe("package-agent-cli", () => {
       if (command === "wsl" && args[0] === "-e" && args[3]?.includes("./bin/agent version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
           stderr: ""
         };
       }
@@ -386,7 +394,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "2.0.0"
         }
       }
     });
@@ -400,7 +408,7 @@ describe("package-agent-cli", () => {
       if (command === "powershell.exe" && args.join(" ").includes("agent.cmd") && args.join(" ").includes("version --json")) {
         return {
           status: 0,
-          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "0.1.0" } })}\n`,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
           stderr: ""
         };
       }
@@ -421,7 +429,7 @@ describe("package-agent-cli", () => {
         product: "Sigma Code",
         package: {
           name: "agent-cli",
-          version: "0.1.0"
+          version: "2.0.0"
         }
       }
     });
