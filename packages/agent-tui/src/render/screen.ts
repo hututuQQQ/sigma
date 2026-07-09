@@ -283,6 +283,10 @@ export function renderScreen(options: RenderScreenOptions): string {
     ? []
     : [renderTopBar(options), ...(notice ? [notice] : [])];
   const statusLine = renderBottomStatus(options);
+  const overlayHeight = (options.palette ? lineCount(options.palette) : 0) + (options.overlay ? lineCount(options.overlay) : 0);
+  const composerMaxHeight = compact
+    ? Math.max(1, Math.min(4, options.height - topLines.length - overlayHeight - 1))
+    : Math.max(4, Math.min(12, Math.floor(options.height * 0.35), options.height - topLines.length - overlayHeight - 2));
   const composer = renderComposer({
     state: options.composer,
     mode: options.mode,
@@ -292,10 +296,11 @@ export function renderScreen(options: RenderScreenOptions): string {
     queuedInstruction: runState.queuedInstruction,
     footerStatus: statusLine,
     width: options.width,
+    maxHeight: composerMaxHeight,
     color: options.color,
     compact
   });
-  const bottomHeight = lineCount(composer) + (options.palette ? lineCount(options.palette) : 0) + (options.overlay ? lineCount(options.overlay) : 0);
+  const bottomHeight = lineCount(composer) + overlayHeight;
   const mainHeight = Math.max(2, options.height - topLines.length - bottomHeight);
   const useWorkbench = shouldUseWorkbench(options, mainHeight);
   const workbenchWidth = useWorkbench ? Math.min(42, Math.max(34, Math.floor(options.width * 0.32))) : 0;

@@ -101,6 +101,34 @@ describe("agent-tui stream rendering", () => {
     expect(fullWidthRules.length).toBeLessThanOrEqual(2);
   });
 
+  it("keeps very long multiline composer input in a bottom viewport", () => {
+    process.env.TERM = "xterm-256color";
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const composer = createComposerState(Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"));
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: null,
+      events: [],
+      message: "Ready now",
+      composer,
+      entries: buildTranscript({ workspacePath: "/tmp/sigma", events: [], result: null }),
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(splitLines(rendered).length).toBeLessThanOrEqual(24);
+    expect(rendered).toContain("... 36 lines above");
+    expect(rendered).toContain("line 40\u258c");
+    expect(rendered).toContain("build \u00b7 deepseek/default \u00b7 ask \u00b7 idle");
+    expect(rendered).not.toContain("line 1\n");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
   it("renders a wide workbench panel with files, changes, tools, and checks", () => {
     process.env.TERM = "xterm-256color";
     process.env.SIGMA_FORCE_UNICODE = "1";
