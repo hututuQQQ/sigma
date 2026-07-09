@@ -619,6 +619,46 @@ describe("agent-tui stream rendering", () => {
     expect(assertWithinWidth(rendered, 96)).toBe(true);
   });
 
+  it("surfaces turn budget nudges in the transcript and activity strip", () => {
+    const budget = event("turn_budget_nudge", {
+      turn: 18,
+      remainingTurns: 2,
+      changedFiles: 0,
+      message: "Run budget warning: only 2 model turns remain and no files have changed yet."
+    });
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [budget],
+      result: null
+    });
+    const activityItems = buildActivity({
+      events: [budget],
+      result: null
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [budget],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      activityItems,
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(rendered).toContain("Run budget warning");
+    expect(rendered).toContain("turn budget");
+    expect(rendered).toContain("2 turns left; no files changed");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
   it("can render older transcript questions with a scroll offset", () => {
     const entries: TranscriptEntry[] = [
       { kind: "user", text: "first question that should remain available", timestamp: "2026-07-07T12:00:00.000Z" },

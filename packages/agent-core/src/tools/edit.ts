@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { requestToolPermission, resolveWorkspacePath, workspaceRelativePath } from "../policy.js";
+import { invalidateReadFileState } from "./read.js";
 
 interface EditArgs {
   path?: unknown;
@@ -74,6 +75,7 @@ export async function executeEditTool(args: unknown, context: ToolExecutionConte
     const updated = original.split(parsed.oldString).join(parsed.newString);
     await writeFile(filePath, updated, "utf8");
     context.runState.changedFiles.add(relativePath);
+    invalidateReadFileState(context, relativePath);
     return {
       ok: true,
       content: `Edited ${relativePath} (${replacements} replacement(s))`,

@@ -226,6 +226,7 @@ export type AgentFinishReason =
   | "max_turns"
   | "max_wall_time"
   | "loop_guard"
+  | "controller_stop"
   | "validation_failed"
   | "precheck_failed"
   | "cancelled"
@@ -234,6 +235,31 @@ export type AgentFinishReason =
 export type AgentHarnessValidationMode = "off" | "auto";
 export type AgentFinalEvidenceMode = "off" | "auto";
 export type AgentSkillsMode = "off" | "auto";
+export type AgentTaskIntent = "mutation" | "answer" | "inspect";
+export type AgentLoopControlMode = "normal" | "narrow_explore" | "force_implement" | "force_final_text";
+
+export interface AgentLoopPolicy {
+  maxProviderTurns: number;
+  broadExploreLimit: number;
+  readOnlyTurnLimit: number;
+  noChangeTurnLimit: number;
+  implementationReserveTurns: number;
+  repeatedReadIntentLimit: number;
+}
+
+export interface AgentLoopDiagnostics {
+  intent: AgentTaskIntent;
+  mode: AgentLoopControlMode;
+  providerTurns: number;
+  readOnlyTurns: number;
+  noChangeTurns: number;
+  broadReadTurns: number;
+  repeatedReadIntents: number;
+  mutationCount: number;
+  validationCount: number;
+  forcedActions: string[];
+  lastControllerReason?: string;
+}
 
 export type WorkflowPhase =
   | "triage"
@@ -500,10 +526,23 @@ export interface AgentRunState {
   todos: TodoItem[];
   nextTodoId: number;
   changedFiles: Set<string>;
+  readFileState?: Map<string, ReadFileState>;
   contextIndexes?: Map<string, unknown>;
   contextIndexVersion?: number;
   toolArtifacts?: ToolArtifactSummary[];
   subagentRuns?: SubagentRunSummary[];
+}
+
+export interface ReadFileState {
+  path: string;
+  relativePath: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  startLine?: number;
+  limit?: number;
+  byteOffset?: number;
+  byteLimit?: number;
+  contentHash: string;
 }
 
 export type ContextMode = "off" | "repo-map";
@@ -707,6 +746,7 @@ export interface AgentRunConfig {
   finalEvidenceMode?: AgentFinalEvidenceMode;
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
+  loopPolicy?: Partial<AgentLoopPolicy>;
   execPolicy?: ExecPolicyConfig;
   sandbox?: SandboxConfig;
   sandboxAdapter?: SandboxAdapter;
@@ -754,6 +794,12 @@ export interface AgentEvent {
     | "context_compaction_end"
     | "context_compaction_error"
     | "failure_analysis"
+    | "turn_budget_nudge"
+    | "loop_control_state"
+    | "loop_control_steer"
+    | "loop_control_tool_policy"
+    | "loop_control_stop"
+    | "read_cache_hit"
     | "validation_plan_created"
     | "subagent_start"
     | "subagent_end"
@@ -812,6 +858,7 @@ export interface AgentRunResult {
   finalGate?: FinalGateStatus;
   selectedSkills?: SelectedSkillSummary[];
   contextCompactions?: ContextCompactionSummary[];
+  loopDiagnostics?: AgentLoopDiagnostics;
   failureAnalyses?: FailureAnalysisSummary[];
   validationPlan?: ValidationPlan;
   codeIndex?: CodeIndexSummary;
@@ -927,6 +974,7 @@ export interface SummaryJson {
   final_gate?: FinalGateStatus;
   selected_skills?: SelectedSkillSummary[];
   context_compactions?: ContextCompactionSummary[];
+  loop_diagnostics?: AgentLoopDiagnostics;
   failure_analyses?: FailureAnalysisSummary[];
   validation_plan?: ValidationPlan;
   code_index?: CodeIndexSummary;

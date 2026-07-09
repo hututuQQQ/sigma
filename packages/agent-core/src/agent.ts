@@ -36,6 +36,7 @@ import {
   summarizeWorkflowState,
   workflowFailureNudge
 } from "./controller/workflow-state.js";
+import { AgentLoopController, resolveAgentLoopPolicy, type LoopControllerDecision } from "./controller/loop-controller.js";
 import { redactSecrets } from "./redaction.js";
 import { createDefaultSandboxConfig } from "./sandbox.js";
 import { InMemorySubagentJobManager } from "./subagents/subagent-job-manager.js";
@@ -58,7 +59,7 @@ import type {
 } from "./types.js";
 import { addUsage, normalizeToolResult, toolAllMetadata, toolModelContent, toolModelMetadata } from "./types.js";
 
-const DEFAULT_MAX_TURNS = 20;
+const DEFAULT_MAX_TURNS = 80;
 const DEFAULT_MAX_WALL_TIME_SEC = 900;
 const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000;
@@ -309,6 +310,9 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.contextCompactions && result.contextCompactions.length > 0) {
     summary.context_compactions = result.contextCompactions;
   }
+  if (result.loopDiagnostics) {
+    summary.loop_diagnostics = result.loopDiagnostics;
+  }
   if (result.failureAnalyses && result.failureAnalyses.length > 0) {
     summary.failure_analyses = result.failureAnalyses;
   }
@@ -344,7 +348,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   const runId = randomUUID();
   const provider = config.modelClient.provider;
   const model = config.modelClient.model;
-  const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+  const loopPolicy = resolveAgentLoopPolicy({ maxTurns: config.maxTurns, override: config.loopPolicy });
+  const maxTurns = loopPolicy.maxProviderTurns;
   const maxWallTimeSec = config.maxWallTimeSec ?? DEFAULT_MAX_WALL_TIME_SEC;
   const compactionMode = config.compactionMode ?? DEFAULT_COMPACTION_MODE;
   const subagentsEnabled = config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
@@ -368,6 +373,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       todos: [],
       nextTodoId: 1,
       changedFiles: new Set<string>(),
+      readFileState: new Map(),
       contextIndexes: new Map<string, unknown>(),
       subagentRuns: []
     },
@@ -407,6 +413,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         forkedFromSessionId: config.forkedFromSessionId
       });
   const workflow = createWorkflowState();
+  const loopController = new AgentLoopController({ instruction: config.instruction, policy: loopPolicy });
   const finalEvidenceMode = config.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
@@ -583,6 +590,33 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     { role: "system", content: systemSections.join("\n\n") },
     { role: "user", content: config.instruction }
   ];
+  const activeToolDefinitions = (): ToolDefinition[] => {
+    const policy = loopController.toolPolicy();
+    if (policy.toolsDisabled) return [];
+    if (policy.disabledTools.size === 0) return registry.definitions;
+    return registry.definitions.filter((definition) => !policy.disabledTools.has(definition.function.name));
+  };
+  const recordLoopDecision = async (decision: LoopControllerDecision, turn: number, turnId: string): Promise<void> => {
+    if (decision.action === "none") return;
+    const metadata = {
+      turn,
+      turnId,
+      action: decision.action,
+      mode: decision.mode,
+      reason: decision.reason,
+      message: decision.message,
+      diagnostics: loopController.diagnostics()
+    };
+    await recordEvent(event(
+      runId,
+      decision.action === "stop" ? "loop_control_stop" : "loop_control_steer",
+      provider,
+      model,
+      metadata,
+      undefined,
+      durableSession?.sessionId
+    ));
+  };
   const toolRuntime = new ToolRuntime(registry, context);
   let turns = 0;
   let toolCalls = 0;
@@ -651,6 +685,26 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
       const turnId = `${runId}:turn:${turns}`;
       await recordEvent(event(runId, "turn_start", provider, model, { turn: turns, turnId }, undefined, durableSession?.sessionId));
+      const toolPolicy = loopController.toolPolicy();
+      const toolsForTurn = activeToolDefinitions();
+      if (toolPolicy.mode !== "normal" || toolPolicy.toolsDisabled || toolPolicy.disabledTools.size > 0) {
+        await recordEvent(event(
+          runId,
+          "loop_control_tool_policy",
+          provider,
+          model,
+          {
+            turn: turns,
+            turnId,
+            mode: toolPolicy.mode,
+            toolsDisabled: toolPolicy.toolsDisabled,
+            disabledTools: [...toolPolicy.disabledTools].sort((a, b) => a.localeCompare(b, "en")),
+            reason: toolPolicy.reason
+          },
+          undefined,
+          durableSession?.sessionId
+        ));
+      }
       const changedFilesForContext = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
       const preparedMessages = await contextManager.prepareMessages({
         messages,
@@ -662,6 +716,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         evidenceRecords: workflow.evidenceRecords,
         changedFiles: changedFilesForContext,
         todos: context.runState.todos,
+        loopDiagnostics: loopController.diagnostics(),
         emitEvent: async (contextEvent) => {
           await recordEvent(event(
             runId,
@@ -686,6 +741,13 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (preparedMessages.messages !== messages) {
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
+      if (preparedMessages.compacted && preparedMessages.artifact) {
+        const decision = loopController.observeCompaction(preparedMessages.artifact.next_actions);
+        if (decision.message) {
+          messages.push({ role: "user", content: decision.message });
+          await recordLoopDecision(decision, turns, turnId);
+        }
+      }
       const dynamicBlocks = (
         await Promise.all([
           recentDiffBlock(context.workspacePath),
@@ -708,7 +770,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const requestMessages = runtimeContextMessage ? [...messages, runtimeContextMessage] : messages;
       lastContextBudget = summarizeContextBudget({
         messages: requestMessages,
-        tools: registry.definitions,
+        tools: toolsForTurn,
         maxMessageHistoryChars: effectiveMaxMessageHistoryChars,
         modelContextChars: modelContext.modelContextChars,
         repoMapChars: repoMap?.chars,
@@ -724,7 +786,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       await recordEvent(event(runId, "model_start", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
-      const response = await requestModel(turns, requestMessages, registry.definitions, [...staticSourceEntries, ...dynamicSourceEntries]);
+      const response = await requestModel(turns, requestMessages, toolsForTurn, [...staticSourceEntries, ...dynamicSourceEntries]);
       addUsage(usage, response.usage);
       await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       if (response.usage) {
@@ -745,6 +807,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const calls = response.message.toolCalls ?? [];
       if (calls.length === 0) {
         const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+        const controllerDecision = loopController.observeAssistantStop(changedFiles);
+        if (controllerDecision.message) {
+          messages.push({ role: "user", content: controllerDecision.message });
+          await recordLoopDecision(controllerDecision, turns, turnId);
+          continue;
+        }
         const workflowSummary = summarizeWorkflowState(workflow, changedFiles);
         const gate = finalGateNudge({
           mode: finalEvidenceMode,
@@ -801,6 +869,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           workflowNudges.push(loopGuardDecision.message);
         }
       }
+      const changedFilesBeforeTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
       const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
         emit: async (type, metadata, parentId) => {
           const agentEvent = event(
@@ -833,7 +902,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           let result: ToolResult;
           const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call) ?? null;
           try {
-            result = await registry.execute(call, context);
+            const deniedByController = loopController.denyToolMessage(call.function.name);
+            result = deniedByController
+              ? {
+                  ok: false,
+                  content: deniedByController,
+                  metadata: { loopControlDenied: true, mode: loopController.toolPolicy().mode }
+                }
+              : await registry.execute(call, context);
           } catch (error) {
             result = {
               ok: false,
@@ -853,6 +929,26 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         const call = execution.call;
         const result = execution.result;
         const resultMetadata = toolAllMetadata(result);
+        if (resultMetadata.cacheHit === true && call.function.name === "read") {
+          await recordEvent(event(
+            runId,
+            "read_cache_hit",
+            provider,
+            model,
+            {
+              turn: turns,
+              turnId,
+              toolName: call.function.name,
+              path: resultMetadata.relativePath ?? resultMetadata.path,
+              startLine: resultMetadata.startLine,
+              limit: resultMetadata.limit,
+              byteOffset: resultMetadata.byteOffset,
+              byteLimit: resultMetadata.byteLimit
+            },
+            execution.startEventId,
+            durableSession?.sessionId
+          ));
+        }
         if (isSubagentRunSummary(resultMetadata.subagentRun)) {
           recordSubagentRun(resultMetadata.subagentRun);
         }
@@ -901,6 +997,32 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
       if (workflowNudges.length > 0 && finishReason !== "cancelled") {
         messages.push({ role: "user", content: [...new Set(workflowNudges)].join("\n\n") });
+      }
+      const changedFilesAfterTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+      const controllerDecision = loopController.observeTurn({
+        turn: turns,
+        maxTurns,
+        calls: calls as ToolCall[],
+        results: (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => execution.result),
+        changedFilesBefore: changedFilesBeforeTools,
+        changedFilesAfter: changedFilesAfterTools
+      });
+      await recordEvent(event(
+        runId,
+        "loop_control_state",
+        provider,
+        model,
+        {
+          turn: turns,
+          turnId,
+          diagnostics: loopController.diagnostics()
+        },
+        undefined,
+        durableSession?.sessionId
+      ));
+      if (controllerDecision.message && finishReason !== "cancelled") {
+        messages.push({ role: "user", content: controllerDecision.message });
+        await recordLoopDecision(controllerDecision, turns, turnId);
       }
       if (finishReason === "cancelled") break;
     }
@@ -955,6 +1077,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     finalGate: finalGateStatus,
     selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source })),
     contextCompactions,
+    loopDiagnostics: loopController.diagnostics(),
     failureAnalyses: workflow.failureAnalyses,
     subagentRuns,
     toolRuntime: toolRuntime.summary(),

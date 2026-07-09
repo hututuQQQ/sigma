@@ -3,6 +3,7 @@ import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { requestToolPermission, resolveWorkspacePath } from "../policy.js";
 import { runCommand } from "../command-runner.js";
 import { gitCommandSpec } from "./git-command.js";
+import { invalidateReadFileState } from "./read.js";
 
 interface ApplyPatchArgs {
   patch?: unknown;
@@ -303,6 +304,7 @@ export async function executeApplyPatchTool(args: unknown, context: ToolExecutio
 
   for (const file of changedFiles) {
     context.runState.changedFiles.add(file);
+    invalidateReadFileState(context, file);
   }
   return {
     ok: true,

@@ -3,6 +3,7 @@ import path from "node:path";
 import { Buffer } from "node:buffer";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 import { requestToolPermission, resolveWorkspacePath, workspaceRelativePath } from "../policy.js";
+import { invalidateReadFileState } from "./read.js";
 
 interface WriteArgs {
   path?: unknown;
@@ -41,6 +42,7 @@ export async function executeWriteTool(args: unknown, context: ToolExecutionCont
     }
     await writeFile(filePath, parsed.content, "utf8");
     context.runState.changedFiles.add(relativePath);
+    invalidateReadFileState(context, relativePath);
     return {
       ok: true,
       content: `Wrote ${relativePath}`,

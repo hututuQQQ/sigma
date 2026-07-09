@@ -125,6 +125,20 @@ export function formatAgentEvent(event: AgentEvent): string | null {
         : "";
       return `[sigma] failure_analysis category=${String(analysis?.category ?? "?")} confidence=${confidence}${primary}`;
     }
+    case "turn_budget_nudge":
+      return `[sigma] turn_budget_nudge turn=${String(event.metadata?.turn ?? "?")} remaining=${String(event.metadata?.remainingTurns ?? "?")} changed_files=${String(event.metadata?.changedFiles ?? "?")} ${truncateMiddle(redactSecretText(String(event.metadata?.message ?? "")).replace(/\s+/g, " "), 160).text}`;
+    case "loop_control_state": {
+      const diagnostics = event.metadata?.diagnostics as { mode?: unknown; intent?: unknown; readOnlyTurns?: unknown; noChangeTurns?: unknown } | undefined;
+      return `[sigma] loop_control_state turn=${String(event.metadata?.turn ?? "?")} intent=${String(diagnostics?.intent ?? "?")} mode=${String(diagnostics?.mode ?? "?")} read_only=${String(diagnostics?.readOnlyTurns ?? "?")} no_change=${String(diagnostics?.noChangeTurns ?? "?")}`;
+    }
+    case "loop_control_steer":
+      return `[sigma] loop_control_steer turn=${String(event.metadata?.turn ?? "?")} mode=${String(event.metadata?.mode ?? "?")} reason=${String(event.metadata?.reason ?? "?")} ${truncateMiddle(redactSecretText(String(event.metadata?.message ?? "")).replace(/\s+/g, " "), 160).text}`;
+    case "loop_control_tool_policy":
+      return `[sigma] loop_control_tool_policy turn=${String(event.metadata?.turn ?? "?")} mode=${String(event.metadata?.mode ?? "?")} tools_disabled=${String(event.metadata?.toolsDisabled ?? false)} disabled=${Array.isArray(event.metadata?.disabledTools) ? event.metadata.disabledTools.join(",") : ""}`;
+    case "loop_control_stop":
+      return `[sigma] loop_control_stop turn=${String(event.metadata?.turn ?? "?")} mode=${String(event.metadata?.mode ?? "?")} reason=${String(event.metadata?.reason ?? "?")}`;
+    case "read_cache_hit":
+      return `[sigma] read_cache_hit path=${String(event.metadata?.path ?? "?")} offset=${String(event.metadata?.startLine ?? "?")} limit=${String(event.metadata?.limit ?? "?")}`;
     case "validation_plan_created": {
       const plan = event.metadata?.validationPlan as { candidates?: unknown[]; skipped?: unknown[] } | undefined;
       return `[sigma] validation_plan_created candidates=${String(plan?.candidates?.length ?? 0)} skipped=${String(plan?.skipped?.length ?? 0)}`;

@@ -406,7 +406,7 @@ describe("agent-cli run", () => {
       expect(loadCliConfig({ workspace: dir })).toMatchObject({
         provider: "deepseek",
         model: "from-env",
-        maxTurns: 20,
+        maxTurns: 80,
         allowedTools: []
       });
       expect(loadCliConfig({ workspace: dir, model: "from-cli", "max-turns": "22" })).toMatchObject({

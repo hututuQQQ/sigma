@@ -181,7 +181,7 @@ describe("tool registry and permissions", () => {
     await writeFile(path.join(dir, "note.txt"), "hello", "utf8");
     const result = await executeReadTool({ path: "note.txt" }, context);
     expect(result.ok).toBe(true);
-    expect(result.content).toBe("hello");
+    expect(result.content).toBe("     1\thello");
   });
 
   it("uses mock permission decider allow, deny, and always_allow decisions", async () => {

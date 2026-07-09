@@ -1,7 +1,7 @@
 import type { AgentMessage } from "agent-ai";
 import { truncateMiddle } from "../compaction.js";
 import { redactSecretText } from "../redaction.js";
-import type { CompactionFallbackMode, CompactionMode, EvidenceRecord, TodoItem, WorkflowStateSummary } from "../types.js";
+import type { AgentLoopDiagnostics, CompactionFallbackMode, CompactionMode, EvidenceRecord, TodoItem, WorkflowStateSummary } from "../types.js";
 
 export const DEFAULT_MESSAGE_HISTORY_RETAIN = 24;
 export const DEFAULT_COMPACTION_SUMMARY_CHARS = 30000;
@@ -11,8 +11,14 @@ export type CompactionStrategyName = CompactionMode;
 
 export interface CompactionArtifact {
   objective: string;
+  task_intent?: string;
+  phase?: string;
   current_plan: string[];
   changed_files: string[];
+  files_read?: string[];
+  read_ranges?: string[];
+  loop_counters?: Record<string, unknown>;
+  forbidden_repeats?: string[];
   key_decisions: string[];
   failed_attempts: string[];
   validation_evidence: string[];
@@ -30,6 +36,7 @@ export interface CompactionRequest {
   evidenceRecords?: EvidenceRecord[];
   changedFiles?: string[];
   todos?: TodoItem[];
+  loopDiagnostics?: AgentLoopDiagnostics;
   traceTail?: string;
 }
 
@@ -110,6 +117,7 @@ export function createDeterministicCompactionArtifact(request: CompactionRequest
   const todos = request.todos ?? [];
   const evidence = request.evidenceRecords ?? [];
   const changedFiles = request.changedFiles ?? workflow?.changed_files ?? [];
+  const loop = request.loopDiagnostics;
   const pendingTodos = todos.filter((todo) => todo.status !== "done");
   const completedTodos = todos.filter((todo) => todo.status === "done");
   const failurePatterns = workflow?.failure_patterns ?? [];
@@ -129,12 +137,28 @@ export function createDeterministicCompactionArtifact(request: CompactionRequest
 
   return {
     objective: compactLine(request.objective ?? firstUserContent(request.messages), 1000),
+    ...(loop?.intent ? { task_intent: loop.intent } : {}),
+    ...(workflow?.phase ? { phase: workflow.phase } : {}),
     current_plan: pendingTodos.length > 0
       ? pendingTodos.map(formatTodo)
       : workflow?.phase
         ? [`workflow phase: ${workflow.phase}`]
         : [],
     changed_files: [...changedFiles],
+    ...(loop ? {
+      loop_counters: {
+        mode: loop.mode,
+        provider_turns: loop.providerTurns,
+        read_only_turns: loop.readOnlyTurns,
+        no_change_turns: loop.noChangeTurns,
+        broad_read_turns: loop.broadReadTurns,
+        repeated_read_intents: loop.repeatedReadIntents,
+        mutation_count: loop.mutationCount,
+        validation_count: loop.validationCount,
+        last_reason: loop.lastControllerReason
+      }
+    } : {}),
+    ...(loop?.lastControllerReason ? { forbidden_repeats: [loop.lastControllerReason] } : {}),
     key_decisions: [
       ...completedTodos.slice(-5).map(formatTodo),
       ...tailDecisions

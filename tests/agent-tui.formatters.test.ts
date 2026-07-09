@@ -99,6 +99,19 @@ describe("agent-tui formatting helpers", () => {
     }))).toContain("123ms");
   });
 
+  it("formats turn budget timeline events", () => {
+    const rendered = formatTimelineEvent(event("turn_budget_nudge", {
+      turn: 18,
+      remainingTurns: 2,
+      changedFiles: 0,
+      message: "Run budget warning: only 2 model turns remain and no files have changed yet."
+    }));
+
+    expect(rendered).toContain("turn budget warning turn 18");
+    expect(rendered).toContain("2 remaining");
+    expect(rendered).toContain("Run budget warning");
+  });
+
   it("parses diff command modes", () => {
     expect(parseDiffMode("")).toBe("stat");
     expect(parseDiffMode("stat")).toBe("stat");

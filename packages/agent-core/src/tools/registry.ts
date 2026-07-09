@@ -142,13 +142,16 @@ const readTool: RegisteredTool = {
     type: "function",
     function: {
       name: "read",
-      description: "Read a text file from the workspace. Binary files return metadata only.",
+      description:
+        "Read a text file from the workspace using 1-based line ranges. Results include line numbers. Binary files return metadata only.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string" },
-          offset: { type: "number" },
-          limit: { type: "number" }
+          offset: { type: "number", description: "1-based start line. Defaults to 1." },
+          limit: { type: "number", description: "Number of lines to read. Defaults to 2000." },
+          byteOffset: { type: "number", description: "Explicit byte offset for low-level reads. Prefer line offset for source files." },
+          byteLimit: { type: "number", description: "Explicit byte count for low-level reads. Prefer line limit for source files." }
         },
         required: ["path"],
         additionalProperties: false
@@ -165,7 +168,8 @@ const readManyTool: RegisteredTool = {
     type: "function",
     function: {
       name: "read_many",
-      description: "Read multiple workspace files or snippets in one call. Binary files return metadata only.",
+      description:
+        "Read multiple workspace files or line-range snippets in one call. Results include line numbers. Binary files return metadata only.",
       parameters: {
         type: "object",
         properties: {
@@ -178,8 +182,10 @@ const readManyTool: RegisteredTool = {
                   type: "object",
                   properties: {
                     path: { type: "string" },
-                    offset: { type: "number" },
-                    limit: { type: "number" }
+                    offset: { type: "number", description: "1-based start line. Defaults to 1." },
+                    limit: { type: "number", description: "Number of lines to read. Defaults to 2000." },
+                    byteOffset: { type: "number", description: "Explicit byte offset for low-level reads." },
+                    byteLimit: { type: "number", description: "Explicit byte count for low-level reads." }
                   },
                   required: ["path"],
                   additionalProperties: false
