@@ -25,30 +25,33 @@ export function summarizeContextBudget(options: {
 }): ContextBudgetSummary {
   const messageChars = options.messages.reduce((total, message) => total + textOfMessage(message).length, 0);
   const toolChars = options.tools.reduce((total, tool) => total + JSON.stringify(tool).length, 0);
-  const estimatedChars = messageChars + toolChars + (options.repoMapChars ?? 0) + (options.skillsChars ?? 0);
-  const generatedSourceMap: ContextSourceMap = buildContextSourceMap([
-    contextSourceEntry({
-      id: "messages",
-      kind: "messages",
-      label: "Conversation messages",
-      content: JSON.stringify(options.messages),
-      modelVisible: true,
-      activationReason: "active conversation window",
-      authority: "runtime"
-    }),
-    contextSourceEntry({
-      id: "tool_definitions",
-      kind: "tool_definitions",
-      label: "Tool definitions",
-      content: JSON.stringify(options.tools),
-      cacheable: true,
-      modelVisible: true,
-      activationReason: "tools available to the model",
-      authority: "system"
-    }),
-    ...(options.sourceEntries ?? [])
-  ]);
+  const estimatedChars = messageChars + toolChars;
   const estimatedTokens = estimateContextTokens(estimatedChars);
+  const generatedSourceMap: ContextSourceMap = {
+    ...buildContextSourceMap([
+      contextSourceEntry({
+        id: "messages",
+        kind: "messages",
+        label: "Conversation messages",
+        content: JSON.stringify(options.messages),
+        modelVisible: true,
+        activationReason: "active conversation window",
+        authority: "runtime"
+      }),
+      contextSourceEntry({
+        id: "tool_definitions",
+        kind: "tool_definitions",
+        label: "Tool definitions",
+        content: JSON.stringify(options.tools),
+        cacheable: true,
+        modelVisible: true,
+        activationReason: "tools available to the model",
+        authority: "system"
+      }),
+      ...(options.sourceEntries ?? [])
+    ]),
+    total_estimated_tokens: estimatedTokens
+  };
   return {
     estimated_tokens: estimatedTokens,
     message_count: options.messages.length,

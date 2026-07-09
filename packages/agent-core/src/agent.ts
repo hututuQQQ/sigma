@@ -11,7 +11,13 @@ import { CompactionService } from "./context/compaction-service.js";
 import { ContextManager } from "./context/context-manager.js";
 import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
 import { summarizeContextBudget } from "./context/token-budget.js";
-import { memoryContextBlock, recentDiffBlock, staticContextBlocks, type ContextAssemblyBlock } from "./context/context-assembly.js";
+import {
+  formatRuntimeContextMessage,
+  memoryContextBlock,
+  recentDiffBlock,
+  staticContextBlocks,
+  type ContextAssemblyBlock
+} from "./context/context-assembly.js";
 import { formatProjectInstructionsBlock, loadProjectInstructions } from "./context/project-instructions.js";
 import { formatRepoMapBlock, generateRepoMap } from "./context/repo-map.js";
 import { DEFAULT_COMPACTION_MODE, DEFAULT_FINAL_EVIDENCE_MODE, DEFAULT_SUBAGENTS_ENABLED } from "./defaults.js";
@@ -642,8 +648,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const dynamicSourceEntries: ContextSourceEntry[] = dynamicBlocks.map((item) => item.source);
       const runtimeContextMessage: AgentMessage | null = dynamicBlocks.length > 0
         ? {
-            role: "user",
-            content: `Runtime context update for this turn:\n\n${dynamicBlocks.map((item) => item.content).join("\n\n")}`
+            role: "system",
+            content: formatRuntimeContextMessage(dynamicBlocks)
           }
         : null;
       const requestMessages = runtimeContextMessage ? [...messages, runtimeContextMessage] : messages;

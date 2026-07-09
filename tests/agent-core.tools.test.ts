@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -56,6 +56,16 @@ async function waitForFileContaining(filePath: string, needle: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   expect(lastText).toContain(needle);
+}
+
+async function memoryFiles(dir: string): Promise<string[]> {
+  try {
+    const entries = await readdir(path.join(dir, ".agent", "memory"), { recursive: true });
+    return entries.map((entry) => String(entry)).sort((a, b) => a.localeCompare(b, "en"));
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 describe("agent-core tools", () => {
@@ -152,6 +162,69 @@ describe("agent-core tools", () => {
     const read = await executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context);
     expect(read.ok).toBe(true);
     expect(read.modelContent).toContain("narrowest changed-file validation");
+  });
+
+  it("denies memory writes in ask mode without a decider and does not persist files", async () => {
+    const { dir, context } = await workspace();
+    context.permissionMode = "ask";
+
+    const denied = await executeMemoryTool({
+      action: "write",
+      kind: "project",
+      title: "Denied durable memory",
+      content: "This content must not be persisted."
+    }, context);
+
+    expect(denied.ok).toBe(false);
+    expect(denied.modelContent).toContain("Permission denied");
+    expect(denied.modelMetadata).toMatchObject({ denied: true, risk: "write" });
+    await expect(memoryFiles(dir)).resolves.toEqual([]);
+  });
+
+  it("allows memory writes when an ask-mode decider approves", async () => {
+    const { context } = await workspace();
+    context.permissionMode = "ask";
+    const requests: unknown[] = [];
+    context.permissionDecider = {
+      decide: async (request) => {
+        requests.push(request);
+        return "allow";
+      }
+    };
+
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "reference",
+      title: "Approved memory",
+      content: "Approved memory content.",
+      tags: ["approval"]
+    }, context);
+
+    expect(saved.ok).toBe(true);
+    expect(saved.modelMetadata?.kind).toBe("reference");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      toolName: "memory",
+      risk: "write",
+      reason: "Write durable memory reference/Approved memory",
+      resources: [{ kind: "memory", mode: "write" }]
+    });
+  });
+
+  it("keeps memory list, search, and read available as read-only actions in ask mode", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "feedback",
+      title: "Readable memory",
+      content: "Read-only memory actions should not ask for write approval."
+    }, context);
+    expect(saved.ok).toBe(true);
+    context.permissionMode = "ask";
+
+    await expect(executeMemoryTool({ action: "list" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "search", query: "read-only memory" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context)).resolves.toMatchObject({ ok: true });
   });
 
   it("edits exact replacements", async () => {

@@ -7,6 +7,7 @@ import {
   writeMemory,
   type MemoryKind
 } from "../memory/local-memory.js";
+import { requestToolPermission } from "../policy.js";
 import type { ToolExecutionContext, ToolResult } from "../types.js";
 
 interface MemoryArgs {
@@ -98,10 +99,20 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
     if (typeof parsed.content !== "string" || parsed.content.trim().length === 0) {
       return { ok: false, modelContent: "memory.write requires content" };
     }
+    const kind = kindValue(parsed.kind);
+    const denied = await requestToolPermission(context, {
+      toolName: "memory",
+      arguments: parsed,
+      risk: "write",
+      reason: `Write durable memory ${kind ?? "project"}/${parsed.title.trim()}`,
+      resources: [{ kind: "memory", mode: "write", description: "durable local memory" }]
+    });
+    if (denied) return denied;
+
     const memory = await writeMemory({
       workspacePath: context.workspacePath,
       id: typeof parsed.id === "string" ? parsed.id : undefined,
-      kind: kindValue(parsed.kind),
+      kind,
       title: parsed.title,
       content: parsed.content,
       tags: stringArray(parsed.tags)
