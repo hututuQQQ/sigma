@@ -7,14 +7,21 @@ import { RepositoryContextProvider } from "../packages/agent-context/dist/index.
 
 async function git(workspace, args, input = "") {
   return await new Promise((resolve, reject) => {
-    const child = spawn("git", ["-C", workspace, ...args], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const hasInput = input.length > 0;
+    const child = spawn("git", ["-C", workspace, ...args], {
+      windowsHide: true,
+      stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"]
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("close", (code) => code === 0 ? resolve(stdout.trim()) : reject(new Error(`git ${args[0]} failed: ${stderr}`)));
-    child.stdin.end(input);
+    if (hasInput) {
+      child.stdin.on("error", (error) => { if (error.code !== "EPIPE") reject(error); });
+      child.stdin.end(input);
+    }
   });
 }
 
