@@ -44,7 +44,7 @@ function parseRequest(args: unknown): { request?: SubagentRunRequest; error?: st
   }
   const type = subagentType(parsed.subagentType);
   if (!type) {
-    return { error: "task subagentType must be investigator or reviewer" };
+    return { error: "task subagentType must be investigator, reviewer, or planner" };
   }
   return {
     request: {

@@ -48,6 +48,20 @@ function scopeArray(value: unknown, fallback?: MemoryKind[]): MemoryKind[] | und
   return scopes && scopes.length > 0 ? scopes : fallback;
 }
 
+async function requestMemoryReadPermission(
+  context: ToolExecutionContext,
+  action: "list" | "read" | "search",
+  args: MemoryArgs
+): Promise<ToolResult | null> {
+  return await requestToolPermission(context, {
+    toolName: "memory",
+    arguments: args,
+    risk: "read",
+    reason: `Read durable memory via memory.${action}`,
+    resources: [{ kind: "memory", mode: "read", description: "durable local memory" }]
+  });
+}
+
 export async function executeMemoryTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
   const parsed = (args && typeof args === "object" ? args : {}) as MemoryArgs;
   const action = actionValue(parsed.action);
@@ -56,6 +70,8 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
 
   try {
     if (action === "list") {
+      const denied = await requestMemoryReadPermission(context, "list", parsed);
+      if (denied) return denied;
       const memories = await listMemories(context.workspacePath, { scopes });
       const content = JSON.stringify({ memories: memories.map(({ content, ...record }) => ({ ...record, chars: content.length })) }, null, 2);
       return {
@@ -71,6 +87,8 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
       if (typeof parsed.id !== "string" || parsed.id.trim().length === 0) {
         return { ok: false, modelContent: "memory.read requires id" };
       }
+      const denied = await requestMemoryReadPermission(context, "read", parsed);
+      if (denied) return denied;
       const memory = await readMemory(context.workspacePath, parsed.id, { scopes });
       if (!memory) return { ok: false, modelContent: `Memory not found: ${parsed.id}` };
       return {
@@ -86,6 +104,8 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
       if (typeof parsed.query !== "string" || parsed.query.trim().length === 0) {
         return { ok: false, modelContent: "memory.search requires query" };
       }
+      const denied = await requestMemoryReadPermission(context, "search", parsed);
+      if (denied) return denied;
       const results = await searchMemories({
         workspacePath: context.workspacePath,
         query: parsed.query,

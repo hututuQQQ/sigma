@@ -258,6 +258,61 @@ describe("agent-core tools", () => {
     await expect(executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context)).resolves.toMatchObject({ ok: true });
   });
 
+  it("applies deny permission rules to memory list, search, and read actions", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "project",
+      title: "Denied read memory",
+      content: "Permission rules should block this read side."
+    }, context);
+    context.permissionRules = [{ action: "deny", tool: "memory", resourceKind: "memory" }];
+
+    for (const args of [
+      { action: "list" },
+      { action: "search", query: "Permission rules" },
+      { action: "read", id: String(saved.modelMetadata?.id) }
+    ]) {
+      const result = await executeMemoryTool(args, context);
+      expect(result.ok).toBe(false);
+      expect(result.modelContent).toContain("Permission denied");
+      expect(result.modelMetadata).toMatchObject({ denied: true, risk: "read" });
+    }
+  });
+
+  it("denies ask-rule memory reads without a decider and allows them when approved", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "reference",
+      title: "Approved read memory",
+      content: "A decider can approve read-side memory access."
+    }, context);
+    context.permissionRules = [{ action: "ask", tool: "memory", resourceKind: "memory" }];
+
+    const denied = await executeMemoryTool({ action: "list" }, context);
+    expect(denied.ok).toBe(false);
+    expect(denied.modelMetadata).toMatchObject({ denied: true, risk: "read" });
+
+    const requests: unknown[] = [];
+    context.permissionDecider = {
+      decide: async (request) => {
+        requests.push(request);
+        return "allow";
+      }
+    };
+
+    await expect(executeMemoryTool({ action: "list" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "search", query: "decider approve" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context)).resolves.toMatchObject({ ok: true });
+    expect(requests).toHaveLength(3);
+    expect(requests[0]).toMatchObject({
+      toolName: "memory",
+      risk: "read",
+      resources: [{ kind: "memory", mode: "read" }]
+    });
+  });
+
   it("edits exact replacements", async () => {
     const { dir, context } = await workspace();
     await writeFile(path.join(dir, "edit.txt"), "one two one", "utf8");

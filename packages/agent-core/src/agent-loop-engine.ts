@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import type { AgentMessage, ToolCall } from "agent-ai";
 import type { LoopGuardMode } from "./types.js";
 
 const DEFAULT_REPEATED_CALL_THRESHOLD = 3;
-const MAX_SIGNATURE_ARGUMENT_CHARS = 1200;
+const MAX_SIGNATURE_PREVIEW_CHARS = 1200;
 
 export type QueuedAgentMessage =
   | { role: "user" | "system"; content: string }
@@ -23,8 +24,10 @@ export class AgentMessageQueue {
 export interface LoopGuardDecision {
   action: "none" | "nudge" | "stop";
   signature?: string;
+  signaturePreview?: string;
   streak?: number;
   message?: string;
+  skipToolCalls?: boolean;
 }
 
 function stableJson(value: unknown): string {
@@ -36,13 +39,28 @@ function stableJson(value: unknown): string {
     .join(",")}}`;
 }
 
-function callSignature(call: ToolCall): string {
-  const args = stableJson(call.function.arguments);
-  return `${call.function.name}:${args.length > MAX_SIGNATURE_ARGUMENT_CHARS ? `${args.slice(0, MAX_SIGNATURE_ARGUMENT_CHARS)}...` : args}`;
+function hashText(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
-function callsSignature(calls: ToolCall[]): string {
-  return calls.map(callSignature).join("\n");
+function previewText(value: string): string {
+  return value.length > MAX_SIGNATURE_PREVIEW_CHARS ? `${value.slice(0, MAX_SIGNATURE_PREVIEW_CHARS)}...` : value;
+}
+
+function callSignature(call: ToolCall): { key: string; preview: string } {
+  const args = stableJson(call.function.arguments);
+  return {
+    key: `${call.function.name}:${hashText(args)}`,
+    preview: `${call.function.name}:${previewText(args)}`
+  };
+}
+
+function callsSignature(calls: ToolCall[]): { key: string; preview: string } {
+  const signatures = calls.map(callSignature);
+  return {
+    key: signatures.map((item) => item.key).join("\n"),
+    preview: signatures.map((item) => item.preview).join("\n")
+  };
 }
 
 export class RepeatedToolCallGuard {
@@ -58,29 +76,34 @@ export class RepeatedToolCallGuard {
   observe(calls: ToolCall[]): LoopGuardDecision {
     if (this.mode === "off" || calls.length === 0) return { action: "none" };
     const signature = callsSignature(calls);
-    if (signature === this.lastSignature) {
+    if (signature.key === this.lastSignature) {
       this.streak += 1;
     } else {
-      this.lastSignature = signature;
+      this.lastSignature = signature.key;
       this.streak = 1;
     }
-    if (this.streak < this.threshold) return { action: "none", signature, streak: this.streak };
+    if (this.streak < this.threshold) {
+      return { action: "none", signature: signature.key, signaturePreview: signature.preview, streak: this.streak };
+    }
 
-    const alreadyNudged = this.nudgedForSignature.has(signature);
+    const alreadyNudged = this.nudgedForSignature.has(signature.key);
     if (alreadyNudged && this.mode === "stop") {
       return {
         action: "stop",
-        signature,
+        signature: signature.key,
+        signaturePreview: signature.preview,
         streak: this.streak,
         message: "Sigma stopped because the model repeated the same tool call sequence after a recovery nudge."
       };
     }
 
-    this.nudgedForSignature.add(signature);
+    this.nudgedForSignature.add(signature.key);
     return {
       action: "nudge",
-      signature,
+      signature: signature.key,
+      signaturePreview: signature.preview,
       streak: this.streak,
+      skipToolCalls: this.mode === "stop",
       message: [
         "Loop guard: you have repeated the same tool call sequence several times.",
         "Do not repeat that exact call again. Reassess the result, change the approach, or explain why no further tool use is useful."

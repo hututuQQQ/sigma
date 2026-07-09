@@ -17,6 +17,9 @@ interface InternalJob {
   options: SubagentRunnerOptions;
   controller: AbortController;
   promise: Promise<SubagentJobSummary>;
+  lastActivityAtMs: number;
+  heartbeatTimer?: ReturnType<typeof setInterval>;
+  cleanup?: () => void;
 }
 
 function nowIso(): string {
@@ -40,15 +43,32 @@ async function emit(context: ToolExecutionContext, type: AgentEvent["type"], met
   await context.emitEvent?.(event(context, type, metadata));
 }
 
-function cloneForJob(context: ToolExecutionContext, controller: AbortController): ToolExecutionContext {
+function unrefTimer(timer: ReturnType<typeof setInterval> | ReturnType<typeof setTimeout>): void {
+  if (typeof timer === "object" && timer && "unref" in timer && typeof timer.unref === "function") {
+    timer.unref();
+  }
+}
+
+function cloneForJob(
+  context: ToolExecutionContext,
+  controller: AbortController,
+  onActivity: () => void
+): { context: ToolExecutionContext; cleanup: () => void } {
   const parentSignal = context.abortSignal;
   if (parentSignal?.aborted) controller.abort(parentSignal.reason);
   const onAbort = () => controller.abort(parentSignal?.reason ?? new Error("Parent run aborted."));
   parentSignal?.addEventListener("abort", onAbort, { once: true });
   return {
-    ...context,
-    abortSignal: controller.signal,
-    subagentJobManager: undefined
+    cleanup: () => parentSignal?.removeEventListener("abort", onAbort),
+    context: {
+      ...context,
+      abortSignal: controller.signal,
+      subagentJobManager: undefined,
+      emitEvent: async (agentEvent) => {
+        onActivity();
+        await context.emitEvent?.(agentEvent);
+      }
+    }
   };
 }
 
@@ -71,8 +91,112 @@ function compactJob(job: InternalJob): SubagentJobSummary {
   return { ...job.summary };
 }
 
+function heartbeatTimeoutMs(value: number | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return Math.max(1, Math.floor(value * 1000));
+}
+
+function clearHeartbeat(job: InternalJob): void {
+  if (!job.heartbeatTimer) return;
+  clearInterval(job.heartbeatTimer);
+  job.heartbeatTimer = undefined;
+}
+
+function touch(job: InternalJob): void {
+  if (job.summary.status !== "running") return;
+  job.lastActivityAtMs = Date.now();
+  job.summary = {
+    ...job.summary,
+    updated_at: nowIso()
+  };
+}
+
+function recordReport(context: ToolExecutionContext, report: SubagentRunSummary): void {
+  const key = report.job_id ?? report.id;
+  const exists = (item: SubagentRunSummary) => (item.job_id ?? item.id) === key;
+  context.runState.subagentRuns = [...(context.runState.subagentRuns ?? []).filter((item) => !exists(item)), report];
+}
+
+function timeoutReport(job: InternalJob, message: string): SubagentRunSummary {
+  const finishedAt = nowIso();
+  const startedAt = job.summary.created_at;
+  return {
+    id: `subagent-job-${job.summary.job_id}`,
+    job_id: job.summary.job_id,
+    subagent_type: job.request.subagentType,
+    description: job.request.description,
+    status: "error",
+    background: true,
+    summary: message,
+    findings: [],
+    relevant_files: job.request.relatedFiles ?? [],
+    evidence: [],
+    validation_suggestions: [],
+    risks: [],
+    blockers: [message],
+    tool_calls: job.summary.report?.tool_calls ?? 0,
+    duration_ms: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
+    started_at: startedAt,
+    finished_at: finishedAt,
+    error: message
+  };
+}
+
 export class InMemorySubagentJobManager implements SubagentJobManager {
   private readonly jobs = new Map<string, InternalJob>();
+
+  private async timeoutJob(job: InternalJob, timeoutMs: number): Promise<void> {
+    if (job.summary.status !== "running") return;
+    const seconds = Math.max(0.001, timeoutMs / 1000);
+    const message = `Subagent heartbeat timeout after ${seconds}s without activity.`;
+    clearHeartbeat(job);
+    job.cleanup?.();
+    job.controller.abort(new Error(message));
+    const report = timeoutReport(job, message);
+    job.summary = {
+      ...job.summary,
+      status: "interrupted",
+      updated_at: report.finished_at ?? nowIso(),
+      report,
+      error: message
+    };
+    recordReport(job.context, report);
+    await emit(job.context, "subagent_progress", {
+      job_id: job.summary.job_id,
+      status: job.summary.status,
+      error: message,
+      report
+    });
+    await emit(job.context, "subagent_error", {
+      job_id: job.summary.job_id,
+      subagent_id: report.id,
+      report
+    });
+  }
+
+  private startHeartbeat(job: InternalJob): void {
+    const timeoutMs = heartbeatTimeoutMs(job.options.heartbeatTimeoutSec);
+    if (timeoutMs === null) return;
+    const intervalMs = Math.max(1, Math.min(timeoutMs, 1000));
+    job.heartbeatTimer = setInterval(() => {
+      if (job.summary.status !== "running") {
+        clearHeartbeat(job);
+        return;
+      }
+      if (Date.now() - job.lastActivityAtMs < timeoutMs) return;
+      void this.timeoutJob(job, timeoutMs).catch(() => undefined);
+    }, intervalMs);
+    unrefTimer(job.heartbeatTimer);
+  }
+
+  private finishJob(job: InternalJob, update: (job: InternalJob) => void): SubagentJobSummary {
+    if (job.summary.status === "running") {
+      clearHeartbeat(job);
+      job.cleanup?.();
+      update(job);
+    }
+    return compactJob(job);
+  }
 
   create(request: SubagentRunRequest, context: ToolExecutionContext, options: SubagentRunnerOptions): SubagentJobSummary {
     const jobId = randomUUID();
@@ -87,57 +211,65 @@ export class InMemorySubagentJobManager implements SubagentJobManager {
       created_at: createdAt,
       updated_at: createdAt
     };
-    const jobContext = cloneForJob(context, controller);
-    const execution: SubagentExecution = {
-      request: { ...request, background: false },
-      context: jobContext,
-      options
-    };
     const job: InternalJob = {
       summary: jobSummary,
       request: { ...request, background: true },
       context,
       options,
       controller,
-      promise: Promise.resolve(jobSummary)
+      promise: Promise.resolve(jobSummary),
+      lastActivityAtMs: Date.now()
+    };
+    const cloned = cloneForJob(context, controller, () => touch(job));
+    job.cleanup = cloned.cleanup;
+    const execution: SubagentExecution = {
+      request: { ...request, background: false },
+      context: cloned.context,
+      options
     };
     job.promise = (async () => {
+      touch(job);
       await emit(context, "subagent_progress", {
         job_id: jobId,
         status: "running",
         message: `Subagent ${request.subagentType} started.`
       });
       const report = attachJobFields(await runSubagent(execution), jobSummary);
-      job.summary = {
-        ...job.summary,
-        status: controller.signal.aborted && report.status !== "ok" ? "interrupted" : settleStatus(report),
-        updated_at: report.finished_at ?? nowIso(),
-        report,
-        ...(report.error ? { error: report.error } : {})
-      };
-      context.runState.subagentRuns = [...(context.runState.subagentRuns ?? []), report];
+      const summary = this.finishJob(job, () => {
+        job.summary = {
+          ...job.summary,
+          status: controller.signal.aborted && report.status !== "ok" ? "interrupted" : settleStatus(report),
+          updated_at: report.finished_at ?? nowIso(),
+          report,
+          ...(report.error ? { error: report.error } : {})
+        };
+        recordReport(context, report);
+      });
       await emit(context, "subagent_progress", {
         job_id: jobId,
         status: job.summary.status,
         report
       });
-      return compactJob(job);
+      return summary;
     })().catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
-      job.summary = {
-        ...job.summary,
-        status: controller.signal.aborted ? "interrupted" : "error",
-        updated_at: nowIso(),
-        error: message
-      };
+      const summary = this.finishJob(job, () => {
+        job.summary = {
+          ...job.summary,
+          status: controller.signal.aborted ? "interrupted" : "error",
+          updated_at: nowIso(),
+          error: message
+        };
+      });
       await emit(context, "subagent_progress", {
         job_id: jobId,
         status: job.summary.status,
         error: message
       });
-      return compactJob(job);
+      return summary;
     });
     this.jobs.set(jobId, job);
+    this.startHeartbeat(job);
     void emit(context, "subagent_job_created", { job: compactJob(job) });
     return compactJob(job);
   }
@@ -150,20 +282,23 @@ export class InMemorySubagentJobManager implements SubagentJobManager {
     const job = this.jobs.get(jobId);
     if (!job) return null;
     if (job.summary.status !== "running") return compactJob(job);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<SubagentJobSummary>((resolve) => {
-      setTimeout(() => resolve(compactJob(job)), Math.max(0, timeoutMs));
+      timer = setTimeout(() => resolve(compactJob(job)), Math.max(0, timeoutMs));
+      unrefTimer(timer);
     });
-    return await Promise.race([job.promise, timeout]);
+    try {
+      return await Promise.race([job.promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async followup(jobId: string, prompt: string): Promise<SubagentJobSummary> {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error(`Subagent job not found: ${jobId}`);
     if (job.summary.status === "running") {
-      job.summary = {
-        ...job.summary,
-        updated_at: nowIso()
-      };
+      touch(job);
       await emit(job.context, "subagent_progress", {
         job_id: jobId,
         status: job.summary.status,
@@ -188,6 +323,8 @@ export class InMemorySubagentJobManager implements SubagentJobManager {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error(`Subagent job not found: ${jobId}`);
     if (job.summary.status === "running") {
+      clearHeartbeat(job);
+      job.cleanup?.();
       job.controller.abort(new Error(reason));
       job.summary = {
         ...job.summary,
@@ -204,7 +341,11 @@ export class InMemorySubagentJobManager implements SubagentJobManager {
     const jobs = jobId ? [...(this.jobs.get(jobId) ? [this.jobs.get(jobId) as InternalJob] : [])] : [...this.jobs.values()];
     const closed: SubagentJobSummary[] = [];
     for (const job of jobs) {
-      if (job.summary.status === "running") job.controller.abort(new Error("closed"));
+      if (job.summary.status === "running") {
+        clearHeartbeat(job);
+        job.cleanup?.();
+        job.controller.abort(new Error("closed"));
+      }
       job.summary = {
         ...job.summary,
         status: "closed",

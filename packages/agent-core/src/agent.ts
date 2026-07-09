@@ -782,6 +782,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             action: loopGuardDecision.action,
             streak: loopGuardDecision.streak,
             signature: loopGuardDecision.signature,
+            signaturePreview: loopGuardDecision.signaturePreview,
             message: loopGuardDecision.message
           },
           undefined,
@@ -792,8 +793,13 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           lastError = loopGuardDecision.message ?? "Stopped by loop guard.";
           break;
         }
-        if (loopGuardDecision.message) messages.push({ role: "user", content: loopGuardDecision.message });
-        continue;
+        if (loopGuardDecision.message) {
+          if (loopGuardDecision.skipToolCalls === true) {
+            messages.push({ role: "user", content: loopGuardDecision.message });
+            continue;
+          }
+          workflowNudges.push(loopGuardDecision.message);
+        }
       }
       const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
         emit: async (type, metadata, parentId) => {

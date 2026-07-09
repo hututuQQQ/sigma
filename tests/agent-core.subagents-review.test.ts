@@ -28,6 +28,42 @@ class SequenceModel implements ModelClient {
   }
 }
 
+class DelayedSequenceModel extends SequenceModel {
+  constructor(responses: ModelResponse[], private readonly delayMs: number) {
+    super(responses);
+  }
+
+  override async complete(req: ModelRequest): Promise<ModelResponse> {
+    await sleep(this.delayMs);
+    return await super.complete(req);
+  }
+}
+
+class AbortAwareHangingModel implements ModelClient {
+  readonly provider = "deepseek" as const;
+  readonly model = "fake-hanging-subagent-model";
+  readonly requests: ModelRequest[] = [];
+
+  async complete(req: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(req);
+    return await new Promise<ModelResponse>((_resolve, reject) => {
+      const abort = () => {
+        const reason = req.abortSignal?.reason;
+        reject(new Error(reason instanceof Error ? reason.message : "aborted"));
+      };
+      if (req.abortSignal?.aborted) {
+        abort();
+        return;
+      }
+      req.abortSignal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function workspace(model: ModelClient): Promise<{ dir: string; context: ToolExecutionContext }> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-subagents-"));
   return {
@@ -134,6 +170,108 @@ describe("subagent task tool", () => {
       blockers: []
     });
     expect(events).toEqual(expect.arrayContaining(["subagent_job_created", "subagent_progress", "subagent_start", "subagent_end"]));
+  });
+
+  it("interrupts stalled background subagent jobs after the heartbeat timeout", async () => {
+    const model = new AbortAwareHangingModel();
+    const { context } = await workspace(model);
+    const events: string[] = [];
+    context.emitEvent = async (event) => {
+      events.push(event.type);
+    };
+    const registry = createDefaultToolRegistry({
+      subagents: { enabled: true, backgroundEnabled: true, heartbeatTimeoutSec: 0.03 }
+    });
+
+    const created = await registry.execute(
+      toolCall("task-timeout", "task", {
+        description: "Stalled background work",
+        prompt: "Keep working until interrupted",
+        subagentType: "investigator",
+        background: true
+      }),
+      context
+    );
+    const jobId = (created.metadata?.subagentJob as { job_id?: string } | undefined)?.job_id ?? "";
+    const waited = await registry.execute(
+      toolCall("wait-timeout", "subagent_job", { action: "wait", jobId, timeoutSec: 1 }),
+      context
+    );
+
+    expect(waited.ok).toBe(true);
+    expect(waited.metadata?.subagentJob).toMatchObject({
+      status: "interrupted",
+      error: expect.stringContaining("heartbeat timeout")
+    });
+    expect(JSON.stringify(waited.metadata?.subagentJob)).toContain("heartbeat timeout");
+    expect(context.runState.subagentRuns?.[0]).toMatchObject({
+      job_id: jobId,
+      status: "error",
+      error: expect.stringContaining("heartbeat timeout")
+    });
+    expect(events).toEqual(expect.arrayContaining(["subagent_progress", "subagent_error"]));
+  });
+
+  it("does not let heartbeat timers rewrite completed background jobs", async () => {
+    const model = new SequenceModel([reportResponse("Finished before the heartbeat timer.")]);
+    const { context } = await workspace(model);
+    const registry = createDefaultToolRegistry({
+      subagents: { enabled: true, backgroundEnabled: true, heartbeatTimeoutSec: 0.03 }
+    });
+
+    const created = await registry.execute(
+      toolCall("task-fast", "task", {
+        description: "Fast background work",
+        prompt: "Finish quickly",
+        subagentType: "planner",
+        background: true
+      }),
+      context
+    );
+    const jobId = (created.metadata?.subagentJob as { job_id?: string } | undefined)?.job_id ?? "";
+    await expect(registry.execute(
+      toolCall("wait-fast", "subagent_job", { action: "wait", jobId, timeoutSec: 1 }),
+      context
+    )).resolves.toMatchObject({
+      ok: true,
+      metadata: { subagentJob: expect.objectContaining({ status: "completed" }) }
+    });
+
+    await sleep(80);
+    const listed = await registry.execute(toolCall("list-fast", "subagent_job", { action: "list" }), context);
+    expect(JSON.stringify(listed.metadata?.subagentJobs)).toContain("\"status\":\"completed\"");
+    expect(JSON.stringify(listed.metadata?.subagentJobs)).not.toContain("heartbeat timeout");
+  });
+
+  it("treats subagent_job.wait timeout as a wait-only timeout", async () => {
+    const model = new DelayedSequenceModel([reportResponse("Finished after an early wait timeout.")], 80);
+    const { context } = await workspace(model);
+    const registry = createDefaultToolRegistry({
+      subagents: { enabled: true, backgroundEnabled: true, heartbeatTimeoutSec: 5 }
+    });
+
+    const created = await registry.execute(
+      toolCall("task-wait-timeout", "task", {
+        description: "Delayed background work",
+        prompt: "Finish after a short delay",
+        subagentType: "reviewer",
+        background: true
+      }),
+      context
+    );
+    const jobId = (created.metadata?.subagentJob as { job_id?: string } | undefined)?.job_id ?? "";
+    const early = await registry.execute(
+      toolCall("wait-short", "subagent_job", { action: "wait", jobId, timeoutSec: 0.01 }),
+      context
+    );
+    const finished = await registry.execute(
+      toolCall("wait-long", "subagent_job", { action: "wait", jobId, timeoutSec: 1 }),
+      context
+    );
+
+    expect(early.metadata?.subagentJob).toMatchObject({ status: "running" });
+    expect(finished.metadata?.subagentJob).toMatchObject({ status: "completed" });
+    expect(JSON.stringify(finished.metadata?.subagentJob)).not.toContain("heartbeat timeout");
   });
 
   it("keeps reviewer subagents read-only even when the model asks for write", async () => {

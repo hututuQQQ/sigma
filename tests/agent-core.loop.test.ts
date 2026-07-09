@@ -119,6 +119,39 @@ async function tempWorkspace(): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), "agent-loop-"));
 }
 
+function noopRegistry() {
+  return createToolRegistryFromTools([
+    {
+      definition: {
+        type: "function",
+        function: {
+          name: "noop",
+          description: "test no-op tool",
+          parameters: { type: "object", additionalProperties: true }
+        }
+      },
+      risk: "read",
+      runtime: { readOnly: true, supportsParallel: true },
+      execute: async () => ({ ok: true, content: "ok" })
+    }
+  ]);
+}
+
+function noopResponse(id: string, args: Record<string, unknown>): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      toolCalls: [
+        {
+          id,
+          type: "function",
+          function: { name: "noop", arguments: args }
+        }
+      ]
+    }
+  };
+}
+
 describe("agent loop", () => {
   it("executes a bash tool call then stops on final assistant message", async () => {
     const dir = await tempWorkspace();
@@ -350,6 +383,94 @@ describe("agent loop", () => {
       "stop"
     ]);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
+  });
+
+  it("warns on repeated tool calls without skipping execution or stopping", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const model = new FakeModel([
+      noopResponse("noop-1", { value: "same" }),
+      noopResponse("noop-2", { value: "same" }),
+      noopResponse("noop-3", { value: "same" }),
+      noopResponse("noop-4", { value: "same" }),
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "warn but keep executing",
+      workspacePath: dir,
+      modelClient: model,
+      toolRegistry: noopRegistry(),
+      loopGuardMode: "warn",
+      maxTurns: 6,
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.finishReason).toBe("assistant_stop");
+    expect(result.toolCalls).toBe(4);
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
+      "nudge",
+      "nudge"
+    ]);
+    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
+  });
+
+  it("does not treat long arguments with shared prefixes as the same loop signature", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const prefix = "x".repeat(1300);
+    const model = new FakeModel([
+      noopResponse("long-1", { payload: `${prefix}A` }),
+      noopResponse("long-2", { payload: `${prefix}B` }),
+      noopResponse("long-3", { payload: `${prefix}A` }),
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "handle long arguments",
+      workspacePath: dir,
+      modelClient: model,
+      toolRegistry: noopRegistry(),
+      maxTurns: 5,
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.toolCalls).toBe(3);
+    expect(events.filter((event) => event.type === "loop_guard_triggered")).toEqual([]);
+  });
+
+  it("does not emit loop guard events when loopGuardMode is off", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const model = new FakeModel([
+      noopResponse("off-1", { value: "same" }),
+      noopResponse("off-2", { value: "same" }),
+      noopResponse("off-3", { value: "same" }),
+      noopResponse("off-4", { value: "same" }),
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "loop guard off",
+      workspacePath: dir,
+      modelClient: model,
+      toolRegistry: noopRegistry(),
+      loopGuardMode: "off",
+      maxTurns: 6,
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.toolCalls).toBe(4);
+    expect(events.filter((event) => event.type === "loop_guard_triggered")).toEqual([]);
   });
 
   it("compacts old messages without leaving an orphan tool message at the retained tail", async () => {

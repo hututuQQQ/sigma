@@ -116,7 +116,7 @@ Context and tool flags:
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
   --permission-rules <json>
-  --loop-guard-mode <off|warn|stop>
+  --loop-guard-mode <off|warn|stop>        off disables; warn nudges only; stop nudges then stops repeated calls
   --model-context-chars <number>
   --memory-scopes <comma-separated>
   --context-mode <off|repo-map>
@@ -129,7 +129,7 @@ Context and tool flags:
   --skills-max-chars <number>
   --no-subagents
   --no-subagent-background
-  --subagent-heartbeat-timeout-sec <number>
+  --subagent-heartbeat-timeout-sec <number> interrupt stalled background subagent jobs
   --subagent-max-turns <number>
   --subagent-max-output-chars <number>
   --review-anti-gaming / --no-review-anti-gaming
