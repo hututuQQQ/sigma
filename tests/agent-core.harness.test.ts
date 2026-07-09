@@ -525,7 +525,7 @@ describe("agent-core harness", () => {
     });
 
     const result = await runAgentHarness({
-      instruction: "finish after parent event write",
+      instruction: "finish after parent event persists",
       workspacePath: dir,
       sessionRootDir,
       modelClient: new AwaitEventModel(() => runStartWritten),

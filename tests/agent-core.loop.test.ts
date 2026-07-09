@@ -485,9 +485,88 @@ describe("agent loop", () => {
       eventBus: bus
     });
 
-    expect(result.status).toBe("completed");
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("controller_stop");
     expect(model.requests[2].tools).toEqual([]);
+    expect(model.requests[2].toolChoice).toBe("none");
     expect(events.some((event) => event.type === "loop_control_tool_policy" && event.metadata?.toolsDisabled === true)).toBe(true);
+  });
+
+  it("does not mark a no-change mutation final response as completed", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const model = new FakeModel([
+      { message: { role: "assistant", content: "done" } },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 4,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("controller_stop");
+    expect(result.finalMessage).toContain("will not mark a no-change mutation run as completed");
+    expect(model.requests[1].tools).toEqual([]);
+    expect(model.requests[1].toolChoice).toBe("none");
+    expect(events.map((event) => event.type)).toContain("loop_control_stop");
+  });
+
+  it("rejects raw tool-call text during text-only final recovery", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const rawToolText = '<tool_calls><invoke name="read">{"path":"notes.txt"}</invoke></tool_calls>';
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("read-2")] } },
+      { message: { role: "assistant", content: rawToolText } },
+      { message: { role: "assistant", content: rawToolText } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 6,
+      loopPolicy: {
+        broadExploreLimit: 99,
+        readOnlyTurnLimit: 1,
+        implementationReserveTurns: 1
+      },
+      loopGuardMode: "off",
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("controller_stop");
+    expect(result.finalMessage).toContain("tools are disabled");
+    expect(model.requests[2]).toMatchObject({ tools: [], toolChoice: "none" });
+    expect(model.requests[3]).toMatchObject({ tools: [], toolChoice: "none" });
+    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("looks like a tool call"))).toBe(true);
+    expect(events.filter((event) => event.type === "loop_control_steer").map((event) => event.metadata?.reason)).toContain(
+      "tool_call_text_while_tools_disabled"
+    );
+    expect(events.filter((event) => event.type === "loop_control_stop").map((event) => event.metadata?.reason)).toContain(
+      "tool_call_text_while_tools_disabled"
+    );
   });
 
   it("nudges repeated identical tool calls then stops on continued repetition", async () => {

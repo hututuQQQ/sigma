@@ -539,7 +539,8 @@ describe("agent-cli run", () => {
     const stdoutLines = stdoutText.trim().split(/\r?\n/);
     expect(stdoutLines).toHaveLength(1);
     const parsed = JSON.parse(stdoutText) as { status?: string; finalMessage?: string };
-    expect(parsed).toMatchObject({ status: "completed", finalMessage: "done after approval" });
+    expect(parsed).toMatchObject({ status: "stopped" });
+    expect(parsed.finalMessage).toContain("will not mark a no-change mutation run as completed");
     expect(stdoutText).not.toMatch(/Tool:|Risk:|Allow\?|\[sigma\]|status=completed/);
     expect(stderr.text()).toContain("Tool: write");
     expect(stderr.text()).toContain("Risk: write");
