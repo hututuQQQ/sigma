@@ -10,7 +10,11 @@ import {
   type CompactionFallbackMode,
   type CompactionMode,
   type ContextMode,
+  type LoopGuardMode,
+  type MemoryScope,
+  type ModelContextLimits,
   type PermissionMode,
+  type PermissionRule,
   type SandboxConfig
 } from "agent-core";
 import type { TuiPermissionController } from "./permission.js";
@@ -37,8 +41,12 @@ export interface RunSessionOptions {
   attemptsDir?: string;
   allowedTools?: string[];
   disabledTools?: string[];
+  permissionRules?: PermissionRule[];
+  loopGuardMode?: LoopGuardMode;
+  memoryScopes?: MemoryScope[];
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
+  modelContextLimits?: ModelContextLimits;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
@@ -53,6 +61,8 @@ export interface RunSessionOptions {
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
   subagentsEnabled?: boolean;
+  subagentBackgroundEnabled?: boolean;
+  subagentHeartbeatTimeoutSec?: number;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming?: boolean;
@@ -97,8 +107,12 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       attemptsDir: options.attemptsDir,
       allowedTools: options.allowedTools,
       disabledTools: options.disabledTools,
+      permissionRules: options.permissionRules,
+      loopGuardMode: options.loopGuardMode,
+      memoryScopes: options.memoryScopes,
       contextMode: options.contextMode ?? "repo-map",
       repoMapMaxChars: options.repoMapMaxChars,
+      modelContextLimits: options.modelContextLimits,
       maxMessageHistoryChars: options.maxMessageHistoryChars,
       messageHistoryRetain: options.messageHistoryRetain,
       compactionSummaryChars: options.compactionSummaryChars,
@@ -113,6 +127,8 @@ export async function runSession(options: RunSessionOptions): Promise<AgentRunRe
       skillsMode: options.skillsMode,
       skillsMaxChars: options.skillsMaxChars,
       subagentsEnabled: options.subagentsEnabled,
+      subagentBackgroundEnabled: options.subagentBackgroundEnabled,
+      subagentHeartbeatTimeoutSec: options.subagentHeartbeatTimeoutSec,
       subagentMaxTurns: options.subagentMaxTurns,
       subagentMaxOutputChars: options.subagentMaxOutputChars,
       reviewAntiGaming: options.reviewAntiGaming,

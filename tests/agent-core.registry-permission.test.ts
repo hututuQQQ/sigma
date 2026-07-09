@@ -134,6 +134,34 @@ describe("tool registry and permissions", () => {
     expect(model.requests[0].tools?.map((tool) => tool.function.name)).toEqual(["read"]);
   });
 
+  it("hides tools denied by permission rules before model calls", async () => {
+    const { dir } = await workspace();
+    const model = new FakeModel([{ message: { role: "assistant", content: "done" } }]);
+
+    await runAgent({
+      instruction: "finish",
+      workspacePath: dir,
+      modelClient: model,
+      permissionRules: [{ action: "deny", tool: "bash" }]
+    });
+
+    expect(model.requests[0].tools?.map((tool) => tool.function.name)).not.toContain("bash");
+  });
+
+  it("hides the memory tool when a tool-level deny rule matches it", async () => {
+    const { dir } = await workspace();
+    const model = new FakeModel([{ message: { role: "assistant", content: "done" } }]);
+
+    await runAgent({
+      instruction: "finish",
+      workspacePath: dir,
+      modelClient: model,
+      permissionRules: [{ action: "deny", tool: "memory" }]
+    });
+
+    expect(model.requests[0].tools?.map((tool) => tool.function.name)).not.toContain("memory");
+  });
+
   it("rejects duplicate tool names", () => {
     expect(() => createToolRegistryFromTools([customTool("dup"), customTool("dup")])).toThrow("Duplicate tool name");
     expect(() =>

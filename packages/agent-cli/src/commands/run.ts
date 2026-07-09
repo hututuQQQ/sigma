@@ -115,6 +115,10 @@ Run-controller flags:
 Context and tool flags:
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
+  --permission-rules <json>
+  --loop-guard-mode <off|warn|stop>        off disables; warn nudges only; stop nudges then stops repeated calls
+  --model-context-chars <number>
+  --memory-scopes <comma-separated>
   --context-mode <off|repo-map>
   --repo-map-max-chars <number>
   --max-message-history-chars <number>
@@ -124,6 +128,8 @@ Context and tool flags:
   --skills-mode <off|auto>
   --skills-max-chars <number>
   --no-subagents
+  --no-subagent-background
+  --subagent-heartbeat-timeout-sec <number> interrupt stalled background subagent jobs
   --subagent-max-turns <number>
   --subagent-max-output-chars <number>
   --review-anti-gaming / --no-review-anti-gaming
@@ -222,15 +228,21 @@ async function runNonInteractiveCommand(
       attemptsDir: cliConfig.attemptsDir,
       allowedTools: cliConfig.allowedTools,
       disabledTools: cliConfig.disabledTools,
+      permissionRules: cliConfig.permissionRules,
+      loopGuardMode: cliConfig.loopGuardMode,
+      memoryScopes: cliConfig.memoryScopes,
       permissionDecider,
       projectInstructionsEnabled: !cliConfig.noProjectInstructions,
       projectDocMaxBytes: cliConfig.projectDocMaxBytes,
       contextMode: cliConfig.contextMode,
       repoMapMaxChars: cliConfig.repoMapMaxChars,
+      modelContextLimits: cliConfig.modelContextLimits,
       finalEvidenceMode: cliConfig.finalEvidenceMode,
       skillsMode: cliConfig.skillsMode,
       skillsMaxChars: cliConfig.skillsMaxChars,
       subagentsEnabled: cliConfig.subagentsEnabled,
+      subagentBackgroundEnabled: cliConfig.subagentBackgroundEnabled,
+      subagentHeartbeatTimeoutSec: cliConfig.subagentHeartbeatTimeoutSec,
       subagentMaxTurns: cliConfig.subagentMaxTurns,
       subagentMaxOutputChars: cliConfig.subagentMaxOutputChars,
       reviewAntiGaming: cliConfig.reviewAntiGaming,

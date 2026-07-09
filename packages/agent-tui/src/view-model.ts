@@ -185,6 +185,51 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       });
       continue;
     }
+    if (event.type === "subagent_job_created") {
+      const job = meta.job as { job_id?: unknown; subagent_type?: unknown; description?: unknown } | undefined;
+      entries.push({
+        kind: "summary",
+        text: `subagent job ${String(job?.job_id ?? "?")} ${String(job?.subagent_type ?? "?")}: ${truncate(oneLine(redactSecretText(String(job?.description ?? ""))), 90)}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_progress") {
+      entries.push({
+        kind: "summary",
+        status: String(meta.status ?? ""),
+        text: `subagent job ${String(meta.job_id ?? "?")} ${String(meta.status ?? "?")}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "subagent_job_closed") {
+      const job = meta.job as { job_id?: unknown; status?: unknown } | undefined;
+      entries.push({
+        kind: "summary",
+        status: String(job?.status ?? "closed"),
+        text: `subagent job ${String(job?.job_id ?? "?")} closed`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "loop_guard_triggered") {
+      entries.push({
+        kind: "summary",
+        status: String(meta.action ?? "loop_guard"),
+        text: `loop guard ${String(meta.action ?? "?")}: ${truncate(oneLine(redactSecretText(String(meta.message ?? ""))), 120)}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "permission_catalog_updated") {
+      entries.push({
+        kind: "summary",
+        text: `permission catalog updated: ${String(meta.ruleCount ?? "?")} rules`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
     if (event.type === "subagent_end" || event.type === "subagent_error") {
       const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
       const status = String(report?.status ?? (event.type === "subagent_error" ? "error" : "?"));

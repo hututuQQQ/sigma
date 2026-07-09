@@ -19,6 +19,7 @@ export function summarizeContextBudget(options: {
   messages: AgentMessage[];
   tools: ToolDefinition[];
   maxMessageHistoryChars?: number;
+  modelContextChars?: number;
   repoMapChars?: number;
   skillsChars?: number;
   sourceEntries?: ContextSourceEntry[];
@@ -57,6 +58,7 @@ export function summarizeContextBudget(options: {
     message_count: options.messages.length,
     tool_count: options.tools.length,
     ...(options.maxMessageHistoryChars ? { max_message_history_chars: options.maxMessageHistoryChars } : {}),
+    ...(options.modelContextChars ? { model_context_chars: options.modelContextChars } : {}),
     ...(typeof options.repoMapChars === "number" ? { repo_map_chars: options.repoMapChars } : {}),
     ...(typeof options.skillsChars === "number" ? { skills_chars: options.skillsChars } : {}),
     source_map: generatedSourceMap,

@@ -164,6 +164,37 @@ describe("agent-core tools", () => {
     expect(read.modelContent).toContain("narrowest changed-file validation");
   });
 
+  it("filters local memories by scope", async () => {
+    const { context } = await workspace();
+    await executeMemoryTool({
+      action: "write",
+      kind: "agent",
+      title: "Agent-only note",
+      content: "Only agent scoped searches should find this."
+    }, context);
+    await executeMemoryTool({
+      action: "write",
+      kind: "project",
+      title: "Project note",
+      content: "Project scoped searches should find this."
+    }, context);
+
+    const projectSearch = await executeMemoryTool({
+      action: "search",
+      query: "scoped searches",
+      scopes: ["project"]
+    }, context);
+    const agentSearch = await executeMemoryTool({
+      action: "search",
+      query: "agent scoped",
+      scopes: ["agent"]
+    }, context);
+
+    expect(projectSearch.modelContent).toContain("Project note");
+    expect(projectSearch.modelContent).not.toContain("Agent-only note");
+    expect(agentSearch.modelContent).toContain("Agent-only note");
+  });
+
   it("denies memory writes in ask mode without a decider and does not persist files", async () => {
     const { dir, context } = await workspace();
     context.permissionMode = "ask";
@@ -225,6 +256,61 @@ describe("agent-core tools", () => {
     await expect(executeMemoryTool({ action: "list" }, context)).resolves.toMatchObject({ ok: true });
     await expect(executeMemoryTool({ action: "search", query: "read-only memory" }, context)).resolves.toMatchObject({ ok: true });
     await expect(executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context)).resolves.toMatchObject({ ok: true });
+  });
+
+  it("applies deny permission rules to memory list, search, and read actions", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "project",
+      title: "Denied read memory",
+      content: "Permission rules should block this read side."
+    }, context);
+    context.permissionRules = [{ action: "deny", tool: "memory", resourceKind: "memory" }];
+
+    for (const args of [
+      { action: "list" },
+      { action: "search", query: "Permission rules" },
+      { action: "read", id: String(saved.modelMetadata?.id) }
+    ]) {
+      const result = await executeMemoryTool(args, context);
+      expect(result.ok).toBe(false);
+      expect(result.modelContent).toContain("Permission denied");
+      expect(result.modelMetadata).toMatchObject({ denied: true, risk: "read" });
+    }
+  });
+
+  it("denies ask-rule memory reads without a decider and allows them when approved", async () => {
+    const { context } = await workspace();
+    const saved = await executeMemoryTool({
+      action: "write",
+      kind: "reference",
+      title: "Approved read memory",
+      content: "A decider can approve read-side memory access."
+    }, context);
+    context.permissionRules = [{ action: "ask", tool: "memory", resourceKind: "memory" }];
+
+    const denied = await executeMemoryTool({ action: "list" }, context);
+    expect(denied.ok).toBe(false);
+    expect(denied.modelMetadata).toMatchObject({ denied: true, risk: "read" });
+
+    const requests: unknown[] = [];
+    context.permissionDecider = {
+      decide: async (request) => {
+        requests.push(request);
+        return "allow";
+      }
+    };
+
+    await expect(executeMemoryTool({ action: "list" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "search", query: "decider approve" }, context)).resolves.toMatchObject({ ok: true });
+    await expect(executeMemoryTool({ action: "read", id: String(saved.modelMetadata?.id) }, context)).resolves.toMatchObject({ ok: true });
+    expect(requests).toHaveLength(3);
+    expect(requests[0]).toMatchObject({
+      toolName: "memory",
+      risk: "read",
+      resources: [{ kind: "memory", mode: "read" }]
+    });
   });
 
   it("edits exact replacements", async () => {

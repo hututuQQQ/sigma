@@ -10,7 +10,11 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
+  LoopGuardMode,
+  MemoryScope,
+  ModelContextLimits,
   PermissionMode,
+  PermissionRule,
   SandboxBackend,
   SandboxConfig,
   SandboxMode,
@@ -54,6 +58,7 @@ export interface CliConfig {
   compactionMaxOutputChars?: number;
   compactionTimeoutSec: number;
   compactionFallback: CompactionFallbackMode;
+  modelContextLimits?: ModelContextLimits;
   validationMode: AgentHarnessValidationMode;
   validationCommands: string[];
   validationRetryLimit: number;
@@ -74,9 +79,14 @@ export interface CliConfig {
   skillsMode: AgentSkillsMode;
   skillsMaxChars: number;
   subagentsEnabled: boolean;
+  subagentBackgroundEnabled: boolean;
+  subagentHeartbeatTimeoutSec?: number;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming: boolean;
+  permissionRules: PermissionRule[];
+  loopGuardMode: LoopGuardMode;
+  memoryScopes: MemoryScope[];
   sandbox: SandboxConfig;
   enableMcp: boolean;
   mcpConfig?: string;
@@ -104,9 +114,12 @@ const DEFAULTS = {
   validationMode: DEFAULT_VALIDATION_MODE,
   finalEvidenceMode: DEFAULT_FINAL_EVIDENCE_MODE,
   subagentsEnabled: DEFAULT_SUBAGENTS_ENABLED,
+  subagentBackgroundEnabled: true,
   subagentMaxTurns: 4,
   subagentMaxOutputChars: 12000,
-  reviewAntiGaming: true
+  reviewAntiGaming: true,
+  loopGuardMode: "stop" as LoopGuardMode,
+  memoryScopes: ["user", "feedback", "project", "reference"] as MemoryScope[]
 };
 
 const BOOLEAN_FLAGS = new Set([
@@ -116,6 +129,7 @@ const BOOLEAN_FLAGS = new Set([
   "no-project-instructions",
   "no-stream-ui",
   "no-subagents",
+  "no-subagent-background",
   "quiet",
   "review-anti-gaming",
   "sandbox-required",
@@ -183,8 +197,12 @@ function flattenConfig(parsed: unknown): ConfigValues {
     command_timeout_sec: "command_timeout_sec",
     run_controller_timeout_sec: "run_controller_timeout_sec",
     permission_mode: "permission_mode",
+    loop_guard_mode: "loop_guard_mode",
     output_format: "output_format",
     quiet: "quiet"
+  });
+  addSection("permissions", {
+    rules: "permission_rules"
   });
   addSection("validation", {
     mode: "validation_mode",
@@ -219,14 +237,20 @@ function flattenConfig(parsed: unknown): ConfigValues {
     compaction_max_input_chars: "compaction_max_input_chars",
     compaction_max_output_chars: "compaction_max_output_chars",
     compaction_timeout_sec: "compaction_timeout_sec",
-    compaction_fallback: "compaction_fallback"
+    compaction_fallback: "compaction_fallback",
+    model_context_chars: "model_context_chars"
   });
   addSection("skills", {
     mode: "skills_mode",
     max_chars: "skills_max_chars"
   });
+  addSection("memory", {
+    scopes: "memory_scopes"
+  });
   addSection("subagents", {
     enabled: "subagents_enabled",
+    background_enabled: "subagent_background_enabled",
+    heartbeat_timeout_sec: "subagent_heartbeat_timeout_sec",
     max_turns: "subagent_max_turns",
     max_output_chars: "subagent_max_output_chars"
   });
@@ -392,6 +416,59 @@ function compactionModeValue(value: unknown): CompactionMode {
 function compactionFallbackValue(value: unknown): CompactionFallbackMode {
   if (value === "deterministic" || value === "fail") return value;
   throw new Error(`Unsupported compaction fallback '${String(value)}'. Use deterministic or fail.`);
+}
+
+function loopGuardModeValue(value: unknown): LoopGuardMode {
+  if (value === "off" || value === "warn" || value === "stop") return value;
+  throw new Error(`Unsupported loop guard mode '${String(value)}'. Use off, warn, or stop.`);
+}
+
+function memoryScopeValue(value: unknown): MemoryScope | null {
+  return value === "user" ||
+    value === "feedback" ||
+    value === "project" ||
+    value === "reference" ||
+    value === "agent" ||
+    value === "subagent"
+    ? value
+    : null;
+}
+
+function memoryScopesValue(value: unknown, fallback: MemoryScope[]): MemoryScope[] {
+  const scopes = stringListValue(value)
+    .map(memoryScopeValue)
+    .filter((item): item is MemoryScope => Boolean(item));
+  return scopes.length > 0 ? scopes : fallback;
+}
+
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) return value;
+  return JSON.parse(trimmed) as unknown;
+}
+
+function permissionRulesValue(value: unknown): PermissionRule[] {
+  const parsed = parseMaybeJson(value);
+  const rawRules = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" ? [parsed] : [];
+  return rawRules
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .map((item) => {
+      const action = item.action ?? item.effect;
+      if (action !== "allow" && action !== "ask" && action !== "deny") return null;
+      const rule: PermissionRule = { action };
+      if (typeof item.tool === "string" || Array.isArray(item.tool)) rule.tool = item.tool as string | string[];
+      if (Array.isArray(item.tools)) rule.tools = item.tools.filter((tool): tool is string => typeof tool === "string");
+      if (typeof item.risk === "string" || Array.isArray(item.risk)) rule.risk = item.risk as PermissionRule["risk"];
+      if (typeof item.resourceKind === "string" || Array.isArray(item.resourceKind)) rule.resourceKind = item.resourceKind as PermissionRule["resourceKind"];
+      if (typeof item.path === "string" || Array.isArray(item.path)) rule.path = item.path as string | string[];
+      if (typeof item.host === "string" || Array.isArray(item.host)) rule.host = item.host as string | string[];
+      if (typeof item.command === "string" || Array.isArray(item.command)) rule.command = item.command as string | string[];
+      if (typeof item.reason === "string") rule.reason = item.reason;
+      return rule;
+    })
+    .filter((item): item is PermissionRule => Boolean(item));
 }
 
 function stringListValue(value: unknown): string[] {
@@ -663,6 +740,15 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         stringValue(config.compaction_fallback) ??
         DEFAULTS.compactionFallback
     ),
+    modelContextLimits: optionalNumberValue(
+      flags["model-context-chars"] ?? process.env.AGENT_MODEL_CONTEXT_CHARS ?? config.model_context_chars
+    )
+      ? {
+          contextChars: optionalNumberValue(
+            flags["model-context-chars"] ?? process.env.AGENT_MODEL_CONTEXT_CHARS ?? config.model_context_chars
+          )
+        }
+      : undefined,
     validationMode,
     validationCommands: validationCommandList({
       singleValues: [flags["validation-command"], process.env.AGENT_VALIDATION_COMMAND, config.validation_command],
@@ -708,6 +794,19 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
       stringValue(config.attempts_dir),
     allowedTools: stringListValue(flags["allowed-tools"] ?? process.env.AGENT_ALLOWED_TOOLS ?? config.allowed_tools),
     disabledTools: stringListValue(flags["disabled-tools"] ?? process.env.AGENT_DISABLED_TOOLS ?? config.disabled_tools),
+    permissionRules: permissionRulesValue(
+      flags["permission-rules"] ?? process.env.AGENT_PERMISSION_RULES ?? config.permission_rules
+    ),
+    loopGuardMode: loopGuardModeValue(
+      stringValue(flags["loop-guard-mode"]) ??
+        process.env.AGENT_LOOP_GUARD_MODE ??
+        stringValue(config.loop_guard_mode) ??
+        DEFAULTS.loopGuardMode
+    ),
+    memoryScopes: memoryScopesValue(
+      flags["memory-scopes"] ?? process.env.AGENT_MEMORY_SCOPES ?? config.memory_scopes,
+      DEFAULTS.memoryScopes
+    ),
     noProjectInstructions: boolValue(
       flags["no-project-instructions"] ?? process.env.AGENT_NO_PROJECT_INSTRUCTIONS ?? config.no_project_instructions,
       false
@@ -747,6 +846,19 @@ export function loadCliConfig(flags: Record<string, string | boolean>): CliConfi
         ? false
         : process.env.AGENT_SUBAGENTS_ENABLED ?? config.subagents_enabled,
       DEFAULTS.subagentsEnabled
+    ),
+    subagentBackgroundEnabled: boolValue(
+      flags["no-subagent-background"] !== undefined
+        ? false
+        : flags["subagent-background-enabled"] ??
+          process.env.AGENT_SUBAGENT_BACKGROUND_ENABLED ??
+          config.subagent_background_enabled,
+      DEFAULTS.subagentBackgroundEnabled
+    ),
+    subagentHeartbeatTimeoutSec: optionalNumberValue(
+      flags["subagent-heartbeat-timeout-sec"] ??
+        process.env.AGENT_SUBAGENT_HEARTBEAT_TIMEOUT_SEC ??
+        config.subagent_heartbeat_timeout_sec
     ),
     subagentMaxTurns: optionalNumberValue(
       flags["subagent-max-turns"] ?? process.env.AGENT_SUBAGENT_MAX_TURNS ?? config.subagent_max_turns

@@ -1,5 +1,14 @@
 export { runAgent, summaryJsonFromRunResult, writeRunSummary } from "./agent.js";
 export {
+  AgentLoopEngine,
+  AgentMessageQueue,
+  RepeatedToolCallGuard
+} from "./agent-loop-engine.js";
+export type {
+  LoopGuardDecision,
+  QueuedAgentMessage
+} from "./agent-loop-engine.js";
+export {
   DEFAULT_COMPACTION_MODE,
   DEFAULT_FINAL_EVIDENCE_MODE,
   DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
@@ -51,6 +60,8 @@ export type {
 } from "./context/compaction-service.js";
 export { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
 export type { ModelSubSessionCompactionProviderOptions } from "./context/model-compaction-provider.js";
+export { resolveModelContextLimits } from "./context/model-context-limits.js";
+export type { ResolvedModelContextLimits } from "./context/model-context-limits.js";
 export { ContextManager } from "./context/context-manager.js";
 export type {
   ContextManagerEvent,
@@ -152,7 +163,9 @@ export type {
 } from "./workflow/failure-analyzer.js";
 export {
   classifyShellCommand,
+  evaluatePermissionRules,
   evaluateExecPolicy,
+  isToolDeniedByPermissionRules,
   isPathInside,
   isProbablyMutatingCommand,
   permissionDeniedResult,
@@ -217,8 +230,12 @@ export type {
 export { reviewAntiGamingDiff, reviewAntiGamingWorkspace } from "./review/anti-gaming.js";
 export type { AntiGamingReviewOptions, AntiGamingWorkspaceOptions } from "./review/anti-gaming.js";
 export { READ_ONLY_SUBAGENT_TOOLS, runSubagent } from "./subagents/subagent-runner.js";
-export { createSubtaskTool, executeSubtaskTool } from "./subagents/subtask-tool.js";
+export { InMemorySubagentJobManager } from "./subagents/subagent-job-manager.js";
+export { createSubagentJobTool, createSubtaskTool, executeSubtaskTool } from "./subagents/subtask-tool.js";
 export type {
+  SubagentJobManager,
+  SubagentJobStatus,
+  SubagentJobSummary,
   SubagentExecution,
   SubagentRunRequest,
   SubagentRunnerOptions,
@@ -286,10 +303,16 @@ export type {
   HarnessRetryDecision,
   HarnessServiceCleanupResult,
   ContextMode,
+  LoopGuardMode,
+  MemoryScope,
   McpServerRunSummary,
+  ModelContextLimits,
   PermissionDecider,
   PermissionDecision,
   PermissionMode,
+  PermissionRule,
+  PermissionRuleAction,
+  PermissionRuleEffect,
   PermissionRequest,
   ReviewGateFinding,
   ReviewGateStatus,

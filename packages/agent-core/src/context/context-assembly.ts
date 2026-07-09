@@ -2,7 +2,7 @@ import path from "node:path";
 import type { ToolDefinition } from "agent-ai";
 import { runCommand } from "../command-runner.js";
 import { gitCommandSpec } from "../tools/git-command.js";
-import { formatMemorySnippet, searchMemories } from "../memory/local-memory.js";
+import { formatMemorySnippet, searchMemories, type MemoryKind } from "../memory/local-memory.js";
 import type { ContextSourceEntry } from "../types.js";
 import { contextSourceEntry } from "./source-map.js";
 
@@ -184,11 +184,13 @@ export async function memoryContextBlock(options: {
   query: string;
   maxItems?: number;
   maxChars?: number;
+  scopes?: MemoryKind[];
 }): Promise<ContextAssemblyBlock | null> {
   const memories = await searchMemories({
     workspacePath: options.workspacePath,
     query: options.query,
-    limit: options.maxItems ?? 5
+    limit: options.maxItems ?? 5,
+    scopes: options.scopes
   });
   if (memories.length === 0) return null;
   const maxChars = options.maxChars ?? 6000;

@@ -1,5 +1,17 @@
 import path from "node:path";
-import type { ExecIntentSummary, ExecPolicyConfig, PermissionRequest, ToolExecutionContext, ToolResult, ToolRisk } from "./types.js";
+import type {
+  ExecIntentSummary,
+  ExecPolicyConfig,
+  PermissionRequest,
+  PermissionRule,
+  PermissionRuleAction,
+  RegisteredTool,
+  ToolExecutionContext,
+  ToolPermissionRisk,
+  ToolResourceDescriptor,
+  ToolResult,
+  ToolRisk
+} from "./types.js";
 
 export function isPathInside(parentPath: string, candidatePath: string): boolean {
   const parent = path.resolve(parentPath);
@@ -103,6 +115,108 @@ export function isProbablyMutatingCommand(command: string): boolean {
   return classifyShellCommand(command).mutatesWorkspace;
 }
 
+function arrayValue<T>(value: T | T[] | undefined): T[] {
+  if (value === undefined) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function wildcardMatch(pattern: string, value: string): boolean {
+  const normalizedPattern = pattern.trim().toLowerCase();
+  const normalizedValue = value.trim().toLowerCase();
+  if (!normalizedPattern) return false;
+  if (normalizedPattern === "*" || normalizedPattern === normalizedValue) return true;
+  const expression = normalizedPattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp(`^${expression}$`).test(normalizedValue);
+}
+
+function anyPatternMatches(patterns: string[], values: string[]): boolean {
+  if (patterns.length === 0) return true;
+  return patterns.some((pattern) => values.some((value) => wildcardMatch(pattern, value)));
+}
+
+function ruleAction(rule: PermissionRule): PermissionRuleAction | null {
+  const action = rule.action ?? rule.effect;
+  return action === "allow" || action === "ask" || action === "deny" ? action : null;
+}
+
+function ruleTools(rule: PermissionRule): string[] {
+  return [...arrayValue(rule.tool), ...(rule.tools ?? [])].filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+function ruleRisks(rule: PermissionRule): ToolPermissionRisk[] {
+  return arrayValue(rule.risk).filter((item): item is ToolPermissionRisk => typeof item === "string" && item.length > 0);
+}
+
+function resourceValues(
+  resources: ToolResourceDescriptor[],
+  selector: "path" | "host" | "command"
+): string[] {
+  return resources
+    .map((resource) => resource[selector])
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function ruleMatches(options: {
+  rule: PermissionRule;
+  toolName: string;
+  risk?: ToolPermissionRisk;
+  resources?: ToolResourceDescriptor[];
+}): boolean {
+  const resources = options.resources ?? [];
+  const toolPatterns = ruleTools(options.rule);
+  if (!anyPatternMatches(toolPatterns, [options.toolName])) return false;
+
+  const risks = ruleRisks(options.rule);
+  if (risks.length > 0 && (!options.risk || !risks.includes(options.risk))) return false;
+
+  const resourceKinds = arrayValue(options.rule.resourceKind);
+  if (resourceKinds.length > 0 && !resources.some((resource) => resourceKinds.includes(resource.kind))) return false;
+
+  const paths = arrayValue(options.rule.path).filter((item): item is string => typeof item === "string");
+  if (!anyPatternMatches(paths, resourceValues(resources, "path"))) return false;
+
+  const hosts = arrayValue(options.rule.host).filter((item): item is string => typeof item === "string");
+  if (!anyPatternMatches(hosts, resourceValues(resources, "host"))) return false;
+
+  const commands = arrayValue(options.rule.command).filter((item): item is string => typeof item === "string");
+  if (!anyPatternMatches(commands, resourceValues(resources, "command"))) return false;
+
+  return true;
+}
+
+export function evaluatePermissionRules(options: {
+  rules?: PermissionRule[];
+  toolName: string;
+  risk?: ToolPermissionRisk;
+  resources?: ToolResourceDescriptor[];
+}): { action: PermissionRuleAction; rule: PermissionRule } | null {
+  const matches = (options.rules ?? [])
+    .map((rule) => ({ rule, action: ruleAction(rule) }))
+    .filter((entry): entry is { rule: PermissionRule; action: PermissionRuleAction } => Boolean(entry.action))
+    .filter((entry) => ruleMatches({
+      rule: entry.rule,
+      toolName: options.toolName,
+      risk: options.risk,
+      resources: options.resources
+    }));
+  return (
+    matches.find((entry) => entry.action === "deny") ??
+    matches.find((entry) => entry.action === "ask") ??
+    matches.find((entry) => entry.action === "allow") ??
+    null
+  );
+}
+
+export function isToolDeniedByPermissionRules(tool: RegisteredTool, rules?: PermissionRule[]): boolean {
+  const descriptor = tool.descriptor;
+  const name = tool.definition.function.name;
+  const risk = descriptor?.permission?.risk ?? tool.risk;
+  const resources = descriptor?.permission?.resources ?? [];
+  return evaluatePermissionRules({ rules, toolName: name, risk, resources })?.action === "deny";
+}
+
 export function permissionDeniedResult(toolName: string, risk: ToolRisk): ToolResult {
   const message = `Permission denied for ${toolName} (${risk}). Mutating or risky tools require yolo mode or explicit approval.`;
   return {
@@ -117,6 +231,31 @@ export async function requestToolPermission(
   context: ToolExecutionContext,
   request: Omit<PermissionRequest, "workspacePath">
 ): Promise<ToolResult | null> {
+  const rule = evaluatePermissionRules({
+    rules: context.permissionRules,
+    toolName: request.toolName,
+    risk: request.risk,
+    resources: request.resources
+  });
+  if (rule?.action === "deny") {
+    return permissionDeniedResult(request.toolName, request.risk);
+  }
+  if (rule?.action === "allow") return null;
+  if (rule?.action === "ask") {
+    if (context.alwaysAllowTools.has(request.toolName)) return null;
+    if (!context.permissionDecider) return permissionDeniedResult(request.toolName, request.risk);
+    const decision = await context.permissionDecider.decide({
+      ...request,
+      reason: rule.rule.reason ?? request.reason,
+      workspacePath: context.workspacePath
+    });
+    if (decision === "allow") return null;
+    if (decision === "always_allow") {
+      context.alwaysAllowTools.add(request.toolName);
+      return null;
+    }
+    return permissionDeniedResult(request.toolName, request.risk);
+  }
   if (request.risk === "read") return null;
   if (context.permissionMode === "yolo") return null;
   if (context.alwaysAllowTools.has(request.toolName)) return null;

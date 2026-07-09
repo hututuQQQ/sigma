@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { toolModelContent, toolModelMetadata } from "../types.js";
 import { investigatorSystemPrompt } from "./investigator-agent.js";
+import { plannerSystemPrompt } from "./planner-agent.js";
 import { reviewerSystemPrompt } from "./reviewer-agent.js";
 import type { SubagentExecution, SubagentRunRequest } from "./subagent-types.js";
 
@@ -129,6 +130,7 @@ function reportFromAssistant(options: {
   response: ModelResponse;
   toolCalls: number;
   durationMs: number;
+  startedAtIso: string;
 }): SubagentRunSummary {
   const content = options.response.message.content ?? "";
   const parsed = extractJsonObject(content);
@@ -141,10 +143,14 @@ function reportFromAssistant(options: {
       summary: truncateMiddle(content.trim() || "Subagent finished without a JSON body.", 1200).text,
       findings: [],
       relevant_files: options.request.relatedFiles ?? [],
+      evidence: [],
       validation_suggestions: [],
       risks: [],
+      blockers: [],
       tool_calls: options.toolCalls,
-      duration_ms: options.durationMs
+      duration_ms: options.durationMs,
+      started_at: options.startedAtIso,
+      finished_at: nowIso()
     };
   }
   const status = parsed.status === "error" ? "error" : "ok";
@@ -156,10 +162,14 @@ function reportFromAssistant(options: {
     summary: truncateMiddle(String(parsed.summary ?? content.trim() ?? "Subagent finished."), 1200).text,
     findings: findingsArray(parsed.findings),
     relevant_files: stringArray(parsed.relevantFiles ?? parsed.relevant_files, 50),
+    evidence: stringArray(parsed.evidence, 30),
     validation_suggestions: stringArray(parsed.validationSuggestions ?? parsed.validation_suggestions, 20),
     risks: stringArray(parsed.risks, 20),
+    blockers: stringArray(parsed.blockers, 20),
     tool_calls: options.toolCalls,
     duration_ms: options.durationMs,
+    started_at: options.startedAtIso,
+    finished_at: nowIso(),
     ...(typeof parsed.error === "string" ? { error: truncateMiddle(parsed.error, 800).text } : {})
   };
 }
@@ -170,6 +180,7 @@ function errorReport(options: {
   message: string;
   toolCalls: number;
   startedAt: number;
+  startedAtIso?: string;
 }): SubagentRunSummary {
   return {
     id: options.id,
@@ -179,16 +190,22 @@ function errorReport(options: {
     summary: truncateMiddle(redactSecretText(options.message), 1200).text,
     findings: [],
     relevant_files: options.request.relatedFiles ?? [],
+    evidence: [],
     validation_suggestions: [],
     risks: [],
+    blockers: [],
     tool_calls: options.toolCalls,
     duration_ms: Date.now() - options.startedAt,
+    started_at: options.startedAtIso,
+    finished_at: nowIso(),
     error: truncateMiddle(redactSecretText(options.message), 1200).text
   };
 }
 
 function systemPrompt(type: SubagentType): string {
-  return type === "reviewer" ? reviewerSystemPrompt() : investigatorSystemPrompt();
+  if (type === "reviewer") return reviewerSystemPrompt();
+  if (type === "planner") return plannerSystemPrompt();
+  return investigatorSystemPrompt();
 }
 
 function userPrompt(request: SubagentRunRequest): string {
@@ -200,7 +217,8 @@ function userPrompt(request: SubagentRunRequest): string {
     "",
     `Related files: ${(request.relatedFiles ?? []).join(", ") || "(none supplied)"}`,
     "",
-    "Return one JSON object only. Keep findings concise and cite file paths when possible."
+    "Return one JSON object only. Keep findings concise and cite file paths when possible.",
+    "Always include evidence and blockers arrays, using [] when none apply."
   ].join("\n");
 }
 
@@ -220,18 +238,19 @@ function toolResultMessage(call: ToolCall, result: ToolResult, maxOutputChars: n
 export async function runSubagent(execution: SubagentExecution): Promise<SubagentRunSummary> {
   const id = randomUUID();
   const startedAt = Date.now();
+  const startedAtIso = nowIso();
   const request = execution.request;
   const context = execution.context;
   let toolCalls = 0;
 
   if (!context.modelClient) {
-    return errorReport({ id, request, message: "Subagent requires a model client in the tool execution context.", toolCalls, startedAt });
+    return errorReport({ id, request, message: "Subagent requires a model client in the tool execution context.", toolCalls, startedAt, startedAtIso });
   }
   if (context.subagentDepth && context.subagentDepth > 0) {
-    return errorReport({ id, request, message: "Recursive subagent calls are disabled.", toolCalls, startedAt });
+    return errorReport({ id, request, message: "Recursive subagent calls are disabled.", toolCalls, startedAt, startedAtIso });
   }
   if ((request as { background?: unknown }).background === true) {
-    return errorReport({ id, request, message: "Background subagents are not supported yet.", toolCalls, startedAt });
+    return errorReport({ id, request, message: "Background subagents must be created through the task tool job manager.", toolCalls, startedAt, startedAtIso });
   }
 
   const maxTurns = numberLimit(request.maxTurns, execution.options.defaultMaxTurns ?? DEFAULT_MAX_TURNS, 1, 8);
@@ -252,7 +271,8 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
     alwaysAllowTools: new Set<string>(),
     ...(context.abortSignal ? { abortSignal: context.abortSignal } : {}),
     subagentsEnabled: false,
-    subagentDepth: (context.subagentDepth ?? 0) + 1
+    subagentDepth: (context.subagentDepth ?? 0) + 1,
+    memoryScopes: context.memoryScopes
   };
   const messages: AgentMessage[] = [
     { role: "system", content: systemPrompt(request.subagentType) },
@@ -283,7 +303,8 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
           request,
           response,
           toolCalls,
-          durationMs: Date.now() - startedAt
+          durationMs: Date.now() - startedAt,
+          startedAtIso
         });
         await emit(context, "subagent_end", { subagent_id: id, report });
         await registry.close?.();
@@ -300,7 +321,8 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
       request,
       message: `Subagent reached maxTurns=${maxTurns} before returning a final JSON report.`,
       toolCalls,
-      startedAt
+      startedAt,
+      startedAtIso
     });
     await emit(context, "subagent_error", { subagent_id: id, report });
     await registry.close?.();
@@ -311,7 +333,8 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
       request,
       message: error instanceof Error ? error.message : String(error),
       toolCalls,
-      startedAt
+      startedAt,
+      startedAtIso
     });
     await emit(context, "subagent_error", { subagent_id: id, report });
     await registry.close?.();

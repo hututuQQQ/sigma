@@ -47,7 +47,11 @@ Common run flags:
   --quiet
   --allowed-tools <comma-separated>
   --disabled-tools <comma-separated>
+  --permission-rules <json>
+  --loop-guard-mode <off|warn|stop>
   --context-mode <off|repo-map>
+  --model-context-chars <number>
+  --memory-scopes <comma-separated>
   --max-message-history-chars <number>
   --message-history-retain <number>
   --compaction-mode <off|deterministic|model-sub-session>
@@ -58,6 +62,7 @@ Common run flags:
   --final-evidence-mode <off|auto>
   --skills-mode <off|auto>
   --no-subagents
+  --no-subagent-background
   --review-anti-gaming / --no-review-anti-gaming
   --enable-mcp
   --stream-ui / --no-stream-ui
@@ -104,6 +109,10 @@ function completionScript(shell: string): string {
     "--precheck-command",
     "--allowed-tools",
     "--disabled-tools",
+    "--permission-rules",
+    "--loop-guard-mode",
+    "--model-context-chars",
+    "--memory-scopes",
     "--context-mode",
     "--compaction-mode",
     "--compaction-model",
@@ -116,6 +125,9 @@ function completionScript(shell: string): string {
     "--message-history-retain",
     "--final-evidence-mode",
     "--no-subagents",
+    "--no-subagent-background",
+    "--subagent-background-enabled",
+    "--subagent-heartbeat-timeout-sec",
     "--subagent-max-turns",
     "--subagent-max-output-chars",
     "--review-anti-gaming",
@@ -190,8 +202,12 @@ function tuiOptionsFromCliConfig(config: CliConfig): TuiAppOptions {
     attemptsDir: config.attemptsDir,
     allowedTools: config.allowedTools,
     disabledTools: config.disabledTools,
+    permissionRules: config.permissionRules,
+    loopGuardMode: config.loopGuardMode,
+    memoryScopes: config.memoryScopes,
     contextMode: config.contextMode,
     repoMapMaxChars: config.repoMapMaxChars,
+    modelContextLimits: config.modelContextLimits,
     compactionMode: config.compactionMode,
     compactionModel: config.compactionModel,
     compactionProvider: config.compactionProvider,
@@ -203,6 +219,8 @@ function tuiOptionsFromCliConfig(config: CliConfig): TuiAppOptions {
     skillsMode: config.skillsMode,
     skillsMaxChars: config.skillsMaxChars,
     subagentsEnabled: config.subagentsEnabled,
+    subagentBackgroundEnabled: config.subagentBackgroundEnabled,
+    subagentHeartbeatTimeoutSec: config.subagentHeartbeatTimeoutSec,
     subagentMaxTurns: config.subagentMaxTurns,
     subagentMaxOutputChars: config.subagentMaxOutputChars,
     reviewAntiGaming: config.reviewAntiGaming,

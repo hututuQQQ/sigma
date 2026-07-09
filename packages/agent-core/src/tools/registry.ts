@@ -32,8 +32,9 @@ import { executeMemoryTool } from "./memory.js";
 import { createShellSessionToolController } from "./shell-session.js";
 import { invalidateContextIndexes } from "../context/code-index.js";
 import { changedWorkspaceFiles, listWorkspaceManifest } from "../harness/manifest.js";
+import { isToolDeniedByPermissionRules } from "../policy.js";
 import { READ_ONLY_SUBAGENT_TOOLS } from "../subagents/subagent-runner.js";
-import { createSubtaskTool } from "../subagents/subtask-tool.js";
+import { createSubagentJobTool, createSubtaskTool } from "../subagents/subtask-tool.js";
 import type { SubagentType } from "../types.js";
 import { DEFAULT_SUBAGENTS_ENABLED } from "../defaults.js";
 
@@ -560,7 +561,8 @@ const memoryTool: RegisteredTool = {
         properties: {
           action: { type: "string", enum: ["list", "read", "search", "write"] },
           id: { type: "string" },
-          kind: { type: "string", enum: ["user", "feedback", "project", "reference"] },
+          kind: { type: "string", enum: ["user", "feedback", "project", "reference", "agent", "subagent"] },
+          scopes: { type: "array", items: { type: "string", enum: ["user", "feedback", "project", "reference", "agent", "subagent"] } },
           title: { type: "string" },
           content: { type: "string" },
           query: { type: "string" },
@@ -642,14 +644,19 @@ export function createDefaultToolRegistry(_options: ToolRegistryOptions = {}): T
           toolName: "task",
           createToolRegistry: createReadOnlySubagentRegistry,
           defaultMaxTurns: _options.subagents?.defaultMaxTurns,
-          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars
+          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars,
+          backgroundEnabled: _options.subagents?.backgroundEnabled,
+          heartbeatTimeoutSec: _options.subagents?.heartbeatTimeoutSec
         }),
         createSubtaskTool({
           toolName: "subtask",
           createToolRegistry: createReadOnlySubagentRegistry,
           defaultMaxTurns: _options.subagents?.defaultMaxTurns,
-          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars
-        })
+          defaultMaxOutputChars: _options.subagents?.defaultMaxOutputChars,
+          backgroundEnabled: _options.subagents?.backgroundEnabled,
+          heartbeatTimeoutSec: _options.subagents?.heartbeatTimeoutSec
+        }),
+        createSubagentJobTool()
       ]
     : [];
   return createToolRegistryFromTools(
@@ -713,11 +720,20 @@ export function mergeToolRegistries(registries: ToolRegistry[], options: ToolReg
 export function filterToolRegistry(registry: ToolRegistry, filter: ToolRegistryFilter): ToolRegistry {
   const allowed = filter.allowedTools && filter.allowedTools.length > 0 ? new Set(filter.allowedTools) : null;
   const disabled = new Set(filter.disabledTools ?? []);
+  const deniedByPermission = new Set(
+    registry.definitions
+      .map((definition) => definition.function.name)
+      .filter((name) => {
+        const tool = registry.getTool?.(name);
+        return tool ? isToolDeniedByPermissionRules(tool, filter.permissionRules) : false;
+      })
+  );
   const names = new Set(
     registry.definitions
       .map((definition) => definition.function.name)
       .filter((name) => (allowed ? allowed.has(name) : true))
       .filter((name) => !disabled.has(name))
+      .filter((name) => !deniedByPermission.has(name))
   );
   return {
     descriptors: (registry.descriptors ?? registry.definitions.map((definition) => toolDescriptorFromDefinition(definition)))
