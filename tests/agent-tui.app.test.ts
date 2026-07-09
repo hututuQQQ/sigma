@@ -114,7 +114,9 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       await Promise.resolve();
 
       expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${ENABLE_BRACKETED_PASTE}${HIDE_CURSOR}`);
-      expect(stdout.text()).toContain(`${HIDE_CURSOR}\x1b[2J\x1b[H`);
+      expect(stdout.writes[1]).toContain(`${HIDE_CURSOR}\x1b[H`);
+      expect(stdout.writes[1]).toContain("\x1b[K");
+      expect(stdout.writes[1]).not.toContain("\x1b[2J");
 
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
@@ -123,6 +125,33 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(stdout.last()).toContain(DISABLE_BRACKETED_PASTE);
       expect(stdout.last()).toContain(EXIT_ALT_SCREEN);
       expect(stdin.rawModes).toEqual([true, false]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses Home and End to move within the composer without submitting or exiting", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-home-end-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, "abc", 0);
+
+      stdin.emit("keypress", "", { name: "end" });
+      expect(target.composer.cursor).toBe(3);
+      expect(stdin.rawModes).toEqual([true]);
+
+      stdin.emit("keypress", "", { name: "home" });
+      expect(target.composer.cursor).toBe(0);
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

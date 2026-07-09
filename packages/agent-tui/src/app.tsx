@@ -502,6 +502,16 @@ export class TuiApp {
       this.render();
       return;
     }
+    if (key.name === "home") {
+      moveCursorStart(this.composer);
+      this.render();
+      return;
+    }
+    if (key.name === "end") {
+      moveCursorEnd(this.composer);
+      this.render();
+      return;
+    }
     if (key.name === "pageup") {
       this.adjustTranscriptScroll(Math.max(6, Math.floor((this.stdout.rows ?? 24) * 0.5)));
       return;
@@ -1363,7 +1373,8 @@ export class TuiApp {
       height: rows,
       color: this.colorEnabled
     });
-    this.stdout.write(`${HIDE_CURSOR}\x1b[2J\x1b[H${screen}`);
+    const painted = screen.split("\n").map((line) => `${line}\x1b[K`).join("\n");
+    this.stdout.write(`${HIDE_CURSOR}\x1b[H${painted}\x1b[J`);
   }
 
   private focusTitle(): string {
@@ -1576,9 +1587,9 @@ export class TuiApp {
       "",
       "Shortcuts",
       "Enter send   Ctrl+J newline   Tab workbench   Shift+Tab plan/build   Esc close/clear",
-      "Left/Right move cursor   Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
+      "Left/Right move cursor   Home/End or Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
       "Ctrl+D diff   Ctrl+T tools   F1 help   /files workbench   @ file mention   !command shell",
-      "PageUp/PageDown scroll transcript",
+      "PageUp/PageDown scroll transcript   Ctrl+C cancel active run; Ctrl+C again/idle exits",
       "Local: cd <path>, pwd, ls/dir, clear/cls",
       "",
       "Commands",
