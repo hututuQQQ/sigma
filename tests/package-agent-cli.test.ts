@@ -58,16 +58,36 @@ function psQuote(value: string) {
 
 function runPowerShell(script: string) {
   const commands = process.platform === "win32" ? ["powershell.exe", "powershell", "pwsh"] : ["pwsh", "powershell"];
-  let last: ReturnType<typeof spawnSync> | null = null;
   for (const command of commands) {
     const result = spawnSync(command, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
       encoding: "utf8"
     });
-    last = result;
     if (!result.error && result.status === 0) return result;
   }
-  throw new Error(last?.stderr || last?.stdout || last?.error?.message || "PowerShell is not available");
+  return null;
 }
+
+function commandAvailable(command: string, args: string[]) {
+  const result = spawnSync(command, args, { encoding: "utf8" });
+  return !result.error && result.status === 0;
+}
+
+function windowsZipFixtureAvailable() {
+  return runPowerShell("$PSVersionTable.PSVersion.ToString()") !== null
+    || (commandAvailable("zip", ["-v"]) && commandAvailable("unzip", ["-v"]));
+}
+
+function runZip(args: string[], cwd: string) {
+  const result = spawnSync("zip", args, {
+    cwd,
+    encoding: "utf8"
+  });
+  if (result.status !== 0) {
+    throw new Error(`zip failed: ${result.stderr || result.stdout || result.error?.message}`);
+  }
+}
+
+const windowsZipFixtureIt = windowsZipFixtureAvailable() ? it : it.skip;
 
 async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime-win");
@@ -77,9 +97,12 @@ async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   await cp(process.execPath, path.join(runtimeDir, "node.exe"));
 
   const archive = path.join(tmpDir, "node-runtime-win.zip");
-  runPowerShell(
+  const powerShell = runPowerShell(
     `$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath ${psQuote(runtimeDir)} -DestinationPath ${psQuote(archive)} -Force`
   );
+  if (!powerShell) {
+    runZip(["-qr", archive, runtimeDirName], runtimeRoot);
+  }
   return archive;
 }
 
@@ -234,7 +257,7 @@ describe("package-agent-cli", () => {
     expect(report.entries).toBeGreaterThan(10);
   });
 
-  it("creates and verifies the Windows x64 artifact with agent.cmd and bundled node.exe", async () => {
+  windowsZipFixtureIt("creates and verifies the Windows x64 artifact with agent.cmd and bundled node.exe", async () => {
     const rootDir = await writePackageFixture();
     const runtimeArchive = await writeFakeWindowsNodeRuntimeZip(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -258,6 +281,10 @@ describe("package-agent-cli", () => {
     expect(wrapper).toContain("set \"NODE_EXE=%SCRIPT_DIR%node.exe\"");
     expect(wrapper).toContain("where node");
     expect(wrapper).toContain("\"%NODE_EXE%\" \"%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js\" %*");
+
+    const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
+    expect(readme).toContain(String.raw`.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict`);
+    expect(readme).not.toContain(String.raw`.\bin\agent.cmd doctor --workspace /path/to/repo`);
 
     const report = await verifyAgentCliPackage({
       rootDir,

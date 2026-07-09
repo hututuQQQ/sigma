@@ -533,7 +533,7 @@ export async function verifyAgentCliPackage(options = {}) {
     }
     assertContains("README.md", readme, "Sigma Code CLI Bundle");
     assertContains("README.md", readme, targetPlatform === "win32" ? String.raw`.\bin\agent.cmd version --json` : "./bin/agent version --json");
-    assertContains("README.md", readme, targetPlatform === "win32" ? String.raw`.\bin\agent.cmd doctor --workspace /path/to/repo --json --strict` : "./bin/agent doctor --workspace /path/to/repo --json --strict");
+    assertContains("README.md", readme, targetPlatform === "win32" ? String.raw`.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict` : "./bin/agent doctor --workspace /path/to/repo --json --strict");
     assertContains("README.md", readme, "Product Boundary");
     assertContains("README.md", readme, "benchmark identity, verifier output, rewards, scores, and hidden test details must not be fed back");
 

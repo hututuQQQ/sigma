@@ -5,6 +5,7 @@ import { parseArgs } from "../config.js";
 
 interface VersionCommandDeps {
   stdout?: NodeJS.WritableStream;
+  buildVersionReport?: () => Promise<VersionReport>;
 }
 
 interface PackageJson {
@@ -69,6 +70,22 @@ export async function buildVersionReport(): Promise<VersionReport> {
   };
 }
 
+function bundleValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  return String(value);
+}
+
+function bundleLabel(bundle: unknown): string {
+  if (!bundle || typeof bundle !== "object") return "";
+
+  const metadata = bundle as { targetPlatform?: unknown; targetArch?: unknown };
+  const targetArch = bundleValue(metadata.targetArch);
+  if (!targetArch) return "";
+
+  const targetPlatform = bundleValue(metadata.targetPlatform);
+  return targetPlatform ? ` bundle=${targetPlatform}-${targetArch}` : ` bundle=linux-${targetArch}`;
+}
+
 export async function runVersionCommand(argv: string[], deps: VersionCommandDeps = {}): Promise<number> {
   if (argv.includes("--help") || argv.includes("-h")) {
     stdout(deps).write(`agent version [flags]
@@ -82,13 +99,11 @@ Flags:
   }
 
   const { flags } = parseArgs(argv);
-  const report = await buildVersionReport();
+  const report = deps.buildVersionReport ? await deps.buildVersionReport() : await buildVersionReport();
   if (flags.json) {
     stdout(deps).write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    const bundle = report.bundle && typeof report.bundle === "object" && "targetArch" in report.bundle
-      ? ` bundle=linux-${String((report.bundle as { targetArch?: unknown }).targetArch)}`
-      : "";
+    const bundle = bundleLabel(report.bundle);
     stdout(deps).write(
       `${report.product} ${report.package.version} (${report.package.name}) node=${report.runtime.node} platform=${report.runtime.platform}/${report.runtime.arch}${bundle}\n`
     );

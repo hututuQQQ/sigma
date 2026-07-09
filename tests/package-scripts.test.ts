@@ -21,7 +21,7 @@ describe("package scripts", () => {
     const packageJson = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8"));
 
     expect(packageJson.scripts).toMatchObject({
-      "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm product:readiness",
+      "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness",
       "verify:release:windows": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm smoke:provider -- --provider deepseek && node scripts/product-readiness-report.mjs --require-release-ready --require-provider-smoke",
       "smoke:product": "pnpm build && node scripts/smoke-product.mjs",
       "smoke:tui-product": "pnpm build && node scripts/smoke-tui-product.mjs",
@@ -29,11 +29,24 @@ describe("package scripts", () => {
       "product:readiness": "node scripts/product-readiness-report.mjs",
       "package:agent-cli:windows": "pnpm build && node scripts/package-agent-cli.mjs --target-platform win32 --target-arch x64",
       "verify:package:agent-cli": "pnpm package:agent-cli && node scripts/verify-agent-cli-package.mjs",
+      "verify:package:agent-cli:windows:structure": "pnpm package:agent-cli:windows && node scripts/verify-agent-cli-package.mjs --target-platform win32 --target-arch x64",
       "verify:package:agent-cli:windows": "pnpm package:agent-cli:windows && node scripts/verify-agent-cli-package.mjs --target-platform win32 --target-arch x64 --require-target-wrapper"
     });
-    expect(packageJson.scripts["verify:product"]).not.toContain("bench:");
-    expect(packageJson.scripts["verify:product"]).not.toContain("harbor");
-    expect(packageJson.scripts["verify:product"]).not.toContain("smoke:provider");
-    expect(packageJson.scripts["verify:release:windows"]).toContain("smoke:provider -- --provider deepseek");
+    const verifyProduct = packageJson.scripts["verify:product"];
+    const verifyReleaseWindows = packageJson.scripts["verify:release:windows"];
+    const verifyWindowsStructure = packageJson.scripts["verify:package:agent-cli:windows:structure"];
+    const verifyWindowsRelease = packageJson.scripts["verify:package:agent-cli:windows"];
+
+    expect(verifyProduct).toContain("verify:package:agent-cli:windows:structure");
+    expect(verifyProduct).not.toContain("bench:");
+    expect(verifyProduct).not.toContain("harbor");
+    expect(verifyProduct).not.toContain("smoke:provider");
+    expect(verifyProduct).not.toContain("--require-target-wrapper");
+    expect(verifyWindowsStructure).not.toContain("--require-target-wrapper");
+    expect(verifyWindowsRelease).toContain("--require-target-wrapper");
+    expect(verifyReleaseWindows).toContain("verify:package:agent-cli:windows");
+    expect(verifyReleaseWindows).toContain("smoke:provider -- --provider deepseek");
+    expect(verifyReleaseWindows).toContain("--require-release-ready");
+    expect(verifyReleaseWindows).toContain("--require-provider-smoke");
   });
 });

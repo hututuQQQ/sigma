@@ -27,6 +27,10 @@ function benchmarkNeutralScripts(packageJson) {
   return !verifyProduct.includes("bench:") && !verifyProduct.toLowerCase().includes("harbor");
 }
 
+function productGateScript(packageJson) {
+  return String(packageJson.scripts?.["verify:product"] ?? "");
+}
+
 function productSmokeChecks(productSmoke) {
   return [
     check("productSmoke:ok", productSmoke?.ok === true, "product smoke completed"),
@@ -132,7 +136,10 @@ export async function buildProductReadinessReport(options = {}) {
     existsSync(providerSmokePath) ? readJson(providerSmokePath) : Promise.resolve(null)
   ]);
 
+  const verifyProductScript = productGateScript(packageJson);
   checks.push(check("productGate:benchmarkNeutral", benchmarkNeutralScripts(packageJson), "verify:product excludes bench/Harbor adapters"));
+  checks.push(check("productGate:noLiveProviderSmoke", !verifyProductScript.includes("smoke:provider"), "verify:product excludes live provider smoke"));
+  checks.push(check("productGate:noRequiredTargetWrapper", !verifyProductScript.includes("--require-target-wrapper"), "verify:product does not require target wrapper smoke"));
   checks.push(...productSmokeChecks(productSmoke));
   checks.push(...tuiSmokeChecks(tuiSmoke));
   checks.push(...packageChecks(packageVerify));

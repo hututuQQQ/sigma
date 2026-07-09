@@ -395,6 +395,7 @@ exit /b %ERRORLEVEL%
 function createBundleReadme(targetPlatform, targetArch, nodeRuntime) {
   const isWindows = targetPlatform === "win32";
   const agent = isWindows ? String.raw`.\bin\agent.cmd` : "./bin/agent";
+  const workspace = isWindows ? String.raw`D:\path\to\repo` : "/path/to/repo";
   const platformLabel = isWindows ? `Windows ${targetArch}` : `Linux ${targetArch}`;
   return `# Sigma Code CLI Bundle
 
@@ -403,20 +404,20 @@ This archive contains a portable Sigma Code CLI for ${platformLabel}.
 ## Start
 
 \`\`\`${isWindows ? "powershell" : "sh"}
-${agent} init --workspace /path/to/repo
+${agent} init --workspace ${workspace}
 ${agent} version --json
-${agent} doctor --workspace /path/to/repo
-${agent} doctor --workspace /path/to/repo --json --strict
-${agent} tui --workspace /path/to/repo
+${agent} doctor --workspace ${workspace}
+${agent} doctor --workspace ${workspace} --json --strict
+${agent} tui --workspace ${workspace}
 \`\`\`
 
 For non-interactive use:
 
 \`\`\`${isWindows ? "powershell" : "sh"}
-${agent} run "Fix failing tests" --workspace /path/to/repo
-${agent} inspect --workspace /path/to/repo
-${agent} jobs --workspace /path/to/repo
-${agent} artifacts --workspace /path/to/repo
+${agent} run "Fix failing tests" --workspace ${workspace}
+${agent} inspect --workspace ${workspace}
+${agent} jobs --workspace ${workspace}
+${agent} artifacts --workspace ${workspace}
 \`\`\`
 
 The wrapper uses the bundled Node runtime when available and falls back to a system \`node\` on PATH.

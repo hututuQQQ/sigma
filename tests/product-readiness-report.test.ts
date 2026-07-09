@@ -17,7 +17,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
   const artifactsDir = path.join(rootDir, ".artifacts");
   await writeJson(path.join(rootDir, "package.json"), {
     scripts: {
-      "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm product:readiness"
+      "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness"
     }
   });
   await writeJson(path.join(artifactsDir, "smoke-product", "product-smoke.json"), {

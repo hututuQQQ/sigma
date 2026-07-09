@@ -242,11 +242,13 @@ pnpm smoke:tui-product
 pnpm verify:product
 ```
 
+`pnpm verify:product` is the internal-ready product gate. It is intended to run on ordinary CI and Linux developer machines: lint, tests, product smoke, TUI smoke, Windows bundle structure verification, and the product readiness report. It does not require a live provider key or native Windows wrapper execution.
+
 The Public MVP product bundle is a self-contained Windows x64 zip. Packaging downloads the pinned Windows Node runtime into `.artifacts/cache/` when needed; offline environments can pre-fill that cache or set `NODE_RUNTIME_ARCHIVE`.
 
 ```bash
 pnpm package:agent-cli:windows
-pnpm verify:package:agent-cli:windows
+pnpm verify:package:agent-cli:windows:structure
 ```
 
 After extracting `.artifacts/agent-cli-win32-x64.zip`, the bundled wrapper runs through `agent.cmd`:
@@ -256,6 +258,8 @@ After extracting `.artifacts/agent-cli-win32-x64.zip`, the bundled wrapper runs 
 .\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict
 .\bin\agent.cmd tui --workspace D:\path\to\repo --provider deepseek
 ```
+
+`pnpm verify:release:windows` is the strict Windows release gate. It runs the product gate checks plus native `agent.cmd` wrapper verification, live DeepSeek provider smoke, and release-ready readiness flags.
 
 ## External Benchmark Adapters
 
@@ -825,20 +829,19 @@ The newer fields are optional. They appear when relevant and preserve the summar
 
 `pnpm package:agent-cli:windows` bundles the pinned Windows Node runtime and creates `.artifacts/agent-cli-win32-x64.zip`. Set `NODE_RUNTIME_ARCHIVE` to use a pre-downloaded Node zip, or let the package script use `.artifacts/cache/node-v22.16.0-win-x64.zip` / nodejs.org. The bundle writes `package-metadata.json` with the runtime URL, platform, architecture, cache path, source, and download status.
 
-`pnpm verify:package:agent-cli:windows` checks the zip structure, README product boundary, `agent.cmd`, metadata, host CLI startup, and `.\bin\agent.cmd version --json` through the bundled `node.exe`. The older `pnpm package:agent-cli` / `pnpm verify:package:agent-cli` Linux tarball path remains available for external adapters and later Linux release validation.
+`pnpm verify:package:agent-cli:windows:structure` checks the zip structure, README product boundary, `agent.cmd`, metadata, and host CLI startup without requiring native Windows wrapper execution. `pnpm verify:package:agent-cli:windows` is the strict release verifier and also requires `.\bin\agent.cmd version --json` through the bundled `node.exe`. The older `pnpm package:agent-cli` / `pnpm verify:package:agent-cli` Linux tarball path remains available for external adapters and later Linux release validation.
 
 Product readiness:
 
 ```bash
 pnpm verify:product
-pnpm smoke:tui-product
-pnpm verify:package:agent-cli:windows
 pnpm product:readiness
 pnpm verify:release:windows
-pnpm smoke:provider -- --provider deepseek
 ```
 
-`pnpm product:readiness` writes `.artifacts/product-readiness.json` and `.artifacts/product-readiness.md`, aggregating CLI smoke, TUI smoke, package verification, optional live-provider smoke, and remaining release-hardening gaps. See `docs/PRODUCT_READINESS_CHECKLIST.md` for the full evidence contract.
+`pnpm verify:product` is the internal-ready, cross-platform-ish product gate. It excludes Harbor, Terminal-Bench, live provider smoke, and required target wrapper execution. `pnpm verify:release:windows` is the strict Windows release gate and requires the Windows wrapper, live DeepSeek provider smoke, and release-ready readiness flags.
+
+`pnpm product:readiness` writes `.artifacts/product-readiness.json` and `.artifacts/product-readiness.md`, aggregating CLI smoke, TUI smoke, package verification, optional live-provider smoke, and remaining release-hardening gaps. Harbor and Terminal-Bench remain external benchmark adapters, not product gate dependencies. See `docs/PRODUCT_READINESS_CHECKLIST.md` for the full evidence contract.
 
 ## Harbor And Terminal-Bench 2.0
 
