@@ -5,7 +5,13 @@ import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ProviderName, ProviderOptions } from "../packages/agent-ai/src/index.js";
 import { loadSessionMeta } from "../packages/agent-core/src/index.js";
-import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
+import { runAgentCommand } from "../packages/agent-cli/src/index.js";
+import {
+  runArtifactsCommand,
+  runJobsCommand,
+  runSessionCommand,
+  runSessionsCommand
+} from "../packages/agent-cli/src/commands/session.js";
 import { runRunCommand } from "../packages/agent-cli/src/commands/run.js";
 
 class FinalModel implements ModelClient {
@@ -61,8 +67,89 @@ describe("agent-cli sessions", () => {
     await expect(runSessionCommand(["show", sessionId, "--workspace", dir, "--json"], { stdout: showStdout })).resolves.toBe(0);
     expect(JSON.parse(showStdout.text())).toMatchObject({
       meta: { sessionId, title: "Investigate flaky parser" },
+      artifacts: {
+        manifest: expect.stringContaining(path.join(".agent", "sessions")),
+        meta: expect.stringContaining(path.join(".agent", "sessions")),
+        summary: expect.stringContaining(path.join(".agent", "sessions")),
+        events: expect.stringContaining(path.join(".agent", "sessions")),
+        checkpoints: expect.stringContaining(path.join(".agent", "sessions"))
+      },
+      artifactManifest: {
+        schemaVersion: 1,
+        sessionId,
+        artifacts: {
+          manifest: expect.stringContaining("artifacts.json")
+        }
+      },
+      changedFiles: [],
+      evidence: {
+        validation: { total: expect.any(Number), failed: expect.any(Number) },
+        precheck: { total: expect.any(Number), failed: expect.any(Number) },
+        attempts: expect.any(Array)
+      },
       eventCount: expect.any(Number)
     });
+
+    const latestStdout = new MemoryWritable();
+    await expect(runSessionCommand(["show", "--latest", "--workspace", dir], { stdout: latestStdout })).resolves.toBe(0);
+    expect(latestStdout.text()).toContain(sessionId);
+    expect(latestStdout.text()).toContain("artifacts:");
+    expect(latestStdout.text()).toContain("evidence:");
+    expect(latestStdout.text()).toContain("validation:");
+    expect(latestStdout.text()).toContain("final_gate:");
+
+    const inspectStdout = new MemoryWritable();
+    const previousWrite = process.stdout.write;
+    try {
+      process.stdout.write = inspectStdout.write.bind(inspectStdout) as typeof process.stdout.write;
+      await expect(runAgentCommand(["inspect", "--workspace", dir])).resolves.toBe(0);
+    } finally {
+      process.stdout.write = previousWrite;
+    }
+    expect(inspectStdout.text()).toContain(sessionId);
+    expect(inspectStdout.text()).toContain("artifacts:");
+
+    const jobsStdout = new MemoryWritable();
+    await expect(runJobsCommand(["--workspace", dir, "--json"], { stdout: jobsStdout })).resolves.toBe(0);
+    const jobs = JSON.parse(jobsStdout.text()) as {
+      summary: { total: number; completed: number; failed: number };
+      jobs: Array<{ sessionId: string; artifacts: { manifest?: string; summary: string; events: string } }>;
+    };
+    expect(jobs.summary).toMatchObject({ total: 1, completed: 1, failed: 0 });
+    expect(jobs.jobs[0]).toMatchObject({
+      sessionId,
+      artifacts: {
+        manifest: expect.stringContaining(path.join(".agent", "sessions")),
+        summary: expect.stringContaining(path.join(".agent", "sessions")),
+        events: expect.stringContaining(path.join(".agent", "sessions"))
+      }
+    });
+
+    const artifactsJsonStdout = new MemoryWritable();
+    await expect(runArtifactsCommand(["--workspace", dir, "--json"], { stdout: artifactsJsonStdout })).resolves.toBe(0);
+    expect(JSON.parse(artifactsJsonStdout.text())).toMatchObject({
+      meta: { sessionId },
+      artifacts: {
+        manifest: expect.stringContaining(path.join(".agent", "sessions")),
+        meta: expect.stringContaining(path.join(".agent", "sessions")),
+        summary: expect.stringContaining(path.join(".agent", "sessions")),
+        events: expect.stringContaining(path.join(".agent", "sessions"))
+      },
+      artifactManifest: {
+        schemaVersion: 1,
+        sessionId
+      },
+      evidence: {
+        validation: { total: expect.any(Number), failed: expect.any(Number) }
+      }
+    });
+
+    const artifactsTextStdout = new MemoryWritable();
+    await expect(runArtifactsCommand([sessionId, "--workspace", dir], { stdout: artifactsTextStdout })).resolves.toBe(0);
+    expect(artifactsTextStdout.text()).toContain(sessionId);
+    expect(artifactsTextStdout.text()).toContain("artifacts:");
+    expect(artifactsTextStdout.text()).toContain("changed:");
+    expect(artifactsTextStdout.text()).toContain("evidence:");
 
     const searchStdout = new MemoryWritable();
     await expect(runSessionCommand(["search", "flaky parser", "--workspace", dir], { stdout: searchStdout })).resolves.toBe(0);

@@ -9,6 +9,7 @@ import {
   createDefaultToolRegistry,
   reviewAntiGamingDiff,
   runAgent,
+  type AgentEvent,
   type ToolExecutionContext
 } from "../packages/agent-core/src/index.js";
 
@@ -133,7 +134,8 @@ describe("subagent task tool", () => {
       summary: "Located the parser entry point.",
       relevant_files: ["src/parser.ts"]
     });
-    expect(events).toEqual(["subagent_start", "subagent_end"]);
+    expect(events[0]).toBe("subagent_start");
+    expect(events).toEqual(expect.arrayContaining(["subagent_progress", "subagent_end"]));
   });
 
   it("creates and waits for a read-only background subagent job", async () => {
@@ -291,6 +293,10 @@ describe("subagent task tool", () => {
       reportResponse("The write tool was unavailable to the reviewer.")
     ]);
     const { dir, context } = await workspace(model);
+    const events: AgentEvent[] = [];
+    context.emitEvent = async (event) => {
+      events.push(event);
+    };
     const registry = createDefaultToolRegistry({ subagents: { enabled: true } });
 
     const result = await registry.execute(
@@ -305,6 +311,16 @@ describe("subagent task tool", () => {
     expect(result.ok).toBe(true);
     await expect(readFile(path.join(dir, "should-not-exist.txt"), "utf8")).rejects.toThrow();
     expect(JSON.stringify(model.requests[1]?.messages ?? [])).toContain("Unknown tool: write");
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "subagent_progress",
+        metadata: expect.objectContaining({ phase: "tool_start", tool_name: "write" })
+      }),
+      expect.objectContaining({
+        type: "subagent_progress",
+        metadata: expect.objectContaining({ phase: "tool_end", tool_name: "write", ok: false })
+      })
+    ]));
   });
 
   it("forbids recursive subagent calls", async () => {

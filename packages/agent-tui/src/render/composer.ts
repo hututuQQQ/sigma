@@ -10,6 +10,7 @@ export interface RenderComposerOptions {
   mode: TuiRunMode;
   running: boolean;
   approvalPending: boolean;
+  prompt?: ">" | "queue >" | "approval >";
   queuedInstruction?: string | null;
   footerStatus?: string;
   width: number;
@@ -18,7 +19,9 @@ export interface RenderComposerOptions {
 }
 
 function promptLabel(options: RenderComposerOptions): string {
+  if (options.prompt) return options.prompt;
   if (options.approvalPending) return "approval >";
+  if (options.running) return "queue >";
   return ">";
 }
 

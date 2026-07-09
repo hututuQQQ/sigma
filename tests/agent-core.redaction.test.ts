@@ -32,6 +32,27 @@ describe("secret redaction", () => {
     });
   });
 
+  it("does not mark shared non-cyclic objects as circular", () => {
+    const shared = { ok: true, content: "done" };
+    const redacted = redactSecrets({ metadata: { result: shared }, threadItem: { result: shared } });
+
+    expect(redacted).toMatchObject({
+      metadata: { result: { ok: true, content: "done" } },
+      threadItem: { result: { ok: true, content: "done" } }
+    });
+    expect(JSON.stringify(redacted)).not.toContain("[Circular]");
+  });
+
+  it("still marks true circular references", () => {
+    const circular: { name: string; self?: unknown } = { name: "root" };
+    circular.self = circular;
+
+    expect(redactSecrets(circular)).toMatchObject({
+      name: "root",
+      self: "[Circular]"
+    });
+  });
+
   it("redacts env-shaped secrets from summaries and traces", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-redaction-"));
     const secret = "sigma-secret-value-123456";

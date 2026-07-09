@@ -28,23 +28,27 @@ export function redactSecretText(value: string): string {
 }
 
 export function redactSecrets<T>(value: T): T {
-  const seen = new WeakSet<object>();
+  const active = new WeakSet<object>();
 
   function visit(item: unknown): unknown {
     if (typeof item === "string") return redactSecretText(item);
     if (typeof item !== "object" || item === null) return item;
-    if (seen.has(item)) return "[Circular]";
-    seen.add(item);
-    if (Array.isArray(item)) return item.map(visit);
-    const result: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(item)) {
-      if (SECRET_KEY_PATTERN.test(key)) {
-        result[key] = "[REDACTED]";
-      } else {
-        result[key] = visit(nested);
+    if (active.has(item)) return "[Circular]";
+    active.add(item);
+    try {
+      if (Array.isArray(item)) return item.map(visit);
+      const result: Record<string, unknown> = {};
+      for (const [key, nested] of Object.entries(item)) {
+        if (SECRET_KEY_PATTERN.test(key)) {
+          result[key] = "[REDACTED]";
+        } else {
+          result[key] = visit(nested);
+        }
       }
+      return result;
+    } finally {
+      active.delete(item);
     }
-    return result;
   }
 
   return visit(value) as T;

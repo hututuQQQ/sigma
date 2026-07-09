@@ -21,6 +21,10 @@ export interface ResolvedCommand {
 export const COMMANDS: CommandSpec[] = [
   { name: "/help", usage: "/help", aliases: ["/h", "/?"], group: "core", description: "Show shortcuts and commands", shortcut: "F1" },
   { name: "/status", usage: "/status", aliases: ["/s"], group: "inspect", description: "Show current run settings" },
+  { name: "/settings", usage: "/settings", aliases: [], group: "inspect", description: "Show product settings and profiles" },
+  { name: "/permissions", usage: "/permissions", aliases: [], group: "inspect", description: "Show permission and sandbox policy" },
+  { name: "/jobs", usage: "/jobs", aliases: [], group: "inspect", description: "Show queued and running work" },
+  { name: "/artifacts", usage: "/artifacts", aliases: [], group: "inspect", description: "Show output paths and run artifacts" },
   { name: "/tokens", usage: "/tokens", aliases: ["/tk"], group: "inspect", description: "Show token usage" },
   { name: "/context", usage: "/context", aliases: ["/c"], group: "inspect", description: "Show context and skills state" },
   { name: "/files", usage: "/files", aliases: ["/f"], group: "inspect", description: "Open files, changes, tools, and checks", shortcut: "Tab" },

@@ -235,6 +235,20 @@ function toolResultMessage(call: ToolCall, result: ToolResult, maxOutputChars: n
   };
 }
 
+async function emitProgress(
+  context: ToolExecutionContext,
+  request: SubagentRunRequest,
+  subagentId: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  await emit(context, "subagent_progress", {
+    subagent_id: subagentId,
+    subagent_type: request.subagentType,
+    description: request.description,
+    ...metadata
+  });
+}
+
 export async function runSubagent(execution: SubagentExecution): Promise<SubagentRunSummary> {
   const id = randomUUID();
   const startedAt = Date.now();
@@ -288,6 +302,13 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
 
   try {
     for (let turn = 1; turn <= maxTurns; turn += 1) {
+      await emitProgress(context, request, id, {
+        status: "running",
+        phase: "model",
+        turn,
+        max_turns: maxTurns,
+        message: `Turn ${turn}/${maxTurns}: asking ${request.subagentType} subagent.`
+      });
       const response = await context.modelClient.complete({
         messages,
         tools: registry.definitions,
@@ -297,6 +318,16 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
       });
       messages.push(response.message);
       const calls = response.message.toolCalls ?? [];
+      await emitProgress(context, request, id, {
+        status: "running",
+        phase: calls.length === 0 ? "finalizing" : "tools",
+        turn,
+        max_turns: maxTurns,
+        tool_calls: calls.length,
+        message: calls.length === 0
+          ? `Turn ${turn}/${maxTurns}: final report received.`
+          : `Turn ${turn}/${maxTurns}: ${calls.length} tool call${calls.length === 1 ? "" : "s"} requested.`
+      });
       if (calls.length === 0) {
         const report = reportFromAssistant({
           id,
@@ -312,7 +343,26 @@ export async function runSubagent(execution: SubagentExecution): Promise<Subagen
       }
       for (const call of calls) {
         toolCalls += 1;
+        await emitProgress(context, request, id, {
+          status: "running",
+          phase: "tool_start",
+          turn,
+          max_turns: maxTurns,
+          tool_name: call.function.name,
+          tool_call_id: call.id,
+          message: `Turn ${turn}/${maxTurns}: running tool ${call.function.name}.`
+        });
         const result = await registry.execute(call, childContext);
+        await emitProgress(context, request, id, {
+          status: "running",
+          phase: "tool_end",
+          turn,
+          max_turns: maxTurns,
+          tool_name: call.function.name,
+          tool_call_id: call.id,
+          ok: result.ok,
+          message: `Turn ${turn}/${maxTurns}: ${call.function.name} ${result.ok ? "finished" : "failed"}.`
+        });
         messages.push(toolResultMessage(call, result, maxOutputChars));
       }
     }

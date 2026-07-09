@@ -52,13 +52,31 @@ describe("durable sessions", () => {
 
       const meta = await loadSessionMeta({ sessionId: result.sessionId as string, workspacePath: dir });
       expect(meta?.eventsPath).toContain(path.join(".agent", "sessions"));
+      expect(meta?.artifactManifestPath).toContain(path.join(".agent", "sessions"));
       const indexText = await readFile(path.join(dir, ".agent", "sessions", "index.jsonl"), "utf8");
       const eventsText = await readFile(meta?.eventsPath as string, "utf8");
       const summaryText = await readFile(meta?.summaryPath as string, "utf8");
+      const artifactsText = await readFile(meta?.artifactManifestPath as string, "utf8");
       expect(indexText).not.toContain(secret);
       expect(eventsText).not.toContain(secret);
       expect(summaryText).not.toContain(secret);
+      expect(artifactsText).not.toContain(secret);
       expect(summaryText).toContain("[REDACTED]");
+      expect(JSON.parse(artifactsText)).toMatchObject({
+        schemaVersion: 1,
+        sessionId: result.sessionId,
+        artifacts: {
+          manifest: meta?.artifactManifestPath,
+          meta: expect.stringContaining("meta.json"),
+          summary: meta?.summaryPath,
+          events: meta?.eventsPath,
+          checkpoints: meta?.checkpointsDir
+        },
+        evidence: {
+          validation: { total: expect.any(Number), failed: expect.any(Number) },
+          precheck: { total: expect.any(Number), failed: expect.any(Number) }
+        }
+      });
 
       const found = await searchSessions({ query: "login all set", workspacePath: dir });
       expect(found[0]?.session.sessionId).toBe(result.sessionId);

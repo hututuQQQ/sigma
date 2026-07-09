@@ -11,7 +11,7 @@ import {
   sessionIndexPath,
   sessionIndexRecordFromMeta
 } from "./session-index.js";
-import type { DurableSessionMeta, SessionPaths } from "./session-types.js";
+import type { DurableSessionMeta, SessionArtifactManifest, SessionPaths } from "./session-types.js";
 import { HybridCheckpointManager, type CheckpointManager } from "./checkpoints.js";
 
 export interface CreateSessionManagerOptions {
@@ -54,10 +54,56 @@ function pathsForSession(rootDir: string, sessionId: string): SessionPaths {
     rootDir,
     sessionDir: sessionPath,
     metaPath: path.join(sessionPath, "meta.json"),
+    artifactManifestPath: path.join(sessionPath, "artifacts.json"),
     eventsPath: path.join(sessionPath, "events.jsonl"),
     summaryPath: path.join(sessionPath, "summary.json"),
     checkpointsDir: path.join(sessionPath, "checkpoints"),
     indexPath: sessionIndexPath(rootDir)
+  };
+}
+
+function isExitFailure(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && (value as { exit_code?: unknown }).exit_code !== 0);
+}
+
+function artifactManifestFromMeta(meta: DurableSessionMeta, paths: SessionPaths, summary?: SummaryJson): SessionArtifactManifest {
+  const validation = summary?.harness?.validation_results ?? [];
+  const precheck = summary?.harness?.precheck_results ?? [];
+  return {
+    schemaVersion: 1,
+    sessionId: meta.sessionId,
+    runId: meta.runId,
+    workspacePath: meta.workspacePath,
+    status: meta.status,
+    ...(meta.finishReason ? { finishReason: meta.finishReason } : {}),
+    createdAt: meta.createdAt,
+    updatedAt: meta.updatedAt,
+    artifacts: {
+      manifest: paths.artifactManifestPath,
+      meta: paths.metaPath,
+      summary: paths.summaryPath,
+      events: paths.eventsPath,
+      checkpoints: paths.checkpointsDir,
+      trace: meta.traceJsonlPath ?? null,
+      sessionJsonl: meta.sessionJsonlPath ?? null,
+      runSummary: meta.runSummaryJsonPath ?? null
+    },
+    changedFiles: meta.changedFiles,
+    evidence: {
+      finalGate: summary?.final_gate ?? null,
+      validation: {
+        total: validation.length,
+        failed: validation.filter(isExitFailure).length
+      },
+      precheck: {
+        total: precheck.length,
+        failed: precheck.filter(isExitFailure).length
+      },
+      attempts: summary?.harness?.attempts.length ?? 0,
+      evidenceRecords: summary?.evidence?.length ?? 0,
+      reviewFindings: summary?.review_findings?.length ?? 0,
+      failureAnalyses: summary?.failure_analyses?.length ?? 0
+    }
   };
 }
 
@@ -97,6 +143,7 @@ export class SessionManager {
       createdAt: timestamp,
       updatedAt: timestamp,
       changedFiles: [],
+      artifactManifestPath: paths.artifactManifestPath,
       summaryPath: paths.summaryPath,
       eventsPath: paths.eventsPath,
       checkpointsDir: paths.checkpointsDir,
@@ -108,6 +155,7 @@ export class SessionManager {
     };
     const manager = new SessionManager(meta, paths);
     await manager.writeMeta();
+    await manager.writeArtifactManifest();
     await manager.writeIndex();
     return manager;
   }
@@ -131,6 +179,7 @@ export class SessionManager {
     await mkdir(this.paths.sessionDir, { recursive: true });
     await writeFile(this.paths.summaryPath, `${JSON.stringify(redactSecrets(summary), null, 2)}\n`, "utf8");
     await this.writeMeta();
+    await this.writeArtifactManifest(summary);
     await this.writeIndex();
   }
 
@@ -141,6 +190,15 @@ export class SessionManager {
 
   private async writeIndex(): Promise<void> {
     await appendSessionIndexRecord(this.paths.rootDir, sessionIndexRecordFromMeta(this.meta));
+  }
+
+  private async writeArtifactManifest(summary?: SummaryJson): Promise<void> {
+    await mkdir(this.paths.sessionDir, { recursive: true });
+    await writeFile(
+      this.paths.artifactManifestPath,
+      `${JSON.stringify(redactSecrets(artifactManifestFromMeta(this.meta, this.paths, summary)), null, 2)}\n`,
+      "utf8"
+    );
   }
 }
 

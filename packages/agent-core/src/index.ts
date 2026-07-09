@@ -108,6 +108,7 @@ export {
   buildResumeInstruction,
   defaultSessionRootDir,
   listSessions,
+  loadSessionArtifactManifest,
   loadSessionMeta,
   loadSessionResumeContext,
   readSessionEventsText,
@@ -133,6 +134,7 @@ export type {
   CheckpointRecord,
   CheckpointRestoreResult,
   DurableSessionMeta,
+  SessionArtifactManifest,
   SessionIndexRecord,
   SessionResumeContext,
   SessionSearchResult

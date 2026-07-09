@@ -143,7 +143,7 @@ describe("agent-tui composer editor", () => {
       color: false
     });
 
-    expect(queued).toContain("> inspect\u258c");
+    expect(queued).toContain("queue > inspect\u258c");
     expect(queued).toContain("queued \u203a run the focused tests");
     expect(queued).toContain("? for shortcuts");
     expect(assertWithinWidth(queued, 80)).toBe(true);

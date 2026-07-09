@@ -1,9 +1,10 @@
-import type { AgentRunStatus, AgentFinishReason } from "../types.js";
+import type { AgentRunStatus, AgentFinishReason, SummaryJson } from "../types.js";
 
 export interface SessionPaths {
   rootDir: string;
   sessionDir: string;
   metaPath: string;
+  artifactManifestPath: string;
   eventsPath: string;
   summaryPath: string;
   checkpointsDir: string;
@@ -24,6 +25,7 @@ export interface DurableSessionMeta {
   updatedAt: string;
   durationMs?: number;
   changedFiles: string[];
+  artifactManifestPath?: string;
   summaryPath: string;
   eventsPath: string;
   checkpointsDir: string;
@@ -50,6 +52,7 @@ export interface SessionIndexRecord {
   updatedAt: string;
   durationMs?: number;
   changedFiles: string[];
+  artifactManifestPath?: string;
   summaryPath: string;
   eventsPath: string;
   parentSessionId?: string;
@@ -102,4 +105,41 @@ export interface CheckpointRestoreResult {
   stdout: string;
   stderr: string;
   durationMs: number;
+}
+
+export interface SessionArtifactManifest {
+  schemaVersion: 1;
+  sessionId: string;
+  runId: string;
+  workspacePath: string;
+  status: DurableSessionMeta["status"];
+  finishReason?: AgentFinishReason;
+  createdAt: string;
+  updatedAt: string;
+  artifacts: {
+    manifest: string;
+    meta: string;
+    summary: string;
+    events: string;
+    checkpoints: string;
+    trace: string | null;
+    sessionJsonl: string | null;
+    runSummary: string | null;
+  };
+  changedFiles: string[];
+  evidence: {
+    finalGate: SummaryJson["final_gate"] | null;
+    validation: {
+      total: number;
+      failed: number;
+    };
+    precheck: {
+      total: number;
+      failed: number;
+    };
+    attempts: number;
+    evidenceRecords: number;
+    reviewFindings: number;
+    failureAnalyses: number;
+  };
 }
