@@ -829,6 +829,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
       if (preparedMessages.compacted && preparedMessages.artifact) {
+        // Earlier read outputs may have been compacted out, so repeated reads must be real content again.
+        context.runState.readFileState?.clear();
         const decision = stepProcessor.observeCompaction(turns, preparedMessages.artifact.next_actions);
         if (decision.message) {
           messages.push({ role: "user", content: decision.message });

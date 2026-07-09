@@ -7,7 +7,7 @@ describe("package scripts", () => {
     const packageJson = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8"));
 
     expect(packageJson.scripts).toMatchObject({
-      "bench:deepseek": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro",
+      "bench:deepseek": "pnpm bench:tb:deepseek",
       "bench:tb:deepseek": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro",
       "bench:tb:deepseek:k5": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro --k 5",
       "bench:tb:deepseek:k10": "node scripts/bench-terminal-bench.mjs --mode k --provider deepseek --model deepseek-v4-pro --k 10",
@@ -16,6 +16,7 @@ describe("package scripts", () => {
       "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
       "tui:deepseek": "pnpm --filter agent-tui build && pnpm --filter agent-cli build && node scripts/run-tui-deepseek.mjs"
     });
+    expect(packageJson.scripts["bench:deepseek"]).not.toBe(packageJson.scripts["bench:tb:deepseek"]);
     expect(JSON.stringify(packageJson.scripts)).not.toContain("DEEPSEEK_API_KEY");
   });
 

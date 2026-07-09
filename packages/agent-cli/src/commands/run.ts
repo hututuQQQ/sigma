@@ -325,7 +325,7 @@ async function runNonInteractiveCommand(
     } else {
       printRunResult(result, stdout, { quiet: cliConfig.quiet });
     }
-    return result.status === "error" ? 1 : 0;
+    return result.status === "completed" ? 0 : 1;
   } catch (error) {
     detachStreamUi?.();
     detachJsonStream?.();

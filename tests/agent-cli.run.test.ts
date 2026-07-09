@@ -534,7 +534,7 @@ describe("agent-cli run", () => {
       }
     );
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     const stdoutText = stdout.text();
     const stdoutLines = stdoutText.trim().split(/\r?\n/);
     expect(stdoutLines).toHaveLength(1);
@@ -545,6 +545,37 @@ describe("agent-cli run", () => {
     expect(stderr.text()).toContain("Tool: write");
     expect(stderr.text()).toContain("Risk: write");
     expect(stderr.text()).toContain("Allow?");
+  });
+
+  it("returns non-zero when the structured loop stops a no-change mutation run", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-no-change-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+
+    const code = await runRunCommand(
+      [
+        "fix the issue",
+        "--workspace",
+        dir,
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--validation-mode",
+        "off",
+        "--final-evidence-mode",
+        "off",
+        "--json"
+      ],
+      {
+        stdout,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout.text()) as { status?: string; finishReason?: string; finalMessage?: string };
+    expect(parsed).toMatchObject({ status: "stopped", finishReason: "blocked_no_feasible_edit" });
+    expect(parsed.finalMessage).toContain("will not mark a no-change mutation run as completed");
   });
 
   it("prints valid JSONL events and a final result in stream-json mode", async () => {

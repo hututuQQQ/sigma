@@ -19,9 +19,9 @@ export const DEFAULT_AGENT_LOOP_POLICY: AgentLoopPolicy = {
 };
 
 const MUTATION_INTENT_PATTERN =
-  /\b(fix|repair|implement|refactor|change|modify|update|add|create|write|remove|delete|migrate|split|extract|tighten|harden|address|ship|patch|pr)\b|修复|实现|修改|改动|更改|更新|新增|添加|创建|写入|删除|移除|重构|拆分|抽取|收紧|加固|提交|合并|大改|根治|执行/i;
+  /\b(fix|repair|implement|refactor|change|modify|update|add|create|write|remove|delete|migrate|split|extract|tighten|harden|address|ship|patch)\b|修复|实现|修改|改动|更改|更新|新增|添加|创建|写入|删除|移除|重构|拆分|抽取|收紧|加固|提交|合并|大改|根治|执行/i;
 const ANSWER_INTENT_PATTERN =
-  /\b(explain|summarize|inspect|review|analyze|look|read|understand|why|what|how)\b|解释|总结|分析|查看|看看|阅读|理解|为什么|怎么|原因/i;
+  /\b(explain|summarize|inspect|review|analyze|look|read|understand|why|what|how)\b|解释|总结|分析|审查|查看|看一下|看看|阅读|理解|为什么|怎么|原因/i;
 
 const MUTATION_TOOLS = new Set(["edit", "write", "apply_patch"]);
 const VALIDATION_TOOLS = new Set(["validate"]);
@@ -29,6 +29,8 @@ const READ_TOOLS = new Set(["read", "read_many", "grep", "glob", "repo_query", "
 const BROAD_READ_TOOLS = new Set(["glob", "read_many", "repo_query", "symbol_search", "memory"]);
 const NARROW_DISABLED_TOOLS = new Set(["glob", "read_many", "symbol_search"]);
 const FORCE_IMPLEMENT_DISABLED_TOOLS = new Set(["glob", "read_many", "repo_query", "symbol_search", "memory"]);
+const RESUME_INSTRUCTION_HEADER_PATTERN = /^Previous Sigma session context \((?:resume|fork)\):/;
+const RESUME_NEW_INSTRUCTION_MARKER = "\nNew instruction:";
 
 export interface LoopControllerDecision {
   action: "none" | "steer" | "force_final_text" | "stop";
@@ -74,9 +76,18 @@ export function resolveAgentLoopPolicy(options: {
 }
 
 export function classifyTaskIntent(instruction: string): AgentTaskIntent {
-  if (MUTATION_INTENT_PATTERN.test(instruction)) return "mutation";
-  if (ANSWER_INTENT_PATTERN.test(instruction)) return "answer";
+  const intentText = intentRelevantInstruction(instruction);
+  if (MUTATION_INTENT_PATTERN.test(intentText)) return "mutation";
+  if (ANSWER_INTENT_PATTERN.test(intentText)) return "answer";
   return "inspect";
+}
+
+function intentRelevantInstruction(instruction: string): string {
+  if (!RESUME_INSTRUCTION_HEADER_PATTERN.test(instruction)) return instruction;
+  const markerIndex = instruction.lastIndexOf(RESUME_NEW_INSTRUCTION_MARKER);
+  if (markerIndex < 0) return instruction;
+  const tail = instruction.slice(markerIndex + RESUME_NEW_INSTRUCTION_MARKER.length).trim();
+  return tail || instruction;
 }
 
 function toolName(call: ToolCall): string {

@@ -910,6 +910,59 @@ describe("agent loop", () => {
     expect(thirdRequestMessages[3].role).toBe("assistant");
   });
 
+  it("clears repeated read cache after compaction removes earlier read output", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "alpha\nbeta\n", "utf8");
+    const events: AgentEvent[] = [];
+    const eventBus = new AgentEventBus();
+    eventBus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt", offset: 1, limit: 2 } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-before-compaction")] } },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "grep-between-reads",
+              type: "function" as const,
+              function: { name: "grep", arguments: { pattern: "alpha", path: "." } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", toolCalls: [readCall("read-after-compaction")] } },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "inspect workspace",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 5,
+      maxMessageHistoryChars: 1000,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 500,
+      compactionMode: "deterministic",
+      finalEvidenceMode: "off",
+      eventBus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(events.map((event) => event.type)).toContain("context_compaction_end");
+    expect(events.filter((event) => event.type === "read_cache_hit")).toEqual([]);
+    const finalRequest = model.requests[3];
+    const readToolMessages = finalRequest.messages.filter((message) => message.role === "tool" && message.name === "read");
+    const latestReadPayload = JSON.parse(readToolMessages[readToolMessages.length - 1].content) as { content: string };
+    expect(latestReadPayload.content).toContain("     1\talpha");
+    expect(latestReadPayload.content).not.toContain("File unchanged since last read");
+  });
+
   it("uses model sub-session compaction by default with no tools", async () => {
     const dir = await tempWorkspace();
     const model = new DefaultCompactionModel();
