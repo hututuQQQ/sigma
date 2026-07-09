@@ -23,6 +23,7 @@ export type TranscriptEntry =
   | { kind: "assistant"; text: string; toolCalls?: number; timestamp?: string }
   | { kind: "tool"; name: string; status: "queued" | "running" | "ok" | "failed" | "aborted"; summary: string; durationMs?: number; timestamp?: string }
   | { kind: "approval"; toolName: string; risk: string; summary: string; timestamp?: string }
+  | { kind: "subagent"; status: ActivityStatus; label: string; detail: string; timestamp?: string }
   | { kind: "diff"; mode: "stat" | "patch"; summary: string; timestamp?: string }
   | { kind: "changes"; files: string[]; timestamp?: string }
   | { kind: "test"; command: string; status: "running" | "ok" | "failed"; summary: string; durationMs?: number; timestamp?: string }
@@ -151,6 +152,98 @@ function harnessActivity(start: AgentEvent, end: AgentEvent | undefined): Activi
   };
 }
 
+interface SubagentJobLike {
+  job_id?: unknown;
+  subagent_type?: unknown;
+  description?: unknown;
+  status?: unknown;
+  error?: unknown;
+  report?: SubagentReportLike;
+}
+
+interface SubagentReportLike {
+  id?: unknown;
+  job_id?: unknown;
+  subagent_type?: unknown;
+  description?: unknown;
+  status?: unknown;
+  summary?: unknown;
+  error?: unknown;
+}
+
+function shortId(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) return "";
+  return value.length <= 8 ? value : value.slice(0, 8);
+}
+
+function subagentTypeName(value: unknown): string {
+  return typeof value === "string" && value.length > 0 ? value : "subagent";
+}
+
+function subagentStatus(value: unknown, fallback: ActivityStatus = "running"): ActivityStatus {
+  const status = String(value ?? "");
+  if (status === "completed" || status === "complete" || status === "ok" || status === "closed") return "ok";
+  if (status === "failed" || status === "error") return "failed";
+  if (status === "interrupted" || status === "cancelled" || status === "canceled") return "aborted";
+  if (status === "waiting") return "waiting";
+  if (status === "queued") return "queued";
+  if (status === "info") return "info";
+  if (status === "running") return "running";
+  return fallback;
+}
+
+function subagentLabelFromMeta(meta: Record<string, unknown>): string {
+  const job = meta.job as SubagentJobLike | undefined;
+  const report = meta.report as SubagentReportLike | undefined;
+  const type = subagentTypeName(meta.subagent_type ?? job?.subagent_type ?? report?.subagent_type);
+  const jobId = shortId(meta.job_id ?? job?.job_id ?? report?.job_id);
+  const subagentId = shortId(meta.subagent_id ?? report?.id);
+  if (jobId) return `${type} job ${jobId}`;
+  if (subagentId) return `${type} ${subagentId}`;
+  return type;
+}
+
+function subagentDescriptionFromMeta(meta: Record<string, unknown>): string {
+  const job = meta.job as SubagentJobLike | undefined;
+  const report = meta.report as SubagentReportLike | undefined;
+  const value = meta.description ?? job?.description ?? report?.description;
+  return typeof value === "string" ? value : "";
+}
+
+function subagentDetailFromMeta(meta: Record<string, unknown>, fallback: string): string {
+  const report = meta.report as SubagentReportLike | undefined;
+  const job = meta.job as SubagentJobLike | undefined;
+  const message = meta.message ?? meta.error ?? report?.error ?? report?.summary ?? job?.error ?? job?.status ?? meta.status;
+  const text = typeof message === "string" && message.trim() ? message : fallback;
+  const tool = typeof meta.tool_name === "string" && meta.tool_name ? `tool=${meta.tool_name}` : "";
+  const phase = typeof meta.phase === "string" && meta.phase ? meta.phase : "";
+  return truncate(oneLine(redactSecretText([phase, tool, text].filter(Boolean).join("  "))), 120);
+}
+
+function subagentActivity(event: AgentEvent, status: ActivityStatus, fallback: string): ActivityItem {
+  const meta = event.metadata ?? {};
+  return {
+    kind: "subagent",
+    status,
+    label: subagentLabelFromMeta(meta),
+    detail: subagentDetailFromMeta(meta, fallback),
+    timestamp: eventTime(event)
+  };
+}
+
+function subagentTranscriptEntry(event: AgentEvent, status: ActivityStatus, fallback: string): TranscriptEntry {
+  const meta = event.metadata ?? {};
+  const description = subagentDescriptionFromMeta(meta);
+  const detail = subagentDetailFromMeta(meta, fallback);
+  return {
+    kind: "subagent",
+    status,
+    label: subagentLabelFromMeta(meta),
+    detail: [description ? truncate(oneLine(redactSecretText(description)), 80) : "", detail].filter(Boolean).join("  "),
+    timestamp: eventTime(event)
+  };
+}
+
 function activityFromEvents(events: AgentEvent[]): ActivityItem[] {
   const items: ActivityItem[] = [];
   const toolEndsByParent = new Map<string, AgentEvent>();
@@ -219,58 +312,24 @@ function activityFromEvents(events: AgentEvent[]): ActivityItem[] {
       continue;
     }
     if (event.type === "subagent_start") {
-      items.push({
-        kind: "subagent",
-        status: "running",
-        label: `subagent ${String(meta.subagent_type ?? "?")}`,
-        detail: truncate(oneLine(redactSecretText(String(meta.description ?? ""))), 90),
-        timestamp: eventTime(event)
-      });
+      items.push(subagentActivity(event, "running", "started"));
       continue;
     }
     if (event.type === "subagent_job_created") {
-      const job = meta.job as { job_id?: unknown; subagent_type?: unknown; description?: unknown } | undefined;
-      items.push({
-        kind: "subagent",
-        status: "queued",
-        label: `job ${String(job?.job_id ?? "?")} ${String(job?.subagent_type ?? "?")}`,
-        detail: truncate(oneLine(redactSecretText(String(job?.description ?? ""))), 90),
-        timestamp: eventTime(event)
-      });
+      items.push(subagentActivity(event, subagentStatus((meta.job as SubagentJobLike | undefined)?.status, "running"), "created"));
       continue;
     }
     if (event.type === "subagent_progress") {
-      items.push({
-        kind: "subagent",
-        status: String(meta.status ?? "") === "failed" ? "failed" : "running",
-        label: `job ${String(meta.job_id ?? "?")}`,
-        detail: String(meta.status ?? "progress"),
-        timestamp: eventTime(event)
-      });
+      items.push(subagentActivity(event, subagentStatus(meta.status, "running"), "progress"));
       continue;
     }
     if (event.type === "subagent_job_closed") {
-      const job = meta.job as { job_id?: unknown; status?: unknown } | undefined;
-      const status = String(job?.status ?? "closed");
-      items.push({
-        kind: "subagent",
-        status: status === "failed" || status === "error" ? "failed" : "ok",
-        label: `job ${String(job?.job_id ?? "?")}`,
-        detail: status,
-        timestamp: eventTime(event)
-      });
+      items.push(subagentActivity(event, subagentStatus((meta.job as SubagentJobLike | undefined)?.status, "ok"), "closed"));
       continue;
     }
     if (event.type === "subagent_end" || event.type === "subagent_error") {
       const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
-      const status = String(report?.status ?? (event.type === "subagent_error" ? "error" : "?"));
-      items.push({
-        kind: "subagent",
-        status: event.type === "subagent_error" || status === "failed" || status === "error" ? "failed" : "ok",
-        label: `subagent ${status}`,
-        detail: truncate(oneLine(redactSecretText(String(report?.error ?? report?.summary ?? ""))), 110),
-        timestamp: eventTime(event)
-      });
+      items.push(subagentActivity(event, subagentStatus(report?.status, event.type === "subagent_error" ? "failed" : "ok"), "finished"));
       continue;
     }
     if (event.type === "review_gate_start") {
@@ -371,39 +430,19 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       continue;
     }
     if (event.type === "subagent_start") {
-      entries.push({
-        kind: "summary",
-        text: `subagent ${String(meta.subagent_type ?? "?")} started: ${truncate(oneLine(redactSecretText(String(meta.description ?? ""))), 90)}`,
-        timestamp: eventTime(event)
-      });
+      entries.push(subagentTranscriptEntry(event, "running", "started"));
       continue;
     }
     if (event.type === "subagent_job_created") {
-      const job = meta.job as { job_id?: unknown; subagent_type?: unknown; description?: unknown } | undefined;
-      entries.push({
-        kind: "summary",
-        text: `subagent job ${String(job?.job_id ?? "?")} ${String(job?.subagent_type ?? "?")}: ${truncate(oneLine(redactSecretText(String(job?.description ?? ""))), 90)}`,
-        timestamp: eventTime(event)
-      });
+      entries.push(subagentTranscriptEntry(event, subagentStatus((meta.job as SubagentJobLike | undefined)?.status, "running"), "created"));
       continue;
     }
     if (event.type === "subagent_progress") {
-      entries.push({
-        kind: "summary",
-        status: String(meta.status ?? ""),
-        text: `subagent job ${String(meta.job_id ?? "?")} ${String(meta.status ?? "?")}`,
-        timestamp: eventTime(event)
-      });
+      entries.push(subagentTranscriptEntry(event, subagentStatus(meta.status, "running"), "progress"));
       continue;
     }
     if (event.type === "subagent_job_closed") {
-      const job = meta.job as { job_id?: unknown; status?: unknown } | undefined;
-      entries.push({
-        kind: "summary",
-        status: String(job?.status ?? "closed"),
-        text: `subagent job ${String(job?.job_id ?? "?")} closed`,
-        timestamp: eventTime(event)
-      });
+      entries.push(subagentTranscriptEntry(event, subagentStatus((meta.job as SubagentJobLike | undefined)?.status, "ok"), "closed"));
       continue;
     }
     if (event.type === "loop_guard_triggered") {
@@ -425,14 +464,7 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
     }
     if (event.type === "subagent_end" || event.type === "subagent_error") {
       const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
-      const status = String(report?.status ?? (event.type === "subagent_error" ? "error" : "?"));
-      const text = String(report?.error ?? report?.summary ?? "");
-      entries.push({
-        kind: "summary",
-        status,
-        text: `subagent ${status}: ${truncate(oneLine(redactSecretText(text)), 110)}`,
-        timestamp: eventTime(event)
-      });
+      entries.push(subagentTranscriptEntry(event, subagentStatus(report?.status, event.type === "subagent_error" ? "failed" : "ok"), "finished"));
       continue;
     }
     if (event.type === "review_gate_start") {
@@ -473,10 +505,11 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
 }
 
 function sortEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
-  return entries
+  const sorted = entries
     .map((entry, index) => ({ entry, index }))
     .sort((a, b) => (a.entry.timestamp ?? "").localeCompare(b.entry.timestamp ?? "") || a.index - b.index)
     .map((item) => item.entry);
+  return coalesceRunningSubagentEntries(sorted);
 }
 
 function sortActivity(items: ActivityItem[]): ActivityItem[] {
@@ -484,6 +517,18 @@ function sortActivity(items: ActivityItem[]): ActivityItem[] {
     .map((item, index) => ({ item, index }))
     .sort((a, b) => (a.item.timestamp ?? "").localeCompare(b.item.timestamp ?? "") || a.index - b.index)
     .map((item) => item.item);
+}
+
+function coalesceRunningSubagentEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
+  const keep = entries.map(() => true);
+  const latestByLabel = new Map<string, number>();
+  entries.forEach((entry, index) => {
+    if (entry.kind !== "subagent" || entry.status !== "running") return;
+    const previous = latestByLabel.get(entry.label);
+    if (previous !== undefined) keep[previous] = false;
+    latestByLabel.set(entry.label, index);
+  });
+  return entries.filter((_entry, index) => keep[index]);
 }
 
 export function buildActivity(options: BuildActivityOptions): ActivityItem[] {

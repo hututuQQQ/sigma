@@ -49,6 +49,7 @@ export interface RenderScreenOptions {
   diffText?: string;
   overlay?: string;
   palette?: string;
+  transcriptScrollOffset?: number;
   width: number;
   height: number;
   color?: boolean;
@@ -162,6 +163,33 @@ function recentActivity(activityItems: ActivityItem[] | undefined, entries: Tran
   });
 }
 
+function activityLine(item: ActivityItem, width: number, color: boolean): string {
+  const g = streamGlyphs();
+  const duration = typeof item.durationMs === "number" ? ` ${g.separator} ${item.durationMs}ms` : "";
+  return truncateToWidth(`${statusMarker(item.status, color)} ${item.label} ${item.detail}${duration}`, width);
+}
+
+function activityStripItems(options: RenderScreenOptions): ActivityItem[] {
+  const all = options.activityItems ?? fallbackActivity(options.entries);
+  const active = all.filter((item) => item.status === "queued" || item.status === "running" || item.status === "waiting");
+  if (active.length > 0) return active.slice(-4);
+  if (!options.running) return [];
+  return all.filter((item) => item.kind === "subagent" || item.kind === "tool" || item.kind === "check" || item.kind === "approval").slice(-4);
+}
+
+function renderActivityStrip(options: RenderScreenOptions, width: number, maxHeight: number): string[] {
+  if (maxHeight < 2) return [];
+  const color = options.color ?? false;
+  const items = activityStripItems(options);
+  if (items.length === 0) return [];
+  const lines = [
+    muted(separatorLine(width), color),
+    roleColor("accent", "Activity", color),
+    ...items.map((item) => `  ${activityLine(item, Math.max(8, width - 2), color)}`)
+  ];
+  return lines.slice(0, maxHeight).map((line) => fitStreamLine(line, width));
+}
+
 function panelLine(label: string, value: string, width: number): string {
   return truncateToWidth(`${label.padEnd(11)} ${value}`, width);
 }
@@ -234,6 +262,7 @@ function renderBottomStatus(options: RenderScreenOptions): string {
   if (usage) pieces.push(`ctx ${formatUsage(usage).replaceAll(" ", "/")}`);
   if (tools > 0) pieces.push(`${tools} tool${tools === 1 ? "" : "s"}`);
   if (runState.queuedCount > 0) pieces.push(`queued ${runState.queuedCount}`);
+  if ((options.transcriptScrollOffset ?? 0) > 0) pieces.push(`scroll +${options.transcriptScrollOffset}`);
   return pieces.join(` ${g.separator} `);
 }
 
@@ -271,10 +300,18 @@ export function renderScreen(options: RenderScreenOptions): string {
   const useWorkbench = shouldUseWorkbench(options, mainHeight);
   const workbenchWidth = useWorkbench ? Math.min(42, Math.max(34, Math.floor(options.width * 0.32))) : 0;
   const transcriptWidth = useWorkbench ? Math.max(40, options.width - workbenchWidth - 2) : options.width;
-  const transcript = renderTranscript(options.entries, transcriptWidth, mainHeight, options.color);
+  const activityStrip = useWorkbench ? [] : renderActivityStrip(options, transcriptWidth, Math.min(5, Math.max(0, mainHeight - 4)));
+  const transcriptHeight = useWorkbench ? mainHeight : Math.max(1, mainHeight - activityStrip.length);
+  const transcript = renderTranscript(
+    options.entries,
+    transcriptWidth,
+    transcriptHeight,
+    options.color,
+    options.transcriptScrollOffset ?? 0
+  );
   const main = useWorkbench
     ? joinColumns(transcript, renderWorkbenchPanel(options, workbenchWidth, mainHeight), 2, options.width)
-    : transcript;
+    : [transcript, ...activityStrip].filter(Boolean).join("\n");
   const lines = [
     ...topLines,
     ...splitLines(main),

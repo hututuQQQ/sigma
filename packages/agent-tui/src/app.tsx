@@ -368,6 +368,7 @@ export class TuiApp {
   private paletteHidden = false;
   private workbenchOpen = false;
   private changePromptDismissed = false;
+  private transcriptScrollOffset = 0;
 
   constructor(
     private readonly options: TuiAppOptions,
@@ -491,6 +492,14 @@ export class TuiApp {
     if (key.name === "right") {
       moveCursorRight(this.composer);
       this.render();
+      return;
+    }
+    if (key.name === "pageup") {
+      this.adjustTranscriptScroll(Math.max(6, Math.floor((this.stdout.rows ?? 24) * 0.5)));
+      return;
+    }
+    if (key.name === "pagedown") {
+      this.adjustTranscriptScroll(-Math.max(6, Math.floor((this.stdout.rows ?? 24) * 0.5)));
       return;
     }
     if (key.name === "up") {
@@ -655,6 +664,7 @@ export class TuiApp {
     rememberInput(this.composer, value);
     clearComposer(this.composer);
     this.paletteHidden = false;
+    this.transcriptScrollOffset = 0;
 
     if (value.startsWith("/") || value.startsWith("!")) {
       await this.handleCommand(value);
@@ -994,7 +1004,22 @@ export class TuiApp {
     this.focusMode = "none";
     this.workbenchOpen = false;
     this.changePromptDismissed = false;
+    this.transcriptScrollOffset = 0;
     this.message = message;
+    this.render();
+  }
+
+  private adjustTranscriptScroll(delta: number): void {
+    const next = Math.max(0, this.transcriptScrollOffset + delta);
+    if (next === this.transcriptScrollOffset) {
+      this.message = next === 0 ? "Transcript is at the latest output." : "Transcript scroll limit reached.";
+      this.render();
+      return;
+    }
+    this.transcriptScrollOffset = next;
+    this.message = next === 0
+      ? "Transcript returned to latest output."
+      : `Transcript scrolled back ${next} line${next === 1 ? "" : "s"}.`;
     this.render();
   }
 
@@ -1084,6 +1109,7 @@ export class TuiApp {
     this.result = null;
     this.focusMode = "none";
     this.changePromptDismissed = false;
+    this.transcriptScrollOffset = 0;
     this.message = "Run started.";
     this.render();
     try {
@@ -1289,6 +1315,7 @@ export class TuiApp {
       diffText: this.diffText,
       overlay,
       palette,
+      transcriptScrollOffset: this.transcriptScrollOffset,
       width,
       height: rows,
       color: this.colorEnabled
@@ -1508,6 +1535,7 @@ export class TuiApp {
       "Enter send   Ctrl+J newline   Tab workbench   Shift+Tab plan/build   Esc close/clear",
       "Left/Right move cursor   Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
       "Ctrl+D diff   Ctrl+T tools   F1 help   /files workbench   @ file mention   !command shell",
+      "PageUp/PageDown scroll transcript",
       "Local: cd <path>, pwd, ls/dir, clear/cls",
       "",
       "Commands",

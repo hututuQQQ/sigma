@@ -6,7 +6,7 @@ import { ToolPanel } from "../packages/agent-tui/src/components/tool-panel.js";
 import { createComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { mergeDisabledToolsForMode, PLAN_DISABLED_TOOLS } from "../packages/agent-tui/src/mode.js";
 import { renderScreen } from "../packages/agent-tui/src/render/screen.js";
-import { buildActivity, buildTranscript } from "../packages/agent-tui/src/view-model.js";
+import { buildActivity, buildTranscript, type TranscriptEntry } from "../packages/agent-tui/src/view-model.js";
 import { assertWithinWidth, splitLines } from "../packages/agent-tui/src/ui/layout.js";
 
 const savedEnv = {
@@ -513,6 +513,92 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).not.toContain("context 123 est tokens");
     expect(rendered).toContain("ctx input=2/output=3/total=5");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
+  it("surfaces live subagent progress in the default activity strip", () => {
+    const start = event("subagent_start", {
+      subagent_id: "subagent-123456789",
+      subagent_type: "investigator",
+      description: "Map parser flow",
+      max_turns: 4
+    });
+    const progress = event("subagent_progress", {
+      subagent_id: "subagent-123456789",
+      subagent_type: "investigator",
+      description: "Map parser flow",
+      status: "running",
+      phase: "tool_start",
+      tool_name: "grep",
+      message: "Turn 1/4: running tool grep."
+    });
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [start, progress],
+      result: null
+    });
+    const activityItems = buildActivity({
+      events: [start, progress],
+      result: null
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [start, progress],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      activityItems,
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(rendered).toContain("Activity");
+    expect(rendered).toContain("investigator subagent");
+    expect(rendered).toContain("tool=grep");
+    expect(rendered).toContain("running tool grep");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
+  it("can render older transcript questions with a scroll offset", () => {
+    const entries: TranscriptEntry[] = [
+      { kind: "user", text: "first question that should remain available", timestamp: "2026-07-07T12:00:00.000Z" },
+      ...Array.from({ length: 18 }, (_, index): TranscriptEntry => ({
+        kind: "assistant",
+        text: `assistant tail line ${index}`,
+        timestamp: `2026-07-07T12:${String(index + 1).padStart(2, "0")}:00.000Z`
+      })),
+      { kind: "summary", status: "completed", text: "completed assistant_stop", timestamp: "2026-07-07T12:30:00.000Z" }
+    ];
+    const common = {
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek" as const,
+      permissionMode: "ask" as const,
+      mode: "build" as const,
+      running: false,
+      result: null,
+      events: [],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      width: 88,
+      height: 24,
+      color: false
+    };
+
+    const latest = renderScreen(common);
+    const scrolled = renderScreen({ ...common, transcriptScrollOffset: 100 });
+
+    expect(latest).toContain("assistant tail line 17");
+    expect(latest).not.toContain("first question that should remain available");
+    expect(scrolled).toContain("first question that should remain available");
+    expect(scrolled).toContain("scroll +100");
+    expect(assertWithinWidth(scrolled, 88)).toBe(true);
   });
 
   it("dedupes terminal tool events in the tool panel", () => {

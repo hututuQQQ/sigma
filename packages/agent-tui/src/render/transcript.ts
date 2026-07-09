@@ -1,16 +1,18 @@
 import { redactSecretText } from "agent-core";
-import type { TranscriptEntry } from "../view-model.js";
+import type { ActivityStatus, TranscriptEntry } from "../view-model.js";
 import { oneLine } from "../components/formatting.js";
 import { fitStreamLine, muted, roleColor, streamGlyphs } from "./theme.js";
 import { rgb, truncateToWidth, wrapText } from "../ui/theme.js";
 
-function statusMarker(status: "queued" | "running" | "ok" | "failed" | "aborted" | undefined, color: boolean): string {
+function statusMarker(status: ActivityStatus | "ok" | "failed" | "aborted" | undefined, color: boolean): string {
   const g = streamGlyphs();
   if (status === "queued") return muted(g.info, color);
   if (status === "running") return roleColor("warning", g.running, color);
   if (status === "ok") return roleColor("success", g.ok, color);
   if (status === "failed") return roleColor("danger", g.fail, color);
   if (status === "aborted") return roleColor("warning", g.fail, color);
+  if (status === "waiting") return roleColor("warning", g.info, color);
+  if (status === "info") return muted(g.info, color);
   return "";
 }
 
@@ -126,6 +128,9 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
   if (entry.kind === "approval") {
     return [joinParts([roleColor("warning", "approval", color), entry.toolName, entry.risk, entry.summary])];
   }
+  if (entry.kind === "subagent") {
+    return [joinParts([statusMarker(entry.status, color), "subagent", entry.label, entry.detail])];
+  }
   if (entry.kind === "diff") {
     return [joinParts([entry.mode, entry.summary])];
   }
@@ -162,7 +167,7 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
   return systemLines(text, width, color);
 }
 
-export function renderTranscript(entries: TranscriptEntry[], width: number, height: number, color = false): string {
+export function renderTranscript(entries: TranscriptEntry[], width: number, height: number, color = false, scrollOffset = 0): string {
   const lines: string[] = [];
 
   for (const entry of entries) {
@@ -172,6 +177,10 @@ export function renderTranscript(entries: TranscriptEntry[], width: number, heig
   }
 
   const compact = lines.filter((line, index) => !(line === "" && lines[index - 1] === ""));
-  const visible = compact.slice(Math.max(0, compact.length - Math.max(1, height)));
+  const safeHeight = Math.max(1, height);
+  const maxOffset = Math.max(0, compact.length - safeHeight);
+  const offset = Math.max(0, Math.min(maxOffset, Math.floor(scrollOffset)));
+  const start = Math.max(0, compact.length - safeHeight - offset);
+  const visible = compact.slice(start, start + safeHeight);
   return visible.map((line) => fitStreamLine(line, width)).join("\n");
 }

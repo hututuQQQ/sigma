@@ -82,6 +82,18 @@ export function formatTimelineEvent(event: AgentEvent): string {
     const ok = meta.exitCode === 0;
     return prefix(ok ? g.ok : g.fail, joinDetails([`${meta.kind ?? "check"} check ${ok ? "passed" : "failed"}`, `attempt=${meta.attempt ?? "?"}`, `exit=${meta.exitCode ?? "?"}`, `${meta.durationMs ?? "?"}ms`]));
   }
+  if (event.type === "subagent_start") {
+    return prefix(g.running, joinDetails([`subagent ${meta.subagent_type ?? "?"} started`, truncate(oneLine(redactSecretText(String(meta.description ?? ""))), 90)]));
+  }
+  if (event.type === "subagent_progress") {
+    const message = String(meta.message ?? meta.error ?? meta.status ?? "progress");
+    return prefix(g.running, joinDetails([`subagent ${meta.subagent_type ?? meta.job_id ?? "?"}`, truncate(oneLine(redactSecretText(message)), 100)]));
+  }
+  if (event.type === "subagent_end" || event.type === "subagent_error") {
+    const report = meta.report as { status?: unknown; summary?: unknown; error?: unknown; subagent_type?: unknown } | undefined;
+    const ok = event.type === "subagent_end" && report?.status !== "error";
+    return prefix(ok ? g.ok : g.fail, joinDetails([`subagent ${report?.subagent_type ?? meta.subagent_type ?? "?"} ${report?.status ?? (ok ? "ok" : "error")}`, truncate(oneLine(redactSecretText(String(report?.error ?? report?.summary ?? ""))), 100)]));
+  }
   if (event.type === "usage") return prefix(g.info, joinDetails([`usage turn=${meta.turn ?? "?"}`, formatUsage(eventUsage(event))]));
   if (event.type === "error") return prefix(g.fail, `error ${truncate(redactSecretText(String(meta.message ?? "")))}`);
   if (event.type === "run_end") {
