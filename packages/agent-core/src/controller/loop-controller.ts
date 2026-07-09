@@ -7,6 +7,7 @@ import type {
   ToolResult
 } from "../types.js";
 import { toolModelContent } from "../types.js";
+import { assessTerminalText } from "./terminal-acceptance.js";
 
 export const DEFAULT_AGENT_LOOP_POLICY: AgentLoopPolicy = {
   maxProviderTurns: 80,
@@ -50,6 +51,11 @@ export interface LoopTurnObservation {
   results: ToolResult[];
   changedFilesBefore: string[];
   changedFilesAfter: string[];
+}
+
+export interface LoopTerminalCandidate {
+  content?: string;
+  changedFiles: string[];
 }
 
 export function resolveAgentLoopPolicy(options: {
@@ -116,6 +122,7 @@ export class AgentLoopController {
   private forcedActions: string[] = [];
   private lastControllerReason: string | undefined;
   private forcedImplementTurn: number | undefined;
+  private textToolAttemptCount = 0;
 
   constructor(options: { instruction: string; policy?: AgentLoopPolicy }) {
     this.intent = classifyTaskIntent(options.instruction);
@@ -250,21 +257,38 @@ export class AgentLoopController {
     return { action: "none", mode: this.mode };
   }
 
-  observeAssistantStop(changedFiles: string[]): LoopControllerDecision {
-    if (this.intent !== "mutation" || changedFiles.length > 0) {
+  observeTerminalCandidate(candidate: LoopTerminalCandidate): LoopControllerDecision {
+    const text = assessTerminalText(candidate.content);
+    if (text.kind === "tool_call_text") return this.observeTextToolAttempt();
+
+    if (this.intent !== "mutation" || candidate.changedFiles.length > 0) {
       return { action: "none", mode: this.mode };
     }
-    if (this.mode === "force_final_text") return { action: "none", mode: this.mode };
-    if (this.readOnlyTurns >= this.policy.broadExploreLimit || this.noChangeTurns > 0) {
+
+    if (this.mode !== "force_final_text") {
       return this.setMode("force_final_text", "assistant_stopped_without_mutation", [
         "Loop controller: this task appears to require code changes, but no files changed.",
         "Do not call tools. Explain the blocker or identify the exact smallest edit still needed."
       ].join("\n"));
     }
-    return { action: "none", mode: this.mode };
+
+    if (text.kind === "blocker") {
+      return this.stop("mutation_blocked_without_changes", [
+        "Loop controller stopped after a text-only blocker response because this mutation task produced no file changes.",
+        "The run is not marked completed; inspect the final message for the blocker and next edit."
+      ].join("\n"));
+    }
+
+    return this.stop("mutation_unresolved_without_changes", [
+      "Loop controller stopped because this mutation task produced no file changes and the final response did not state a concrete blocker.",
+      "Sigma will not mark a no-change mutation run as completed."
+    ].join("\n"));
   }
 
   observeCompaction(nextActions: string[]): LoopControllerDecision {
+    if (this.mode === "force_final_text") {
+      return { action: "none", mode: this.mode };
+    }
     if (nextActions.length === 0) return { action: "none", mode: this.mode };
     return {
       action: "steer",
@@ -275,6 +299,33 @@ export class AgentLoopController {
         ...nextActions.slice(0, 3).map((item) => `Next action: ${item}`),
         "Do not restart broad exploration unless the next action is impossible."
       ].join("\n")
+    };
+  }
+
+  observeTextToolAttempt(): LoopControllerDecision {
+    this.textToolAttemptCount += 1;
+    this.mode = "force_final_text";
+    this.lastControllerReason = "tool_call_text_while_tools_disabled";
+    if (!this.forcedActions.includes(this.lastControllerReason)) {
+      this.forcedActions.push(this.lastControllerReason);
+    }
+    const message = [
+      "Loop controller: tools are disabled, but the assistant emitted text that looks like a tool call.",
+      "Do not emit XML/DSML/JSON tool-call markup. Reply in plain text with the blocker, completed work, and smallest next edit."
+    ].join("\n");
+    if (this.textToolAttemptCount >= 2) {
+      return {
+        action: "stop",
+        mode: this.mode,
+        reason: this.lastControllerReason,
+        message
+      };
+    }
+    return {
+      action: "force_final_text",
+      mode: this.mode,
+      reason: this.lastControllerReason,
+      message
     };
   }
 
@@ -302,6 +353,17 @@ export class AgentLoopController {
     return {
       action: mode === "force_final_text" ? "force_final_text" : "steer",
       mode,
+      reason,
+      message
+    };
+  }
+
+  private stop(reason: string, message: string): LoopControllerDecision {
+    this.lastControllerReason = reason;
+    if (!this.forcedActions.includes(reason)) this.forcedActions.push(reason);
+    return {
+      action: "stop",
+      mode: this.mode,
       reason,
       message
     };

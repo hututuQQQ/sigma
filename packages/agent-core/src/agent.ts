@@ -463,6 +463,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     tools: ToolDefinition[],
     sourceEntries: ContextSourceEntry[] = []
   ): Promise<ModelResponse> => {
+    const toolChoice = tools.length === 0 ? "none" : "auto";
     const cacheHints = sourceEntries
       .filter((entry) => entry.cacheable && entry.cache_key)
       .map((entry) => ({ key: entry.cache_key as string, kind: entry.kind, label: entry.label }));
@@ -470,7 +471,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       return await config.modelClient.complete({
         messages: requestMessages,
         tools,
-        toolChoice: "auto",
+        toolChoice,
         metadata: { sigma_turn: String(turn) },
         cacheHints,
         abortSignal: config.abortSignal
@@ -486,7 +487,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       for await (const modelEvent of config.modelClient.stream({
         messages: requestMessages,
         tools,
-        toolChoice: "auto",
+        toolChoice,
         metadata: { sigma_turn: String(turn) },
         cacheHints,
         abortSignal: config.abortSignal
@@ -807,7 +808,26 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const calls = response.message.toolCalls ?? [];
       if (calls.length === 0) {
         const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
-        const controllerDecision = loopController.observeAssistantStop(changedFiles);
+        const controllerDecision = loopController.observeTerminalCandidate({
+          content: response.message.content,
+          changedFiles
+        });
+        if (controllerDecision.action === "stop") {
+          await recordLoopDecision(controllerDecision, turns, turnId);
+          workflow.phase = "final";
+          finishReason = "controller_stop";
+          lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by loop controller.";
+          if (
+            controllerDecision.message &&
+            (
+              controllerDecision.reason === "tool_call_text_while_tools_disabled" ||
+              controllerDecision.reason === "mutation_unresolved_without_changes"
+            )
+          ) {
+            finalMessage = controllerDecision.message;
+          }
+          break;
+        }
         if (controllerDecision.message) {
           messages.push({ role: "user", content: controllerDecision.message });
           await recordLoopDecision(controllerDecision, turns, turnId);
