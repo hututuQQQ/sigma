@@ -89,6 +89,8 @@ import {
 
 export const HIDE_CURSOR = "\x1b[?25l";
 export const SHOW_CURSOR = "\x1b[?25h";
+export const ENTER_ALT_SCREEN = "\x1b[?1049h";
+export const EXIT_ALT_SCREEN = "\x1b[?1049l";
 export type TuiSessionRunner = typeof runSession;
 
 const execFileAsync = promisify(execFile);
@@ -278,7 +280,7 @@ export class TuiApp {
   }
 
   async start(): Promise<void> {
-    this.stdout.write(HIDE_CURSOR);
+    this.stdout.write(`${ENTER_ALT_SCREEN}${HIDE_CURSOR}`);
     try {
       this.filePaths = listWorkspaceFiles(this.options.workspace);
       readline.emitKeypressEvents(this.stdin);
@@ -291,7 +293,7 @@ export class TuiApp {
         this.resolveExit = resolve;
       });
     } catch (error) {
-      this.stdout.write(SHOW_CURSOR);
+      this.stdout.write(`${SHOW_CURSOR}${EXIT_ALT_SCREEN}`);
       throw error;
     }
   }
@@ -1350,7 +1352,7 @@ export class TuiApp {
   private stop(): void {
     this.stdin.off("keypress", this.handleKeypress);
     if (this.stdin.isTTY) this.stdin.setRawMode(false);
-    this.stdout.write(`${SHOW_CURSOR}\x1b[2J\x1b[H`);
+    this.stdout.write(`${SHOW_CURSOR}\x1b[2J\x1b[H${EXIT_ALT_SCREEN}`);
     this.resolveExit?.();
   }
 }
@@ -1360,6 +1362,6 @@ export async function runTuiApp(options: TuiAppOptions): Promise<void> {
   try {
     await app.start();
   } finally {
-    process.stdout.write(SHOW_CURSOR);
+    process.stdout.write(`${SHOW_CURSOR}${EXIT_ALT_SCREEN}`);
   }
 }

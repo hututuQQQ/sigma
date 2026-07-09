@@ -162,6 +162,43 @@ describe("agent-tui stream rendering", () => {
     expect(assertWithinWidth(rendered, 124)).toBe(true);
   });
 
+  it("falls back to metadata result when persisted thread item result is circular", () => {
+    const start = event("tool_start", {
+      toolCall: { id: "call-1", function: { name: "read", arguments: { path: "package.json" } } }
+    });
+    const end: AgentEvent = {
+      ...event("tool_end", {
+        toolName: "read",
+        result: { ok: true, content: "{}", metadata: { durationMs: 18 } }
+      }, start.id),
+      threadItem: {
+        id: start.id,
+        kind: "dynamic_tool_call",
+        status: "completed",
+        title: "read completed",
+        created_at: "2026-07-07T12:34:56.000Z",
+        updated_at: "2026-07-07T12:34:56.000Z",
+        parent_id: start.id,
+        tool_call_id: "call-1",
+        tool_name: "read",
+        input: { path: "package.json" },
+        result: "[Circular]" as unknown as Record<string, unknown>
+      }
+    };
+
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [start, end],
+      result: null
+    });
+
+    expect(entries.find((entry) => entry.kind === "tool")).toMatchObject({
+      kind: "tool",
+      name: "read",
+      status: "ok"
+    });
+  });
+
   it("renders a diff-first changed files card after edits", () => {
     process.env.TERM = "xterm-256color";
     process.env.SIGMA_FORCE_UNICODE = "1";

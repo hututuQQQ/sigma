@@ -92,10 +92,13 @@ export function toolArgsFromEvent(event: AgentEvent): unknown {
   return toolCall?.function?.arguments;
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
 export function toolResultFromEvent(event: AgentEvent): { ok?: boolean; content?: string; metadata?: Record<string, unknown> } | undefined {
-  const result = event.threadItem?.result ?? event.metadata?.result;
-  if (!result || typeof result !== "object") return undefined;
-  const record = result as Record<string, unknown>;
+  const record = objectRecord(event.threadItem?.result) ?? objectRecord(event.metadata?.result);
+  if (!record) return undefined;
   const modelMetadata = record.modelMetadata && typeof record.modelMetadata === "object"
     ? record.modelMetadata as Record<string, unknown>
     : undefined;

@@ -4,7 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRunResult } from "../packages/agent-core/src/index.js";
-import { TuiApp, HIDE_CURSOR, SHOW_CURSOR, type TuiAppOptions, type TuiSessionRunner } from "../packages/agent-tui/src/app.js";
+import {
+  ENTER_ALT_SCREEN,
+  EXIT_ALT_SCREEN,
+  HIDE_CURSOR,
+  SHOW_CURSOR,
+  TuiApp,
+  type TuiAppOptions,
+  type TuiSessionRunner
+} from "../packages/agent-tui/src/app.js";
 import { setComposerText, type ComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { stripAnsi } from "../packages/agent-tui/src/ui/theme.js";
 import { SHELL_COMMAND_HINT } from "../packages/agent-tui/src/workspace-command.js";
@@ -104,13 +112,14 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       const started = app.start();
       await Promise.resolve();
 
-      expect(stdout.writes[0]).toBe(HIDE_CURSOR);
+      expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${HIDE_CURSOR}`);
       expect(stdout.text()).toContain(`${HIDE_CURSOR}\x1b[2J\x1b[H`);
 
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
 
       expect(stdout.last()).toContain(SHOW_CURSOR);
+      expect(stdout.last()).toContain(EXIT_ALT_SCREEN);
       expect(stdin.rawModes).toEqual([true, false]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
