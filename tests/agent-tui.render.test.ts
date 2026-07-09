@@ -178,6 +178,7 @@ describe("agent-tui stream rendering", () => {
       entries,
       activityItems,
       workbenchOpen: true,
+      workbenchWidthDelta: 28,
       filePaths: ["package.json", "packages/agent-tui/src/app.tsx"],
       diffText: " packages/agent-tui/src/app.tsx | 24 ++++++++++----",
       width: 124,
@@ -195,6 +196,7 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("tokens      input=10 output=5 total=15");
     expect(rendered).toContain("read path=package.json");
     expect(rendered).toContain("ctx input=10/output=5/total=15");
+    expect(rendered).toContain("wb 67 cols");
     expect(assertWithinWidth(rendered, 124)).toBe(true);
   });
 
@@ -537,10 +539,34 @@ describe("agent-tui stream rendering", () => {
       height: 24,
       color: false
     });
-    expect(rendered).toContain("read");
+    expect(rendered).toContain("tool activity: 2 calls");
+    expect(rendered).toContain("Ctrl+T details");
+    expect(rendered).not.toContain("bash abort signal");
     expect(rendered).not.toContain("context 123 est tokens");
     expect(rendered).toContain("ctx input=2/output=3/total=5");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
+
+    const expanded = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [queued, aborted, contextBudget, usage],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      activityItems,
+      toolDetailsOpen: true,
+      width: 96,
+      height: 24,
+      color: false
+    });
+    expect(expanded).toContain("read");
+    expect(expanded).toContain("bash");
+    expect(expanded).toContain("abort signal");
+    expect(assertWithinWidth(expanded, 96)).toBe(true);
   });
 
   it("surfaces live subagent progress in the default activity strip", () => {

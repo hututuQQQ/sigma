@@ -394,11 +394,9 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
     if (event.type === "assistant_message") {
       latestAssistantDelta = null;
       const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
-      const text = typeof meta.content === "string" && meta.content.trim()
-        ? redactSecretText(meta.content.trim())
-        : toolCalls > 0
-          ? `I will use ${toolCalls} tool${toolCalls === 1 ? "" : "s"}.`
-          : "(empty message)";
+      const hasContent = typeof meta.content === "string" && meta.content.trim().length > 0;
+      if (!hasContent && toolCalls > 0) continue;
+      const text = hasContent ? redactSecretText(String(meta.content).trim()) : "(empty message)";
       entries.push({ kind: "assistant", text, toolCalls, timestamp: eventTime(event) });
       continue;
     }
@@ -620,8 +618,11 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
       });
     }
     const usageText = (options.result.usage.totalTokens ?? 0) > 0 ? formatUsage(options.result.usage) : "";
+    const changedCount = options.result.changedFiles?.length ?? 0;
+    const noChanges = changedCount === 0 && options.result.status === "stopped";
     const resultText = [
       `${options.result.status} ${options.result.finishReason}`,
+      noChanges ? "no files changed" : changedCount > 0 ? `${changedCount} changed` : "",
       options.result.toolCalls > 0 ? `${options.result.toolCalls} tools` : "",
       options.result.turns > 0 ? `${options.result.turns} turns` : "",
       usageText

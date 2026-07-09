@@ -339,6 +339,9 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(stdout.last()).toContain("Files");
       expect(stdout.last()).toContain("README.md");
       expect(stdout.last()).toContain("Checks");
+      stdin.emit("keypress", "", { ctrl: true, name: "right" });
+      expect(stripAnsi(stdout.last())).toContain("Workbench width +4 cols.");
+      expect(stripAnsi(stdout.last())).toContain("wb 43 cols");
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
     } finally {

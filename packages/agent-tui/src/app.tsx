@@ -371,6 +371,8 @@ export class TuiApp {
   private selectedFileMentions = new Set<string>();
   private paletteHidden = false;
   private workbenchOpen = false;
+  private toolDetailsOpen = false;
+  private workbenchWidthDelta = 0;
   private changePromptDismissed = false;
   private transcriptScrollOffset = 0;
   private pasteMode = false;
@@ -436,7 +438,7 @@ export class TuiApp {
       return;
     }
     if (key.ctrl && key.name === "t") {
-      this.toggleFocus("tools");
+      this.toggleToolDetails();
       return;
     }
     if (key.name === "f1" || (key.ctrl && key.name === "h")) {
@@ -490,6 +492,10 @@ export class TuiApp {
     if (key.name === "delete") {
       deleteForward(this.composer);
       this.afterComposerEdit();
+      return;
+    }
+    if (this.workbenchOpen && key.ctrl && (key.name === "left" || key.name === "right")) {
+      this.adjustWorkbenchWidth(key.name === "right" ? 4 : -4);
       return;
     }
     if (key.name === "left") {
@@ -690,6 +696,7 @@ export class TuiApp {
       return;
     }
     if (this.focusMode !== "none") {
+      if (this.focusMode === "tools") this.toolDetailsOpen = false;
       this.focusMode = "none";
       this.message = "Detail closed.";
       this.render();
@@ -799,7 +806,7 @@ export class TuiApp {
       return;
     }
     if (name === "/tools") {
-      this.toggleFocus("tools");
+      this.toggleToolDetails();
       return;
     }
     if (name === "/files") {
@@ -877,6 +884,7 @@ export class TuiApp {
         return;
       }
       this.focusMode = "diff";
+      this.toolDetailsOpen = false;
       this.message = `Diff ${this.diffMode} opened.`;
       await this.refreshDiff();
       this.render();
@@ -1056,6 +1064,8 @@ export class TuiApp {
     this.localCommandSnapshot = null;
     this.focusMode = "none";
     this.workbenchOpen = false;
+    this.toolDetailsOpen = false;
+    this.workbenchWidthDelta = 0;
     this.changePromptDismissed = false;
     this.transcriptScrollOffset = 0;
     this.message = message;
@@ -1076,6 +1086,12 @@ export class TuiApp {
     this.render();
   }
 
+  private adjustWorkbenchWidth(delta: number): void {
+    this.workbenchWidthDelta = Math.max(-16, Math.min(40, this.workbenchWidthDelta + delta));
+    this.message = `Workbench width ${this.workbenchWidthDelta >= 0 ? "+" : ""}${this.workbenchWidthDelta} cols.`;
+    this.render();
+  }
+
   private toggleMode(): void {
     this.mode = this.mode === "build" ? "plan" : "build";
     this.message = `Mode set to ${this.mode}.`;
@@ -1084,13 +1100,23 @@ export class TuiApp {
 
   private openFocus(mode: Exclude<FocusMode, "none">, message: string): void {
     this.focusMode = mode;
+    this.toolDetailsOpen = mode === "tools";
     this.message = message;
     this.render();
   }
 
   private toggleFocus(mode: Exclude<FocusMode, "none">): void {
     this.focusMode = this.focusMode === mode ? "none" : mode;
+    this.toolDetailsOpen = this.focusMode === "tools";
     this.message = this.focusMode === mode ? `${mode} opened.` : `${mode} closed.`;
+    this.render();
+  }
+
+  private toggleToolDetails(): void {
+    const opening = this.focusMode !== "tools";
+    this.focusMode = opening ? "tools" : "none";
+    this.toolDetailsOpen = opening;
+    this.message = opening ? "Tool details opened." : "Tool details collapsed.";
     this.render();
   }
 
@@ -1150,6 +1176,7 @@ export class TuiApp {
       return;
     }
     this.focusMode = "diff";
+    this.toolDetailsOpen = false;
     this.message = "Diff opened.";
     await this.refreshDiff();
     this.render();
@@ -1161,6 +1188,7 @@ export class TuiApp {
     this.abortController = new AbortController();
     this.result = null;
     this.focusMode = "none";
+    this.toolDetailsOpen = false;
     this.changePromptDismissed = false;
     this.transcriptScrollOffset = 0;
     this.message = "Run started.";
@@ -1272,6 +1300,9 @@ export class TuiApp {
 
   private completionMessage(result: AgentRunResult): string {
     if (result.status === "completed") return "Run completed.";
+    if (result.status === "stopped" && result.finishReason === "max_turns" && (result.changedFiles?.length ?? 0) === 0) {
+      return "Run stopped: max_turns. No files changed.";
+    }
     if (result.status === "stopped") return `Run stopped: ${result.finishReason}.`;
     return `Run failed: ${result.lastError ?? result.finishReason}.`;
   }
@@ -1364,6 +1395,8 @@ export class TuiApp {
       entries,
       activityItems,
       workbenchOpen: this.workbenchOpen,
+      toolDetailsOpen: this.toolDetailsOpen,
+      workbenchWidthDelta: this.workbenchWidthDelta,
       filePaths: this.filePaths,
       diffText: this.diffText,
       overlay,
@@ -1589,7 +1622,7 @@ export class TuiApp {
       "Enter send   Ctrl+J newline   Tab workbench   Shift+Tab plan/build   Esc close/clear",
       "Left/Right move cursor   Home/End or Ctrl+A/E start/end   Ctrl+U/K kill   Ctrl+W delete word   Ctrl+Y yank",
       "Ctrl+D diff   Ctrl+T tools   F1 help   /files workbench   @ file mention   !command shell",
-      "PageUp/PageDown scroll transcript   Ctrl+C cancel active run; Ctrl+C again/idle exits",
+      "PageUp/PageDown scroll transcript   Ctrl+Left/Right resize workbench   Ctrl+C cancel active run; Ctrl+C again/idle exits",
       "Local: cd <path>, pwd, ls/dir, clear/cls",
       "",
       "Commands",
@@ -1651,6 +1684,7 @@ export class TuiApp {
     };
     this.localEntries.push(entry);
     this.focusMode = "test";
+    this.toolDetailsOpen = false;
     this.message = `Running ${kind} command.`;
     this.render();
     const result = await runLocalShellCommand(command, this.options.workspace, this.options.commandTimeoutSec ?? 60);
