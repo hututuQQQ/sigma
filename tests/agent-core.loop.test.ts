@@ -362,6 +362,60 @@ describe("agent loop", () => {
     expect(summary.step_outcomes.some((item: { reason?: string }) => item.reason === "mutation_evidence_recorded")).toBe(true);
   });
 
+  it("does not count historical mutation evidence as verify-step progress", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "edit-notes",
+              type: "function",
+              function: {
+                name: "edit",
+                arguments: {
+                  path: "notes.txt",
+                  oldString: "hello",
+                  newString: "hello fixed",
+                  expectedReplacements: 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", toolCalls: [readCall("verify-read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("verify-read-2")] } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 8,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off"
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("blocked_no_verification_progress");
+    expect(result.changedFiles).toEqual(["notes.txt"]);
+    expect(result.stepOutcomes?.filter((item) => item.reason === "mutation_evidence_recorded")).toHaveLength(1);
+    expect(result.stepOutcomes?.map((item) => item.reason)).toContain("no_step_progress_post_mutation");
+    expect(result.loopDiagnostics).toMatchObject({
+      phase: "stopped",
+      lastControllerReason: "blocked_no_verification_progress"
+    });
+    await expect(readFile(path.join(dir, "notes.txt"), "utf8")).resolves.toBe("hello fixed");
+  });
+
   it("stops at max turns", async () => {
     const dir = await tempWorkspace();
     const model = new FakeModel([
@@ -650,6 +704,49 @@ describe("agent loop", () => {
     ]);
     expect(events.filter((event) => event.type === "tool_end").some((event) => event.metadata?.result && (event.metadata.result as { ok?: boolean }).ok === false)).toBe(true);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
+  });
+
+  it("guards a repeated single tool call even when the surrounding batch changes", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const repeatedRead = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "missing.txt" } }
+    });
+    const grepCall = (id: string, pattern: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "grep", arguments: { pattern, path: "." } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-1"), grepCall("grep-1", "alpha")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-2"), grepCall("grep-2", "beta")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-3"), grepCall("grep-3", "gamma")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-4"), grepCall("grep-4", "delta")] } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "inspect the workspace",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 5,
+      permissionMode: "yolo",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("loop_guard_repeated_tool");
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
+      "nudge",
+      "stop"
+    ]);
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => String(event.metadata?.signature))).toEqual([
+      expect.stringContaining("call:read:"),
+      expect.stringContaining("call:read:")
+    ]);
   });
 
   it("warns on repeated tool calls without skipping execution or stopping", async () => {

@@ -9,6 +9,7 @@ import type {
   AgentStepOutcomeKind,
   AgentStepOutcomeSummary,
   AgentTaskIntent,
+  EvidenceRecord,
   LoopGuardMode,
   MutationEvidenceRecord,
   ProtocolRepairRecord,
@@ -25,8 +26,13 @@ const BROAD_READ_TOOLS = new Set(["glob", "read_many", "repo_query", "symbol_sea
 const MUTATION_TOOLS = new Set(["edit", "write", "apply_patch"]);
 const EXEC_MUTATION_TOOLS = new Set(["bash", "shell_session", "service"]);
 const VALIDATION_TOOLS = new Set(["validate"]);
+const DIFF_TOOLS = new Set(["git_diff", "git_status"]);
 const IMPLEMENT_DISABLED_TOOLS = new Set(["glob", "read_many", "repo_query", "symbol_search", "memory", "list"]);
 const STRICT_IMPLEMENT_DISABLED_TOOLS = new Set([...IMPLEMENT_DISABLED_TOOLS, "read", "grep"]);
+const VERIFY_DISABLED_TOOLS = new Set(["glob", "read_many", "repo_query", "symbol_search", "memory", "list"]);
+const VERIFY_NO_PROGRESS_LIMIT = 2;
+const STRICT_IMPLEMENT_NO_MUTATION_LIMIT = 3;
+const REPAIR_ATTEMPT_LIMIT = 1;
 
 export type QueuedAgentMessage =
   | { role: "user" | "system"; content: string }
@@ -89,6 +95,8 @@ function callsSignature(calls: ToolCall[]): { key: string; preview: string } {
 export class RepeatedToolCallGuard {
   private lastSignature = "";
   private streak = 0;
+  private lastSingleSignatures = new Set<string>();
+  private singleStreaks = new Map<string, number>();
   private nudgedForSignature = new Set<string>();
 
   constructor(
@@ -99,6 +107,9 @@ export class RepeatedToolCallGuard {
   observe(calls: ToolCall[]): LoopGuardDecision {
     if (this.mode === "off" || calls.length === 0) return { action: "none" };
     const signature = callsSignature(calls);
+    const singleDecision = this.observeSingleCalls(calls);
+    if (singleDecision.action !== "none") return singleDecision;
+
     if (signature.key === this.lastSignature) {
       this.streak += 1;
     } else {
@@ -109,26 +120,54 @@ export class RepeatedToolCallGuard {
       return { action: "none", signature: signature.key, signaturePreview: signature.preview, streak: this.streak };
     }
 
-    const alreadyNudged = this.nudgedForSignature.has(signature.key);
+    return this.repeatedDecision(`batch:${signature.key}`, signature.preview, this.streak);
+  }
+
+  private observeSingleCalls(calls: ToolCall[]): LoopGuardDecision {
+    const current = new Set<string>();
+    let repeated: { key: string; preview: string; streak: number } | null = null;
+    for (const call of calls) {
+      const signature = callSignature(call);
+      const key = `call:${signature.key}`;
+      current.add(key);
+      const streak = this.lastSingleSignatures.has(key)
+        ? (this.singleStreaks.get(key) ?? 1) + 1
+        : 1;
+      this.singleStreaks.set(key, streak);
+      if (streak >= this.threshold && (!repeated || streak > repeated.streak)) {
+        repeated = { key, preview: signature.preview, streak };
+      }
+    }
+    for (const key of [...this.singleStreaks.keys()]) {
+      if (!current.has(key)) this.singleStreaks.delete(key);
+    }
+    this.lastSingleSignatures = current;
+    return repeated
+      ? this.repeatedDecision(repeated.key, repeated.preview, repeated.streak)
+      : { action: "none" };
+  }
+
+  private repeatedDecision(signatureKey: string, signaturePreview: string, streak: number): LoopGuardDecision {
+    const alreadyNudged = this.nudgedForSignature.has(signatureKey);
     if (alreadyNudged && this.mode === "stop") {
       return {
         action: "stop",
-        signature: signature.key,
-        signaturePreview: signature.preview,
-        streak: this.streak,
+        signature: signatureKey,
+        signaturePreview,
+        streak,
         message: "Sigma stopped because the model repeated the same tool call sequence after a recovery nudge."
       };
     }
 
-    this.nudgedForSignature.add(signature.key);
+    this.nudgedForSignature.add(signatureKey);
     return {
       action: "nudge",
-      signature: signature.key,
-      signaturePreview: signature.preview,
-      streak: this.streak,
+      signature: signatureKey,
+      signaturePreview,
+      streak,
       skipToolCalls: this.mode === "stop",
       message: [
-        "Loop guard: you have repeated the same tool call sequence several times.",
+        "Loop guard: you have repeated the same tool call several times.",
         "Do not repeat that exact call again. Reassess the result, change the approach, or explain why no further tool use is useful."
       ].join("\n")
     };
@@ -171,8 +210,11 @@ export interface StructuredLoopDecision {
     | "completed_with_changes"
     | "completed_no_changes_allowed"
     | "blocked_no_feasible_edit"
+    | "blocked_no_verification_progress"
+    | "blocked_validation_failed"
     | "protocol_violation"
     | "loop_guard_repeated_tool"
+    | "max_wall_time"
     | "max_steps";
 }
 
@@ -188,6 +230,17 @@ export interface TurnObservation {
   results: ToolResult[];
   changedFilesBefore: string[];
   changedFilesAfter: string[];
+  evidence: AgentStepEvidence;
+}
+
+export interface AgentStepEvidence {
+  newMutationEvidence: MutationEvidenceRecord[];
+  newWorkspaceDiffFiles: string[];
+  newValidationEvidence: EvidenceRecord[];
+  changedFilesDelta: string[];
+  toolNames: string[];
+  readIntentSignatures: string[];
+  deniedToolCalls: string[];
 }
 
 function timestamp(): string {
@@ -216,6 +269,27 @@ function resultOk(result: ToolResult | undefined): boolean {
   return result?.ok === true;
 }
 
+function commandTextArg(call: ToolCall): string {
+  const args = toolArgs(call);
+  if (call.function.name === "shell_session") return typeof args.input === "string" ? args.input : "";
+  return typeof args.command === "string" ? args.command : "";
+}
+
+function commandLooksValidation(command: string): boolean {
+  return /\b(test|build|lint|check|verify|validate|pytest|go test|cargo test|mvn test|gradle test|tsc|typecheck|type-check|vitest|jest|mocha|eslint|ruff)\b/i.test(command);
+}
+
+function callLooksValidation(call: ToolCall): boolean {
+  const name = toolName(call);
+  if (VALIDATION_TOOLS.has(name) || DIFF_TOOLS.has(name)) return true;
+  if (name === "bash" || name === "shell_session") return commandLooksValidation(commandTextArg(call));
+  return false;
+}
+
+function validationEvidenceCounts(record: EvidenceRecord): boolean {
+  return record.executable || record.kind === "manual-check" || record.kind === "service";
+}
+
 function resultChangedFiles(result: ToolResult): string[] {
   const metadata = toolAllMetadata(result);
   if (metadata.checkOnly === true) return [];
@@ -238,9 +312,9 @@ function uniqueSorted(values: Iterable<string>): string[] {
 export class MutationEvidenceLedger {
   private readonly records: MutationEvidenceRecord[] = [];
 
-  add(record: Omit<MutationEvidenceRecord, "timestamp"> & { timestamp?: string }): void {
+  add(record: Omit<MutationEvidenceRecord, "timestamp"> & { timestamp?: string }): MutationEvidenceRecord | null {
     const files = uniqueSorted(record.files);
-    if (files.length === 0) return;
+    if (files.length === 0) return null;
     const normalized: MutationEvidenceRecord = {
       ...record,
       files,
@@ -248,17 +322,18 @@ export class MutationEvidenceLedger {
     };
     const key = `${normalized.kind}:${normalized.toolCallId ?? ""}:${normalized.toolName ?? ""}:${normalized.files.join("|")}`;
     if (this.records.some((item) => `${item.kind}:${item.toolCallId ?? ""}:${item.toolName ?? ""}:${item.files.join("|")}` === key)) {
-      return;
+      return null;
     }
     this.records.push(normalized);
+    return normalized;
   }
 
-  observeTool(call: ToolCall, result: ToolResult): void {
-    if (!result.ok) return;
-    if (!MUTATION_TOOLS.has(call.function.name) && !EXEC_MUTATION_TOOLS.has(call.function.name)) return;
+  observeTool(call: ToolCall, result: ToolResult): MutationEvidenceRecord | null {
+    if (!result.ok) return null;
+    if (!MUTATION_TOOLS.has(call.function.name) && !EXEC_MUTATION_TOOLS.has(call.function.name)) return null;
     const files = resultChangedFiles(result);
-    if (files.length === 0) return;
-    this.add({
+    if (files.length === 0) return null;
+    return this.add({
       kind: "tool",
       files,
       toolName: call.function.name,
@@ -267,8 +342,8 @@ export class MutationEvidenceLedger {
     });
   }
 
-  observeWorkspaceDiff(files: string[], summary = "Workspace changed during tool execution."): void {
-    this.add({ kind: "workspace_diff", files, summary });
+  observeWorkspaceDiff(files: string[], summary = "Workspace changed during tool execution."): MutationEvidenceRecord | null {
+    return this.add({ kind: "workspace_diff", files, summary });
   }
 
   all(): MutationEvidenceRecord[] {
@@ -301,6 +376,9 @@ export class AgentStepProcessor {
   private lastOutcome: AgentStepOutcomeKind | undefined;
   private implementStartTurn: number | undefined;
   private implementNoMutationTurns = 0;
+  private verifyNoProgressTurns = 0;
+  private postMutationNoProgressTurns = 0;
+  private repairAttempts = 0;
   private strictImplement = false;
   private plainNoEvidenceTerminalAttempts = 0;
 
@@ -317,6 +395,14 @@ export class AgentStepProcessor {
   toolPolicy(): StructuredLoopToolPolicy {
     if (this.options.intent !== "mutation") {
       return { phase: this.phase, disabledTools: new Set(), toolsDisabled: false };
+    }
+    if (this.phase === "verify") {
+      return {
+        phase: this.phase,
+        disabledTools: new Set(VERIFY_DISABLED_TOOLS),
+        toolsDisabled: false,
+        reason: this.lastReason ?? "Verification phase requires validation, diff review, final summary, or a concrete blocker."
+      };
     }
     if (this.phase === "implement" || this.phase === "repair") {
       return {
@@ -459,29 +545,45 @@ export class AgentStepProcessor {
 
   observeTurn(observation: TurnObservation): StructuredLoopDecision {
     this.providerTurns = observation.turn;
-    const toolNames = observation.calls.map(toolName);
-    const beforeCount = observation.changedFilesBefore.length;
-    const afterCount = observation.changedFilesAfter.length;
-    const changed = afterCount > beforeCount || this.mutationEvidence.hasEvidence();
-    const hasMutationTool = observation.calls.some((call, index) => MUTATION_TOOLS.has(toolName(call)) && resultOk(observation.results[index]));
-    const hasValidationTool = observation.calls.some((call, index) => VALIDATION_TOOLS.has(toolName(call)) && resultOk(observation.results[index]));
+    const toolNames = observation.evidence.toolNames.length > 0 ? observation.evidence.toolNames : observation.calls.map(toolName);
+    const stepMutationFiles = uniqueSorted([
+      ...observation.evidence.newMutationEvidence.flatMap((record) => record.files),
+      ...observation.evidence.changedFilesDelta,
+      ...observation.evidence.newWorkspaceDiffFiles
+    ]);
+    const hasStepMutationEvidence = observation.evidence.newMutationEvidence.length > 0 || stepMutationFiles.length > 0;
+    const validationEvidence = observation.evidence.newValidationEvidence.filter(validationEvidenceCounts);
+    const hasValidationEvidence = validationEvidence.length > 0;
+    const validationAttemptIndexes = observation.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => callLooksValidation(call));
+    const hasValidationAttempt = validationAttemptIndexes.length > 0;
+    const hasValidationFailure = validationAttemptIndexes.some(({ index }) => !resultOk(observation.results[index]));
     const hasReadTool = observation.calls.some((call) => READ_TOOLS.has(toolName(call)));
     const hasBroadReadTool = observation.calls.some((call) => BROAD_READ_TOOLS.has(toolName(call)));
+    const hasCumulativeMutationEvidence = observation.changedFilesAfter.length > 0 || this.mutationEvidence.hasEvidence();
 
-    if (changed || hasMutationTool) {
+    if (hasStepMutationEvidence) {
       this.mutationCount += 1;
       this.noChangeTurns = 0;
       this.readOnlyTurns = 0;
+      this.verifyNoProgressTurns = 0;
+      this.postMutationNoProgressTurns = 0;
       this.implementNoMutationTurns = 0;
       this.strictImplement = false;
       if (this.options.intent === "mutation") this.transition(observation.turn, "verify", "mutation_evidence_recorded");
-    } else if (observation.calls.length > 0) {
-      this.noChangeTurns += 1;
-      if (!hasMutationTool && hasReadTool) this.readOnlyTurns += 1;
-      if (hasBroadReadTool) this.broadReadTurns += 1;
-      if (this.phase === "implement" && !hasMutationTool) this.implementNoMutationTurns += 1;
     }
-    if (hasValidationTool) this.validationCount += 1;
+    if (hasValidationAttempt) this.validationCount += 1;
+    if (!hasStepMutationEvidence && observation.calls.length > 0) {
+      this.noChangeTurns += 1;
+      if (hasReadTool) this.readOnlyTurns += 1;
+      if (hasBroadReadTool) this.broadReadTurns += 1;
+      if (this.phase === "implement") this.implementNoMutationTurns += 1;
+      if (this.phase === "verify" && hasCumulativeMutationEvidence) {
+        this.verifyNoProgressTurns += 1;
+        this.postMutationNoProgressTurns += 1;
+      }
+    }
 
     for (const call of observation.calls) {
       const key = readIntentKey(call);
@@ -501,17 +603,104 @@ export class AgentStepProcessor {
       return { action: "none", outcome: "continue", phase: this.phase };
     }
 
-    if (changed) {
-      this.recordOutcome(observation.turn, "continue", "mutation_evidence_recorded", undefined, observation.changedFilesAfter, toolNames);
+    if (hasStepMutationEvidence) {
+      this.recordOutcome(
+        observation.turn,
+        "continue",
+        "mutation_evidence_recorded",
+        undefined,
+        observation.changedFilesAfter,
+        toolNames,
+        observation.evidence
+      );
       return { action: "none", outcome: "continue", phase: this.phase };
     }
 
     const remainingTurns = Math.max(0, observation.maxTurns - observation.turn);
     if (remainingTurns <= 0) {
-      const message = "Structured loop stopped: max step budget reached before mutation evidence was produced.";
+      const message = hasCumulativeMutationEvidence
+        ? "Structured loop stopped: max step budget reached while waiting for verification or final settlement."
+        : "Structured loop stopped: max step budget reached before mutation evidence was produced.";
       this.transition(observation.turn, "stopped", "max_steps", message);
-      this.recordOutcome(observation.turn, "max_steps", "max_steps", message, observation.changedFilesAfter, toolNames);
+      this.recordOutcome(observation.turn, "max_steps", "max_steps", message, observation.changedFilesAfter, toolNames, observation.evidence);
       return { action: "stop", outcome: "max_steps", phase: this.phase, reason: "max_steps", message, finishReason: "max_steps" };
+    }
+
+    if (hasValidationFailure && hasCumulativeMutationEvidence) {
+      if (this.repairAttempts >= REPAIR_ATTEMPT_LIMIT) {
+        const message = "Structured loop stopped: validation is still failing after the repair budget was used.";
+        this.transition(observation.turn, "stopped", "blocked_validation_failed", message);
+        this.recordOutcome(observation.turn, "blocked", "blocked_validation_failed", message, observation.changedFilesAfter, toolNames, observation.evidence);
+        return {
+          action: "stop",
+          outcome: "blocked",
+          phase: this.phase,
+          reason: "blocked_validation_failed",
+          message,
+          finishReason: "blocked_validation_failed"
+        };
+      }
+      this.repairAttempts += 1;
+      const message = [
+        "Structured loop: validation failed after mutation evidence was recorded.",
+        "Move to a focused repair. Use edit/write/apply_patch or a narrow read of the failing file, then rerun validation."
+      ].join("\n");
+      this.transition(observation.turn, "repair", "validation_failed", message);
+      this.recordOutcome(observation.turn, "needs_follow_up", "validation_failed", message, observation.changedFilesAfter, toolNames, observation.evidence);
+      return { action: "continue", outcome: "needs_follow_up", phase: this.phase, reason: "validation_failed", message };
+    }
+
+    if (hasValidationEvidence && hasCumulativeMutationEvidence) {
+      this.verifyNoProgressTurns = 0;
+      this.postMutationNoProgressTurns = 0;
+      const message = [
+        "Structured loop: verification evidence is recorded for the changed files.",
+        "Do not restart exploration. Provide the final concise summary, or state a concrete blocker if completion is not valid."
+      ].join("\n");
+      this.transition(observation.turn, "final", "validation_evidence_recorded", message);
+      this.recordOutcome(observation.turn, "needs_follow_up", "validation_evidence_recorded", message, observation.changedFilesAfter, toolNames, observation.evidence);
+      return { action: "continue", outcome: "needs_follow_up", phase: this.phase, reason: "validation_evidence_recorded", message };
+    }
+
+    if (hasCumulativeMutationEvidence && this.phase === "verify") {
+      if (this.verifyNoProgressTurns >= VERIFY_NO_PROGRESS_LIMIT) {
+        const message = [
+          "Structured loop stopped: mutation evidence exists, but verification made no step-local progress.",
+          "Read/search/todo-only turns after mutation do not count as progress; run validation, summarize completion, or report a concrete blocker."
+        ].join("\n");
+        this.transition(observation.turn, "stopped", "blocked_no_verification_progress", message);
+        this.recordOutcome(
+          observation.turn,
+          "blocked",
+          "blocked_no_verification_progress",
+          message,
+          observation.changedFilesAfter,
+          toolNames,
+          observation.evidence
+        );
+        return {
+          action: "stop",
+          outcome: "blocked",
+          phase: this.phase,
+          reason: "blocked_no_verification_progress",
+          message,
+          finishReason: "blocked_no_verification_progress"
+        };
+      }
+      const message = [
+        "Structured loop: mutation evidence already exists; this verify step did not add validation or mutation evidence.",
+        "Next action must be validation/diff review, final completion summary, or a concrete blocker. Do not continue broad reading."
+      ].join("\n");
+      this.recordOutcome(
+        observation.turn,
+        "needs_follow_up",
+        "no_step_progress_post_mutation",
+        message,
+        observation.changedFilesAfter,
+        toolNames,
+        observation.evidence
+      );
+      return { action: "continue", outcome: "needs_follow_up", phase: this.phase, reason: "no_step_progress_post_mutation", message };
     }
 
     if (
@@ -522,6 +711,22 @@ export class AgentStepProcessor {
       remainingTurns <= this.options.policy.implementationReserveTurns ||
       (this.phase === "implement" && this.implementNoMutationTurns >= 2)
     ) {
+      if (this.phase === "implement" && this.implementNoMutationTurns >= STRICT_IMPLEMENT_NO_MUTATION_LIMIT) {
+        const message = [
+          "Structured loop stopped: implementation phase repeated without producing mutation evidence.",
+          "Sigma will not keep spending turns on a mutation task when edit/write/apply_patch did not produce a real change."
+        ].join("\n");
+        this.transition(observation.turn, "stopped", "blocked_no_feasible_edit", message);
+        this.recordOutcome(observation.turn, "blocked", "blocked_no_feasible_edit", message, observation.changedFilesAfter, toolNames, observation.evidence);
+        return {
+          action: "stop",
+          outcome: "blocked",
+          phase: this.phase,
+          reason: "blocked_no_feasible_edit",
+          message,
+          finishReason: "blocked_no_feasible_edit"
+        };
+      }
       const reason = this.phase === "implement" && this.implementNoMutationTurns >= 2
         ? "implement_without_mutation"
         : this.broadReadTurns >= this.options.policy.broadExploreLimit || this.repeatedReadIntents > 0
@@ -537,21 +742,25 @@ export class AgentStepProcessor {
       ].join("\n");
       if (this.implementStartTurn === undefined) this.implementStartTurn = observation.turn;
       this.transition(observation.turn, "implement", reason, message);
-      this.recordOutcome(observation.turn, "needs_follow_up", reason, message, observation.changedFilesAfter, toolNames);
+      this.recordOutcome(observation.turn, "needs_follow_up", reason, message, observation.changedFilesAfter, toolNames, observation.evidence);
       return { action: "continue", outcome: "needs_follow_up", phase: this.phase, reason, message };
     }
 
-    this.recordOutcome(observation.turn, "continue", "explore_follow_up", undefined, observation.changedFilesAfter, toolNames);
+    this.recordOutcome(observation.turn, "continue", "explore_follow_up", undefined, observation.changedFilesAfter, toolNames, observation.evidence);
     return { action: "none", outcome: "continue", phase: this.phase };
   }
 
-  observeMutationEvidence(observations: ToolObservation[], workspaceDiffFiles: string[]): void {
+  observeMutationEvidence(observations: ToolObservation[], workspaceDiffFiles: string[]): MutationEvidenceRecord[] {
+    const records: MutationEvidenceRecord[] = [];
     for (const observation of observations) {
-      this.mutationEvidence.observeTool(observation.call, observation.result);
+      const record = this.mutationEvidence.observeTool(observation.call, observation.result);
+      if (record) records.push(record);
     }
     if (workspaceDiffFiles.length > 0) {
-      this.mutationEvidence.observeWorkspaceDiff(workspaceDiffFiles);
+      const record = this.mutationEvidence.observeWorkspaceDiff(workspaceDiffFiles);
+      if (record) records.push(record);
     }
+    return records;
   }
 
   observeCompaction(turn: number, nextActions: string[]): StructuredLoopDecision {
@@ -608,6 +817,8 @@ export class AgentStepProcessor {
       repeatedReadIntents: this.repeatedReadIntents,
       mutationCount: this.mutationCount,
       validationCount: this.validationCount,
+      verifyNoProgressTurns: this.verifyNoProgressTurns,
+      postMutationNoProgressTurns: this.postMutationNoProgressTurns,
       forcedActions: [...this.forcedActions],
       ...(this.lastReason ? { lastControllerReason: this.lastReason } : {})
     };
@@ -615,6 +826,19 @@ export class AgentStepProcessor {
 
   markFinal(turn: number, reason: string): void {
     this.transition(turn, "final", reason);
+  }
+
+  observeBudgetStop(turn: number, finishReason: "max_wall_time" | "max_steps", message: string): StructuredLoopDecision {
+    this.transition(turn, "stopped", finishReason, message);
+    this.recordOutcome(turn, "max_steps", finishReason, message);
+    return {
+      action: "stop",
+      outcome: "max_steps",
+      phase: this.phase,
+      reason: finishReason,
+      message,
+      finishReason
+    };
   }
 
   private legacyMode(): AgentLoopDiagnostics["mode"] {
@@ -650,9 +874,17 @@ export class AgentStepProcessor {
     reason?: string,
     message?: string,
     changedFiles?: string[],
-    toolNames?: string[]
+    toolNames?: string[],
+    evidence?: AgentStepEvidence
   ): void {
     this.lastOutcome = outcome;
+    const newMutationFiles = evidence
+      ? uniqueSorted([
+          ...evidence.newMutationEvidence.flatMap((record) => record.files),
+          ...evidence.changedFilesDelta,
+          ...evidence.newWorkspaceDiffFiles
+        ])
+      : [];
     this.stepOutcomes.push({
       turn,
       phase: this.phase,
@@ -661,6 +893,10 @@ export class AgentStepProcessor {
       ...(message ? { message } : {}),
       ...(toolNames && toolNames.length > 0 ? { toolNames } : {}),
       ...(changedFiles && changedFiles.length > 0 ? { changedFiles } : {}),
+      ...(newMutationFiles.length > 0 ? { newMutationFiles } : {}),
+      ...(evidence && evidence.newValidationEvidence.length > 0 ? { validationEvidence: evidence.newValidationEvidence.length } : {}),
+      ...(evidence && evidence.deniedToolCalls.length > 0 ? { deniedToolCalls: evidence.deniedToolCalls } : {}),
+      ...(evidence && evidence.readIntentSignatures.length > 0 ? { readIntentSignatures: evidence.readIntentSignatures } : {}),
       timestamp: timestamp()
     });
   }

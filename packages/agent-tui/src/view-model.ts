@@ -688,8 +688,12 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
     const usageText = (options.result.usage.totalTokens ?? 0) > 0 ? formatUsage(options.result.usage) : "";
     const changedCount = options.result.changedFiles?.length ?? 0;
     const noChanges = changedCount === 0 && options.result.status === "stopped";
+    const phase = options.result.loopDiagnostics?.phase;
+    const reason = options.result.loopDiagnostics?.lastControllerReason;
     const resultText = [
       `${options.result.status} ${options.result.finishReason}`,
+      phase ? `phase=${phase}` : "",
+      reason ? `reason=${reason}` : "",
       noChanges ? "no files changed" : changedCount > 0 ? `${changedCount} changed` : "",
       options.result.toolCalls > 0 ? `${options.result.toolCalls} tools` : "",
       options.result.turns > 0 ? `${options.result.turns} turns` : "",

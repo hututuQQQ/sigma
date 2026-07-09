@@ -122,11 +122,12 @@ describe("ContextManager compaction", () => {
     expect(result.artifact).toMatchObject({
       objective: "ship the refactor",
       changed_files: ["src/app.ts"],
-      current_plan: ["pending: rerun tests"]
+      phase: "repair",
+      current_plan: ["active phase: repair", "deferred todo: pending: rerun tests"]
     });
     expect(result.artifact?.failed_attempts[0]).toContain("test_failure x1");
     expect(result.artifact?.validation_evidence[0]).toContain("failed: test");
-    expect(result.artifact?.next_actions[0]).toContain("rerun tests");
+    expect(result.artifact?.next_actions[0]).toContain("deferred todo: pending: rerun tests");
   });
 
   it("keeps deterministic fallback output stable", async () => {

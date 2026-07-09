@@ -120,6 +120,11 @@ function stringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function stringArrayWithFallback(value: unknown, fallback: string[] | undefined): string[] {
+  const parsed = stringArray(value);
+  return parsed.length > 0 ? parsed : fallback ?? [];
+}
+
 function artifactFromJson(parsed: unknown, fallback: CompactionArtifact): CompactionArtifact {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Model compaction response JSON must be an object.");
@@ -129,8 +134,8 @@ function artifactFromJson(parsed: unknown, fallback: CompactionArtifact): Compac
     objective: typeof value.objective === "string" && value.objective.trim() ? value.objective.trim() : fallback.objective,
     ...(typeof value.task_intent === "string" && value.task_intent.trim() ? { task_intent: value.task_intent.trim() } : fallback.task_intent ? { task_intent: fallback.task_intent } : {}),
     ...(typeof value.phase === "string" && value.phase.trim() ? { phase: value.phase.trim() } : fallback.phase ? { phase: fallback.phase } : {}),
-    current_plan: stringArray(value.current_plan),
-    changed_files: stringArray(value.changed_files),
+    current_plan: stringArrayWithFallback(value.current_plan, fallback.current_plan),
+    changed_files: stringArrayWithFallback(value.changed_files, fallback.changed_files),
     files_read: stringArray(value.files_read),
     read_ranges: stringArray(value.read_ranges),
     ...(value.loop_counters && typeof value.loop_counters === "object" && !Array.isArray(value.loop_counters)
@@ -139,12 +144,12 @@ function artifactFromJson(parsed: unknown, fallback: CompactionArtifact): Compac
     mutation_evidence: stringArray(value.mutation_evidence).length > 0
       ? stringArray(value.mutation_evidence)
       : fallback.mutation_evidence ?? [],
-    forbidden_repeats: stringArray(value.forbidden_repeats),
-    key_decisions: stringArray(value.key_decisions),
-    failed_attempts: stringArray(value.failed_attempts),
-    validation_evidence: stringArray(value.validation_evidence),
-    unresolved_questions: stringArray(value.unresolved_questions),
-    next_actions: stringArray(value.next_actions)
+    forbidden_repeats: stringArrayWithFallback(value.forbidden_repeats, fallback.forbidden_repeats),
+    key_decisions: stringArrayWithFallback(value.key_decisions, fallback.key_decisions),
+    failed_attempts: stringArrayWithFallback(value.failed_attempts, fallback.failed_attempts),
+    validation_evidence: stringArrayWithFallback(value.validation_evidence, fallback.validation_evidence),
+    unresolved_questions: stringArrayWithFallback(value.unresolved_questions, fallback.unresolved_questions),
+    next_actions: stringArrayWithFallback(value.next_actions, fallback.next_actions)
   };
 }
 

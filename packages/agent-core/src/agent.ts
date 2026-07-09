@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
-import { AgentLoopEngine, AgentStepProcessor, type StructuredLoopDecision } from "./agent-loop-engine.js";
+import { AgentLoopEngine, AgentStepProcessor, type AgentStepEvidence, type StructuredLoopDecision } from "./agent-loop-engine.js";
 import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
@@ -156,6 +156,23 @@ function toolCallCountsAsCommand(call: ToolCall): boolean {
   if (call.function.name === "bash") return true;
   if (call.function.name !== "shell_session") return false;
   return toolArgumentsObject(call.function.arguments)?.action === "send";
+}
+
+const STEP_READ_TOOLS = new Set(["read", "read_many", "grep", "glob", "repo_query", "symbol_search", "memory", "list"]);
+
+function stepReadIntentSignature(call: ToolCall): string | null {
+  const name = call.function.name;
+  if (!STEP_READ_TOOLS.has(name)) return null;
+  const args = toolArgumentsObject(call.function.arguments) ?? {};
+  const pathValue = typeof args.path === "string"
+    ? args.path
+    : typeof args.cwd === "string"
+      ? args.cwd
+      : Array.isArray(args.files)
+        ? args.files.slice(0, 5).map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(",")
+        : "";
+  const pattern = typeof args.pattern === "string" ? args.pattern : typeof args.query === "string" ? args.query : "";
+  return `${name}:${pathValue}:${pattern}`.slice(0, 300);
 }
 
 function compactUnknownForTrace(value: unknown, label: string, maxChars: number): unknown {
@@ -730,7 +747,15 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     while (turns < maxTurns) {
       const elapsedSec = (Date.now() - startedAt) / 1000;
       if (elapsedSec >= maxWallTimeSec) {
+        const decision = stepProcessor.observeBudgetStop(
+          turns,
+          "max_wall_time",
+          "Structured loop stopped: max wall time reached before starting another model turn."
+        );
+        await recordLoopDecision(decision, turns, `${runId}:turn:${turns + 1}:preflight`);
         finishReason = "max_wall_time";
+        lastError = decision.message ?? "Structured loop stopped: max wall time reached.";
+        finalMessage = decision.message ?? finalMessage;
         break;
       }
 
@@ -1018,6 +1043,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         }
       });
 
+      const stepValidationEvidence: AgentStepEvidence["newValidationEvidence"] = [];
       for (const execution of executions as Array<ToolRuntimeExecution<ToolExecutionValue>>) {
         const call = execution.call;
         const result = execution.result;
@@ -1050,6 +1076,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           args: call.function.arguments,
           result
         });
+        if (evidence && (evidence.executable || evidence.kind === "manual-check" || evidence.kind === "service")) {
+          stepValidationEvidence.push(evidence);
+        }
         const failureAnalysisStart = workflow.failureAnalyses.length;
         const failurePattern = recordToolInWorkflow({
           workflow,
@@ -1097,7 +1126,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         context.runState.changedFiles.add(filePath);
       }
       const changedFilesAfterTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
-      stepProcessor.observeMutationEvidence(
+      const newMutationEvidence = stepProcessor.observeMutationEvidence(
         (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => ({
           call: execution.call,
           result: execution.result
@@ -1107,13 +1136,26 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (context.runState.mutationEvidence || stepProcessor.mutationEvidence.all().length > 0) {
         context.runState.mutationEvidence = stepProcessor.mutationEvidence.all();
       }
+      const changedBeforeSet = new Set(changedFilesBeforeTools);
+      const stepEvidence: AgentStepEvidence = {
+        newMutationEvidence,
+        newWorkspaceDiffFiles: workspaceDiffFiles,
+        newValidationEvidence: stepValidationEvidence,
+        changedFilesDelta: changedFilesAfterTools.filter((filePath) => !changedBeforeSet.has(filePath)),
+        toolNames: (calls as ToolCall[]).map((call) => call.function.name),
+        readIntentSignatures: (calls as ToolCall[]).map(stepReadIntentSignature).filter((item): item is string => Boolean(item)),
+        deniedToolCalls: (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>)
+          .filter((execution) => toolAllMetadata(execution.result).loopControlDenied === true)
+          .map((execution) => execution.call.function.name)
+      };
       const controllerDecision = stepProcessor.observeTurn({
         turn: turns,
         maxTurns,
         calls: calls as ToolCall[],
         results: (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => execution.result),
         changedFilesBefore: changedFilesBeforeTools,
-        changedFilesAfter: changedFilesAfterTools
+        changedFilesAfter: changedFilesAfterTools,
+        evidence: stepEvidence
       });
       await recordEvent(event(
         runId,

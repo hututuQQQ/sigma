@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse } from "../packages/agent-ai/src/index.js";
-import { runAgent } from "../packages/agent-core/src/index.js";
+import { runAgent, writeRunSummary, type AgentRunResult } from "../packages/agent-core/src/index.js";
 
 class SummaryModel implements ModelClient {
   readonly provider = "deepseek" as const;
@@ -135,5 +135,56 @@ describe("summary JSON fields", () => {
     const summary = JSON.parse(await readFile(summaryPath, "utf8"));
     expect(summary.tool_calls).toBe(2);
     expect(summary.commands_executed).toBe(1);
+  });
+
+  it("writes parseable summary JSON for complex diagnostic text", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "sigma-summary-json-"));
+    const summaryPath = path.join(dir, "summary.json");
+    const result: AgentRunResult = {
+      status: "stopped",
+      finishReason: "blocked_no_verification_progress",
+      turns: 3,
+      toolCalls: 2,
+      commandsExecuted: 1,
+      usage: { inputTokens: 1, outputTokens: 2, cacheTokens: 0, totalTokens: 3 },
+      provider: "deepseek",
+      model: "fake-summary-model",
+      durationMs: 10,
+      lastError: "validation said: {\"ok\":false}\nnext line with } brace",
+      finalMessage: "raw diagnostic:\n```json\n{\"unterminated-looking\":\"value\"}\n```",
+      changedFiles: ["src/app.ts"],
+      loopDiagnostics: {
+        intent: "mutation",
+        mode: "normal",
+        phase: "stopped",
+        stepOutcome: "blocked",
+        providerTurns: 3,
+        readOnlyTurns: 2,
+        noChangeTurns: 2,
+        broadReadTurns: 0,
+        repeatedReadIntents: 0,
+        mutationCount: 1,
+        validationCount: 0,
+        verifyNoProgressTurns: 2,
+        postMutationNoProgressTurns: 2,
+        forcedActions: ["blocked_no_verification_progress"],
+        lastControllerReason: "blocked_no_verification_progress"
+      },
+      stepOutcomes: [{
+        turn: 3,
+        phase: "stopped",
+        outcome: "blocked",
+        reason: "blocked_no_verification_progress",
+        message: "diagnostic with braces { } and newlines\nstill valid",
+        toolNames: ["read"],
+        changedFiles: ["src/app.ts"],
+        timestamp: new Date(0).toISOString()
+      }]
+    };
+
+    await writeRunSummary(result, summaryPath);
+    const parsed = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(parsed.finish_reason).toBe("blocked_no_verification_progress");
+    expect(parsed.loop_diagnostics.lastControllerReason).toBe("blocked_no_verification_progress");
   });
 });

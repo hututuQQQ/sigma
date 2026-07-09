@@ -226,6 +226,8 @@ export type AgentFinishReason =
   | "completed_with_changes"
   | "completed_no_changes_allowed"
   | "blocked_no_feasible_edit"
+  | "blocked_no_verification_progress"
+  | "blocked_validation_failed"
   | "protocol_violation"
   | "loop_guard_repeated_tool"
   | "max_steps"
@@ -271,6 +273,10 @@ export interface AgentStepOutcomeSummary {
   message?: string;
   toolNames?: string[];
   changedFiles?: string[];
+  newMutationFiles?: string[];
+  validationEvidence?: number;
+  deniedToolCalls?: string[];
+  readIntentSignatures?: string[];
   timestamp: string;
 }
 
@@ -322,6 +328,8 @@ export interface AgentLoopDiagnostics {
   repeatedReadIntents: number;
   mutationCount: number;
   validationCount: number;
+  verifyNoProgressTurns?: number;
+  postMutationNoProgressTurns?: number;
   forcedActions: string[];
   lastControllerReason?: string;
 }

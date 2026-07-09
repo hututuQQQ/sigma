@@ -129,6 +129,7 @@ export function createDeterministicCompactionArtifact(request: CompactionRequest
   const changedFiles = request.changedFiles ?? workflow?.changed_files ?? [];
   const loop = request.loopDiagnostics;
   const mutationEvidence = request.mutationEvidence ?? [];
+  const activePhase = loop?.phase ?? workflow?.phase;
   const pendingTodos = todos.filter((todo) => todo.status !== "done");
   const completedTodos = todos.filter((todo) => todo.status === "done");
   const failurePatterns = workflow?.failure_patterns ?? [];
@@ -149,12 +150,13 @@ export function createDeterministicCompactionArtifact(request: CompactionRequest
   return {
     objective: compactLine(request.objective ?? firstUserContent(request.messages), 1000),
     ...(loop?.intent ? { task_intent: loop.intent } : {}),
-    ...(workflow?.phase ? { phase: workflow.phase } : {}),
-    current_plan: pendingTodos.length > 0
-      ? pendingTodos.map(formatTodo)
-      : workflow?.phase
-        ? [`workflow phase: ${workflow.phase}`]
-        : [],
+    ...(activePhase ? { phase: activePhase } : {}),
+    current_plan: activePhase
+      ? [
+          `active phase: ${activePhase}`,
+          ...pendingTodos.slice(0, 5).map((todo) => `deferred todo: ${formatTodo(todo)}`)
+        ]
+      : pendingTodos.map(formatTodo),
     changed_files: [...changedFiles],
     ...(loop ? {
       loop_counters: {
@@ -189,9 +191,15 @@ export function createDeterministicCompactionArtifact(request: CompactionRequest
     }),
     validation_evidence: validationEvidence,
     unresolved_questions: [],
-    next_actions: pendingTodos.length > 0
-      ? pendingTodos.slice(0, 5).map(formatTodo)
-      : ["Continue from the retained conversation tail."]
+    next_actions: loop?.intent === "mutation" && activePhase === "verify" && changedFiles.length > 0
+      ? [
+          "phase=verify: do not restart broad exploration; run validation/diff review, final summary, or typed blocker."
+        ]
+      : loop?.intent === "mutation" && activePhase === "implement"
+        ? ["phase=implement: produce edit/write/apply_patch mutation evidence or typed blocker."]
+        : pendingTodos.length > 0
+          ? pendingTodos.slice(0, 5).map((todo) => `deferred todo: ${formatTodo(todo)}`)
+          : ["Continue from the retained conversation tail."]
   };
 }
 

@@ -1303,7 +1303,11 @@ export class TuiApp {
     if (result.status === "stopped" && result.finishReason === "max_turns" && (result.changedFiles?.length ?? 0) === 0) {
       return "Run stopped: max_turns. No files changed.";
     }
-    if (result.status === "stopped") return `Run stopped: ${result.finishReason}.`;
+    if (result.status === "stopped") {
+      const phase = result.loopDiagnostics?.phase ? ` phase=${result.loopDiagnostics.phase}` : "";
+      const reason = result.loopDiagnostics?.lastControllerReason ? ` reason=${result.loopDiagnostics.lastControllerReason}` : "";
+      return `Run stopped: ${result.finishReason}${phase}${reason}.`;
+    }
     return `Run failed: ${result.lastError ?? result.finishReason}.`;
   }
 

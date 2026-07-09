@@ -89,4 +89,29 @@ describe("agent-tui run state", () => {
       lastResult: "error model_error"
     });
   });
+
+  it("includes structured loop phase and reason in terminal result labels", () => {
+    const stopped = result("stopped", "blocked_no_verification_progress");
+    stopped.loopDiagnostics = {
+      intent: "mutation",
+      mode: "normal",
+      phase: "stopped",
+      stepOutcome: "blocked",
+      providerTurns: 4,
+      readOnlyTurns: 2,
+      noChangeTurns: 2,
+      broadReadTurns: 0,
+      repeatedReadIntents: 0,
+      mutationCount: 1,
+      validationCount: 0,
+      verifyNoProgressTurns: 2,
+      postMutationNoProgressTurns: 2,
+      forcedActions: ["blocked_no_verification_progress"],
+      lastControllerReason: "blocked_no_verification_progress"
+    };
+
+    expect(buildTuiRunState({ running: false, result: stopped })).toMatchObject({
+      lastResult: "stopped blocked_no_verification_progress phase=stopped reason=blocked_no_verification_progress"
+    });
+  });
 });
