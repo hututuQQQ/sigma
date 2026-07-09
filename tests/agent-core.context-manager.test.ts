@@ -231,13 +231,38 @@ describe("ContextManager compaction", () => {
       messages: messagesWithHistory(),
       maxMessageHistoryChars: 500,
       messageHistoryRetain: 2,
-      objective: "fix the project"
+      objective: "fix the project",
+      loopDiagnostics: {
+        intent: "mutation",
+        mode: "force_implement",
+        phase: "implement",
+        stepOutcome: "needs_follow_up",
+        providerTurns: 4,
+        readOnlyTurns: 3,
+        noChangeTurns: 4,
+        broadReadTurns: 1,
+        repeatedReadIntents: 1,
+        mutationCount: 0,
+        validationCount: 0,
+        forcedActions: ["mutation_no_change_budget"],
+        lastControllerReason: "mutation_no_change_budget"
+      },
+      mutationEvidence: [
+        {
+          kind: "workspace_diff",
+          files: ["src/app.ts"],
+          summary: "Workspace changed during tool execution.",
+          timestamp: "2026-01-01T00:00:00.000Z"
+        }
+      ]
     });
 
     expect(result.compacted).toBe(true);
     expect(result.strategy).toBe("model_sub_session");
     expect(result.fallbackUsed).toBe(true);
     expect(result.error).toContain("valid JSON");
+    expect(result.artifact?.loop_counters).toMatchObject({ phase: "implement", step_outcome: "needs_follow_up" });
+    expect(result.artifact?.mutation_evidence?.[0]).toContain("src/app.ts");
     expect(result.messages[2].content).toContain(COMPACTION_MARKER);
   });
 

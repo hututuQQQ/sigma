@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
-import { AgentLoopEngine } from "./agent-loop-engine.js";
+import { AgentLoopEngine, AgentStepProcessor, type StructuredLoopDecision } from "./agent-loop-engine.js";
 import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
@@ -36,11 +36,12 @@ import {
   summarizeWorkflowState,
   workflowFailureNudge
 } from "./controller/workflow-state.js";
-import { AgentLoopController, resolveAgentLoopPolicy, type LoopControllerDecision } from "./controller/loop-controller.js";
+import { classifyTaskIntent, resolveAgentLoopPolicy } from "./controller/loop-controller.js";
 import { redactSecrets } from "./redaction.js";
 import { createDefaultSandboxConfig } from "./sandbox.js";
 import { InMemorySubagentJobManager } from "./subagents/subagent-job-manager.js";
 import { ToolRuntime, type ToolRuntimeExecution } from "./tool-runtime.js";
+import { changedWorkspaceFiles, listWorkspaceManifest } from "./harness/manifest.js";
 import type {
   AgentEvent,
   AgentFinishReason,
@@ -55,7 +56,8 @@ import type {
   ToolRuntimeMetadata,
   ToolRegistry,
   ToolResult,
-  ContextSourceEntry
+  ContextSourceEntry,
+  WorkspaceManifest
 } from "./types.js";
 import { addUsage, normalizeToolResult, toolAllMetadata, toolModelContent, toolModelMetadata } from "./types.js";
 
@@ -251,6 +253,41 @@ function isSubagentRunSummary(value: unknown): value is SubagentRunSummary {
   );
 }
 
+function isInternalRunArtifact(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.startsWith(".agent/sessions/") || normalized.startsWith(".agent/artifacts/");
+}
+
+function workspaceManifestDiff(before: WorkspaceManifest | null, after: WorkspaceManifest | null): string[] {
+  if (!before || !after) return [];
+  const changed = new Set(changedWorkspaceFiles(before, after));
+  for (const filePath of Object.keys(before)) {
+    if (!after[filePath]) changed.add(filePath);
+  }
+  return [...changed]
+    .filter((filePath) => !isInternalRunArtifact(filePath))
+    .sort((a, b) => a.localeCompare(b, "en"));
+}
+
+function shouldSnapshotWorkspaceForCalls(calls: ToolCall[]): boolean {
+  return calls.some((call) => {
+    const name = call.function.name;
+    return name === "bash" || name === "shell_session" || name === "service" || name === "edit" || name === "write" || name === "apply_patch";
+  });
+}
+
+async function safeListWorkspaceManifest(workspacePath: string): Promise<WorkspaceManifest | null> {
+  try {
+    return await listWorkspaceManifest(workspacePath);
+  } catch {
+    return null;
+  }
+}
+
+function isCompletedFinishReason(reason: AgentFinishReason): boolean {
+  return reason === "assistant_stop" || reason === "completed_with_changes" || reason === "completed_no_changes_allowed";
+}
+
 export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   const summary: SummaryJson = {
     ...(result.sessionId ? { session_id: result.sessionId } : {}),
@@ -313,6 +350,21 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.loopDiagnostics) {
     summary.loop_diagnostics = result.loopDiagnostics;
   }
+  if (result.loopPhaseHistory && result.loopPhaseHistory.length > 0) {
+    summary.loop_phase_history = result.loopPhaseHistory;
+  }
+  if (result.stepOutcomes && result.stepOutcomes.length > 0) {
+    summary.step_outcomes = result.stepOutcomes;
+  }
+  if (result.transitionReasons && result.transitionReasons.length > 0) {
+    summary.transition_reasons = result.transitionReasons;
+  }
+  if (result.mutationEvidence && result.mutationEvidence.length > 0) {
+    summary.mutation_evidence = result.mutationEvidence;
+  }
+  if (result.protocolRepairs && result.protocolRepairs.length > 0) {
+    summary.protocol_repairs = result.protocolRepairs;
+  }
   if (result.failureAnalyses && result.failureAnalyses.length > 0) {
     summary.failure_analyses = result.failureAnalyses;
   }
@@ -373,6 +425,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       todos: [],
       nextTodoId: 1,
       changedFiles: new Set<string>(),
+      mutationEvidence: [],
       readFileState: new Map(),
       contextIndexes: new Map<string, unknown>(),
       subagentRuns: []
@@ -411,9 +464,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         summaryJsonPath: config.summaryJsonPath,
         parentSessionId: config.parentSessionId,
         forkedFromSessionId: config.forkedFromSessionId
-      });
+  });
   const workflow = createWorkflowState();
-  const loopController = new AgentLoopController({ instruction: config.instruction, policy: loopPolicy });
+  const stepProcessor = new AgentStepProcessor({
+    intent: classifyTaskIntent(config.instruction),
+    policy: loopPolicy
+  });
   const finalEvidenceMode = config.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
@@ -592,21 +648,23 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     { role: "user", content: config.instruction }
   ];
   const activeToolDefinitions = (): ToolDefinition[] => {
-    const policy = loopController.toolPolicy();
+    const policy = stepProcessor.toolPolicy();
     if (policy.toolsDisabled) return [];
     if (policy.disabledTools.size === 0) return registry.definitions;
     return registry.definitions.filter((definition) => !policy.disabledTools.has(definition.function.name));
   };
-  const recordLoopDecision = async (decision: LoopControllerDecision, turn: number, turnId: string): Promise<void> => {
+  const recordLoopDecision = async (decision: StructuredLoopDecision, turn: number, turnId: string): Promise<void> => {
     if (decision.action === "none") return;
     const metadata = {
       turn,
       turnId,
       action: decision.action,
-      mode: decision.mode,
+      mode: stepProcessor.diagnostics().mode,
+      phase: decision.phase,
+      outcome: decision.outcome,
       reason: decision.reason,
       message: decision.message,
-      diagnostics: loopController.diagnostics()
+      diagnostics: stepProcessor.diagnostics()
     };
     await recordEvent(event(
       runId,
@@ -686,9 +744,10 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
       const turnId = `${runId}:turn:${turns}`;
       await recordEvent(event(runId, "turn_start", provider, model, { turn: turns, turnId }, undefined, durableSession?.sessionId));
-      const toolPolicy = loopController.toolPolicy();
+      const toolPolicy = stepProcessor.toolPolicy();
       const toolsForTurn = activeToolDefinitions();
-      if (toolPolicy.mode !== "normal" || toolPolicy.toolsDisabled || toolPolicy.disabledTools.size > 0) {
+      const loopDiagnosticsForPolicy = stepProcessor.diagnostics();
+      if (loopDiagnosticsForPolicy.mode !== "normal" || toolPolicy.toolsDisabled || toolPolicy.disabledTools.size > 0) {
         await recordEvent(event(
           runId,
           "loop_control_tool_policy",
@@ -697,7 +756,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           {
             turn: turns,
             turnId,
-            mode: toolPolicy.mode,
+            mode: loopDiagnosticsForPolicy.mode,
+            phase: toolPolicy.phase,
             toolsDisabled: toolPolicy.toolsDisabled,
             disabledTools: [...toolPolicy.disabledTools].sort((a, b) => a.localeCompare(b, "en")),
             reason: toolPolicy.reason
@@ -717,7 +777,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         evidenceRecords: workflow.evidenceRecords,
         changedFiles: changedFilesForContext,
         todos: context.runState.todos,
-        loopDiagnostics: loopController.diagnostics(),
+        loopDiagnostics: stepProcessor.diagnostics(),
+        mutationEvidence: stepProcessor.mutationEvidence.all(),
         emitEvent: async (contextEvent) => {
           await recordEvent(event(
             runId,
@@ -743,7 +804,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
       if (preparedMessages.compacted && preparedMessages.artifact) {
-        const decision = loopController.observeCompaction(preparedMessages.artifact.next_actions);
+        const decision = stepProcessor.observeCompaction(turns, preparedMessages.artifact.next_actions);
         if (decision.message) {
           messages.push({ role: "user", content: decision.message });
           await recordLoopDecision(decision, turns, turnId);
@@ -808,22 +869,19 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const calls = response.message.toolCalls ?? [];
       if (calls.length === 0) {
         const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
-        const controllerDecision = loopController.observeTerminalCandidate({
+        const controllerDecision = stepProcessor.observeTerminalCandidate({
+          turn: turns,
           content: response.message.content,
           changedFiles
         });
-        if (controllerDecision.action === "stop") {
+        const completedTerminal = controllerDecision.action === "stop" &&
+          isCompletedFinishReason(controllerDecision.finishReason ?? "assistant_stop");
+        if (controllerDecision.action === "stop" && !completedTerminal) {
           await recordLoopDecision(controllerDecision, turns, turnId);
           workflow.phase = "final";
-          finishReason = "controller_stop";
-          lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by loop controller.";
-          if (
-            controllerDecision.message &&
-            (
-              controllerDecision.reason === "tool_call_text_while_tools_disabled" ||
-              controllerDecision.reason === "mutation_unresolved_without_changes"
-            )
-          ) {
+          finishReason = controllerDecision.finishReason ?? "assistant_stop";
+          lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by structured loop.";
+          if (controllerDecision.message) {
             finalMessage = controllerDecision.message;
           }
           break;
@@ -850,7 +908,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           continue;
         }
         workflow.phase = "final";
-        finishReason = "assistant_stop";
+        finishReason = completedTerminal ? controllerDecision.finishReason ?? "assistant_stop" : "assistant_stop";
+        stepProcessor.markFinal(turns, finishReason);
         stoppedByAssistant = true;
         break;
       }
@@ -858,6 +917,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const workflowNudges: string[] = [];
       type ToolExecutionValue = { checkpointId?: string };
       const loopGuardDecision = loopEngine.loopGuard.observe(calls as ToolCall[]);
+      let loopGuardStopDecision: StructuredLoopDecision | null = null;
+      const shouldDenyByLoopGuard = loopGuardDecision.action === "stop" || loopGuardDecision.skipToolCalls === true;
+      const loopGuardDeniedMessage = shouldDenyByLoopGuard
+        ? loopGuardDecision.message ?? "Structured loop blocked repeated tool calls."
+        : null;
       if (loopGuardDecision.action !== "none") {
         await recordEvent(event(
           runId,
@@ -874,22 +938,20 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             message: loopGuardDecision.message
           },
           undefined,
-          durableSession?.sessionId
+            durableSession?.sessionId
         ));
-        if (loopGuardDecision.action === "stop") {
-          finishReason = "loop_guard";
-          lastError = loopGuardDecision.message ?? "Stopped by loop guard.";
-          break;
-        }
-        if (loopGuardDecision.message) {
-          if (loopGuardDecision.skipToolCalls === true) {
-            messages.push({ role: "user", content: loopGuardDecision.message });
-            continue;
-          }
-          workflowNudges.push(loopGuardDecision.message);
-        }
+        const structuredDecision = stepProcessor.observeLoopGuard(
+          turns,
+          loopGuardDecision.message,
+          loopGuardDecision.action === "stop"
+        );
+        if (loopGuardDecision.action === "stop") loopGuardStopDecision = structuredDecision;
+        if (structuredDecision.message) workflowNudges.push(structuredDecision.message);
       }
       const changedFilesBeforeTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+      const manifestBeforeTools = shouldSnapshotWorkspaceForCalls(calls as ToolCall[])
+        ? await safeListWorkspaceManifest(context.workspacePath)
+        : null;
       const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
         emit: async (type, metadata, parentId) => {
           const agentEvent = event(
@@ -922,12 +984,23 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           let result: ToolResult;
           const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call) ?? null;
           try {
-            const deniedByController = loopController.denyToolMessage(call.function.name);
+            const deniedByLoopGuard = loopGuardDeniedMessage
+              ? [
+                  loopGuardDeniedMessage,
+                  "This repeated tool call was rejected with a synthetic tool result so the tool protocol stays balanced."
+                ].join("\n")
+              : null;
+            const deniedByController = deniedByLoopGuard ?? stepProcessor.denyToolMessage(call.function.name);
             result = deniedByController
               ? {
                   ok: false,
                   content: deniedByController,
-                  metadata: { loopControlDenied: true, mode: loopController.toolPolicy().mode }
+                  metadata: {
+                    loopControlDenied: true,
+                    loopGuardDenied: Boolean(deniedByLoopGuard),
+                    mode: stepProcessor.diagnostics().mode,
+                    phase: stepProcessor.toolPolicy().phase
+                  }
                 }
               : await registry.execute(call, context);
           } catch (error) {
@@ -1018,8 +1091,23 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (workflowNudges.length > 0 && finishReason !== "cancelled") {
         messages.push({ role: "user", content: [...new Set(workflowNudges)].join("\n\n") });
       }
+      const manifestAfterTools = manifestBeforeTools ? await safeListWorkspaceManifest(context.workspacePath) : null;
+      const workspaceDiffFiles = workspaceManifestDiff(manifestBeforeTools, manifestAfterTools);
+      for (const filePath of workspaceDiffFiles) {
+        context.runState.changedFiles.add(filePath);
+      }
       const changedFilesAfterTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
-      const controllerDecision = loopController.observeTurn({
+      stepProcessor.observeMutationEvidence(
+        (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => ({
+          call: execution.call,
+          result: execution.result
+        })),
+        workspaceDiffFiles
+      );
+      if (context.runState.mutationEvidence || stepProcessor.mutationEvidence.all().length > 0) {
+        context.runState.mutationEvidence = stepProcessor.mutationEvidence.all();
+      }
+      const controllerDecision = stepProcessor.observeTurn({
         turn: turns,
         maxTurns,
         calls: calls as ToolCall[],
@@ -1035,11 +1123,25 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         {
           turn: turns,
           turnId,
-          diagnostics: loopController.diagnostics()
+          diagnostics: stepProcessor.diagnostics()
         },
         undefined,
         durableSession?.sessionId
       ));
+      if (loopGuardStopDecision) {
+        await recordLoopDecision(loopGuardStopDecision, turns, turnId);
+        finishReason = loopGuardStopDecision.finishReason ?? "loop_guard_repeated_tool";
+        lastError = loopGuardStopDecision.message ?? "Stopped by structured loop guard.";
+        finalMessage = loopGuardStopDecision.message;
+        break;
+      }
+      if (controllerDecision.action === "stop") {
+        await recordLoopDecision(controllerDecision, turns, turnId);
+        finishReason = controllerDecision.finishReason ?? "max_steps";
+        lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by structured loop.";
+        finalMessage = controllerDecision.message ?? finalMessage;
+        break;
+      }
       if (controllerDecision.message && finishReason !== "cancelled") {
         messages.push({ role: "user", content: controllerDecision.message });
         await recordLoopDecision(controllerDecision, turns, turnId);
@@ -1048,7 +1150,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     }
 
     if (!stoppedByAssistant && turns >= maxTurns && finishReason === "assistant_stop") {
-      finishReason = "max_turns";
+      finishReason = "max_steps";
+      lastError = lastError ?? "Structured loop stopped: max step budget reached.";
     }
   } catch (error) {
     if (config.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
@@ -1069,7 +1172,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     recordSubagentRun(report);
   }
 
-  const status = finishReason === "error" ? "error" : finishReason === "assistant_stop" ? "completed" : "stopped";
+  const status = finishReason === "error" ? "error" : isCompletedFinishReason(finishReason) ? "completed" : "stopped";
   const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
   const result: AgentRunResult = {
     ...(durableSession?.sessionId ? { sessionId: durableSession.sessionId } : {}),
@@ -1097,7 +1200,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     finalGate: finalGateStatus,
     selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source })),
     contextCompactions,
-    loopDiagnostics: loopController.diagnostics(),
+    loopDiagnostics: stepProcessor.diagnostics(),
+    loopPhaseHistory: stepProcessor.phaseHistory,
+    stepOutcomes: stepProcessor.stepOutcomes,
+    transitionReasons: stepProcessor.transitionReasons,
+    mutationEvidence: stepProcessor.mutationEvidence.all(),
+    protocolRepairs: stepProcessor.protocolRepairs,
     failureAnalyses: workflow.failureAnalyses,
     subagentRuns,
     toolRuntime: toolRuntime.summary(),

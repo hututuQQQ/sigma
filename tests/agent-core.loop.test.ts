@@ -181,7 +181,7 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.finishReason).toBe("assistant_stop");
+    expect(result.finishReason).toBe("completed_no_changes_allowed");
     expect(result.toolCalls).toBe(1);
     expect(result.commandsExecuted).toBe(1);
     await expect(readFile(path.join(dir, "trace.jsonl"), "utf8")).resolves.toContain("tool_end");
@@ -321,6 +321,47 @@ describe("agent loop", () => {
     await expect(readFile(path.join(dir, "hello.txt"), "utf8")).resolves.toBe("hello new");
   });
 
+  it("records shell-created files as mutation evidence through workspace diff", async () => {
+    const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const command = "node -e \"require('node:fs').writeFileSync('from-shell.txt','hi')\"";
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "shell-write",
+              type: "function",
+              function: { name: "bash", arguments: { command } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "create a file from the shell",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      summaryJsonPath: summaryPath
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.finishReason).toBe("completed_with_changes");
+    expect(result.changedFiles).toContain("from-shell.txt");
+    expect(result.mutationEvidence).toEqual([
+      expect.objectContaining({ kind: "workspace_diff", files: ["from-shell.txt"] })
+    ]);
+    await expect(readFile(path.join(dir, "from-shell.txt"), "utf8")).resolves.toBe("hi");
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.mutation_evidence[0]).toMatchObject({ kind: "workspace_diff", files: ["from-shell.txt"] });
+    expect(summary.step_outcomes.some((item: { reason?: string }) => item.reason === "mutation_evidence_recorded")).toBe(true);
+  });
+
   it("stops at max turns", async () => {
     const dir = await tempWorkspace();
     const model = new FakeModel([
@@ -347,7 +388,7 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("max_turns");
+    expect(result.finishReason).toBe("max_steps");
   });
 
   it("forces mutation tasks out of repeated read-only exploration", async () => {
@@ -404,16 +445,20 @@ describe("agent loop", () => {
 
     const steer = events.find((event) => event.type === "loop_control_steer");
     expect(result.status).toBe("completed");
+    expect(result.finishReason).toBe("completed_with_changes");
     expect(steer?.metadata).toMatchObject({
       turn: 2,
       mode: "force_implement",
+      phase: "implement",
+      outcome: "needs_follow_up",
       reason: "mutation_no_change_budget"
     });
     expect(model.requests[2].tools?.map((tool) => tool.function.name)).not.toContain("read_many");
+    expect(result.mutationEvidence?.some((item) => item.files.includes("notes.txt"))).toBe(true);
     await expect(readFile(path.join(dir, "notes.txt"), "utf8")).resolves.toBe("hello fixed");
     expect(
       model.requests[2].messages.some(
-        (message) => message.role === "user" && message.content.includes("Make the smallest safe edit")
+        (message) => message.role === "user" && message.content.includes("Move from exploration to implementation")
       )
     ).toBe(true);
   });
@@ -486,10 +531,11 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("controller_stop");
-    expect(model.requests[2].tools).toEqual([]);
-    expect(model.requests[2].toolChoice).toBe("none");
-    expect(events.some((event) => event.type === "loop_control_tool_policy" && event.metadata?.toolsDisabled === true)).toBe(true);
+    expect(result.finishReason).toBe("blocked_no_feasible_edit");
+    expect(model.requests[2].toolChoice).toBe("auto");
+    expect(model.requests[2].tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(["edit", "write", "apply_patch"]));
+    expect(model.requests[2].tools?.map((tool) => tool.function.name)).not.toContain("read_many");
+    expect(events.some((event) => event.type === "loop_control_tool_policy" && event.metadata?.phase === "implement")).toBe(true);
   });
 
   it("does not mark a no-change mutation final response as completed", async () => {
@@ -513,10 +559,10 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("controller_stop");
+    expect(result.finishReason).toBe("blocked_no_feasible_edit");
     expect(result.finalMessage).toContain("will not mark a no-change mutation run as completed");
-    expect(model.requests[1].tools).toEqual([]);
-    expect(model.requests[1].toolChoice).toBe("none");
+    expect(model.requests[1].toolChoice).toBe("auto");
+    expect(model.requests[1].tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(["edit", "write", "apply_patch"]));
     expect(events.map((event) => event.type)).toContain("loop_control_stop");
   });
 
@@ -556,16 +602,17 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("controller_stop");
-    expect(result.finalMessage).toContain("tools are disabled");
-    expect(model.requests[2]).toMatchObject({ tools: [], toolChoice: "none" });
-    expect(model.requests[3]).toMatchObject({ tools: [], toolChoice: "none" });
-    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("looks like a tool call"))).toBe(true);
+    expect(result.finishReason).toBe("protocol_violation");
+    expect(result.finalMessage).toContain("looks like a tool call");
+    expect(model.requests[2].toolChoice).toBe("auto");
+    expect(model.requests[3].toolChoice).toBe("auto");
+    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("real tool channel"))).toBe(true);
+    expect(result.protocolRepairs).toHaveLength(1);
     expect(events.filter((event) => event.type === "loop_control_steer").map((event) => event.metadata?.reason)).toContain(
-      "tool_call_text_while_tools_disabled"
+      "protocol_repair"
     );
     expect(events.filter((event) => event.type === "loop_control_stop").map((event) => event.metadata?.reason)).toContain(
-      "tool_call_text_while_tools_disabled"
+      "protocol_violation"
     );
   });
 
@@ -596,11 +643,12 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("loop_guard");
+    expect(result.finishReason).toBe("loop_guard_repeated_tool");
     expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
       "nudge",
       "stop"
     ]);
+    expect(events.filter((event) => event.type === "tool_end").some((event) => event.metadata?.result && (event.metadata.result as { ok?: boolean }).ok === false)).toBe(true);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
   });
 
@@ -628,12 +676,17 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.finishReason).toBe("assistant_stop");
+    expect(result.finishReason).toBe("completed_no_changes_allowed");
     expect(result.toolCalls).toBe(4);
     expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
       "nudge",
       "nudge"
     ]);
+    expect(
+      events
+        .filter((event) => event.type === "tool_end")
+        .every((event) => (event.metadata?.result as { ok?: boolean } | undefined)?.ok === true)
+    ).toBe(true);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
   });
 

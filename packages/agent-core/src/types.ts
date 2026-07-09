@@ -223,6 +223,13 @@ export type AgentRunStatus = "completed" | "stopped" | "error";
 
 export type AgentFinishReason =
   | "assistant_stop"
+  | "completed_with_changes"
+  | "completed_no_changes_allowed"
+  | "blocked_no_feasible_edit"
+  | "protocol_violation"
+  | "loop_guard_repeated_tool"
+  | "max_steps"
+  | "compaction_failed"
   | "max_turns"
   | "max_wall_time"
   | "loop_guard"
@@ -237,6 +244,62 @@ export type AgentFinalEvidenceMode = "off" | "auto";
 export type AgentSkillsMode = "off" | "auto";
 export type AgentTaskIntent = "mutation" | "answer" | "inspect";
 export type AgentLoopControlMode = "normal" | "narrow_explore" | "force_implement" | "force_final_text";
+export type AgentLoopPhase = "explore" | "implement" | "verify" | "repair" | "final" | "stopped";
+export type AgentStepOutcomeKind =
+  | "continue"
+  | "needs_follow_up"
+  | "compact"
+  | "terminal"
+  | "blocked"
+  | "protocol_error"
+  | "loop_guard"
+  | "max_steps";
+
+export interface AgentLoopPhaseHistoryItem {
+  turn: number;
+  phase: AgentLoopPhase;
+  reason?: string;
+  previousPhase?: AgentLoopPhase;
+  timestamp: string;
+}
+
+export interface AgentStepOutcomeSummary {
+  turn: number;
+  phase: AgentLoopPhase;
+  outcome: AgentStepOutcomeKind;
+  reason?: string;
+  message?: string;
+  toolNames?: string[];
+  changedFiles?: string[];
+  timestamp: string;
+}
+
+export interface AgentLoopTransitionReason {
+  turn: number;
+  from: AgentLoopPhase;
+  to: AgentLoopPhase;
+  reason: string;
+  message?: string;
+  timestamp: string;
+}
+
+export interface MutationEvidenceRecord {
+  kind: "tool" | "workspace_diff";
+  files: string[];
+  toolName?: string;
+  toolCallId?: string;
+  summary?: string;
+  timestamp: string;
+}
+
+export interface ProtocolRepairRecord {
+  turn: number;
+  phase: AgentLoopPhase;
+  reason: string;
+  message: string;
+  attempt: number;
+  timestamp: string;
+}
 
 export interface AgentLoopPolicy {
   maxProviderTurns: number;
@@ -250,6 +313,8 @@ export interface AgentLoopPolicy {
 export interface AgentLoopDiagnostics {
   intent: AgentTaskIntent;
   mode: AgentLoopControlMode;
+  phase?: AgentLoopPhase;
+  stepOutcome?: AgentStepOutcomeKind;
   providerTurns: number;
   readOnlyTurns: number;
   noChangeTurns: number;
@@ -526,6 +591,7 @@ export interface AgentRunState {
   todos: TodoItem[];
   nextTodoId: number;
   changedFiles: Set<string>;
+  mutationEvidence?: MutationEvidenceRecord[];
   readFileState?: Map<string, ReadFileState>;
   contextIndexes?: Map<string, unknown>;
   contextIndexVersion?: number;
@@ -859,6 +925,11 @@ export interface AgentRunResult {
   selectedSkills?: SelectedSkillSummary[];
   contextCompactions?: ContextCompactionSummary[];
   loopDiagnostics?: AgentLoopDiagnostics;
+  loopPhaseHistory?: AgentLoopPhaseHistoryItem[];
+  stepOutcomes?: AgentStepOutcomeSummary[];
+  transitionReasons?: AgentLoopTransitionReason[];
+  mutationEvidence?: MutationEvidenceRecord[];
+  protocolRepairs?: ProtocolRepairRecord[];
   failureAnalyses?: FailureAnalysisSummary[];
   validationPlan?: ValidationPlan;
   codeIndex?: CodeIndexSummary;
@@ -975,6 +1046,11 @@ export interface SummaryJson {
   selected_skills?: SelectedSkillSummary[];
   context_compactions?: ContextCompactionSummary[];
   loop_diagnostics?: AgentLoopDiagnostics;
+  loop_phase_history?: AgentLoopPhaseHistoryItem[];
+  step_outcomes?: AgentStepOutcomeSummary[];
+  transition_reasons?: AgentLoopTransitionReason[];
+  mutation_evidence?: MutationEvidenceRecord[];
+  protocol_repairs?: ProtocolRepairRecord[];
   failure_analyses?: FailureAnalysisSummary[];
   validation_plan?: ValidationPlan;
   code_index?: CodeIndexSummary;
