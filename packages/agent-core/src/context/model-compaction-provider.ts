@@ -120,6 +120,11 @@ function stringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function stringArrayWithFallback(value: unknown, fallback: string[] | undefined): string[] {
+  const parsed = stringArray(value);
+  return parsed.length > 0 ? parsed : fallback ?? [];
+}
+
 function artifactFromJson(parsed: unknown, fallback: CompactionArtifact): CompactionArtifact {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Model compaction response JSON must be an object.");
@@ -127,13 +132,24 @@ function artifactFromJson(parsed: unknown, fallback: CompactionArtifact): Compac
   const value = parsed as Record<string, unknown>;
   return {
     objective: typeof value.objective === "string" && value.objective.trim() ? value.objective.trim() : fallback.objective,
-    current_plan: stringArray(value.current_plan),
-    changed_files: stringArray(value.changed_files),
-    key_decisions: stringArray(value.key_decisions),
-    failed_attempts: stringArray(value.failed_attempts),
-    validation_evidence: stringArray(value.validation_evidence),
-    unresolved_questions: stringArray(value.unresolved_questions),
-    next_actions: stringArray(value.next_actions)
+    ...(typeof value.task_intent === "string" && value.task_intent.trim() ? { task_intent: value.task_intent.trim() } : fallback.task_intent ? { task_intent: fallback.task_intent } : {}),
+    ...(typeof value.phase === "string" && value.phase.trim() ? { phase: value.phase.trim() } : fallback.phase ? { phase: fallback.phase } : {}),
+    current_plan: stringArrayWithFallback(value.current_plan, fallback.current_plan),
+    changed_files: stringArrayWithFallback(value.changed_files, fallback.changed_files),
+    files_read: stringArray(value.files_read),
+    read_ranges: stringArray(value.read_ranges),
+    ...(value.loop_counters && typeof value.loop_counters === "object" && !Array.isArray(value.loop_counters)
+      ? { loop_counters: value.loop_counters as Record<string, unknown> }
+      : fallback.loop_counters ? { loop_counters: fallback.loop_counters } : {}),
+    mutation_evidence: stringArray(value.mutation_evidence).length > 0
+      ? stringArray(value.mutation_evidence)
+      : fallback.mutation_evidence ?? [],
+    forbidden_repeats: stringArrayWithFallback(value.forbidden_repeats, fallback.forbidden_repeats),
+    key_decisions: stringArrayWithFallback(value.key_decisions, fallback.key_decisions),
+    failed_attempts: stringArrayWithFallback(value.failed_attempts, fallback.failed_attempts),
+    validation_evidence: stringArrayWithFallback(value.validation_evidence, fallback.validation_evidence),
+    unresolved_questions: stringArrayWithFallback(value.unresolved_questions, fallback.unresolved_questions),
+    next_actions: stringArrayWithFallback(value.next_actions, fallback.next_actions)
   };
 }
 
@@ -144,6 +160,8 @@ function buildPayload(request: ModelCompactionRequest, maxInputChars: number): s
     workflow_summary: workflow ?? null,
     todos: request.todos ?? [],
     changed_files: request.changedFiles ?? workflow?.changed_files ?? [],
+    loop_diagnostics: request.loopDiagnostics ?? null,
+    mutation_evidence: request.mutationEvidence ?? request.fallbackArtifact.mutation_evidence ?? [],
     evidence_records: (request.evidenceRecords ?? []).slice(-12),
     failure_patterns: workflow?.failure_patterns ?? [],
     compacted_message_history: safeMessages(request.compactedMessages),
@@ -193,8 +211,8 @@ export class ModelSubSessionCompactionProvider implements ModelCompactionProvide
           content: [
             "You compact an autonomous coding agent conversation into durable JSON.",
             "Return only a JSON object with these keys:",
-            "objective, current_plan, changed_files, key_decisions, failed_attempts, validation_evidence, unresolved_questions, next_actions.",
-            "Each key except objective must be an array of concise strings.",
+            "objective, task_intent, phase, current_plan, changed_files, files_read, read_ranges, loop_counters, mutation_evidence, forbidden_repeats, key_decisions, failed_attempts, validation_evidence, unresolved_questions, next_actions.",
+            "Each key except objective, task_intent, phase, and loop_counters must be an array of concise strings.",
             "Do not call tools. Do not include secrets, credentials, or raw large tool output."
           ].join("\n")
         },

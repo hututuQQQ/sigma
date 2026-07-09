@@ -210,6 +210,8 @@ describe("agent-cli run", () => {
     const flagFirst = parseArgs(["--json", "Fix failing tests"]);
     expect(flagFirst.flags.json).toBe(true);
     expect(flagFirst.positionals).toEqual(["Fix failing tests"]);
+    const clipboard = parseArgs(["--instruction-clipboard", "--workspace", "work"]);
+    expect(clipboard.flags["instruction-clipboard"]).toBe(true);
     expect(loadCliConfig({ workspace: "work", provider: "deepseek", "output-format": "stream-json" })).toMatchObject({
       outputFormat: "stream-json",
       noStreamUi: true
@@ -404,7 +406,7 @@ describe("agent-cli run", () => {
       expect(loadCliConfig({ workspace: dir })).toMatchObject({
         provider: "deepseek",
         model: "from-env",
-        maxTurns: 20,
+        maxTurns: 80,
         allowedTools: []
       });
       expect(loadCliConfig({ workspace: dir, model: "from-cli", "max-turns": "22" })).toMatchObject({
@@ -469,6 +471,32 @@ describe("agent-cli run", () => {
     expect(stdout.text()).toContain("status=completed");
   });
 
+  it("supports agent run with a clipboard instruction", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-clipboard-${Date.now()}`), { recursive: true });
+    const requests: ModelRequest[] = [];
+
+    const code = await runRunCommand(
+      ["--instruction-clipboard", "--workspace", dir, "--provider", "deepseek", "--permission-mode", "yolo", "--no-stream-ui"],
+      {
+        clipboardReader: async () => "first line\r\nsecond line",
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => ({
+          provider: "deepseek",
+          model: "fake-cli-model",
+          async complete(req: ModelRequest): Promise<ModelResponse> {
+            requests.push(req);
+            return {
+              message: { role: "assistant", content: "all set" },
+              usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }
+            };
+          }
+        })
+      }
+    );
+
+    expect(code).toBe(0);
+    expect(JSON.stringify(requests[0]?.messages)).toContain("first line\\nsecond line");
+  });
+
   it("prints exactly one parseable JSON result in json mode", async () => {
     const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-json-${Date.now()}`), { recursive: true });
     const stdout = new MemoryWritable();
@@ -506,16 +534,48 @@ describe("agent-cli run", () => {
       }
     );
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     const stdoutText = stdout.text();
     const stdoutLines = stdoutText.trim().split(/\r?\n/);
     expect(stdoutLines).toHaveLength(1);
     const parsed = JSON.parse(stdoutText) as { status?: string; finalMessage?: string };
-    expect(parsed).toMatchObject({ status: "completed", finalMessage: "done after approval" });
+    expect(parsed).toMatchObject({ status: "stopped" });
+    expect(parsed.finalMessage).toContain("will not mark a no-change mutation run as completed");
     expect(stdoutText).not.toMatch(/Tool:|Risk:|Allow\?|\[sigma\]|status=completed/);
     expect(stderr.text()).toContain("Tool: write");
     expect(stderr.text()).toContain("Risk: write");
     expect(stderr.text()).toContain("Allow?");
+  });
+
+  it("returns non-zero when the structured loop stops a no-change mutation run", async () => {
+    const dir = await mkdir(path.join(os.tmpdir(), `agent-cli-no-change-${Date.now()}`), { recursive: true });
+    const stdout = new MemoryWritable();
+
+    const code = await runRunCommand(
+      [
+        "fix the issue",
+        "--workspace",
+        dir,
+        "--provider",
+        "deepseek",
+        "--permission-mode",
+        "yolo",
+        "--validation-mode",
+        "off",
+        "--final-evidence-mode",
+        "off",
+        "--json"
+      ],
+      {
+        stdout,
+        modelClientFactory: (_provider: ProviderName, _options: ProviderOptions) => new FinalModel()
+      }
+    );
+
+    expect(code).toBe(1);
+    const parsed = JSON.parse(stdout.text()) as { status?: string; finishReason?: string; finalMessage?: string };
+    expect(parsed).toMatchObject({ status: "stopped", finishReason: "blocked_no_feasible_edit" });
+    expect(parsed.finalMessage).toContain("will not mark a no-change mutation run as completed");
   });
 
   it("prints valid JSONL events and a final result in stream-json mode", async () => {

@@ -49,6 +49,42 @@ export function formatTimelineEvent(event: AgentEvent): string {
     const budget = meta.budget as { estimated_tokens?: unknown; message_count?: unknown; tool_count?: unknown } | undefined;
     return prefix(g.info, joinDetails([`context turn ${meta.turn ?? "?"}`, `${budget?.estimated_tokens ?? "?"} est tokens`, `${budget?.message_count ?? "?"} messages`, `${budget?.tool_count ?? "?"} tools`]));
   }
+  if (event.type === "turn_budget_nudge") {
+    return prefix(g.blocked, joinDetails([
+      `turn budget warning turn ${meta.turn ?? "?"}`,
+      `${meta.remainingTurns ?? "?"} remaining`,
+      truncate(oneLine(redactSecretText(String(meta.message ?? ""))), 120)
+    ]));
+  }
+  if (event.type === "loop_control_state") {
+    const diagnostics = meta.diagnostics as { intent?: unknown; mode?: unknown; readOnlyTurns?: unknown; noChangeTurns?: unknown } | undefined;
+    return prefix(g.info, joinDetails([
+      `loop ${diagnostics?.mode ?? "?"}`,
+      `intent=${diagnostics?.intent ?? "?"}`,
+      `read-only=${diagnostics?.readOnlyTurns ?? "?"}`,
+      `no-change=${diagnostics?.noChangeTurns ?? "?"}`
+    ]));
+  }
+  if (event.type === "loop_control_steer") {
+    return prefix(g.blocked, joinDetails([
+      `loop steer ${meta.mode ?? "?"}`,
+      String(meta.reason ?? "?"),
+      truncate(oneLine(redactSecretText(String(meta.message ?? ""))), 120)
+    ]));
+  }
+  if (event.type === "loop_control_tool_policy") {
+    const disabled = Array.isArray(meta.disabledTools) ? meta.disabledTools.join(",") : "";
+    return prefix(g.info, joinDetails([
+      `tool policy ${meta.mode ?? "?"}`,
+      meta.toolsDisabled ? "tools disabled" : disabled ? `disabled=${disabled}` : ""
+    ]));
+  }
+  if (event.type === "loop_control_stop") {
+    return prefix(g.fail, joinDetails([`loop stopped ${meta.mode ?? "?"}`, String(meta.reason ?? "?")]));
+  }
+  if (event.type === "read_cache_hit") {
+    return prefix(g.info, joinDetails([`read cache hit`, String(meta.path ?? "?")]));
+  }
   if (event.type === "assistant_message") {
     const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
     if (toolCalls > 0) return prefix(g.info, `assistant proposed ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`);

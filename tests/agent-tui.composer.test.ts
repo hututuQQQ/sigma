@@ -8,6 +8,8 @@ import {
   killToEnd,
   killToStart,
   moveCursorEnd,
+  moveCursorLineDown,
+  moveCursorLineUp,
   moveCursorLeft,
   moveCursorRight,
   moveCursorStart,
@@ -16,7 +18,7 @@ import {
   yank
 } from "../packages/agent-tui/src/composer-state.js";
 import { renderComposer } from "../packages/agent-tui/src/render/composer.js";
-import { assertWithinWidth } from "../packages/agent-tui/src/ui/layout.js";
+import { assertWithinWidth, splitLines } from "../packages/agent-tui/src/ui/layout.js";
 
 const savedEnv = {
   SIGMA_ASCII: process.env.SIGMA_ASCII,
@@ -93,6 +95,20 @@ describe("agent-tui composer editor", () => {
     expect(state.cursor).toBe("first\nsecond".length);
   });
 
+  it("moves the cursor vertically through multiline drafts", () => {
+    const state = createComposerState("one\ntwo longer\nthree");
+    state.cursor = "one\ntwo lo".length;
+
+    expect(moveCursorLineUp(state)).toBe(true);
+    expect(state.cursor).toBe("one".length);
+
+    expect(moveCursorLineDown(state)).toBe(true);
+    expect(state.cursor).toBe("one\ntwo".length);
+
+    expect(moveCursorLineDown(state)).toBe(true);
+    expect(state.cursor).toBe("one\ntwo longer\nthr".length);
+  });
+
   it("cycles history up and down without losing the current draft", () => {
     const state = createComposerState("draft");
     rememberInput(state, "first");
@@ -163,6 +179,27 @@ describe("agent-tui composer editor", () => {
 
     expect(rendered).toContain("> fix tests\u258c");
     expect(rendered).not.toContain("\u256d");
+    expect(assertWithinWidth(rendered, 80)).toBe(true);
+  });
+
+  it("keeps long multiline drafts inside a fixed composer viewport", () => {
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const state = createComposerState(Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n"));
+
+    const rendered = renderComposer({
+      state,
+      mode: "build",
+      running: false,
+      approvalPending: false,
+      width: 80,
+      maxHeight: 6,
+      color: false
+    });
+
+    expect(splitLines(rendered)).toHaveLength(6);
+    expect(rendered).toContain("... 8 lines above");
+    expect(rendered).toContain("line 10\u258c");
+    expect(rendered).not.toContain("line 1\n");
     expect(assertWithinWidth(rendered, 80)).toBe(true);
   });
 

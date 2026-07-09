@@ -22,54 +22,12 @@ export type WorkspaceChangeResult =
   | WorkspaceChangeFailed;
 
 export const WORKSPACE_HINT = "Use !<command> for shell or /workspace <path> to switch workspace.";
-export const SHELL_COMMAND_HINT = "Use !<command> for shell commands.";
 
 export type LocalTerminalInputResult =
   | { handled: false }
-  | { handled: true; action: "pwd" | "list" | "clear" | "hint"; message: string };
+  | { handled: true; action: "pwd" | "list" | "clear"; message: string };
 
 const LOCAL_COMMANDS = new Set(["pwd", "ls", "dir", "clear", "cls"]);
-const SHELL_COMMANDS = new Set([
-  "bash",
-  "bun",
-  "cargo",
-  "cat",
-  "cmd",
-  "cmake",
-  "code",
-  "cp",
-  "curl",
-  "deno",
-  "docker",
-  "dotnet",
-  "echo",
-  "git",
-  "go",
-  "grep",
-  "java",
-  "make",
-  "mkdir",
-  "mv",
-  "node",
-  "npm",
-  "npx",
-  "pnpm",
-  "powershell",
-  "pwsh",
-  "python",
-  "python3",
-  "rg",
-  "rm",
-  "rmdir",
-  "sed",
-  "sh",
-  "ssh",
-  "touch",
-  "tsc",
-  "wget",
-  "yarn",
-  ...LOCAL_COMMANDS
-]);
 
 function stripQuotes(value: string): string {
   const trimmed = value.trim();
@@ -89,19 +47,6 @@ function targetFromCd(input: string): string | null {
   const match = /^cd(?:\s+(.*))?$/i.exec(input.trim());
   if (!match) return null;
   return stripQuotes(match[1] ?? "");
-}
-
-function firstToken(input: string): string {
-  const [token = ""] = input.trim().split(/\s+/, 1);
-  return token.toLowerCase().replace(/\.(?:bat|cmd|com|exe|ps1|sh)$/i, "");
-}
-
-function looksShellLike(input: string): boolean {
-  const trimmed = input.trim();
-  if (!trimmed) return false;
-  if (/^(?:\.{1,2}[\\/]|[A-Za-z]:[\\/]|[/\\])/.test(trimmed)) return true;
-  if (/[;&|<>`]/.test(trimmed)) return true;
-  return SHELL_COMMANDS.has(firstToken(trimmed));
 }
 
 function formatEntry(name: string, isDirectory: boolean): string {
@@ -165,12 +110,11 @@ export function resolveLocalWorkspaceInput(input: string, currentWorkspace: stri
 
 export function resolveLocalTerminalInput(input: string): LocalTerminalInputResult {
   const trimmed = input.trim();
-  const command = firstToken(trimmed);
-  if (LOCAL_COMMANDS.has(command) && trimmed.toLowerCase() === command) {
+  const command = trimmed.toLowerCase();
+  if (LOCAL_COMMANDS.has(command)) {
     if (command === "clear" || command === "cls") return { handled: true, action: "clear", message: "Cleared." };
     if (command === "pwd") return { handled: true, action: "pwd", message: "Workspace printed." };
     return { handled: true, action: "list", message: "Workspace entries listed." };
   }
-  if (looksShellLike(trimmed)) return { handled: true, action: "hint", message: SHELL_COMMAND_HINT };
   return { handled: false };
 }

@@ -102,6 +102,7 @@ function completionScript(shell: string): string {
     "--check-api",
     "--strict",
     "--instruction",
+    "--instruction-clipboard",
     "--instruction-file",
     "--provider",
     "--model",

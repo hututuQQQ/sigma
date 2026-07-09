@@ -96,7 +96,7 @@ export interface CliConfig {
 export type CliOutputFormat = "text" | "json" | "stream-json";
 
 const DEFAULTS = {
-  maxTurns: 20,
+  maxTurns: 80,
   maxWallTimeSec: 900,
   commandTimeoutSec: 60,
   permissionMode: "ask" as PermissionMode,
@@ -124,6 +124,7 @@ const DEFAULTS = {
 
 const BOOLEAN_FLAGS = new Set([
   "enable-mcp",
+  "instruction-clipboard",
   "json",
   "no-review-anti-gaming",
   "no-project-instructions",

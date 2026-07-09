@@ -21,6 +21,59 @@ function joinParts(parts: Array<string | undefined>): string {
   return parts.filter((part): part is string => Boolean(part)).join(` ${g.separator} `);
 }
 
+type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>;
+
+export interface RenderTranscriptOptions {
+  toolDetailsOpen?: boolean;
+}
+
+function plural(value: number, singular: string): string {
+  return `${value} ${singular}${value === 1 ? "" : "s"}`;
+}
+
+function toolGroupSummary(entries: ToolEntry[]): TranscriptEntry {
+  const ok = entries.filter((entry) => entry.status === "ok").length;
+  const failed = entries.filter((entry) => entry.status === "failed").length;
+  const aborted = entries.filter((entry) => entry.status === "aborted").length;
+  const active = entries.filter((entry) => entry.status === "queued" || entry.status === "running").length;
+  const parts = [
+    plural(entries.length, "call"),
+    active > 0 ? `${active} active` : "",
+    ok > 0 ? `${ok} ok` : "",
+    failed > 0 ? `${failed} failed` : "",
+    aborted > 0 ? `${aborted} aborted` : "",
+    "Ctrl+T details"
+  ].filter(Boolean);
+  return {
+    kind: "summary",
+    status: failed > 0 ? "failed" : active > 0 ? "running" : "tools",
+    text: `tool activity: ${parts.join("  ")}`,
+    timestamp: entries.at(-1)?.timestamp
+  };
+}
+
+function collapseToolEntries(entries: TranscriptEntry[], toolDetailsOpen: boolean): TranscriptEntry[] {
+  if (toolDetailsOpen) return entries;
+  const collapsed: TranscriptEntry[] = [];
+  let pendingTools: ToolEntry[] = [];
+  const flush = () => {
+    if (pendingTools.length > 0) {
+      collapsed.push(toolGroupSummary(pendingTools));
+      pendingTools = [];
+    }
+  };
+  for (const entry of entries) {
+    if (entry.kind === "tool") {
+      pendingTools.push(entry);
+      continue;
+    }
+    flush();
+    collapsed.push(entry);
+  }
+  flush();
+  return collapsed;
+}
+
 function missingApiKeyName(text: string): string | null {
   const normalized = text.toLowerCase();
   if (text.includes("DEEPSEEK_API_KEY") || /deepseek.*api key.*missing|deepseek api key is missing/.test(normalized)) {
@@ -156,7 +209,13 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
       if (keyName) return missingApiKeyCard(keyName, color);
       return [`${roleColor("danger", g.fail, color)} ${truncateToWidth(text, width - 2)}`];
     }
-    const marker = entry.status === "completed" ? statusMarker("ok", color) : entry.status === "failed" ? statusMarker("failed", color) : g.info;
+    const marker = entry.status === "completed"
+      ? statusMarker("ok", color)
+      : entry.status === "failed"
+        ? statusMarker("failed", color)
+        : entry.status === "running"
+          ? statusMarker("running", color)
+          : g.info;
     return [joinParts([marker, redactSecretText(entry.text)])];
   }
   if (entry.kind === "user") {
@@ -167,10 +226,17 @@ function entryLines(entry: TranscriptEntry, width: number, color: boolean): stri
   return systemLines(text, width, color);
 }
 
-export function renderTranscript(entries: TranscriptEntry[], width: number, height: number, color = false, scrollOffset = 0): string {
+export function renderTranscript(
+  entries: TranscriptEntry[],
+  width: number,
+  height: number,
+  color = false,
+  scrollOffset = 0,
+  options: RenderTranscriptOptions = {}
+): string {
   const lines: string[] = [];
 
-  for (const entry of entries) {
+  for (const entry of collapseToolEntries(entries, options.toolDetailsOpen === true)) {
     const body = entryLines(entry, width, color);
     lines.push(...body.map((line) => fitStreamLine(line, width)));
     if (entry.kind === "assistant" || entry.kind === "user" || (entry.kind === "summary" && entry.status === "error")) lines.push("");

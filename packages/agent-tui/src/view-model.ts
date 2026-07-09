@@ -35,7 +35,7 @@ type ToolTranscriptEntry = Extract<TranscriptEntry, { kind: "tool" }>;
 type TestTranscriptEntry = Extract<TranscriptEntry, { kind: "test" }>;
 
 export interface ActivityItem {
-  kind: "tool" | "check" | "approval" | "subagent" | "review" | "context" | "usage" | "error";
+  kind: "tool" | "check" | "approval" | "subagent" | "review" | "context" | "usage" | "budget" | "error";
   status: ActivityStatus;
   label: string;
   detail: string;
@@ -311,6 +311,39 @@ function activityFromEvents(events: AgentEvent[]): ActivityItem[] {
       }
       continue;
     }
+    if (event.type === "turn_budget_nudge") {
+      const remaining = typeof meta.remainingTurns === "number" ? meta.remainingTurns : "?";
+      items.push({
+        kind: "budget",
+        status: "waiting",
+        label: "turn budget",
+        detail: `${remaining} turns left; no files changed`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "loop_control_steer" || event.type === "loop_control_tool_policy" || event.type === "loop_control_stop") {
+      items.push({
+        kind: "budget",
+        status: event.type === "loop_control_stop" ? "failed" : "waiting",
+        label: `loop ${String(meta.mode ?? "?")}`,
+        detail: event.type === "loop_control_tool_policy"
+          ? `tool policy${meta.toolsDisabled ? ": tools disabled" : ""}`
+          : truncate(oneLine(redactSecretText(String(meta.reason ?? meta.message ?? ""))), 120),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "read_cache_hit") {
+      items.push({
+        kind: "tool",
+        status: "ok",
+        label: "read cache",
+        detail: String(meta.path ?? ""),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
     if (event.type === "subagent_start") {
       items.push(subagentActivity(event, "running", "started"));
       continue;
@@ -394,11 +427,9 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
     if (event.type === "assistant_message") {
       latestAssistantDelta = null;
       const toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls.length : 0;
-      const text = typeof meta.content === "string" && meta.content.trim()
-        ? redactSecretText(meta.content.trim())
-        : toolCalls > 0
-          ? `I will use ${toolCalls} tool${toolCalls === 1 ? "" : "s"}.`
-          : "(empty message)";
+      const hasContent = typeof meta.content === "string" && meta.content.trim().length > 0;
+      if (!hasContent && toolCalls > 0) continue;
+      const text = hasContent ? redactSecretText(String(meta.content).trim()) : "(empty message)";
       entries.push({ kind: "assistant", text, toolCalls, timestamp: eventTime(event) });
       continue;
     }
@@ -425,6 +456,41 @@ function entriesFromEvents(events: AgentEvent[]): TranscriptEntry[] {
       continue;
     }
     if (event.type === "context_budget") continue;
+    if (event.type === "turn_budget_nudge") {
+      entries.push({
+        kind: "summary",
+        status: "warning",
+        text: truncate(oneLine(redactSecretText(String(meta.message ?? "Run budget warning."))), 160),
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "loop_control_steer" || event.type === "loop_control_stop") {
+      entries.push({
+        kind: "summary",
+        status: event.type === "loop_control_stop" ? "failed" : "warning",
+        text: `loop controller ${String(meta.mode ?? "?")}: ${truncate(oneLine(redactSecretText(String(meta.message ?? meta.reason ?? ""))), 160)}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "loop_control_tool_policy") {
+      const disabled = Array.isArray(meta.disabledTools) ? meta.disabledTools.join(", ") : "";
+      entries.push({
+        kind: "summary",
+        text: `loop tool policy ${String(meta.mode ?? "?")}${disabled ? ` disabled ${disabled}` : ""}${meta.toolsDisabled ? " tools disabled" : ""}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
+    if (event.type === "read_cache_hit") {
+      entries.push({
+        kind: "summary",
+        text: `read cache hit: ${String(meta.path ?? "?")}`,
+        timestamp: eventTime(event)
+      });
+      continue;
+    }
     if (event.type === "harness_check_start") {
       entries.push(harnessEntry(event, checkEndsByParent.get(event.id)));
       continue;
@@ -620,8 +686,15 @@ export function buildTranscript(options: BuildTranscriptOptions): TranscriptEntr
       });
     }
     const usageText = (options.result.usage.totalTokens ?? 0) > 0 ? formatUsage(options.result.usage) : "";
+    const changedCount = options.result.changedFiles?.length ?? 0;
+    const noChanges = changedCount === 0 && options.result.status === "stopped";
+    const phase = options.result.loopDiagnostics?.phase;
+    const reason = options.result.loopDiagnostics?.lastControllerReason;
     const resultText = [
       `${options.result.status} ${options.result.finishReason}`,
+      phase ? `phase=${phase}` : "",
+      reason ? `reason=${reason}` : "",
+      noChanges ? "no files changed" : changedCount > 0 ? `${changedCount} changed` : "",
       options.result.toolCalls > 0 ? `${options.result.toolCalls} tools` : "",
       options.result.turns > 0 ? `${options.result.turns} turns` : "",
       usageText

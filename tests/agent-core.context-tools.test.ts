@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ToolCall } from "../packages/agent-ai/src/index.js";
 import {
   createDefaultToolRegistry,
+  executeReadTool,
   executeReadManyTool,
   executeRepoQueryTool,
   executeSymbolSearchTool,
@@ -137,6 +138,46 @@ describe("repo context tools", () => {
     const escaped = await executeReadManyTool({ files: ["../outside.txt"] }, context);
     expect(escaped.ok).toBe(false);
     expect(escaped.content).toContain("outside the workspace");
+  });
+
+  it("reads line ranges with line numbers and caches unchanged repeated reads", async () => {
+    const { dir, context } = await workspace();
+    await mkdir(path.join(dir, "src"), { recursive: true });
+    await writeFile(path.join(dir, "src", "lines.txt"), ["one", "two", "three", "four"].join("\n"), "utf8");
+
+    const first = await executeReadTool({ path: "src/lines.txt", offset: 2, limit: 2 }, context);
+    expect(first.ok).toBe(true);
+    expect(first.content).toContain("     2\ttwo");
+    expect(first.content).toContain("     3\tthree");
+    expect(first.content).not.toContain("four");
+    expect(first.metadata).toMatchObject({
+      offset: 2,
+      startLine: 2,
+      limit: 2,
+      totalLines: 4,
+      truncated: true,
+      truncatedReason: "line_limit"
+    });
+
+    const second = await executeReadTool({ path: "src/lines.txt", offset: 2, limit: 2 }, context);
+    expect(second.ok).toBe(true);
+    expect(second.content).toContain("File unchanged since last read");
+    expect(second.metadata).toMatchObject({ cacheHit: true, offset: 2, limit: 2 });
+  });
+
+  it("keeps explicit byte ranges separate from line ranges", async () => {
+    const { dir, context } = await workspace();
+    await writeFile(path.join(dir, "bytes.txt"), "abcdef", "utf8");
+
+    const result = await executeReadTool({ path: "bytes.txt", byteOffset: 2, byteLimit: 3 }, context);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe("cde");
+    expect(result.metadata).toMatchObject({
+      byteOffset: 2,
+      byteLimit: 3,
+      truncated: true,
+      truncatedReason: "byte_range"
+    });
   });
 
   it("invalidates symbol_search cache after edit, apply_patch, and bash mutations", async () => {

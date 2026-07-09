@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentRunResult } from "../packages/agent-core/src/index.js";
 import {
+  DISABLE_BRACKETED_PASTE,
+  ENABLE_BRACKETED_PASTE,
   ENTER_ALT_SCREEN,
   EXIT_ALT_SCREEN,
   HIDE_CURSOR,
@@ -15,7 +17,6 @@ import {
 } from "../packages/agent-tui/src/app.js";
 import { setComposerText, type ComposerState } from "../packages/agent-tui/src/composer-state.js";
 import { stripAnsi } from "../packages/agent-tui/src/ui/theme.js";
-import { SHELL_COMMAND_HINT } from "../packages/agent-tui/src/workspace-command.js";
 
 const savedEnv = {
   SIGMA_ASCII: process.env.SIGMA_ASCII,
@@ -112,15 +113,108 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       const started = app.start();
       await Promise.resolve();
 
-      expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${HIDE_CURSOR}`);
-      expect(stdout.text()).toContain(`${HIDE_CURSOR}\x1b[2J\x1b[H`);
+      expect(stdout.writes[0]).toBe(`${ENTER_ALT_SCREEN}${ENABLE_BRACKETED_PASTE}${HIDE_CURSOR}`);
+      expect(stdout.writes[1]).toContain(`${HIDE_CURSOR}\x1b[H`);
+      expect(stdout.writes[1]).toContain("\x1b[K");
+      expect(stdout.writes[1]).not.toContain("\x1b[2J");
 
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
 
       expect(stdout.last()).toContain(SHOW_CURSOR);
+      expect(stdout.last()).toContain(DISABLE_BRACKETED_PASTE);
       expect(stdout.last()).toContain(EXIT_ALT_SCREEN);
       expect(stdin.rawModes).toEqual([true, false]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses Home and End to move within the composer without submitting or exiting", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-home-end-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, "abc", 0);
+
+      stdin.emit("keypress", "", { name: "end" });
+      expect(target.composer.cursor).toBe(3);
+      expect(stdin.rawModes).toEqual([true]);
+
+      stdin.emit("keypress", "", { name: "home" });
+      expect(target.composer.cursor).toBe(0);
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps bracketed pasted multiline text in the composer until explicit submit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-paste-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+
+      stdin.emit("keypress", "", { name: "paste-start" });
+      stdin.emit("keypress", "first", { name: "f" });
+      stdin.emit("keypress", "\r", { name: "return" });
+      stdin.emit("keypress", "\n", { name: "enter" });
+      stdin.emit("keypress", "second", { name: "s" });
+      stdin.emit("keypress", "\r", { name: "return" });
+      stdin.emit("keypress", "third", { name: "t" });
+      stdin.emit("keypress", "", { name: "paste-end" });
+
+      expect(target.composer.text).toBe("first\nsecond\nthird");
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { name: "enter" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(calls).toEqual([{ instruction: "first\nsecond\nthird" }]);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses Up and Down to navigate long multiline composer drafts", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-multiline-nav-"));
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), stdin as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const started = app.start();
+      await Promise.resolve();
+      const target = testable(app);
+      setComposerText(target.composer, Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"));
+
+      stdin.emit("keypress", "", { name: "up" });
+      expect(target.composer.cursor).toBe("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11".length);
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { name: "down" });
+      expect(target.composer.cursor).toBe(target.composer.text.length);
+      expect(calls).toHaveLength(0);
+
+      stdin.emit("keypress", "", { ctrl: true, name: "c" });
+      await started;
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -245,6 +339,9 @@ describe("agent-tui app lifecycle and local terminal input", () => {
       expect(stdout.last()).toContain("Files");
       expect(stdout.last()).toContain("README.md");
       expect(stdout.last()).toContain("Checks");
+      stdin.emit("keypress", "", { ctrl: true, name: "right" });
+      expect(stripAnsi(stdout.last())).toContain("Workbench width +4 cols.");
+      expect(stripAnsi(stdout.last())).toContain("wb 43 cols");
       stdin.emit("keypress", "", { ctrl: true, name: "c" });
       await started;
     } finally {
@@ -380,17 +477,31 @@ describe("agent-tui app lifecycle and local terminal input", () => {
     }
   });
 
-  it("shows a shell hint for shell-like input without calling the model", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-shell-hint-"));
+  it("submits command-like text to the model unless shell execution is explicit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-command-like-prompt-"));
     const stdout = new FakeStdout();
     const { runner, calls } = runnerSpy();
     const app = new TuiApp(options(root), new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
     try {
       await submit(app, "pnpm test");
 
-      expect(calls).toHaveLength(0);
-      expect(stdout.last()).toContain(SHELL_COMMAND_HINT);
+      expect(calls).toEqual([{ instruction: "pnpm test" }]);
       expect(stdout.last()).not.toContain("Missing DEEPSEEK_API_KEY");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("submits markdown prompts with backticks instead of treating them as shell commands", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "sigma-tui-markdown-prompt-"));
+    const stdout = new FakeStdout();
+    const { runner, calls } = runnerSpy();
+    const app = new TuiApp(options(root), new FakeStdin() as unknown as NodeJS.ReadStream, stdout as unknown as NodeJS.WriteStream, runner);
+    try {
+      const instruction = "Fix the `pnpm test` failure.\nKeep `README.md` accurate.";
+      await submit(app, instruction);
+
+      expect(calls).toEqual([{ instruction }]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

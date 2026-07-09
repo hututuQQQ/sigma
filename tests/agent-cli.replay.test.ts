@@ -172,4 +172,35 @@ describe("agent-cli replay", () => {
       output.restore();
     }
   });
+
+  it("displays turn budget nudges in timeline replay", async () => {
+    const tracePath = await writeTrace([
+      {
+        id: "1",
+        timestamp: "2026-07-07T00:00:00.000Z",
+        type: "turn_budget_nudge",
+        runId: "r1",
+        provider: "deepseek",
+        model: "fake",
+        metadata: {
+          turn: 18,
+          remainingTurns: 2,
+          changedFiles: 0,
+          message: "Run budget warning: only 2 model turns remain and no files have changed yet."
+        }
+      }
+    ]);
+    const output = captureProcessOutput();
+
+    try {
+      const code = await runReplayCommand(["--trace-jsonl", tracePath, "--json", "--timeline"]);
+
+      expect(code).toBe(0);
+      const report = JSON.parse(output.stdout()) as ReplayReport;
+      expect(report.counts.turn_budget_nudge).toBe(1);
+      expect(report.timeline).toEqual([expect.stringContaining("turn_budget_nudge turn=18 remaining=2 changed_files=0")]);
+    } finally {
+      output.restore();
+    }
+  });
 });

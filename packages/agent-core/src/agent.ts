@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
-import { AgentLoopEngine } from "./agent-loop-engine.js";
+import { AgentLoopEngine, AgentStepProcessor, type AgentStepEvidence, type StructuredLoopDecision } from "./agent-loop-engine.js";
 import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
@@ -36,10 +36,12 @@ import {
   summarizeWorkflowState,
   workflowFailureNudge
 } from "./controller/workflow-state.js";
+import { classifyTaskIntent, resolveAgentLoopPolicy } from "./controller/loop-controller.js";
 import { redactSecrets } from "./redaction.js";
 import { createDefaultSandboxConfig } from "./sandbox.js";
 import { InMemorySubagentJobManager } from "./subagents/subagent-job-manager.js";
 import { ToolRuntime, type ToolRuntimeExecution } from "./tool-runtime.js";
+import { changedWorkspaceFiles, listWorkspaceManifest } from "./harness/manifest.js";
 import type {
   AgentEvent,
   AgentFinishReason,
@@ -54,11 +56,12 @@ import type {
   ToolRuntimeMetadata,
   ToolRegistry,
   ToolResult,
-  ContextSourceEntry
+  ContextSourceEntry,
+  WorkspaceManifest
 } from "./types.js";
 import { addUsage, normalizeToolResult, toolAllMetadata, toolModelContent, toolModelMetadata } from "./types.js";
 
-const DEFAULT_MAX_TURNS = 20;
+const DEFAULT_MAX_TURNS = 80;
 const DEFAULT_MAX_WALL_TIME_SEC = 900;
 const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12000;
@@ -153,6 +156,23 @@ function toolCallCountsAsCommand(call: ToolCall): boolean {
   if (call.function.name === "bash") return true;
   if (call.function.name !== "shell_session") return false;
   return toolArgumentsObject(call.function.arguments)?.action === "send";
+}
+
+const STEP_READ_TOOLS = new Set(["read", "read_many", "grep", "glob", "repo_query", "symbol_search", "memory", "list"]);
+
+function stepReadIntentSignature(call: ToolCall): string | null {
+  const name = call.function.name;
+  if (!STEP_READ_TOOLS.has(name)) return null;
+  const args = toolArgumentsObject(call.function.arguments) ?? {};
+  const pathValue = typeof args.path === "string"
+    ? args.path
+    : typeof args.cwd === "string"
+      ? args.cwd
+      : Array.isArray(args.files)
+        ? args.files.slice(0, 5).map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(",")
+        : "";
+  const pattern = typeof args.pattern === "string" ? args.pattern : typeof args.query === "string" ? args.query : "";
+  return `${name}:${pathValue}:${pattern}`.slice(0, 300);
 }
 
 function compactUnknownForTrace(value: unknown, label: string, maxChars: number): unknown {
@@ -250,6 +270,41 @@ function isSubagentRunSummary(value: unknown): value is SubagentRunSummary {
   );
 }
 
+function isInternalRunArtifact(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.startsWith(".agent/sessions/") || normalized.startsWith(".agent/artifacts/");
+}
+
+function workspaceManifestDiff(before: WorkspaceManifest | null, after: WorkspaceManifest | null): string[] {
+  if (!before || !after) return [];
+  const changed = new Set(changedWorkspaceFiles(before, after));
+  for (const filePath of Object.keys(before)) {
+    if (!after[filePath]) changed.add(filePath);
+  }
+  return [...changed]
+    .filter((filePath) => !isInternalRunArtifact(filePath))
+    .sort((a, b) => a.localeCompare(b, "en"));
+}
+
+function shouldSnapshotWorkspaceForCalls(calls: ToolCall[]): boolean {
+  return calls.some((call) => {
+    const name = call.function.name;
+    return name === "bash" || name === "shell_session" || name === "service" || name === "edit" || name === "write" || name === "apply_patch";
+  });
+}
+
+async function safeListWorkspaceManifest(workspacePath: string): Promise<WorkspaceManifest | null> {
+  try {
+    return await listWorkspaceManifest(workspacePath);
+  } catch {
+    return null;
+  }
+}
+
+function isCompletedFinishReason(reason: AgentFinishReason): boolean {
+  return reason === "assistant_stop" || reason === "completed_with_changes" || reason === "completed_no_changes_allowed";
+}
+
 export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   const summary: SummaryJson = {
     ...(result.sessionId ? { session_id: result.sessionId } : {}),
@@ -309,6 +364,24 @@ export function summaryJsonFromRunResult(result: AgentRunResult): SummaryJson {
   if (result.contextCompactions && result.contextCompactions.length > 0) {
     summary.context_compactions = result.contextCompactions;
   }
+  if (result.loopDiagnostics) {
+    summary.loop_diagnostics = result.loopDiagnostics;
+  }
+  if (result.loopPhaseHistory && result.loopPhaseHistory.length > 0) {
+    summary.loop_phase_history = result.loopPhaseHistory;
+  }
+  if (result.stepOutcomes && result.stepOutcomes.length > 0) {
+    summary.step_outcomes = result.stepOutcomes;
+  }
+  if (result.transitionReasons && result.transitionReasons.length > 0) {
+    summary.transition_reasons = result.transitionReasons;
+  }
+  if (result.mutationEvidence && result.mutationEvidence.length > 0) {
+    summary.mutation_evidence = result.mutationEvidence;
+  }
+  if (result.protocolRepairs && result.protocolRepairs.length > 0) {
+    summary.protocol_repairs = result.protocolRepairs;
+  }
   if (result.failureAnalyses && result.failureAnalyses.length > 0) {
     summary.failure_analyses = result.failureAnalyses;
   }
@@ -344,7 +417,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   const runId = randomUUID();
   const provider = config.modelClient.provider;
   const model = config.modelClient.model;
-  const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
+  const loopPolicy = resolveAgentLoopPolicy({ maxTurns: config.maxTurns, override: config.loopPolicy });
+  const maxTurns = loopPolicy.maxProviderTurns;
   const maxWallTimeSec = config.maxWallTimeSec ?? DEFAULT_MAX_WALL_TIME_SEC;
   const compactionMode = config.compactionMode ?? DEFAULT_COMPACTION_MODE;
   const subagentsEnabled = config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
@@ -368,6 +442,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       todos: [],
       nextTodoId: 1,
       changedFiles: new Set<string>(),
+      mutationEvidence: [],
+      readFileState: new Map(),
       contextIndexes: new Map<string, unknown>(),
       subagentRuns: []
     },
@@ -405,8 +481,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         summaryJsonPath: config.summaryJsonPath,
         parentSessionId: config.parentSessionId,
         forkedFromSessionId: config.forkedFromSessionId
-      });
+  });
   const workflow = createWorkflowState();
+  const stepProcessor = new AgentStepProcessor({
+    intent: classifyTaskIntent(config.instruction),
+    policy: loopPolicy
+  });
   const finalEvidenceMode = config.finalEvidenceMode ?? DEFAULT_FINAL_EVIDENCE_MODE;
   let finalGateStatus = createInitialFinalGateStatus(finalEvidenceMode);
   let finalGateAlreadyNudged = false;
@@ -456,6 +536,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     tools: ToolDefinition[],
     sourceEntries: ContextSourceEntry[] = []
   ): Promise<ModelResponse> => {
+    const toolChoice = tools.length === 0 ? "none" : "auto";
     const cacheHints = sourceEntries
       .filter((entry) => entry.cacheable && entry.cache_key)
       .map((entry) => ({ key: entry.cache_key as string, kind: entry.kind, label: entry.label }));
@@ -463,7 +544,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       return await config.modelClient.complete({
         messages: requestMessages,
         tools,
-        toolChoice: "auto",
+        toolChoice,
         metadata: { sigma_turn: String(turn) },
         cacheHints,
         abortSignal: config.abortSignal
@@ -479,7 +560,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       for await (const modelEvent of config.modelClient.stream({
         messages: requestMessages,
         tools,
-        toolChoice: "auto",
+        toolChoice,
         metadata: { sigma_turn: String(turn) },
         cacheHints,
         abortSignal: config.abortSignal
@@ -583,6 +664,35 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     { role: "system", content: systemSections.join("\n\n") },
     { role: "user", content: config.instruction }
   ];
+  const activeToolDefinitions = (): ToolDefinition[] => {
+    const policy = stepProcessor.toolPolicy();
+    if (policy.toolsDisabled) return [];
+    if (policy.disabledTools.size === 0) return registry.definitions;
+    return registry.definitions.filter((definition) => !policy.disabledTools.has(definition.function.name));
+  };
+  const recordLoopDecision = async (decision: StructuredLoopDecision, turn: number, turnId: string): Promise<void> => {
+    if (decision.action === "none") return;
+    const metadata = {
+      turn,
+      turnId,
+      action: decision.action,
+      mode: stepProcessor.diagnostics().mode,
+      phase: decision.phase,
+      outcome: decision.outcome,
+      reason: decision.reason,
+      message: decision.message,
+      diagnostics: stepProcessor.diagnostics()
+    };
+    await recordEvent(event(
+      runId,
+      decision.action === "stop" ? "loop_control_stop" : "loop_control_steer",
+      provider,
+      model,
+      metadata,
+      undefined,
+      durableSession?.sessionId
+    ));
+  };
   const toolRuntime = new ToolRuntime(registry, context);
   let turns = 0;
   let toolCalls = 0;
@@ -637,7 +747,15 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     while (turns < maxTurns) {
       const elapsedSec = (Date.now() - startedAt) / 1000;
       if (elapsedSec >= maxWallTimeSec) {
+        const decision = stepProcessor.observeBudgetStop(
+          turns,
+          "max_wall_time",
+          "Structured loop stopped: max wall time reached before starting another model turn."
+        );
+        await recordLoopDecision(decision, turns, `${runId}:turn:${turns + 1}:preflight`);
         finishReason = "max_wall_time";
+        lastError = decision.message ?? "Structured loop stopped: max wall time reached.";
+        finalMessage = decision.message ?? finalMessage;
         break;
       }
 
@@ -651,6 +769,28 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
       const turnId = `${runId}:turn:${turns}`;
       await recordEvent(event(runId, "turn_start", provider, model, { turn: turns, turnId }, undefined, durableSession?.sessionId));
+      const toolPolicy = stepProcessor.toolPolicy();
+      const toolsForTurn = activeToolDefinitions();
+      const loopDiagnosticsForPolicy = stepProcessor.diagnostics();
+      if (loopDiagnosticsForPolicy.mode !== "normal" || toolPolicy.toolsDisabled || toolPolicy.disabledTools.size > 0) {
+        await recordEvent(event(
+          runId,
+          "loop_control_tool_policy",
+          provider,
+          model,
+          {
+            turn: turns,
+            turnId,
+            mode: loopDiagnosticsForPolicy.mode,
+            phase: toolPolicy.phase,
+            toolsDisabled: toolPolicy.toolsDisabled,
+            disabledTools: [...toolPolicy.disabledTools].sort((a, b) => a.localeCompare(b, "en")),
+            reason: toolPolicy.reason
+          },
+          undefined,
+          durableSession?.sessionId
+        ));
+      }
       const changedFilesForContext = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
       const preparedMessages = await contextManager.prepareMessages({
         messages,
@@ -662,6 +802,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         evidenceRecords: workflow.evidenceRecords,
         changedFiles: changedFilesForContext,
         todos: context.runState.todos,
+        loopDiagnostics: stepProcessor.diagnostics(),
+        mutationEvidence: stepProcessor.mutationEvidence.all(),
         emitEvent: async (contextEvent) => {
           await recordEvent(event(
             runId,
@@ -686,6 +828,15 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (preparedMessages.messages !== messages) {
         messages.splice(0, messages.length, ...preparedMessages.messages);
       }
+      if (preparedMessages.compacted && preparedMessages.artifact) {
+        // Earlier read outputs may have been compacted out, so repeated reads must be real content again.
+        context.runState.readFileState?.clear();
+        const decision = stepProcessor.observeCompaction(turns, preparedMessages.artifact.next_actions);
+        if (decision.message) {
+          messages.push({ role: "user", content: decision.message });
+          await recordLoopDecision(decision, turns, turnId);
+        }
+      }
       const dynamicBlocks = (
         await Promise.all([
           recentDiffBlock(context.workspacePath),
@@ -708,7 +859,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const requestMessages = runtimeContextMessage ? [...messages, runtimeContextMessage] : messages;
       lastContextBudget = summarizeContextBudget({
         messages: requestMessages,
-        tools: registry.definitions,
+        tools: toolsForTurn,
         maxMessageHistoryChars: effectiveMaxMessageHistoryChars,
         modelContextChars: modelContext.modelContextChars,
         repoMapChars: repoMap?.chars,
@@ -724,7 +875,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       await recordEvent(event(runId, "model_start", provider, model, { turn: turns }, undefined, durableSession?.sessionId));
-      const response = await requestModel(turns, requestMessages, registry.definitions, [...staticSourceEntries, ...dynamicSourceEntries]);
+      const response = await requestModel(turns, requestMessages, toolsForTurn, [...staticSourceEntries, ...dynamicSourceEntries]);
       addUsage(usage, response.usage);
       await recordEvent(event(runId, "model_end", provider, model, { turn: turns, usage: response.usage }, undefined, durableSession?.sessionId));
       if (response.usage) {
@@ -745,6 +896,28 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const calls = response.message.toolCalls ?? [];
       if (calls.length === 0) {
         const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+        const controllerDecision = stepProcessor.observeTerminalCandidate({
+          turn: turns,
+          content: response.message.content,
+          changedFiles
+        });
+        const completedTerminal = controllerDecision.action === "stop" &&
+          isCompletedFinishReason(controllerDecision.finishReason ?? "assistant_stop");
+        if (controllerDecision.action === "stop" && !completedTerminal) {
+          await recordLoopDecision(controllerDecision, turns, turnId);
+          workflow.phase = "final";
+          finishReason = controllerDecision.finishReason ?? "assistant_stop";
+          lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by structured loop.";
+          if (controllerDecision.message) {
+            finalMessage = controllerDecision.message;
+          }
+          break;
+        }
+        if (controllerDecision.message) {
+          messages.push({ role: "user", content: controllerDecision.message });
+          await recordLoopDecision(controllerDecision, turns, turnId);
+          continue;
+        }
         const workflowSummary = summarizeWorkflowState(workflow, changedFiles);
         const gate = finalGateNudge({
           mode: finalEvidenceMode,
@@ -762,7 +935,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           continue;
         }
         workflow.phase = "final";
-        finishReason = "assistant_stop";
+        finishReason = completedTerminal ? controllerDecision.finishReason ?? "assistant_stop" : "assistant_stop";
+        stepProcessor.markFinal(turns, finishReason);
         stoppedByAssistant = true;
         break;
       }
@@ -770,6 +944,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       const workflowNudges: string[] = [];
       type ToolExecutionValue = { checkpointId?: string };
       const loopGuardDecision = loopEngine.loopGuard.observe(calls as ToolCall[]);
+      let loopGuardStopDecision: StructuredLoopDecision | null = null;
+      const shouldDenyByLoopGuard = loopGuardDecision.action === "stop" || loopGuardDecision.skipToolCalls === true;
+      const loopGuardDeniedMessage = shouldDenyByLoopGuard
+        ? loopGuardDecision.message ?? "Structured loop blocked repeated tool calls."
+        : null;
       if (loopGuardDecision.action !== "none") {
         await recordEvent(event(
           runId,
@@ -786,21 +965,20 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             message: loopGuardDecision.message
           },
           undefined,
-          durableSession?.sessionId
+            durableSession?.sessionId
         ));
-        if (loopGuardDecision.action === "stop") {
-          finishReason = "loop_guard";
-          lastError = loopGuardDecision.message ?? "Stopped by loop guard.";
-          break;
-        }
-        if (loopGuardDecision.message) {
-          if (loopGuardDecision.skipToolCalls === true) {
-            messages.push({ role: "user", content: loopGuardDecision.message });
-            continue;
-          }
-          workflowNudges.push(loopGuardDecision.message);
-        }
+        const structuredDecision = stepProcessor.observeLoopGuard(
+          turns,
+          loopGuardDecision.message,
+          loopGuardDecision.action === "stop"
+        );
+        if (loopGuardDecision.action === "stop") loopGuardStopDecision = structuredDecision;
+        if (structuredDecision.message) workflowNudges.push(structuredDecision.message);
       }
+      const changedFilesBeforeTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+      const manifestBeforeTools = shouldSnapshotWorkspaceForCalls(calls as ToolCall[])
+        ? await safeListWorkspaceManifest(context.workspacePath)
+        : null;
       const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
         emit: async (type, metadata, parentId) => {
           const agentEvent = event(
@@ -833,7 +1011,25 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           let result: ToolResult;
           const pendingCheckpoint = await durableSession?.checkpoints.beforeTool(call) ?? null;
           try {
-            result = await registry.execute(call, context);
+            const deniedByLoopGuard = loopGuardDeniedMessage
+              ? [
+                  loopGuardDeniedMessage,
+                  "This repeated tool call was rejected with a synthetic tool result so the tool protocol stays balanced."
+                ].join("\n")
+              : null;
+            const deniedByController = deniedByLoopGuard ?? stepProcessor.denyToolMessage(call.function.name);
+            result = deniedByController
+              ? {
+                  ok: false,
+                  content: deniedByController,
+                  metadata: {
+                    loopControlDenied: true,
+                    loopGuardDenied: Boolean(deniedByLoopGuard),
+                    mode: stepProcessor.diagnostics().mode,
+                    phase: stepProcessor.toolPolicy().phase
+                  }
+                }
+              : await registry.execute(call, context);
           } catch (error) {
             result = {
               ok: false,
@@ -849,10 +1045,31 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         }
       });
 
+      const stepValidationEvidence: AgentStepEvidence["newValidationEvidence"] = [];
       for (const execution of executions as Array<ToolRuntimeExecution<ToolExecutionValue>>) {
         const call = execution.call;
         const result = execution.result;
         const resultMetadata = toolAllMetadata(result);
+        if (resultMetadata.cacheHit === true && call.function.name === "read") {
+          await recordEvent(event(
+            runId,
+            "read_cache_hit",
+            provider,
+            model,
+            {
+              turn: turns,
+              turnId,
+              toolName: call.function.name,
+              path: resultMetadata.relativePath ?? resultMetadata.path,
+              startLine: resultMetadata.startLine,
+              limit: resultMetadata.limit,
+              byteOffset: resultMetadata.byteOffset,
+              byteLimit: resultMetadata.byteLimit
+            },
+            execution.startEventId,
+            durableSession?.sessionId
+          ));
+        }
         if (isSubagentRunSummary(resultMetadata.subagentRun)) {
           recordSubagentRun(resultMetadata.subagentRun);
         }
@@ -861,6 +1078,9 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
           args: call.function.arguments,
           result
         });
+        if (evidence && (evidence.executable || evidence.kind === "manual-check" || evidence.kind === "service")) {
+          stepValidationEvidence.push(evidence);
+        }
         const failureAnalysisStart = workflow.failureAnalyses.length;
         const failurePattern = recordToolInWorkflow({
           workflow,
@@ -902,11 +1122,80 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       if (workflowNudges.length > 0 && finishReason !== "cancelled") {
         messages.push({ role: "user", content: [...new Set(workflowNudges)].join("\n\n") });
       }
+      const manifestAfterTools = manifestBeforeTools ? await safeListWorkspaceManifest(context.workspacePath) : null;
+      const workspaceDiffFiles = workspaceManifestDiff(manifestBeforeTools, manifestAfterTools);
+      for (const filePath of workspaceDiffFiles) {
+        context.runState.changedFiles.add(filePath);
+      }
+      const changedFilesAfterTools = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
+      const newMutationEvidence = stepProcessor.observeMutationEvidence(
+        (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => ({
+          call: execution.call,
+          result: execution.result
+        })),
+        workspaceDiffFiles
+      );
+      if (context.runState.mutationEvidence || stepProcessor.mutationEvidence.all().length > 0) {
+        context.runState.mutationEvidence = stepProcessor.mutationEvidence.all();
+      }
+      const changedBeforeSet = new Set(changedFilesBeforeTools);
+      const stepEvidence: AgentStepEvidence = {
+        newMutationEvidence,
+        newWorkspaceDiffFiles: workspaceDiffFiles,
+        newValidationEvidence: stepValidationEvidence,
+        changedFilesDelta: changedFilesAfterTools.filter((filePath) => !changedBeforeSet.has(filePath)),
+        toolNames: (calls as ToolCall[]).map((call) => call.function.name),
+        readIntentSignatures: (calls as ToolCall[]).map(stepReadIntentSignature).filter((item): item is string => Boolean(item)),
+        deniedToolCalls: (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>)
+          .filter((execution) => toolAllMetadata(execution.result).loopControlDenied === true)
+          .map((execution) => execution.call.function.name)
+      };
+      const controllerDecision = stepProcessor.observeTurn({
+        turn: turns,
+        maxTurns,
+        calls: calls as ToolCall[],
+        results: (executions as Array<ToolRuntimeExecution<ToolExecutionValue>>).map((execution) => execution.result),
+        changedFilesBefore: changedFilesBeforeTools,
+        changedFilesAfter: changedFilesAfterTools,
+        evidence: stepEvidence
+      });
+      await recordEvent(event(
+        runId,
+        "loop_control_state",
+        provider,
+        model,
+        {
+          turn: turns,
+          turnId,
+          diagnostics: stepProcessor.diagnostics()
+        },
+        undefined,
+        durableSession?.sessionId
+      ));
+      if (loopGuardStopDecision) {
+        await recordLoopDecision(loopGuardStopDecision, turns, turnId);
+        finishReason = loopGuardStopDecision.finishReason ?? "loop_guard_repeated_tool";
+        lastError = loopGuardStopDecision.message ?? "Stopped by structured loop guard.";
+        finalMessage = loopGuardStopDecision.message;
+        break;
+      }
+      if (controllerDecision.action === "stop") {
+        await recordLoopDecision(controllerDecision, turns, turnId);
+        finishReason = controllerDecision.finishReason ?? "max_steps";
+        lastError = controllerDecision.message ?? controllerDecision.reason ?? "Stopped by structured loop.";
+        finalMessage = controllerDecision.message ?? finalMessage;
+        break;
+      }
+      if (controllerDecision.message && finishReason !== "cancelled") {
+        messages.push({ role: "user", content: controllerDecision.message });
+        await recordLoopDecision(controllerDecision, turns, turnId);
+      }
       if (finishReason === "cancelled") break;
     }
 
     if (!stoppedByAssistant && turns >= maxTurns && finishReason === "assistant_stop") {
-      finishReason = "max_turns";
+      finishReason = "max_steps";
+      lastError = lastError ?? "Structured loop stopped: max step budget reached.";
     }
   } catch (error) {
     if (config.abortSignal?.aborted || (error instanceof Error && error.name === "AbortError")) {
@@ -927,7 +1216,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     recordSubagentRun(report);
   }
 
-  const status = finishReason === "error" ? "error" : finishReason === "assistant_stop" ? "completed" : "stopped";
+  const status = finishReason === "error" ? "error" : isCompletedFinishReason(finishReason) ? "completed" : "stopped";
   const changedFiles = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
   const result: AgentRunResult = {
     ...(durableSession?.sessionId ? { sessionId: durableSession.sessionId } : {}),
@@ -955,6 +1244,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     finalGate: finalGateStatus,
     selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source })),
     contextCompactions,
+    loopDiagnostics: stepProcessor.diagnostics(),
+    loopPhaseHistory: stepProcessor.phaseHistory,
+    stepOutcomes: stepProcessor.stepOutcomes,
+    transitionReasons: stepProcessor.transitionReasons,
+    mutationEvidence: stepProcessor.mutationEvidence.all(),
+    protocolRepairs: stepProcessor.protocolRepairs,
     failureAnalyses: workflow.failureAnalyses,
     subagentRuns,
     toolRuntime: toolRuntime.summary(),

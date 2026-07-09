@@ -181,7 +181,7 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.finishReason).toBe("assistant_stop");
+    expect(result.finishReason).toBe("completed_no_changes_allowed");
     expect(result.toolCalls).toBe(1);
     expect(result.commandsExecuted).toBe(1);
     await expect(readFile(path.join(dir, "trace.jsonl"), "utf8")).resolves.toContain("tool_end");
@@ -321,6 +321,101 @@ describe("agent loop", () => {
     await expect(readFile(path.join(dir, "hello.txt"), "utf8")).resolves.toBe("hello new");
   });
 
+  it("records shell-created files as mutation evidence through workspace diff", async () => {
+    const dir = await tempWorkspace();
+    const summaryPath = path.join(dir, "summary.json");
+    const command = "node -e \"require('node:fs').writeFileSync('from-shell.txt','hi')\"";
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "shell-write",
+              type: "function",
+              function: { name: "bash", arguments: { command } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "create a file from the shell",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      summaryJsonPath: summaryPath
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.finishReason).toBe("completed_with_changes");
+    expect(result.changedFiles).toContain("from-shell.txt");
+    expect(result.mutationEvidence).toEqual([
+      expect.objectContaining({ kind: "workspace_diff", files: ["from-shell.txt"] })
+    ]);
+    await expect(readFile(path.join(dir, "from-shell.txt"), "utf8")).resolves.toBe("hi");
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    expect(summary.mutation_evidence[0]).toMatchObject({ kind: "workspace_diff", files: ["from-shell.txt"] });
+    expect(summary.step_outcomes.some((item: { reason?: string }) => item.reason === "mutation_evidence_recorded")).toBe(true);
+  });
+
+  it("does not count historical mutation evidence as verify-step progress", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const model = new FakeModel([
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "edit-notes",
+              type: "function",
+              function: {
+                name: "edit",
+                arguments: {
+                  path: "notes.txt",
+                  oldString: "hello",
+                  newString: "hello fixed",
+                  expectedReplacements: 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", toolCalls: [readCall("verify-read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("verify-read-2")] } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 8,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off"
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("blocked_no_verification_progress");
+    expect(result.changedFiles).toEqual(["notes.txt"]);
+    expect(result.stepOutcomes?.filter((item) => item.reason === "mutation_evidence_recorded")).toHaveLength(1);
+    expect(result.stepOutcomes?.map((item) => item.reason)).toContain("no_step_progress_post_mutation");
+    expect(result.loopDiagnostics).toMatchObject({
+      phase: "stopped",
+      lastControllerReason: "blocked_no_verification_progress"
+    });
+    await expect(readFile(path.join(dir, "notes.txt"), "utf8")).resolves.toBe("hello fixed");
+  });
+
   it("stops at max turns", async () => {
     const dir = await tempWorkspace();
     const model = new FakeModel([
@@ -347,7 +442,232 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("max_turns");
+    expect(result.finishReason).toBe("max_steps");
+  });
+
+  it("forces mutation tasks out of repeated read-only exploration", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("read-2")] } },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "edit-notes",
+              type: "function" as const,
+              function: {
+                name: "edit",
+                arguments: {
+                  path: "notes.txt",
+                  oldString: "hello",
+                  newString: "hello fixed",
+                  expectedReplacements: 1
+                }
+              }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 6,
+      loopPolicy: {
+        broadExploreLimit: 99,
+        readOnlyTurnLimit: 2,
+        implementationReserveTurns: 1
+      },
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    const steer = events.find((event) => event.type === "loop_control_steer");
+    expect(result.status).toBe("completed");
+    expect(result.finishReason).toBe("completed_with_changes");
+    expect(steer?.metadata).toMatchObject({
+      turn: 2,
+      mode: "force_implement",
+      phase: "implement",
+      outcome: "needs_follow_up",
+      reason: "mutation_no_change_budget"
+    });
+    expect(model.requests[2].tools?.map((tool) => tool.function.name)).not.toContain("read_many");
+    expect(result.mutationEvidence?.some((item) => item.files.includes("notes.txt"))).toBe(true);
+    await expect(readFile(path.join(dir, "notes.txt"), "utf8")).resolves.toBe("hello fixed");
+    expect(
+      model.requests[2].messages.some(
+        (message) => message.role === "user" && message.content.includes("Move from exploration to implementation")
+      )
+    ).toBe(true);
+  });
+
+  it("does not force implementation for read-only tasks", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("read-2")] } },
+      { message: { role: "assistant", content: "summary" } }
+    ]);
+
+    await runAgent({
+      instruction: "summarize the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 4,
+      loopPolicy: {
+        broadExploreLimit: 1,
+        readOnlyTurnLimit: 1,
+        implementationReserveTurns: 1
+      },
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(events.some((event) => event.type === "loop_control_steer")).toBe(false);
+  });
+
+  it("uses a text-only final recovery turn when forced implementation still makes no changes", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("read-2")] } },
+      { message: { role: "assistant", content: "blocked: no safe edit" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 5,
+      loopPolicy: {
+        broadExploreLimit: 99,
+        readOnlyTurnLimit: 1,
+        implementationReserveTurns: 1
+      },
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("blocked_no_feasible_edit");
+    expect(model.requests[2].toolChoice).toBe("auto");
+    expect(model.requests[2].tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(["edit", "write", "apply_patch"]));
+    expect(model.requests[2].tools?.map((tool) => tool.function.name)).not.toContain("read_many");
+    expect(events.some((event) => event.type === "loop_control_tool_policy" && event.metadata?.phase === "implement")).toBe(true);
+  });
+
+  it("does not mark a no-change mutation final response as completed", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const model = new FakeModel([
+      { message: { role: "assistant", content: "done" } },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 4,
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("blocked_no_feasible_edit");
+    expect(result.finalMessage).toContain("will not mark a no-change mutation run as completed");
+    expect(model.requests[1].toolChoice).toBe("auto");
+    expect(model.requests[1].tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining(["edit", "write", "apply_patch"]));
+    expect(events.map((event) => event.type)).toContain("loop_control_stop");
+  });
+
+  it("rejects raw tool-call text during text-only final recovery", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "hello", "utf8");
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt" } }
+    });
+    const rawToolText = '<tool_calls><invoke name="read">{"path":"notes.txt"}</invoke></tool_calls>';
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-1")] } },
+      { message: { role: "assistant", toolCalls: [readCall("read-2")] } },
+      { message: { role: "assistant", content: rawToolText } },
+      { message: { role: "assistant", content: rawToolText } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "fix the notes file",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 6,
+      loopPolicy: {
+        broadExploreLimit: 99,
+        readOnlyTurnLimit: 1,
+        implementationReserveTurns: 1
+      },
+      loopGuardMode: "off",
+      permissionMode: "yolo",
+      finalEvidenceMode: "off",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("protocol_violation");
+    expect(result.finalMessage).toContain("looks like a tool call");
+    expect(model.requests[2].toolChoice).toBe("auto");
+    expect(model.requests[3].toolChoice).toBe("auto");
+    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("real tool channel"))).toBe(true);
+    expect(result.protocolRepairs).toHaveLength(1);
+    expect(events.filter((event) => event.type === "loop_control_steer").map((event) => event.metadata?.reason)).toContain(
+      "protocol_repair"
+    );
+    expect(events.filter((event) => event.type === "loop_control_stop").map((event) => event.metadata?.reason)).toContain(
+      "protocol_violation"
+    );
   });
 
   it("nudges repeated identical tool calls then stops on continued repetition", async () => {
@@ -377,12 +697,56 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("stopped");
-    expect(result.finishReason).toBe("loop_guard");
+    expect(result.finishReason).toBe("loop_guard_repeated_tool");
     expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
       "nudge",
       "stop"
     ]);
+    expect(events.filter((event) => event.type === "tool_end").some((event) => event.metadata?.result && (event.metadata.result as { ok?: boolean }).ok === false)).toBe(true);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
+  });
+
+  it("guards a repeated single tool call even when the surrounding batch changes", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const repeatedRead = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "missing.txt" } }
+    });
+    const grepCall = (id: string, pattern: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "grep", arguments: { pattern, path: "." } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-1"), grepCall("grep-1", "alpha")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-2"), grepCall("grep-2", "beta")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-3"), grepCall("grep-3", "gamma")] } },
+      { message: { role: "assistant", toolCalls: [repeatedRead("read-4"), grepCall("grep-4", "delta")] } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "inspect the workspace",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 5,
+      permissionMode: "yolo",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("loop_guard_repeated_tool");
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
+      "nudge",
+      "stop"
+    ]);
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => String(event.metadata?.signature))).toEqual([
+      expect.stringContaining("call:read:"),
+      expect.stringContaining("call:read:")
+    ]);
   });
 
   it("warns on repeated tool calls without skipping execution or stopping", async () => {
@@ -409,12 +773,17 @@ describe("agent loop", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.finishReason).toBe("assistant_stop");
+    expect(result.finishReason).toBe("completed_no_changes_allowed");
     expect(result.toolCalls).toBe(4);
     expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
       "nudge",
       "nudge"
     ]);
+    expect(
+      events
+        .filter((event) => event.type === "tool_end")
+        .every((event) => (event.metadata?.result as { ok?: boolean } | undefined)?.ok === true)
+    ).toBe(true);
     expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
   });
 
@@ -539,6 +908,59 @@ describe("agent loop", () => {
       "Previous agent conversation compacted by the run controller."
     );
     expect(thirdRequestMessages[3].role).toBe("assistant");
+  });
+
+  it("clears repeated read cache after compaction removes earlier read output", async () => {
+    const dir = await tempWorkspace();
+    await writeFile(path.join(dir, "notes.txt"), "alpha\nbeta\n", "utf8");
+    const events: AgentEvent[] = [];
+    const eventBus = new AgentEventBus();
+    eventBus.on((event) => events.push(event));
+    const readCall = (id: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "notes.txt", offset: 1, limit: 2 } }
+    });
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [readCall("read-before-compaction")] } },
+      {
+        message: {
+          role: "assistant",
+          toolCalls: [
+            {
+              id: "grep-between-reads",
+              type: "function" as const,
+              function: { name: "grep", arguments: { pattern: "alpha", path: "." } }
+            }
+          ]
+        }
+      },
+      { message: { role: "assistant", toolCalls: [readCall("read-after-compaction")] } },
+      { message: { role: "assistant", content: "done" } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "inspect workspace",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 5,
+      maxMessageHistoryChars: 1000,
+      messageHistoryRetain: 2,
+      compactionSummaryChars: 500,
+      compactionMode: "deterministic",
+      finalEvidenceMode: "off",
+      eventBus
+    });
+
+    expect(result.status).toBe("completed");
+    expect(events.map((event) => event.type)).toContain("context_compaction_end");
+    expect(events.filter((event) => event.type === "read_cache_hit")).toEqual([]);
+    const finalRequest = model.requests[3];
+    const readToolMessages = finalRequest.messages.filter((message) => message.role === "tool" && message.name === "read");
+    const latestReadPayload = JSON.parse(readToolMessages[readToolMessages.length - 1].content) as { content: string };
+    expect(latestReadPayload.content).toContain("     1\talpha");
+    expect(latestReadPayload.content).not.toContain("File unchanged since last read");
   });
 
   it("uses model sub-session compaction by default with no tools", async () => {

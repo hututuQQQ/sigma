@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { stdin as processStdin } from "node:process";
+import { promisify } from "node:util";
 import type { ModelClient, ProviderName, ProviderOptions } from "agent-ai";
 import { createModelClient } from "agent-ai";
 import {
@@ -14,8 +16,11 @@ import { printJsonRunResult, printRunResult, writeJsonLine, writeStreamJsonEvent
 import { createInteractivePermissionDecider } from "../permission.js";
 import { attachStreamUi } from "../stream-ui.js";
 
+const execFileAsync = promisify(execFile);
+
 export interface SolveCommandDeps {
   modelClientFactory?: (provider: ProviderName, options: ProviderOptions) => ModelClient;
+  clipboardReader?: () => Promise<string>;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
@@ -36,6 +41,57 @@ async function readStdin(stream: NodeJS.ReadableStream): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+interface ClipboardCommand {
+  command: string;
+  args: string[];
+}
+
+function powershellClipboardCommand(command = "powershell.exe"): ClipboardCommand {
+  return {
+    command,
+    args: [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw"
+    ]
+  };
+}
+
+function clipboardCommands(): ClipboardCommand[] {
+  if (process.platform === "win32") return [powershellClipboardCommand()];
+  if (process.platform === "darwin") return [{ command: "pbpaste", args: [] }];
+
+  const commands: ClipboardCommand[] = [];
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) commands.push(powershellClipboardCommand());
+  commands.push(
+    { command: "wl-paste", args: [] },
+    { command: "xclip", args: ["-selection", "clipboard", "-o"] },
+    { command: "xsel", args: ["--clipboard", "--output"] }
+  );
+  return commands;
+}
+
+async function readClipboardText(): Promise<string> {
+  const failures: string[] = [];
+  for (const candidate of clipboardCommands()) {
+    try {
+      const { stdout } = await execFileAsync(candidate.command, candidate.args, {
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 5000,
+        windowsHide: true
+      });
+      return stdout;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push(`${candidate.command}: ${message}`);
+    }
+  }
+
+  throw new Error(`Could not read clipboard. Tried: ${failures.join("; ")}`);
+}
+
 async function resolveInstruction(
   flags: Record<string, string | boolean>,
   positionals: string[],
@@ -49,6 +105,13 @@ async function resolveInstruction(
     return await readFile(flags["instruction-file"], "utf8");
   }
 
+  if (flags["instruction-clipboard"] === true) {
+    const content = await (deps.clipboardReader ?? readClipboardText)();
+    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (normalized.trim().length > 0) return normalized;
+    throw new Error("Clipboard is empty. Copy a prompt first, or use --instruction-file / stdin.");
+  }
+
   if (positionals.length > 0) {
     return positionals.join(" ");
   }
@@ -59,7 +122,7 @@ async function resolveInstruction(
     if (content.trim().length > 0) return content;
   }
 
-  throw new Error("No instruction supplied. Use --instruction, --instruction-file, or pipe text on stdin.");
+  throw new Error("No instruction supplied. Use --instruction, --instruction-file, --instruction-clipboard, or pipe text on stdin.");
 }
 
 function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.WritableStream): void {
@@ -80,6 +143,7 @@ Instruction input:
   agent run "Fix failing tests"
   agent run --instruction "Fix failing tests"
   agent run --instruction-file ./task.md
+  agent run --instruction-clipboard
   printf "Fix failing tests" | agent run
 
 Core flags:
@@ -261,7 +325,7 @@ async function runNonInteractiveCommand(
     } else {
       printRunResult(result, stdout, { quiet: cliConfig.quiet });
     }
-    return result.status === "error" ? 1 : 0;
+    return result.status === "completed" ? 0 : 1;
   } catch (error) {
     detachStreamUi?.();
     detachJsonStream?.();

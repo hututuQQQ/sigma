@@ -120,11 +120,13 @@ Shortcuts:
   Ctrl+T toggle tools
   F1 open help
   Ctrl+J insert newline
-  Ctrl+A/E move to start/end
+  Ctrl+A/E or Home/End move to start/end
   Ctrl+U/K kill to start/end
   Ctrl+W delete previous word
   Ctrl+Y yank killed text
   Left/Right move cursor
+  Ctrl+C cancel active run; Ctrl+C again or idle exits
+  PageUp/PageDown scroll transcript
   Tab accepts command/file suggestions or opens the workbench
   Shift+Tab toggles plan/build mode
   Up/Down cycle prompt history

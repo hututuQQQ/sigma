@@ -19,8 +19,7 @@ import { assertWithinWidth } from "../packages/agent-tui/src/ui/layout.js";
 import {
   listWorkspaceEntries,
   resolveLocalTerminalInput,
-  resolveLocalWorkspaceInput,
-  SHELL_COMMAND_HINT
+  resolveLocalWorkspaceInput
 } from "../packages/agent-tui/src/workspace-command.js";
 
 describe("agent-tui commands and mention palettes", () => {
@@ -108,11 +107,12 @@ describe("agent-tui commands and mention palettes", () => {
     expect(resolveLocalTerminalInput("dir")).toMatchObject({ handled: true, action: "list" });
     expect(resolveLocalTerminalInput("clear")).toMatchObject({ handled: true, action: "clear" });
     expect(resolveLocalTerminalInput("cls")).toMatchObject({ handled: true, action: "clear" });
-    expect(resolveLocalTerminalInput("pnpm test")).toEqual({
-      handled: true,
-      action: "hint",
-      message: SHELL_COMMAND_HINT
-    });
+    expect(resolveLocalTerminalInput("pnpm test")).toEqual({ handled: false });
+    expect(resolveLocalTerminalInput("git status")).toEqual({ handled: false });
+    expect(resolveLocalTerminalInput("./scripts/test.sh")).toEqual({ handled: false });
+    expect(resolveLocalTerminalInput("cat package.json | head")).toEqual({ handled: false });
+    expect(resolveLocalTerminalInput("fix `pnpm test` failures")).toEqual({ handled: false });
+    expect(resolveLocalTerminalInput("fix tests\nrun `pnpm test` after changes")).toEqual({ handled: false });
     expect(resolveLocalTerminalInput("fix the tests")).toEqual({ handled: false });
   });
 

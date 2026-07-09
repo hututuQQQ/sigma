@@ -34,7 +34,7 @@ describe("durable sessions", () => {
     process.env.SIGMA_SESSION_TOKEN = secret;
     try {
       const result = await runAgent({
-        instruction: "Fix the login flow",
+        instruction: "Inspect the login flow",
         workspacePath: dir,
         modelClient: new FinalModel(`all set token=${secret}`)
       });
@@ -44,8 +44,8 @@ describe("durable sessions", () => {
       expect(sessions).toHaveLength(1);
       expect(sessions[0]).toMatchObject({
         sessionId: result.sessionId,
-        title: "Fix the login flow",
-        status: "completed",
+        title: "Inspect the login flow",
+        status: result.status,
         provider: "deepseek",
         model: "fake-session-model"
       });

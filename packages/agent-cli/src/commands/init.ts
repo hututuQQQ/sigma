@@ -115,7 +115,7 @@ function configToml(config: InitConfig): string {
 [run]
 provider = ${quoted(config.provider)}
 ${modelLine}permission_mode = ${quoted(config.permissionMode)}
-max_turns = 20
+max_turns = 80
 max_wall_time_sec = 900
 ${outputLine}
 [validation]

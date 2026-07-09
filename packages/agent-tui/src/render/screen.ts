@@ -18,7 +18,7 @@ import type { TuiRunMode } from "../mode.js";
 import type { TranscriptEntry } from "../view-model.js";
 import { joinColumns, lineCount, splitLines } from "../ui/layout.js";
 import { sigmaBrandName } from "../ui/brand.js";
-import { truncateToWidth, visibleWidth } from "../ui/theme.js";
+import { truncateToWidth, visibleWidth, wrapText } from "../ui/theme.js";
 import { buildTuiRunState, type TuiRunState } from "../run-state.js";
 import { renderComposer } from "./composer.js";
 import { renderTranscript } from "./transcript.js";
@@ -50,6 +50,8 @@ export interface RenderScreenOptions {
   overlay?: string;
   palette?: string;
   transcriptScrollOffset?: number;
+  toolDetailsOpen?: boolean;
+  workbenchWidthDelta?: number;
   width: number;
   height: number;
   color?: boolean;
@@ -152,21 +154,21 @@ function fallbackActivity(entries: TranscriptEntry[]): ActivityItem[] {
   });
 }
 
-function recentActivity(activityItems: ActivityItem[] | undefined, entries: TranscriptEntry[], width: number, color: boolean): string[] {
+function activityText(item: ActivityItem, color: boolean): string {
   const g = streamGlyphs();
+  const duration = typeof item.durationMs === "number" ? ` ${g.separator} ${item.durationMs}ms` : "";
+  return `${statusMarker(item.status, color)} ${item.label} ${item.detail}${duration}`;
+}
+
+function recentActivity(activityItems: ActivityItem[] | undefined, entries: TranscriptEntry[], width: number, color: boolean): string[] {
   const recent = (activityItems ?? fallbackActivity(entries)).slice(-6);
   if (recent.length === 0) return [muted("none yet", color)];
 
-  return recent.map((item) => {
-    const duration = typeof item.durationMs === "number" ? ` ${g.separator} ${item.durationMs}ms` : "";
-    return truncateToWidth(`${statusMarker(item.status, color)} ${item.label} ${item.detail}${duration}`, width);
-  });
+  return recent.flatMap((item) => wrapText(activityText(item, color), Math.max(8, width - 2)).map((line) => `  ${line}`));
 }
 
 function activityLine(item: ActivityItem, width: number, color: boolean): string {
-  const g = streamGlyphs();
-  const duration = typeof item.durationMs === "number" ? ` ${g.separator} ${item.durationMs}ms` : "";
-  return truncateToWidth(`${statusMarker(item.status, color)} ${item.label} ${item.detail}${duration}`, width);
+  return truncateToWidth(activityText(item, color), width);
 }
 
 function activityStripItems(options: RenderScreenOptions): ActivityItem[] {
@@ -177,10 +179,44 @@ function activityStripItems(options: RenderScreenOptions): ActivityItem[] {
   return all.filter((item) => item.kind === "subagent" || item.kind === "tool" || item.kind === "check" || item.kind === "approval").slice(-4);
 }
 
+function compactToolActivity(items: ActivityItem[]): ActivityItem[] {
+  if (items.length === 0) return items;
+  const tools = items.filter((item) => item.kind === "tool");
+  if (tools.length === 0) return items;
+  const nonTools = items.filter((item) => item.kind !== "tool");
+  const active = tools.filter((item) => item.status === "queued" || item.status === "running" || item.status === "waiting");
+  const failed = tools.filter((item) => item.status === "failed").length;
+  const aborted = tools.filter((item) => item.status === "aborted").length;
+  const running = active.filter((item) => item.status === "running").length;
+  const queued = active.length - running;
+  const latestTool = tools.at(-1);
+  const detail = [
+    active.length > 0 ? `${active.length} active` : `${tools.length} recent call${tools.length === 1 ? "" : "s"}`,
+    running > 0 ? `${running} running` : "",
+    queued > 0 ? `${queued} queued` : "",
+    failed > 0 ? `${failed} failed` : "",
+    aborted > 0 ? `${aborted} aborted` : "",
+    "Ctrl+T details"
+  ].filter(Boolean).join("  ");
+  const toolSummary: ActivityItem = {
+    kind: "tool",
+    status: failed > 0 ? "failed" : aborted > 0 ? "aborted" : active.length > 0 ? "running" : "info",
+    label: "tools",
+    detail,
+    timestamp: latestTool?.timestamp
+  };
+  return [
+    ...nonTools,
+    toolSummary
+  ].sort((a, b) => (a.timestamp ?? "").localeCompare(b.timestamp ?? ""));
+}
+
 function renderActivityStrip(options: RenderScreenOptions, width: number, maxHeight: number): string[] {
   if (maxHeight < 2) return [];
   const color = options.color ?? false;
-  const items = activityStripItems(options);
+  const items = options.toolDetailsOpen
+    ? activityStripItems(options)
+    : compactToolActivity(activityStripItems(options));
   if (items.length === 0) return [];
   const lines = [
     muted(separatorLine(width), color),
@@ -200,6 +236,15 @@ function diffStatLines(diffText: string | undefined, width: number): string[] {
   return raw.split(/\r?\n/).slice(0, 5).map((line) => truncateToWidth(line.trimEnd(), width));
 }
 
+function panelWrappedLines(text: string, width: number, indent = "  "): string[] {
+  const innerWidth = Math.max(8, width - indent.length);
+  return wrapText(redactSecretText(text), innerWidth).map((line) => `${indent}${line}`);
+}
+
+function panelItemLines(values: string[], width: number): string[] {
+  return values.flatMap((value) => panelWrappedLines(value, width));
+}
+
 function renderWorkbenchPanel(options: RenderScreenOptions, width: number, height: number): string {
   const color = options.color ?? false;
   const g = streamGlyphs();
@@ -209,15 +254,15 @@ function renderWorkbenchPanel(options: RenderScreenOptions, width: number, heigh
     roleColor("brand", `${g.sigma} Workbench`, color),
     muted(separatorLine(width), color),
     roleColor("accent", "Files", color),
-    ...(files.length > 0 ? files.map((file) => `  ${truncateToWidth(file, Math.max(8, width - 2))}`) : ["  none indexed"]),
+    ...(files.length > 0 ? panelItemLines(files, width) : ["  none indexed"]),
     "",
     roleColor("accent", "Changes", color),
     ...(changed.length > 0
-      ? changed.slice(0, 6).map((file) => `  ${truncateToWidth(file, Math.max(8, width - 2))}`)
+      ? panelItemLines(changed.slice(0, 6), width)
       : diffStatLines(options.diffText, Math.max(8, width - 2)).map((line) => `  ${line}`)),
     "",
     roleColor("accent", "Activity", color),
-    ...recentActivity(options.activityItems, options.entries, width, color).map((line) => `  ${truncateToWidth(line, Math.max(8, width - 2))}`),
+    ...recentActivity(options.activityItems, options.entries, width, color),
     "",
     roleColor("accent", "Checks", color),
     panelLine("validation", validationState(options), width),
@@ -229,6 +274,13 @@ function renderWorkbenchPanel(options: RenderScreenOptions, width: number, heigh
 
 function shouldUseWorkbench(options: RenderScreenOptions, mainHeight: number): boolean {
   return Boolean(options.workbenchOpen) && options.width >= 110 && mainHeight >= 8;
+}
+
+function computeWorkbenchWidth(options: RenderScreenOptions): number {
+  const base = Math.floor(options.width * 0.32);
+  const min = 32;
+  const max = Math.max(min, Math.min(72, options.width - 44));
+  return Math.max(min, Math.min(max, base + (options.workbenchWidthDelta ?? 0)));
 }
 
 function runningTools(events: AgentEvent[]): number {
@@ -261,6 +313,10 @@ function renderBottomStatus(options: RenderScreenOptions): string {
   ];
   if (usage) pieces.push(`ctx ${formatUsage(usage).replaceAll(" ", "/")}`);
   if (tools > 0) pieces.push(`${tools} tool${tools === 1 ? "" : "s"}`);
+  if ((options.toolDetailsOpen ?? false) && options.events.some((event) => event.type === "tool_start" || event.type === "tool_queued")) {
+    pieces.push("tool details");
+  }
+  if (options.workbenchOpen) pieces.push(`wb ${computeWorkbenchWidth(options)} cols`);
   if (runState.queuedCount > 0) pieces.push(`queued ${runState.queuedCount}`);
   if ((options.transcriptScrollOffset ?? 0) > 0) pieces.push(`scroll +${options.transcriptScrollOffset}`);
   return pieces.join(` ${g.separator} `);
@@ -283,6 +339,10 @@ export function renderScreen(options: RenderScreenOptions): string {
     ? []
     : [renderTopBar(options), ...(notice ? [notice] : [])];
   const statusLine = renderBottomStatus(options);
+  const overlayHeight = (options.palette ? lineCount(options.palette) : 0) + (options.overlay ? lineCount(options.overlay) : 0);
+  const composerMaxHeight = compact
+    ? Math.max(1, Math.min(4, options.height - topLines.length - overlayHeight - 1))
+    : Math.max(4, Math.min(12, Math.floor(options.height * 0.35), options.height - topLines.length - overlayHeight - 2));
   const composer = renderComposer({
     state: options.composer,
     mode: options.mode,
@@ -292,13 +352,14 @@ export function renderScreen(options: RenderScreenOptions): string {
     queuedInstruction: runState.queuedInstruction,
     footerStatus: statusLine,
     width: options.width,
+    maxHeight: composerMaxHeight,
     color: options.color,
     compact
   });
-  const bottomHeight = lineCount(composer) + (options.palette ? lineCount(options.palette) : 0) + (options.overlay ? lineCount(options.overlay) : 0);
+  const bottomHeight = lineCount(composer) + overlayHeight;
   const mainHeight = Math.max(2, options.height - topLines.length - bottomHeight);
   const useWorkbench = shouldUseWorkbench(options, mainHeight);
-  const workbenchWidth = useWorkbench ? Math.min(42, Math.max(34, Math.floor(options.width * 0.32))) : 0;
+  const workbenchWidth = useWorkbench ? computeWorkbenchWidth(options) : 0;
   const transcriptWidth = useWorkbench ? Math.max(40, options.width - workbenchWidth - 2) : options.width;
   const activityStrip = useWorkbench ? [] : renderActivityStrip(options, transcriptWidth, Math.min(5, Math.max(0, mainHeight - 4)));
   const transcriptHeight = useWorkbench ? mainHeight : Math.max(1, mainHeight - activityStrip.length);
@@ -307,7 +368,8 @@ export function renderScreen(options: RenderScreenOptions): string {
     transcriptWidth,
     transcriptHeight,
     options.color,
-    options.transcriptScrollOffset ?? 0
+    options.transcriptScrollOffset ?? 0,
+    { toolDetailsOpen: options.toolDetailsOpen === true }
   );
   const main = useWorkbench
     ? joinColumns(transcript, renderWorkbenchPanel(options, workbenchWidth, mainHeight), 2, options.width)

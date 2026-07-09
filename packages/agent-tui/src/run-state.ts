@@ -28,7 +28,13 @@ export interface TuiRunState {
 
 function resultLabel(result: AgentRunResult | null): string | null {
   if (!result) return null;
-  return result.finishReason ? `${result.status} ${result.finishReason}` : result.status;
+  const phase = result.loopDiagnostics?.phase;
+  const reason = result.loopDiagnostics?.lastControllerReason;
+  return [
+    result.finishReason ? `${result.status} ${result.finishReason}` : result.status,
+    phase ? `phase=${phase}` : "",
+    reason ? `reason=${reason}` : ""
+  ].filter(Boolean).join(" ");
 }
 
 export function buildTuiRunState(options: BuildTuiRunStateOptions): TuiRunState {

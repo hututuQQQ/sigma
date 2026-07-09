@@ -101,6 +101,34 @@ describe("agent-tui stream rendering", () => {
     expect(fullWidthRules.length).toBeLessThanOrEqual(2);
   });
 
+  it("keeps very long multiline composer input in a bottom viewport", () => {
+    process.env.TERM = "xterm-256color";
+    process.env.SIGMA_FORCE_UNICODE = "1";
+    const composer = createComposerState(Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"));
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: false,
+      result: null,
+      events: [],
+      message: "Ready now",
+      composer,
+      entries: buildTranscript({ workspacePath: "/tmp/sigma", events: [], result: null }),
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(splitLines(rendered).length).toBeLessThanOrEqual(24);
+    expect(rendered).toContain("... 36 lines above");
+    expect(rendered).toContain("line 40\u258c");
+    expect(rendered).toContain("build \u00b7 deepseek/default \u00b7 ask \u00b7 idle");
+    expect(rendered).not.toContain("line 1\n");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
   it("renders a wide workbench panel with files, changes, tools, and checks", () => {
     process.env.TERM = "xterm-256color";
     process.env.SIGMA_FORCE_UNICODE = "1";
@@ -150,6 +178,7 @@ describe("agent-tui stream rendering", () => {
       entries,
       activityItems,
       workbenchOpen: true,
+      workbenchWidthDelta: 28,
       filePaths: ["package.json", "packages/agent-tui/src/app.tsx"],
       diffText: " packages/agent-tui/src/app.tsx | 24 ++++++++++----",
       width: 124,
@@ -167,6 +196,7 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("tokens      input=10 output=5 total=15");
     expect(rendered).toContain("read path=package.json");
     expect(rendered).toContain("ctx input=10/output=5/total=15");
+    expect(rendered).toContain("wb 67 cols");
     expect(assertWithinWidth(rendered, 124)).toBe(true);
   });
 
@@ -509,10 +539,34 @@ describe("agent-tui stream rendering", () => {
       height: 24,
       color: false
     });
-    expect(rendered).toContain("read");
+    expect(rendered).toContain("tool activity: 2 calls");
+    expect(rendered).toContain("Ctrl+T details");
+    expect(rendered).not.toContain("bash abort signal");
     expect(rendered).not.toContain("context 123 est tokens");
     expect(rendered).toContain("ctx input=2/output=3/total=5");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
+
+    const expanded = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [queued, aborted, contextBudget, usage],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      activityItems,
+      toolDetailsOpen: true,
+      width: 96,
+      height: 24,
+      color: false
+    });
+    expect(expanded).toContain("read");
+    expect(expanded).toContain("bash");
+    expect(expanded).toContain("abort signal");
+    expect(assertWithinWidth(expanded, 96)).toBe(true);
   });
 
   it("surfaces live subagent progress in the default activity strip", () => {
@@ -562,6 +616,46 @@ describe("agent-tui stream rendering", () => {
     expect(rendered).toContain("investigator subagent");
     expect(rendered).toContain("tool=grep");
     expect(rendered).toContain("running tool grep");
+    expect(assertWithinWidth(rendered, 96)).toBe(true);
+  });
+
+  it("surfaces turn budget nudges in the transcript and activity strip", () => {
+    const budget = event("turn_budget_nudge", {
+      turn: 18,
+      remainingTurns: 2,
+      changedFiles: 0,
+      message: "Run budget warning: only 2 model turns remain and no files have changed yet."
+    });
+    const entries = buildTranscript({
+      workspacePath: "/tmp/sigma",
+      events: [budget],
+      result: null
+    });
+    const activityItems = buildActivity({
+      events: [budget],
+      result: null
+    });
+
+    const rendered = renderScreen({
+      workspacePath: "/tmp/sigma",
+      provider: "deepseek",
+      permissionMode: "ask",
+      mode: "build",
+      running: true,
+      result: null,
+      events: [budget],
+      message: null,
+      composer: createComposerState(),
+      entries,
+      activityItems,
+      width: 96,
+      height: 24,
+      color: false
+    });
+
+    expect(rendered).toContain("Run budget warning");
+    expect(rendered).toContain("turn budget");
+    expect(rendered).toContain("2 turns left; no files changed");
     expect(assertWithinWidth(rendered, 96)).toBe(true);
   });
 

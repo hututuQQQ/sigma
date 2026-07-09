@@ -125,7 +125,7 @@ describe("agent-core tools", () => {
     await writeFile(path.join(dir, "note.txt"), "hello world", "utf8");
     const result = await executeReadTool({ path: "note.txt" }, context);
     expect(result.ok).toBe(true);
-    expect(result.content).toBe("hello world");
+    expect(result.content).toBe("     1\thello world");
   });
 
   it("rejects reads outside the workspace", async () => {
