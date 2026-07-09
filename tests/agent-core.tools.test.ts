@@ -164,6 +164,37 @@ describe("agent-core tools", () => {
     expect(read.modelContent).toContain("narrowest changed-file validation");
   });
 
+  it("filters local memories by scope", async () => {
+    const { context } = await workspace();
+    await executeMemoryTool({
+      action: "write",
+      kind: "agent",
+      title: "Agent-only note",
+      content: "Only agent scoped searches should find this."
+    }, context);
+    await executeMemoryTool({
+      action: "write",
+      kind: "project",
+      title: "Project note",
+      content: "Project scoped searches should find this."
+    }, context);
+
+    const projectSearch = await executeMemoryTool({
+      action: "search",
+      query: "scoped searches",
+      scopes: ["project"]
+    }, context);
+    const agentSearch = await executeMemoryTool({
+      action: "search",
+      query: "agent scoped",
+      scopes: ["agent"]
+    }, context);
+
+    expect(projectSearch.modelContent).toContain("Project note");
+    expect(projectSearch.modelContent).not.toContain("Agent-only note");
+    expect(agentSearch.modelContent).toContain("Agent-only note");
+  });
+
   it("denies memory writes in ask mode without a decider and does not persist files", async () => {
     const { dir, context } = await workspace();
     context.permissionMode = "ask";

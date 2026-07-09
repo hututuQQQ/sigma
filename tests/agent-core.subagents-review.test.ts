@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ModelClient, ModelRequest, ModelResponse, ToolCall } from "../packages/agent-ai/src/index.js";
 import {
   AgentEventBus,
+  InMemorySubagentJobManager,
   createDefaultToolRegistry,
   reviewAntiGamingDiff,
   runAgent,
@@ -40,6 +41,8 @@ async function workspace(model: ModelClient): Promise<{ dir: string; context: To
       alwaysAllowTools: new Set<string>(),
       modelClient: model,
       subagentsEnabled: true,
+      subagentBackgroundEnabled: true,
+      subagentJobManager: new InMemorySubagentJobManager(),
       subagentDepth: 0
     }
   };
@@ -56,10 +59,12 @@ function reportResponse(summary: string, relevantFiles: string[] = []): ModelRes
       content: JSON.stringify({
         status: "ok",
         summary,
+        evidence: ["observed requested files"],
         findings: [{ title: "finding", detail: summary, severity: "info" }],
         relevantFiles,
         validationSuggestions: ["run the focused project check"],
-        risks: []
+        risks: [],
+        blockers: []
       })
     }
   };
@@ -93,6 +98,42 @@ describe("subagent task tool", () => {
       relevant_files: ["src/parser.ts"]
     });
     expect(events).toEqual(["subagent_start", "subagent_end"]);
+  });
+
+  it("creates and waits for a read-only background subagent job", async () => {
+    const model = new SequenceModel([reportResponse("Planned the work.", ["src/index.ts"])]);
+    const { context } = await workspace(model);
+    const events: string[] = [];
+    context.emitEvent = async (event) => {
+      events.push(event.type);
+    };
+    const registry = createDefaultToolRegistry({ subagents: { enabled: true, backgroundEnabled: true } });
+
+    const created = await registry.execute(
+      toolCall("task-bg", "task", {
+        description: "Plan work",
+        prompt: "Plan the implementation",
+        subagentType: "planner",
+        background: true
+      }),
+      context
+    );
+    const jobId = (created.metadata?.subagentJob as { job_id?: string } | undefined)?.job_id ?? "";
+    const waited = await registry.execute(
+      toolCall("wait-bg", "subagent_job", { action: "wait", jobId, timeoutSec: 2 }),
+      context
+    );
+
+    expect(created.ok).toBe(true);
+    expect(jobId).toBeTruthy();
+    expect(waited.metadata?.subagentRun).toMatchObject({
+      background: true,
+      subagent_type: "planner",
+      summary: "Planned the work.",
+      evidence: ["observed requested files"],
+      blockers: []
+    });
+    expect(events).toEqual(expect.arrayContaining(["subagent_job_created", "subagent_progress", "subagent_start", "subagent_end"]));
   });
 
   it("keeps reviewer subagents read-only even when the model asks for write", async () => {
@@ -240,4 +281,3 @@ describe("anti-gaming review gate", () => {
     expect(review.status).toBe("clean");
   });
 });
-

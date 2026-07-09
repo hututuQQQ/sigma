@@ -22,9 +22,13 @@ import type {
   CompactionMode,
   ContextMode,
   ExecPolicyConfig,
+  LoopGuardMode,
+  MemoryScope,
+  ModelContextLimits,
   McpServerRunSummary,
   PermissionDecider,
   PermissionMode,
+  PermissionRule,
   SandboxAdapter,
   SandboxConfig,
   ToolRegistry
@@ -62,12 +66,15 @@ export interface RunConfiguredAgentOptions {
   compactionMaxOutputChars?: number;
   compactionTimeoutSec?: number;
   compactionFallback?: CompactionFallbackMode;
+  modelContextLimits?: ModelContextLimits;
   compactionModelClient?: ModelClient;
   contextManager?: import("./context/context-manager.js").ContextManager;
   contextManagerFactory?: AgentHarnessConfig["contextManagerFactory"];
   compactionService?: import("./context/compaction-service.js").CompactionService;
   failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
   subagentsEnabled?: boolean;
+  subagentBackgroundEnabled?: boolean;
+  subagentHeartbeatTimeoutSec?: number;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming?: boolean;
@@ -83,6 +90,9 @@ export interface RunConfiguredAgentOptions {
   attemptsDir?: string;
   allowedTools?: string[];
   disabledTools?: string[];
+  permissionRules?: PermissionRule[];
+  loopGuardMode?: LoopGuardMode;
+  memoryScopes?: MemoryScope[];
   projectInstructionsEnabled?: boolean;
   projectDocMaxBytes?: number;
   contextMode?: ContextMode;
@@ -178,17 +188,23 @@ function baseRunConfig(
     ...(defined(options.compactionMaxOutputChars) ? { compactionMaxOutputChars: options.compactionMaxOutputChars } : {}),
     ...(defined(options.compactionTimeoutSec) ? { compactionTimeoutSec: options.compactionTimeoutSec } : {}),
     ...(defined(options.compactionFallback) ? { compactionFallback: options.compactionFallback } : {}),
+    ...(defined(options.modelContextLimits) ? { modelContextLimits: options.modelContextLimits } : {}),
     ...(defined(options.compactionModelClient) ? { compactionModelClient: options.compactionModelClient } : {}),
     ...(defined(options.contextManager) ? { contextManager: options.contextManager } : {}),
     ...(defined(options.contextManagerFactory) ? { contextManagerFactory: options.contextManagerFactory } : {}),
     ...(defined(options.compactionService) ? { compactionService: options.compactionService } : {}),
     ...(defined(options.failureAnalyzer) ? { failureAnalyzer: options.failureAnalyzer } : {}),
     subagentsEnabled: resolved.subagentsEnabled,
+    ...(defined(options.subagentBackgroundEnabled) ? { subagentBackgroundEnabled: options.subagentBackgroundEnabled } : {}),
+    ...(defined(options.subagentHeartbeatTimeoutSec) ? { subagentHeartbeatTimeoutSec: options.subagentHeartbeatTimeoutSec } : {}),
     ...(defined(options.subagentMaxTurns) ? { subagentMaxTurns: options.subagentMaxTurns } : {}),
     ...(defined(options.subagentMaxOutputChars) ? { subagentMaxOutputChars: options.subagentMaxOutputChars } : {}),
     reviewAntiGaming: resolved.reviewAntiGaming,
     ...(defined(options.allowedTools) ? { allowedTools: options.allowedTools } : {}),
     ...(defined(options.disabledTools) ? { disabledTools: options.disabledTools } : {}),
+    ...(defined(options.permissionRules) ? { permissionRules: options.permissionRules } : {}),
+    ...(defined(options.loopGuardMode) ? { loopGuardMode: options.loopGuardMode } : {}),
+    ...(defined(options.memoryScopes) ? { memoryScopes: options.memoryScopes } : {}),
     ...(defined(options.permissionDecider) ? { permissionDecider: options.permissionDecider } : {}),
     ...(defined(options.projectInstructionsEnabled)
       ? { projectInstructionsEnabled: options.projectInstructionsEnabled }

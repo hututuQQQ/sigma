@@ -353,14 +353,20 @@ Adapter report notes:
 --attempts-dir <path>
 --allowed-tools <comma-separated-tools>
 --disabled-tools <comma-separated-tools>
+--permission-rules <json>
+--loop-guard-mode <off|warn|stop>
 --no-project-instructions
 --project-doc-max-bytes <number>
 --context-mode <off|repo-map>
 --repo-map-max-chars <number>
+--model-context-chars <number>
+--memory-scopes <comma-separated-scopes>
 --final-evidence-mode <off|auto>
 --skills-mode <off|auto>
 --skills-max-chars <number>
 --no-subagents
+--no-subagent-background
+--subagent-heartbeat-timeout-sec <number>
 --subagent-max-turns <number>
 --subagent-max-output-chars <number>
 --review-anti-gaming / --no-review-anti-gaming
@@ -379,7 +385,13 @@ model = "deepseek-v4-pro"
 max_turns = 30
 max_wall_time_sec = 1800
 permission_mode = "ask"
+loop_guard_mode = "stop"
 run_controller_timeout_sec = 900
+
+[permissions]
+rules = [
+  { action = "deny", tool = "bash", reason = "No shell commands in this profile" }
+]
 
 [validation]
 mode = "auto"
@@ -393,9 +405,15 @@ message_history_retain = 24
 compaction_mode = "model_sub_session"
 compaction_fallback = "deterministic"
 compaction_timeout_sec = 60
+model_context_chars = 200000
+
+[memory]
+scopes = ["user", "feedback", "project", "reference"]
 
 [subagents]
 enabled = true
+background_enabled = true
+heartbeat_timeout_sec = 120
 max_turns = 4
 max_output_chars = 12000
 
@@ -437,10 +455,14 @@ AGENT_RUN_CONTROLLER_TIMEOUT_SEC
 AGENT_RETRY_MIN_BUDGET_SEC
 AGENT_ALLOWED_TOOLS
 AGENT_DISABLED_TOOLS
+AGENT_PERMISSION_RULES
+AGENT_LOOP_GUARD_MODE
 AGENT_NO_PROJECT_INSTRUCTIONS
 AGENT_PROJECT_DOC_MAX_BYTES
 AGENT_CONTEXT_MODE
 AGENT_REPO_MAP_MAX_CHARS
+AGENT_MODEL_CONTEXT_CHARS
+AGENT_MEMORY_SCOPES
 AGENT_MAX_MESSAGE_HISTORY_CHARS
 AGENT_MESSAGE_HISTORY_RETAIN
 AGENT_COMPACTION_SUMMARY_CHARS
@@ -455,6 +477,8 @@ AGENT_FINAL_EVIDENCE_MODE
 AGENT_SKILLS_MODE
 AGENT_SKILLS_MAX_CHARS
 AGENT_SUBAGENTS_ENABLED
+AGENT_SUBAGENT_BACKGROUND_ENABLED
+AGENT_SUBAGENT_HEARTBEAT_TIMEOUT_SEC
 AGENT_SUBAGENT_MAX_TURNS
 AGENT_SUBAGENT_MAX_OUTPUT_CHARS
 AGENT_REVIEW_ANTI_GAMING
@@ -472,7 +496,7 @@ OpenAI-compatible providers support SSE model streaming. The core run loop prefe
 
 ## Tools And Permissions
 
-The default tool registry is extensible and can be injected, merged, filtered, or configured with `--allowed-tools` and `--disabled-tools`. Tool names must be unique; duplicate names fail clearly unless an internal override path is used.
+The default tool registry is extensible and can be injected, merged, filtered, or configured with `--allowed-tools`, `--disabled-tools`, and permission rules. Tool names must be unique; duplicate names fail clearly unless an internal override path is used.
 
 Tool calls are described by `ToolDescriptor`, which separates provider schema, UI hints, runtime behavior, permission resources, result projection, and lifecycle details. Provider-facing tool definitions are derived from that descriptor. Tool results separate `modelContent`, `uiContent`, structured data, model-visible metadata, private metadata, artifacts, result groups, and actual resources. Only model-visible fields are serialized back into tool messages.
 
@@ -480,7 +504,7 @@ Tool calls are dispatched through the core tool runtime. Read-only tools that de
 
 Each turn also emits `turn_start` and `context_budget`. The budget is an estimate of current model-visible messages, tool definitions, repo map, and selected skills. Oversized runtime tool output can be saved under `.agent/artifacts/<run-id>/`, with the model receiving a bounded preview plus an artifact reference.
 
-Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Policy rules can allow, prompt, or deny command prefixes; the default remains conservative in `ask` and permissive in `yolo`. Sandbox-aware execution is used for bash, service, shell sessions, and harness precheck/validation commands. On Linux, the bubblewrap backend mounts only required system paths plus the workspace/read roots, overlays configured write roots, and protects `denyRead`/`denyWrite` paths where the OS can enforce them. On Windows, the native helper uses a restricted token and restores any temporary ACL changes before returning.
+Shell execution now passes through an execution policy classifier before `bash` starts. The classifier records whether a command appears read-only, workspace-changing, git-state-changing, network-using, or code-executing. Execution policy rules can allow, prompt, or deny command prefixes; permission rules can allow, ask, or deny tools and declared resources, with deny taking precedence and denied tools hidden from the model tool catalog. The default remains conservative in `ask` and permissive in `yolo`. Sandbox-aware execution is used for bash, service, shell sessions, and harness precheck/validation commands. On Linux, the bubblewrap backend mounts only required system paths plus the workspace/read roots, overlays configured write roots, and protects `denyRead`/`denyWrite` paths where the OS can enforce them. On Windows, the native helper uses a restricted token and restores any temporary ACL changes before returning.
 
 If an OS sandbox backend is unavailable and `sandbox.required=false`, Sigma may fall back to policy-only checks. Tool metadata, harness results, stream UI, and `agent doctor` include a clear warning when this happens. Use `--sandbox-required` (or `AGENT_SANDBOX_REQUIRED=true`) for fail-closed automation, including benchmark or harness runs where policy-only fallback is not acceptable.
 
@@ -502,11 +526,12 @@ The core loop exposes these default tools:
 - `apply_patch`: validates and applies safe unified diffs to workspace-relative files, including quoted paths with spaces. Its `git apply` subprocesses are bounded by the command timeout and return `metadata.timedOut` on timeout.
 - `validate`: runs an explicit validation command or infers one for changed files, a file, or the project. It returns structured `ok`, `command`, `kind`, `exitCode`, output tails, related files, and best-effort diagnostics.
 - `todo`: maintains run-scoped todo state for the agent.
-- `memory`: lists, reads, searches, and writes durable local memories in `.agent/memory` for user preferences, feedback, project notes, and reference notes. Memories are selected by relevance and should not duplicate code facts that current files can provide.
-- `task` / `subtask`: runs a foreground read-only investigator or reviewer subagent and returns a structured JSON report. Child subagents receive only `read`, `list`, `glob`, `grep`, `repo_query`, `symbol_search`, `git_status`, and `git_diff`; they cannot write files, run shells, start services, or spawn nested subagents.
+- `memory`: lists, reads, searches, and writes durable local memories in `.agent/memory` for user, feedback, project, reference, agent, and subagent scopes. Default retrieval uses user/feedback/project/reference scopes; memories are selected by relevance and should not duplicate code facts that current files can provide.
+- `task` / `subtask`: runs a foreground or background read-only investigator, reviewer, or planner subagent and returns a structured JSON report. Child subagents receive only `read`, `list`, `glob`, `grep`, `repo_query`, `symbol_search`, `git_status`, and `git_diff`; they cannot write files, run shells, start services, or spawn nested subagents.
+- `subagent_job`: lists, waits for, follows up, interrupts, or closes read-only background subagent jobs created by `task`/`subtask`.
 - `shell_session`: starts, sends to, reads from, lists, and stops a persistent non-PTY bash session for multi-step terminal workflows.
 
-Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting and is intended only for trusted unattended automation.
+Paths exposed to tools are resolved inside the workspace and rejected if they escape it. `permission-mode ask` allows read-only tools. Mutating tools require an interactive approval prompt when stdin/stdout are TTY; non-interactive `ask` denies mutating tools conservatively. `permission-mode yolo` allows mutating tools without prompting unless a permission rule forces `ask` or `deny`, and is intended only for trusted unattended automation.
 
 Interactive approval prompt:
 
@@ -534,7 +559,7 @@ Local `agent run` defaults to `--context-mode repo-map`. The startup repo map us
 
 Each model turn records a `ContextSourceMap` under `context_budget.source_map`. It attributes estimated tokens to system prompt, project instructions, tool definitions, repo map, selected skills, conversation messages, recent diff, memory snippets, and compaction summaries. Stable blocks carry cache keys as prompt-cache hints; providers that ignore those hints receive the same plain messages. Recent diff and relevant memories are injected as per-turn runtime context so the long-lived conversation history stays normalized.
 
-Conversation compaction defaults to `model-sub-session` with `--max-message-history-chars 120000`, so long sessions automatically compact. The sub-session request is read-only, uses `toolChoice: "none"` with no tools, receives clipped structured history instead of raw large tool output, and falls back to deterministic compaction with `context_compaction_error`, `context_compaction_end`, `fallback_used: true`, and a redacted error summary. Set `--compaction-fallback fail` to fail the run on model compaction errors. Set `--compaction-mode deterministic`, `--compaction-mode off`, or `--max-message-history-chars 0` to explicitly change or disable the default.
+Conversation compaction defaults to `model-sub-session` with `--max-message-history-chars 120000`, so long sessions automatically compact. If `--model-context-chars` is set, Sigma caps the message-history budget to the model context after reserving output space. The sub-session request is read-only, uses `toolChoice: "none"` with no tools, receives clipped structured history instead of raw large tool output, and falls back to deterministic compaction with `context_compaction_error`, `context_compaction_end`, `fallback_used: true`, and a redacted error summary. Set `--compaction-fallback fail` to fail the run on model compaction errors. Set `--compaction-mode deterministic`, `--compaction-mode off`, or `--max-message-history-chars 0` to explicitly change or disable the default.
 
 Repo map generation, `repo_query`, `symbol_search`, and `read_many` share the same workspace path safety and ignore behavior. The walker honors built-in skips plus workspace `.gitignore` and `.agentignore`. `repo_query` and `symbol_search` use the semantic graph index during tool calls; mutating tools invalidate that index after detected changes so subsequent lookups see fresh files.
 
@@ -542,7 +567,9 @@ Repo map v2 and `repo_query` use a lightweight graph index by default. It record
 
 Generic coding skills are loaded in `--skills-mode auto` by default. Built-in skills cover common stacks such as Python/pytest, Node/TypeScript, Go/Rust/Java tests, services and ports, certificates, archives, data processing, and small-sample ML training checks. Workspace skills can be added as Markdown files under `.agent/skills/*.md`; malformed files are ignored or parsed best-effort. Selected skills are injected after project instructions and repo map context, bounded by `--skills-max-chars`.
 
-Read-only subagents are enabled by default through the `task` and `subtask` tools. `investigator` is intended for locating files, reading failure logs, and suggesting validation plans. `reviewer` is intended for diff review, unrelated-change checks, validation gaps, and generic integrity concerns. Child agents can use only read/list/glob/grep/repo_query/symbol_search/git_status/git_diff, and recursive subagents are disabled. Parent runs receive only the compact JSON report in the `task`/`subtask` tool result and `subagent_runs`; child transcripts are not inherited by the parent model. Use `--no-subagents`, `AGENT_SUBAGENTS_ENABLED=false`, or `[subagents].enabled = false` to disable them.
+Read-only subagents are enabled by default through the `task` and `subtask` tools. `investigator` is intended for locating files, reading failure logs, and suggesting validation plans. `reviewer` is intended for diff review, unrelated-change checks, validation gaps, and generic integrity concerns. `planner` is intended for breaking work into implementation steps. Child agents can use only read/list/glob/grep/repo_query/symbol_search/git_status/git_diff, and recursive subagents are disabled. Parent runs receive only compact JSON reports in tool results, `subagent_progress` events, and `subagent_runs`; child transcripts are not inherited by the parent model. Background subagents are enabled by default and are managed through `subagent_job`; use `--no-subagent-background`, `AGENT_SUBAGENT_BACKGROUND_ENABLED=false`, or `[subagents].background_enabled = false` to disable background jobs. Use `--no-subagents`, `AGENT_SUBAGENTS_ENABLED=false`, or `[subagents].enabled = false` to disable all subagents.
+
+The loop guard watches for repeated identical tool-call sequences. With the default `--loop-guard-mode stop`, Sigma injects one recovery nudge after repeated calls and stops with `finish_reason=loop_guard` if the model repeats the same call sequence again.
 
 The anti-gaming review gate is generic policy infrastructure, not a benchmark shortcut. It scans added diff lines for patterns such as hardcoded task IDs, evaluator environment/path probes, fake validation results, scoring control flow, and product-core evaluator terminology. External adapter paths under `portable/harbor` and `scripts/bench-*` may contain adapter vocabulary. Product packages must remain free of task/verifier/scoring-specific behavior, with `packages/agent-core/src/review/anti-gaming.ts` as the single explicit exception because it owns the generic detection rules.
 

@@ -317,6 +317,41 @@ describe("agent loop", () => {
     expect(result.finishReason).toBe("max_turns");
   });
 
+  it("nudges repeated identical tool calls then stops on continued repetition", async () => {
+    const dir = await tempWorkspace();
+    const events: AgentEvent[] = [];
+    const bus = new AgentEventBus();
+    bus.on((event) => events.push(event));
+    const repeatedCall = {
+      id: "read-repeat",
+      type: "function" as const,
+      function: { name: "read", arguments: { path: "missing.txt" } }
+    };
+    const model = new FakeModel([
+      { message: { role: "assistant", toolCalls: [repeatedCall] } },
+      { message: { role: "assistant", toolCalls: [{ ...repeatedCall, id: "read-repeat-2" }] } },
+      { message: { role: "assistant", toolCalls: [{ ...repeatedCall, id: "read-repeat-3" }] } },
+      { message: { role: "assistant", toolCalls: [{ ...repeatedCall, id: "read-repeat-4" }] } }
+    ]);
+
+    const result = await runAgent({
+      instruction: "loop",
+      workspacePath: dir,
+      modelClient: model,
+      maxTurns: 5,
+      permissionMode: "yolo",
+      eventBus: bus
+    });
+
+    expect(result.status).toBe("stopped");
+    expect(result.finishReason).toBe("loop_guard");
+    expect(events.filter((event) => event.type === "loop_guard_triggered").map((event) => event.metadata?.action)).toEqual([
+      "nudge",
+      "stop"
+    ]);
+    expect(model.requests[3].messages.some((message) => message.role === "user" && message.content.includes("Loop guard"))).toBe(true);
+  });
+
   it("compacts old messages without leaving an orphan tool message at the retained tail", async () => {
     const dir = await tempWorkspace();
     const summaryPath = path.join(dir, "summary.json");
@@ -407,6 +442,26 @@ describe("agent loop", () => {
       strategy: "model_sub_session",
       fallback_used: false
     });
+  });
+
+  it("uses model context limits as an effective compaction budget", async () => {
+    const dir = await tempWorkspace();
+    const model = new DefaultCompactionModel();
+
+    const result = await runAgent({
+      instruction: "make lots of output",
+      workspacePath: dir,
+      modelClient: model,
+      permissionMode: "yolo",
+      maxTurns: 3,
+      messageHistoryRetain: 2,
+      modelContextLimits: { contextChars: 1100, reservedOutputChars: 100 }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.contextBudget?.model_context_chars).toBe(1100);
+    expect(result.contextBudget?.max_message_history_chars).toBe(1000);
+    expect(result.contextCompactions?.[0]).toMatchObject({ strategy: "model_sub_session" });
   });
 
   it("uses streaming model deltas and emits token-level events", async () => {

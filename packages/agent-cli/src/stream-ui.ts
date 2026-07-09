@@ -139,6 +139,20 @@ export function formatAgentEvent(event: AgentEvent): string | null {
       const report = event.metadata?.report as { status?: unknown; summary?: unknown; error?: unknown } | undefined;
       return `[sigma] subagent_error status=${String(report?.status ?? "error")} error=${truncateMiddle(redactSecretText(String(report?.error ?? report?.summary ?? "").replace(/\s+/g, " ")), 160).text}`;
     }
+    case "subagent_job_created": {
+      const job = event.metadata?.job as { job_id?: unknown; subagent_type?: unknown; description?: unknown } | undefined;
+      return `[sigma] subagent_job_created id=${String(job?.job_id ?? "?")} type=${String(job?.subagent_type ?? "?")} description=${truncateMiddle(redactSecretText(String(job?.description ?? "").replace(/\s+/g, " ")), 120).text}`;
+    }
+    case "subagent_progress":
+      return `[sigma] subagent_progress id=${String(event.metadata?.job_id ?? "?")} status=${String(event.metadata?.status ?? "?")}`;
+    case "subagent_job_closed": {
+      const job = event.metadata?.job as { job_id?: unknown; status?: unknown } | undefined;
+      return `[sigma] subagent_job_closed id=${String(job?.job_id ?? "?")} status=${String(job?.status ?? "?")}`;
+    }
+    case "loop_guard_triggered":
+      return `[sigma] loop_guard action=${String(event.metadata?.action ?? "?")} streak=${String(event.metadata?.streak ?? "?")} ${truncateMiddle(redactSecretText(String(event.metadata?.message ?? "").replace(/\s+/g, " ")), 160).text}`;
+    case "permission_catalog_updated":
+      return `[sigma] permission_catalog_updated rules=${String(event.metadata?.ruleCount ?? "?")} tools=${Array.isArray(event.metadata?.toolsAvailable) ? event.metadata.toolsAvailable.length : "?"}`;
     case "review_gate_start":
       return `[sigma] review_gate_start gate=${String(event.metadata?.gate ?? "?")}`;
     case "review_gate_end":

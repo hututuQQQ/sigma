@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseToolArguments, type AgentMessage, type ModelEvent, type ModelResponse, type ToolCall, type ToolDefinition } from "agent-ai";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts.js";
+import { AgentLoopEngine } from "./agent-loop-engine.js";
 import { compactLargeText } from "./compaction.js";
 import { JsonlSessionStore } from "./session/jsonl-session-store.js";
 import { createSessionManager, type SessionManager } from "./session/session-manager.js";
@@ -10,6 +11,7 @@ import { createDefaultToolRegistry, filterToolRegistry } from "./tools/registry.
 import { CompactionService } from "./context/compaction-service.js";
 import { ContextManager } from "./context/context-manager.js";
 import { ModelSubSessionCompactionProvider } from "./context/model-compaction-provider.js";
+import { resolveModelContextLimits } from "./context/model-context-limits.js";
 import { summarizeContextBudget } from "./context/token-budget.js";
 import {
   formatRuntimeContextMessage,
@@ -36,6 +38,7 @@ import {
 } from "./controller/workflow-state.js";
 import { redactSecrets } from "./redaction.js";
 import { createDefaultSandboxConfig } from "./sandbox.js";
+import { InMemorySubagentJobManager } from "./subagents/subagent-job-manager.js";
 import { ToolRuntime, type ToolRuntimeExecution } from "./tool-runtime.js";
 import type {
   AgentEvent,
@@ -43,6 +46,7 @@ import type {
   AgentRunConfig,
   AgentRunResult,
   ContextCompactionSummary,
+  MemoryScope,
   SubagentRunSummary,
   SummaryJson,
   TokenTotals,
@@ -221,6 +225,8 @@ async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegis
       : createDefaultToolRegistry({
         subagents: {
             enabled: config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED,
+            backgroundEnabled: config.subagentBackgroundEnabled,
+            heartbeatTimeoutSec: config.subagentHeartbeatTimeoutSec,
             defaultMaxTurns: config.subagentMaxTurns,
             defaultMaxOutputChars: config.subagentMaxOutputChars
           }
@@ -228,7 +234,8 @@ async function resolveRunToolRegistry(config: AgentRunConfig): Promise<ToolRegis
   );
   return filterToolRegistry(registry, {
     allowedTools: config.allowedTools,
-    disabledTools: config.disabledTools
+    disabledTools: config.disabledTools,
+    permissionRules: config.permissionRules
   });
 }
 
@@ -237,7 +244,7 @@ function isSubagentRunSummary(value: unknown): value is SubagentRunSummary {
   const record = value as Record<string, unknown>;
   return (
     typeof record.id === "string" &&
-    (record.subagent_type === "investigator" || record.subagent_type === "reviewer") &&
+    (record.subagent_type === "investigator" || record.subagent_type === "reviewer" || record.subagent_type === "planner") &&
     (record.status === "ok" || record.status === "error") &&
     typeof record.summary === "string"
   );
@@ -341,6 +348,14 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   const maxWallTimeSec = config.maxWallTimeSec ?? DEFAULT_MAX_WALL_TIME_SEC;
   const compactionMode = config.compactionMode ?? DEFAULT_COMPACTION_MODE;
   const subagentsEnabled = config.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED;
+  const modelContext = resolveModelContextLimits({
+    configuredMaxMessageHistoryChars: config.maxMessageHistoryChars,
+    limits: config.modelContextLimits
+  });
+  const effectiveMaxMessageHistoryChars = modelContext.effectiveMaxMessageHistoryChars ?? config.maxMessageHistoryChars;
+  const memoryScopes: MemoryScope[] = config.memoryScopes ?? ["user", "feedback", "project", "reference"];
+  const loopEngine = new AgentLoopEngine({ loopGuardMode: config.loopGuardMode ?? "stop" });
+  const subagentJobManager = new InMemorySubagentJobManager();
   const context: ToolExecutionContext = {
     workspacePath: path.resolve(config.workspacePath),
     permissionMode: config.permissionMode ?? "ask",
@@ -353,7 +368,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       todos: [],
       nextTodoId: 1,
       changedFiles: new Set<string>(),
-      contextIndexes: new Map<string, unknown>()
+      contextIndexes: new Map<string, unknown>(),
+      subagentRuns: []
     },
     alwaysAllowTools: new Set<string>(),
     modelClient: config.modelClient,
@@ -361,6 +377,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
     provider,
     model,
     subagentsEnabled,
+    subagentBackgroundEnabled: config.subagentBackgroundEnabled ?? true,
+    subagentHeartbeatTimeoutSec: config.subagentHeartbeatTimeoutSec,
+    subagentJobManager,
+    permissionRules: config.permissionRules,
+    memoryScopes,
     subagentDepth: 0,
     execPolicy: config.execPolicy,
     sandbox: config.sandbox ?? createDefaultSandboxConfig(),
@@ -391,6 +412,12 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   let finalGateAlreadyNudged = false;
   const contextCompactions: ContextCompactionSummary[] = [];
   const subagentRuns: SubagentRunSummary[] = [];
+  const recordSubagentRun = (report: SubagentRunSummary): void => {
+    const key = report.job_id ?? report.id;
+    const exists = (item: SubagentRunSummary) => (item.job_id ?? item.id) === key;
+    if (!subagentRuns.some(exists)) subagentRuns.push(report);
+    context.runState.subagentRuns = [...(context.runState.subagentRuns ?? []).filter((item) => !exists(item)), report];
+  };
 
   const recordEvent = async (agentEvent: AgentEvent): Promise<void> => {
     const safeEvent = compactEventForTrace(redactSecrets(agentEvent));
@@ -567,7 +594,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
   let lastContextBudget = summarizeContextBudget({
     messages,
     tools: registry.definitions,
-    maxMessageHistoryChars: config.maxMessageHistoryChars,
+    maxMessageHistoryChars: effectiveMaxMessageHistoryChars,
+    modelContextChars: modelContext.modelContextChars,
     repoMapChars: repoMap?.chars,
     skillsChars: skillsBlock.length || undefined,
     sourceEntries: staticSourceEntries
@@ -583,6 +611,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       maxWallTimeSec,
       permissionMode: context.permissionMode,
       toolsAvailable,
+      ...(config.permissionRules && config.permissionRules.length > 0 ? { permissionRules: config.permissionRules.length } : {}),
+      ...(modelContext.modelContextChars ? { modelContextChars: modelContext.modelContextChars } : {}),
       projectInstructionSources: loadedProjectInstructions.sources,
       contextMode: config.contextMode,
       repoMapChars: repoMap?.chars,
@@ -591,6 +621,17 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         selectedSkills: selectedSkills.map((skill) => ({ name: skill.name, source: skill.source }))
     }, undefined, durableSession?.sessionId)
   );
+  if (config.permissionRules && config.permissionRules.length > 0) {
+    await recordEvent(event(
+      runId,
+      "permission_catalog_updated",
+      provider,
+      model,
+      { toolsAvailable, ruleCount: config.permissionRules.length },
+      undefined,
+      durableSession?.sessionId
+    ));
+  }
 
   try {
     while (turns < maxTurns) {
@@ -601,12 +642,19 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       }
 
       turns += 1;
+      const queued = loopEngine.drainQueuedMessages(messages);
+      if (queued.stopReason) {
+        finishReason = "cancelled";
+        lastError = queued.stopReason;
+        await recordEvent(event(runId, "run_abort", provider, model, { turn: turns, reason: queued.stopReason }, undefined, durableSession?.sessionId));
+        break;
+      }
       const turnId = `${runId}:turn:${turns}`;
       await recordEvent(event(runId, "turn_start", provider, model, { turn: turns, turnId }, undefined, durableSession?.sessionId));
       const changedFilesForContext = [...context.runState.changedFiles].sort((a, b) => a.localeCompare(b, "en"));
       const preparedMessages = await contextManager.prepareMessages({
         messages,
-        maxMessageHistoryChars: config.maxMessageHistoryChars,
+        maxMessageHistoryChars: effectiveMaxMessageHistoryChars,
         messageHistoryRetain: config.messageHistoryRetain,
         compactionSummaryChars: config.compactionSummaryChars,
         objective: config.instruction,
@@ -620,7 +668,11 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             contextEvent.type,
             provider,
             model,
-            contextEvent.metadata as unknown as Record<string, unknown>,
+            {
+              ...(contextEvent.metadata as unknown as Record<string, unknown>),
+              ...modelContext,
+              effective_max_message_history_chars: effectiveMaxMessageHistoryChars
+            },
             undefined,
             durableSession?.sessionId
           ));
@@ -641,7 +693,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
             workspacePath: context.workspacePath,
             query: [config.instruction, changedFilesForContext.join(" ")].filter(Boolean).join("\n"),
             maxItems: 5,
-            maxChars: 6000
+            maxChars: 6000,
+            scopes: memoryScopes
           })
         ])
       ).filter((item): item is ContextAssemblyBlock => Boolean(item));
@@ -656,7 +709,8 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       lastContextBudget = summarizeContextBudget({
         messages: requestMessages,
         tools: registry.definitions,
-        maxMessageHistoryChars: config.maxMessageHistoryChars,
+        maxMessageHistoryChars: effectiveMaxMessageHistoryChars,
+        modelContextChars: modelContext.modelContextChars,
         repoMapChars: repoMap?.chars,
         skillsChars: skillsBlock.length || undefined,
         sourceEntries: [...staticSourceEntries, ...dynamicSourceEntries]
@@ -715,6 +769,32 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
 
       const workflowNudges: string[] = [];
       type ToolExecutionValue = { checkpointId?: string };
+      const loopGuardDecision = loopEngine.loopGuard.observe(calls as ToolCall[]);
+      if (loopGuardDecision.action !== "none") {
+        await recordEvent(event(
+          runId,
+          "loop_guard_triggered",
+          provider,
+          model,
+          {
+            turn: turns,
+            turnId,
+            action: loopGuardDecision.action,
+            streak: loopGuardDecision.streak,
+            signature: loopGuardDecision.signature,
+            message: loopGuardDecision.message
+          },
+          undefined,
+          durableSession?.sessionId
+        ));
+        if (loopGuardDecision.action === "stop") {
+          finishReason = "loop_guard";
+          lastError = loopGuardDecision.message ?? "Stopped by loop guard.";
+          break;
+        }
+        if (loopGuardDecision.message) messages.push({ role: "user", content: loopGuardDecision.message });
+        continue;
+      }
       const executions = await toolRuntime.executeBatch<ToolExecutionValue>(calls as ToolCall[], {
         emit: async (type, metadata, parentId) => {
           const agentEvent = event(
@@ -768,7 +848,7 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
         const result = execution.result;
         const resultMetadata = toolAllMetadata(result);
         if (isSubagentRunSummary(resultMetadata.subagentRun)) {
-          subagentRuns.push(resultMetadata.subagentRun);
+          recordSubagentRun(resultMetadata.subagentRun);
         }
         const evidence = inferEvidenceRecord({
           toolName: call.function.name,
@@ -832,6 +912,13 @@ export async function runAgent(config: AgentRunConfig): Promise<AgentRunResult> 
       lastError = error instanceof Error ? error.message : String(error);
     }
     await recordEvent(event(runId, "error", provider, model, { message: lastError }, undefined, durableSession?.sessionId));
+  }
+
+  for (const job of subagentJobManager.list().filter((item) => item.status === "running")) {
+    await subagentJobManager.interrupt(job.job_id, "Parent run finished before background subagent completed.");
+  }
+  for (const report of context.runState.subagentRuns ?? []) {
+    recordSubagentRun(report);
   }
 
   const status = finishReason === "error" ? "error" : finishReason === "assistant_stop" ? "completed" : "stopped";

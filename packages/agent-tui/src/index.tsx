@@ -9,7 +9,10 @@ import type {
   CompactionFallbackMode,
   CompactionMode,
   ContextMode,
+  LoopGuardMode,
+  MemoryScope,
   PermissionMode,
+  PermissionRule,
   SandboxBackend,
   SandboxConfig,
   SandboxMode,
@@ -259,6 +262,31 @@ function compactionFallbackValue(value: string | true | undefined): CompactionFa
   throw new Error("Unsupported compaction fallback. Use deterministic or fail.");
 }
 
+function loopGuardModeValue(value: string | true | undefined): LoopGuardMode | undefined {
+  if (value === undefined || value === true) return undefined;
+  if (value === "off" || value === "warn" || value === "stop") return value;
+  throw new Error("Unsupported loop guard mode. Use off, warn, or stop.");
+}
+
+function memoryScopesValue(value: string | true | undefined): MemoryScope[] | undefined {
+  const scopes = stringList(value).filter((item): item is MemoryScope =>
+    item === "user" ||
+    item === "feedback" ||
+    item === "project" ||
+    item === "reference" ||
+    item === "agent" ||
+    item === "subagent"
+  );
+  return scopes.length > 0 ? scopes : undefined;
+}
+
+function permissionRulesValue(value: string | true | undefined): PermissionRule[] | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = JSON.parse(value) as unknown;
+  const raw = Array.isArray(parsed) ? parsed : [parsed];
+  return raw.filter((item): item is PermissionRule => Boolean(item) && typeof item === "object");
+}
+
 function validationCommands(flags: Map<string, string | true>): string[] | undefined {
   const commands = [
     ...(typeof flags.get("validation-command") === "string" ? [flags.get("validation-command") as string] : []),
@@ -317,8 +345,14 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
     attemptsDir: typeof flags.get("attempts-dir") === "string" ? flags.get("attempts-dir") as string : undefined,
     allowedTools: stringList(flags.get("allowed-tools")),
     disabledTools: stringList(flags.get("disabled-tools")),
+    permissionRules: permissionRulesValue(flags.get("permission-rules")),
+    loopGuardMode: loopGuardModeValue(flags.get("loop-guard-mode")),
+    memoryScopes: memoryScopesValue(flags.get("memory-scopes")),
     contextMode: contextModeValue(flags.get("context-mode")),
     repoMapMaxChars: numberFlag(flags, "repo-map-max-chars"),
+    modelContextLimits: numberFlag(flags, "model-context-chars")
+      ? { contextChars: numberFlag(flags, "model-context-chars") }
+      : undefined,
     maxMessageHistoryChars: numberFlag(flags, "max-message-history-chars") ?? DEFAULT_MAX_MESSAGE_HISTORY_CHARS,
     messageHistoryRetain: numberFlag(flags, "message-history-retain"),
     compactionSummaryChars: numberFlag(flags, "compaction-summary-chars"),
@@ -335,6 +369,8 @@ export function parseTuiArgs(argv: string[]): CliOptions | "help" {
     skillsMode: skillsModeValue(flags.get("skills-mode")),
     skillsMaxChars: numberFlag(flags, "skills-max-chars"),
     subagentsEnabled: flags.has("no-subagents") ? false : DEFAULT_SUBAGENTS_ENABLED,
+    subagentBackgroundEnabled: flags.has("no-subagent-background") ? false : undefined,
+    subagentHeartbeatTimeoutSec: numberFlag(flags, "subagent-heartbeat-timeout-sec"),
     subagentMaxTurns: numberFlag(flags, "subagent-max-turns"),
     subagentMaxOutputChars: numberFlag(flags, "subagent-max-output-chars"),
     enableMcp: flags.has("enable-mcp"),

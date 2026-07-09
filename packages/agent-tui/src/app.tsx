@@ -12,8 +12,12 @@ import {
   type CompactionFallbackMode,
   type CompactionMode,
   type ContextMode,
+  type LoopGuardMode,
+  type MemoryScope,
+  type ModelContextLimits,
   type PermissionMode,
   type PermissionRequest,
+  type PermissionRule,
   type SandboxConfig,
   type TokenTotals,
   buildResumeInstruction,
@@ -110,8 +114,12 @@ export interface TuiAppOptions {
   attemptsDir?: string;
   allowedTools?: string[];
   disabledTools?: string[];
+  permissionRules?: PermissionRule[];
+  loopGuardMode?: LoopGuardMode;
+  memoryScopes?: MemoryScope[];
   contextMode?: ContextMode;
   repoMapMaxChars?: number;
+  modelContextLimits?: ModelContextLimits;
   maxMessageHistoryChars?: number;
   messageHistoryRetain?: number;
   compactionSummaryChars?: number;
@@ -126,6 +134,8 @@ export interface TuiAppOptions {
   skillsMode?: AgentSkillsMode;
   skillsMaxChars?: number;
   subagentsEnabled?: boolean;
+  subagentBackgroundEnabled?: boolean;
+  subagentHeartbeatTimeoutSec?: number;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming?: boolean;
@@ -982,8 +992,12 @@ export class TuiApp {
         attemptsDir: this.options.attemptsDir,
         allowedTools: this.options.allowedTools,
         disabledTools: mergeDisabledToolsForMode(this.mode, this.options.disabledTools),
+        permissionRules: this.options.permissionRules,
+        loopGuardMode: this.options.loopGuardMode,
+        memoryScopes: this.options.memoryScopes,
         contextMode: this.options.contextMode,
         repoMapMaxChars: this.options.repoMapMaxChars,
+        modelContextLimits: this.options.modelContextLimits,
         maxMessageHistoryChars: this.options.maxMessageHistoryChars,
         messageHistoryRetain: this.options.messageHistoryRetain,
         compactionSummaryChars: this.options.compactionSummaryChars,
@@ -998,6 +1012,8 @@ export class TuiApp {
         skillsMode: this.options.skillsMode,
         skillsMaxChars: this.options.skillsMaxChars,
         subagentsEnabled: this.options.subagentsEnabled,
+        subagentBackgroundEnabled: this.options.subagentBackgroundEnabled,
+        subagentHeartbeatTimeoutSec: this.options.subagentHeartbeatTimeoutSec,
         subagentMaxTurns: this.options.subagentMaxTurns,
         subagentMaxOutputChars: this.options.subagentMaxOutputChars,
         reviewAntiGaming: this.options.reviewAntiGaming,

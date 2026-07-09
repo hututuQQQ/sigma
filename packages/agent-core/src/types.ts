@@ -5,6 +5,31 @@ export type PermissionMode = "ask" | "yolo";
 
 export type ToolRisk = "read" | "write" | "execute" | "network" | "unknown";
 
+export type PermissionRuleAction = "allow" | "ask" | "deny";
+export type PermissionRuleEffect = PermissionRuleAction;
+
+export interface PermissionRule {
+  action?: PermissionRuleAction;
+  effect?: PermissionRuleEffect;
+  tool?: string | string[];
+  tools?: string[];
+  risk?: ToolRisk | ToolRisk[] | ToolPermissionRisk | ToolPermissionRisk[];
+  resourceKind?: ToolResourceKind | ToolResourceKind[];
+  path?: string | string[];
+  host?: string | string[];
+  command?: string | string[];
+  reason?: string;
+}
+
+export type LoopGuardMode = "off" | "warn" | "stop";
+export type MemoryScope = "user" | "feedback" | "project" | "reference" | "agent" | "subagent";
+
+export interface ModelContextLimits {
+  contextChars?: number;
+  inputChars?: number;
+  reservedOutputChars?: number;
+}
+
 export type ToolApprovalMode = "auto" | "prompt" | "deny";
 export type ToolSandboxMode = "default" | "policy_only" | "bypass";
 export type SandboxMode =
@@ -200,6 +225,7 @@ export type AgentFinishReason =
   | "assistant_stop"
   | "max_turns"
   | "max_wall_time"
+  | "loop_guard"
   | "validation_failed"
   | "precheck_failed"
   | "cancelled"
@@ -288,7 +314,7 @@ export interface FinalGateStatus {
   reason?: string;
 }
 
-export type SubagentType = "investigator" | "reviewer";
+export type SubagentType = "investigator" | "reviewer" | "planner";
 
 export interface SubagentFinding {
   title: string;
@@ -299,16 +325,22 @@ export interface SubagentFinding {
 
 export interface SubagentRunSummary {
   id: string;
+  job_id?: string;
   subagent_type: SubagentType;
   description: string;
   status: "ok" | "error";
+  background?: boolean;
   summary: string;
+  evidence?: string[];
   findings: SubagentFinding[];
   relevant_files: string[];
   validation_suggestions: string[];
   risks: string[];
+  blockers?: string[];
   tool_calls: number;
   duration_ms: number;
+  started_at?: string;
+  finished_at?: string;
   error?: string;
 }
 
@@ -407,6 +439,11 @@ export interface ToolExecutionContext {
   sandboxAdapter?: SandboxAdapter;
   declaredResources?: ToolResourceDescriptor[];
   actualResources?: ToolResourceDescriptor[];
+  permissionRules?: PermissionRule[];
+  subagentBackgroundEnabled?: boolean;
+  subagentHeartbeatTimeoutSec?: number;
+  subagentJobManager?: unknown;
+  memoryScopes?: MemoryScope[];
   reportProgress?: (update: ToolProgressUpdate) => void | Promise<void>;
   createArtifact?: (artifact: ToolArtifactInput) => Promise<ToolArtifactSummary>;
   groupResult?: (group: ToolResultGroup) => void | Promise<void>;
@@ -437,6 +474,8 @@ export interface ToolRegistryOptions {
   allowOverrides?: boolean;
   subagents?: {
     enabled?: boolean;
+    backgroundEnabled?: boolean;
+    heartbeatTimeoutSec?: number;
     defaultMaxTurns?: number;
     defaultMaxOutputChars?: number;
   };
@@ -445,6 +484,7 @@ export interface ToolRegistryOptions {
 export interface ToolRegistryFilter {
   allowedTools?: string[];
   disabledTools?: string[];
+  permissionRules?: PermissionRule[];
 }
 
 export type TodoStatus = "pending" | "in_progress" | "done" | "blocked";
@@ -463,6 +503,7 @@ export interface AgentRunState {
   contextIndexes?: Map<string, unknown>;
   contextIndexVersion?: number;
   toolArtifacts?: ToolArtifactSummary[];
+  subagentRuns?: SubagentRunSummary[];
 }
 
 export type ContextMode = "off" | "repo-map";
@@ -482,6 +523,8 @@ export interface ContextCompactionSummary {
   before_message_count: number;
   after_message_count: number;
   compacted_message_count: number;
+  model_context_chars?: number;
+  effective_max_message_history_chars?: number;
   artifact?: unknown;
   fallback_used: boolean;
   duration_ms: number;
@@ -493,6 +536,7 @@ export interface ContextBudgetSummary {
   message_count: number;
   tool_count: number;
   max_message_history_chars?: number;
+  model_context_chars?: number;
   repo_map_chars?: number;
   skills_chars?: number;
   source_map?: ContextSourceMap;
@@ -632,6 +676,7 @@ export interface AgentRunConfig {
   compactionMaxOutputChars?: number;
   compactionTimeoutSec?: number;
   compactionFallback?: CompactionFallbackMode;
+  modelContextLimits?: ModelContextLimits;
   contextManager?: import("./context/context-manager.js").ContextManager;
   contextManagerFactory?: (options: {
     config: AgentRunConfig;
@@ -640,6 +685,8 @@ export interface AgentRunConfig {
   compactionService?: import("./context/compaction-service.js").CompactionService;
   failureAnalyzer?: import("./workflow/failure-analyzer.js").FailureAnalyzer;
   subagentsEnabled?: boolean;
+  subagentBackgroundEnabled?: boolean;
+  subagentHeartbeatTimeoutSec?: number;
   subagentMaxTurns?: number;
   subagentMaxOutputChars?: number;
   reviewAntiGaming?: boolean;
@@ -648,6 +695,9 @@ export interface AgentRunConfig {
   toolRegistryFactory?: () => ToolRegistry | Promise<ToolRegistry>;
   allowedTools?: string[];
   disabledTools?: string[];
+  permissionRules?: PermissionRule[];
+  loopGuardMode?: LoopGuardMode;
+  memoryScopes?: MemoryScope[];
   permissionDecider?: PermissionDecider;
   projectInstructionsEnabled?: boolean;
   projectDocMaxBytes?: number;
@@ -708,6 +758,11 @@ export interface AgentEvent {
     | "subagent_start"
     | "subagent_end"
     | "subagent_error"
+    | "subagent_job_created"
+    | "subagent_progress"
+    | "subagent_job_closed"
+    | "loop_guard_triggered"
+    | "permission_catalog_updated"
     | "review_gate_start"
     | "review_gate_end"
     | "harness_check_start"

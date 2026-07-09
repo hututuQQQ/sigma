@@ -19,13 +19,15 @@ export interface SubagentRunRequest {
   relatedFiles?: string[];
   maxTurns?: number;
   maxOutputChars?: number;
-  background?: false;
+  background?: boolean;
 }
 
 export interface SubagentRunnerOptions {
   createToolRegistry: (subagentType: SubagentType) => ToolRegistry;
   defaultMaxTurns?: number;
   defaultMaxOutputChars?: number;
+  backgroundEnabled?: boolean;
+  heartbeatTimeoutSec?: number;
 }
 
 export interface SubagentToolOptions extends SubagentRunnerOptions {
@@ -38,3 +40,25 @@ export interface SubagentExecution {
   options: SubagentRunnerOptions;
 }
 
+export type SubagentJobStatus = "running" | "completed" | "error" | "interrupted" | "closed";
+
+export interface SubagentJobSummary {
+  job_id: string;
+  status: SubagentJobStatus;
+  subagent_type: SubagentType;
+  description: string;
+  background: true;
+  created_at: string;
+  updated_at: string;
+  report?: SubagentRunSummary;
+  error?: string;
+}
+
+export interface SubagentJobManager {
+  create(request: SubagentRunRequest, context: ToolExecutionContext, options: SubagentRunnerOptions): SubagentJobSummary;
+  list(): SubagentJobSummary[];
+  wait(jobId: string, timeoutMs?: number): Promise<SubagentJobSummary | null>;
+  followup(jobId: string, prompt: string): Promise<SubagentJobSummary>;
+  interrupt(jobId: string, reason?: string): Promise<SubagentJobSummary>;
+  close(jobId?: string): Promise<SubagentJobSummary[]>;
+}

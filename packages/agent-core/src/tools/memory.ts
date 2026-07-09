@@ -20,6 +20,7 @@ interface MemoryArgs {
   tags?: unknown;
   limit?: unknown;
   maxChars?: unknown;
+  scopes?: unknown;
 }
 
 function numberOrDefault(value: unknown, fallback: number, min: number, max: number): number {
@@ -36,17 +37,26 @@ function actionValue(value: unknown): "list" | "read" | "search" | "write" {
 }
 
 function kindValue(value: unknown): MemoryKind | undefined {
-  return value === "user" || value === "feedback" || value === "project" || value === "reference" ? value : undefined;
+  return value === "user" || value === "feedback" || value === "project" || value === "reference" || value === "agent" || value === "subagent"
+    ? value
+    : undefined;
+}
+
+function scopeArray(value: unknown, fallback?: MemoryKind[]): MemoryKind[] | undefined {
+  const raw = Array.isArray(value) ? value : undefined;
+  const scopes = raw?.map(kindValue).filter((item): item is MemoryKind => Boolean(item));
+  return scopes && scopes.length > 0 ? scopes : fallback;
 }
 
 export async function executeMemoryTool(args: unknown, context: ToolExecutionContext): Promise<ToolResult> {
   const parsed = (args && typeof args === "object" ? args : {}) as MemoryArgs;
   const action = actionValue(parsed.action);
   const maxChars = numberOrDefault(parsed.maxChars, context.maxToolOutputChars, 500, 50000);
+  const scopes = scopeArray(parsed.scopes, context.memoryScopes as MemoryKind[] | undefined);
 
   try {
     if (action === "list") {
-      const memories = await listMemories(context.workspacePath);
+      const memories = await listMemories(context.workspacePath, { scopes });
       const content = JSON.stringify({ memories: memories.map(({ content, ...record }) => ({ ...record, chars: content.length })) }, null, 2);
       return {
         ok: true,
@@ -61,7 +71,7 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
       if (typeof parsed.id !== "string" || parsed.id.trim().length === 0) {
         return { ok: false, modelContent: "memory.read requires id" };
       }
-      const memory = await readMemory(context.workspacePath, parsed.id);
+      const memory = await readMemory(context.workspacePath, parsed.id, { scopes });
       if (!memory) return { ok: false, modelContent: `Memory not found: ${parsed.id}` };
       return {
         ok: true,
@@ -79,7 +89,8 @@ export async function executeMemoryTool(args: unknown, context: ToolExecutionCon
       const results = await searchMemories({
         workspacePath: context.workspacePath,
         query: parsed.query,
-        limit: numberOrDefault(parsed.limit, 5, 1, 20)
+        limit: numberOrDefault(parsed.limit, 5, 1, 20),
+        scopes
       });
       const content = results.length > 0
         ? results.map((record) => formatMemorySnippet(record, 1000)).join("\n")

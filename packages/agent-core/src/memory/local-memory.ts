@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { truncateMiddle } from "../compaction.js";
 import { isPathInside } from "../policy.js";
 
-export type MemoryKind = "user" | "feedback" | "project" | "reference";
+export type MemoryKind = "user" | "feedback" | "project" | "reference" | "agent" | "subagent";
 
 export interface MemoryRecord {
   id: string;
@@ -23,7 +23,7 @@ export interface MemorySearchResult extends MemoryRecord {
   reason: string;
 }
 
-const MEMORY_KINDS = new Set<MemoryKind>(["user", "feedback", "project", "reference"]);
+const MEMORY_KINDS = new Set<MemoryKind>(["user", "feedback", "project", "reference", "agent", "subagent"]);
 
 function memoryRoot(workspacePath: string): string {
   return path.join(path.resolve(workspacePath), ".agent", "memory");
@@ -105,14 +105,21 @@ async function memoryFiles(root: string): Promise<string[]> {
   return files;
 }
 
-export async function listMemories(workspacePath: string): Promise<MemoryRecord[]> {
+function allowedScopes(scopes?: MemoryKind[]): Set<MemoryKind> | null {
+  if (!scopes || scopes.length === 0) return null;
+  return new Set(scopes.filter((scope) => MEMORY_KINDS.has(scope)));
+}
+
+export async function listMemories(workspacePath: string, options: { scopes?: MemoryKind[] } = {}): Promise<MemoryRecord[]> {
   const root = memoryRoot(workspacePath);
+  const scopes = allowedScopes(options.scopes);
   const records: MemoryRecord[] = [];
   for (const filePath of await memoryFiles(root)) {
     const text = await readFile(filePath, "utf8");
     const parsed = parseFrontmatter(text);
     const id = parsed.metadata.id || path.basename(filePath, ".md");
     const kind = kindValue(parsed.metadata.kind);
+    if (scopes && !scopes.has(kind)) continue;
     const info = await stat(filePath);
     records.push({
       id,
@@ -128,9 +135,9 @@ export async function listMemories(workspacePath: string): Promise<MemoryRecord[
   return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.title.localeCompare(b.title, "en"));
 }
 
-export async function readMemory(workspacePath: string, idOrPath: string): Promise<MemoryRecord | null> {
+export async function readMemory(workspacePath: string, idOrPath: string, options: { scopes?: MemoryKind[] } = {}): Promise<MemoryRecord | null> {
   const normalized = idOrPath.replace(/\\/g, "/");
-  const records = await listMemories(workspacePath);
+  const records = await listMemories(workspacePath, options);
   return records.find((record) => record.id === normalized || record.path === normalized || record.path.endsWith(`/${normalized}.md`)) ?? null;
 }
 
@@ -170,9 +177,10 @@ export async function searchMemories(options: {
   workspacePath: string;
   query: string;
   limit?: number;
+  scopes?: MemoryKind[];
 }): Promise<MemorySearchResult[]> {
   const tokens = tokenize(options.query);
-  const scored = (await listMemories(options.workspacePath))
+  const scored = (await listMemories(options.workspacePath, { scopes: options.scopes }))
     .map((record) => scoreMemory(record, tokens))
     .filter((record): record is MemorySearchResult => Boolean(record));
   return scored
