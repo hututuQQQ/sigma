@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -18,6 +18,7 @@ import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { runtimeStateRoot } from "../packages/agent-runtime/src/index.js";
+import { SessionCommandBus } from "../packages/agent-runtime/src/session-command-bus.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 class Capture extends Writable {
@@ -97,16 +98,6 @@ class FakeRuntime implements RuntimeClient {
 
 async function workspace(prefix: string): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), prefix));
-}
-
-async function writeOwner(root: string, sessionId: string): Promise<void> {
-  const directory = path.join(runtimeStateRoot(root), "sessions", sessionId);
-  await mkdir(directory, { recursive: true });
-  await writeFile(path.join(directory, "runtime-owner.json"), JSON.stringify({
-    pid: process.pid,
-    instanceId: "coverage-owner",
-    startedAt: new Date().toISOString()
-  }), "utf8");
 }
 
 afterEach(() => {
@@ -283,7 +274,8 @@ describe("CLI session branches", () => {
     const root = await workspace("sigma-session-owner-");
     vi.stubEnv("SIGMA_STATE_HOME", path.join(root, "private-state"));
     const runtime = new FakeRuntime();
-    await writeOwner(root, "active");
+    const owner = new SessionCommandBus(runtimeStateRoot(root), async () => undefined);
+    await owner.claim("active");
 
     const resume = new Capture();
     await expect(runSessionCommand(["resume", "active", "--workspace", root], { runtime, stdout: resume })).resolves.toBe(0);
@@ -310,6 +302,7 @@ describe("CLI session branches", () => {
       stderr: unknown
     })).resolves.toBe(1);
     expect(unknown.text()).toContain("Unknown session command");
+    await owner.release("active");
   });
 });
 
