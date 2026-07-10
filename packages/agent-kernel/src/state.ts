@@ -35,9 +35,15 @@ export interface KernelState {
   activeModelTurn?: ActiveModelTurn;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
+  toolCallIds: string[];
   receipts: ToolReceipt[];
   evidence: JsonValue[];
   childIds: string[];
+  completionRepairAttempts: number;
+  continuationAttempts: number;
+  repeatedToolBatchCount: number;
+  receiptCountAtLastUserInput: number;
+  lastToolBatchSignature?: string;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -63,9 +69,14 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     deadlineAt: options.deadlineAt,
     messages: [],
     pendingTools: [],
+    toolCallIds: [],
     receipts: [],
     evidence: [],
-    childIds: []
+    childIds: [],
+    completionRepairAttempts: 0,
+    continuationAttempts: 0,
+    repeatedToolBatchCount: 0,
+    receiptCountAtLastUserInput: 0
   };
 }
 

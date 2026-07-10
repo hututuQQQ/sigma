@@ -42,7 +42,7 @@ Run the neutral product checks without live provider credentials:
 ```powershell
 pnpm smoke:product
 pnpm smoke:tui-product
-pnpm verify:sandbox
+pnpm verify:containment
 pnpm verify:package:agent-cli
 pnpm perf:repo-100k
 pnpm package:harbor-runtime
@@ -53,7 +53,7 @@ What these commands prove:
 
 - `smoke:product`: a fake gateway completes a normal multi-turn tool/session workflow through the built CLI.
 - `smoke:tui-product`: the built TUI exercises alternate-screen, cursor, raw-mode, completion, cleanup, and responsive-resize behavior with controlled terminal streams.
-- `verify:sandbox`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check.
+- `verify:containment`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check. This command does not claim process isolation.
 - `verify:package:agent-cli`: the default Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime; verification runs the bundled CLI entry with host Node and attempts the target wrapper when the native/WSL environment supports it.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
 - `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness from release readiness.
@@ -83,6 +83,7 @@ The automated suites cover:
 - effect-based permission/mode decisions, per-call contexts, resource locking, process cancellation, tool failures, workspace delta receipts, and nested `AGENTS.md` discovery;
 - stale model/tool/outcome rejection after steering, protocol-safe closure of superseded tool calls, nested-instruction replan-before-write-or-completion, delegated write-scope enforcement, and tool idle/hard deadlines;
 - current-run-only completion receipts, same-turn completion barriers, strict met-criterion evidence, CJK/Unicode repository retrieval, provider-sized token fitting, atomic tool-call/result compaction, bounded large outputs, Git-root/workspace containment, symlink/junction containment, and cache invalidation;
+- typed user-input suspension, bounded natural-stop repair, repeated tool-batch detection, run-wide tool-call ID uniqueness, child follow-up quiescence, and durable joined-child evidence recovery;
 - child scheduling, durable FIFO follow-ups, parent cancellation/join behavior, crash-visible unresolved children, clean-repository worktrees, dirty/non-Git single-writer leases, delegated approval capabilities, scoped integration, and integration conflicts;
 - MCP initialize/tools/call flows, repository trust/digest invalidation, cwd containment, environment-secret isolation, malicious-config preflight, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
 - CLI strict config precedence, init/replay/session commands, active-owner routing, output formats, exit codes, interactive approval, and provider failure;

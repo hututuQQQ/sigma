@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -53,7 +54,9 @@ export class SessionCommandBus {
   private readonly instanceId = randomUUID();
   private readonly timers = new Map<string, ReturnType<typeof setInterval>>();
   private readonly leases = new Map<string, ProcessOwnerLease>();
-  private readonly polling = new Set<string>();
+  private readonly polling = new Map<string, Promise<void>>();
+  private readonly dispatchContext = new AsyncLocalStorage<string>();
+  private readonly deferredReleases = new Set<string>();
 
   constructor(
     private readonly rootDir: string,
@@ -89,6 +92,16 @@ export class SessionCommandBus {
       clearInterval(timer);
       this.timers.delete(sessionId);
     }
+    const polling = this.polling.get(sessionId);
+    if (polling && this.dispatchContext.getStore() === sessionId) {
+      this.deferredReleases.add(sessionId);
+      return;
+    }
+    await polling;
+    await this.releaseLease(sessionId);
+  }
+
+  private async releaseLease(sessionId: string): Promise<void> {
     const lease = this.leases.get(sessionId);
     if (!lease) return;
     await lease.release();
@@ -97,28 +110,34 @@ export class SessionCommandBus {
 
   private async poll(sessionId: string): Promise<void> {
     if (this.polling.has(sessionId) || !this.timers.has(sessionId)) return;
-    this.polling.add(sessionId);
+    const task = this.pollOwned(sessionId);
+    this.polling.set(sessionId, task);
     try {
-      const directory = commandDirectory(this.rootDir, sessionId);
-      await this.restoreInterruptedCommands(directory);
-      const files = (await readdir(directory).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
-      for (const file of files) {
-        const source = path.join(directory, file);
-        const processing = `${source}.${this.instanceId}.processing`;
-        try { await rename(source, processing); } catch { continue; }
-        let dispatched = false;
-        try {
-          const command = JSON.parse(await readFile(processing, "utf8")) as RunCommand;
-          if (command.sessionId !== sessionId) throw new Error("Session command inbox mismatch.");
-          await this.dispatch(command);
-          dispatched = true;
-        } finally {
-          if (dispatched) await unlink(processing).catch(() => undefined);
-          else await rename(processing, source).catch(() => undefined);
-        }
-      }
+      await task;
     } finally {
-      this.polling.delete(sessionId);
+      if (this.polling.get(sessionId) === task) this.polling.delete(sessionId);
+      if (this.deferredReleases.delete(sessionId)) await this.releaseLease(sessionId);
+    }
+  }
+
+  private async pollOwned(sessionId: string): Promise<void> {
+    const directory = commandDirectory(this.rootDir, sessionId);
+    await this.restoreInterruptedCommands(directory);
+    const files = (await readdir(directory).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
+    for (const file of files) {
+      const source = path.join(directory, file);
+      const processing = `${source}.${this.instanceId}.processing`;
+      try { await rename(source, processing); } catch { continue; }
+      let dispatched = false;
+      try {
+        const command = JSON.parse(await readFile(processing, "utf8")) as RunCommand;
+        if (command.sessionId !== sessionId) throw new Error("Session command inbox mismatch.");
+        await this.dispatchContext.run(sessionId, async () => await this.dispatch(command));
+        dispatched = true;
+      } finally {
+        if (dispatched) await unlink(processing).catch(() => undefined);
+        else await rename(processing, source).catch(() => undefined);
+      }
     }
   }
 

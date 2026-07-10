@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -148,6 +149,231 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
+  it("suspends a conversational natural stop after one model turn", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
+    const gateway = new ScriptedGateway([{
+      message: { role: "assistant", content: "Hello. What would you like me to work on?" },
+      finishReason: "stop"
+    }]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "hi" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input",
+      requestId: "model-response-1",
+      message: "Hello. What would you like me to work on?"
+    });
+    expect(gateway.requests).toHaveLength(1);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
+  });
+
+  it("supports an explicit typed request for user input", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-request-input-"));
+    const gateway = new ScriptedGateway([{
+      message: {
+        role: "assistant", content: "",
+        toolCalls: [{ id: "need-target", name: "request_user_input", arguments: { message: "Which target should I change?" } }]
+      },
+      finishReason: "tool_calls"
+    }]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "change it" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input", requestId: "need-target", message: "Which target should I change?"
+    });
+  });
+
+  it("bounds completion repair when a model keeps returning plain text", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-bounded-completion-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "read-progress", name: "read", arguments: { path: "seed.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "I am done." }, finishReason: "stop" },
+      { message: { role: "assistant", content: "I am still done." }, finishReason: "stop" }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "needs_input", message: "I am still done."
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
+  });
+
+  it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-call-id-ledger-"));
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "same-id", name: "write", arguments: { path: "a.txt", content: "A" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "same-id", name: "write", arguments: { path: "b.txt", content: "B" } }] },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write two files" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "protocol_error"
+    });
+    await expect(readFile(path.join(workspace, "a.txt"), "utf8")).resolves.toBe("A");
+    await expect(readFile(path.join(workspace, "b.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("stops three consecutive identical tool batches without executing the third", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repeated-batch-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([1, 2, 3].map((index) => ({
+      message: { role: "assistant", content: "", toolCalls: [{ id: `repeat-${index}`, name: "read", arguments: { path: "seed.txt" } }] },
+      finishReason: "tool_calls" as const
+    })));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect without looping" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "agent_no_progress"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "tool.completed")).toHaveLength(2);
+  });
+
+  it("removes aborted outcome waiters", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-outcome-waiter-"));
+    const runtime = createRuntime({
+      gateway: new ScriptedGateway([]),
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    const controller = new AbortController();
+    const waiting = runtime.waitForOutcome(session.sessionId, controller.signal);
+    controller.abort(new Error("stop waiting"));
+    await expect(waiting).rejects.toThrow("stop waiting");
+    const sessions = (runtime as unknown as { sessions: Map<string, { outcomeWaiters: unknown[] }> }).sessions;
+    expect(sessions.get(session.sessionId)?.outcomeWaiters).toHaveLength(0);
+    await runtime.command({ type: "cancel", sessionId: session.sessionId, reason: "test cleanup" });
+  });
+
+  it("reports deletion of a pre-existing untracked file in workspace delta", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-delta-untracked-delete-"));
+    execFileSync("git", ["-C", workspace, "init"], { windowsHide: true });
+    execFileSync("git", ["-C", workspace, "config", "user.email", "sigma-tests@example.invalid"], { windowsHide: true });
+    execFileSync("git", ["-C", workspace, "config", "user.name", "Sigma Tests"], { windowsHide: true });
+    await writeFile(path.join(workspace, "tracked.txt"), "tracked", "utf8");
+    execFileSync("git", ["-C", workspace, "add", "tracked.txt"], { windowsHide: true });
+    execFileSync("git", ["-C", workspace, "commit", "-m", "initial"], { windowsHide: true });
+    await writeFile(path.join(workspace, "victim.txt"), "remove me", "utf8");
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "remove_fixture", description: "Remove the fixture file.", inputSchema: { type: "object" },
+        possibleEffects: ["filesystem.write"], executionMode: "exclusive", resourceKeys: ["workspace:write"],
+        approval: "auto", idempotent: false, timeoutMs: 5_000
+      },
+      async execute(request, context): Promise<ToolReceipt> {
+        const startedAt = new Date().toISOString();
+        await rm(path.join(context.workspacePath, "victim.txt"));
+        return {
+          callId: request.callId, ok: true, output: "removed", observedEffects: ["filesystem.write"],
+          artifacts: [], diagnostics: [], startedAt, completedAt: new Date().toISOString()
+        };
+      }
+    });
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "remove-victim", name: "remove_fixture", arguments: {} }] },
+        finishReason: "tool_calls"
+      },
+      completion("removed victim", ["remove-victim"])
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"), tools, permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "remove victim" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    const receipt = (await storedEvents(store, session.sessionId)).find((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "remove-victim");
+    expect(receipt?.payload).toMatchObject({ workspaceDelta: { deleted: ["victim.txt"] } });
+  });
+
+  it("restores joined child completion evidence from the durable outcome", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-child-evidence-recovery-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const firstStore = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const first = createRuntime({
+      gateway: new ScriptedGateway([
+        {
+          message: { role: "assistant", content: "", toolCalls: [{ id: "read-for-evidence", name: "read", arguments: { path: "seed.txt" } }] },
+          finishReason: "tool_calls"
+        },
+        completion("joined evidence", ["read-for-evidence"])
+      ]),
+      store: firstStore,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000,
+      joinChildren: async () => ({ evidence: [{ childId: "durable-child", status: "completed" }], failures: [] })
+    });
+    const session = await first.createSession({ workspacePath: workspace, mode: "analyze" });
+    await first.command({ type: "submit", sessionId: session.sessionId, text: "inspect with child evidence" });
+    await expect(first.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      evidence: expect.arrayContaining([{ childId: "durable-child", status: "completed" }])
+    });
+
+    const resumed = createRuntime({
+      gateway: new ScriptedGateway([]),
+      store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000
+    });
+    await resumed.command({ type: "resume", sessionId: session.sessionId });
+    await expect(resumed.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      evidence: expect.arrayContaining([{ childId: "durable-child", status: "completed" }])
+    });
+  });
+
   it("rehydrates durable follow-ups in FIFO order and removes delivered entries", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-follow-up-recovery-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });

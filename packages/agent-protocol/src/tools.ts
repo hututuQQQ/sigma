@@ -9,6 +9,7 @@ export type ToolEffect =
   | "network"
   | "validation"
   | "outcome.propose"
+  | "outcome.request_input"
   | "destructive"
   | "open_world";
 

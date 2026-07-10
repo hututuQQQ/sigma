@@ -127,8 +127,10 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
     state.mode === "analyze" || state.mode === "change", phases.includes(state.phase),
     Number.isInteger(state.revision), Number.isInteger(state.lastSeq), typeof state.deadlineAt === "string",
     Array.isArray(state.messages) && state.messages.every(validMessage),
-    Array.isArray(state.pendingTools) && state.pendingTools.every(validPendingTool),
+    Array.isArray(state.pendingTools) && state.pendingTools.every(validPendingTool), Array.isArray(state.toolCallIds),
     Array.isArray(state.receipts), Array.isArray(state.evidence), Array.isArray(state.childIds),
+    Number.isInteger(state.completionRepairAttempts), Number.isInteger(state.continuationAttempts),
+    Number.isInteger(state.repeatedToolBatchCount), Number.isInteger(state.receiptCountAtLastUserInput),
     state.activeModelTurn === undefined || (
       Number.isInteger(state.activeModelTurn.turnId) && Number.isInteger(state.activeModelTurn.effectRevision)
     )
@@ -137,7 +139,19 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
 
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
-  const state = snapshot.state as unknown as KernelState;
+  const stored = snapshot.state as unknown as Partial<KernelState>;
+  const state = {
+    ...stored,
+    toolCallIds: Array.isArray(stored.toolCallIds)
+      ? stored.toolCallIds
+      : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
+        ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
+    completionRepairAttempts: Number.isInteger(stored.completionRepairAttempts) ? stored.completionRepairAttempts : 0,
+    continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
+    repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
+    receiptCountAtLastUserInput: Number.isInteger(stored.receiptCountAtLastUserInput)
+      ? stored.receiptCountAtLastUserInput : 0
+  } as KernelState;
   if (!validSnapshotShape(state, sessionId)) return undefined;
   try {
     assertKernelInvariants(state);

@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SessionCommandBus, activeSessionOwner } from "../packages/agent-runtime/src/index.js";
+import { SessionCommandBus, activeSessionOwner, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
 import { acquireProcessOwnerLease } from "../packages/agent-platform/src/index.js";
 import { sessionDirectory } from "../packages/agent-store/src/index.js";
 
@@ -35,6 +36,41 @@ afterEach(async () => {
 });
 
 describe("SessionCommandBus runtime ownership", () => {
+  it("keeps ownership until an in-flight dispatch finishes during release", async () => {
+    const root = await fixture();
+    const sessionId = "release-during-dispatch";
+    let entered!: () => void;
+    let unblock!: () => void;
+    const dispatchEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const dispatchGate = new Promise<void>((resolve) => { unblock = resolve; });
+    let dispatches = 0;
+    const first = new SessionCommandBus(root, async () => {
+      dispatches += 1;
+      entered();
+      await dispatchGate;
+    }, { claimTimeoutMs: 100, retryIntervalMs: 5 });
+    await first.claim(sessionId);
+    await sendSessionCommand(root, { type: "cancel", sessionId, reason: "once" });
+    await dispatchEntered;
+
+    let released = false;
+    const releasing = first.release(sessionId).then(() => { released = true; });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(released).toBe(false);
+    await expect(activeSessionOwner(root, sessionId)).resolves.not.toBeNull();
+    const contender = new SessionCommandBus(root, async () => undefined, { claimTimeoutMs: 25, retryIntervalMs: 5 });
+    await expect(contender.claim(sessionId)).rejects.toThrow("is active");
+
+    unblock();
+    await releasing;
+    expect(dispatches).toBe(1);
+    await expect(activeSessionOwner(root, sessionId)).resolves.toBeNull();
+    await contender.claim(sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(dispatches).toBe(1);
+    await contender.release(sessionId);
+  });
+
   it.each([
     ["empty", ""],
     ["truncated", '{"pid":'],
@@ -90,6 +126,30 @@ describe("SessionCommandBus runtime ownership", () => {
     expect(owner).toMatchObject({ pid: process.pid });
     expect(owner?.processMarker).not.toBe("node:previous-process");
     await bus.release(sessionId);
+  });
+
+  it("retires an old unverified owner even when its PID has been reused by a live process", async () => {
+    const root = await fixture();
+    const sessionId = "reused-live-pid";
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { windowsHide: true });
+    try {
+      if (!unrelated.pid) throw new Error("Failed to start PID-reuse fixture process.");
+      await writeOwner(root, sessionId, JSON.stringify({
+        pid: unrelated.pid,
+        instanceId: "owner-from-dead-process",
+        startedAt: new Date(Date.now() - 60_000).toISOString()
+      }), true);
+      const bus = new SessionCommandBus(root, async () => undefined, {
+        claimTimeoutMs: 500,
+        retryIntervalMs: 5
+      });
+
+      await bus.claim(sessionId);
+      await expect(activeSessionOwner(root, sessionId)).resolves.toMatchObject({ pid: process.pid });
+      await bus.release(sessionId);
+    } finally {
+      unrelated.kill();
+    }
   });
 
   it("serializes stale-owner retirement without deleting a successor lease", async () => {

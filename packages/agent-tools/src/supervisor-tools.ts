@@ -34,15 +34,17 @@ function descriptor(
   properties: Record<string, JsonValue>,
   required: string[] = [],
   approval: ToolDescriptor["approval"] = "auto",
-  possibleEffects: ToolEffect[] = ["agent.spawn", "open_world"]
+  possibleEffects: ToolEffect[] = ["agent.spawn", "open_world"],
+  executionMode: ToolDescriptor["executionMode"] = "parallel",
+  resourceKeys: string[] = []
 ): ToolDescriptor {
   return {
     name,
     description,
     inputSchema: { type: "object", properties, required, additionalProperties: false },
     possibleEffects,
-    executionMode: "parallel",
-    resourceKeys: [],
+    executionMode,
+    resourceKeys,
     approval,
     idempotent: false,
     timeoutMs: 900_000
@@ -131,7 +133,9 @@ function integrateTool(supervisor: SupervisorPort): RegisteredEffectTool {
       { childId: { type: "string" } },
       ["childId"],
       "prompt",
-      ["agent.spawn", "filesystem.write", "process.spawn"]
+      ["agent.spawn", "filesystem.write", "process.spawn"],
+      "exclusive",
+      ["workspace:write"]
     ),
     async execute(request, context) {
       const startedAt = new Date().toISOString();

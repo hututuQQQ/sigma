@@ -36,7 +36,7 @@
     "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
     "product:readiness": "node scripts/product-readiness-report.mjs",
     "smoke:harbor": "node scripts/run-bash.mjs scripts/smoke-harbor.sh",
-    "verify:sandbox": "node scripts/verify-sandbox.mjs",
+    "verify:containment": "node scripts/verify-containment.mjs",
     "perf:repo-100k": "pnpm build && node scripts/perf-repository-100k.mjs",
     "bench:deepseek": "pnpm bench:tb:deepseek",
     "bench:tb:smoke": "node scripts/bench-terminal-bench.mjs --mode smoke",

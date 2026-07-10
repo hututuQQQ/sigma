@@ -175,6 +175,23 @@ const projectChild: EventProjector = (state, event, data) => {
   };
 };
 
+const projectSuspended: EventProjector = (state, event, data) => {
+  const message = text(data.message).trim();
+  if (!message || state.transcript.at(-1)?.text.trim() === message) return { ...state, status: "needs_input" };
+  const item: TranscriptItem = {
+    id: `input:${event.runId}:${text(data.requestId) || event.eventId}`,
+    role: "assistant",
+    text: message,
+    streaming: false,
+    occurredAt: event.occurredAt
+  };
+  return {
+    ...state,
+    status: "needs_input",
+    transcript: [...state.transcript, item].slice(-2_000)
+  };
+};
+
 const projectors: Partial<Record<AgentEventType, EventProjector>> = {
   "run.started": withStatus("running"),
   "user.message": projectUserInput,
@@ -196,7 +213,7 @@ const projectors: Partial<Record<AgentEventType, EventProjector>> = {
   "child.spawned": projectChild,
   "child.message": projectChild,
   "child.completed": projectChild,
-  "run.suspended": withStatus("needs_input"),
+  "run.suspended": projectSuspended,
   "run.completed": withStatus("completed"),
   "run.cancelled": withStatus("cancelled"),
   "run.failed": projectRunFailed,

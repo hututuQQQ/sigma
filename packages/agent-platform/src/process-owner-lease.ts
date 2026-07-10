@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { link, mkdir, open, readFile, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
-import { performance } from "node:perf_hooks";
 import { retryFilesystemOperation, unlinkWithRetry, type UnlinkFile } from "./filesystem-retry.js";
-
-export interface ProcessOwnerRecord {
-  pid: number;
-  instanceId: string;
-  startedAt: string;
-  processMarker?: string;
-}
+import {
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_STALE_MS,
+  processMarker,
+  processStatus,
+  startOwnerHeartbeat
+} from "./process-heartbeat.js";
+import { legacyOwner, validOwner, type ProcessOwnerRecord } from "./process-owner-record.js";
+export type { ProcessOwnerRecord } from "./process-owner-record.js";
 
 export interface ProcessOwnerLeaseOptions {
   label: string;
@@ -21,6 +21,8 @@ export interface ProcessOwnerLeaseOptions {
   allowLegacyPid?: boolean;
   signal?: AbortSignal;
   unlinkFile?: UnlinkFile;
+  heartbeatIntervalMs?: number;
+  heartbeatStaleMs?: number;
 }
 
 export interface ProcessOwnerLease {
@@ -38,56 +40,6 @@ interface QueueTicketEntry { filePath: string; number: bigint; token: string; }
 
 const UNSUPPORTED_DIRECTORY_SYNC = new Set(["EPERM", "EINVAL", "ENOTSUP", "EISDIR"]);
 const TRANSIENT_QUEUE_READ = new Set(["EPERM", "EACCES", "EBUSY"]);
-const NODE_PROCESS_MARKER = `node:${performance.timeOrigin}`;
-
-function linuxProcessMarker(pid: number): string | undefined {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const source = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = source.slice(source.lastIndexOf(")") + 1).trim().split(/\s+/u);
-    const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    return fields[19] ? `linux:${bootId}:${fields[19]}` : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function processMarker(pid: number): string | undefined {
-  return linuxProcessMarker(pid) ?? (pid === process.pid ? NODE_PROCESS_MARKER : undefined);
-}
-
-function validOwner(value: unknown): ProcessOwnerRecord | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Partial<ProcessOwnerRecord>;
-  if (!Number.isInteger(candidate.pid) || Number(candidate.pid) <= 0) return undefined;
-  if (typeof candidate.instanceId !== "string" || candidate.instanceId.length === 0) return undefined;
-  if (typeof candidate.startedAt !== "string" || !Number.isFinite(Date.parse(candidate.startedAt))) return undefined;
-  if (candidate.processMarker !== undefined
-    && (typeof candidate.processMarker !== "string" || candidate.processMarker.length === 0)) return undefined;
-  return candidate as ProcessOwnerRecord;
-}
-
-function legacyOwner(source: string): ProcessOwnerRecord | undefined {
-  const match = /^(\d+)(?:\s+(\S+))?\s*$/u.exec(source);
-  if (!match?.[1]) return undefined;
-  const pid = Number.parseInt(match[1], 10);
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  const startedAt = match[2] && Number.isFinite(Date.parse(match[2])) ? match[2] : new Date(0).toISOString();
-  return { pid, instanceId: "legacy-pid-lock", startedAt };
-}
-
-function processAlive(owner: ProcessOwnerRecord): boolean {
-  try {
-    process.kill(owner.pid, 0);
-    const actualMarker = processMarker(owner.pid);
-    return !owner.processMarker || !actualMarker || owner.processMarker === actualMarker;
-  } catch (error) {
-    const code = (error as { code?: unknown }).code;
-    if (code === "ESRCH") return false;
-    return true;
-  }
-}
-
 async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, "r").catch(() => null);
   try {
@@ -122,8 +74,15 @@ export async function inspectProcessOwner(
   return { kind: "malformed", ageMs, detail };
 }
 
-export function isProcessOwnerActive(observation: ProcessOwnerObservation): boolean {
-  return observation.kind === "valid" && processAlive(observation.owner);
+export function isProcessOwnerActive(
+  observation: ProcessOwnerObservation,
+  heartbeatStaleMs = DEFAULT_HEARTBEAT_STALE_MS
+): boolean {
+  if (observation.kind !== "valid") return false;
+  const status = processStatus(observation.owner);
+  if (status === "alive") return true;
+  if (status === "dead") return false;
+  return observation.ageMs < heartbeatStaleMs;
 }
 
 async function publishImmutable(filePath: string, contents: string): Promise<boolean> {
@@ -172,7 +131,11 @@ function parseQueueTicket(directory: string, name: string): QueueTicketEntry | u
   }
 }
 
-async function queueEntryIsLive(filePath: string, malformedStaleMs: number): Promise<boolean> {
+async function queueEntryIsLive(
+  filePath: string,
+  malformedStaleMs: number,
+  heartbeatStaleMs = DEFAULT_HEARTBEAT_STALE_MS
+): Promise<boolean> {
   const observation = await inspectProcessOwner(filePath).catch((error: unknown) => {
     // Windows can briefly report a sharing violation between stat/read and an
     // unlink by another contender. Conservatively keep the entry for this
@@ -183,7 +146,7 @@ async function queueEntryIsLive(filePath: string, malformedStaleMs: number): Pro
   if (!observation) return true;
   if (observation.kind === "missing") return false;
   const stale = observation.kind === "valid"
-    ? !isProcessOwnerActive(observation)
+    ? !isProcessOwnerActive(observation, heartbeatStaleMs)
     : observation.ageMs >= malformedStaleMs;
   if (!stale) return true;
   // Queue entry paths contain an unrepeatable UUID. Removing this exact path can
@@ -194,7 +157,8 @@ async function queueEntryIsLive(filePath: string, malformedStaleMs: number): Pro
 
 async function queueTicketEntries(
   directory: string,
-  malformedStaleMs: number
+  malformedStaleMs: number,
+  heartbeatStaleMs = DEFAULT_HEARTBEAT_STALE_MS
 ): Promise<{ blocked: boolean; tickets: QueueTicketEntry[] }> {
   const names = await readdir(directory);
   let blocked = false;
@@ -202,7 +166,7 @@ async function queueTicketEntries(
   for (const name of names.filter((candidate) => candidate.endsWith(".ticket"))) {
     const entry = parseQueueTicket(directory, name);
     const filePath = entry?.filePath ?? path.join(directory, name);
-    if (!await queueEntryIsLive(filePath, malformedStaleMs)) continue;
+    if (!await queueEntryIsLive(filePath, malformedStaleMs, heartbeatStaleMs)) continue;
     if (entry) tickets.push(entry);
     else blocked = true;
   }
@@ -211,10 +175,14 @@ async function queueTicketEntries(
   return { blocked, tickets };
 }
 
-async function queueHasChooser(directory: string, malformedStaleMs: number): Promise<boolean> {
+async function queueHasChooser(
+  directory: string,
+  malformedStaleMs: number,
+  heartbeatStaleMs = DEFAULT_HEARTBEAT_STALE_MS
+): Promise<boolean> {
   const names = await readdir(directory);
   for (const name of names.filter((candidate) => candidate.endsWith(".choosing"))) {
-    if (await queueEntryIsLive(path.join(directory, name), malformedStaleMs)) return true;
+    if (await queueEntryIsLive(path.join(directory, name), malformedStaleMs, heartbeatStaleMs)) return true;
   }
   return false;
 }
@@ -234,8 +202,9 @@ async function waitForQueueTurn(
   while (true) {
     options.signal?.throwIfAborted();
     const malformedStaleMs = options.malformedStaleMs ?? 5_000;
-    const hasChooser = await queueHasChooser(directory, malformedStaleMs);
-    const snapshot = await queueTicketEntries(directory, malformedStaleMs);
+    const heartbeatStaleMs = options.heartbeatStaleMs ?? DEFAULT_HEARTBEAT_STALE_MS;
+    const hasChooser = await queueHasChooser(directory, malformedStaleMs, heartbeatStaleMs);
+    const snapshot = await queueTicketEntries(directory, malformedStaleMs, heartbeatStaleMs);
     if (!hasChooser && !snapshot.blocked && snapshot.tickets[0]?.filePath === ticketPath) return;
     if (Date.now() >= deadline) throw queueTimeout(options, filePath, timeoutMs);
     const delay = Math.min(options.retryIntervalMs ?? 25, Math.max(1, deadline - Date.now()));
@@ -260,15 +229,28 @@ async function acquireOwnerQueueTicket(
   };
   const choosingPath = path.join(directory, `${token}.choosing`);
   let ticketPath: string | undefined;
+  let stopChoosingHeartbeat: (() => Promise<void>) | undefined;
+  let stopHeartbeat: (() => Promise<void>) | undefined;
   try {
     if (!await publishOwner(choosingPath, queueOwner)) throw new Error("Owner lease queue token collision.");
-    const initial = await queueTicketEntries(directory, options.malformedStaleMs ?? 5_000);
+    stopChoosingHeartbeat = startOwnerHeartbeat(
+      choosingPath, token, options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
+    );
+    const initial = await queueTicketEntries(
+      directory,
+      options.malformedStaleMs ?? 5_000,
+      options.heartbeatStaleMs ?? DEFAULT_HEARTBEAT_STALE_MS
+    );
     const nextNumber = (initial.tickets.at(-1)?.number ?? 0n) + 1n;
     ticketPath = path.join(directory, `${nextNumber.toString().padStart(20, "0")}-${token}.ticket`);
     if (!await publishOwner(ticketPath, queueOwner)) throw new Error("Owner lease queue ticket collision.");
+    stopHeartbeat = startOwnerHeartbeat(ticketPath, token, options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS);
+    await stopChoosingHeartbeat();
     await unlinkWithRetry(choosingPath, undefined, options.unlinkFile);
     await waitForQueueTurn(directory, ticketPath, filePath, options, deadline, timeoutMs);
   } catch (error) {
+    await stopChoosingHeartbeat?.().catch(() => undefined);
+    await stopHeartbeat?.().catch(() => undefined);
     await unlinkWithRetry(choosingPath, undefined, options.unlinkFile).catch(() => undefined);
     if (ticketPath) await unlinkWithRetry(ticketPath, undefined, options.unlinkFile).catch(() => undefined);
     throw error;
@@ -276,9 +258,13 @@ async function acquireOwnerQueueTicket(
   let releasePromise: Promise<void> | undefined;
   return {
     release: () => releasePromise ??= (async () => {
+      await stopHeartbeat?.();
       await unlinkWithRetry(ticketPath!, undefined, options.unlinkFile);
       await syncDirectory(directory);
     })().catch((error: unknown) => {
+      stopHeartbeat = startOwnerHeartbeat(
+        ticketPath!, token, options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
+      );
       releasePromise = undefined;
       throw error;
     })
@@ -293,8 +279,12 @@ function observationMessage(observation: ProcessOwnerObservation): string {
   return `owner pid=${observation.owner.pid}, instance=${observation.owner.instanceId}, started=${observation.owner.startedAt}`;
 }
 
-function ownerIsStale(observation: ProcessOwnerObservation, malformedStaleMs: number): boolean {
-  return observation.kind === "valid" ? !isProcessOwnerActive(observation)
+function ownerIsStale(
+  observation: ProcessOwnerObservation,
+  malformedStaleMs: number,
+  heartbeatStaleMs = DEFAULT_HEARTBEAT_STALE_MS
+): boolean {
+  return observation.kind === "valid" ? !isProcessOwnerActive(observation, heartbeatStaleMs)
     : observation.kind === "malformed" && observation.ageMs >= malformedStaleMs;
 }
 
@@ -321,14 +311,25 @@ function ownerLease(
   options: ProcessOwnerLeaseOptions
 ): ProcessOwnerLease {
   let releasePromise: Promise<void> | undefined;
+  let stopHeartbeat = startOwnerHeartbeat(
+    filePath,
+    publishedOwner.instanceId,
+    options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
+  );
   return {
     owner: publishedOwner,
     release: () => releasePromise ??= (async () => {
+      await stopHeartbeat();
       const current = await inspectProcessOwner(filePath, options.allowLegacyPid);
       if (current.kind === "valid" && current.owner.instanceId === publishedOwner.instanceId) {
         await removeOwner(filePath, options.unlinkFile);
       }
     })().catch((error: unknown) => {
+      stopHeartbeat = startOwnerHeartbeat(
+        filePath,
+        publishedOwner.instanceId,
+        options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS
+      );
       releasePromise = undefined;
       throw error;
     })
@@ -346,7 +347,7 @@ async function replaceStaleOwner(
   const ticket = await acquireOwnerQueueTicket(filePath, options, deadline, timeoutMs);
   try {
     const observation = await inspectProcessOwner(filePath, options.allowLegacyPid);
-    if (!ownerIsStale(observation, malformedStaleMs)) return { acquired: false, observation };
+    if (!ownerIsStale(observation, malformedStaleMs, options.heartbeatStaleMs)) return { acquired: false, observation };
     await removeOwner(filePath, options.unlinkFile);
     return { acquired: await publishOwner(filePath, publishedOwner), observation: { kind: "missing" } };
   } finally {
@@ -374,7 +375,7 @@ export async function acquireProcessOwnerLease(
       }
       continue;
     }
-    if (ownerIsStale(lastObservation, malformedStaleMs)) {
+    if (ownerIsStale(lastObservation, malformedStaleMs, options.heartbeatStaleMs)) {
       const replacement = await replaceStaleOwner(
         filePath, publishedOwner, options, deadline, timeoutMs, malformedStaleMs
       );

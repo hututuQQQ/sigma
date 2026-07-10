@@ -50,7 +50,9 @@ A provider `stop` response or a natural-language claim does not finish a run. Th
 - unknown or failed receipt IDs reject the proposal;
 - non-detached children are joined before completion, and a failed child or retained, unintegrated writer worktree keeps the parent run open.
 
-Rejected completion proposals become ordinary tool failures and the kernel continues from the durable state. This replaces fixed read/repair/no-progress counters with acceptance criteria and typed evidence.
+When no actionable task was provided or a concrete decision is required, the agent calls `request_user_input`; this produces a durable `NeedsInput` outcome that can be continued in the same task. A natural `stop` before any tool work also falls back to `NeedsInput`. After tool work, the kernel permits one protocol-repair turn, then suspends instead of repeatedly buying identical model responses. Three consecutive identical tool batches and repeated output-limit continuations end as typed recoverable failures.
+
+Rejected completion proposals become ordinary tool failures and the kernel continues from the durable state. Completion correctness comes from acceptance criteria and typed evidence; bounded convergence guards prevent provider or prompt failures from turning into an unbounded agent loop.
 
 ## Requirements
 
@@ -85,7 +87,7 @@ agent doctor --workspace . --check-api
 
 `run` uses `change` mode. `inspect` uses `analyze` mode: tools declaring `filesystem.write`, unrestricted `process.spawn`, or `destructive` effects are denied, while read-only tools remain available. Policy is evaluated from `ToolDescriptor` effects and approval metadata, not from a hard-coded tool-name list.
 
-A non-interactive `run` or `inspect` in `permissionMode=ask` returns `NeedsInput` before starting because no approval response can be collected. Use `auto` only for a workspace and external tools you trust, or use the TUI for interactive approval.
+A non-interactive `run` or `inspect` in `permissionMode=ask` returns `NeedsInput` before starting because no approval response can be collected. `--permission-mode auto` is an explicit unsafe opt-in that allows commands to access the host with the current user's authority; use it only for a workspace, instructions, and external tools you trust, or use the TUI for interactive approval.
 
 Process exit codes are stable:
 
@@ -205,7 +207,7 @@ pnpm test:coverage
 pnpm test:harbor
 pnpm smoke:product
 pnpm smoke:tui-product
-pnpm verify:sandbox
+pnpm verify:containment
 pnpm verify:package:agent-cli
 ```
 

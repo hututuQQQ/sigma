@@ -72,6 +72,19 @@ describe("Sigma v2 TUI", () => {
     expect(view.activity.find((item) => item.id === "child:child-one")).toMatchObject({ kind: "child", status: "completed" });
   });
 
+  it("shows a typed user-input request once in the transcript", () => {
+    let view = projectEvent(createPresentationState(), event(1, "run.suspended", {
+      requestId: "need-target", message: "Which target should I change?"
+    }));
+    view = projectEvent(view, event(2, "run.suspended", {
+      requestId: "need-target", message: "Which target should I change?"
+    }));
+    expect(view.status).toBe("needs_input");
+    expect(view.transcript).toMatchObject([{
+      role: "assistant", text: "Which target should I change?", streaming: false
+    }]);
+  });
+
   it("renders bounded responsive frames and virtualizes long transcripts", () => {
     const heapBefore = process.memoryUsage().heapUsed;
     let view = createPresentationState();
@@ -256,7 +269,7 @@ describe("Sigma v2 TUI", () => {
     stdin.write("/quit\r");
     await running;
     expect(runtime.commands[0]).toEqual({ type: "resume", sessionId: "session" });
-    expect(runtime.commands).toContainEqual({ type: "steer", sessionId: "session", text: "new context" });
+    expect(runtime.commands).toContainEqual({ type: "submit", sessionId: "session", text: "new context", mode: "change" });
     expect(runtime.commands).toContainEqual({ type: "approve", sessionId: "session", requestId: "approval", decision: "allow" });
   });
 

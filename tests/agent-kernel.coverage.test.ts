@@ -153,23 +153,51 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCallId: "call",
       content: expect.stringContaining("Superseded by a newer user instruction")
     });
-    expect(() => settleModel(startModel(apply(initial(), "user.message", { text: "duplicate" })), "model.completed", {
+    const duplicate = settleModel(startModel(apply(initial(), "user.message", { text: "duplicate" })), "model.completed", {
       message: { role: "assistant", content: "" },
       toolCalls: [{ id: "duplicate", name: "read" }, { id: "duplicate", name: "read" }]
-    })).toThrow("duplicate tool call id");
+    });
+    expect(duplicate).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: { kind: "recoverable_failure", code: "protocol_error" }
+    });
 
     const inFlight = (): KernelState => startModel(apply(initial(), "user.message", { text: "request" }));
     const length = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "partial" }, toolCalls: [], finishReason: "length" });
     expect(length.phase).toBe("ready_model");
+    const secondLength = settleModel(startModel(length, 2), "model.completed", {
+      message: { role: "assistant", content: "still partial" }, toolCalls: [], finishReason: "length"
+    });
+    const exhaustedLength = settleModel(startModel(secondLength, 3), "model.completed", {
+      message: { role: "assistant", content: "again partial" }, toolCalls: [], finishReason: "length"
+    });
+    expect(exhaustedLength.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "model_output_limit"
+    });
     const filtered = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "" }, toolCalls: [], finishReason: "content_filter" });
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
-    let incomplete = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
+    const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
+    expect(conversational).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: { kind: "needs_input", message: "answer" }
+    });
+    const receipt = {
+      callId: "progress", ok: true, output: "inspected", observedEffects: ["filesystem.read" as const],
+      artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
+    };
+    let incomplete = settleModel({ ...inFlight(), receipts: [receipt] }, "model.completed", {
+      message: { role: "assistant", content: "premature answer" }, toolCalls: [], finishReason: "stop"
+    });
     expect(incomplete.phase).toBe("ready_model");
     expect(incomplete.messages.at(-1)).toMatchObject({ role: "developer" });
-    incomplete = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
-    expect(incomplete.phase).toBe("ready_model");
-    incomplete = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
-    expect(incomplete.phase).toBe("ready_model");
+    incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
+      message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
+    });
+    expect(incomplete.proposedOutcome).toMatchObject({ kind: "needs_input", message: "still no action" });
+    const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
+    expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
+    const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
+    expect(missingMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
 
     const modelFailure = settleModel(inFlight(), "model.failed", { message: "network" });
     expect(modelFailure.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_error" });
@@ -251,6 +279,38 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.messages.at(-1)).toMatchObject({ role: "tool", toolCallId: "call" });
     expect(state.messages.at(-1)?.content).toBe("Successful tool receipt ID: call\ncontents");
 
+    const reusedCallId = settleModel(startModel(state, 2), "model.completed", {
+      message: { role: "assistant", content: "" },
+      toolCalls: [{ id: "call", name: "write", arguments: { path: "different.txt", content: "different" } }],
+      finishReason: "tool_calls"
+    });
+    expect(reusedCallId).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: { kind: "recoverable_failure", code: "protocol_error" },
+      pendingTools: []
+    });
+
+    let malformedInputRequest = withPendingTool("input-malformed", "request_user_input");
+    malformedInputRequest = toolEvent(malformedInputRequest, "tool.completed", "input-malformed", {
+      ok: true, output: "{", observedEffects: ["outcome.request_input"], artifacts: [], diagnostics: [],
+      startedAt: "start", completedAt: "end"
+    });
+    expect(malformedInputRequest).toMatchObject({ phase: "ready_model", proposedOutcome: undefined });
+
+    let malformedCompletion = withPendingTool("completion-malformed", "complete_task");
+    malformedCompletion = toolEvent(malformedCompletion, "tool.completed", "completion-malformed", {
+      ok: true, output: "{", observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [],
+      startedAt: "start", completedAt: "end"
+    });
+    expect(malformedCompletion).toMatchObject({ phase: "ready_model", proposedOutcome: undefined });
+
+    const arrayArguments = settleModel(startModel(apply(initial(), "user.message", { text: "array args" })), "model.completed", {
+      message: { role: "assistant", content: "" },
+      toolCalls: [{ id: "array-args", name: "read", arguments: [1, { nested: ["value"] }] }],
+      finishReason: "tool_calls"
+    });
+    expect(arrayArguments).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { callId: "array-args" } }] });
+
     let completion = withPendingTool("complete", "complete_task");
     completion = toolEvent(completion, "tool.completed", "complete", {
       ok: true, output: JSON.stringify({ summary: "evidence-backed result" }),
@@ -259,8 +319,11 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
-      message: "committed", outcomeRevision: committedRevision
-    })).toMatchObject({ phase: "terminal", outcome: { kind: "completed", message: "committed" } });
+      message: "committed", outcomeRevision: committedRevision, evidence: [{ childId: "durable-child" }]
+    })).toMatchObject({
+      phase: "terminal",
+      outcome: { kind: "completed", message: "committed", evidence: [{ childId: "durable-child" }] }
+    });
     expect(apply(completion, "run.completed", {
       message: "stale", outcomeRevision: committedRevision - 1
     })).toMatchObject({ phase: "outcome_pending", proposedOutcome: { message: "evidence-backed result" } });

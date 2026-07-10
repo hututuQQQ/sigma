@@ -28,6 +28,7 @@ export interface ChildAgentContext {
   metadata: JsonValue;
   started(sessionId: string): Promise<void>;
   notify(payload: JsonValue): Promise<void>;
+  settling(): void;
 }
 
 export interface SpawnChildInput {
@@ -80,6 +81,7 @@ interface InternalJob {
   preparing: boolean;
   launched: boolean;
   settled: boolean;
+  acceptingMessages: boolean;
   completion: Promise<ChildJob>;
   finish(value: ChildJob): void;
 }
@@ -158,6 +160,7 @@ export class AgentSupervisor implements SupervisorPort {
       preparing: true,
       launched: false,
       settled: false,
+      acceptingMessages: true,
       completion,
       finish
     };
@@ -177,7 +180,7 @@ export class AgentSupervisor implements SupervisorPort {
 
   followUp(childId: string, text: string): void {
     const job = this.required(childId);
-    if (job.public.status !== "running") throw new Error(`Child ${childId} is not running.`);
+    if (job.public.status !== "running" || !job.acceptingMessages) throw new Error(`Child ${childId} is not accepting messages.`);
     job.mailbox.send({ type: "follow_up", text });
   }
 
@@ -199,11 +202,8 @@ export class AgentSupervisor implements SupervisorPort {
       } else if (!job.preparing) this.complete(job);
       return;
     }
-    try {
-      job.mailbox.send({ type: "cancel", text: reason });
-    } finally {
-      job.controller.abort(new Error(reason));
-    }
+    try { if (job.acceptingMessages) job.mailbox.send({ type: "cancel", text: reason }); }
+    finally { job.controller.abort(new Error(reason)); }
   }
 
   async cancelParent(parentId: string, reason = "parent cancelled children"): Promise<void> {
@@ -330,7 +330,12 @@ export class AgentSupervisor implements SupervisorPort {
         job.public.sessionId = sessionId;
         await this.publish(job, "child.message", { kind: "started", sessionId });
       },
-      notify: async (payload) => await this.publish(job, "child.message", payload)
+      notify: async (payload) => await this.publish(job, "child.message", payload),
+      settling: () => {
+        if (!job.acceptingMessages) return;
+        job.acceptingMessages = false;
+        job.mailbox.close();
+      }
     }).then(
       (result) => {
         job.public.result = result;
@@ -342,6 +347,7 @@ export class AgentSupervisor implements SupervisorPort {
         job.public.error = error instanceof Error ? error.message : String(error);
       }
     ).finally(async () => {
+      job.acceptingMessages = false;
       job.mailbox.close();
       try {
         try {

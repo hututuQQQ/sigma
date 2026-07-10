@@ -40,6 +40,16 @@ export interface QueuedFollowUp {
   text: string;
 }
 
+export interface OutcomeWaiter {
+  runId: string;
+  resolve(outcome: RunOutcome): void;
+}
+
+export interface IdleWaiter {
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
 export interface RuntimeSession {
   sessionId: string;
   runId: string;
@@ -62,5 +72,7 @@ export interface RuntimeSession {
   contextItems: ContextItem[];
   loadedContextIds: Set<string>;
   lastOutcome?: RunOutcome;
-  outcomeWaiters: Array<(outcome: RunOutcome) => void>;
+  outcomeWaiters: OutcomeWaiter[];
+  idleWaiters: IdleWaiter[];
+  runError?: Error;
 }

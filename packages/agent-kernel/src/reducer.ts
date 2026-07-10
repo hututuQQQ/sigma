@@ -4,11 +4,16 @@ import type {
   JsonValue,
   ModelMessage,
   ModelToolCall,
-  RunOutcome,
-  ToolEffect,
-  ToolReceipt
+  RunOutcome
 } from "agent-protocol";
 import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
+import {
+  completionSummary,
+  incompleteModelCompletion,
+  requestedInput,
+  toolBatchSignature
+} from "./model-convergence.js";
+import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 
 function objectPayload(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -44,40 +49,6 @@ function modelMessage(value: JsonValue | undefined): ModelMessage | null {
   };
 }
 
-function toolReceipt(value: JsonValue): ToolReceipt | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const item = value as Record<string, JsonValue>;
-  if (typeof item.callId !== "string" || typeof item.ok !== "boolean") return null;
-  return {
-    callId: item.callId,
-    ok: item.ok,
-    output: text(item.output),
-    observedEffects: Array.isArray(item.observedEffects)
-      ? item.observedEffects.filter((effect): effect is ToolEffect => typeof effect === "string")
-      : [],
-    artifacts: Array.isArray(item.artifacts) ? item.artifacts.filter((value): value is string => typeof value === "string") : [],
-    diagnostics: Array.isArray(item.diagnostics) ? item.diagnostics.filter((value): value is string => typeof value === "string") : [],
-    startedAt: text(item.startedAt),
-    completedAt: text(item.completedAt)
-  };
-}
-
-function completionSummary(receipt: ToolReceipt): string | null {
-  if (!receipt.ok || !receipt.observedEffects.includes("outcome.propose")) return null;
-  try {
-    const value = JSON.parse(receipt.output) as unknown;
-    return value && typeof value === "object" && typeof (value as { summary?: unknown }).summary === "string"
-      ? (value as { summary: string }).summary : null;
-  } catch {
-    return null;
-  }
-}
-
-function receiptContent(receipt: ToolReceipt): string {
-  const status = receipt.ok ? "Successful" : "Failed";
-  return `${status} tool receipt ID: ${receipt.callId}\n${receipt.output}`;
-}
-
 function supersededToolMessages(state: KernelState): ModelMessage[] {
   return state.pendingTools.map((pending) => ({
     role: "tool",
@@ -101,19 +72,12 @@ function nextPhase(pending: PendingTool[]): KernelState["phase"] {
 }
 
 function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): PendingTool[] {
-  const identifiers = new Set<string>();
-  return calls.map((call): PendingTool => {
-    if (identifiers.has(call.id)) {
-      throw Object.assign(new Error(`Model returned duplicate tool call id '${call.id}'.`), { code: "protocol_error" });
-    }
-    identifiers.add(call.id);
-    return {
-      request: { callId: call.id, name: call.name, arguments: call.arguments },
-      modelTurn,
-      approval: "not_required",
-      started: false
-    };
-  });
+  return calls.map((call): PendingTool => ({
+    request: { callId: call.id, name: call.name, arguments: call.arguments },
+    modelTurn,
+    approval: "not_required",
+    started: false
+  }));
 }
 
 type EventReducer = (
@@ -128,6 +92,11 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   phase: state.messages.length > 0 ? "ready_model" : "idle",
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
   activeModelTurn: undefined,
+  completionRepairAttempts: 0,
+  continuationAttempts: 0,
+  repeatedToolBatchCount: 0,
+  receiptCountAtLastUserInput: state.receipts.length,
+  lastToolBatchSignature: undefined,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -135,7 +104,14 @@ const runStarted: EventReducer = (state, _event, payload) => ({
 const userInput: EventReducer = (state, _event, payload) => ({
   ...state,
   phase: "ready_model",
-  messages: [...state.messages, { role: "user", content: text(payload.text) }]
+  messages: [...state.messages, { role: "user", content: text(payload.text) }],
+  completionRepairAttempts: 0,
+  continuationAttempts: 0,
+  repeatedToolBatchCount: 0,
+  receiptCountAtLastUserInput: state.receipts.length,
+  lastToolBatchSignature: undefined,
+  outcome: undefined,
+  proposedOutcome: undefined
 });
 
 const steeringInput: EventReducer = (state, _event, payload) => ({
@@ -148,6 +124,11 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   phase: "ready_model",
   activeModelTurn: undefined,
   pendingTools: [],
+  completionRepairAttempts: 0,
+  continuationAttempts: 0,
+  repeatedToolBatchCount: 0,
+  receiptCountAtLastUserInput: state.receipts.length,
+  lastToolBatchSignature: undefined,
   proposedOutcome: undefined,
   outcome: undefined
 });
@@ -155,25 +136,6 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
 const followUpInput: EventReducer = (state, event, payload) => payload.status === "queued"
   ? state
   : userInput(state, event, payload);
-
-function incompleteCompletion(state: KernelState, payload: Record<string, JsonValue>, messages: ModelMessage[]): KernelState {
-  if (payload.finishReason === "length") return { ...state, messages, phase: "ready_model" };
-  if (payload.finishReason === "content_filter") {
-    return propose({ ...state, messages }, {
-      kind: "fatal",
-      code: "content_filter",
-      message: "Provider blocked the response."
-    });
-  }
-  return {
-    ...state,
-    messages: [...messages, {
-      role: "developer",
-      content: "Completion was not accepted. Use complete_task with explicit criteria and successful tool receipt IDs; continue working if evidence is missing."
-    }],
-    phase: "ready_model"
-  };
-}
 
 function modelTurn(payload: Record<string, JsonValue>): { turnId: number; effectRevision: number } | null {
   return Number.isInteger(payload.turnId) && Number.isInteger(payload.effectRevision)
@@ -217,9 +179,45 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
   const calls = modelToolCalls(payload.toolCalls);
   const modelTurn = state.activeModelTurn!;
   const completedState = { ...state, activeModelTurn: undefined };
-  if (calls.length === 0) return incompleteCompletion(completedState, payload, messages);
+  if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
+  const identifiers = calls.map((call) => call.id);
+  const seen = new Set(state.toolCallIds);
+  const duplicate = identifiers.find((id, index) => identifiers.indexOf(id) !== index || seen.has(id));
+  if (duplicate) {
+    return propose({ ...completedState, messages }, {
+      kind: "recoverable_failure",
+      code: "protocol_error",
+      message: `Model reused tool call id '${duplicate}' within the current run.`
+    });
+  }
+  const signature = toolBatchSignature(calls);
+  const repeatedToolBatchCount = signature === state.lastToolBatchSignature
+    ? state.repeatedToolBatchCount + 1 : 1;
+  if (repeatedToolBatchCount >= 3) {
+    return propose({
+      ...completedState,
+      messages,
+      toolCallIds: [...state.toolCallIds, ...identifiers],
+      lastToolBatchSignature: signature,
+      repeatedToolBatchCount
+    }, {
+      kind: "recoverable_failure",
+      code: "agent_no_progress",
+      message: "The model proposed the same tool batch three times without an intervening action."
+    });
+  }
   const pendingTools = pendingFromCalls(calls, modelTurn);
-  return { ...completedState, messages, pendingTools, phase: "tool_pending" };
+  return {
+    ...completedState,
+    messages,
+    pendingTools,
+    toolCallIds: [...state.toolCallIds, ...identifiers],
+    completionRepairAttempts: 0,
+    continuationAttempts: 0,
+    lastToolBatchSignature: signature,
+    repeatedToolBatchCount,
+    phase: "tool_pending"
+  };
 };
 
 const modelFailed: EventReducer = (state, _event, payload) => {
@@ -278,8 +276,14 @@ const toolFinished: EventReducer = (state, event) => {
     pendingTools,
     receipts: [...state.receipts, receipt],
     evidence: receipt.ok ? [...state.evidence, event.payload] : state.evidence,
+    completionRepairAttempts: 0,
+    continuationAttempts: 0,
     phase: nextPhase(pendingTools)
   };
+  const inputMessage = requestedInput(receipt);
+  if (inputMessage) {
+    return propose(next, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
+  }
   const summary = completionSummary(receipt);
   return summary ? propose(next, { kind: "completed", message: summary, evidence: next.evidence }) : next;
 };
@@ -289,6 +293,8 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   return {
     ...state,
     phase: "needs_input",
+    activeModelTurn: undefined,
+    proposedOutcome: undefined,
     outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
   };
 };
@@ -307,7 +313,11 @@ const runFailed: EventReducer = (state, _event, payload) => {
 };
 
 const runCompleted: EventReducer = (state, _event, payload) => acceptsOutcomeRevision(state, payload)
-  ? terminal(state, { kind: "completed", message: text(payload.message), evidence: state.evidence })
+  ? terminal(state, {
+    kind: "completed",
+    message: text(payload.message),
+    evidence: Array.isArray(payload.evidence) ? payload.evidence : state.evidence
+  })
   : state;
 
 const diagnostic: EventReducer = (state, _event, payload) => {

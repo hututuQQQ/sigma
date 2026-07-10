@@ -2,7 +2,7 @@ import { mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { JsonValue, ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
+import type { JsonValue, SupervisorPort, ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
 import {
   approximateTokens,
   lexicalScore,
@@ -19,6 +19,7 @@ import {
   isToolAllowed,
   parseCompletionProposal,
   registerBuiltinTools,
+  registerSupervisorTools,
   ResourceLockManager
 } from "../packages/agent-tools/src/index.js";
 
@@ -172,7 +173,17 @@ describe("context, platform, and repository tool capabilities", () => {
     const signal = new AbortController().signal;
     await runProcess({ executable: "git", args: ["init", "-q"], cwd: workspace, timeoutMs: 10_000, signal });
     const tools = registerBuiltinTools(new EffectToolRegistry());
-    expect(tools.descriptors().map((item) => item.name)).toContain("complete_task");
+    expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["complete_task", "request_user_input"]));
+    const supervisor: SupervisorPort = {
+      spawnDurable: async () => ({ id: "child" }), followUp: () => undefined,
+      join: async () => null, list: () => [], integrate: async () => null
+    };
+    const supervisorTools = registerSupervisorTools(new EffectToolRegistry(), supervisor);
+    expect(supervisorTools.descriptor("integrate_agent")).toMatchObject({
+      executionMode: "exclusive",
+      resourceKeys: ["workspace:write"],
+      possibleEffects: expect.arrayContaining(["filesystem.write"])
+    });
     const listed = await tools.execute(request("list", "list", { path: "src", glob: "**/*.txt" }), context(workspace));
     expect(listed.output).toContain("src/one.txt");
     const found = await tools.execute(request("grep", "grep", { query: "alpha", path: "src", limit: 20 }), context(workspace));

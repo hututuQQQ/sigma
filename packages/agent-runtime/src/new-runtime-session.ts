@@ -40,6 +40,7 @@ export async function newRuntimeSession(input: StartSession, runDeadlineMs: numb
     followUps: [],
     contextItems: [...base, ...project],
     loadedContextIds: new Set([...base.map((item) => item.id), ...project.map((item) => item.id)]),
-    outcomeWaiters: []
+    outcomeWaiters: [],
+    idleWaiters: []
   };
 }

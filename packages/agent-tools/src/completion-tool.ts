@@ -104,7 +104,47 @@ function completionTool(): RegisteredEffectTool {
   };
 }
 
+function requestUserInputTool(): RegisteredEffectTool {
+  const descriptor: ToolDescriptor = {
+    name: "request_user_input",
+    description: "End the active run in a typed waiting state when no actionable task was provided or a specific user decision is required. Ask one concise question; do not call this merely to narrate progress.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The concise question or information needed from the user." }
+      },
+      required: ["message"],
+      additionalProperties: false
+    },
+    possibleEffects: ["outcome.request_input"],
+    executionMode: "sequential",
+    resourceKeys: ["run:outcome"],
+    approval: "auto",
+    idempotent: false,
+    timeoutMs: 5_000
+  };
+  return {
+    descriptor,
+    async execute(request: ToolRequest): Promise<ToolReceipt> {
+      const startedAt = new Date().toISOString();
+      const input = record(request.arguments);
+      const message = typeof input?.message === "string" ? input.message.trim() : "";
+      return {
+        callId: request.callId,
+        ok: message.length > 0,
+        output: message ? JSON.stringify({ message }) : "User-input request requires a non-empty message.",
+        observedEffects: message ? ["outcome.request_input"] : [],
+        artifacts: [],
+        diagnostics: message ? [] : ["invalid_user_input_request"],
+        startedAt,
+        completedAt: new Date().toISOString()
+      };
+    }
+  };
+}
+
 export function registerCompletionTool(registry: EffectToolRegistry): EffectToolRegistry {
   registry.register(completionTool());
+  registry.register(requestUserInputTool());
   return registry;
 }

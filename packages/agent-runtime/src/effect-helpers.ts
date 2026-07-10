@@ -65,12 +65,21 @@ export async function fileFingerprint(workspace: string, file: string): Promise<
 
 export function workspaceDelta(before: Map<string, string>, after: Map<string, string>): WorkspaceDelta {
   const result: WorkspaceDelta = { added: [], modified: [], deleted: [] };
-  for (const [file, status] of after) {
-    if (before.get(file) === status) continue;
-    if (status === "??" || status.includes("A")) result.added.push(file);
-    else if (status.includes("D")) result.deleted.push(file);
+  for (const file of new Set([...before.keys(), ...after.keys()])) {
+    const beforeStatus = before.get(file);
+    const afterStatus = after.get(file);
+    if (beforeStatus === afterStatus) continue;
+    if (afterStatus === undefined) {
+      const priorCode = beforeStatus?.slice(0, 2) ?? "";
+      if (priorCode === "??" || priorCode.includes("A")) result.deleted.push(file);
+      else result.modified.push(file);
+    } else if (afterStatus.slice(0, 2) === "??" || afterStatus.slice(0, 2).includes("A")) result.added.push(file);
+    else if (afterStatus.slice(0, 2).includes("D")) result.deleted.push(file);
     else result.modified.push(file);
   }
+  result.added.sort();
+  result.modified.sort();
+  result.deleted.sort();
   return result;
 }
 
@@ -125,12 +134,15 @@ export function writeScopeFailure(session: RuntimeSession, call: ModelToolCall, 
 
 export function lockKeys(session: RuntimeSession, descriptor: ToolDescriptor): string[] {
   const scope = process.platform === "win32" ? session.workspacePath.toLowerCase() : session.workspacePath;
-  const resources = descriptor.resourceKeys.map((key) => `${scope}:${key}`);
+  const declared = descriptor.resourceKeys.map((key) => `${scope}:${key}`);
+  const writer = descriptor.possibleEffects.some((effect) => effect === "filesystem.write" || effect === "destructive")
+    ? [`${scope}:workspace:write`] : [];
+  const resources = [...new Set([...declared, ...writer])];
   return descriptor.executionMode === "parallel" ? resources : [...resources, `${scope}:runtime:serial`];
 }
 
 export function requiresInstructionReplan(descriptor: ToolDescriptor): boolean {
-  const risky = new Set(["filesystem.write", "process.spawn", "agent.spawn", "network", "validation", "outcome.propose", "destructive", "open_world"]);
+  const risky = new Set(["filesystem.write", "process.spawn", "agent.spawn", "network", "validation", "outcome.propose", "outcome.request_input", "destructive", "open_world"]);
   return descriptor.possibleEffects.some((effect) => risky.has(effect));
 }
 

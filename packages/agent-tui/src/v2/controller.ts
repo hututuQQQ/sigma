@@ -154,7 +154,7 @@ export class TuiController {
       return;
     }
     if (await this.handleCommand(text)) return;
-    const type = this.state.view.status === "running" || this.state.view.status === "needs_input" ? "steer" : "submit";
+    const type = this.state.view.status === "running" ? "steer" : "submit";
     await this.options.runtime.command(type === "steer"
       ? { type, sessionId, text }
       : { type, sessionId, text, mode: this.state.mode });

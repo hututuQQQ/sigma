@@ -102,7 +102,7 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
     };
     const onAbort = (): void => { void requestCancellation(); };
     context.signal.addEventListener("abort", onAbort, { once: true });
-    void forwardMailbox(context, runtime, child.sessionId).catch(() => undefined);
+    const mailboxForwarding = forwardMailbox(context, runtime, child.sessionId);
     try {
       if (context.signal.aborted) {
         await requestCancellation();
@@ -111,8 +111,12 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
         await submit;
         if (context.signal.aborted) await requestCancellation();
       }
-      const outcome = await runtime.waitForOutcome(child.sessionId);
+      await runtime.waitForOutcome(child.sessionId);
       if (context.signal.aborted) await requestCancellation();
+      await runtime.waitForIdleOutcome(child.sessionId);
+      context.settling();
+      await mailboxForwarding;
+      const outcome = await runtime.waitForIdleOutcome(child.sessionId);
       await waitForSafeChildCleanup(context, runtime, child.sessionId);
       return {
         childId: context.childId,
@@ -125,6 +129,8 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
         }
       };
     } finally {
+      context.settling();
+      await mailboxForwarding.catch(() => undefined);
       context.signal.removeEventListener("abort", onAbort);
       eventController.abort();
       await childEvents;

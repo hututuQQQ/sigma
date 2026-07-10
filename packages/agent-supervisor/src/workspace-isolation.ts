@@ -4,6 +4,7 @@ import { access, cp, mkdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { acquireProcessOwnerLease, resolveWorkspacePath, selfContainedGitRoot } from "agent-platform";
+import { nulPaths, outsideWriteScope } from "./integration-paths.js";
 
 export type ChildRunIntent = "analyze" | "write";
 export type WorkspaceIsolationKind = "shared_read" | "git_worktree" | "exclusive_workspace";
@@ -129,27 +130,6 @@ function hasUserChanges(status: string): boolean {
     const file = line.slice(3).replace(/^"|"$/gu, "").replaceAll("\\", "/");
     return file !== ".agent" && !file.startsWith(".agent/");
   });
-}
-
-function nulPaths(output: string): string[] {
-  return output.split("\0").filter(Boolean).map((item) => item.replaceAll("\\", "/"));
-}
-
-function withinWriteScope(file: string, scopes: string[]): boolean {
-  if (scopes.length === 0) return true;
-  const normalized = file.replaceAll("\\", "/");
-  return scopes.some((scope) => {
-    const candidate = scope.replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/$/u, "");
-    return normalized === candidate || normalized.startsWith(`${candidate}/`);
-  });
-}
-
-function repositoryWriteScopes(isolation: ChildWorkspaceIsolation, scopes: string[]): string[] {
-  const repositoryRoot = isolation.repositoryRoot;
-  if (!repositoryRoot) return scopes;
-  const prefix = path.relative(repositoryRoot, isolation.sourceWorkspacePath).replaceAll("\\", "/");
-  if (!prefix) return scopes;
-  return scopes.map((scope) => `${prefix}/${scope.replaceAll("\\", "/").replace(/^\.\//u, "")}`);
 }
 
 export interface WorkspaceIsolationManagerOptions {
@@ -354,42 +334,50 @@ export class WorkspaceIsolationManager {
   ): Promise<ChildWorkspaceIsolation> {
     if (isolation.kind !== "git_worktree" || isolation.cleanup !== "retained" || !isolation.worktreePath
       || !isolation.repositoryRoot || !isolation.baseHead) throw new Error("Child has no retained Git worktree to integrate.");
-    const [sourceHead, sourceStatus] = await Promise.all([
-      runGit(["-C", isolation.repositoryRoot, "rev-parse", "HEAD"], signal),
-      runGit(["-C", isolation.repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], signal)
-    ]);
-    if (sourceHead !== isolation.baseHead || hasUserChanges(sourceStatus)) {
-      throw new Error("Source workspace changed after child isolation; refusing unsafe integration.");
-    }
-    const [copyOutput, deleteOutput, untrackedOutput, ignoredOutput] = await Promise.all([
-      runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRTUXB", isolation.baseHead], signal),
-      runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", isolation.baseHead], signal),
-      runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--exclude-standard", "-z"], signal),
-      runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], signal)
-    ]);
-    const ignored = nulPaths(ignoredOutput);
-    if (ignored.length > 0) throw new Error(`Child produced ignored files that require manual review: ${ignored.join(", ")}`);
-    const copies = [...new Set([...nulPaths(copyOutput), ...nulPaths(untrackedOutput)])];
-    const deletions = [...new Set(nulPaths(deleteOutput))];
-    const effectiveScopes = repositoryWriteScopes(isolation, writeScope);
-    const outside = [...copies, ...deletions].filter((file) => !withinWriteScope(file, effectiveScopes));
-    if (outside.length > 0) throw new Error(`Child changed files outside write scope: ${outside.join(", ")}`);
-    for (const file of copies) {
-      const source = await resolveWorkspacePath(isolation.worktreePath, file);
-      const target = await resolveWorkspacePath(isolation.repositoryRoot, file);
-      await mkdir(path.dirname(target), { recursive: true });
-      await cp(source, target, { recursive: true, force: true });
-    }
-    for (const file of deletions) {
-      await rm(await resolveWorkspacePath(isolation.repositoryRoot, file), { force: true, recursive: true });
-    }
-    const unlockGit = await mutex(this.gitMutation, isolation.repositoryRoot).acquire(signal);
+    const unlockWorkspace = await mutex(this.exclusive, isolation.repositoryRoot).acquire(signal);
+    let unlockProcess: (() => Promise<void>) | undefined;
+    let unlockGit: (() => void) | undefined;
     try {
+      unlockProcess = await this.acquireProcessWriterLease(isolation.repositoryRoot, signal);
+      unlockGit = await mutex(this.gitMutation, isolation.repositoryRoot).acquire(signal);
+      const [sourceHead, sourceStatus] = await Promise.all([
+        runGit(["-C", isolation.repositoryRoot, "rev-parse", "HEAD"], signal),
+        runGit(["-C", isolation.repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], signal)
+      ]);
+      if (sourceHead !== isolation.baseHead || hasUserChanges(sourceStatus)) {
+        throw new Error("Source workspace changed after child isolation; refusing unsafe integration.");
+      }
+      const [copyOutput, deleteOutput, untrackedOutput, ignoredOutput] = await Promise.all([
+        runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRTUXB", isolation.baseHead], signal),
+        runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", isolation.baseHead], signal),
+        runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--exclude-standard", "-z"], signal),
+        runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], signal)
+      ]);
+      const ignored = nulPaths(ignoredOutput);
+      if (ignored.length > 0) throw new Error(`Child produced ignored files that require manual review: ${ignored.join(", ")}`);
+      const copies = [...new Set([...nulPaths(copyOutput), ...nulPaths(untrackedOutput)])];
+      const deletions = [...new Set(nulPaths(deleteOutput))];
+      const outside = outsideWriteScope(isolation, writeScope, [...copies, ...deletions]);
+      if (outside.length > 0) throw new Error(`Child changed files outside write scope: ${outside.join(", ")}`);
+      for (const file of copies) {
+        const source = await resolveWorkspacePath(isolation.worktreePath, file);
+        const target = await resolveWorkspacePath(isolation.repositoryRoot, file);
+        await mkdir(path.dirname(target), { recursive: true });
+        await cp(source, target, { recursive: true, force: true });
+      }
+      for (const file of deletions) {
+        await rm(await resolveWorkspacePath(isolation.repositoryRoot, file), { force: true, recursive: true });
+      }
       await runGit(["-C", isolation.repositoryRoot, "worktree", "remove", "--force", isolation.worktreePath], signal);
       await runGit(["-C", isolation.repositoryRoot, "worktree", "prune"], signal);
+      return { ...isolation, cleanup: "integrated", reason: `Integrated ${copies.length} changed and ${deletions.length} deleted files.` };
     } finally {
-      unlockGit();
+      unlockGit?.();
+      try {
+        await unlockProcess?.();
+      } finally {
+        unlockWorkspace();
+      }
     }
-    return { ...isolation, cleanup: "integrated", reason: `Integrated ${copies.length} changed and ${deletions.length} deleted files.` };
   }
 }

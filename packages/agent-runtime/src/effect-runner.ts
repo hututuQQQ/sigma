@@ -162,8 +162,6 @@ export class EffectRunner {
     await this.options.emit(session, "tool.requested", "runtime", {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });
-    const cached = session.state.receipts.find((item) => item.callId === call.id);
-    if (cached && descriptor.idempotent) return { ...cached, diagnostics: [...cached.diagnostics, "reused_idempotent_receipt"], completedAt: new Date().toISOString() };
     if (!isToolAllowed(descriptor, session.mode)) return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.mode} mode.`, "mode_denied");
     const scopeError = writeScopeFailure(session, call, descriptor, startedAt);
     if (scopeError) return scopeError;

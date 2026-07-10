@@ -1,18 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { loadNestedInstructions } from "agent-context";
 import type { AgentEventEnvelope, AgentEventType, ContextAuthority, JsonValue, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession } from "agent-protocol";
-import { createKernelState, evolve } from "agent-kernel";
+import { evolve } from "agent-kernel";
 import { ContentAddressedArtifactStore } from "agent-store";
-import { AsyncQueue } from "./async-queue.js";
 import { EffectRunner } from "./effect-runner.js";
 import { jsonValue } from "./json.js";
 import { newRuntimeSession } from "./new-runtime-session.js";
 import { baseContext } from "./runtime-context.js";
 import { persistRuntimeSnapshot } from "./runtime-snapshot.js";
+import { beginNextRun, recoveryDenialPayload } from "./run-transitions.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
 import { restoreStoredSession } from "./restore-session.js";
 import { SessionCommandBus } from "./session-command-bus.js";
 import { storedSessionOverview } from "./session-overview.js";
+import { streamSessionEvents } from "./runtime-stream.js";
+import {
+  resolveOutcomeWaiters,
+  settleIdleWaiters,
+  waitForSessionIdleOutcome,
+  waitForSessionOutcome
+} from "./runtime-waiters.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
@@ -95,25 +102,18 @@ export class InProcessRuntimeClient implements RuntimeClient {
     });
     approval.resolve(command.decision);
     if (approval.recovered && command.decision === "deny") {
-      await this.emitRecoveryDenial(session, command.requestId, pendingTool.modelTurn);
+      await this.emit(
+        session,
+        "tool.failed",
+        "runtime",
+        recoveryDenialPayload(command.requestId, pendingTool.modelTurn)
+      );
     }
     if (!session.running && session.state.phase !== "terminal") {
       session.lastOutcome = undefined;
       this.startRun(session);
     }
   }
-  private async emitRecoveryDenial(
-    session: RuntimeSession,
-    callId: string,
-    modelTurn: { turnId: number; effectRevision: number }
-  ): Promise<void> {
-    const now = new Date().toISOString();
-    await this.emit(session, "tool.failed", "runtime", {
-      callId, name: "tool", ok: false, output: "Interrupted tool retry denied by user.", observedEffects: [],
-      artifacts: [], diagnostics: ["recovery_retry_denied"], startedAt: now, completedAt: now, ...modelTurn
-    });
-  }
-
   private async handleSteer(session: RuntimeSession, text: string): Promise<void> {
     if (session.steeringPending >= 256) throw new Error("Steering queue is full (256 messages).");
     session.steeringPending += 1;
@@ -138,7 +138,10 @@ export class InProcessRuntimeClient implements RuntimeClient {
     }
     if (session.state.phase === "terminal") {
       await this.commandBus.claim(session.sessionId);
-      this.beginNextRun(session, session.mode);
+      beginNextRun(session, session.mode, this.runDeadlineMs);
+    } else if (session.state.phase === "needs_input") {
+      await this.commandBus.claim(session.sessionId);
+      session.lastOutcome = undefined;
     }
     await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
     await this.emit(session, "user.follow_up", "user", { text, queueId: randomUUID(), status: "delivered" });
@@ -153,53 +156,31 @@ export class InProcessRuntimeClient implements RuntimeClient {
     }
     if (session.state.phase === "terminal") {
       await this.commandBus.claim(session.sessionId);
-      this.beginNextRun(session, command.mode ?? session.mode);
+      beginNextRun(session, command.mode ?? session.mode, this.runDeadlineMs);
+    } else if (session.state.phase === "needs_input") {
+      await this.commandBus.claim(session.sessionId);
+      session.lastOutcome = undefined;
     }
     await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
     await this.emit(session, "user.message", "user", { text: command.text });
     this.startRun(session);
   }
 
-  async *subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope> {
-    const session = this.sessions.get(sessionId);
-    const queue = new AsyncQueue<AgentEventEnvelope>();
-    const onAbort = (): void => queue.close();
-    if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
-    session?.subscribers.add(queue);
-    let lastSeq = 0;
-    try {
-      for await (const event of this.options.store.events(sessionId)) {
-        lastSeq = Math.max(lastSeq, event.seq);
-        yield event;
-      }
-      if (!session) return;
-      for await (const event of queue) {
-        if (event.seq <= lastSeq) continue;
-        lastSeq = event.seq;
-        yield event;
-      }
-    } finally {
-      signal?.removeEventListener("abort", onAbort);
-      session?.subscribers.delete(queue);
-      queue.close();
-    }
+  subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope> {
+    return streamSessionEvents(this.options.store, this.sessions.get(sessionId), sessionId, signal);
   }
 
   async waitForOutcome(sessionId: string, signal?: AbortSignal): Promise<RunOutcome> {
+    return await waitForSessionOutcome(this.required(sessionId), signal);
+  }
+
+  async waitForIdleOutcome(sessionId: string, signal?: AbortSignal): Promise<RunOutcome> {
     const session = this.required(sessionId);
-    if (session.lastOutcome && session.state.phase === "terminal") return session.lastOutcome;
-    return await new Promise<RunOutcome>((resolve, reject) => {
-      const onAbort = (): void => {
-        signal?.removeEventListener("abort", onAbort);
-        reject(signal?.reason ?? new Error("Outcome wait cancelled."));
-      };
-      if (signal?.aborted) return onAbort();
-      signal?.addEventListener("abort", onAbort, { once: true });
-      session.outcomeWaiters.push((outcome) => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve(outcome);
-      });
-    });
+    return await waitForSessionIdleOutcome(
+      session,
+      async (idleSignal) => await this.effects.waitForQuiescence(sessionId, idleSignal),
+      signal
+    );
   }
 
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
@@ -274,8 +255,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
     }
     session.lastOutcome = outcome;
     await this.writeSnapshot(session);
-    await this.commandBus.release(session.sessionId);
-    for (const waiter of session.outcomeWaiters.splice(0)) waiter(outcome);
+    if (session.followUps.length === 0) await this.commandBus.release(session.sessionId);
+    resolveOutcomeWaiters(session, event.runId, outcome);
     return true;
   }
 
@@ -342,16 +323,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
     await persistRuntimeSnapshot(this.options.store, session);
   }
 
-  private beginNextRun(session: RuntimeSession, mode: RuntimeSession["mode"]): void {
-    const now = new Date().toISOString();
-    session.runId = randomUUID();
-    session.modelTurn = 0;
-    session.mode = mode;
-    const state = createKernelState({ sessionId: session.sessionId, runId: session.runId, mode, startedAt: now, deadlineAt: new Date(Date.now() + this.runDeadlineMs).toISOString() });
-    session.state = { ...state, messages: session.state.messages, lastSeq: session.seq };
-    session.lastOutcome = undefined;
-  }
-
   private async resume(sessionId: string): Promise<void> {
     if (this.sessions.has(sessionId)) return;
     const restored = await restoreStoredSession(this.options.store, sessionId, this.runDeadlineMs);
@@ -363,7 +334,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       workspacePath, mode: state.mode, writeScope, strictWriteScope, state, seq: lastSeq,
       controller: null, turnController: null, deadlineTimer: null, running: null, subscribers: new Set(), approvals: new Map(),
       alwaysAllowedEffects: new Set(), steeringPending: 0, followUps, contextItems: [...base, ...project, ...contextItems],
-      loadedContextIds: new Set([...base, ...project, ...contextItems].map((item) => item.id)), outcomeWaiters: [], lastOutcome: state.outcome
+      loadedContextIds: new Set([...base, ...project, ...contextItems].map((item) => item.id)), outcomeWaiters: [], idleWaiters: [], lastOutcome: state.outcome
     };
     this.sessions.set(sessionId, session);
     await this.recoverSession(session);
@@ -384,17 +355,42 @@ export class InProcessRuntimeClient implements RuntimeClient {
   }
 
   private startRun(session: RuntimeSession): void {
-    const task = this.run(session);
+    if (session.running) return;
+    session.runError = undefined;
+    const task = this.drainRuns(session);
     session.running = task;
-    void task.finally(async () => {
-      if (session.running === task) session.running = null;
+    void task.then(
+      async () => await this.settleRunTask(session, task),
+      async (error) => await this.settleRunTask(session, task, error)
+    ).catch(() => undefined);
+  }
+
+  private async drainRuns(session: RuntimeSession): Promise<void> {
+    while (true) {
+      await this.run(session);
       const next = session.followUps.shift();
       if (!next) return;
-      await this.commandBus.claim(session.sessionId);
-      this.beginNextRun(session, session.mode);
-      await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
-      await this.emit(session, "user.follow_up", "user", { text: next.text, queueId: next.id, status: "delivered" });
-      this.startRun(session);
-    });
+      try {
+        await this.commandBus.claim(session.sessionId);
+        beginNextRun(session, session.mode, this.runDeadlineMs);
+        await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
+        await this.emit(session, "user.follow_up", "user", { text: next.text, queueId: next.id, status: "delivered" });
+      } catch (error) {
+        if (session.state.phase === "terminal") beginNextRun(session, session.mode, this.runDeadlineMs);
+        await this.finish(session, {
+          kind: "recoverable_failure",
+          code: "follow_up_handoff_failed",
+          message: error instanceof Error ? error.message : String(error)
+        });
+        return;
+      }
+    }
+  }
+
+  private async settleRunTask(session: RuntimeSession, task: Promise<void>, error?: unknown): Promise<void> {
+    await this.effects.waitForQuiescence(session.sessionId).catch(() => undefined);
+    if (session.running !== task) return;
+    session.running = null;
+    settleIdleWaiters(session, error);
   }
 }

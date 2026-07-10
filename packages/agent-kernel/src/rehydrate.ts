@@ -11,9 +11,13 @@ export function rehydrate(initial: KernelState, events: Iterable<AgentEventEnvel
 export function assertKernelInvariants(state: KernelState): void {
   const callIds = state.pendingTools.map((item) => item.request.callId);
   if (new Set(callIds).size !== callIds.length) throw new Error("Duplicate pending tool call IDs.");
+  if (new Set(state.toolCallIds).size !== state.toolCallIds.length) throw new Error("Duplicate run tool call IDs.");
   if (state.pendingTools.some((item) => !Number.isInteger(item.modelTurn.turnId)
     || !Number.isInteger(item.modelTurn.effectRevision))) {
     throw new Error("Pending tools require a valid originating model turn.");
+  }
+  if (callIds.some((callId) => !state.toolCallIds.includes(callId))) {
+    throw new Error("Every pending tool call must be present in the run tool-call ledger.");
   }
   if ((state.phase === "model_in_flight") !== Boolean(state.activeModelTurn)) {
     throw new Error("Model-in-flight state and active model turn must agree.");
