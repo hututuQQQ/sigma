@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -165,9 +165,12 @@ describe("Sigma v2 CLI", () => {
 
   it("injects the only RuntimeClient boundary into the TUI", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-tui-"));
+    const canonicalWorkspace = await realpath(workspace);
     let received = false;
     await expect(runAgentCommand(["tui", "--workspace", workspace], {
-      tuiRunner: async (options) => { received = typeof options.runtime.command === "function" && options.workspace === workspace; }
+      tuiRunner: async (options) => {
+        received = typeof options.runtime.command === "function" && options.workspace === canonicalWorkspace;
+      }
     })).resolves.toBe(0);
     expect(received).toBe(true);
   });

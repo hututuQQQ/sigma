@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
@@ -93,7 +93,10 @@ describe("Git workspace containment", () => {
       workspacePath: workspace,
       intent: "write"
     });
-    expect(allocation.isolation).toMatchObject({ kind: "exclusive_workspace", sourceWorkspacePath: workspace });
+    expect(allocation.isolation).toMatchObject({
+      kind: "exclusive_workspace",
+      sourceWorkspacePath: await realpath(workspace)
+    });
     expect(allocation.isolation.repositoryRoot).toBeUndefined();
     await allocation.release();
   });
@@ -107,7 +110,7 @@ describe("Git workspace containment", () => {
     await writeFile(path.join(workspace, "tracked.txt"), "SELF_CONTAINED_CHANGE\n", "utf8");
 
     const signal = new AbortController().signal;
-    await expect(selfContainedGitRoot(workspace, signal)).resolves.toBe(workspace);
+    await expect(selfContainedGitRoot(workspace, signal)).resolves.toBe(await realpath(workspace));
     const contextItems = await new RepositoryContextProvider().collect(workspace, "tracked", signal);
     expect(contextItems.find((item) => item.provenance === "current Git diff")?.content).toContain("SELF_CONTAINED_CHANGE");
     const tools = registerBuiltinTools(new EffectToolRegistry());

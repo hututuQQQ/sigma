@@ -711,10 +711,24 @@ describe("Sigma v2 architecture", () => {
       permissionMode: "auto", runDeadlineMs: 2_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    const deadlineObserved = (async (): Promise<number> => {
+      for await (const stored of runtime.subscribe(session.sessionId)) {
+        if (stored.type === "tool.failed"
+          && (stored.payload as { callId?: string }).callId === "hang") return Date.now();
+      }
+      throw new Error("Runtime event stream ended before the deadline receipt.");
+    })();
     const started = Date.now();
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "exercise timeout", mode: "analyze" });
+    const failedAt = await Promise.race([
+      deadlineObserved,
+      new Promise<never>((_resolve, reject) => setTimeout(
+        () => reject(new Error("Tool deadline receipt exceeded 1 second.")),
+        1_000
+      ))
+    ]);
+    expect(failedAt - started).toBeLessThan(1_000);
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
-    expect(Date.now() - started).toBeLessThan(1_000);
     expect(gateway.requests[1].messages.some((message) => message.role === "tool" && message.content.includes("exceeded 25ms"))).toBe(true);
   });
 
