@@ -328,6 +328,67 @@ describe("Sigma OpenTUI", () => {
     expect(activityToggles).toBe(1);
   });
 
+  it("exits promptly while initial session creation is still blocked", async () => {
+    let releaseCreation!: () => void;
+    const creationGate = new Promise<void>((resolve) => { releaseCreation = resolve; });
+    const runtime = new FakeRuntime();
+    runtime.createSession = async () => {
+      await creationGate;
+      return { sessionId: "late-session", runId: "run" };
+    };
+    const stdin = Object.assign(new PassThrough(), { isTTY: true }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 }) as unknown as NodeJS.WriteStream;
+    let actions!: TuiViewActions;
+    const controller = new TuiSessionController({ runtime, workspace: ".", stdin, stdout }, async (_options, nextActions) => {
+      actions = nextActions;
+      return { update: () => undefined, showHelp: () => undefined, toggleActivity: () => undefined, destroy: () => undefined };
+    });
+    const running = controller.run();
+    await waitUntil(() => Boolean(actions));
+    await actions.interrupt();
+    await actions.interrupt();
+    await expect(Promise.race([
+      running.then(() => "exited"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 100))
+    ])).resolves.toBe("exited");
+    releaseCreation();
+    await waitUntil(() => runtime.released.includes("late-session"));
+  });
+
+  it("holds input for the new session while a session switch is pending", async () => {
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const runtime = new FakeRuntime([]);
+    let creations = 0;
+    runtime.createSession = async () => {
+      creations += 1;
+      if (creations === 2) await secondGate;
+      return { sessionId: creations === 1 ? "old-session" : "new-session", runId: "run" };
+    };
+    const stdin = Object.assign(new PassThrough(), { isTTY: true }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 }) as unknown as NodeJS.WriteStream;
+    let actions!: TuiViewActions;
+    let latest!: TuiSnapshot;
+    const controller = new TuiSessionController({ runtime, workspace: ".", stdin, stdout }, async (_options, nextActions) => {
+      actions = nextActions;
+      return { update: (next) => { latest = next; }, showHelp: () => undefined, toggleActivity: () => undefined, destroy: () => undefined };
+    });
+    const running = controller.run();
+    await waitUntil(() => latest?.sessionId === "old-session");
+    const switching = actions.newSession();
+    await waitUntil(() => creations === 2);
+    const submitting = actions.submit("after switch", "default");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runtime.commands).not.toContainEqual(expect.objectContaining({ text: "after switch" }));
+    releaseSecond();
+    await Promise.all([switching, submitting]);
+    expect(runtime.commands).toContainEqual({
+      type: "submit", sessionId: "new-session", text: "after switch", mode: "change"
+    });
+    controller.stop();
+    await running;
+  });
+
   it("keeps long transcripts incremental within the renderer budgets", async () => {
     const heapBefore = process.memoryUsage().heapUsed;
     let presentation = createPresentationState();

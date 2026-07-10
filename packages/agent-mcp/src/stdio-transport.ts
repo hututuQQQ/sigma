@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { McpConnectionError, McpProtocolError } from "./errors.js";
 import { JsonLineDecoder } from "./framing.js";
 import { detachedProcessGroup, terminateProcessTree } from "./process-tree.js";
@@ -41,6 +42,8 @@ export class McpStdioTransport {
   private failed = false;
   private closePromise?: Promise<void>;
   private stderrValue = "";
+  private readonly stderrDecoder = new StringDecoder("utf8");
+  private stderrFinished = false;
 
   constructor(
     private readonly config: McpStdioServerConfig,
@@ -69,10 +72,9 @@ export class McpStdioTransport {
     child.stdout.on("data", (chunk: Buffer) => this.receive(chunk));
     child.stdout.on("end", () => this.finishInput());
     child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      this.stderrValue = appendBounded(this.stderrValue, text, this.maxStderrBytes);
-      try { this.hooks.onStderr?.(text); } catch { /* diagnostic hooks cannot break transport */ }
+      this.appendStderr(this.stderrDecoder.write(chunk));
     });
+    child.stderr.on("end", () => this.finishStderr());
     child.on("close", (code, signal) => {
       if (!this.closing) this.fail(new McpConnectionError(`MCP server exited unexpectedly (${signal ?? code ?? "unknown"}).`));
     });
@@ -136,6 +138,18 @@ export class McpStdioTransport {
     } catch (error) {
       this.fail(error instanceof Error ? error : new McpProtocolError(String(error)));
     }
+  }
+
+  private appendStderr(text: string): void {
+    if (!text) return;
+    this.stderrValue = appendBounded(this.stderrValue, text, this.maxStderrBytes);
+    try { this.hooks.onStderr?.(text); } catch { /* diagnostic hooks cannot break transport */ }
+  }
+
+  private finishStderr(): void {
+    if (this.stderrFinished) return;
+    this.stderrFinished = true;
+    this.appendStderr(this.stderrDecoder.end());
   }
 
   private fail(error: Error): void {

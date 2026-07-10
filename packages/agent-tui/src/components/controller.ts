@@ -49,9 +49,12 @@ export class TuiSessionController {
     try {
       this.view = await this.viewFactory(this.options, this.actions());
       this.refresh();
-      this.sessionReady = this.options.sessionId ? this.resume(this.options.sessionId) : this.newSession();
-      await this.sessionReady;
-      await exited;
+      const startup = this.beginSessionTransition(async () => {
+        if (this.options.sessionId) await this.resume(this.options.sessionId);
+        else await this.newSession();
+      });
+      await Promise.race([startup, exited]);
+      if (this.active) await exited;
     } finally {
       await this.cleanup();
     }
@@ -59,6 +62,7 @@ export class TuiSessionController {
 
   stop(): void {
     if (!this.active) return;
+    this.active = false;
     this.exitResolve?.();
   }
 
@@ -70,7 +74,7 @@ export class TuiSessionController {
         await this.options.runtime.command({ type: "approve", sessionId: this.sessionId, requestId, decision });
       }),
       interrupt: async () => await this.protect(async () => await this.interrupt()),
-      newSession: async () => await this.protect(async () => await this.newSession()),
+      newSession: async () => await this.protect(async () => await this.beginSessionTransition(async () => await this.newSession())),
       setMode: (mode) => { this.mode = mode; this.notice(`Mode changed to ${mode}.`); this.refresh(); },
       stop: () => this.stop(),
       userAction: () => { if (this.noticeState?.error) this.notice(); }
@@ -85,7 +89,7 @@ export class TuiSessionController {
   private async submit(text: string, kind: SubmissionKind): Promise<void> {
     this.notice();
     await this.sessionReady;
-    if (!this.sessionId) return;
+    if (!this.active || !this.sessionId) return;
     if (await this.command(text)) return;
     if (kind === "follow_up") {
       await this.options.runtime.command({ type: "follow_up", sessionId: this.sessionId, text });
@@ -106,7 +110,10 @@ export class TuiSessionController {
     const { action } = parsed.command;
     const { argument } = parsed;
     if (action === "quit") { this.stop(); return true; }
-    if (action === "new") { await this.newSession(); return true; }
+    if (action === "new") {
+      await this.beginSessionTransition(async () => await this.newSession());
+      return true;
+    }
     if (action === "help") { this.view?.showHelp(); return true; }
     if (action === "activity") { this.view?.toggleActivity(); return true; }
     if (action === "mode") {
@@ -132,17 +139,37 @@ export class TuiSessionController {
   }
 
   private async newSession(): Promise<void> {
+    if (!this.active) return;
     if (this.sessionId && ["running", "needs_input"].includes(this.presentation.status)) {
       await this.options.runtime.command({ type: "cancel", sessionId: this.sessionId, reason: "Replaced by /new from TUI." });
     }
     const session = await this.options.runtime.createSession({ workspacePath: this.options.workspace, mode: this.mode });
+    if (!this.active) {
+      await this.release(session.sessionId);
+      return;
+    }
     await this.attach(session.sessionId);
-    this.notice("New session. Type a request and press Enter.");
+    if (this.active) this.notice("New session. Type a request and press Enter.");
   }
 
   private async resume(sessionId: string): Promise<void> {
+    if (!this.active) return;
     await this.options.runtime.command({ type: "resume", sessionId });
+    if (!this.active) {
+      await this.release(sessionId);
+      return;
+    }
     await this.attach(sessionId);
+  }
+
+  private beginSessionTransition(operation: () => Promise<void>): Promise<void> {
+    const transition = this.sessionReady.catch(() => undefined).then(operation);
+    this.sessionReady = transition;
+    return transition;
+  }
+
+  private async release(sessionId: string): Promise<void> {
+    try { await this.options.runtime.releaseSession?.(sessionId); } catch { /* cleanup is best effort */ }
   }
 
   private async attach(sessionId: string): Promise<void> {
@@ -150,6 +177,10 @@ export class TuiSessionController {
     this.subscriptionEpoch += 1;
     this.subscriptionAbort?.abort();
     await this.subscription?.return?.();
+    if (!this.active) {
+      if (previous !== sessionId) await this.release(sessionId);
+      return;
+    }
     if (previous && previous !== sessionId) await this.options.runtime.releaseSession?.(previous);
     this.sessionId = sessionId;
     this.presentation = createPresentationState();

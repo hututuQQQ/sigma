@@ -257,4 +257,30 @@ describe("context, platform, and repository tool capabilities", () => {
     ]);
     expect(order).toEqual(["first", "second"]);
   });
+
+  it("decodes UTF-8 process output incrementally across byte chunks", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-process-utf8-"));
+    const script = [
+      "const out = Buffer.from([0xe4,0xb8,0xad,0xe6,0x96,0x87,0x20,0xf0,0x9f,0x9a,0x80]);",
+      "const err = Buffer.from([0xe9,0x94,0x99,0xe8,0xaf,0xaf]);",
+      "let index = 0;",
+      "const timer = setInterval(() => {",
+      "  if (index < out.length) process.stdout.write(out.subarray(index, index + 1));",
+      "  if (index < err.length) process.stderr.write(err.subarray(index, index + 1));",
+      "  index += 1;",
+      "  if (index >= out.length) clearInterval(timer);",
+      "}, 2);"
+    ].join("\n");
+    const result = await runProcess({
+      executable: process.execPath,
+      args: ["-e", script],
+      cwd: workspace,
+      timeoutMs: 5_000,
+      signal: new AbortController().signal
+    });
+    expect(result.stdout).toBe("中文 🚀");
+    expect(result.stderr).toBe("错误");
+    expect(result.stdout).not.toContain("�");
+    expect(result.stderr).not.toContain("�");
+  });
 });

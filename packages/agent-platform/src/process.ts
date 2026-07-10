@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ShellKind } from "./environment.js";
 
 export interface ProcessRequest {
@@ -74,6 +75,18 @@ class ProcessOutputCapture {
   }
 }
 
+function finishDecodedOutput(
+  output: ProcessOutputCapture,
+  stdoutDecoder: StringDecoder,
+  stderrDecoder: StringDecoder
+): void {
+  const stdoutTail = stdoutDecoder.end();
+  const stderrTail = stderrDecoder.end();
+  if (stdoutTail) output.appendStdout(stdoutTail);
+  if (stderrTail) output.appendStderr(stderrTail);
+  output.finish();
+}
+
 export function terminateProcessTree(child: ChildProcess, force = false): void {
   if (child.exitCode !== null || !child.pid) return;
   if (process.platform === "win32") {
@@ -107,6 +120,8 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
       stdio: ["ignore", "pipe", "pipe"]
     });
     const output = new ProcessOutputCapture(maxOutput, request.maxStdoutLines);
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     let timedOut = false;
     let cancelled = false;
     let settled = false;
@@ -116,7 +131,7 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       request.signal.removeEventListener("abort", onAbort);
-      output.finish();
+      finishDecodedOutput(output, stdoutDecoder, stderrDecoder);
       resolve({
         exitCode, stdout: output.stdout, stderr: output.stderr, timedOut, cancelled,
         durationMs: Date.now() - startedAt,
@@ -152,11 +167,11 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
     request.signal.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
       heartbeat();
-      if (output.appendStdout(chunk.toString("utf8"))) terminate();
+      if (output.appendStdout(stdoutDecoder.write(chunk))) terminate();
     });
     child.stderr.on("data", (chunk: Buffer) => {
       heartbeat();
-      output.appendStderr(chunk.toString("utf8"));
+      output.appendStderr(stderrDecoder.write(chunk));
     });
     child.on("error", (error) => {
       if (settled) return;
