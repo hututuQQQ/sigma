@@ -236,13 +236,13 @@ export class TuiController {
   }
 
   private async cleanup(): Promise<void> {
-    this.active = false;
-    this.subscriptionEpoch += 1;
+    const sessionId = this.state.sessionId;
+    this.active = false; this.subscriptionEpoch += 1;
     this.subscriptionAbort?.abort();
-    this.renderer.stop();
-    await this.subscription?.return?.();
-    this.input.off("data", this.onData);
-    this.output.off("resize", this.onResize);
+    this.renderer.stop(); await this.subscription?.return?.();
+    if (sessionId && ["running", "needs_input"].includes(this.state.view.status)) await this.options.runtime.command({ type: "cancel", sessionId, reason: "TUI closed." });
+    if (sessionId) await this.options.runtime.releaseSession?.(sessionId);
+    this.input.off("data", this.onData); this.output.off("resize", this.onResize);
     this.input.setRawMode?.(false);
     this.input.pause();
     this.output.write("\u001b[?2004l\u001b[?1049l\u001b[?25h\u001b[0m");

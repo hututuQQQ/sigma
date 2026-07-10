@@ -226,6 +226,22 @@ describe("Sigma TUI", () => {
     expect(rendered).toContain("\u001b[?1049l");
     expect(rendered).toContain("\u001b[?2004h");
     expect(rendered).toContain("\u001b[?2004l");
+    expect(runtime.released).toEqual(["session"]);
+  });
+
+  it("cancels and releases an active session when the TUI closes", async () => {
+    const runtime = new FakeRuntime([event(1, "session.created", {}), event(2, "run.started", {})]);
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
+    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
+    const running = controller.run();
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stdin.write("/quit\r");
+    await running;
+
+    expect(runtime.commands).toContainEqual({ type: "cancel", sessionId: "session", reason: "TUI closed." });
+    expect(runtime.released).toEqual(["session"]);
   });
 
   it("queues an immediate submission until the initial session is ready", async () => {
