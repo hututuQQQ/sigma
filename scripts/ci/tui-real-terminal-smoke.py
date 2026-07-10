@@ -196,12 +196,13 @@ def exercise(terminal: Terminal, timeout: float) -> tuple[int, str]:
         thread.join(timeout=1)
 
 
-def isolated_environment(home: Path) -> dict[str, str]:
+def isolated_environment(home: Path, state_home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update({
         "CI": "1",
         "HOME": str(home),
         "USERPROFILE": str(home),
+        "SIGMA_STATE_HOME": str(state_home),
         "NO_COLOR": "1",
         "SIGMA_NO_COLOR": "1",
         "TERM": "xterm-256color",
@@ -232,16 +233,17 @@ def main() -> None:
         temporary_path = Path(temporary)
         workspace = temporary_path / "workspace"
         home = temporary_path / "home"
+        state_home = temporary_path / "state"
         workspace.mkdir()
         home.mkdir()
         command = [str(node), str(cli), "tui", "--workspace", str(workspace), "--permission-mode", "deny"]
-        terminal = terminal_for(command, root, isolated_environment(home))
+        terminal = terminal_for(command, root, isolated_environment(home, state_home))
         code, transcript = exercise(terminal, args.timeout)
         missing = [marker for marker in REQUIRED_MARKERS if marker not in transcript]
-        if code != 0 or READY_TEXT not in transcript or missing or not (workspace / ".agent").is_dir():
+        if code != 0 or READY_TEXT not in transcript or missing or not (state_home / "workspaces").is_dir():
             raise RuntimeError(
                 f"TUI terminal smoke failed: exit={code}, ready={READY_TEXT in transcript}, "
-                f"missing={missing}, store={(workspace / '.agent').is_dir()}, output={escaped_tail(transcript)}"
+                f"missing={missing}, store={(state_home / 'workspaces').is_dir()}, output={escaped_tail(transcript)}"
             )
         print(f"PASS real terminal /quit smoke backend={terminal.backend} bytes={len(transcript.encode('utf-8'))}")
 

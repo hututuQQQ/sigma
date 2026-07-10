@@ -18,6 +18,7 @@ import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { runtimeStateRoot } from "../packages/agent-runtime/src/index.js";
+import { processMarker } from "../packages/agent-platform/src/process-heartbeat.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 class Capture extends Writable {
@@ -105,7 +106,8 @@ async function writeOwner(root: string, sessionId: string): Promise<void> {
   await writeFile(path.join(directory, "runtime-owner.json"), JSON.stringify({
     pid: process.pid,
     instanceId: "coverage-owner",
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    processMarker: processMarker(process.pid)
   }), "utf8");
 }
 
