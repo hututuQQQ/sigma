@@ -37,7 +37,7 @@ describe("agent-store crash and validation coverage", () => {
     await expect(artifacts.get("session", "bad")).rejects.toThrow("Invalid artifact digest");
     for (const invalid of [".", "..", "x".repeat(129), "path/escape"]) expect(() => safeId(invalid)).toThrow("Unsafe");
     expect(safeId("valid.session-1")).toBe("valid.session-1");
-    expect(sessionDirectory(actualRoot, "session")).toContain(path.join("sessions-v2", "session"));
+    expect(sessionDirectory(actualRoot, "session")).toContain(path.join("sessions", "session"));
     expect(segmentName(3)).toBe("000003.jsonl");
     expect(snapshotName(12)).toBe("000000000012.json");
     await rm(actualRoot, { recursive: true, force: true });
@@ -48,7 +48,7 @@ describe("agent-store crash and validation coverage", () => {
     const store = new SegmentedJsonlStore({ rootDir: root, segmentEvents: 1, segmentBytes: 1_000_000 });
     expect(await store.append(event("rotate", 1, "session.created"), 0)).toEqual({ rotated: false });
     expect(await store.append(event("rotate", 2), 1)).toEqual({ rotated: true });
-    expect((await readdir(path.join(root, "sessions-v2", "rotate", "events"))).sort()).toEqual(["000001.jsonl", "000002.jsonl"]);
+    expect((await readdir(path.join(root, "sessions", "rotate", "events"))).sort()).toEqual(["000001.jsonl", "000002.jsonl"]);
     const filtered: number[] = [];
     for await (const item of store.events("rotate", 1)) filtered.push(item.seq);
     expect(filtered).toEqual([2]);
@@ -60,7 +60,7 @@ describe("agent-store crash and validation coverage", () => {
     const root = path.join(os.tmpdir(), `sigma-tail-${Date.now()}-${Math.random()}`);
     const store = new SegmentedJsonlStore({ rootDir: root });
     await store.append(event("tail", 1, "session.created"), 0);
-    const eventPath = path.join(root, "sessions-v2", "tail", "events", "000001.jsonl");
+    const eventPath = path.join(root, "sessions", "tail", "events", "000001.jsonl");
     const complete = await readFile(eventPath, "utf8");
     await writeFile(eventPath, complete.trimEnd(), "utf8");
     const readOnly: number[] = [];
@@ -86,7 +86,7 @@ describe("agent-store crash and validation coverage", () => {
       replaceFile: async (source, target) => {
         if (armed && !failed && target.endsWith("meta.json")) {
           failed = true;
-          const durable = await readFile(path.join(root, "sessions-v2", "meta-crash", "events", "000001.jsonl"), "utf8");
+          const durable = await readFile(path.join(root, "sessions", "meta-crash", "events", "000001.jsonl"), "utf8");
           expect(durable.trimEnd().split("\n")).toHaveLength(2);
           throw Object.assign(new Error("injected metadata replace failure"), { code: "EIO" });
         }
@@ -120,7 +120,7 @@ describe("agent-store crash and validation coverage", () => {
 
     await store.append(event("meta-retry", 1, "session.created"), 0);
     expect(attempts).toBe(3);
-    const directory = path.join(root, "sessions-v2", "meta-retry");
+    const directory = path.join(root, "sessions", "meta-retry");
     const meta = JSON.parse(await readFile(path.join(directory, "meta.json"), "utf8")) as { lastSeq: number };
     expect(meta.lastSeq).toBe(1);
     expect((await readdir(directory)).some((name) => name.endsWith(".tmp"))).toBe(false);
@@ -130,7 +130,7 @@ describe("agent-store crash and validation coverage", () => {
     const root = path.join(os.tmpdir(), `sigma-corruption-${Date.now()}-${Math.random()}`);
     const store = new SegmentedJsonlStore({ rootDir: root });
     await store.append(event("corrupt", 1, "session.created"), 0);
-    const directory = path.join(root, "sessions-v2", "corrupt");
+    const directory = path.join(root, "sessions", "corrupt");
     const lock = path.join(directory, ".append.lock");
     await writeFile(lock, "stale", "utf8");
     const old = new Date(Date.now() - 180_000);
@@ -156,12 +156,12 @@ describe("agent-store crash and validation coverage", () => {
     await store.append(event("snap", 1, "session.created"), 0);
     await store.writeSnapshot({ schemaVersion: 2, sessionId: "snap", seq: 1, createdAt: "one", state: { value: 1 } });
     await store.writeSnapshot({ schemaVersion: 2, sessionId: "snap", seq: 2, createdAt: "two", state: { value: 2 } });
-    const latest = path.join(root, "sessions-v2", "snap", "snapshots", snapshotName(2));
+    const latest = path.join(root, "sessions", "snap", "snapshots", snapshotName(2));
     await writeFile(latest, "{corrupt", "utf8");
     await expect(store.latestSnapshot("snap")).resolves.toMatchObject({ seq: 1, state: { value: 1 } });
 
-    await mkdir(path.join(root, "sessions-v2", "invalid"), { recursive: true });
-    await writeFile(path.join(root, "sessions-v2", "invalid", "meta.json"), "bad", "utf8");
+    await mkdir(path.join(root, "sessions", "invalid"), { recursive: true });
+    await writeFile(path.join(root, "sessions", "invalid", "meta.json"), "bad", "utf8");
     await store.append({ ...event("newer", 1, "session.created"), occurredAt: "2099-01-01T00:00:00.000Z" }, 0);
     expect((await store.listSessions()).map((item) => item.sessionId)).toEqual(["newer", "snap"]);
 

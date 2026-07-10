@@ -1,6 +1,6 @@
 # agent-mcp
 
-`agent-mcp` is Sigma's v2 MCP boundary. It launches stdio servers without a shell, negotiates MCP, and exposes remote tools through the `agent-protocol` tool port.
+`agent-mcp` is Sigma's MCP boundary. It launches stdio servers without a shell, negotiates MCP, and exposes remote tools through the `agent-protocol` tool port.
 
 ```ts
 import { McpStdioClient, McpToolBridge } from "agent-mcp";

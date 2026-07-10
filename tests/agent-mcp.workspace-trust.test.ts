@@ -6,7 +6,7 @@ import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { renderConfigToml, resolveConfig, type McpServerConfigValue } from "../packages/agent-config/src/index.js";
 import { loadCliConfig, workspaceMcpTrustMessage } from "../packages/agent-cli/src/config.js";
-import { runV2Command } from "../packages/agent-cli/src/commands/run-v2.js";
+import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { createConfiguredRuntime } from "../packages/agent-runtime/src/configured-runtime.js";
 import { connectMcpServers } from "../packages/agent-runtime/src/composition-mcp.js";
@@ -82,7 +82,7 @@ describe("workspace MCP trust boundary", () => {
     const stdout = new Capture();
     const stderr = new Capture();
 
-    const inspectCode = await runV2Command([
+    const inspectCode = await runCommand([
       "inspect safely", "--workspace", workspace, "--permission-mode", "deny", "--output-format", "json"
     ], { mode: "analyze", stdin, stdout, stderr });
     expect(inspectCode).toBe(2);

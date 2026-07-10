@@ -18,7 +18,6 @@ import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { runtimeStateRoot } from "../packages/agent-runtime/src/index.js";
-import { processMarker } from "../packages/agent-platform/src/process-heartbeat.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 class Capture extends Writable {
@@ -101,13 +100,12 @@ async function workspace(prefix: string): Promise<string> {
 }
 
 async function writeOwner(root: string, sessionId: string): Promise<void> {
-  const directory = path.join(runtimeStateRoot(root), "sessions-v2", sessionId);
+  const directory = path.join(runtimeStateRoot(root), "sessions", sessionId);
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, "runtime-owner.json"), JSON.stringify({
     pid: process.pid,
     instanceId: "coverage-owner",
-    startedAt: new Date().toISOString(),
-    processMarker: processMarker(process.pid)
+    startedAt: new Date().toISOString()
   }), "utf8");
 }
 
@@ -170,7 +168,7 @@ describe("CLI init and replay branches", () => {
     for (const argv of [[], ["--latest"], ["missing"]]) {
       const stderr = new Capture();
       await expect(runReplayCommand(argv, { runtime, stderr })).resolves.toBe(1);
-      expect(stderr.text()).toMatch(/requires a session id|No v2 session|was not found/);
+      expect(stderr.text()).toMatch(/requires a session id|No session|was not found/);
     }
   });
 
@@ -187,10 +185,10 @@ describe("CLI session branches", () => {
     const runtime = new FakeRuntime();
     const empty = new Capture();
     await expect(runSessionsCommand([], { runtime, stdout: empty })).resolves.toBe(0);
-    expect(empty.text()).toBe("No v2 sessions.\n");
+    expect(empty.text()).toBe("No sessions.\n");
     const defaultCommand = new Capture();
     await expect(runSessionCommand([], { runtime, stdout: defaultCommand })).resolves.toBe(0);
-    expect(defaultCommand.text()).toBe("No v2 sessions.\n");
+    expect(defaultCommand.text()).toBe("No sessions.\n");
 
     runtime.sessions = [overview()];
     const text = new Capture();
@@ -238,7 +236,7 @@ describe("CLI session branches", () => {
     expect(missing.text()).toContain("session id is required");
     const latest = new Capture();
     await expect(runSessionCommand(["resume", "--latest"], { runtime, stderr: latest })).resolves.toBe(1);
-    expect(latest.text()).toContain("No v2 sessions");
+    expect(latest.text()).toContain("No sessions");
 
     runtime.sessions = [overview()];
     const resumed = new Capture();
@@ -301,7 +299,7 @@ describe("CLI session branches", () => {
     ], { runtime, stderr: approval })).resolves.toBe(1);
     expect(approval.text()).toContain("controlling TUI");
 
-    const commandDir = path.join(runtimeStateRoot(root), "sessions-v2", "active", "commands");
+    const commandDir = path.join(runtimeStateRoot(root), "sessions", "active", "commands");
     const files = await readdir(commandDir);
     const commands = await Promise.all(files.map(async (file) => JSON.parse(await readFile(path.join(commandDir, file), "utf8")) as RunCommand));
     expect(commands).toEqual([{ type: "cancel", sessionId: "active", reason: "operator" }]);

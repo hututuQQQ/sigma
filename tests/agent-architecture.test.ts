@@ -41,7 +41,7 @@ function event(
 
 class FakeGateway implements ModelGateway {
   readonly provider = "fake";
-  readonly model = "fake-v2";
+  readonly model = "fake";
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 16_000,
     maxOutputTokens: 2_000,
@@ -109,7 +109,7 @@ class FakeGateway implements ModelGateway {
   }
 }
 
-describe("Sigma v2 architecture", () => {
+describe("Sigma architecture", () => {
   it("uses explicit completion rather than mutation heuristics", () => {
     let state = createKernelState({
       sessionId: "session",
@@ -156,8 +156,8 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("rejects workspace paths that escape through a directory link", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-workspace-"));
-    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-external-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-workspace-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-external-"));
     await writeFile(path.join(external, "secret.txt"), "secret", "utf8");
     try {
       await symlink(external, path.join(workspace, "linked"), process.platform === "win32" ? "junction" : "dir");
@@ -168,11 +168,11 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("stores checksummed segmented events and ignores only a torn tail", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-store-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-store-"));
     const store = new SegmentedJsonlStore({ rootDir: root, segmentBytes: 600 });
     await store.append(event(1, "session.created"), 0);
     await store.append(event(2, "run.started"), 1);
-    const eventsPath = path.join(root, "sessions-v2", "session", "events", "000001.jsonl");
+    const eventsPath = path.join(root, "sessions", "session", "events", "000001.jsonl");
     await writeFile(eventsPath, `${await readFile(eventsPath, "utf8")}{"torn"`, "utf8");
     const restored: AgentEventEnvelope[] = [];
     for await (const restoredEvent of store.events("session")) restored.push(restoredEvent);
@@ -184,9 +184,9 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("reconciles both store commit crash windows and serializes independent writers", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-store-commit-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-store-commit-"));
     const first = new SegmentedJsonlStore({ rootDir: root });
-    const metaPath = path.join(root, "sessions-v2", "session", "meta.json");
+    const metaPath = path.join(root, "sessions", "session", "meta.json");
     await first.append(event(1, "session.created"), 0);
     await first.append(event(2, "diagnostic", { completeLine: true }), 1);
 
@@ -215,7 +215,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("runs a tool turn and completes in the new runtime", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-runtime-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-"));
     const gateway = new FakeGateway([
       {
         message: {
@@ -245,7 +245,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("treats completion as a commit barrier after same-turn evidence tools", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-barrier-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-barrier-"));
     const gateway = new FakeGateway([{
       message: {
         role: "assistant",
@@ -298,7 +298,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("rejects same-turn completion when its evidence tool fails", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-failure-barrier-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-failure-barrier-"));
     const complete = (id: string, evidenceCallIds: string[]): ModelResponse => ({
       message: {
         role: "assistant",
@@ -360,7 +360,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("exposes exact successful receipt IDs and repairs invalid completion evidence", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-guidance-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-guidance-"));
     await writeFile(path.join(workspace, "result.txt"), "done", "utf8");
     const proposal = (id: string, evidenceCallIds: string[]): ModelResponse => ({
       message: {
@@ -415,7 +415,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("serializes durable events emitted by parallel tool calls", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-parallel-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-parallel-"));
     await writeFile(path.join(workspace, "a.txt"), "a", "utf8");
     await writeFile(path.join(workspace, "b.txt"), "b", "utf8");
     const gateway = new FakeGateway([
@@ -451,7 +451,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("rehydrates the most recent outcome across multiple runs", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-resume-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-resume-"));
     const storeRootDir = path.join(workspace, ".agent");
     const gateway = new FakeGateway([
       { message: { role: "assistant", content: "first" }, finishReason: "stop" },
@@ -494,7 +494,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("finishes an outcome-pending crash boundary and never extends a durable deadline", async () => {
-    const pendingWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-outcome-pending-"));
+    const pendingWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-outcome-pending-"));
     const pendingRoot = path.join(pendingWorkspace, ".agent");
     const pendingStore = new SegmentedJsonlStore({ rootDir: pendingRoot });
     const future = new Date(Date.now() + 10_000).toISOString();
@@ -522,7 +522,7 @@ describe("Sigma v2 architecture", () => {
     await pendingRuntime.command({ type: "resume", sessionId: "session" });
     await expect(pendingRuntime.waitForOutcome("session")).resolves.toMatchObject({ kind: "completed", message: "already generated" });
 
-    const expiredWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-expired-resume-"));
+    const expiredWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-expired-resume-"));
     const expiredRoot = path.join(expiredWorkspace, ".agent");
     const expiredStore = new SegmentedJsonlStore({ rootDir: expiredRoot });
     const expiredEvents = [
@@ -540,7 +540,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("cancels a run waiting for approval without hanging", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-cancel-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cancel-"));
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway: new FakeGateway([{
@@ -568,7 +568,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("restores a durable pending approval and continues after approval", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-approval-resume-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-resume-"));
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const persisted = [
@@ -624,7 +624,7 @@ describe("Sigma v2 architecture", () => {
       return { storeRootDir, store };
     };
 
-    const deniedWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-deny-resume-"));
+    const deniedWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deny-resume-"));
     const deniedStore = await createSuspendedStore(deniedWorkspace);
     const deniedRuntime = createRuntime({
       gateway: new FakeGateway([{ message: { role: "assistant", content: "continued safely" }, finishReason: "stop" }]),
@@ -639,7 +639,7 @@ describe("Sigma v2 architecture", () => {
     await expect(deniedRuntime.waitForOutcome("session")).resolves.toMatchObject({ kind: "completed", message: "continued safely" });
     await expect(readFile(path.join(deniedWorkspace, "result.txt"), "utf8")).rejects.toThrow();
 
-    const cancelledWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-cancel-resume-"));
+    const cancelledWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cancel-resume-"));
     const cancelledStore = await createSuspendedStore(cancelledWorkspace);
     const cancelledRuntime = createRuntime({
       gateway: new FakeGateway([]),
@@ -655,7 +655,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("normalizes a throwing tool into a protocol receipt", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-tool-error-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-tool-error-"));
     const gateway = new FakeGateway([
       { message: { role: "assistant", content: "", toolCalls: [{ id: "boom", name: "explode", arguments: {} }] }, finishReason: "tool_calls" },
       { message: { role: "assistant", content: "Recovered from tool failure." }, finishReason: "stop" }
@@ -691,7 +691,7 @@ describe("Sigma v2 architecture", () => {
   });
 
   it("enforces a hard tool deadline even when a plugin ignores cancellation", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-tool-timeout-"));
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-tool-timeout-"));
     const gateway = new FakeGateway([
       { message: { role: "assistant", content: "", toolCalls: [{ id: "hang", name: "never_returns", arguments: {} }] }, finishReason: "tool_calls" },
       { message: { role: "assistant", content: "Handled the timeout." }, finishReason: "stop" }

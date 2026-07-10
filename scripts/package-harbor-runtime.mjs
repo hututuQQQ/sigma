@@ -75,7 +75,7 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \\
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 \`\`\`
 
-The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes the v2 \`agent run\` command, and records its structured result after the run. Evaluation output is never passed back into the solving session.
+The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent run\`, and records its structured result after the run. Evaluation output is never passed back into the solving session.
 `;
 }
 

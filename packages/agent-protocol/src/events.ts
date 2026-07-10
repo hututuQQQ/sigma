@@ -98,5 +98,5 @@ export function isAgentEventEnvelope(value: unknown): value is AgentEventEnvelop
 }
 
 export function assertAgentEventEnvelope(value: unknown): asserts value is AgentEventEnvelope {
-  if (!isAgentEventEnvelope(value)) throw new Error("Invalid AgentEventEnvelope v2.");
+  if (!isAgentEventEnvelope(value)) throw new Error("Invalid AgentEventEnvelope.");
 }

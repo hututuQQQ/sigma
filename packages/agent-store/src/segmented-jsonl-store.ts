@@ -81,8 +81,7 @@ async function acquireSessionLock(directory: string): Promise<() => Promise<void
     timeoutMs: 10_000,
     malformedStaleMs: 5_000,
     retryIntervalMs: 10,
-    activeOwner: "wait",
-    allowLegacyPid: true
+    activeOwner: "wait"
   });
   return lease.release;
 }
@@ -296,7 +295,7 @@ export class SegmentedJsonlStore implements RunStore {
   }
 
   async listSessions(): Promise<Array<{ sessionId: string; updatedAt: string; lastSeq: number }>> {
-    const root = path.join(this.rootDir, "sessions-v2");
+    const root = path.join(this.rootDir, "sessions");
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
     const sessions = await Promise.all(entries.filter((item) => item.isDirectory()).map(async (item) => {
       try {

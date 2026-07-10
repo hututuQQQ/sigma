@@ -83,7 +83,7 @@ function bundleLabel(bundle: unknown): string {
   if (!targetArch) return "";
 
   const targetPlatform = bundleValue(metadata.targetPlatform);
-  return targetPlatform ? ` bundle=${targetPlatform}-${targetArch}` : ` bundle=linux-${targetArch}`;
+  return targetPlatform ? ` bundle=${targetPlatform}-${targetArch}` : "";
 }
 
 export async function runVersionCommand(argv: string[], deps: VersionCommandDeps = {}): Promise<number> {

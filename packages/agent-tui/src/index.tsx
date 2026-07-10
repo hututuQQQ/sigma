@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-export { runTuiApp, type TuiAppOptions } from "./v2/app.js";
-export { TuiController, type TuiControllerOptions } from "./v2/controller.js";
-export { createComposer, composerText, insertText, backspace, moveCursor, cellWidth } from "./v2/composer.js";
-export { renderFrame } from "./v2/render.js";
-export { createTuiState, reduceTui } from "./v2/state.js";
+export { runTuiApp, type TuiAppOptions } from "./components/app.js";
+export { TuiController, type TuiControllerOptions } from "./components/controller.js";
+export { createComposer, composerText, insertText, backspace, moveCursor, cellWidth } from "./components/composer.js";
+export { renderFrame } from "./components/render.js";
+export { createTuiState, reduceTui } from "./components/state.js";
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   if (argv.includes("--help") || argv.includes("-h")) {

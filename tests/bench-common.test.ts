@@ -361,7 +361,7 @@ describe("Terminal-Bench command construction", () => {
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
   });
 
-  it("does not expose legacy validation or retry controls", () => {
+  it("does not expose removed validation or retry controls", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/ordinary-task" }],
       tasks: [{ task_name: "terminal-bench/ordinary-task", agent_timeout_sec: 1800 }],
@@ -454,7 +454,7 @@ describe("Terminal-Bench command construction", () => {
     ).toThrow(removedHarborAdapterErrorMessage);
   });
 
-  it("writes portable command scripts without the legacy integration import path", () => {
+  it("writes portable command scripts without the removed integration import path", () => {
     const env = harborEnvForRun("run-dir", {});
     const args = buildHarborArgs({
       mode: "k",

@@ -11,7 +11,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { runV2Command } from "../packages/agent-cli/src/commands/run-v2.js";
+import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { describe, expect, it } from "vitest";
 
 class Capture extends Writable {
@@ -133,18 +133,18 @@ function gatewayFactory(script: Array<ModelResponse | Error>): () => ModelGatewa
   return () => new ScriptedGateway(script);
 }
 
-describe("run v2 command branch coverage", () => {
+describe("run command branch coverage", () => {
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
-    await expect(runV2Command(["--help"], { stdout: runHelp })).resolves.toBe(0);
+    await expect(runCommand(["--help"], { stdout: runHelp })).resolves.toBe(0);
     expect(runHelp.text()).toContain("agent run");
     const inspectHelp = new Capture();
-    await expect(runV2Command(["-h"], { mode: "analyze", stdout: inspectHelp })).resolves.toBe(0);
+    await expect(runCommand(["-h"], { mode: "analyze", stdout: inspectHelp })).resolves.toBe(0);
     expect(inspectHelp.text()).toContain("agent inspect");
 
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
-    await expect(runV2Command(["--prompt", ""], { stdin, stderr })).resolves.toBe(1);
+    await expect(runCommand(["--prompt", ""], { stdin, stderr })).resolves.toBe(1);
     expect(stderr.text()).toContain("non-empty instruction");
   });
 
@@ -156,7 +156,7 @@ describe("run v2 command branch coverage", () => {
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
     stdout.isTTY = true;
-    const code = await runV2Command([
+    const code = await runCommand([
       "--prompt-file", prompt,
       "--workspace", root,
       "--permission-mode", "auto"
@@ -173,7 +173,7 @@ describe("run v2 command branch coverage", () => {
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
     stdout.isTTY = true;
-    const code = await runV2Command([
+    const code = await runCommand([
       "--prompt", "inline prompt",
       "--workspace", root,
       "--permission-mode", "auto",
@@ -199,7 +199,7 @@ describe("run v2 command branch coverage", () => {
       "--permission-mode", "auto",
       "--output-format", "json"
     ];
-    const code = await runV2Command(argv, {
+    const code = await runCommand(argv, {
       stdin,
       stdout,
       stderr,
@@ -218,7 +218,7 @@ describe("run v2 command branch coverage", () => {
       const stdin = Object.assign(new PassThrough(), { isTTY: false });
       const stdout = new Capture();
       const stderr = new Capture();
-      const code = await runV2Command([
+      const code = await runCommand([
         "change files", "--workspace", root, "--output-format", format
       ], { stdin, stdout, stderr });
       expect(code).toBe(2);
@@ -233,7 +233,7 @@ describe("run v2 command branch coverage", () => {
     const stdout = new Capture();
     stdout.isTTY = true;
     const stderr = new Capture();
-    const running = runV2Command([
+    const running = runCommand([
       "choose a target", "--workspace", root, "--permission-mode", "auto", "--output-format", "json"
     ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([userInputRequest()]) });
     const code = await Promise.race([
@@ -261,7 +261,7 @@ describe("run v2 command branch coverage", () => {
     const script = allowed
       ? [writeRequest(), completion]
       : [writeRequest(), evidenceRequest("denial-evidence"), completion];
-    const code = await runV2Command([
+    const code = await runCommand([
       "write approval result",
       "--workspace", root,
       "--permission-mode", "ask"
@@ -277,7 +277,7 @@ describe("run v2 command branch coverage", () => {
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
     stdout.isTTY = true;
-    const code = await runV2Command([
+    const code = await runCommand([
       "fail safely",
       "--workspace", root,
       "--permission-mode", "auto",
@@ -290,7 +290,7 @@ describe("run v2 command branch coverage", () => {
   it("reports prompt-file read failures through stderr", async () => {
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
-    await expect(runV2Command(["--prompt-file", path.join(os.tmpdir(), "missing-sigma-prompt")], {
+    await expect(runCommand(["--prompt-file", path.join(os.tmpdir(), "missing-sigma-prompt")], {
       stdin,
       stderr
     })).resolves.toBe(1);

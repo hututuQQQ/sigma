@@ -52,7 +52,7 @@ describe("doctor command branch coverage", () => {
     expect(stdout.text()).toContain("agent doctor");
   });
 
-  it("reports an all-compatible Node/provider/API path as JSON", async () => {
+  it("reports a healthy Node/provider/API path as JSON", async () => {
     const root = await workspace();
     const originalNode = Object.getOwnPropertyDescriptor(process.versions, "node");
     Object.defineProperty(process.versions, "node", { value: "24.18.0", configurable: true, enumerable: true });

@@ -21,7 +21,7 @@ function validEvent(): Record<string, unknown> {
   };
 }
 
-describe("AgentEventEnvelope v2 runtime boundary", () => {
+describe("AgentEventEnvelope runtime boundary", () => {
   it("accepts every declared event type and solver-visible authority", () => {
     for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope({ ...validEvent(), type })).toBe(true);
     for (const authority of ["system", "developer", "user", "project", "runtime", "tool"]) {
@@ -49,7 +49,7 @@ describe("AgentEventEnvelope v2 runtime boundary", () => {
       { ...validEvent(), payload: Number.POSITIVE_INFINITY }
     ];
     for (const value of invalid) expect(isAgentEventEnvelope(value)).toBe(false);
-    expect(() => assertAgentEventEnvelope(invalid[2])).toThrow("Invalid AgentEventEnvelope v2");
+    expect(() => assertAgentEventEnvelope(invalid[2])).toThrow("Invalid AgentEventEnvelope");
   });
 
   it("validates JSON recursively", () => {

@@ -34,7 +34,7 @@ describe("product evaluation boundary", () => {
     expect(violations).toEqual([]);
   });
 
-  it("ships no legacy solver packages", async () => {
+  it("ships no removed solver packages", async () => {
     await expect(access(path.resolve("packages/agent-core"))).rejects.toThrow();
     await expect(access(path.resolve("packages/agent-ai"))).rejects.toThrow();
   });

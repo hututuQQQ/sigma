@@ -2,11 +2,11 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { AgentEventEnvelope, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession } from "../packages/agent-protocol/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
-import { backspace, cellWidth, composerText, createComposer, insertText, moveCursor } from "../packages/agent-tui/src/v2/composer.js";
-import { parseApprovalInput } from "../packages/agent-tui/src/v2/approval-input.js";
-import { TuiController } from "../packages/agent-tui/src/v2/controller.js";
-import { renderFrame, sanitizeTerminalText } from "../packages/agent-tui/src/v2/render.js";
-import { createTuiState } from "../packages/agent-tui/src/v2/state.js";
+import { backspace, cellWidth, composerText, createComposer, insertText, moveCursor } from "../packages/agent-tui/src/components/composer.js";
+import { parseApprovalInput } from "../packages/agent-tui/src/components/approval-input.js";
+import { TuiController } from "../packages/agent-tui/src/components/controller.js";
+import { renderFrame, sanitizeTerminalText } from "../packages/agent-tui/src/components/render.js";
+import { createTuiState } from "../packages/agent-tui/src/components/state.js";
 
 function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): AgentEventEnvelope {
   return { schemaVersion: 2, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run", occurredAt: new Date(seq).toISOString(), type, authority: "runtime", payload };
@@ -44,7 +44,7 @@ class FakeRuntime implements RuntimeClient {
   async releaseSession(sessionId: string): Promise<void> { this.released.push(sessionId); }
 }
 
-describe("Sigma v2 TUI", () => {
+describe("Sigma TUI", () => {
   it("edits by grapheme cluster across CJK, combining marks, and emoji", () => {
     let state = createComposer("你é👨‍👩‍👧‍👦");
     expect(state.graphemes).toEqual(["你", "é", "👨‍👩‍👧‍👦"]);

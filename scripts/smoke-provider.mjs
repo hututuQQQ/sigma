@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(rootDir, "packages", "agent-cli", "dist", "index.js");
-const cliRunEntry = path.join(rootDir, "packages", "agent-cli", "dist", "commands", "run-v2.js");
+const cliRunEntry = path.join(rootDir, "packages", "agent-cli", "dist", "commands", "run.js");
 const cliDoctorEntry = path.join(rootDir, "packages", "agent-cli", "dist", "commands", "doctor.js");
 const cliSessionEntry = path.join(rootDir, "packages", "agent-cli", "dist", "commands", "session.js");
 const artifactsDir = path.join(rootDir, ".artifacts", "smoke-provider");
@@ -137,7 +137,7 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const { runDoctorCommand } = await import(`file://${cliDoctorEntry.replace(/\\/g, "/")}`);
-  const { runV2Command } = await import(`file://${cliRunEntry.replace(/\\/g, "/")}`);
+  const { runCommand } = await import(`file://${cliRunEntry.replace(/\\/g, "/")}`);
   const { runSessionCommand } = await import(`file://${cliSessionEntry.replace(/\\/g, "/")}`);
 
   const doctor = await captureProcessWrites(async (stdout, stderr) => await runDoctorCommand([
@@ -177,7 +177,7 @@ async function main(argv = process.argv.slice(2)) {
     "sigma provider smoke",
     "ready"
   ].join("\n");
-  const run = await captureProcessWrites(async (stdout, stderr) => await runV2Command([
+  const run = await captureProcessWrites(async (stdout, stderr) => await runCommand([
     instruction,
     "--workspace",
     workspace,

@@ -6,7 +6,7 @@ import type { TuiAppOptions } from "agent-tui";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runInitCommand } from "./commands/init.js";
 import { runReplayCommand } from "./commands/replay.js";
-import { runV2Command } from "./commands/run-v2.js";
+import { runCommand } from "./commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
 import { loadCliConfig, parseArgs, workspaceMcpTrustMessage } from "./config.js";
@@ -72,7 +72,7 @@ async function dispatchCommand(
   options: AgentCliMainOptions
 ): Promise<number> {
   switch (definition.handler) {
-    case "run": return await runV2Command(argv, { mode: definition.mode });
+    case "run": return await runCommand(argv, { mode: definition.mode });
     case "tui": return await runTuiCommand(argv, options);
     case "session": return definition.sessionAction === "list"
       ? await runSessionsCommand(argv)

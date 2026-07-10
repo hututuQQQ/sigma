@@ -1,6 +1,6 @@
-# Sigma Code 2.0
+# Sigma Code
 
-Sigma Code is an event-sourced coding agent for DeepSeek and GLM. The shipped product has one v2 kernel, one v2 session format, and one terminal UI. The former `agent-core`, `agent-ai`, controller/final-gate stack, and legacy TUI are not part of the runtime or portable package.
+Sigma Code is an event-sourced coding agent for DeepSeek and GLM. The shipped product has one kernel, one session format, and one terminal UI. Removed `agent-core`, `agent-ai`, controller/final-gate, and prior TUI components are not part of the runtime or portable package.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ flowchart LR
   ROOT --> STORE["agent-store"]
   TOOLS --> PLATFORM["agent-platform"]
   TOOLS --> SUP["agent-supervisor"]
-  RC --> EVENTS["AgentEventEnvelope v2"]
+  RC --> EVENTS["AgentEventEnvelope"]
   EVENTS --> PRESENT["agent-presentation"]
   PRESENT --> TUI
 ```
@@ -27,7 +27,7 @@ flowchart LR
 
 Workspace packages communicate through public exports, and the production dependency graph is required to be acyclic:
 
-- `agent-protocol`: v2 events, typed outcomes, context authority, and model/tool/store/runtime ports
+- `agent-protocol`: events, typed outcomes, context authority, and model/tool/store/runtime ports
 - `agent-config`: the single CLI/env/TOML/default/help schema and command registry
 - `agent-kernel`: pure state evolution and effect decisions
 - `agent-model`: DeepSeek/GLM transport, tool-call aggregation, retry boundaries, deadlines, and cancellation
@@ -159,7 +159,7 @@ Filesystem tools reject lexical and symlink/junction escapes from the workspace.
 ## Sessions and recovery
 
 ```text
-<user-state>/sigma/workspaces/<workspace-sha256>/sessions-v2/<sessionId>/
+<user-state>/sigma/workspaces/<workspace-sha256>/sessions/<sessionId>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json

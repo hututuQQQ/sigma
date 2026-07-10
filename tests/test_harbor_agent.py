@@ -267,7 +267,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
             os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
             logs_dir = Path(tmp) / "logs"
-            result_json = {"status": "completed", "finishReason": "completed", "sessionId": "session-v2", "finalMessage": "done"}
+            result_json = {"status": "completed", "finishReason": "completed", "sessionId": "session", "finalMessage": "done"}
 
             async def exec_side_effect(command, **kwargs):
                 if "/usr/local/bin/agent run" in command:

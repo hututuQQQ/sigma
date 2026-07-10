@@ -8,7 +8,7 @@ import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runDoctorCommand } from "../packages/agent-cli/src/commands/doctor.js";
 import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
-import { runV2Command } from "../packages/agent-cli/src/commands/run-v2.js";
+import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
 import { createRuntime } from "../packages/agent-runtime/src/index.js";
@@ -99,12 +99,12 @@ async function completedRuntime(workspace: string) {
   return { runtime, sessionId: session.sessionId };
 }
 
-describe("Sigma v2 CLI", () => {
+describe("Sigma CLI", () => {
   it("rejects unknown options at the schema boundary", () => {
     expect(() => parseArgs(["--validation-mode", "auto"])).toThrow("Unknown option");
   });
 
-  it("creates and loads the single v2 TOML configuration", async () => {
+  it("creates and loads the TOML configuration", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-init-"));
     const stdout = new Capture();
     await expect(runInitCommand(["--workspace", workspace, "--provider", "glm", "--permission-mode", "auto"], { stdout })).resolves.toBe(0);
@@ -119,7 +119,7 @@ describe("Sigma v2 CLI", () => {
     const stdout = new Capture();
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: false });
-    const code = await runV2Command(["change something", "--workspace", workspace, "--output-format", "json"], { stdin, stdout, stderr });
+    const code = await runCommand(["change something", "--workspace", workspace, "--output-format", "json"], { stdin, stdout, stderr });
     expect(code).toBe(2);
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "needs_input" });
   });
@@ -129,7 +129,7 @@ describe("Sigma v2 CLI", () => {
     const stdout = new Capture();
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: false });
-    const code = await runV2Command(["review architecture", "--workspace", workspace, "--output-format", "json", "--permission-mode", "auto"], {
+    const code = await runCommand(["review architecture", "--workspace", workspace, "--output-format", "json", "--permission-mode", "auto"], {
       mode: "analyze",
       stdin,
       stdout,
@@ -140,7 +140,7 @@ describe("Sigma v2 CLI", () => {
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "completed", finalMessage: "analysis" });
   });
 
-  it("lists, shows, and replays v2 sessions through RuntimeClient", async () => {
+  it("lists, shows, and replays sessions through RuntimeClient", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-session-"));
     const { runtime, sessionId } = await completedRuntime(workspace);
     const listed = new Capture();

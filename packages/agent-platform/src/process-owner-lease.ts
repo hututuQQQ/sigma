@@ -9,7 +9,7 @@ import {
   processStatus,
   startOwnerHeartbeat
 } from "./process-heartbeat.js";
-import { legacyOwner, validOwner, type ProcessOwnerRecord } from "./process-owner-record.js";
+import { validOwner, type ProcessOwnerRecord } from "./process-owner-record.js";
 export type { ProcessOwnerRecord } from "./process-owner-record.js";
 
 export interface ProcessOwnerLeaseOptions {
@@ -18,7 +18,6 @@ export interface ProcessOwnerLeaseOptions {
   malformedStaleMs?: number;
   retryIntervalMs?: number;
   activeOwner?: "wait" | "reject";
-  allowLegacyPid?: boolean;
   signal?: AbortSignal;
   unlinkFile?: UnlinkFile;
   heartbeatIntervalMs?: number;
@@ -51,10 +50,7 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-export async function inspectProcessOwner(
-  filePath: string,
-  allowLegacyPid = false
-): Promise<ProcessOwnerObservation> {
+export async function inspectProcessOwner(filePath: string): Promise<ProcessOwnerObservation> {
   const info = await retryFilesystemOperation(async () => await stat(filePath), 250).catch((error: unknown) => {
     if ((error as { code?: unknown }).code === "ENOENT") return null;
     throw error;
@@ -67,7 +63,6 @@ export async function inspectProcessOwner(
   if (source === null) return { kind: "missing" };
   let owner: ProcessOwnerRecord | undefined;
   try { owner = validOwner(JSON.parse(source)); } catch { /* Report malformed content below. */ }
-  owner ??= allowLegacyPid ? legacyOwner(source) : undefined;
   const ageMs = Math.max(0, Date.now() - info.mtimeMs);
   if (owner) return { kind: "valid", owner, ageMs };
   const detail = source.trim().length === 0 ? "empty" : source.trimEnd().endsWith("}") ? "invalid" : "truncated";
@@ -320,7 +315,7 @@ function ownerLease(
     owner: publishedOwner,
     release: () => releasePromise ??= (async () => {
       await stopHeartbeat();
-      const current = await inspectProcessOwner(filePath, options.allowLegacyPid);
+      const current = await inspectProcessOwner(filePath);
       if (current.kind === "valid" && current.owner.instanceId === publishedOwner.instanceId) {
         await removeOwner(filePath, options.unlinkFile);
       }
@@ -346,7 +341,7 @@ async function replaceStaleOwner(
 ): Promise<{ acquired: boolean; observation: ProcessOwnerObservation }> {
   const ticket = await acquireOwnerQueueTicket(filePath, options, deadline, timeoutMs);
   try {
-    const observation = await inspectProcessOwner(filePath, options.allowLegacyPid);
+    const observation = await inspectProcessOwner(filePath);
     if (!ownerIsStale(observation, malformedStaleMs, options.heartbeatStaleMs)) return { acquired: false, observation };
     await removeOwner(filePath, options.unlinkFile);
     return { acquired: await publishOwner(filePath, publishedOwner), observation: { kind: "missing" } };
@@ -368,7 +363,7 @@ export async function acquireProcessOwnerLease(
   let lastObservation: ProcessOwnerObservation;
   while (true) {
     options.signal?.throwIfAborted();
-    lastObservation = await inspectProcessOwner(filePath, options.allowLegacyPid);
+    lastObservation = await inspectProcessOwner(filePath);
     if (lastObservation.kind === "missing") {
       if (await publishOwner(filePath, publishedOwner)) {
         return ownerLease(filePath, publishedOwner, options);

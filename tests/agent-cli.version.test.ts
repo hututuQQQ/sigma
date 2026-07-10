@@ -88,7 +88,7 @@ describe("agent-cli version", () => {
     expect(stdout.text()).toContain("bundle=win32-x64");
   });
 
-  it("keeps the legacy Linux bundle label when metadata only has targetArch", async () => {
+  it("omits the bundle label when metadata has no target platform", async () => {
     const stdout = new MemoryWritable();
 
     await expect(runVersionCommand([], {
@@ -96,7 +96,7 @@ describe("agent-cli version", () => {
       buildVersionReport: async () => versionReport({ targetArch: "x64" })
     })).resolves.toBe(0);
 
-    expect(stdout.text()).toContain("bundle=linux-x64");
+    expect(stdout.text()).not.toContain("bundle=");
   });
 
   it("supports the top-level --version alias", async () => {

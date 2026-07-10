@@ -53,7 +53,7 @@ async function targetSession(runtime: RuntimeClient, requested: string | undefin
   if (requested) return requested;
   if (!latest) throw new Error("A session id is required (or pass --latest)." );
   const first = (await runtime.listSessions(1))[0];
-  if (!first) throw new Error("No v2 sessions exist in this workspace.");
+  if (!first) throw new Error("No sessions exist in this workspace.");
   return first.sessionId;
 }
 
@@ -151,7 +151,7 @@ export async function runSessionsCommand(argv: string[], deps: SessionCommandDep
     const limit = typeof flags.limit === "string" ? Number(flags.limit) : 20;
     const sessions = await runtime.listSessions(limit);
     if (flags.json === true) io.stdout.write(`${JSON.stringify({ sessions })}\n`);
-    else if (sessions.length === 0) io.stdout.write("No v2 sessions.\n");
+    else if (sessions.length === 0) io.stdout.write("No sessions.\n");
     else io.stdout.write(`${sessions.map(presentation).join("\n")}\n`);
     return 0;
   } catch (error) {

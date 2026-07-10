@@ -5,7 +5,7 @@ import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agen
 import { createConfiguredRuntime, type ConfiguredRuntime, type InProcessRuntimeClient } from "agent-runtime";
 import { loadCliConfig, parseArgs, workspaceMcpTrustMessage, type CliConfig } from "../config.js";
 
-export interface RunV2Deps {
+export interface RunCommandDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
   stdout?: NodeJS.WritableStream & { isTTY?: boolean };
   stderr?: NodeJS.WritableStream;
@@ -169,7 +169,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function runV2Command(argv: string[], deps: RunV2Deps = {}): Promise<number> {
+export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Promise<number> {
   const stdin = deps.stdin ?? processStdin;
   const stdout = deps.stdout ?? processStdout;
   const stderr = deps.stderr ?? processStderr;

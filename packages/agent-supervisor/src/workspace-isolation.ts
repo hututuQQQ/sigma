@@ -160,7 +160,6 @@ export class WorkspaceIsolationManager {
       malformedStaleMs: this.options.malformedLockStaleMs,
       retryIntervalMs: this.options.retryIntervalMs,
       activeOwner: "wait",
-      allowLegacyPid: true,
       signal
     });
     return lease.release;

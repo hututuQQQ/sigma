@@ -8,7 +8,7 @@ export function safeId(value: string): string {
 }
 
 export function sessionDirectory(rootDir: string, sessionId: string): string {
-  return path.join(path.resolve(rootDir), "sessions-v2", safeId(sessionId));
+  return path.join(path.resolve(rootDir), "sessions", safeId(sessionId));
 }
 
 export function segmentName(index: number): string {

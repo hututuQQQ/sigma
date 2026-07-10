@@ -512,7 +512,7 @@ export async function verifyAgentCliPackage(options = {}) {
   const entries = targetPlatform === "win32" ? zipEntries(archive, spawn) : tarEntries(archive, spawn);
   requireEntries(entries, requiredEntries);
   if (entries.some((entry) => entry.includes("agent-core") || entry.includes("agent-ai"))) {
-    throw new Error("Legacy agent-core/agent-ai content must not be present in the v2 bundle.");
+    throw new Error("Removed agent-core/agent-ai content must not be present in the bundle.");
   }
 
   await mkdir(artifactsDir, { recursive: true });

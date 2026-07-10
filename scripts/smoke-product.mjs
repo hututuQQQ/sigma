@@ -36,7 +36,7 @@ async function main() {
   const entries = ["agent-cli", "agent-runtime", "agent-store", "agent-tools", "agent-tui"]
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
-  if (missing.length) throw new Error(`Built v2 product is missing:\n${missing.join("\n")}`);
+  if (missing.length) throw new Error(`Built product is missing:\n${missing.join("\n")}`);
   const [{ runAgentCommand }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all([
     import(pathToFileURL(entries[0]).href),
     import(pathToFileURL(entries[1]).href),
@@ -74,7 +74,7 @@ async function main() {
     if (result.code !== 0) throw new Error(`${name} failed: ${result.stderr}`);
   }
   const sessionReport = JSON.parse(sessions.stdout);
-  if (sessionReport.sessions[0]?.sessionId !== session.sessionId) throw new Error("sessions did not return the latest v2 session");
+  if (sessionReport.sessions[0]?.sessionId !== session.sessionId) throw new Error("sessions did not return the latest session");
   const report = {
     ok: true,
     sessionId: session.sessionId,
