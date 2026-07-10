@@ -169,7 +169,7 @@ describe("AgentSupervisor writer isolation", () => {
     await supervisor.join(second.id);
 
     expect(maximumWriters).toBe(1);
-    expect(writerContexts.every((context) => path.relative(workspace, context.workspacePath) === "")).toBe(true);
+    expect(writerContexts.every((context) => context.workspacePath === context.sourceWorkspacePath)).toBe(true);
     expect(writerContexts.every((context) => context.isolation.kind === "exclusive_workspace")).toBe(true);
     expect(analyzeContexts.every((context) => context.isolation.kind === "shared_read")).toBe(true);
   });
