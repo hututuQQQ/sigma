@@ -19,6 +19,7 @@ from typing import Protocol
 
 
 READY_TEXT = "New session. Type a request and press Enter."
+READY_TOKENS = ("New", "session.", "Type", "a", "request", "and", "press", "Enter.")
 REQUIRED_MARKERS = (
     "\x1b[?25l",
     "\x1b[?1049h",
@@ -161,6 +162,18 @@ def escaped_tail(transcript: str, limit: int = 4_000) -> str:
     return transcript[-limit:].encode("unicode_escape", errors="backslashreplace").decode("ascii")
 
 
+def contains_ready_frame(transcript: str) -> bool:
+    """Match text painted in separate cursor-positioned OpenTUI spans."""
+    cursor = max(0, transcript.rfind(READY_TOKENS[0]))
+    start = cursor
+    for token in READY_TOKENS:
+        cursor = transcript.find(token, cursor)
+        if cursor < 0 or cursor - start > 20_000:
+            return False
+        cursor += len(token)
+    return True
+
+
 def exercise(terminal: Terminal, timeout: float) -> tuple[int, str]:
     chunks: queue.Queue[str | None] = queue.Queue()
     thread = threading.Thread(target=reader, args=(terminal, chunks), daemon=True)
@@ -181,7 +194,7 @@ def exercise(terminal: Terminal, timeout: float) -> tuple[int, str]:
                         raise RuntimeError("TUI emitted more than 2 MB during the /quit smoke.")
             except queue.Empty:
                 pass
-            if not sent_quit and READY_TEXT in transcript:
+            if not sent_quit and contains_ready_frame(transcript):
                 terminal.write("/quit\r")
                 sent_quit = True
             if not terminal.alive() and reader_done:
@@ -236,13 +249,14 @@ def main() -> None:
         state_home = temporary_path / "state"
         workspace.mkdir()
         home.mkdir()
-        command = [str(node), str(cli), "tui", "--workspace", str(workspace), "--permission-mode", "deny"]
+        command = [str(node), "--experimental-ffi", "--disable-warning=ExperimentalWarning", str(cli), "tui", "--workspace", str(workspace), "--permission-mode", "deny"]
         terminal = terminal_for(command, root, isolated_environment(home, state_home))
         code, transcript = exercise(terminal, args.timeout)
         missing = [marker for marker in REQUIRED_MARKERS if marker not in transcript]
-        if code != 0 or READY_TEXT not in transcript or missing or not (state_home / "workspaces").is_dir():
+        ready = contains_ready_frame(transcript)
+        if code != 0 or not ready or missing or not (state_home / "workspaces").is_dir():
             raise RuntimeError(
-                f"TUI terminal smoke failed: exit={code}, ready={READY_TEXT in transcript}, "
+                f"TUI terminal smoke failed: exit={code}, ready={ready}, "
                 f"missing={missing}, store={(state_home / 'workspaces').is_dir()}, output={escaped_tail(transcript)}"
             )
         print(f"PASS real terminal /quit smoke backend={terminal.backend} bytes={len(transcript.encode('utf-8'))}")

@@ -1,74 +1,56 @@
-import type { AgentEventEnvelope, RunMode, RuntimeClient } from "agent-protocol";
-import { projectEvent } from "agent-presentation";
-import { StringDecoder } from "node:string_decoder";
-import { parseApprovalInput } from "./approval-input.js";
-import { backspace, composerText, insertText, moveCursor } from "./composer.js";
-import { renderFrame } from "./render.js";
-import { FrameScheduler } from "./frame-scheduler.js";
-import { createTuiState, pendingApproval, reduceTui, type TuiState } from "./state.js";
-interface TtyInput extends NodeJS.ReadableStream {
-  isTTY?: boolean;
-  setRawMode?(mode: boolean): void;
+import { createPresentationState, projectEvent } from "agent-presentation";
+import type { AgentEventEnvelope, RunMode } from "agent-protocol";
+import { parseTuiCommand } from "./commands.js";
+import { TuiView } from "./view.js";
+import type { SubmissionKind, TuiAppOptions, TuiSnapshot, TuiViewActions } from "./types.js";
+
+interface ControllerView {
+  update(snapshot: TuiSnapshot): void;
+  showHelp(): void;
+  toggleActivity(): void;
+  destroy(): void;
 }
 
-interface TtyOutput extends NodeJS.WritableStream {
-  columns?: number;
-  rows?: number;
+type ViewFactory = (options: TuiAppOptions, actions: TuiViewActions) => Promise<ControllerView>;
+
+function ffiReady(): boolean {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  const supported = major > 26 || major === 26 && minor >= 4;
+  return supported && (process.execArgv.includes("--experimental-ffi")
+    || (process.env.NODE_OPTIONS ?? "").split(/\s+/u).includes("--experimental-ffi"));
 }
 
-export interface TuiControllerOptions {
-  runtime: RuntimeClient;
-  workspace: string;
-  mode?: RunMode;
-  sessionId?: string;
-  stdin?: TtyInput;
-  stdout?: TtyOutput;
-  maxFps?: number;
-}
-
-export class TuiController {
-  private state: TuiState;
-  private readonly input: TtyInput;
-  private readonly output: TtyOutput;
+export class TuiSessionController {
+  private mode: RunMode;
+  private presentation = createPresentationState();
+  private sessionId?: string;
+  private view?: ControllerView;
   private subscription?: AsyncIterator<AgentEventEnvelope>;
   private subscriptionAbort?: AbortController;
   private subscriptionEpoch = 0;
-  private readonly renderer: FrameScheduler;
+  private active = false;
   private exitResolve?: () => void;
   private lastInterruptAt = 0;
-  private active = false;
-  private readonly decoder = new StringDecoder("utf8");
-  private inputBuffer = "";
-  private inputTail = Promise.resolve();
+  private noticeTimer?: ReturnType<typeof setTimeout>;
+  private noticeState?: { message: string; error: boolean };
   private sessionReady: Promise<void> = Promise.resolve();
-  constructor(private readonly options: TuiControllerOptions) {
-    this.state = createTuiState(options.mode ?? "change");
-    this.input = options.stdin ?? process.stdin;
-    this.output = options.stdout ?? process.stdout;
-    this.renderer = new FrameScheduler(
-      this.output,
-      () => renderFrame(this.state, { width: this.output.columns ?? 80, height: this.output.rows ?? 24 }),
-      options.maxFps
-    );
+
+  constructor(private readonly options: TuiAppOptions, private readonly viewFactory: ViewFactory = TuiView.create) {
+    this.mode = options.mode ?? "change";
   }
 
   async run(): Promise<void> {
-    if (!this.input.isTTY || this.output.columns === undefined) throw new Error("The TUI requires an interactive terminal.");
+    if (!ffiReady()) throw new Error("Sigma TUI requires Node 26.4+ started with --experimental-ffi.");
+    const input = this.options.stdin ?? process.stdin;
+    const output = this.options.stdout ?? process.stdout;
+    if (!input.isTTY || output.columns === undefined) throw new Error("The TUI requires an interactive terminal.");
     this.active = true;
     const exited = new Promise<void>((resolve) => { this.exitResolve = resolve; });
     try {
-      this.input.setRawMode?.(true);
-      this.input.resume();
-      this.input.on("data", this.onData);
-      this.output.on("resize", this.onResize);
-      this.output.write("\u001b[?25l\u001b[?1049h\u001b[?2004h");
-      const requestedSessionId = this.options.sessionId;
-      this.sessionReady = requestedSessionId ? (async () => {
-        await this.options.runtime.command({ type: "resume", sessionId: requestedSessionId });
-        await this.attach(requestedSessionId);
-      })() : this.newSession();
+      this.view = await this.viewFactory(this.options, this.actions());
+      this.refresh();
+      this.sessionReady = this.options.sessionId ? this.resume(this.options.sessionId) : this.newSession();
       await this.sessionReady;
-      if (!this.state.stopped) this.scheduleRender();
       await exited;
     } finally {
       await this.cleanup();
@@ -77,139 +59,104 @@ export class TuiController {
 
   stop(): void {
     if (!this.active) return;
-    this.state = reduceTui(this.state, { type: "stop" });
     this.exitResolve?.();
   }
-  private readonly onResize = (): void => this.scheduleRender();
-  private readonly onData = (chunk: Buffer | string): void => {
-    this.inputBuffer += Buffer.isBuffer(chunk) ? this.decoder.write(chunk) : chunk;
-    this.inputTail = this.inputTail.then(() => this.drainInput()).catch((error) => {
-      this.notice(error instanceof Error ? error.message : String(error));
-    });
-  };
-  private async drainInput(): Promise<void> {
-    const sequences = ["\u001b[200~", "\u001b[201~", "\u001b[5~", "\u001b[6~", "\u001b[A", "\u001b[B", "\u001b[C", "\u001b[D"];
-    while (this.inputBuffer) {
-      if (this.inputBuffer.startsWith("\u001b[200~")) {
-        const end = this.inputBuffer.indexOf("\u001b[201~", 6);
-        if (end < 0) return;
-        const pasted = this.inputBuffer.slice(6, end).replace(/\r?\n/g, " ");
-        this.inputBuffer = this.inputBuffer.slice(end + 6);
-        this.state = reduceTui(this.state, { type: "composer", composer: insertText(this.state.composer, pasted) });
-        this.scheduleRender();
-        continue;
-      }
-      const sequence = sequences.find((item) => this.inputBuffer.startsWith(item));
-      if (sequence) {
-        this.inputBuffer = this.inputBuffer.slice(sequence.length);
-        if (sequence !== "\u001b[201~") await this.handleInput(sequence);
-        continue;
-      }
-      if (this.inputBuffer.startsWith("\u001b") && sequences.some((item) => item.startsWith(this.inputBuffer))) return;
-      const character = [...this.inputBuffer][0];
-      this.inputBuffer = this.inputBuffer.slice(character.length);
-      await this.handleInput(character);
-    }
+
+  private actions(): TuiViewActions {
+    return {
+      submit: async (text, kind) => await this.protect(async () => await this.submit(text, kind)),
+      approve: async (requestId, decision) => await this.protect(async () => {
+        if (!this.sessionId) return;
+        await this.options.runtime.command({ type: "approve", sessionId: this.sessionId, requestId, decision });
+      }),
+      interrupt: async () => await this.protect(async () => await this.interrupt()),
+      newSession: async () => await this.protect(async () => await this.newSession()),
+      setMode: (mode) => { this.mode = mode; this.notice(`Mode changed to ${mode}.`); this.refresh(); },
+      stop: () => this.stop(),
+      userAction: () => { if (this.noticeState?.error) this.notice(); }
+    };
   }
-  private async handleInput(value: string): Promise<void> {
-    if (value === "\u0003") {
-      const now = Date.now();
-      if (now - this.lastInterruptAt <= 1_500) {
-        this.stop();
-        return;
-      }
-      this.lastInterruptAt = now;
-      if (this.state.sessionId) await this.options.runtime.command({ type: "cancel", sessionId: this.state.sessionId, reason: "Cancelled from TUI." });
-      this.notice("Cancelled. Press Ctrl+C again within 1.5s to exit.");
+
+  private async protect(operation: () => Promise<void>): Promise<void> {
+    try { await operation(); }
+    catch (error) { this.notice(error instanceof Error ? error.message : String(error), true); }
+  }
+
+  private async submit(text: string, kind: SubmissionKind): Promise<void> {
+    this.notice();
+    await this.sessionReady;
+    if (!this.sessionId) return;
+    if (await this.command(text)) return;
+    if (kind === "follow_up") {
+      await this.options.runtime.command({ type: "follow_up", sessionId: this.sessionId, text });
+      this.notice("Follow-up queued.");
       return;
     }
-    if (value === "\r" || value === "\n") {
-      await this.submitComposer();
-      return;
+    if (this.presentation.status === "running" || this.presentation.status === "needs_input") {
+      await this.options.runtime.command({ type: "steer", sessionId: this.sessionId, text });
+    } else {
+      await this.options.runtime.command({ type: "submit", sessionId: this.sessionId, text, mode: this.mode });
     }
-    if (value === "\u007f" || value === "\b") {
-      this.state = reduceTui(this.state, { type: "composer", composer: backspace(this.state.composer) });
-    } else if (value === "\u001b[D") {
-      this.state = reduceTui(this.state, { type: "composer", composer: moveCursor(this.state.composer, -1) });
-    } else if (value === "\u001b[C") {
-      this.state = reduceTui(this.state, { type: "composer", composer: moveCursor(this.state.composer, 1) });
-    } else if (value === "\u001b[A" || value === "\u001b[5~") {
-      this.state = reduceTui(this.state, { type: "scroll", delta: 5, maximum: this.state.view.transcript.length * 10 });
-    } else if (value === "\u001b[B" || value === "\u001b[6~") {
-      this.state = reduceTui(this.state, { type: "scroll", delta: -5, maximum: this.state.view.transcript.length * 10 });
-    } else if (!value.startsWith("\u001b")) {
-      this.state = reduceTui(this.state, { type: "composer", composer: insertText(this.state.composer, value) });
-    }
-    this.scheduleRender();
   }
-  private async submitComposer(): Promise<void> {
-    const text = composerText(this.state.composer).trim();
-    if (!text) return;
-    if (!this.state.sessionId) await this.sessionReady;
-    const sessionId = this.state.sessionId;
-    if (!sessionId) return;
-    this.state = reduceTui(this.state, { type: "submitted" });
-    const approval = pendingApproval(this.state);
-    const approvalDecision = approval ? parseApprovalInput(text, approval.requestId) : null;
-    if (approvalDecision) {
-      const { requestId, decision } = approvalDecision;
-      await this.options.runtime.command({ type: "approve", sessionId, requestId, decision });
-      this.scheduleRender();
-      return;
+
+  private async command(text: string): Promise<boolean> {
+    if (!text.startsWith("/")) return false;
+    const parsed = parseTuiCommand(text);
+    if (!parsed) throw new Error(`Unknown command: ${text.split(/\s/u, 1)[0]}. Type /help for available commands.`);
+    const { action } = parsed.command;
+    const { argument } = parsed;
+    if (action === "quit") { this.stop(); return true; }
+    if (action === "new") { await this.newSession(); return true; }
+    if (action === "help") { this.view?.showHelp(); return true; }
+    if (action === "activity") { this.view?.toggleActivity(); return true; }
+    if (action === "mode") {
+      if (argument !== "analyze" && argument !== "change") throw new Error("Mode must be analyze or change.");
+      this.mode = argument; this.notice(`Mode changed to ${argument}.`); this.refresh(); return true;
     }
-    if (await this.handleCommand(text)) return;
-    const type = this.state.view.status === "running" ? "steer" : "submit";
-    await this.options.runtime.command(type === "steer"
-      ? { type, sessionId, text }
-      : { type, sessionId, text, mode: this.state.mode });
-    this.scheduleRender();
-  }
-  private async handleCommand(text: string): Promise<boolean> {
-    if (text === "/quit" || text === "/exit") {
-      this.stop();
-      return true;
-    }
-    if (text === "/new") {
-      if (this.state.sessionId && (this.state.view.status === "running" || this.state.view.status === "needs_input")) {
-        await this.options.runtime.command({ type: "cancel", sessionId: this.state.sessionId, reason: "Replaced by /new from TUI." });
-      }
-      await this.newSession();
-      return true;
-    }
-    if (text.startsWith("/mode ")) {
-      const mode = text.slice(6).trim();
-      if (mode !== "analyze" && mode !== "change") throw new Error("Mode must be analyze or change.");
-      this.state = reduceTui(this.state, { type: "mode", mode });
-      this.notice(`Mode changed to ${mode}.`);
-      return true;
-    }
-    if (text.startsWith("/followup ")) {
-      await this.options.runtime.command({ type: "follow_up", sessionId: this.state.sessionId!, text: text.slice(10).trim() });
-      return true;
-    }
-    if (text === "/activity") {
-      this.state = reduceTui(this.state, { type: "toggle_activity" });
-      return true;
+    if (action === "followup") {
+      if (!argument) throw new Error("/followup requires a message.");
+      await this.options.runtime.command({ type: "follow_up", sessionId: this.sessionId!, text: argument });
+      this.notice("Follow-up queued."); return true;
     }
     return false;
   }
+
+  private async interrupt(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastInterruptAt <= 1_500) { this.stop(); return; }
+    this.lastInterruptAt = now;
+    if (this.sessionId && ["running", "needs_input"].includes(this.presentation.status)) {
+      await this.options.runtime.command({ type: "cancel", sessionId: this.sessionId, reason: "Cancelled from TUI." });
+    }
+    this.notice("Cancelled. Press Ctrl+C again within 1.5s to exit.");
+  }
+
   private async newSession(): Promise<void> {
-    const session = await this.options.runtime.createSession({ workspacePath: this.options.workspace, mode: this.state.mode });
+    if (this.sessionId && ["running", "needs_input"].includes(this.presentation.status)) {
+      await this.options.runtime.command({ type: "cancel", sessionId: this.sessionId, reason: "Replaced by /new from TUI." });
+    }
+    const session = await this.options.runtime.createSession({ workspacePath: this.options.workspace, mode: this.mode });
     await this.attach(session.sessionId);
     this.notice("New session. Type a request and press Enter.");
   }
+
+  private async resume(sessionId: string): Promise<void> {
+    await this.options.runtime.command({ type: "resume", sessionId });
+    await this.attach(sessionId);
+  }
+
   private async attach(sessionId: string): Promise<void> {
-    const previousSessionId = this.state.sessionId;
+    const previous = this.sessionId;
     this.subscriptionEpoch += 1;
     this.subscriptionAbort?.abort();
     await this.subscription?.return?.();
-    if (previousSessionId && previousSessionId !== sessionId) {
-      await this.options.runtime.releaseSession?.(previousSessionId);
-    }
-    this.state = reduceTui(this.state, { type: "session", sessionId });
-    const epoch = this.subscriptionEpoch;
+    if (previous && previous !== sessionId) await this.options.runtime.releaseSession?.(previous);
+    this.sessionId = sessionId;
+    this.presentation = createPresentationState();
     this.subscriptionAbort = new AbortController();
+    const epoch = this.subscriptionEpoch;
     this.subscription = this.options.runtime.subscribe(sessionId, this.subscriptionAbort.signal)[Symbol.asyncIterator]();
+    this.refresh();
     void this.consume(this.subscription, epoch);
   }
 
@@ -218,33 +165,47 @@ export class TuiController {
       while (this.active && epoch === this.subscriptionEpoch) {
         const next = await iterator.next();
         if (next.done || epoch !== this.subscriptionEpoch) return;
-        this.state = reduceTui(this.state, { type: "view", view: projectEvent(this.state.view, next.value) });
-        this.scheduleRender();
+        this.presentation = projectEvent(this.presentation, next.value);
+        this.refresh();
       }
     } catch (error) {
-      if (this.active && epoch === this.subscriptionEpoch) this.notice(error instanceof Error ? error.message : String(error));
+      if (this.active && epoch === this.subscriptionEpoch) this.notice(error instanceof Error ? error.message : String(error), true);
     }
   }
 
-  private notice(message?: string): void {
-    this.state = reduceTui(this.state, { type: "notice", message });
-    this.scheduleRender();
+  private notice(message?: string, error = false): void {
+    if (this.noticeTimer) clearTimeout(this.noticeTimer);
+    this.noticeTimer = undefined;
+    this.noticeState = message ? { message, error } : undefined;
+    if (message && !error) this.noticeTimer = setTimeout(() => { this.noticeState = undefined; this.refresh(); }, 3_000);
+    this.refresh();
   }
 
-  private scheduleRender(): void {
-    if (this.active) this.renderer.schedule();
+  private refresh(): void {
+    this.view?.update({
+      workspace: this.options.workspace, sessionId: this.sessionId, mode: this.mode,
+      presentation: this.presentation, ...(this.noticeState ? { notice: this.noticeState } : {})
+    });
   }
 
   private async cleanup(): Promise<void> {
-    const sessionId = this.state.sessionId;
-    this.active = false; this.subscriptionEpoch += 1;
-    this.subscriptionAbort?.abort();
-    this.renderer.stop(); await this.subscription?.return?.();
-    if (sessionId && ["running", "needs_input"].includes(this.state.view.status)) await this.options.runtime.command({ type: "cancel", sessionId, reason: "TUI closed." });
-    if (sessionId) await this.options.runtime.releaseSession?.(sessionId);
-    this.input.off("data", this.onData); this.output.off("resize", this.onResize);
-    this.input.setRawMode?.(false);
-    this.input.pause();
-    this.output.write("\u001b[?2004l\u001b[?1049l\u001b[?25h\u001b[0m");
+    const sessionId = this.sessionId;
+    this.active = false; this.subscriptionEpoch += 1; this.subscriptionAbort?.abort();
+    if (this.noticeTimer) clearTimeout(this.noticeTimer);
+    const settle = async (operation: (() => Promise<unknown>) | undefined): Promise<void> => {
+      if (!operation) return;
+      try { await operation(); } catch { /* terminal restoration must continue */ }
+    };
+    try {
+      await settle(this.subscription?.return ? async () => await this.subscription!.return!() : undefined);
+      if (sessionId && ["running", "needs_input"].includes(this.presentation.status)) {
+        await settle(async () => await this.options.runtime.command({ type: "cancel", sessionId, reason: "TUI closed." }));
+      }
+      if (sessionId && this.options.runtime.releaseSession) {
+        await settle(async () => await this.options.runtime.releaseSession!(sessionId));
+      }
+    } finally {
+      this.view?.destroy();
+    }
   }
 }

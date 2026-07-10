@@ -27,7 +27,7 @@ describe("package scripts", () => {
       "verify:product": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness",
       "verify:release:windows": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm smoke:provider -- --provider deepseek && node scripts/product-readiness-report.mjs --require-release-ready --require-provider-smoke",
       "smoke:product": "pnpm build && node scripts/smoke-product.mjs",
-      "smoke:tui-product": "pnpm build && node scripts/smoke-tui-product.mjs",
+      "smoke:tui-product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-tui-product.mjs",
       "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
       "product:readiness": "node scripts/product-readiness-report.mjs",
       "package:agent-cli:windows": "pnpm build && node scripts/package-agent-cli.mjs --target-platform win32 --target-arch x64",

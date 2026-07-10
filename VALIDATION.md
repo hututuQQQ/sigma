@@ -1,6 +1,6 @@
 # Sigma Code 2.0 validation
 
-Run release checks from the repository root with Node `24.18.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. A lower local Node may run some tests but is not release evidence.
+Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 
 ```powershell
 node --version
@@ -52,7 +52,7 @@ pnpm product:readiness
 What these commands prove:
 
 - `smoke:product`: a fake gateway completes a normal multi-turn tool/session workflow through the built CLI.
-- `smoke:tui-product`: the built TUI exercises alternate-screen, cursor, raw-mode, completion, cleanup, and responsive-resize behavior with controlled terminal streams.
+- `smoke:tui-product`: the built OpenTUI application starts with FFI and exercises alternate-screen, cursor, raw-mode, completion, cleanup, and responsive resize with controlled terminal streams.
 - `verify:containment`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check. This command does not claim process isolation.
 - `verify:package:agent-cli`: the default Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime; verification runs the bundled CLI entry with host Node and attempts the target wrapper when the native/WSL environment supports it.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
@@ -87,10 +87,11 @@ The automated suites cover:
 - child scheduling, durable FIFO follow-ups, parent cancellation/join behavior, crash-visible unresolved children, clean-repository worktrees, dirty/non-Git single-writer leases, delegated approval capabilities, scoped integration, and integration conflicts;
 - MCP initialize/tools/call flows, repository trust/digest invalidation, cwd containment, environment-secret isolation, malicious-config preflight, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
 - CLI strict config precedence, init/replay/session commands, active-owner routing, output formats, exit codes, interactive approval, and provider failure;
-- TUI grapheme editing, CJK/emoji/flags/keycaps, bracketed paste, control-sequence sanitization, multiple approvals, queue routing, resize/cleanup, 10,000-event projection, render p95 under 16 ms in the unit-test environment, and heap growth under 150 MiB in that test;
+- OpenTUI character/style frames at 20×5, 60×12, 80×24, and 120×40; streaming Markdown/code, CJK/emoji/combining input, bracketed paste, history, command completion, scroll/mouse routing, overlays, approvals, steering/follow-ups, double Ctrl+C, and terminal-control sanitization;
+- 10,000-event projection with keyed incremental updates under 100 ms, long streaming-message update/render stages under 150 ms, and heap growth under 150 MiB in the unit-test environment;
 - packaged TUI startup and cleanup through a real Linux PTY and Windows ConPTY in CI;
 - a synthetic 100,000-path Git index through the production repository-context provider, bounded to 30 seconds and 300 MiB incremental heap;
-- manifest-derived portable packaging and absence of the removed legacy packages;
+- recursive production-dependency packaging, nested-version preservation, target OpenTUI native selection, pinned Node/FFI wrapper startup, and absence of the removed legacy packages;
 - the production evaluation/fairness boundary.
 
 ## Boundaries not established by the automated gate

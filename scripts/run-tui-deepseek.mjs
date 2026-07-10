@@ -47,6 +47,8 @@ async function main(argv = process.argv.slice(2)) {
   const apiKey = await loadDeepSeekApiKey();
   const passthrough = argv[0] === "--" ? argv.slice(1) : argv;
   const args = [
+    "--experimental-ffi",
+    "--disable-warning=ExperimentalWarning",
     cliEntry,
     "tui",
     "--workspace",

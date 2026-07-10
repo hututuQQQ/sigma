@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "start:tui": "node --experimental-ffi --disable-warning=ExperimentalWarning dist/index.js tui",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
@@ -26,5 +27,5 @@
     "agent-tui": "workspace:*",
     "smol-toml": "^1.7.0"
   },
-  "engines": { "node": ">=24.18.0" }
+  "engines": { "node": ">=26.4.0" }
 }

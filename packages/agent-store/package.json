@@ -19,6 +19,6 @@
     "agent-protocol": "workspace:*"
   },
   "engines": {
-    "node": ">=24.18.0"
+    "node": ">=26.4.0"
   }
 }

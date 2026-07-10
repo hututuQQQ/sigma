@@ -36,6 +36,12 @@ async function writeBuiltPackage(rootDir: string, packageName: string, dependenc
   );
 }
 
+async function writeExternalPackage(packageDir: string, manifest: Record<string, unknown>) {
+  await mkdir(packageDir, { recursive: true });
+  await writeFile(path.join(packageDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await writeFile(path.join(packageDir, "index.js"), "export {};\n", "utf8");
+}
+
 async function writeFakeNodeRuntimeTarball(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime");
   const runtimeDirName = `node-${pinnedNodeVersion}-linux-${arch}`;
@@ -163,6 +169,54 @@ describe("package-agent-cli", () => {
     expect(readme).toContain("Product Boundary");
     expect(readme).toContain("`version`, `init`, `doctor`");
     expect(readme).not.toContain("Harbor task containers");
+  });
+
+  it("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
+    await writeBuiltPackage(rootDir, "agent-tui", { "@opentui/core": "0.4.3", "root-dep": "1.0.0" });
+    await writeBuiltPackage(rootDir, "agent-cli", { "agent-tui": "workspace:*" });
+    const modules = path.join(rootDir, "packages", "agent-tui", "node_modules");
+    const core = path.join(modules, "@opentui", "core");
+    await writeExternalPackage(core, {
+      name: "@opentui/core", version: "0.4.3", dependencies: { shared: "1.0.0" },
+      optionalDependencies: {
+        "@opentui/core-linux-x64": "0.4.3", "@opentui/core-linux-x64-musl": "0.4.3",
+        "@opentui/core-win32-x64": "0.4.3"
+      }
+    });
+    await mkdir(path.join(core, "node_modules"), { recursive: true });
+    await writeFile(path.join(core, "node_modules", "source-only.txt"), "must not leak", "utf8");
+    await writeExternalPackage(path.join(modules, "shared"), { name: "shared", version: "1.0.0" });
+    await writeExternalPackage(path.join(modules, "root-dep"), {
+      name: "root-dep", version: "1.0.0", dependencies: { shared: "2.0.0" }
+    });
+    await writeExternalPackage(path.join(modules, "root-dep", "node_modules", "shared"), {
+      name: "shared", version: "2.0.0"
+    });
+    await writeExternalPackage(path.join(modules, "@opentui", "core-linux-x64"), {
+      name: "@opentui/core-linux-x64", version: "0.4.3", os: ["linux"], cpu: ["x64"], libc: ["glibc"]
+    });
+    await writeExternalPackage(path.join(modules, "@opentui", "core-linux-x64-musl"), {
+      name: "@opentui/core-linux-x64-musl", version: "0.4.3", os: ["linux"], cpu: ["x64"], libc: ["musl"]
+    });
+    await writeExternalPackage(path.join(modules, "@opentui", "core-win32-x64"), {
+      name: "@opentui/core-win32-x64", version: "0.4.3", os: ["win32"], cpu: ["x64"]
+    });
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const result = await packageAgentCli({
+      rootDir, env: { NODE_RUNTIME_TARBALL: runtimeTarball, AGENT_TARGET_ARCH: "x64" }
+    });
+
+    const targetModules = path.join(result.bundleDir, "node_modules");
+    await expect(stat(path.join(targetModules, "@opentui", "core-linux-x64", "package.json"))).resolves.toBeTruthy();
+    await expect(stat(path.join(targetModules, "@opentui", "core-win32-x64", "package.json"))).rejects.toThrow();
+    await expect(stat(path.join(targetModules, "@opentui", "core-linux-x64-musl", "package.json"))).rejects.toThrow();
+    await expect(stat(path.join(targetModules, "@opentui", "core", "node_modules", "source-only.txt"))).rejects.toThrow();
+    const nested = JSON.parse(await readFile(path.join(targetModules, "root-dep", "node_modules", "shared", "package.json"), "utf8"));
+    expect(nested.version).toBe("2.0.0");
+    const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent"), "utf8");
+    expect(wrapper).toContain('if [ "${1:-}" = "tui" ]; then');
+    expect(wrapper).toContain("--experimental-ffi");
   });
 
   it("uses a cached Node runtime tarball when env override is absent", async () => {

@@ -12,12 +12,14 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "start": "node --experimental-ffi --disable-warning=ExperimentalWarning dist/index.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
+    "@opentui/core": "0.4.3",
     "agent-presentation": "workspace:*",
-    "agent-protocol": "workspace:*"
+    "agent-protocol": "workspace:*",
+    "web-tree-sitter": "0.25.10"
   },
-  "engines": { "node": ">=24.18.0" }
+  "engines": { "node": ">=26.4.0" }
 }

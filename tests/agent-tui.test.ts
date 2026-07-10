@@ -1,24 +1,20 @@
 import { PassThrough } from "node:stream";
+import { createTestRenderer } from "@opentui/core/testing";
 import { describe, expect, it } from "vitest";
-import type { AgentEventEnvelope, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession } from "../packages/agent-protocol/src/index.js";
+import type {
+  AgentEventEnvelope, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession
+} from "../packages/agent-protocol/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
-import { backspace, cellWidth, composerText, createComposer, insertText, moveCursor } from "../packages/agent-tui/src/components/composer.js";
-import { parseApprovalInput } from "../packages/agent-tui/src/components/approval-input.js";
-import { TuiController } from "../packages/agent-tui/src/components/controller.js";
-import { renderFrame, sanitizeTerminalText } from "../packages/agent-tui/src/components/render.js";
-import { createTuiState } from "../packages/agent-tui/src/components/state.js";
+import { TuiSessionController } from "../packages/agent-tui/src/components/controller.js";
+import { sanitizeTerminalText } from "../packages/agent-tui/src/components/terminal-text.js";
+import type { TuiSnapshot, TuiViewActions } from "../packages/agent-tui/src/components/types.js";
+import { TuiView } from "../packages/agent-tui/src/components/view.js";
 
 function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): AgentEventEnvelope {
-  return { schemaVersion: 2, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run", occurredAt: new Date(seq).toISOString(), type, authority: "runtime", payload };
-}
-
-function runEvent(
-  seq: number,
-  runId: string,
-  type: AgentEventEnvelope["type"],
-  payload: AgentEventEnvelope["payload"]
-): AgentEventEnvelope {
-  return { ...event(seq, type, payload), runId };
+  return {
+    schemaVersion: 2, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run",
+    occurredAt: new Date(seq).toISOString(), type, authority: "runtime", payload
+  };
 }
 
 class FakeRuntime implements RuntimeClient {
@@ -26,13 +22,9 @@ class FakeRuntime implements RuntimeClient {
   readonly released: string[] = [];
   private sessions = 0;
 
-  constructor(
-    private readonly events: AgentEventEnvelope[] = [event(1, "session.created", {})],
-    private readonly createGate: Promise<void> = Promise.resolve()
-  ) {}
+  constructor(readonly events: AgentEventEnvelope[] = [event(1, "session.created", {})]) {}
 
   async createSession(_input: StartSession): Promise<SessionRef> {
-    await this.createGate;
     this.sessions += 1;
     return { sessionId: this.sessions === 1 ? "session" : `session-${this.sessions}`, runId: "run" };
   }
@@ -44,343 +36,268 @@ class FakeRuntime implements RuntimeClient {
   async releaseSession(sessionId: string): Promise<void> { this.released.push(sessionId); }
 }
 
-describe("Sigma TUI", () => {
-  it("edits by grapheme cluster across CJK, combining marks, and emoji", () => {
-    let state = createComposer("你é👨‍👩‍👧‍👦");
-    expect(state.graphemes).toEqual(["你", "é", "👨‍👩‍👧‍👦"]);
-    state = moveCursor(state, -1);
-    state = backspace(state);
-    state = insertText(state, "好");
-    expect(composerText(state)).toBe("你好👨‍👩‍👧‍👦");
-    expect(cellWidth(composerText(state))).toBe(6);
-    expect(cellWidth("🇨🇳1️⃣Ａ")).toBe(6);
-  });
+function snapshot(presentation = createPresentationState()): TuiSnapshot {
+  return { workspace: "D:\\software\\sigma", sessionId: "session", mode: "change", presentation };
+}
 
-  it("keeps all approvals visible until each request is resolved", () => {
+async function viewHarness(width = 80, height = 24) {
+  const setup = await createTestRenderer({ width, height, kittyKeyboard: true, exitOnCtrlC: false });
+  const runtime = new FakeRuntime();
+  const submissions: Array<{ text: string; kind: "default" | "follow_up" }> = [];
+  const approvals: Array<{ requestId: string; decision: "allow" | "deny" | "always_allow" }> = [];
+  let interrupts = 0;
+  const actions: TuiViewActions = {
+    submit: async (text, kind) => { submissions.push({ text, kind }); },
+    approve: async (requestId, decision) => { approvals.push({ requestId, decision }); },
+    interrupt: async () => { interrupts += 1; },
+    newSession: async () => undefined,
+    setMode: () => undefined,
+    stop: () => undefined,
+    userAction: () => undefined
+  };
+  const view = new TuiView(setup.renderer, { runtime, workspace: "D:\\software\\sigma" }, actions);
+  await setup.flush();
+  return { setup, view, submissions, approvals, interrupts: () => interrupts };
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Timed out waiting for TUI state.");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe("Sigma OpenTUI", () => {
+  it("projects approvals, progress, workspace changes, compaction, and queued follow-ups", () => {
     let view = createPresentationState();
-    view = projectEvent(view, event(1, "tool.approval_requested", { requestId: "a", toolName: "write", reason: "write" }));
-    view = projectEvent(view, event(2, "tool.approval_requested", { requestId: "b", toolName: "exec", reason: "exec" }));
-    view = projectEvent(view, event(3, "tool.approval_resolved", { requestId: "a", decision: "allow" }));
-    expect(view.status).toBe("needs_input");
-    expect(view.approvals.filter((item) => item.status === "pending").map((item) => item.requestId)).toEqual(["b"]);
-    expect(parseApprovalInput("new steering context", "b")).toBeNull();
-    expect(parseApprovalInput("y", "b")).toEqual({ requestId: "b", decision: "allow" });
-    expect(parseApprovalInput("/approve b always", "a")).toEqual({ requestId: "b", decision: "always_allow" });
-    expect(() => parseApprovalInput("/approve b maybe", "a")).toThrow("must be y, n, or always");
-
-    view = projectEvent(view, event(4, "child.spawned", { childId: "child-one", payload: { intent: "write" } }));
-    view = projectEvent(view, event(5, "child.message", { childId: "child-one", payload: { kind: "started" } }));
-    view = projectEvent(view, event(6, "child.completed", { childId: "child-one", payload: { status: "completed" } }));
-    expect(view.activity.find((item) => item.id === "child:child-one")).toMatchObject({ kind: "child", status: "completed" });
-  });
-
-  it("shows a typed user-input request once in the transcript", () => {
-    let view = projectEvent(createPresentationState(), event(1, "run.suspended", {
-      requestId: "need-target", message: "Which target should I change?"
+    view = projectEvent(view, event(1, "user.follow_up", { text: "later", queueId: "q1", status: "queued" }));
+    view = projectEvent(view, event(2, "tool.approval_requested", {
+      requestId: "a1", toolName: "write", reason: "Effects: filesystem.write",
+      effects: ["filesystem.write"], arguments: { path: "a.txt", content: "hello" }
     }));
-    view = projectEvent(view, event(2, "run.suspended", {
-      requestId: "need-target", message: "Which target should I change?"
+    view = projectEvent(view, event(3, "tool.progress", { callId: "call", name: "shell", message: "working", percent: 45 }));
+    view = projectEvent(view, event(4, "tool.completed", {
+      callId: "call", name: "shell", workspaceDelta: { added: ["a.txt"], modified: [], deleted: [] }
     }));
-    expect(view.status).toBe("needs_input");
-    expect(view.transcript).toMatchObject([{
-      role: "assistant", text: "Which target should I change?", streaming: false
-    }]);
-  });
+    view = projectEvent(view, event(5, "context.compacted", { omittedHistoryTurns: 12 }));
+    view = projectEvent(view, event(6, "user.follow_up", { text: "later", queueId: "q1", status: "delivered" }));
 
-  it("renders bounded responsive frames and virtualizes long transcripts", () => {
-    const heapBefore = process.memoryUsage().heapUsed;
-    let view = createPresentationState();
-    for (let index = 1; index <= 10_000; index += 1) view = projectEvent(view, event(index, "user.message", { text: `消息 ${index} 🙂` }));
-    expect(view.transcript).toHaveLength(2_000);
-    for (const [width, height] of [[20, 5], [80, 24], [240, 80]] as const) {
-      const state = { ...createTuiState(), sessionId: "session", view };
-      const started = performance.now();
-      const frame = renderFrame(state, { width, height });
-      expect(performance.now() - started).toBeLessThan(100);
-      expect(frame.split("\n")).toHaveLength(height);
-      expect(frame).toContain("消息 10000");
-    }
-    for (let index = 0; index < 5; index += 1) renderFrame({ ...createTuiState(), sessionId: "session", view }, { width: 120, height: 40 });
-    const timings = Array.from({ length: 40 }, () => {
-      const started = performance.now();
-      renderFrame({ ...createTuiState(), sessionId: "session", view }, { width: 120, height: 40 });
-      return performance.now() - started;
-    }).sort((left, right) => left - right);
-    expect(timings[Math.ceil(timings.length * 0.95) - 1]).toBeLessThan(16);
-    expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(150 * 1024 * 1024);
-  });
-
-  it("renders one long streaming answer and a long composer in linear time", () => {
-    const view = projectEvent(createPresentationState(), event(1, "model.delta", {
-      turnId: 1,
-      delta: "长回答🙂".repeat(40_000)
-    }));
-    const state = {
-      ...createTuiState(),
-      sessionId: "session",
-      view,
-      composer: createComposer("输入内容界".repeat(10_000))
-    };
-    const started = performance.now();
-    const frame = renderFrame(state, { width: 120, height: 40 });
-    expect(performance.now() - started).toBeLessThan(150);
-    expect(frame.split("\n")).toHaveLength(40);
-  });
-
-  it("sanitizes terminal control injection and renders the approval inbox", () => {
-    let view = createPresentationState();
-    view = projectEvent(view, event(1, "user.message", { text: "safe\u001b]8;;https://evil.example\u0007link\u001b]8;;\u0007\u001b[31mOWN" }));
-    view = projectEvent(view, event(2, "tool.approval_requested", { requestId: "request-1", toolName: "shell", reason: "process.spawn" }));
-    const frame = renderFrame({ ...createTuiState(), sessionId: "session", view }, { width: 80, height: 12 });
-    expect(frame).not.toContain("evil.example");
-    expect(frame).not.toContain("\u001b[31mOWN");
-    expect(frame).toContain("shell: process.spawn [request-1]");
-    expect(sanitizeTerminalText("a\tb\u0000c")).toBe("a    b�c");
-  });
-
-  it("settles the matching model activity and reports each run failure once", () => {
-    let view = createPresentationState();
-    view = projectEvent(view, runEvent(1, "run-a", "model.started", { turnId: 1, model: "deepseek-v4-pro" }));
-    view = projectEvent(view, runEvent(2, "run-a", "model.delta", { turnId: 1, delta: "partial" }));
-    view = projectEvent(view, runEvent(3, "run-a", "model.failed", { turnId: 1, code: "bad_request", message: "first failure" }));
-    view = projectEvent(view, runEvent(4, "run-a", "run.failed", { code: "bad_request", message: "first failure" }));
-    view = projectEvent(view, runEvent(5, "run-b", "model.started", { turnId: 1, model: "glm-5" }));
-    view = projectEvent(view, runEvent(6, "run-b", "model.failed", { turnId: 1, code: "overloaded", message: "second failure" }));
-    view = projectEvent(view, runEvent(7, "run-b", "run.failed", { code: "overloaded", message: "second failure" }));
-
-    expect(view.activity.filter((item) => item.kind === "model")).toMatchObject([
-      { id: "model:run-a:1", title: "deepseek-v4-pro", detail: "bad_request: first failure", status: "failed" },
-      { id: "model:run-b:1", title: "glm-5", detail: "overloaded: second failure", status: "failed" }
+    expect(view.queuedFollowUps).toEqual([]);
+    expect(view.transcript).toMatchObject([{ id: "follow-up:q1", delivery: "follow_up", text: "later" }]);
+    expect(view.approvals[0]).toMatchObject({
+      effects: ["filesystem.write"], argumentPreview: expect.stringContaining('"path": "a.txt"'),
+      argumentPreviewTruncated: false
+    });
+    expect(view.activity).toMatchObject([
+      { id: "tool:call", detail: "added a.txt", status: "completed", progressPercent: 45 },
+      { title: "context compacted", detail: "12 earlier history turns summarized" }
     ]);
-    expect(view.activity.some((item) => item.detail === "Generating response")).toBe(false);
-    expect(view.transcript.filter((item) => item.role === "system")).toHaveLength(2);
-    expect(view.transcript.filter((item) => item.streaming)).toHaveLength(0);
   });
 
-  it("shows a generic run failure when no model failure preceded it", () => {
-    const view = projectEvent(createPresentationState(), event(1, "run.failed", {}));
-    expect(view.status).toBe("failed");
-    expect(view.transcript).toMatchObject([{
-      id: "error:run", role: "system", text: "Run failed without an error message.", streaming: false
-    }]);
-    expect(view.activity).toMatchObject([{
-      id: "run:run", kind: "diagnostic", title: "run failed", status: "failed"
-    }]);
-  });
-
-  it("renders the full provider root cause in red with bounded, sanitized wrapping", () => {
-    const rootCause = "messages[1].role: unknown variant `developer`, expected system, user, assistant, or tool";
-    const failure = `deepseek stream HTTP 400: ${"request body context ".repeat(24)}${rootCause}`;
-    let view = createPresentationState();
-    view = projectEvent(view, event(1, "model.started", { turnId: 1, model: "deepseek-v4-pro" }));
-    view = projectEvent(view, event(2, "model.delta", { turnId: 1, delta: "partial response" }));
-    view = projectEvent(view, event(3, "model.failed", { turnId: 1, code: "model_error", message: `${failure}\u001b[31m` }));
-    view = projectEvent(view, event(4, "run.failed", { code: "model_error", message: failure }));
-    const frame = renderFrame({ ...createTuiState(), sessionId: "session", view }, { width: 80, height: 18 });
-
-    expect(frame.split("\n")).toHaveLength(18);
-    expect(frame).toContain("\u001b[38;5;203merror");
-    expect(frame).toContain("messages[1].role");
-    expect(frame).toContain("`developer`");
-    expect(frame).not.toContain("Generating response");
-    expect(frame).not.toContain("\u001b[31m\u001b[0m");
-    expect(view.activity.at(-1)?.detail).toBe(`model_error: ${failure}\u001b[31m`);
-    expect(view.transcript.filter((item) => item.role === "system")).toHaveLength(1);
-    expect(view.transcript.some((item) => item.streaming)).toBe(false);
-  });
-
-  it("projects only diagnostics with user-meaningful detail", () => {
-    let view = createPresentationState();
-    view = projectEvent(view, event(1, "diagnostic", { kind: "steering.restart", turnId: 1 }));
-    view = projectEvent(view, event(2, "diagnostic", { kind: "nested_instructions_loaded", items: [] }));
-    view = projectEvent(view, event(3, "diagnostic", {
-      kind: "provider_notice",
-      diagnostics: ["retrying provider", "", 42, "root diagnostic remains visible"]
+  it("bounds approval arguments and sanitizes terminal control input", () => {
+    const large = "x".repeat(30_000);
+    const view = projectEvent(createPresentationState(), event(1, "tool.approval_requested", {
+      requestId: "a", toolName: "write", effects: [], arguments: { large }
     }));
-    expect(view.activity).toHaveLength(1);
-    expect(view.activity[0]).toMatchObject({
-      kind: "diagnostic",
-      title: "provider_notice",
-      detail: "retrying provider\nroot diagnostic remains visible"
-    });
-    const frame = renderFrame({ ...createTuiState(), view }, { width: 34, height: 8 });
-    expect(frame.split("\n")).toHaveLength(8);
-    expect(frame).toContain("root diagnostic remains visible");
+    expect(view.approvals[0].argumentPreview.length).toBeLessThanOrEqual(16_384);
+    expect(view.approvals[0].argumentPreviewTruncated).toBe(true);
+    expect(sanitizeTerminalText("safe\u001b]8;;https://evil.example\u0007link\u001b]8;;\u0007\u001b[31mOWN\u0000")).toBe("safelinkOWN�");
   });
 
-  it("decodes chunked input and always restores terminal state", async () => {
-    const runtime = new FakeRuntime();
-    const rawModes: boolean[] = [];
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: (mode: boolean) => rawModes.push(mode) });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    let rendered = "";
-    stdout.on("data", (chunk) => { rendered += chunk.toString("utf8"); });
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout, maxFps: 30 });
-    const running = controller.run();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    stdin.write(Buffer.from("/qu"));
-    stdin.write(Buffer.from("it\r"));
-    await running;
-    expect(rawModes).toEqual([true, false]);
-    expect(rendered).toContain("\u001b[?1049h");
-    expect(rendered).toContain("\u001b[?1049l");
-    expect(rendered).toContain("\u001b[?2004h");
-    expect(rendered).toContain("\u001b[?2004l");
-    expect(runtime.released).toEqual(["session"]);
-  });
+  it("renders Markdown, activity, queue state, and responsive compact layouts", async () => {
+    const harness = await viewHarness();
+    try {
+      let presentation = createPresentationState();
+      presentation = projectEvent(presentation, event(1, "user.message", { text: "Explain it" }));
+      presentation = projectEvent(presentation, event(2, "model.delta", { turnId: 1, delta: "# Result\n\n- one\n- two\n\n```ts\nconst x = 1\n```" }));
+      presentation = projectEvent(presentation, event(3, "tool.started", { callId: "c", name: "shell" }));
+      presentation = projectEvent(presentation, event(4, "user.follow_up", { text: "check tests", queueId: "q", status: "queued" }));
+      harness.view.update(snapshot(presentation));
+      await harness.setup.flush();
+      const frame = harness.setup.captureCharFrame();
+      expect(frame).toContain("Result");
+      expect(frame).toContain("const x = 1");
+      expect(frame).toContain("queued follow-up");
+      expect(frame).toContain("shell");
 
-  it("cancels and releases an active session when the TUI closes", async () => {
-    const runtime = new FakeRuntime([event(1, "session.created", {}), event(2, "run.started", {})]);
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
-    const running = controller.run();
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    stdin.write("/quit\r");
-    await running;
-
-    expect(runtime.commands).toContainEqual({ type: "cancel", sessionId: "session", reason: "TUI closed." });
-    expect(runtime.released).toEqual(["session"]);
-  });
-
-  it("queues an immediate submission until the initial session is ready", async () => {
-    let releaseSession!: () => void;
-    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
-    const runtime = new FakeRuntime([event(1, "session.created", {})], sessionGate);
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
-    const running = controller.run();
-
-    stdin.write("submitted before startup completes\r");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(runtime.commands).toEqual([]);
-    releaseSession();
-    for (let attempt = 0; attempt < 50 && runtime.commands.length === 0; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(runtime.commands).toContainEqual({
-      type: "submit", sessionId: "session", text: "submitted before startup completes", mode: "change"
-    });
-    stdin.write("/quit\r");
-    await running;
-  });
-
-  it("coalesces renders while terminal output is backpressured", async () => {
-    const runtime = new FakeRuntime();
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    const originalWrite = stdout.write.bind(stdout);
-    let blockFrames = true;
-    let frameWrites = 0;
-    stdout.write = ((chunk: Uint8Array | string, ...args: unknown[]): boolean => {
-      const value = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-      if (value.includes("\u001b[2J")) {
-        frameWrites += 1;
-        if (blockFrames) return false;
+      for (const [width, height] of [[120, 40], [80, 24], [60, 12], [20, 5]] as const) {
+        harness.setup.resize(width, height);
+        await harness.setup.flush();
+        const layout = harness.setup.captureSpans();
+        const characters = harness.setup.captureCharFrame();
+        expect(layout).toMatchObject({ cols: width, rows: height });
+        expect(characters.split("\n")).toHaveLength(height + 1);
+        expect(characters).toContain("Sigma");
+        if (width >= 60) {
+          const colors = new Set(layout.lines.flatMap((line) => line.spans).map((span) => span.fg.toString()));
+          expect(colors.size).toBeGreaterThan(1);
+        }
       }
-      return originalWrite(chunk, ...(args as Parameters<typeof originalWrite>));
-    }) as typeof stdout.write;
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout, maxFps: 30 });
-    const running = controller.run();
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    expect(frameWrites).toBe(1);
-
-    for (let index = 0; index < 100; index += 1) stdin.write("x");
-    stdout.emit("resize");
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    expect(frameWrites).toBe(1);
-
-    blockFrames = false;
-    stdout.emit("drain");
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    expect(frameWrites).toBe(2);
-    stdin.write("\u0003\u0003");
-    await running;
+    } finally { harness.view.destroy(); }
   });
 
-  it("does not lose an early double interrupt while session creation is blocked", async () => {
-    let releaseSession!: () => void;
-    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
-    const runtime = new FakeRuntime([event(1, "session.created", {})], sessionGate);
-    const rawModes: boolean[] = [];
-    const stdin = Object.assign(new PassThrough(), {
-      isTTY: true,
-      setRawMode: (mode: boolean) => rawModes.push(mode)
-    });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
-    const running = controller.run();
+  it("supports multiline input, follow-ups, history, and command completion", async () => {
+    const harness = await viewHarness();
+    try {
+      await harness.setup.mockInput.typeText("first");
+      harness.setup.mockInput.pressKey("j", { ctrl: true });
+      await harness.setup.mockInput.typeText("second");
+      harness.setup.mockInput.pressEnter();
+      await harness.setup.flush();
+      expect(harness.submissions).toContainEqual({ text: "first\nsecond", kind: "default" });
 
-    stdin.write("\u0003\u0003");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    releaseSession();
-    await running;
-    expect(rawModes).toEqual([true, false]);
-    expect(runtime.commands).toEqual([]);
+      harness.setup.mockInput.pressArrow("up");
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).toContain("first");
+      harness.setup.mockInput.pressEnter({ meta: true });
+      expect(harness.submissions.at(-1)).toEqual({ text: "first\nsecond", kind: "follow_up" });
+
+      await harness.setup.mockInput.pasteBracketedText("中文 🚀 e\u0301\nsecond line");
+      harness.setup.mockInput.pressEnter();
+      expect(harness.submissions.at(-1)).toEqual({ text: "中文 🚀 e\u0301\nsecond line", kind: "default" });
+
+      await harness.setup.mockInput.typeText("/a");
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).toContain("/activity");
+      harness.setup.mockInput.pressTab();
+      harness.setup.mockInput.pressEnter();
+      expect(harness.submissions.at(-1)).toEqual({ text: "/activity", kind: "default" });
+    } finally { harness.view.destroy(); }
   });
 
-  it("routes resumed approvals without implicitly denying other input", async () => {
-    const runtime = new FakeRuntime([
-      event(1, "session.created", {}),
-      event(2, "run.started", {}),
-      event(3, "tool.approval_requested", { requestId: "approval", toolName: "write", reason: "filesystem.write" })
-    ]);
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
-    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    const controller = new TuiController({ runtime, workspace: ".", sessionId: "session", stdin, stdout });
-    const running = controller.run();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    stdin.write("new context\r");
-    stdin.write("/approve approval y\r");
-    stdin.write("/quit\r");
-    await running;
-    expect(runtime.commands[0]).toEqual({ type: "resume", sessionId: "session" });
-    expect(runtime.commands).toContainEqual({ type: "submit", sessionId: "session", text: "new context", mode: "change" });
-    expect(runtime.commands).toContainEqual({ type: "approve", sessionId: "session", requestId: "approval", decision: "allow" });
+  it("shows contextual help and routes approval choices without editing the composer", async () => {
+    const harness = await viewHarness();
+    try {
+      await harness.setup.mockInput.typeText("?");
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).toContain("Sigma shortcuts");
+      await harness.setup.mockInput.typeText("must-not-leak");
+      harness.setup.mockInput.pressEscape();
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).not.toContain("must-not-leak");
+
+      const presentation = projectEvent(createPresentationState(), event(1, "tool.approval_requested", {
+        requestId: "approval", toolName: "shell", reason: "process.spawn", effects: ["process.spawn"],
+        arguments: { command: "pnpm test" }
+      }));
+      harness.view.update(snapshot(presentation));
+      await harness.setup.mockInput.typeText("x");
+      harness.setup.mockInput.pressKey("a");
+      await harness.setup.flush();
+      expect(harness.approvals).toEqual([{ requestId: "approval", decision: "always_allow" }]);
+      expect(harness.setup.captureCharFrame()).toContain("pnpm test");
+    } finally { harness.view.destroy(); }
   });
 
-  it("handles paste, navigation, commands, replacement, and double interrupt", async () => {
+  it("honors NO_COLOR in character and style output", async () => {
+    const previous = process.env.NO_COLOR;
+    process.env.NO_COLOR = "1";
+    const harness = await viewHarness();
+    try {
+      let presentation = projectEvent(createPresentationState(), event(1, "user.message", { text: "plain user" }));
+      presentation = projectEvent(presentation, event(2, "model.delta", { turnId: 1, delta: "# Plain assistant" }));
+      harness.view.update(snapshot(presentation));
+      await harness.setup.renderOnce();
+      const visibleSpans = harness.setup.captureSpans().lines.flatMap((line) => line.spans)
+        .filter((span) => span.text.trim().length > 0);
+      const sigmaColors = new Set(["95,215,255", "135,215,135", "255,215,95", "255,95,95", "138,138,138"]);
+      expect(visibleSpans.some((span) => sigmaColors.has(span.fg.toInts().slice(0, 3).join(",")))).toBe(false);
+      expect(harness.setup.captureCharFrame()).toContain("Plain assistant");
+    } finally {
+      harness.view.destroy();
+      if (previous === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previous;
+    }
+  });
+
+  it("routes scroll, activity, and interrupt shortcuts", async () => {
+    const harness = await viewHarness();
+    try {
+      let presentation = createPresentationState();
+      for (let index = 1; index <= 40; index += 1) {
+        presentation = projectEvent(presentation, event(index, "user.message", { text: `message ${index}` }));
+      }
+      harness.view.update(snapshot(presentation));
+      await harness.setup.flush();
+      harness.setup.mockInput.pressKey("o", { ctrl: true });
+      harness.setup.mockInput.pressKey("u", { ctrl: true });
+      await harness.setup.mockMouse.scroll(10, 5, "up");
+      harness.setup.mockInput.pressCtrlC();
+      await harness.setup.flush();
+      expect(harness.interrupts()).toBe(1);
+      expect(harness.setup.captureCharFrame()).toContain("PgDn newest");
+    } finally { harness.view.destroy(); }
+  });
+
+  it("drives runtime commands, mode changes, new sessions, and cleanup through the controller", async () => {
     const runtime = new FakeRuntime([event(1, "session.created", {}), event(2, "run.started", {})]);
-    const rawModes: boolean[] = [];
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: (mode: boolean) => rawModes.push(mode) });
-    const stdout = Object.assign(new PassThrough(), { columns: 60, rows: 12 });
-    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout, maxFps: 0 });
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 }) as unknown as NodeJS.WriteStream;
+    const snapshots: TuiSnapshot[] = [];
+    let actions!: TuiViewActions;
+    let activityToggles = 0;
+    const controller = new TuiSessionController({ runtime, workspace: ".", stdin, stdout }, async (_options, nextActions) => {
+      actions = nextActions;
+      return {
+        update: (next) => snapshots.push(next), showHelp: () => undefined,
+        toggleActivity: () => { activityToggles += 1; }, destroy: () => undefined
+      };
+    });
     const running = controller.run();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    stdin.write("\u001b[200~hello\n");
-    stdin.write("world\u001b[201~\u001b[D\u001b[C\u001b[A\u001b[B\u001b[5~\u001b[6~\u007f!\r");
-    stdin.write("/mode invalid\r/mode analyze\r/followup later\r/activity\r/new\r");
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    stdin.write("\u0003\u0003");
+    await waitUntil(() => Boolean(actions) && snapshots.some((item) => item.sessionId === "session"));
+    await actions.submit("/mode analyze", "default");
+    await actions.submit("inspect", "default");
+    await actions.submit("later", "follow_up");
+    await actions.submit("/activity", "default");
+    await actions.newSession();
+    await actions.interrupt();
+    await actions.interrupt();
     await running;
+
+    expect(runtime.commands).toContainEqual({ type: "steer", sessionId: "session", text: "inspect" });
     expect(runtime.commands).toContainEqual({ type: "follow_up", sessionId: "session", text: "later" });
     expect(runtime.commands).toContainEqual({ type: "cancel", sessionId: "session", reason: "Replaced by /new from TUI." });
-    expect(runtime.commands.some((command) => command.type === "steer" && command.text.includes("hello"))).toBe(true);
     expect(runtime.released).toContain("session");
-    expect(rawModes).toEqual([true, false]);
+    expect(activityToggles).toBe(1);
   });
 
-  it("rejects non-TTY use and restores raw mode when terminal setup throws", async () => {
-    const runtime = new FakeRuntime();
-    const nonTty = Object.assign(new PassThrough(), { isTTY: false });
-    const output = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
-    await expect(new TuiController({ runtime, workspace: ".", stdin: nonTty, stdout: output }).run()).rejects.toThrow("interactive terminal");
+  it("keeps long transcripts incremental within the renderer budgets", async () => {
+    const heapBefore = process.memoryUsage().heapUsed;
+    let presentation = createPresentationState();
+    for (let index = 1; index <= 10_000; index += 1) {
+      presentation = projectEvent(presentation, event(index, "user.message", { text: `消息 ${index} 🚀` }));
+    }
+    expect(presentation.transcript).toHaveLength(2_000);
+    const harness = await viewHarness(120, 40);
+    try {
+      const initialStarted = performance.now();
+      harness.view.update(snapshot(presentation));
+      expect(performance.now() - initialStarted).toBeLessThan(100);
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).toContain("消息 10000");
 
-    const rawModes: boolean[] = [];
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: (mode: boolean) => rawModes.push(mode) });
-    let writes = 0;
-    const failingOutput = Object.assign(new PassThrough(), {
-      columns: 80,
-      rows: 24,
-      write(chunk: unknown) {
-        writes += 1;
-        if (writes === 1) throw new Error("terminal setup failed");
-        return PassThrough.prototype.write.call(this, chunk);
-      }
-    });
-    await expect(new TuiController({ runtime, workspace: ".", stdin, stdout: failingOutput }).run()).rejects.toThrow("terminal setup failed");
-    expect(rawModes).toEqual([true, false]);
+      const next = projectEvent(presentation, event(10_001, "user.message", { text: "incremental tail" }));
+      const incrementalStarted = performance.now();
+      harness.view.update(snapshot(next));
+      expect(performance.now() - incrementalStarted).toBeLessThan(100);
+      expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(150 * 1024 * 1024);
+    } finally { harness.view.destroy(); }
+  });
+
+  it("renders a bounded long streaming Markdown answer within 150 ms", async () => {
+    const harness = await viewHarness(120, 40);
+    try {
+      const presentation = projectEvent(createPresentationState(), event(1, "model.delta", {
+        turnId: 1, delta: "流式回答".repeat(40_000)
+      }));
+      const updateStarted = performance.now();
+      harness.view.update(snapshot(presentation));
+      expect(performance.now() - updateStarted).toBeLessThan(150);
+      const renderStarted = performance.now();
+      await harness.setup.renderOnce();
+      expect(performance.now() - renderStarted).toBeLessThan(150);
+      expect(harness.setup.captureCharFrame()).toContain("流式回答");
+    } finally { harness.view.destroy(); }
   });
 });
