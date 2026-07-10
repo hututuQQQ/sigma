@@ -1,8 +1,18 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/agent-ai" },
-    { "path": "./packages/agent-core" },
+    { "path": "./packages/agent-protocol" },
+    { "path": "./packages/agent-config" },
+    { "path": "./packages/agent-platform" },
+    { "path": "./packages/agent-context" },
+    { "path": "./packages/agent-mcp" },
+    { "path": "./packages/agent-model" },
+    { "path": "./packages/agent-store" },
+    { "path": "./packages/agent-tools" },
+    { "path": "./packages/agent-supervisor" },
+    { "path": "./packages/agent-kernel" },
+    { "path": "./packages/agent-presentation" },
+    { "path": "./packages/agent-runtime" },
     { "path": "./packages/agent-cli" },
     { "path": "./packages/agent-tui" }
   ]

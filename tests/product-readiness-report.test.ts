@@ -23,9 +23,9 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
   await writeJson(path.join(artifactsDir, "smoke-product", "product-smoke.json"), {
     ok: true,
     sessionId: "product-session",
-    changedFiles: ["hello.txt"],
-    jobSummary: { completed: 1 },
-    artifacts: { manifest: path.join(rootDir, ".agent", "sessions", "product-session", "artifacts.json") }
+    outcome: { kind: "completed" },
+    sessions: 1,
+    doctor: { status: "warning" }
   });
   await writeJson(path.join(artifactsDir, "smoke-tui-product", "tui-smoke.json"), {
     ok: true,
@@ -35,8 +35,7 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       cursorLifecycle: true,
       rawModeLifecycle: true,
       runCompleted: true,
-      jobsPanel: true,
-      artifactsPanel: true
+      resize: true
     }
   });
   await writeJson(path.join(artifactsDir, "agent-cli-package-verify.json"), {

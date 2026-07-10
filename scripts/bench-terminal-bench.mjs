@@ -84,8 +84,6 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const harborCommand = harborCommandInfo.command;
   await mkdir(runDir, { recursive: true });
 
-  let taskSelectionFlag = null;
-  let capabilities = {};
   let harborVersion = null;
   let harborArgs = ["run", "--help"];
   let config = {
@@ -187,11 +185,11 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
   const helpText = `${helpResult.stdout}\n${helpResult.stderr}`;
   await writeFile(path.join(runDir, "harbor-run-help.txt"), helpText, "utf8");
-  capabilities = detectHarborRunCapabilities(helpText);
-  taskSelectionFlag = detectTaskSelectionFlag(helpText);
+  const capabilities = detectHarborRunCapabilities(helpText);
+  const taskSelectionFlag = detectTaskSelectionFlag(helpText);
 
   let timeoutProbe = null;
-  let timeoutPlan = null;
+  let timeoutPlan;
   if (options.mode !== "smoke") {
     process.stdout.write(`Inspecting selected task timeout metadata...\n`);
     const timeoutProbeJobsDir = path.join(runDir, "harbor-timeout-probe-jobs");
@@ -235,8 +233,6 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     timeoutPlan = computeHarborTimeoutPlan(options, null);
   }
 
-  let harborResult = null;
-  let report = null;
   const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
   const attemptOptions = {
     ...options,
@@ -270,7 +266,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
   process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
-  harborResult = await runner(harborCommand, harborArgs, {
+  const harborResult = await runner(harborCommand, harborArgs, {
     cwd: rootDir,
     env,
     stdoutPath: path.join(runDir, "harbor.stdout.log"),
@@ -292,7 +288,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
   });
 
-  report = await generateBenchReport(runDir);
+  const report = await generateBenchReport(runDir);
 
   process.stdout.write(`Benchmark artifacts: ${runDir}\n`);
   process.stdout.write(`Report: ${path.join(runDir, "report.md")}\n`);

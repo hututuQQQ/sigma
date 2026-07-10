@@ -1,347 +1,205 @@
-import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { stdin as processStdin } from "node:process";
-import { promisify } from "node:util";
-import type { ModelClient, ProviderName, ProviderOptions } from "agent-ai";
-import { createModelClient } from "agent-ai";
-import {
-  AgentEventBus,
-  redactSecretText,
-  runConfiguredAgent,
-  truncateMiddle,
-  type McpServerRunSummary
-} from "agent-core";
-import { loadCliConfig, parseArgs } from "../config.js";
-import { printJsonRunResult, printRunResult, writeJsonLine, writeStreamJsonEvent } from "../output.js";
-import { createInteractivePermissionDecider } from "../permission.js";
-import { attachStreamUi } from "../stream-ui.js";
+import { createInterface } from "node:readline/promises";
+import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
+import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agent-protocol";
+import { createConfiguredRuntime, type ConfiguredRuntime, type InProcessRuntimeClient } from "agent-runtime";
+import { loadCliConfig, parseArgs, workspaceMcpTrustMessage, type CliConfig } from "../config.js";
 
-const execFileAsync = promisify(execFile);
-
-export interface SolveCommandDeps {
-  modelClientFactory?: (provider: ProviderName, options: ProviderOptions) => ModelClient;
-  clipboardReader?: () => Promise<string>;
-  stdout?: NodeJS.WritableStream;
-  stderr?: NodeJS.WritableStream;
+export interface RunCommandDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
+  stdout?: NodeJS.WritableStream & { isTTY?: boolean };
+  stderr?: NodeJS.WritableStream;
+  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
+  mode?: RunMode;
 }
 
-export interface RunCommandOverrides {
-  instruction?: string;
-  workspacePath?: string;
-  parentSessionId?: string;
-  forkedFromSessionId?: string;
-}
-
-async function readStdin(stream: NodeJS.ReadableStream): Promise<string> {
+async function readStream(stream: NodeJS.ReadableStream): Promise<string> {
   const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
-  }
+  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   return Buffer.concat(chunks).toString("utf8");
 }
 
-interface ClipboardCommand {
-  command: string;
-  args: string[];
-}
-
-function powershellClipboardCommand(command = "powershell.exe"): ClipboardCommand {
-  return {
-    command,
-    args: [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw"
-    ]
-  };
-}
-
-function clipboardCommands(): ClipboardCommand[] {
-  if (process.platform === "win32") return [powershellClipboardCommand()];
-  if (process.platform === "darwin") return [{ command: "pbpaste", args: [] }];
-
-  const commands: ClipboardCommand[] = [];
-  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) commands.push(powershellClipboardCommand());
-  commands.push(
-    { command: "wl-paste", args: [] },
-    { command: "xclip", args: ["-selection", "clipboard", "-o"] },
-    { command: "xsel", args: ["--clipboard", "--output"] }
-  );
-  return commands;
-}
-
-async function readClipboardText(): Promise<string> {
-  const failures: string[] = [];
-  for (const candidate of clipboardCommands()) {
-    try {
-      const { stdout } = await execFileAsync(candidate.command, candidate.args, {
-        encoding: "utf8",
-        maxBuffer: 8 * 1024 * 1024,
-        timeout: 5000,
-        windowsHide: true
-      });
-      return stdout;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      failures.push(`${candidate.command}: ${message}`);
-    }
-  }
-
-  throw new Error(`Could not read clipboard. Tried: ${failures.join("; ")}`);
-}
-
-async function resolveInstruction(
-  flags: Record<string, string | boolean>,
+async function instructionFromArgs(
+  flags: Record<string, unknown>,
   positionals: string[],
-  deps: SolveCommandDeps
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean }
 ): Promise<string> {
-  if (typeof flags.instruction === "string") {
-    return flags.instruction;
-  }
-
-  if (typeof flags["instruction-file"] === "string") {
-    return await readFile(flags["instruction-file"], "utf8");
-  }
-
-  if (flags["instruction-clipboard"] === true) {
-    const content = await (deps.clipboardReader ?? readClipboardText)();
-    const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    if (normalized.trim().length > 0) return normalized;
-    throw new Error("Clipboard is empty. Copy a prompt first, or use --instruction-file / stdin.");
-  }
-
-  if (positionals.length > 0) {
-    return positionals.join(" ");
-  }
-
-  const stdin = deps.stdin ?? processStdin;
-  if (!stdin.isTTY) {
-    const content = await readStdin(stdin);
-    if (content.trim().length > 0) return content;
-  }
-
-  throw new Error("No instruction supplied. Use --instruction, --instruction-file, --instruction-clipboard, or pipe text on stdin.");
+  if (typeof flags["prompt-file"] === "string") return (await readFile(flags["prompt-file"], "utf8")).trim();
+  if (typeof flags.prompt === "string") return flags.prompt.trim();
+  if (flags.stdin === true || (!stdin.isTTY && positionals.length === 0)) return (await readStream(stdin)).trim();
+  return positionals.join(" ").trim();
 }
 
-function writeMcpServerWarnings(servers: McpServerRunSummary[], stderr: NodeJS.WritableStream): void {
-  for (const server of servers) {
-    if (!server.enabled || !server.error) continue;
-    const name = redactSecretText(server.name).replace(/\s+/g, "_");
-    const error = truncateMiddle(redactSecretText(server.error.replace(/\s+/g, " ").trim()), 300).text;
-    stderr.write(`[sigma] mcp_error server=${name} error=${error}\n`);
+function status(outcome: RunOutcome): "completed" | "needs_input" | "cancelled" | "error" {
+  if (outcome.kind === "completed") return "completed";
+  if (outcome.kind === "needs_input") return "needs_input";
+  if (outcome.kind === "cancelled") return "cancelled";
+  return "error";
+}
+
+function exitCode(outcome: RunOutcome): number {
+  if (outcome.kind === "completed") return 0;
+  if (outcome.kind === "needs_input") return 2;
+  if (outcome.kind === "cancelled") return 130;
+  return 1;
+}
+
+function outcomeMessage(outcome: RunOutcome): string {
+  if (outcome.kind === "completed") return outcome.message;
+  if (outcome.kind === "cancelled") return outcome.reason;
+  return outcome.message;
+}
+
+async function promptApproval(
+  event: AgentEventEnvelope,
+  runtime: InProcessRuntimeClient,
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean },
+  stderr: NodeJS.WritableStream
+): Promise<void> {
+  if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
+  const data = event.payload as Record<string, unknown>;
+  const requestId = typeof data.requestId === "string" ? data.requestId : "";
+  if (!requestId) return;
+  const readline = createInterface({ input: stdin, output: stderr });
+  try {
+    const answer = (await readline.question(`Allow ${String(data.toolName ?? "tool")} (${String(data.reason ?? "")})? [y/N/a] `)).trim().toLowerCase();
+    const decision = answer === "a" ? "always_allow" : answer === "y" || answer === "yes" ? "allow" : "deny";
+    await runtime.command({ type: "approve", sessionId: event.sessionId, requestId, decision });
+  } finally {
+    readline.close();
   }
 }
 
-function printNonInteractiveHelp(stdout: NodeJS.WritableStream): void {
-  stdout.write(`agent run [instruction] [flags]
-
-Run the autonomous coding agent once.
-
-Instruction input:
-  agent run "Fix failing tests"
-  agent run --instruction "Fix failing tests"
-  agent run --instruction-file ./task.md
-  agent run --instruction-clipboard
-  printf "Fix failing tests" | agent run
-
-Core flags:
-  --workspace <path>
-  --provider <deepseek|glm>
-  --model <name>
-  --permission-mode <ask|yolo>
-  --max-turns <number>
-  --max-wall-time-sec <number>
-  --command-timeout-sec <number>
-  --sandbox <read-only|workspace-write|danger-full-access|policy-only|external>
-  --sandbox-backend <auto|bubblewrap|seatbelt|windows|external|policy-only>
-  --sandbox-required
-  --sandbox-network <default|restricted|disabled>
-  --sandbox-add-read <comma-separated-paths>
-  --sandbox-add-write <comma-separated-paths>
-  --sandbox-deny-read <comma-separated-paths>
-  --sandbox-deny-write <comma-separated-paths>
-  --sandbox-external-command <command>
-
-Run-controller flags:
-  --validation-mode <off|auto>
-  --validation-command <command>
-  --validation-commands <comma-separated>
-  --validation-retry-limit <number>
-  --validation-timeout-sec <number>
-  --precheck-command <command>
-  --precheck-timeout-sec <number>
-  --harness-timeout-sec <number>
-  --retry-min-budget-sec <number>
-  --attempts-dir <path>
-
-Context and tool flags:
-  --allowed-tools <comma-separated>
-  --disabled-tools <comma-separated>
-  --permission-rules <json>
-  --loop-guard-mode <off|warn|stop>        off disables; warn nudges only; stop nudges then stops repeated calls
-  --model-context-chars <number>
-  --memory-scopes <comma-separated>
-  --context-mode <off|repo-map>
-  --repo-map-max-chars <number>
-  --max-message-history-chars <number>
-  --message-history-retain <number>
-  --compaction-summary-chars <number>
-  --final-evidence-mode <off|auto>
-  --skills-mode <off|auto>
-  --skills-max-chars <number>
-  --no-subagents
-  --no-subagent-background
-  --subagent-heartbeat-timeout-sec <number> interrupt stalled background subagent jobs
-  --subagent-max-turns <number>
-  --subagent-max-output-chars <number>
-  --review-anti-gaming / --no-review-anti-gaming
-  --compaction-mode <off|deterministic|model-sub-session>
-  --compaction-model <model>
-  --compaction-provider <deepseek|glm>
-  --compaction-max-input-chars <number>
-  --compaction-max-output-chars <number>
-  --compaction-timeout-sec <number>
-  --compaction-fallback <deterministic|fail>
-  --enable-mcp
-  --mcp-config <path>
-
-Output flags:
-  --output-format <text|json|stream-json>
-  --json
-  --quiet
-  --stream-ui / --no-stream-ui
-  --trace-jsonl <path>
-  --session-jsonl <path>
-  --summary-json <path>
-`);
+function writeEvent(event: AgentEventEnvelope, format: string, stderr: NodeJS.WritableStream, stdout: NodeJS.WritableStream): void {
+  if (format === "stream-json") {
+    stdout.write(`${JSON.stringify(event)}\n`);
+    return;
+  }
+  if (format === "json") return;
+  if (event.type === "model.delta" && event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)) {
+    const delta = (event.payload as Record<string, unknown>).delta;
+    if (typeof delta === "string") stderr.write(delta);
+  } else if (event.type === "tool.started") {
+    stderr.write(`\n[sigma] tool started\n`);
+  } else if (event.type === "tool.completed" || event.type === "tool.failed") {
+    stderr.write(`[sigma] ${event.type}\n`);
+  }
 }
 
-async function runNonInteractiveCommand(
-  argv: string[],
-  deps: SolveCommandDeps,
-  overrides: RunCommandOverrides = {}
+async function streamSession(
+  runtime: InProcessRuntimeClient,
+  sessionId: string,
+  config: CliConfig,
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean },
+  stdout: NodeJS.WritableStream,
+  stderr: NodeJS.WritableStream,
+  signal: AbortSignal
+): Promise<void> {
+  for await (const event of runtime.subscribe(sessionId, signal)) {
+    writeEvent(event, config.outputFormat, stderr, stdout);
+    if (event.type === "tool.approval_requested") await promptApproval(event, runtime, stdin, stderr);
+    if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") break;
+  }
+}
+
+function writeResult(
+  outcome: RunOutcome,
+  sessionId: string,
+  format: CliConfig["outputFormat"],
+  stdout: NodeJS.WritableStream
+): void {
+  const result = {
+    status: status(outcome),
+    finishReason: outcome.kind,
+    sessionId,
+    finalMessage: outcomeMessage(outcome)
+  };
+  if (format === "json") stdout.write(`${JSON.stringify(result)}\n`);
+  else if (format === "stream-json") stdout.write(`${JSON.stringify({ type: "result", result })}\n`);
+  else stdout.write(`\n${result.finalMessage}\n`);
+}
+
+async function executeRun(
+  configured: ConfiguredRuntime,
+  config: CliConfig,
+  instruction: string,
+  mode: RunMode,
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean },
+  stdout: NodeJS.WritableStream,
+  stderr: NodeJS.WritableStream
 ): Promise<number> {
-  const stdout = deps.stdout ?? process.stdout;
-  const stderr = deps.stderr ?? process.stderr;
-  const stdin = deps.stdin ?? processStdin;
-  const factory = deps.modelClientFactory ?? createModelClient;
-  let detachStreamUi: (() => void) | undefined;
-  let detachJsonStream: (() => void) | undefined;
+  const { runtime, workspace } = configured;
+  const session = await runtime.createSession({ workspacePath: workspace, mode, title: instruction.slice(0, 80) });
+  const streamAbort = new AbortController();
+  const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr, streamAbort.signal);
+  try {
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: instruction, mode });
+    const outcome = await runtime.waitForOutcome(session.sessionId);
+    streamAbort.abort();
+    await stream;
+    writeResult(outcome, session.sessionId, config.outputFormat, stdout);
+    return exitCode(outcome);
+  } finally {
+    streamAbort.abort();
+    await stream.catch(() => undefined);
+  }
+}
 
+function nonInteractiveAsk(config: CliConfig, stdinTty: boolean, stdoutTty: boolean): boolean {
+  return config.permissionMode === "ask" && (!stdinTty || !stdoutTty);
+}
+
+function writeNeedsInput(
+  config: CliConfig,
+  stdout: NodeJS.WritableStream,
+  stderr: NodeJS.WritableStream,
+  message = "Non-interactive ask mode cannot resolve tool approvals. Use --permission-mode auto or the TUI.",
+  finishReason = "permission_required"
+): void {
+  const result = {
+    status: "needs_input",
+    finishReason,
+    message
+  };
+  if (config.outputFormat === "json" || config.outputFormat === "stream-json") stdout.write(`${JSON.stringify(result)}\n`);
+  else stderr.write(`${result.message}\n`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Promise<number> {
+  const stdin = deps.stdin ?? processStdin;
+  const stdout = deps.stdout ?? processStdout;
+  const stderr = deps.stderr ?? processStderr;
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
-      printNonInteractiveHelp(stdout);
+      stdout.write(`Usage: agent ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);
       return 0;
     }
-
-    const { flags, positionals } = parseArgs(argv);
-    const cliConfig = loadCliConfig(flags);
-    const instruction = overrides.instruction ?? await resolveInstruction(flags, positionals, deps);
-    const workspacePath = overrides.workspacePath ?? cliConfig.workspace;
-    const eventBus = new AgentEventBus();
-    detachJsonStream = cliConfig.outputFormat === "stream-json"
-      ? eventBus.on((event) => writeStreamJsonEvent(event, stdout))
-      : undefined;
-    detachStreamUi = cliConfig.noStreamUi ? undefined : attachStreamUi(eventBus, stderr);
-    const permissionDecider = cliConfig.permissionMode === "ask"
-      ? createInteractivePermissionDecider({
-          stdin,
-          stdout: stdout as NodeJS.WritableStream & { isTTY?: boolean },
-          stderr
-        })
-      : undefined;
-
-    const { result } = await runConfiguredAgent({
-      instruction,
-      workspacePath,
-      provider: cliConfig.provider,
-      model: cliConfig.model,
-      parentSessionId: overrides.parentSessionId,
-      forkedFromSessionId: overrides.forkedFromSessionId,
-      modelClientFactory: factory,
-      maxTurns: cliConfig.maxTurns,
-      maxWallTimeSec: cliConfig.maxWallTimeSec,
-      commandTimeoutSec: cliConfig.commandTimeoutSec,
-      permissionMode: cliConfig.permissionMode,
-      sandbox: cliConfig.sandbox,
-      traceJsonlPath: cliConfig.traceJsonl,
-      sessionJsonlPath: cliConfig.sessionJsonl,
-      summaryJsonPath: cliConfig.summaryJson,
-      maxToolOutputChars: cliConfig.maxToolOutputChars,
-      maxMessageHistoryChars: cliConfig.maxMessageHistoryChars,
-      messageHistoryRetain: cliConfig.messageHistoryRetain,
-      compactionSummaryChars: cliConfig.compactionSummaryChars,
-      compactionMode: cliConfig.compactionMode,
-      compactionModel: cliConfig.compactionModel,
-      compactionProvider: cliConfig.compactionProvider,
-      compactionMaxInputChars: cliConfig.compactionMaxInputChars,
-      compactionMaxOutputChars: cliConfig.compactionMaxOutputChars,
-      compactionTimeoutSec: cliConfig.compactionTimeoutSec,
-      compactionFallback: cliConfig.compactionFallback,
-      validationMode: cliConfig.validationMode,
-      validationCommands: cliConfig.validationCommands,
-      validationRetryLimit: cliConfig.validationRetryLimit,
-      validationTimeoutSec: cliConfig.validationTimeoutSec,
-      precheckCommand: cliConfig.precheckCommand,
-      precheckTimeoutSec: cliConfig.precheckTimeoutSec,
-      postRunCleanupGlobs: cliConfig.postRunCleanupGlobs,
-      harnessTimeoutSec: cliConfig.harnessTimeoutSec,
-      retryMinBudgetSec: cliConfig.retryMinBudgetSec,
-      attemptsDir: cliConfig.attemptsDir,
-      allowedTools: cliConfig.allowedTools,
-      disabledTools: cliConfig.disabledTools,
-      permissionRules: cliConfig.permissionRules,
-      loopGuardMode: cliConfig.loopGuardMode,
-      memoryScopes: cliConfig.memoryScopes,
-      permissionDecider,
-      projectInstructionsEnabled: !cliConfig.noProjectInstructions,
-      projectDocMaxBytes: cliConfig.projectDocMaxBytes,
-      contextMode: cliConfig.contextMode,
-      repoMapMaxChars: cliConfig.repoMapMaxChars,
-      modelContextLimits: cliConfig.modelContextLimits,
-      finalEvidenceMode: cliConfig.finalEvidenceMode,
-      skillsMode: cliConfig.skillsMode,
-      skillsMaxChars: cliConfig.skillsMaxChars,
-      subagentsEnabled: cliConfig.subagentsEnabled,
-      subagentBackgroundEnabled: cliConfig.subagentBackgroundEnabled,
-      subagentHeartbeatTimeoutSec: cliConfig.subagentHeartbeatTimeoutSec,
-      subagentMaxTurns: cliConfig.subagentMaxTurns,
-      subagentMaxOutputChars: cliConfig.subagentMaxOutputChars,
-      reviewAntiGaming: cliConfig.reviewAntiGaming,
-      enableMcp: cliConfig.enableMcp,
-      mcpConfig: cliConfig.mcpConfig,
-      eventBus,
-      onMcpServers: (servers) => writeMcpServerWarnings(servers, stderr)
-    });
-
-    detachStreamUi?.();
-    detachJsonStream?.();
-    if (cliConfig.outputFormat === "json") {
-      printJsonRunResult(result, stdout);
-    } else if (cliConfig.outputFormat === "stream-json") {
-      writeJsonLine({ type: "result", result }, stdout);
-    } else {
-      printRunResult(result, stdout, { quiet: cliConfig.quiet });
+    const parsed = parseArgs(argv);
+    const config = loadCliConfig(parsed.flags);
+    const instruction = await instructionFromArgs(parsed.flags, parsed.positionals, stdin);
+    if (!instruction) throw new Error("A non-empty instruction is required.");
+    const mode = deps.mode ?? "change";
+    const trustMessage = workspaceMcpTrustMessage(config);
+    if (trustMessage) {
+      writeNeedsInput(config, stdout, stderr, trustMessage, "workspace_mcp_trust_required");
+      return 2;
     }
-    return result.status === "completed" ? 0 : 1;
+    if (nonInteractiveAsk(config, stdin.isTTY === true, stdout.isTTY === true)) {
+      writeNeedsInput(config, stdout, stderr);
+      return 2;
+    }
+    const configured = await createConfiguredRuntime(config, deps);
+    try {
+      return await executeRun(configured, config, instruction, mode, stdin, stdout, stderr);
+    } finally {
+      await configured.close();
+    }
   } catch (error) {
-    detachStreamUi?.();
-    detachJsonStream?.();
-    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    stderr.write(`${errorMessage(error)}\n`);
     return 1;
   }
-}
-
-export async function runRunCommand(argv: string[], deps: SolveCommandDeps = {}): Promise<number> {
-  return await runNonInteractiveCommand(argv, deps);
-}
-
-export async function runRunCommandWithOverrides(
-  argv: string[],
-  deps: SolveCommandDeps = {},
-  overrides: RunCommandOverrides = {}
-): Promise<number> {
-  return await runNonInteractiveCommand(argv, deps, overrides);
 }

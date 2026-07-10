@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"],
+  "references": [
+    { "path": "../agent-config" },
+    { "path": "../agent-protocol" },
+    { "path": "../agent-kernel" },
+    { "path": "../agent-store" },
+    { "path": "../agent-platform" },
+    { "path": "../agent-context" },
+    { "path": "../agent-mcp" },
+    { "path": "../agent-model" },
+    { "path": "../agent-supervisor" },
+    { "path": "../agent-tools" }
+  ]
+}

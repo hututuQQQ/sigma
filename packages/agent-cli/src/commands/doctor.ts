@@ -1,270 +1,94 @@
 import { access } from "node:fs/promises";
-import { createModelClient } from "agent-ai";
-import { createDefaultSandboxAdapter, normalizeSandboxConfig, redactSecrets } from "agent-core";
-import type { SandboxAvailability } from "agent-core";
+import { checkProviderHealth } from "agent-runtime";
 import { loadCliConfig, parseArgs } from "../config.js";
-import { maskSecret } from "../output.js";
 
-type DoctorStatus = "ok" | "warning" | "error";
-type DoctorCheckStatus = DoctorStatus | "skipped";
+interface DoctorDeps {
+  stdout?: NodeJS.WritableStream;
+  stderr?: NodeJS.WritableStream;
+}
 
 interface DoctorCheck {
   name: string;
-  status: DoctorCheckStatus;
+  status: "ok" | "warning" | "error" | "skipped";
   message: string;
-  recommendation?: string;
-  detail?: unknown;
 }
 
-interface DoctorCommandDeps {
-  stdout?: NodeJS.WritableStream;
+function configuredKey(provider: "deepseek" | "glm"): boolean {
+  return provider === "deepseek"
+    ? Boolean(process.env.DEEPSEEK_API_KEY)
+    : Boolean(process.env.GLM_API_KEY || process.env.ZAI_API_KEY || process.env.BIGMODEL_API_KEY);
 }
 
-function fallbackWarning(availability: { available: boolean; backend: string; reason?: string } | undefined, required: boolean): string | null {
-  if (!availability || availability.available || required) return null;
-  return `OS sandbox backend '${availability.backend}' is unavailable; commands will use policy-only checks because sandbox.required=false. Use --sandbox-required to fail closed.`;
+function nodeCheck(): DoctorCheck {
+  return process.versions.node === "24.18.0"
+    ? { name: "node", status: "ok", message: `Node ${process.versions.node}` }
+    : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to 24.18.0.` };
 }
 
-function stdout(deps: DoctorCommandDeps): NodeJS.WritableStream {
-  return deps.stdout ?? process.stdout;
-}
-
-function providerKeyStatus(provider: string): string {
-  if (provider === "deepseek") {
-    return `DEEPSEEK_API_KEY=${maskSecret(process.env.DEEPSEEK_API_KEY)}`;
+async function apiCheck(provider: "deepseek" | "glm", model: string, enabled: boolean): Promise<DoctorCheck> {
+  if (!enabled) return { name: "api", status: "skipped", message: "Pass --check-api to verify the provider." };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("API check timed out.")), 30_000);
+  try {
+    const message = await checkProviderHealth({ provider, model, signal: controller.signal });
+    return { name: "api", status: "ok", message };
+  } catch (error) {
+    return { name: "api", status: "error", message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timer);
   }
-  return [
-    `GLM_API_KEY=${maskSecret(process.env.GLM_API_KEY)}`,
-    `ZAI_API_KEY=${maskSecret(process.env.ZAI_API_KEY)}`,
-    `BIGMODEL_API_KEY=${maskSecret(process.env.BIGMODEL_API_KEY)}`
-  ].join(" ");
 }
 
-function providerKeyStatusJson(provider: string): Record<string, string> {
-  if (provider === "deepseek") {
-    return { DEEPSEEK_API_KEY: maskSecret(process.env.DEEPSEEK_API_KEY) };
+async function workspaceCheck(workspace: string): Promise<DoctorCheck> {
+  try {
+    await access(workspace);
+    return { name: "workspace", status: "ok", message: workspace };
+  } catch {
+    return { name: "workspace", status: "error", message: `Workspace is not accessible: ${workspace}` };
   }
-  return {
-    GLM_API_KEY: maskSecret(process.env.GLM_API_KEY),
-    ZAI_API_KEY: maskSecret(process.env.ZAI_API_KEY),
-    BIGMODEL_API_KEY: maskSecret(process.env.BIGMODEL_API_KEY)
-  };
 }
 
-function providerKeyPresent(provider: string): boolean {
-  if (provider === "deepseek") return Boolean(process.env.DEEPSEEK_API_KEY);
-  return Boolean(process.env.GLM_API_KEY || process.env.ZAI_API_KEY || process.env.BIGMODEL_API_KEY);
+function providerKeyCheck(provider: "deepseek" | "glm"): DoctorCheck {
+  return configuredKey(provider)
+    ? { name: "provider_key", status: "ok", message: `${provider} credentials are configured.` }
+    : { name: "provider_key", status: "warning", message: `${provider} credentials are not configured.` };
 }
 
-function providerKeyCheck(provider: string): DoctorCheck {
-  if (providerKeyPresent(provider)) {
-    return {
-      name: "provider_key",
-      status: "ok",
-      message: `Provider key is configured for ${provider}.`
-    };
+function reportStatus(checks: DoctorCheck[], strict: boolean): { failed: boolean; status: "ok" | "warning" | "error" } {
+  const hasError = checks.some((item) => item.status === "error");
+  const hasWarning = checks.some((item) => item.status === "warning");
+  const failed = hasError || (strict && hasWarning);
+  return { failed, status: failed ? "error" : hasWarning ? "warning" : "ok" };
+}
+
+function writeReport(stdout: NodeJS.WritableStream, report: object, checks: DoctorCheck[], json: boolean): void {
+  if (json) {
+    stdout.write(`${JSON.stringify(report)}\n`);
+    return;
   }
-  return {
-    name: "provider_key",
-    status: "warning",
-    message: `Provider key is not configured for ${provider}.`,
-    recommendation: provider === "deepseek"
-      ? "Set DEEPSEEK_API_KEY before running against the live model."
-      : "Set ZAI_API_KEY, GLM_API_KEY, or BIGMODEL_API_KEY before running against the live model."
-  };
+  for (const check of checks) stdout.write(`${check.name}=${check.status} ${check.message}\n`);
 }
 
-function workspaceCheck(accessible: boolean, workspacePath: string): DoctorCheck {
-  return accessible
-    ? { name: "workspace", status: "ok", message: `Workspace is accessible: ${workspacePath}` }
-    : {
-        name: "workspace",
-        status: "error",
-        message: `Workspace is not accessible: ${workspacePath}`,
-        recommendation: "Create the workspace directory or pass --workspace with a valid path."
-      };
-}
-
-function sandboxCheck(
-  availability: SandboxAvailability | undefined,
-  required: boolean,
-  fallback: string | null
-): DoctorCheck {
-  if (!availability) {
-    return {
-      name: "sandbox",
-      status: "warning",
-      message: "Sandbox availability could not be checked.",
-      recommendation: "Run with --sandbox-required in automation when OS isolation is mandatory."
-    };
-  }
-  if (availability.available) {
-    return {
-      name: "sandbox",
-      status: "ok",
-      message: `Sandbox backend is available: ${availability.backend}.`,
-      detail: availability
-    };
-  }
-  if (required) {
-    return {
-      name: "sandbox",
-      status: "error",
-      message: `Sandbox backend is required but unavailable: ${availability.backend}.`,
-      recommendation: availability.reason ?? "Install/configure the requested sandbox backend or use a supported backend.",
-      detail: availability
-    };
-  }
-  return {
-    name: "sandbox",
-    status: "warning",
-    message: fallback ?? `Sandbox backend is unavailable: ${availability.backend}.`,
-    recommendation: "Use --sandbox-required for fail-closed automation, or switch to a backend available on this OS.",
-    detail: availability
-  };
-}
-
-function apiCheck(requested: boolean, status: "skipped" | "ok" | "failed", message: string | null): DoctorCheck {
-  if (!requested) {
-    return {
-      name: "api",
-      status: "skipped",
-      message: "API check was not requested.",
-      recommendation: "Run agent doctor --check-api to verify live model connectivity."
-    };
-  }
-  if (status === "ok") return { name: "api", status: "ok", message: `API check passed: ${message ?? "ok"}` };
-  return {
-    name: "api",
-    status: "error",
-    message: `API check failed: ${message ?? "unknown error"}`,
-    recommendation: "Check provider credentials, model name, network access, and provider service status."
-  };
-}
-
-function overallStatus(checks: DoctorCheck[]): DoctorStatus {
-  if (checks.some((check) => check.status === "error")) return "error";
-  if (checks.some((check) => check.status === "warning")) return "warning";
-  return "ok";
-}
-
-function checkLine(check: DoctorCheck): string {
-  const recommendation = check.recommendation ? ` recommendation=${check.recommendation}` : "";
-  return `check=${check.name} status=${check.status} message=${check.message}${recommendation}`;
-}
-
-function strictFlag(value: unknown): boolean {
-  return value === true || value === "true";
-}
-
-export async function runDoctorCommand(argv: string[], deps: DoctorCommandDeps = {}): Promise<number> {
+export async function runDoctorCommand(argv: string[], deps: DoctorDeps = {}): Promise<number> {
+  const stdout = deps.stdout ?? process.stdout;
+  const stderr = deps.stderr ?? process.stderr;
   if (argv.includes("--help") || argv.includes("-h")) {
-    stdout(deps).write(`agent doctor [flags]
-
-Check local Sigma configuration and product readiness.
-
-Flags:
-  --workspace <path>
-  --provider <deepseek|glm>
-  --model <name>
-  --check-api
-  --strict
-  --json
-
-Use --strict in CI or release checks to fail on warnings such as missing provider keys or sandbox fallback.
-`);
+    stdout.write("agent doctor [--workspace <path>] [--check-api] [--strict] [--json]\n");
     return 0;
   }
-  const { flags } = parseArgs(argv);
-  const config = loadCliConfig(flags);
-  const json = flags.json !== undefined;
-  const strict = strictFlag(flags.strict);
-  const lines: string[] = [];
-  let workspaceAccessible = true;
-  const report = {
-    status: "ok" as DoctorStatus,
-    strict,
-    node: process.version,
-    workspace: {
-      path: config.workspace,
-      accessible: true
-    },
-    provider: config.provider,
-    model: config.model ?? null,
-    providerKeys: providerKeyStatusJson(config.provider),
-    sandbox: {
-      effective: normalizeSandboxConfig(config.workspace, config.sandbox),
-      availability: await createDefaultSandboxAdapter().checkAvailability?.(config.sandbox, config.workspace),
-      fallbackWarning: null as string | null
-    },
-    apiCheck: {
-      requested: flags["check-api"] === true,
-      status: "skipped" as "skipped" | "ok" | "failed",
-      message: null as string | null
-    },
-    checks: [] as DoctorCheck[]
-  };
-  report.sandbox.fallbackWarning = fallbackWarning(report.sandbox.availability, report.sandbox.effective.required);
-
-  lines.push(`readiness=pending strict=${strict}`);
-  lines.push(`node=${process.version}`);
-  lines.push(`provider=${config.provider}`);
-  lines.push(`model=${config.model ?? "(provider default)"}`);
-  lines.push(providerKeyStatus(config.provider));
-  const sandboxAvailability = report.sandbox.availability;
-  lines.push(
-    `sandbox=${report.sandbox.effective.mode}/${report.sandbox.effective.backend}` +
-      ` network=${report.sandbox.effective.network.mode}` +
-      ` available=${sandboxAvailability?.available ?? false}` +
-      `${sandboxAvailability?.reason ? ` reason=${sandboxAvailability.reason}` : ""}` +
-      `${report.sandbox.fallbackWarning ? ` warning=${report.sandbox.fallbackWarning}` : ""}`
-  );
-
   try {
-    await access(config.workspace);
-    lines.push(`workspace=${config.workspace}`);
-  } catch {
-    workspaceAccessible = false;
-    report.workspace.accessible = false;
-    lines.push(`workspace=${config.workspace} (not accessible)`);
+    const { flags } = parseArgs(argv);
+    const config = loadCliConfig(flags);
+    const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
+    checks.push({ name: "tool_isolation", status: "warning", message: "Tool effects and workspace containment are enforced; OS-level sandboxing is not configured." });
+    checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
+    const strict = flags.strict === true;
+    const outcome = reportStatus(checks, strict);
+    const report = { status: outcome.status, strict, checks };
+    writeReport(stdout, report, checks, flags.json === true);
+    return outcome.failed ? 1 : 0;
+  } catch (error) {
+    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
   }
-
-  if (flags["check-api"] === true) {
-    try {
-      const client = createModelClient(config.provider, { model: config.model });
-      const response = await client.complete({
-        messages: [
-          { role: "system", content: "Reply with ok." },
-          { role: "user", content: "ok?" }
-        ],
-        toolChoice: "none",
-        maxTokens: 8,
-        temperature: 0
-      });
-      lines.push(`api=ok (${response.message.content ?? "no content"})`);
-      report.apiCheck.status = "ok";
-      report.apiCheck.message = response.message.content ?? "no content";
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      lines.push(`api=failed (${message})`);
-      report.apiCheck.status = "failed";
-      report.apiCheck.message = message;
-    }
-  }
-
-  report.checks = [
-    { name: "node", status: "ok", message: `Node runtime is available: ${process.version}` },
-    workspaceCheck(workspaceAccessible, config.workspace),
-    providerKeyCheck(config.provider),
-    sandboxCheck(report.sandbox.availability, report.sandbox.effective.required, report.sandbox.fallbackWarning),
-    apiCheck(flags["check-api"] === true, report.apiCheck.status, report.apiCheck.message)
-  ];
-  report.status = overallStatus(report.checks);
-  lines[0] = `readiness=${report.status} strict=${strict}`;
-  lines.push(...report.checks.map(checkLine));
-
-  stdout(deps).write(json ? `${JSON.stringify(redactSecrets(report))}\n` : `${lines.join("\n")}\n`);
-  if (report.status === "error") return 1;
-  if (strict && report.status === "warning") return 1;
-  return 0;
 }

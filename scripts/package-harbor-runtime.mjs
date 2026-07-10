@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
   buildHarborJobConfig,
   defaultAgentCliTarballForEnv,
@@ -75,7 +75,7 @@ PYTHONPATH="$PWD/.artifacts/harbor-runtime" \\
 harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
 \`\`\`
 
-The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent run\`, and downloads \`summary.json\`, \`trace.jsonl\`, and best-effort attempt artifacts.
+The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent run\`, and records its structured result after the run. Evaluation output is never passed back into the solving session.
 `;
 }
 
@@ -97,6 +97,9 @@ export async function packageHarborRuntime(options = {}) {
 
   if (!existsSync(sourcePath)) {
     throw new Error(`Portable Harbor runtime source is missing: ${sourcePath}`);
+  }
+  if (!existsSync(agentCliTarball)) {
+    throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
 
   const sourceText = await readFile(sourcePath, "utf8");

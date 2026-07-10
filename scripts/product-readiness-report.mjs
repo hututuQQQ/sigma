@@ -35,9 +35,9 @@ function productSmokeChecks(productSmoke) {
   return [
     check("productSmoke:ok", productSmoke?.ok === true, "product smoke completed"),
     check("productSmoke:sessionId", typeof productSmoke?.sessionId === "string" && productSmoke.sessionId.length > 0, productSmoke?.sessionId ?? "missing"),
-    check("productSmoke:changedFiles", Array.isArray(productSmoke?.changedFiles) && productSmoke.changedFiles.includes("hello.txt"), "hello.txt changed"),
-    check("productSmoke:jobs", Number(productSmoke?.jobSummary?.completed ?? 0) >= 1, `completed=${String(productSmoke?.jobSummary?.completed ?? "missing")}`),
-    check("productSmoke:manifest", typeof productSmoke?.artifacts?.manifest === "string" && productSmoke.artifacts.manifest.includes("artifacts.json"), productSmoke?.artifacts?.manifest ?? "missing")
+    check("productSmoke:outcome", productSmoke?.outcome?.kind === "completed", productSmoke?.outcome?.kind ?? "missing"),
+    check("productSmoke:sessions", Number(productSmoke?.sessions ?? 0) >= 1, `sessions=${String(productSmoke?.sessions ?? "missing")}`),
+    check("productSmoke:doctor", typeof productSmoke?.doctor?.status === "string", productSmoke?.doctor?.status ?? "missing")
   ];
 }
 
@@ -50,8 +50,7 @@ function tuiSmokeChecks(tuiSmoke) {
     check("tuiSmoke:cursorLifecycle", checks.cursorLifecycle === true, "cursor hidden/restored"),
     check("tuiSmoke:rawModeLifecycle", checks.rawModeLifecycle === true, "raw mode enabled/restored"),
     check("tuiSmoke:runCompleted", checks.runCompleted === true, "fake-model run completed"),
-    check("tuiSmoke:jobsPanel", checks.jobsPanel === true, "/jobs panel verified"),
-    check("tuiSmoke:artifactsPanel", checks.artifactsPanel === true, "/artifacts panel verified")
+    check("tuiSmoke:resize", checks.resize === true, "responsive resize verified")
   ];
 }
 
@@ -163,7 +162,7 @@ export async function buildProductReadinessReport(options = {}) {
       ? `Live provider smoke passed for ${providerSmoke.provider}${providerSmoke.model ? `/${providerSmoke.model}` : ""}.`
       : `Live provider smoke is not proven: ${providerSmoke?.status ?? "missing"}${providerSmoke?.reason ? ` (${providerSmoke.reason})` : ""}`,
     "Default product readiness remains benchmark-neutral; benchmark adapters stay outside the product gate.",
-    "Windows Terminal manual TUI signoff remains a release-hardening item unless separately evidenced."
+    "CI covers packaged Linux PTY and Windows ConPTY startup/cleanup; IME, rapid resize, fonts, and terminal-emulator matrix signoff remain release-hardening items."
   ];
 
   return {

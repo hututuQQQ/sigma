@@ -137,7 +137,7 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const { runDoctorCommand } = await import(`file://${cliDoctorEntry.replace(/\\/g, "/")}`);
-  const { runRunCommand } = await import(`file://${cliRunEntry.replace(/\\/g, "/")}`);
+  const { runCommand } = await import(`file://${cliRunEntry.replace(/\\/g, "/")}`);
   const { runSessionCommand } = await import(`file://${cliSessionEntry.replace(/\\/g, "/")}`);
 
   const doctor = await captureProcessWrites(async (stdout, stderr) => await runDoctorCommand([
@@ -155,7 +155,8 @@ async function main(argv = process.argv.slice(2)) {
   } catch {
     // Keep raw stdout/stderr in the report below.
   }
-  if (doctor.code !== 0 || doctorReport?.apiCheck?.status !== "ok") {
+  const doctorApi = doctorReport?.checks?.find((item) => item.name === "api");
+  if (doctor.code !== 0 || doctorApi?.status !== "ok") {
     const report = {
       ok: false,
       status: "failed",
@@ -176,7 +177,7 @@ async function main(argv = process.argv.slice(2)) {
     "sigma provider smoke",
     "ready"
   ].join("\n");
-  const run = await captureProcessWrites(async (stdout, stderr) => await runRunCommand([
+  const run = await captureProcessWrites(async (stdout, stderr) => await runCommand([
     instruction,
     "--workspace",
     workspace,
@@ -184,31 +185,11 @@ async function main(argv = process.argv.slice(2)) {
     provider,
     ...(model ? ["--model", model] : []),
     "--permission-mode",
-    "yolo",
-    "--max-turns",
-    "6",
-    "--max-wall-time-sec",
-    "420",
-    "--command-timeout-sec",
-    "60",
-    "--validation-mode",
-    "off",
-    "--context-mode",
-    "repo-map",
-    "--skills-mode",
-    "off",
-    "--no-subagents",
-    "--final-evidence-mode",
     "auto",
-    "--trace-jsonl",
-    path.join(artifactsDir, "trace.jsonl"),
-    "--summary-json",
-    path.join(artifactsDir, "summary.json"),
-    "--session-jsonl",
-    path.join(artifactsDir, "session.jsonl"),
+    "--run-deadline-sec",
+    "420",
     "--output-format",
-    "json",
-    "--no-stream-ui"
+    "json"
   ], { stdout, stderr }));
 
   let runResult = null;
@@ -240,17 +221,17 @@ async function main(argv = process.argv.slice(2)) {
     finishedAt: new Date().toISOString(),
     workspace,
     doctorStatus: doctorReport?.status ?? null,
-    apiCheck: doctorReport?.apiCheck ?? null,
+    apiCheck: doctorApi ?? null,
     run: runResult ?? { code: run.code, stdout: run.stdout, stderr: run.stderr },
-    sessionId: inspection?.meta?.sessionId ?? runResult?.sessionId ?? null,
-    changedFiles: inspection?.changedFiles ?? runResult?.changedFiles ?? [],
-    artifacts: inspection?.artifacts ?? null,
+    sessionId: inspection?.summary?.sessionId ?? runResult?.sessionId ?? null,
+    changedFiles: [],
+    artifacts: null,
     checks: {
-      doctorApi: doctorReport?.apiCheck?.status === "ok",
+      doctorApi: doctorApi?.status === "ok",
       runCompleted: runResult?.status === "completed",
       fileCreated: existsSync(filePath),
       fileContent: fileOk,
-      inspect: inspect.code === 0 && Boolean(inspection?.meta?.sessionId)
+      inspect: inspect.code === 0 && Boolean(inspection?.summary?.sessionId)
     }
   };
   await writeReport(report);

@@ -9,7 +9,8 @@
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "references": [
-    { "path": "../agent-ai" },
-    { "path": "../agent-core" }
+    { "path": "../agent-protocol" },
+    { "path": "../agent-config" },
+    { "path": "../agent-presentation" }
   ]
 }

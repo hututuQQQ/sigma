@@ -127,21 +127,8 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
-        max_turns: int = 200,
-        command_timeout_sec: int = 180,
         max_wall_time_sec: int = 7200,
-        post_run_cleanup_globs: str | list[str] | None = None,
-        precheck_command: str | None = None,
-        precheck_timeout_sec: int | None = None,
-        validation_mode: str | None = None,
-        validation_retry_limit: int = 0,
-        validation_timeout_sec: int | None = None,
-        harness_timeout_sec: int | None = None,
         agent_timeout_grace_sec: int = 120,
-        retry_min_budget_sec: int | None = None,
-        max_message_history_chars: int | None = 250000,
-        message_history_retain: int = 24,
-        compaction_summary_chars: int = 30000,
         **kwargs: Any,
     ) -> None:
         resolved_logs_dir = pathlib.Path(logs_dir) if logs_dir is not None else pathlib.Path.cwd() / ".agent" / "harbor"
@@ -151,25 +138,8 @@ class SigmaCliHarborAgent(BaseAgent):
         self.agent_cli_tarball = pathlib.Path(agent_cli_tarball) if agent_cli_tarball is not None else None
         self.provider = provider
         self.model = resolved_model
-        self.max_turns = max_turns
-        self.command_timeout_sec = command_timeout_sec
         self.max_wall_time_sec = max_wall_time_sec
-        self.cleanup_globs = _normalize_globs(post_run_cleanup_globs)
-        self.precheck_command = precheck_command.strip() if isinstance(precheck_command, str) and precheck_command.strip() else None
-        self.precheck_timeout_sec = max(1, _as_int(precheck_timeout_sec, command_timeout_sec))
-        self.validation_retry_limit = max(0, _as_int(validation_retry_limit, 0))
-        self.validation_mode = self._resolve_validation_mode(validation_mode)
-        harness_timeout = _as_int(harness_timeout_sec, 0)
-        self.harness_timeout_sec = harness_timeout if harness_timeout > 0 else None
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
-        retry_min_budget = _as_int(retry_min_budget_sec, 0)
-        self.retry_min_budget_sec = retry_min_budget if retry_min_budget > 0 else None
-        self.max_message_history_chars = (
-            None if max_message_history_chars is None else max(0, _as_int(max_message_history_chars, 0))
-        )
-        self.message_history_retain = max(0, _as_int(message_history_retain, 24))
-        self.compaction_summary_chars = max(1, _as_int(compaction_summary_chars, 30000))
-        self.validation_timeout_sec = max(1, _as_int(validation_timeout_sec, self.precheck_timeout_sec))
 
     @staticmethod
     def name() -> str:
@@ -177,11 +147,6 @@ class SigmaCliHarborAgent(BaseAgent):
 
     def version(self) -> str | None:
         return "0.1.0"
-
-    def _resolve_validation_mode(self, validation_mode: str | None) -> str:
-        if isinstance(validation_mode, str) and validation_mode.strip():
-            return validation_mode.strip()
-        return "auto"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
@@ -212,9 +177,6 @@ class SigmaCliHarborAgent(BaseAgent):
         env_vars = self._agent_env()
         result: Any | None = None
         error_message: str | None = None
-        summary_path: pathlib.Path | None = None
-        trace_path: pathlib.Path | None = None
-
         try:
             await self._upload_instruction(environment, instruction)
             result = await self._run_agent_once(environment, env_vars, context)
@@ -223,22 +185,11 @@ class SigmaCliHarborAgent(BaseAgent):
         except Exception as exc:
             error_message = str(exc)
         finally:
-            try:
-                summary_path = await self._download_if_present(environment, "/tmp/agent/summary.json", "summary.json")
-            except Exception as exc:
-                error_message = error_message or f"failed to download summary.json: {exc}"
-            try:
-                trace_path = await self._download_if_present(environment, "/tmp/agent/trace.jsonl", "trace.jsonl")
-            except Exception as exc:
-                error_message = error_message or f"failed to download trace.jsonl: {exc}"
-            try:
-                await self._download_attempt_artifacts(environment)
-            except Exception:
-                pass
+            pass
 
-        summary = self._read_summary(summary_path)
+        summary = self._read_result(result)
         self._populate_context(context, result, summary, error_message)
-        self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
+        self._mirror_bench_artifacts(context, result, None, None, summary)
 
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         command = [
@@ -246,69 +197,27 @@ class SigmaCliHarborAgent(BaseAgent):
             "run",
             "--workspace",
             "/app",
-            "--instruction-file",
+            "--prompt-file",
             "/tmp/agent/instruction.md",
             "--provider",
             self.provider,
             "--model",
             self.model,
-            "--max-turns",
-            str(self.max_turns),
-            "--command-timeout-sec",
-            str(self.command_timeout_sec),
-            "--max-wall-time-sec",
+            "--run-deadline-sec",
             str(self.max_wall_time_sec),
             "--permission-mode",
-            "yolo",
-            "--trace-jsonl",
-            "/tmp/agent/trace.jsonl",
-            "--summary-json",
-            "/tmp/agent/summary.json",
-            "--attempts-dir",
-            "/tmp/agent/attempts",
-            "--validation-mode",
-            self.validation_mode,
-            "--validation-retry-limit",
-            str(self.validation_retry_limit),
-            "--validation-timeout-sec",
-            str(self.validation_timeout_sec),
-            "--no-stream-ui",
+            "auto",
+            "--output-format",
+            "json",
         ]
-        if self.precheck_command:
-            command.extend(
-                [
-                    "--precheck-command",
-                    self.precheck_command,
-                    "--precheck-timeout-sec",
-                    str(self.precheck_timeout_sec),
-                ]
-            )
-        if self.cleanup_globs:
-            command.extend(["--post-run-cleanup-globs", ",".join(self.cleanup_globs)])
-        if self.harness_timeout_sec is not None:
-            command.extend(["--harness-timeout-sec", str(self.harness_timeout_sec)])
-        if self.retry_min_budget_sec is not None:
-            command.extend(["--retry-min-budget-sec", str(self.retry_min_budget_sec)])
-        if self.max_message_history_chars and self.max_message_history_chars > 0:
-            command.extend(
-                [
-                    "--max-message-history-chars",
-                    str(self.max_message_history_chars),
-                    "--message-history-retain",
-                    str(self.message_history_retain),
-                    "--compaction-summary-chars",
-                    str(self.compaction_summary_chars),
-                ]
-            )
         return command
 
     async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str], context: AgentContext) -> Any:
         command = self._agent_command(context)
-        base_timeout = self.harness_timeout_sec or self.max_wall_time_sec
         return await environment.exec(
             " ".join(shlex.quote(part) for part in command),
             env=env_vars or None,
-            timeout_sec=base_timeout + self.agent_timeout_grace_sec,
+            timeout_sec=self.max_wall_time_sec + self.agent_timeout_grace_sec,
         )
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -400,6 +309,18 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _read_result(self, result: Any | None) -> dict[str, Any]:
+        if result is None:
+            return {}
+        for line in reversed(_stdout_text(result).splitlines()):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return {}
+
     def _populate_context(
         self,
         context: AgentContext,
@@ -470,19 +391,9 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if trace_path is not None and trace_path.is_file():
             shutil.copy2(trace_path, task_dir / "trace.jsonl")
 
-        attempts_dir = self.logs_dir / "attempts"
-        if attempts_dir.is_dir():
-            shutil.copytree(attempts_dir, task_dir / "attempts", dirs_exist_ok=True)
-
         output = _output_text(result).strip() if result is not None else ""
         if output:
             (task_dir / "agent.log").write_text(f"{output}\n", encoding="utf-8")
-
-        harness = summary.get("harness") if isinstance(summary.get("harness"), dict) else {}
-        validation_results = harness.get("validation_results") if isinstance(harness, dict) else []
-        precheck_results = harness.get("precheck_results") if isinstance(harness, dict) else []
-        retry_decisions = harness.get("retry_decisions") if isinstance(harness, dict) else []
-        cleanup = harness.get("post_run_cleanup") if isinstance(harness, dict) else None
 
         metadata = {
             "task_id": task_id,
@@ -495,15 +406,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_output_tokens": getattr(context, "n_output_tokens", 0),
             "n_cache_tokens": getattr(context, "n_cache_tokens", 0),
             "cost_usd": getattr(context, "cost_usd", None),
-            "precheck_results": precheck_results if isinstance(precheck_results, list) else [],
-            "validation_results": validation_results if isinstance(validation_results, list) else [],
-            "validation_mode": self.validation_mode,
-            "validation_timeout_sec": self.validation_timeout_sec,
-            "precheck_timeout_sec": self.precheck_timeout_sec,
-            "retry_decisions": retry_decisions if isinstance(retry_decisions, list) else [],
-            "changed_app_files": self._changed_files_from_harness(summary),
+            "changed_app_files": [],
             "workspace_snapshots": [],
-            "post_run_cleanup": cleanup,
             "failure_signals": self._failure_signals_for_metadata(result, summary),
         }
         (task_dir / "metadata.json").write_text(f"{json.dumps(metadata, indent=2)}\n", encoding="utf-8")
@@ -533,31 +437,6 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 signals.append(signal)
 
         add("agent_setup_ok")
-        harness = summary.get("harness") if isinstance(summary.get("harness"), dict) else {}
-
-        for key in ("validation_results", "precheck_results"):
-            items = harness.get(key) if isinstance(harness, dict) else []
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if not isinstance(item, dict) or _as_int(item.get("exit_code"), 0) == 0:
-                    continue
-                add("validation_failed" if item.get("kind") == "validation" else "precheck_failed")
-
-        decisions = harness.get("retry_decisions") if isinstance(harness, dict) else []
-        if isinstance(decisions, list):
-            for decision in decisions:
-                if not isinstance(decision, dict):
-                    continue
-                if decision.get("action") == "skipped":
-                    add("retry_cut_short_by_budget")
-                if decision.get("action") == "started" and "validation" in str(decision.get("trigger") or ""):
-                    add("validation_retry_used")
-
-        cleanup = harness.get("post_run_cleanup") if isinstance(harness, dict) else None
-        if isinstance(cleanup, dict) and cleanup.get("warning"):
-            add("post_run_cleanup_warning")
-
         result_text = _output_text(result) if result is not None else ""
         if re.search(r"finish[_ ]?reason\"?\s*[:=]\s*\"?max_wall_time", result_text, flags=re.IGNORECASE) or re.search(
             r"agent execution timed out|timed out after|max wall time",

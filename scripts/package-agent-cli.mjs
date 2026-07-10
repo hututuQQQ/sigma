@@ -6,12 +6,10 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const pinnedNodeVersion = "v22.16.0";
+export const pinnedNodeVersion = "v24.18.0";
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
 export const supportedTargetArchitectures = new Set(["x64", "arm64"]);
 const require = createRequire(import.meta.url);
-
-const packages = ["agent-ai", "agent-core", "agent-tui", "agent-cli"];
 
 export function normalizeTargetArch(value = "x64") {
   const targetArch = String(value || "x64").trim();
@@ -93,9 +91,26 @@ function workspaceDependencyName(value) {
   return typeof value === "string" && value.startsWith("workspace:");
 }
 
-async function runtimeExternalDependencies(rootDir) {
+export async function workspaceRuntimePackages(rootDir, entryPackage = "agent-cli") {
+  const discovered = new Set();
+  const pending = [entryPackage];
+  while (pending.length > 0) {
+    const packageName = pending.shift();
+    if (discovered.has(packageName)) continue;
+    const manifestPath = path.join(rootDir, "packages", packageName, "package.json");
+    if (!existsSync(manifestPath)) throw new Error(`Workspace dependency '${packageName}' has no package.json.`);
+    discovered.add(packageName);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    for (const [name, version] of Object.entries(manifest.dependencies ?? {})) {
+      if (workspaceDependencyName(version)) pending.push(name);
+    }
+  }
+  return [...discovered].sort((left, right) => left.localeCompare(right, "en"));
+}
+
+async function runtimeExternalDependencies(rootDir, packageNames) {
   const names = new Set();
-  for (const packageName of packages) {
+  for (const packageName of packageNames) {
     const packageJson = JSON.parse(await readFile(path.join(rootDir, "packages", packageName, "package.json"), "utf8"));
     for (const [name, version] of Object.entries(packageJson.dependencies ?? {})) {
       if (!workspaceDependencyName(version)) names.add(name);
@@ -105,7 +120,7 @@ async function runtimeExternalDependencies(rootDir) {
 }
 
 async function copyNodeModule(rootDir, packageName, targetNodeModules) {
-  const resolvePaths = [rootDir, path.join(rootDir, "packages", "agent-cli"), path.join(rootDir, "packages", "agent-core")];
+  const resolvePaths = [rootDir, path.join(rootDir, "packages", "agent-cli")];
   let packageJsonPath;
   try {
     packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: resolvePaths });
@@ -243,7 +258,8 @@ async function resolveNodeRuntimeArchive(rootDir, artifactsDir, targetPlatform, 
         `Failed to download Node runtime ${runtimeUrl} to ${cachedPath}.`,
         `${error instanceof Error ? error.message : String(error)}`,
         `Set NODE_RUNTIME_ARCHIVE to a pre-downloaded Node runtime archive or pre-fill the cache for offline packaging.`
-      ].join("\n")
+      ].join("\n"),
+      { cause: error }
     );
   }
   if (!existsSync(cachedPath)) {
@@ -288,11 +304,19 @@ async function extractZipArchive(archive, destination) {
       `failed to extract ${archive} as zip archive`,
       powerShellError instanceof Error ? powerShellError.message : String(powerShellError),
       result.stderr || result.stdout
-    ].filter(Boolean).join("\n"));
+    ].filter(Boolean).join("\n"), { cause: powerShellError });
   }
 }
 
-async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform, targetArch, env, downloader) {
+function inspectBundledNodeVersion(nodePath) {
+  const version = spawnSync(nodePath, ["--version"], { encoding: "utf8" });
+  if (version.status !== 0) {
+    throw new Error(`bundled node did not run --version: ${version.stderr || version.stdout}`);
+  }
+  return (version.stdout || version.stderr).trim();
+}
+
+async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform, targetArch, env, downloader, nodeVersionProbe) {
   const resolvedRuntime = await resolveNodeRuntimeArchive(rootDir, artifactsDir, targetPlatform, targetArch, env, downloader);
   const extractDir = path.join(artifactsDir, `.node-runtime-${targetPlatform}-${targetArch}-${process.pid}`);
   await rm(extractDir, { recursive: true, force: true });
@@ -316,11 +340,10 @@ async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform,
       await chmod(bundledNodePath, 0o755).catch(() => undefined);
       let nodeVersionOutput = null;
       if (process.platform !== "win32") {
-        const version = spawnSync(bundledNodePath, ["--version"], { encoding: "utf8" });
-        if (version.status !== 0) {
-          throw new Error(`bundled node did not run --version: ${version.stderr || version.stdout}`);
+        nodeVersionOutput = await nodeVersionProbe(bundledNodePath);
+        if (nodeVersionOutput !== pinnedNodeVersion) {
+          throw new Error(`bundled node version ${nodeVersionOutput} does not match pinned ${pinnedNodeVersion}`);
         }
-        nodeVersionOutput = (version.stdout || version.stderr).trim();
       }
       return { ...resolvedRuntime, bundledNodePath, nodeVersionOutput };
     }
@@ -334,11 +357,10 @@ async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform,
     await cp(nodePath, bundledNodePath);
     let nodeVersionOutput = null;
     if (process.platform === "win32") {
-      const version = spawnSync(bundledNodePath, ["--version"], { encoding: "utf8" });
-      if (version.status !== 0) {
-        throw new Error(`bundled node did not run --version: ${version.stderr || version.stdout}`);
+      nodeVersionOutput = await nodeVersionProbe(bundledNodePath);
+      if (nodeVersionOutput !== pinnedNodeVersion) {
+        throw new Error(`bundled node version ${nodeVersionOutput} does not match pinned ${pinnedNodeVersion}`);
       }
-      nodeVersionOutput = (version.stdout || version.stderr).trim();
     }
     return { ...resolvedRuntime, bundledNodePath, nodeVersionOutput };
   } finally {
@@ -414,10 +436,9 @@ ${agent} tui --workspace ${workspace}
 For non-interactive use:
 
 \`\`\`${isWindows ? "powershell" : "sh"}
-${agent} run "Fix failing tests" --workspace ${workspace}
-${agent} inspect --workspace ${workspace}
-${agent} jobs --workspace ${workspace}
-${agent} artifacts --workspace ${workspace}
+${agent} run "Fix failing tests" --workspace ${workspace} --permission-mode auto
+${agent} inspect "Review the architecture" --workspace ${workspace}
+${agent} sessions --workspace ${workspace}
 \`\`\`
 
 The wrapper uses the bundled Node runtime when available and falls back to a system \`node\` on PATH.
@@ -429,7 +450,7 @@ The wrapper uses the bundled Node runtime when available and falls back to a sys
 
 ## Product Boundary
 
-This bundle is the product CLI runtime. It should be used through user-facing commands such as \`version\`, \`init\`, \`doctor\`, \`tui\`, \`run\`, \`inspect\`, \`jobs\`, and \`artifacts\`. External benchmark adapters may launch this bundle and collect outputs after a run, but benchmark identity, verifier output, rewards, scores, and hidden test details must not be fed back into the solving agent.
+This bundle is the product CLI runtime. It should be used through user-facing commands such as \`version\`, \`init\`, \`doctor\`, \`tui\`, \`run\`, \`inspect\`, \`sessions\`, and \`replay\`. External benchmark adapters may launch this bundle and collect outputs after a run, but benchmark identity, verifier output, rewards, scores, and hidden test details must not be fed back into the solving agent.
 
 ## Metadata
 
@@ -489,6 +510,7 @@ export async function packageAgentCli(options = {}) {
   const bundleName = agentCliBundleName(targetPlatform, targetArch);
   const bundleDir = path.join(artifactsDir, bundleName);
   const outputPath = archivePathForTarget(artifactsDir, bundleName, targetPlatform);
+  const packages = await workspaceRuntimePackages(rootDir);
 
   for (const packageName of packages) {
     assertBuiltPackage(rootDir, packageName);
@@ -504,21 +526,30 @@ export async function packageAgentCli(options = {}) {
     await copyRuntimePackage(rootDir, packageName, path.join(bundleDir, "packages"));
   }
 
-  await copyRuntimePackage(rootDir, "agent-ai", path.join(bundleDir, "node_modules"));
-  await copyRuntimePackage(rootDir, "agent-core", path.join(bundleDir, "node_modules"));
-  await copyRuntimePackage(rootDir, "agent-tui", path.join(bundleDir, "node_modules"));
-  for (const dependency of await runtimeExternalDependencies(rootDir)) {
+  for (const packageName of packages.filter((name) => name !== "agent-cli")) {
+    await copyRuntimePackage(rootDir, packageName, path.join(bundleDir, "node_modules"));
+  }
+  for (const dependency of await runtimeExternalDependencies(rootDir, packages)) {
     await copyNodeModule(rootDir, dependency, path.join(bundleDir, "node_modules"));
   }
 
-  const nodeRuntime = await copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform, targetArch, env, options.downloader);
+  const nodeRuntime = await copyNodeRuntime(
+    rootDir,
+    artifactsDir,
+    bundleDir,
+    targetPlatform,
+    targetArch,
+    env,
+    options.downloader,
+    options.nodeVersionProbe ?? inspectBundledNodeVersion
+  );
 
   await writeFile(
     path.join(bundleDir, "package.json"),
     `${JSON.stringify(
       {
         name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
-        version: "0.1.0",
+        version: "2.0.0",
         private: true,
         type: "module",
         bin: {

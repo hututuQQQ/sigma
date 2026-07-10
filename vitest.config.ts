@@ -1,18 +1,21 @@
 import { defineConfig } from "vitest/config";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const rootDir = path.dirname(fileURLToPath(import.meta.url));
-
 export default defineConfig({
-  resolve: {
-    alias: {
-      "agent-ai": path.join(rootDir, "packages/agent-ai/src/index.ts"),
-      "agent-core": path.join(rootDir, "packages/agent-core/src/index.ts")
-    }
-  },
   test: {
     include: ["tests/**/*.test.ts"],
-    testTimeout: 10000
+    testTimeout: 10000,
+    coverage: {
+      provider: "v8",
+      include: ["packages/*/src/**/*.{ts,tsx}"],
+      reporter: ["text-summary", "json-summary", "json"],
+      thresholds: {
+        statements: 80,
+        lines: 80,
+        functions: 80,
+        branches: 80,
+        "packages/agent-kernel/src/**": { branches: 90 },
+        "packages/agent-protocol/src/**": { branches: 90 },
+        "packages/agent-store/src/**": { branches: 90 }
+      }
+    }
   }
 });

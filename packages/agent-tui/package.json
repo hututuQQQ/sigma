@@ -1,6 +1,6 @@
 {
   "name": "agent-tui",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,7 +16,8 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
-    "agent-ai": "workspace:*",
-    "agent-core": "workspace:*"
-  }
+    "agent-presentation": "workspace:*",
+    "agent-protocol": "workspace:*"
+  },
+  "engines": { "node": ">=24.18.0" }
 }

@@ -5,19 +5,30 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24.18.0
+  PNPM_VERSION: 11.7.0
+
 jobs:
   build-test:
+    name: Ubuntu product and portable release checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.7.0 --activate
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
+          corepack prepare pnpm@${PNPM_VERSION} --activate
+      - name: Verify pinned toolchain
+        run: |
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Prepare package Node runtime
@@ -32,13 +43,97 @@ jobs:
         run: pnpm build
       - name: Lint
         run: pnpm lint
-      - name: Test
-        run: pnpm test
+      - name: Test with coverage
+        run: pnpm test:coverage
       - name: Harbor tests
         run: pnpm test:harbor
       - name: Local fake smoke
         run: pnpm smoke:local:fake
-      - name: Package agent CLI
-        run: pnpm package:agent-cli
+      - name: TUI product smoke
+        run: pnpm smoke:tui-product
+      - name: Sandbox boundary
+        run: pnpm verify:containment
+      - name: Verify portable Linux agent CLI
+        env:
+          AGENT_REQUIRE_TARGET_WRAPPER: "1"
+        run: pnpm verify:package:agent-cli
+      - name: Real PTY /quit smoke on packaged CLI
+        run: >-
+          python3 scripts/ci/tui-real-terminal-smoke.py
+          --node .artifacts/agent-cli-linux-x64/bin/node
+          --cli .artifacts/agent-cli-linux-x64/packages/agent-cli/dist/index.js
+      - name: 100k-file repository performance
+        run: node scripts/perf-repository-100k.mjs
       - name: Package Harbor runtime
         run: pnpm package:harbor-runtime
+      - name: Product readiness
+        run: pnpm product:readiness
+
+  windows-release:
+    name: Windows product, ConPTY, and portable release checks
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@$env:PNPM_VERSION --activate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify pinned toolchain
+        run: |
+          if ((node --version).Trim() -ne "v$env:NODE_VERSION") { throw "Unexpected Node version: $(node --version)" }
+          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version: $(pnpm --version)" }
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Install pinned ConPTY smoke dependency
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          --require-hashes -r scripts/ci/windows-pty-requirements.txt
+      - name: Build
+        run: pnpm build
+      - name: Lint
+        run: pnpm lint
+      - name: Test with coverage
+        run: pnpm test:coverage
+      - name: Harbor tests
+        run: pnpm test:harbor
+      - name: Local fake smoke
+        run: pnpm smoke:local:fake
+      - name: TUI product smoke
+        run: pnpm smoke:tui-product
+      - name: Sandbox boundary
+        run: pnpm verify:containment
+      - name: Prepare Windows package Node runtime
+        id: windows-node
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "sigma-node-runtime"
+          $runtimeDir = Join-Path $runtimeRoot "node-v$env:NODE_VERSION-win-x64"
+          $archive = Join-Path $env:RUNNER_TEMP "node-v$env:NODE_VERSION-win-x64.zip"
+          Remove-Item -LiteralPath $runtimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+          Copy-Item -LiteralPath (Get-Command node).Source -Destination (Join-Path $runtimeDir "node.exe")
+          if ((& (Join-Path $runtimeDir "node.exe") --version).Trim() -ne "v$env:NODE_VERSION") {
+            throw "Prepared Windows runtime does not match v$env:NODE_VERSION"
+          }
+          Compress-Archive -LiteralPath $runtimeDir -DestinationPath $archive -CompressionLevel Optimal
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Verify portable Windows agent CLI and wrapper
+        env:
+          NODE_RUNTIME_ARCHIVE: ${{ steps.windows-node.outputs.archive }}
+        run: pnpm verify:package:agent-cli:windows
+      - name: Real ConPTY /quit smoke on packaged CLI
+        run: >-
+          python scripts/ci/tui-real-terminal-smoke.py
+          --node .artifacts/agent-cli-win32-x64/bin/node.exe
+          --cli .artifacts/agent-cli-win32-x64/packages/agent-cli/dist/index.js
+      - name: Product readiness
+        run: pnpm product:readiness

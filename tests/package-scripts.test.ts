@@ -14,7 +14,7 @@ describe("package scripts", () => {
       "bench:tb:deepseek:task": "node scripts/bench-terminal-bench.mjs --mode task --provider deepseek --model deepseek-v4-pro",
       "package:harbor-runtime": "node scripts/package-harbor-runtime.mjs",
       "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
-      "tui:deepseek": "pnpm --filter agent-tui build && pnpm --filter agent-cli build && node scripts/run-tui-deepseek.mjs"
+      "tui:deepseek": "pnpm build && node scripts/run-tui-deepseek.mjs"
     });
     expect(packageJson.scripts["bench:deepseek"]).not.toBe(packageJson.scripts["bench:tb:deepseek"]);
     expect(JSON.stringify(packageJson.scripts)).not.toContain("DEEPSEEK_API_KEY");
@@ -24,8 +24,8 @@ describe("package scripts", () => {
     const packageJson = JSON.parse(await readFile(path.join(process.cwd(), "package.json"), "utf8"));
 
     expect(packageJson.scripts).toMatchObject({
-      "verify:product": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness",
-      "verify:release:windows": "pnpm lint && pnpm test && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm smoke:provider -- --provider deepseek && node scripts/product-readiness-report.mjs --require-release-ready --require-provider-smoke",
+      "verify:product": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness",
+      "verify:release:windows": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm smoke:provider -- --provider deepseek && node scripts/product-readiness-report.mjs --require-release-ready --require-provider-smoke",
       "smoke:product": "pnpm build && node scripts/smoke-product.mjs",
       "smoke:tui-product": "pnpm build && node scripts/smoke-tui-product.mjs",
       "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",

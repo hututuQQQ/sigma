@@ -22,7 +22,7 @@ function versionReport(bundle: unknown): VersionReport {
     command: "agent",
     package: {
       name: "agent-cli",
-      version: "0.1.0"
+      version: "2.0.0"
     },
     runtime: {
       node: process.version,
@@ -42,7 +42,7 @@ describe("agent-cli version", () => {
       command: "agent",
       package: {
         name: "agent-cli",
-        version: "0.1.0"
+        version: "2.0.0"
       },
       runtime: {
         node: process.version,
@@ -55,14 +55,14 @@ describe("agent-cli version", () => {
   it("prints human and JSON version output", async () => {
     const textStdout = new MemoryWritable();
     await expect(runVersionCommand([], { stdout: textStdout })).resolves.toBe(0);
-    expect(textStdout.text()).toContain("Sigma Code 0.1.0 (agent-cli)");
+    expect(textStdout.text()).toContain("Sigma Code 2.0.0 (agent-cli)");
     expect(textStdout.text()).toContain(`node=${process.version}`);
 
     const jsonStdout = new MemoryWritable();
     await expect(runVersionCommand(["--json"], { stdout: jsonStdout })).resolves.toBe(0);
     expect(JSON.parse(jsonStdout.text())).toMatchObject({
       product: "Sigma Code",
-      package: { name: "agent-cli", version: "0.1.0" }
+      package: { name: "agent-cli", version: "2.0.0" }
     });
   });
 
@@ -88,7 +88,7 @@ describe("agent-cli version", () => {
     expect(stdout.text()).toContain("bundle=win32-x64");
   });
 
-  it("keeps the legacy Linux bundle label when metadata only has targetArch", async () => {
+  it("omits the bundle label when metadata has no target platform", async () => {
     const stdout = new MemoryWritable();
 
     await expect(runVersionCommand([], {
@@ -96,7 +96,7 @@ describe("agent-cli version", () => {
       buildVersionReport: async () => versionReport({ targetArch: "x64" })
     })).resolves.toBe(0);
 
-    expect(stdout.text()).toContain("bundle=linux-x64");
+    expect(stdout.text()).not.toContain("bundle=");
   });
 
   it("supports the top-level --version alias", async () => {
@@ -109,6 +109,6 @@ describe("agent-cli version", () => {
       process.stdout.write = previousWrite;
     }
 
-    expect(stdout.text()).toContain("Sigma Code 0.1.0 (agent-cli)");
+    expect(stdout.text()).toContain("Sigma Code 2.0.0 (agent-cli)");
   });
 });
