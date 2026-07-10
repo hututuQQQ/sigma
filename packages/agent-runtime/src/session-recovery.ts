@@ -41,6 +41,7 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
       requestId: pending.request.callId,
       callId: pending.request.callId,
       toolName: pending.request.name,
+      arguments: pending.request.arguments,
       effects: descriptor?.possibleEffects ?? [],
       reason: "The process stopped during a non-idempotent tool call. Explicit approval is required before retrying.",
       ...pending.modelTurn

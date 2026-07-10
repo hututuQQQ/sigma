@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: 24.18.0
+  NODE_VERSION: 26.4.0
   PNPM_VERSION: 11.7.0
 
 jobs:

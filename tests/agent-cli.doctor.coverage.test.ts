@@ -55,7 +55,7 @@ describe("doctor command branch coverage", () => {
   it("reports a healthy Node/provider/API path as JSON", async () => {
     const root = await workspace();
     const originalNode = Object.getOwnPropertyDescriptor(process.versions, "node");
-    Object.defineProperty(process.versions, "node", { value: "24.18.0", configurable: true, enumerable: true });
+    Object.defineProperty(process.versions, "node", { value: "26.4.0", configurable: true, enumerable: true });
     vi.stubEnv("DEEPSEEK_API_KEY", "configured-for-test");
     try {
       const stdout = new Capture();

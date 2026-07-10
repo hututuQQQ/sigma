@@ -20,9 +20,9 @@ function configuredKey(provider: "deepseek" | "glm"): boolean {
 }
 
 function nodeCheck(): DoctorCheck {
-  return process.versions.node === "24.18.0"
+  return process.versions.node === "26.4.0"
     ? { name: "node", status: "ok", message: `Node ${process.versions.node}` }
-    : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to 24.18.0.` };
+    : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to 26.4.0.` };
 }
 
 async function apiCheck(provider: "deepseek" | "glm", model: string, enabled: boolean): Promise<DoctorCheck> {

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sigma-code-mark.png" alt="Sigma Code" width="160">
+</p>
+
 # Sigma Code
 
 Sigma Code is an event-sourced coding agent for DeepSeek and GLM. The shipped product has one kernel, one session format, and one terminal UI. Removed `agent-core`, `agent-ai`, controller/final-gate, and prior TUI components are not part of the runtime or portable package.
@@ -39,7 +43,7 @@ Workspace packages communicate through public exports, and the production depend
 - `agent-supervisor`: bounded child scheduling, mailboxes, and writer isolation
 - `agent-runtime`: composition, event execution, recovery, and session ownership
 - `agent-presentation`: incremental event projection
-- `agent-tui`: incremental pure-TypeScript terminal renderer/controller
+- `agent-tui`: imperative OpenTUI Core renderer over the event-driven `RuntimeClient`
 - `agent-cli`: thin user-command adapter
 
 ### Completion is a protocol action
@@ -56,7 +60,7 @@ Rejected completion proposals become ordinary tool failures and the kernel conti
 
 ## Requirements
 
-- Node.js `24.18.0` (pinned by `.node-version`, CI, package metadata, and the portable runtime)
+- Node.js `26.4.0` (pinned by `.node-version`, CI, package metadata, and the portable runtime)
 - pnpm `11.7.0`
 - for live model calls: `DEEPSEEK_API_KEY`, or one of `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`
 
@@ -187,14 +191,15 @@ The default child concurrency is four. Each child gets its own session transcrip
 
 ## TUI
 
-The TUI uses a single status line, virtualized transcript, collapsible activity, multi-request approval inbox, and grapheme-safe composer. It sanitizes untrusted terminal control text, supports CJK/combining characters/emoji and bracketed paste, caps rendering at 30 fps, and restores raw/alternate-screen/cursor state on exit.
+The TUI uses the imperative `@opentui/core` API: a responsive status bar, keyed/culled conversation viewport, compact or expanded activity, queued follow-up preview, a one-to-six-line composer, and help/approval overlays. Assistant replies render as Markdown, user input remains literal text, and oversized terminal message views retain their beginning and end with an explicit omission marker. Untrusted terminal controls are sanitized throughout. CJK, combining characters, emoji, IME/bracketed paste, mouse wheels, and 20×5 terminals are supported; alternate-screen, raw mode, cursor, subscriptions, and active sessions are restored or released on every exit path.
 
-- normal input continues the current session;
+- Enter submits while idle and steers the active run; Shift+Enter or Ctrl+J inserts a line;
+- Alt+Enter queues a follow-up (`/followup` is the compatibility form);
 - `/new` cancels an active run and creates a new session;
-- input during a running or suspended run enters the steering FIFO;
-- `/followup <text>` queues work after the current answer;
 - `/mode analyze|change` changes the next run mode;
 - `/activity` collapses or expands activity;
+- `/help`, an empty-input `?`, and `/` completion expose the same command registry;
+- PgUp/PgDn, Ctrl+U/Ctrl+D, and the mouse wheel scroll without stealing composer focus;
 - the first Ctrl+C cancels, and a second within 1.5 seconds exits.
 
 Steering rejects stale model/tool turns before they can start later effects. Follow-ups are durably recorded as queued/delivered events and recover in FIFO order. Both queues reject new input at their 256-message capacity rather than overwriting existing entries. See [VALIDATION.md](./VALIDATION.md) for renderer and real-terminal CI boundaries.
@@ -213,7 +218,7 @@ pnpm verify:package:agent-cli
 
 `pnpm lint` runs TypeScript, ESLint complexity/function-size rules, dependency-cycle/public-export checks, Knip, and production file-size guards. Coverage gates are global and stricter for kernel/protocol/store; the exact commands and thresholds are documented in [VALIDATION.md](./VALIDATION.md).
 
-Portable Linux and Windows packages discover the complete `agent-cli` workspace dependency closure from manifests and bundle Node `24.18.0`. The structural package check is cross-platform; executing a target wrapper requires a supported native or WSL environment for that target.
+Development and release use Node `26.4.0`. TUI entry points add `--experimental-ffi` automatically; direct `runTuiApp` callers must start Node with that flag. Portable Linux and Windows packages recursively deploy the complete production dependency graph, preserve nested version conflicts, select optional dependencies for the target OS/CPU/libc, assert the matching OpenTUI native runtime, and bundle Node `26.4.0`. Linux remains glibc-targeted. The structural package check is cross-platform; executing a target wrapper requires a supported native or WSL environment for that target.
 
 ## Evaluation fairness boundary
 

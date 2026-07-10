@@ -1,5 +1,6 @@
 export const maximumTranscriptCharacters = 512_000;
 export const maximumActivityDetailCharacters = 64_000;
+export const maximumApprovalPreviewCharacters = 16_384;
 
 export function boundedPresentationText(value: string, maximum: number): string {
   if (value.length <= maximum) return value;

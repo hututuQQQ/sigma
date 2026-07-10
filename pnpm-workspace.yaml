@@ -1,5 +1,17 @@
 packages:
   - "packages/*"
+supportedArchitectures:
+  os:
+    - current
+    - linux
+    - win32
+  cpu:
+    - current
+    - x64
+    - arm64
+  libc:
+    - current
+    - glibc
 onlyBuiltDependencies:
   - esbuild
   - tree-sitter

@@ -169,7 +169,7 @@ export class EffectRunner {
     if (completionError) return completionError;
     try {
       const restored = session.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
-      const decision = restored === "allowed" ? "allow" : await this.approval(session, descriptor, call.id, modelTurn, signal);
+      const decision = restored === "allowed" ? "allow" : await this.approval(session, descriptor, call, modelTurn, signal);
       if (decision === "deny") return failed(call, startedAt, "Tool request denied.", "permission_denied");
       const keys = lockKeys(session, descriptor);
       await this.awaitSettled(keys, signal);
@@ -307,10 +307,11 @@ export class EffectRunner {
   private async approval(
     session: RuntimeSession,
     descriptor: ToolDescriptor,
-    requestId: string,
+    request: ModelToolCall,
     modelTurn: ActiveModelTurn,
     signal: AbortSignal
   ): Promise<"allow" | "deny" | "always_allow"> {
+    const requestId = request.id;
     if (descriptor.approval === "deny" || this.options.permissionMode === "deny") return "deny";
     const effectGrant = descriptor.possibleEffects.slice().sort().join("\0");
     if (descriptor.approval === "auto" || this.options.permissionMode === "auto" || session.alwaysAllowedEffects.has(effectGrant)) return "allow";
@@ -321,6 +322,7 @@ export class EffectRunner {
       requestId,
       callId: requestId,
       toolName: descriptor.name,
+      arguments: request.arguments,
       effects: descriptor.possibleEffects,
       reason: `Effects: ${descriptor.possibleEffects.join(", ")}`,
       ...turnPayload(modelTurn)

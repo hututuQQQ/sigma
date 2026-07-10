@@ -1,12 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const pinnedNodeVersion = "v24.18.0";
+export const pinnedNodeVersion = "v26.4.0";
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
 export const supportedTargetArchitectures = new Set(["x64", "arm64"]);
 const require = createRequire(import.meta.url);
@@ -108,39 +108,129 @@ export async function workspaceRuntimePackages(rootDir, entryPackage = "agent-cl
   return [...discovered].sort((left, right) => left.localeCompare(right, "en"));
 }
 
-async function runtimeExternalDependencies(rootDir, packageNames) {
-  const names = new Set();
-  for (const packageName of packageNames) {
-    const packageJson = JSON.parse(await readFile(path.join(rootDir, "packages", packageName, "package.json"), "utf8"));
-    for (const [name, version] of Object.entries(packageJson.dependencies ?? {})) {
-      if (!workspaceDependencyName(version)) names.add(name);
+function packageJsonPath(packageName, ownerManifest) {
+  const packageParts = packageName.split("/");
+  let cursor = path.dirname(ownerManifest);
+  while (true) {
+    const candidates = [path.join(cursor, "node_modules", ...packageParts, "package.json")];
+    if (path.basename(cursor) === "node_modules") {
+      candidates.push(path.join(cursor, ...packageParts, "package.json"));
     }
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) continue;
+      const manifest = require(candidate);
+      if (manifest.name === packageName) return realpathSync(candidate);
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
   }
-  return [...names].sort((a, b) => a.localeCompare(b, "en"));
+
+  const ownerRequire = createRequire(ownerManifest);
+  let resolvedManifest;
+  try {
+    resolvedManifest = ownerRequire.resolve(`${packageName}/package.json`);
+  } catch {
+    try {
+      cursor = path.dirname(ownerRequire.resolve(packageName));
+      while (cursor !== path.dirname(cursor)) {
+        const candidate = path.join(cursor, "package.json");
+        if (existsSync(candidate)) {
+          const manifest = require(candidate);
+          if (manifest.name === packageName) return realpathSync(candidate);
+        }
+        cursor = path.dirname(cursor);
+      }
+    } catch { /* dependency may expose import-only entry points */ }
+  }
+  if (!resolvedManifest) throw new Error(`Could not locate package root for dependency ${packageName}`);
+  return realpathSync(resolvedManifest);
 }
 
-async function copyNodeModule(rootDir, packageName, targetNodeModules) {
-  const resolvePaths = [rootDir, path.join(rootDir, "packages", "agent-cli")];
-  let packageJsonPath;
-  try {
-    packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: resolvePaths });
-  } catch {
-    let cursor = path.dirname(require.resolve(packageName, { paths: resolvePaths }));
-    while (cursor !== path.dirname(cursor)) {
-      const candidate = path.join(cursor, "package.json");
-      if (existsSync(candidate)) {
-        packageJsonPath = candidate;
-        break;
-      }
-      cursor = path.dirname(cursor);
+function targetMatches(values, target) {
+  if (!Array.isArray(values) || values.length === 0) return true;
+  const denied = values.filter((value) => typeof value === "string" && value.startsWith("!")).map((value) => value.slice(1));
+  const allowed = values.filter((value) => typeof value === "string" && !value.startsWith("!"));
+  return !denied.includes(target) && (allowed.length === 0 || allowed.includes(target));
+}
+
+function compatiblePackage(manifest, targetPlatform, targetArch) {
+  const libc = targetPlatform === "linux" ? "glibc" : "none";
+  return targetMatches(manifest.os, targetPlatform)
+    && targetMatches(manifest.cpu, targetArch)
+    && targetMatches(manifest.libc, libc);
+}
+
+async function dependencyNode(packageName, ownerManifest, targetPlatform, targetArch, cache, optional = false) {
+  let manifestPath;
+  try { manifestPath = packageJsonPath(packageName, ownerManifest); }
+  catch (error) { if (optional) return undefined; throw error; }
+  if (cache.has(manifestPath)) return cache.get(manifestPath);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  if (!compatiblePackage(manifest, targetPlatform, targetArch)) return undefined;
+  const node = { name: packageName, version: String(manifest.version ?? "0.0.0"), manifestPath, sourceDir: path.dirname(manifestPath), dependencies: [] };
+  cache.set(manifestPath, node);
+  const required = Object.keys(manifest.dependencies ?? {});
+  const optionalNames = Object.keys(manifest.optionalDependencies ?? {});
+  for (const name of required) {
+    const child = await dependencyNode(name, manifestPath, targetPlatform, targetArch, cache);
+    if (child) node.dependencies.push(child);
+  }
+  for (const name of optionalNames) {
+    const child = await dependencyNode(name, manifestPath, targetPlatform, targetArch, cache, true);
+    if (child && !node.dependencies.includes(child)) node.dependencies.push(child);
+  }
+  return node;
+}
+
+async function runtimeDependencyGraph(rootDir, packageNames, targetPlatform, targetArch) {
+  const cache = new Map();
+  const roots = [];
+  for (const workspacePackage of packageNames) {
+    const ownerManifest = path.join(rootDir, "packages", workspacePackage, "package.json");
+    const manifest = JSON.parse(await readFile(ownerManifest, "utf8"));
+    for (const [name, version] of Object.entries(manifest.dependencies ?? {})) {
+      if (workspaceDependencyName(version)) continue;
+      const node = await dependencyNode(name, ownerManifest, targetPlatform, targetArch, cache);
+      if (node && !roots.includes(node)) roots.push(node);
     }
   }
-  if (!packageJsonPath) throw new Error(`Could not locate package root for dependency ${packageName}`);
-  const sourceDir = path.dirname(packageJsonPath);
-  const targetDir = path.join(targetNodeModules, packageName);
+  return { roots, nodes: [...cache.values()] };
+}
+
+async function deployDependency(node, targetDir, preferred, deployed) {
+  const destinationKey = `${targetDir}\0${node.name}@${node.version}`;
+  if (deployed.has(destinationKey)) return;
+  deployed.add(destinationKey);
   await rm(targetDir, { recursive: true, force: true });
   await mkdir(path.dirname(targetDir), { recursive: true });
-  await cp(sourceDir, targetDir, { recursive: true });
+  await cp(node.sourceDir, targetDir, {
+    recursive: true,
+    filter: (source) => {
+      const relative = path.relative(node.sourceDir, source);
+      return relative === "" || relative.split(path.sep)[0] !== "node_modules";
+    }
+  });
+  for (const child of node.dependencies) {
+    if (preferred.get(child.name)?.version === child.version) continue;
+    await deployDependency(child, path.join(targetDir, "node_modules", child.name), preferred, deployed);
+  }
+}
+
+async function deployRuntimeDependencies(rootDir, packageNames, targetNodeModules, targetPlatform, targetArch) {
+  const graph = await runtimeDependencyGraph(rootDir, packageNames, targetPlatform, targetArch);
+  const preferred = new Map();
+  for (const node of [...graph.roots, ...graph.nodes]) if (!preferred.has(node.name)) preferred.set(node.name, node);
+  const deployed = new Set();
+  for (const node of [...preferred.values()].sort((left, right) => left.name.localeCompare(right.name, "en"))) {
+    await deployDependency(node, path.join(targetNodeModules, node.name), preferred, deployed);
+  }
+  if (preferred.has("@opentui/core")) {
+    const nativeName = `@opentui/core-${targetPlatform}-${targetArch}`;
+    if (!preferred.has(nativeName) || !existsSync(path.join(targetNodeModules, nativeName, "package.json"))) {
+      throw new Error(`OpenTUI native runtime is missing for ${targetPlatform}-${targetArch}: ${nativeName}`);
+    }
+  }
 }
 
 function runTar(args, errorMessage, cwd) {
@@ -389,6 +479,9 @@ else
   exit 127
 fi
 
+if [ "\${1:-}" = "tui" ]; then
+  exec "$NODE" --experimental-ffi --disable-warning=ExperimentalWarning "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"
+fi
 exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"
 `;
 }
@@ -409,7 +502,11 @@ for /f "delims=" %%i in ('where node') do (
   goto run
 )
 :run
+if /I "%~1"=="tui" goto run_tui
 "%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*
+exit /b %ERRORLEVEL%
+:run_tui
+"%NODE_EXE%" --experimental-ffi --disable-warning=ExperimentalWarning "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*
 exit /b %ERRORLEVEL%
 `;
 }
@@ -529,9 +626,9 @@ export async function packageAgentCli(options = {}) {
   for (const packageName of packages.filter((name) => name !== "agent-cli")) {
     await copyRuntimePackage(rootDir, packageName, path.join(bundleDir, "node_modules"));
   }
-  for (const dependency of await runtimeExternalDependencies(rootDir, packages)) {
-    await copyNodeModule(rootDir, dependency, path.join(bundleDir, "node_modules"));
-  }
+  await deployRuntimeDependencies(
+    rootDir, packages, path.join(bundleDir, "node_modules"), targetPlatform, targetArch
+  );
 
   const nodeRuntime = await copyNodeRuntime(
     rootDir,

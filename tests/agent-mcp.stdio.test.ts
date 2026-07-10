@@ -695,6 +695,35 @@ describe("MCP stdio client", () => {
     }
   });
 
+  it("decodes split UTF-8 stderr without replacement characters", async () => {
+    const seen: string[] = [];
+    const script = [
+      "const value = Buffer.from([0xe4,0xb8,0xad,0xe6,0x96,0x87,0x20,0xf0,0x9f,0x9a,0x80]);",
+      "let index = 0;",
+      "const timer = setInterval(() => {",
+      "  process.stderr.write(value.subarray(index, index + 1));",
+      "  index += 1;",
+      "  if (index >= value.length) clearInterval(timer);",
+      "}, 2);",
+      "process.stdin.resume();"
+    ].join("\n");
+    const transport = new McpStdioTransport({
+      name: "unicode-stderr", command: process.execPath, args: ["-e", script], cwd: process.cwd()
+    }, {
+      onMessage: () => undefined,
+      onFailure: () => undefined,
+      onStderr: (text) => seen.push(text)
+    }, 1_024, 1_024, 10);
+    try {
+      await transport.start();
+      await eventually(() => transport.stderr === "中文 🚀");
+      expect(seen.join("")).toBe("中文 🚀");
+      expect(transport.stderr).not.toContain("�");
+    } finally {
+      await transport.close();
+    }
+  });
+
   it("guards direct transport lifecycle and decodes an unterminated final frame", async () => {
     const config: McpStdioServerConfig = {
       name: "transport",

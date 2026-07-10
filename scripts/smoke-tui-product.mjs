@@ -36,7 +36,7 @@ async function main() {
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
   if (missing.length) throw new Error(`Built TUI product is missing:\n${missing.join("\n")}`);
-  const [{ TuiController }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all(entries.map((entry) => import(pathToFileURL(entry).href)));
+  const [{ runTuiApp }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all(entries.map((entry) => import(pathToFileURL(entry).href)));
   await rm(artifactsDir, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
   const storeRootDir = runtimeStateRoot(workspace);
@@ -53,8 +53,7 @@ async function main() {
   });
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
-  const controller = new TuiController({ runtime, workspace, stdin, stdout, maxFps: 30 });
-  const running = controller.run();
+  const running = runTuiApp({ runtime, workspace, stdin, stdout, maxFps: 30 });
   await new Promise((resolve) => setTimeout(resolve, 30));
   stdin.write("Create hello.txt\r");
   await waitUntil(() => Promise.resolve(existsSync(path.join(workspace, "hello.txt"))));

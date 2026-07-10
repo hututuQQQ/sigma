@@ -12,5 +12,5 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": { "agent-protocol": "workspace:*" },
-  "engines": { "node": ">=24.18.0" }
+  "engines": { "node": ">=26.4.0" }
 }

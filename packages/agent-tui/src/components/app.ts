@@ -1,10 +1,10 @@
-import type { TuiControllerOptions } from "./controller.js";
-import { TuiController } from "./controller.js";
+import { TuiSessionController } from "./controller.js";
+import type { TuiAppOptions } from "./types.js";
 
-export type TuiAppOptions = TuiControllerOptions;
+export type { TuiAppOptions } from "./types.js";
 
 export async function runTuiApp(options: TuiAppOptions): Promise<void> {
-  const controller = new TuiController(options);
+  const controller = new TuiSessionController(options);
   const stop = (): void => controller.stop();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);

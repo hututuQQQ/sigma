@@ -2,7 +2,8 @@ import type { AgentEventEnvelope, AgentEventType, JsonValue } from "agent-protoc
 import type { ActivityItem, ApprovalItem, PresentationState, TranscriptItem } from "./view-state.js";
 import { projectDiagnostic, projectModelFailed, projectRunFailed } from "./failure-projectors.js";
 import {
-  boundedPresentationText, maximumActivityDetailCharacters, maximumTranscriptCharacters
+  boundedPresentationText, maximumActivityDetailCharacters, maximumApprovalPreviewCharacters,
+  maximumTranscriptCharacters
 } from "./bounds.js";
 
 function payload(event: AgentEventEnvelope): Record<string, JsonValue> {
@@ -13,6 +14,17 @@ function payload(event: AgentEventEnvelope): Record<string, JsonValue> {
 
 function text(value: JsonValue | undefined): string {
   return typeof value === "string" ? value : "";
+}
+
+function strings(value: JsonValue | undefined): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function preview(value: JsonValue | undefined, maximum: number): { text: string; truncated: boolean } {
+  if (value === undefined) return { text: "", truncated: false };
+  const serialized = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const source = serialized ?? String(value);
+  return { text: boundedPresentationText(source, maximum), truncated: source.length > maximum };
 }
 
 function upsertActivity(items: ActivityItem[], item: ActivityItem): ActivityItem[] {
@@ -64,6 +76,7 @@ const projectUserInput: EventProjector = (state, event, data) => {
   const item: TranscriptItem = {
     id: event.eventId,
     role: "user",
+    delivery: event.type === "user.steer" ? "steer" : "submit",
     text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
@@ -74,17 +87,30 @@ const projectUserInput: EventProjector = (state, event, data) => {
 const projectFollowUp: EventProjector = (state, event, data) => {
   const queueId = text(data.queueId);
   if (!queueId) return projectUserInput(state, event, data);
+  if (data.status === "queued") {
+    if (state.queuedFollowUps.some((item) => item.queueId === queueId)) return state;
+    return {
+      ...state,
+      queuedFollowUps: [...state.queuedFollowUps, {
+        queueId,
+        text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
+        occurredAt: event.occurredAt
+      }].slice(-256)
+    };
+  }
   const id = `follow-up:${queueId}`;
   const index = state.transcript.findIndex((item) => item.id === id);
-  if (index >= 0) return state;
+  const queuedFollowUps = state.queuedFollowUps.filter((item) => item.queueId !== queueId);
+  if (index >= 0) return { ...state, queuedFollowUps };
   const item: TranscriptItem = {
     id,
     role: "user",
+    delivery: "follow_up",
     text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
   };
-  return { ...state, transcript: [...state.transcript, item].slice(-2_000) };
+  return { ...state, queuedFollowUps, transcript: [...state.transcript, item].slice(-2_000) };
 };
 
 const projectModelStarted: EventProjector = (state, event, data) => ({
@@ -135,30 +161,74 @@ function toolStatus(type: AgentEventType): ActivityItem["status"] {
 
 const projectToolActivity: EventProjector = (state, event, data) => {
   const callId = text(data.callId) || event.eventId;
+  const current = state.activity.find((item) => item.id === `tool:${callId}`);
+  const argumentsPreview = preview(data.arguments, maximumActivityDetailCharacters).text;
+  const delta = data.workspaceDelta && typeof data.workspaceDelta === "object" && !Array.isArray(data.workspaceDelta)
+    ? data.workspaceDelta as Record<string, JsonValue> : {};
+  const changes = [
+    ["added", strings(delta.added)], ["modified", strings(delta.modified)], ["deleted", strings(delta.deleted)]
+  ].flatMap(([label, values]) => (values as string[]).map((value) => `${label} ${value}`));
+  const detail = text(data.output) || text(data.message) || changes.join("\n") || argumentsPreview || current?.detail || "";
   return {
     ...state,
     activity: upsertActivity(state.activity, {
       id: `tool:${callId}`,
       kind: "tool",
       title: text(data.name) || "tool",
-      detail: boundedPresentationText(
-        text(data.output) || text(data.message), maximumActivityDetailCharacters
-      ),
+      detail: boundedPresentationText(detail, maximumActivityDetailCharacters),
       status: toolStatus(event.type),
       occurredAt: event.occurredAt
     })
   };
 };
 
-const projectApprovalRequested: EventProjector = (state, _event, data) => ({
+const projectToolProgress: EventProjector = (state, event, data) => {
+  const callId = text(data.callId) || event.eventId;
+  const current = state.activity.find((item) => item.id === `tool:${callId}`);
+  const percent = typeof data.percent === "number" && Number.isFinite(data.percent)
+    ? Math.max(0, Math.min(100, data.percent)) : undefined;
+  return {
+    ...state,
+    activity: upsertActivity(state.activity, {
+      id: `tool:${callId}`,
+      kind: "tool",
+      title: text(data.name) || current?.title || "tool",
+      detail: boundedPresentationText(text(data.message) || current?.detail || "Running", maximumActivityDetailCharacters),
+      status: "running",
+      ...(percent === undefined ? {} : { progressPercent: percent }),
+      occurredAt: event.occurredAt
+    })
+  };
+};
+
+const projectApprovalRequested: EventProjector = (state, _event, data) => {
+  const argumentsPreview = preview(data.arguments, maximumApprovalPreviewCharacters);
+  return {
+    ...state,
+    status: "needs_input",
+    approvals: boundedApprovals([...state.approvals.filter((item) => item.requestId !== text(data.requestId)), {
+      requestId: text(data.requestId),
+      toolName: text(data.toolName),
+      reason: text(data.reason),
+      effects: strings(data.effects),
+      argumentPreview: argumentsPreview.text,
+      argumentPreviewTruncated: argumentsPreview.truncated,
+      status: "pending"
+    }])
+  };
+};
+
+const projectContextCompacted: EventProjector = (state, event, data) => ({
   ...state,
-  status: "needs_input",
-  approvals: boundedApprovals([...state.approvals.filter((item) => item.requestId !== text(data.requestId)), {
-    requestId: text(data.requestId),
-    toolName: text(data.toolName),
-    reason: text(data.reason),
-    status: "pending"
-  }])
+  activity: upsertActivity(state.activity, {
+    id: `context:${event.eventId}`,
+    kind: "diagnostic",
+    title: "context compacted",
+    detail: typeof data.omittedHistoryTurns === "number"
+      ? `${data.omittedHistoryTurns} earlier history turns summarized` : "Earlier history summarized",
+    status: "completed",
+    occurredAt: event.occurredAt
+  })
 });
 
 const projectApprovalResolved: EventProjector = (state, _event, data) => {
@@ -223,6 +293,7 @@ const projectors: Partial<Record<AgentEventType, EventProjector>> = {
   "model.failed": projectModelFailed,
   "tool.requested": projectToolActivity,
   "tool.started": projectToolActivity,
+  "tool.progress": projectToolProgress,
   "tool.completed": projectToolActivity,
   "tool.failed": projectToolActivity,
   "tool.approval_requested": projectApprovalRequested,
@@ -230,6 +301,7 @@ const projectors: Partial<Record<AgentEventType, EventProjector>> = {
   "child.spawned": projectChild,
   "child.message": projectChild,
   "child.completed": projectChild,
+  "context.compacted": projectContextCompacted,
   "run.suspended": projectSuspended,
   "run.completed": withStatus("completed"),
   "run.cancelled": withStatus("cancelled"),

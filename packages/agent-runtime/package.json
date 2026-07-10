@@ -21,5 +21,5 @@
     "agent-supervisor": "workspace:*",
     "agent-tools": "workspace:*"
   },
-  "engines": { "node": ">=24.18.0" }
+  "engines": { "node": ">=26.4.0" }
 }
