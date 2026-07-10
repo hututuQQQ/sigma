@@ -52,7 +52,7 @@ jobs:
       - name: TUI product smoke
         run: pnpm smoke:tui-product
       - name: Sandbox boundary
-        run: pnpm verify:sandbox
+        run: pnpm verify:containment
       - name: Verify portable Linux agent CLI
         env:
           AGENT_REQUIRE_TARGET_WRAPPER: "1"
@@ -110,7 +110,7 @@ jobs:
       - name: TUI product smoke
         run: pnpm smoke:tui-product
       - name: Sandbox boundary
-        run: pnpm verify:sandbox
+        run: pnpm verify:containment
       - name: Prepare Windows package Node runtime
         id: windows-node
         run: |
