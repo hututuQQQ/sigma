@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -17,8 +17,6 @@ import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
-import { runtimeStateRoot } from "../packages/agent-runtime/src/index.js";
-import { SessionCommandBus } from "../packages/agent-runtime/src/session-command-bus.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 class Capture extends Writable {
@@ -272,37 +270,40 @@ describe("CLI session branches", () => {
 
   it("routes active session commands through the durable owner inbox", async () => {
     const root = await workspace("sigma-session-owner-");
-    vi.stubEnv("SIGMA_STATE_HOME", path.join(root, "private-state"));
     const runtime = new FakeRuntime();
-    const owner = new SessionCommandBus(runtimeStateRoot(root), async () => undefined);
-    await owner.claim("active");
+    const sent: RunCommand[] = [];
+    const activeOwner = async () => ({
+      pid: process.pid,
+      instanceId: "test-owner",
+      startedAt: new Date().toISOString()
+    });
+    const sendCommand = async (_root: string, command: RunCommand) => { sent.push(command); };
 
     const resume = new Capture();
-    await expect(runSessionCommand(["resume", "active", "--workspace", root], { runtime, stdout: resume })).resolves.toBe(0);
+    await expect(runSessionCommand(["resume", "active", "--workspace", root], {
+      runtime, stdout: resume, activeSessionOwner: activeOwner
+    })).resolves.toBe(0);
     expect(resume.text()).toContain(`pid=${process.pid}`);
 
     const cancel = new Capture();
     await expect(runSessionCommand([
       "cancel", "active", "--workspace", root, "--reason", "operator"
-    ], { runtime, stdout: cancel })).resolves.toBe(0);
+    ], { runtime, stdout: cancel, activeSessionOwner: activeOwner, sendSessionCommand: sendCommand })).resolves.toBe(0);
     const approval = new Capture();
     await expect(runSessionCommand([
       "approve", "active", "request-two", "--workspace", root, "--decision", "deny"
-    ], { runtime, stderr: approval })).resolves.toBe(1);
+    ], { runtime, stderr: approval, activeSessionOwner: activeOwner })).resolves.toBe(1);
     expect(approval.text()).toContain("controlling TUI");
 
-    const commandDir = path.join(runtimeStateRoot(root), "sessions", "active", "commands");
-    const files = await readdir(commandDir);
-    const commands = await Promise.all(files.map(async (file) => JSON.parse(await readFile(path.join(commandDir, file), "utf8")) as RunCommand));
-    expect(commands).toEqual([{ type: "cancel", sessionId: "active", reason: "operator" }]);
+    expect(sent).toEqual([{ type: "cancel", sessionId: "active", reason: "operator" }]);
 
     const unknown = new Capture();
     await expect(runSessionCommand(["unknown", "active", "--workspace", root], {
       runtime,
-      stderr: unknown
+      stderr: unknown,
+      activeSessionOwner: activeOwner
     })).resolves.toBe(1);
     expect(unknown.text()).toContain("Unknown session command");
-    await owner.release("active");
   });
 });
 

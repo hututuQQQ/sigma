@@ -8,6 +8,8 @@ interface SessionCommandDeps {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   runtime?: RuntimeClient;
+  activeSessionOwner?: typeof activeSessionOwner;
+  sendSessionCommand?: typeof sendSessionCommand;
 }
 
 interface SessionIo {
@@ -87,14 +89,15 @@ async function handleOwnedSession(
   parsed: ConfiguredSessionCommand,
   sessionId: string,
   ownerPid: number,
-  io: SessionIo
+  io: SessionIo,
+  sendCommand: typeof sendSessionCommand
 ): Promise<number | undefined> {
   if (subcommand === "resume") {
     io.stdout.write(`already active ${sessionId} pid=${ownerPid}\n`);
     return 0;
   }
   if (subcommand === "cancel") {
-    await sendSessionCommand(parsed.storeRootDir, {
+    await sendCommand(parsed.storeRootDir, {
       type: "cancel", sessionId, reason: cancellationReason(parsed.flags)
     });
     io.stdout.write(`cancel requested ${sessionId}\n`);
@@ -136,9 +139,11 @@ async function executeSessionCommand(argv: string[], deps: SessionCommandDeps, i
   const parsed = await configured(rest, deps);
   const sessionId = await targetSession(parsed.runtime, parsed.positionals[0], parsed.flags.latest === true);
   if (subcommand === "show") return await showSession(parsed, sessionId, io);
-  const owner = await activeSessionOwner(parsed.storeRootDir, sessionId);
+  const owner = await (deps.activeSessionOwner ?? activeSessionOwner)(parsed.storeRootDir, sessionId);
   if (owner) {
-    const result = await handleOwnedSession(subcommand, parsed, sessionId, owner.pid, io);
+    const result = await handleOwnedSession(
+      subcommand, parsed, sessionId, owner.pid, io, deps.sendSessionCommand ?? sendSessionCommand
+    );
     if (result !== undefined) return result;
   }
   return await handleStoredSession(subcommand, parsed, sessionId, io);
