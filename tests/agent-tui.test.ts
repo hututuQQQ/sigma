@@ -9,6 +9,7 @@ import { TuiSessionController } from "../packages/agent-tui/src/components/contr
 import { sanitizeTerminalText } from "../packages/agent-tui/src/components/terminal-text.js";
 import type { TuiSnapshot, TuiViewActions } from "../packages/agent-tui/src/components/types.js";
 import { TuiView } from "../packages/agent-tui/src/components/view.js";
+import { configureWindowsConsoleUtf8 } from "../packages/agent-tui/src/components/windows-console.js";
 
 function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): AgentEventEnvelope {
   return {
@@ -69,6 +70,25 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<v
 }
 
 describe("Sigma OpenTUI", () => {
+  it("uses UTF-8 while rendering on Windows and restores both console code pages", () => {
+    let input = 936;
+    let output = 437;
+    let closes = 0;
+    const restore = configureWindowsConsoleUtf8(true, "win32", () => ({
+      functions: {
+        GetConsoleCP: () => input,
+        GetConsoleOutputCP: () => output,
+        SetConsoleCP: (codePage) => { input = codePage; return 1; },
+        SetConsoleOutputCP: (codePage) => { output = codePage; return 1; }
+      },
+      lib: { close: () => { closes += 1; } }
+    }));
+    expect([input, output]).toEqual([65001, 65001]);
+    restore();
+    restore();
+    expect([input, output, closes]).toEqual([936, 437, 1]);
+  });
+
   it("projects approvals, progress, workspace changes, compaction, and queued follow-ups", () => {
     let view = createPresentationState();
     view = projectEvent(view, event(1, "user.follow_up", { text: "later", queueId: "q1", status: "queued" }));

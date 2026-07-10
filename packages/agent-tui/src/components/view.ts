@@ -12,6 +12,7 @@ import { sanitizeTerminalText } from "./terminal-text.js";
 import { createTuiTheme, type TuiTheme } from "./theme.js";
 import { TranscriptView } from "./transcript.js";
 import type { SubmissionKind, TuiAppOptions, TuiSnapshot, TuiViewActions } from "./types.js";
+import { configureWindowsConsoleUtf8 } from "./windows-console.js";
 
 function approvalChoice(name: string): number | undefined {
   const choices: Record<string, number> = { "1": 0, y: 0, "2": 1, a: 1, "3": 2, n: 2, escape: 2 };
@@ -38,21 +39,30 @@ export class TuiView implements KeyRouterHost {
   private activityExpanded = false;
   private scrolled = false;
   private readonly output?: NodeJS.WriteStream;
+  private restoreConsole: () => void = () => undefined;
 
   static async create(options: TuiAppOptions, actions: TuiViewActions): Promise<TuiView> {
-    const renderer = await createCliRenderer({
-      stdin: options.stdin ?? process.stdin,
-      stdout: options.stdout ?? process.stdout,
-      remote: Boolean(options.stdin || options.stdout),
-      exitOnCtrlC: false,
-      exitSignals: [],
-      screenMode: "alternate-screen",
-      consoleMode: "disabled",
-      useMouse: true,
-      targetFps: Math.max(1, Math.min(30, options.maxFps ?? 30)),
-      maxFps: Math.max(1, Math.min(30, options.maxFps ?? 30))
-    });
-    return new TuiView(renderer, options, actions);
+    const restoreConsole = configureWindowsConsoleUtf8(!options.stdin && !options.stdout && Boolean(process.stdout.isTTY));
+    try {
+      const renderer = await createCliRenderer({
+        stdin: options.stdin ?? process.stdin,
+        stdout: options.stdout ?? process.stdout,
+        remote: Boolean(options.stdin || options.stdout),
+        exitOnCtrlC: false,
+        exitSignals: [],
+        screenMode: "alternate-screen",
+        consoleMode: "disabled",
+        useMouse: true,
+        targetFps: Math.max(1, Math.min(30, options.maxFps ?? 30)),
+        maxFps: Math.max(1, Math.min(30, options.maxFps ?? 30))
+      });
+      const view = new TuiView(renderer, options, actions);
+      view.restoreConsole = restoreConsole;
+      return view;
+    } catch (error) {
+      restoreConsole();
+      throw error;
+    }
   }
 
   constructor(readonly renderer: CliRenderer, options: TuiAppOptions, private readonly actions: TuiViewActions) {
@@ -131,6 +141,7 @@ export class TuiView implements KeyRouterHost {
     this.output?.off("resize", this.onOutputResize);
     this.theme.syntax.destroy();
     this.renderer.destroy();
+    setImmediate(this.restoreConsole);
   }
 
   overlayMode = () => this.overlay.mode;
