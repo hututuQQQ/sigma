@@ -111,10 +111,6 @@ jobs:
         run: pnpm smoke:tui-product
       - name: Sandbox boundary
         run: pnpm verify:sandbox
-      - name: Package Linux CLI for Harbor
-        run: pnpm package:agent-cli
-      - name: Package Harbor runtime
-        run: pnpm package:harbor-runtime
       - name: Prepare Windows package Node runtime
         id: windows-node
         run: |
