@@ -138,6 +138,9 @@ importers:
 
   packages/agent-store:
     dependencies:
+      agent-platform:
+        specifier: workspace:*
+        version: link:../agent-platform
       agent-protocol:
         specifier: workspace:*
         version: link:../agent-protocol

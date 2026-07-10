@@ -33,10 +33,24 @@ class FakeGateway implements ModelGateway {
     reasoning: false, structuredOutput: false, promptCache: false, tokenizer: "approximate"
   };
   constructor(private readonly responses: ModelResponse[]) {}
-  async complete(_request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest): Promise<ModelResponse> {
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response.");
     if (response.finishReason === "stop") {
+      const ledger = request.messages.find((message) =>
+        message.content.includes("Current-run successful receipt ledger."))?.content ?? "";
+      const evidenceCallIds = [...ledger.matchAll(/^- (.+?) \(/gmu)].map((match) => match[1]);
+      if (evidenceCallIds.length === 0) {
+        this.responses.unshift(response);
+        return {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: `inspect-cli-${request.messages.length}`, name: "list", arguments: { path: ".", limit: 20 } }]
+          },
+          finishReason: "tool_calls"
+        };
+      }
       return {
         message: {
           role: "assistant",
@@ -48,9 +62,8 @@ class FakeGateway implements ModelGateway {
               summary: response.message.content,
               criteria: [{
                 criterion: "The CLI protocol workflow completed.",
-                status: "not_applicable",
-                evidenceCallIds: [],
-                rationale: "This protocol test does not require repository evidence."
+                status: "met",
+                evidenceCallIds: [evidenceCallIds.at(-1)!]
               }]
             }
           }]

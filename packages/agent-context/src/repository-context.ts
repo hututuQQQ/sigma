@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ContextItem } from "agent-protocol";
-import { resolveWorkspacePath, runProcess } from "agent-platform";
+import { resolveWorkspacePath, runProcess, selfContainedGitRoot } from "agent-platform";
 import { VersionedContextCache } from "./cache.js";
 import { approximateTokens, lexicalScore } from "./unicode.js";
 
@@ -30,14 +30,14 @@ async function fallbackFiles(workspace: string, signal: AbortSignal, limit = 100
   return files;
 }
 
-async function gitVersion(workspace: string, signal: AbortSignal): Promise<string | null> {
+async function gitVersion(repositoryRoot: string, signal: AbortSignal): Promise<string | null> {
   const [status, diff] = await Promise.all([
     runProcess({
-      executable: "git", args: ["status", "--porcelain=v1", "--branch"], cwd: workspace,
+      executable: "git", args: ["status", "--porcelain=v1", "--branch"], cwd: repositoryRoot,
       timeoutMs: 30_000, maxOutputBytes: 2_000_000, signal
     }).catch(() => null),
     runProcess({
-      executable: "git", args: ["diff", "--no-ext-diff", "--binary", "--"], cwd: workspace,
+      executable: "git", args: ["diff", "--no-ext-diff", "--binary", "--"], cwd: repositoryRoot,
       timeoutMs: 30_000, maxOutputBytes: 2_000_000, signal
     }).catch(() => null)
   ]);
@@ -45,13 +45,13 @@ async function gitVersion(workspace: string, signal: AbortSignal): Promise<strin
   return createHash("sha256").update(status.stdout).update(diff?.stdout ?? "").digest("hex");
 }
 
-async function loadGitSnapshot(workspace: string, signal: AbortSignal): Promise<RepositorySnapshot> {
+async function loadGitSnapshot(repositoryRoot: string, signal: AbortSignal): Promise<RepositorySnapshot> {
   const listing = await runProcess({
-    executable: "git", args: ["ls-files", "-co", "--exclude-standard", "-z"], cwd: workspace,
+    executable: "git", args: ["ls-files", "-co", "--exclude-standard", "-z"], cwd: repositoryRoot,
     timeoutMs: 30_000, maxOutputBytes: 16_000_000, signal
   });
   const diff = await runProcess({
-    executable: "git", args: ["diff", "--no-ext-diff", "--unified=2", "--"], cwd: workspace,
+    executable: "git", args: ["diff", "--no-ext-diff", "--unified=2", "--"], cwd: repositoryRoot,
     timeoutMs: 30_000, maxOutputBytes: 200_000, signal
   });
   return {
@@ -85,7 +85,8 @@ export class RepositoryContextProvider {
 
   async collect(workspace: string, query: string, signal: AbortSignal): Promise<ContextItem[]> {
     const resolved = path.resolve(workspace);
-    const git = await gitVersion(resolved, signal);
+    const repositoryRoot = await selfContainedGitRoot(resolved, signal);
+    const git = repositoryRoot ? await gitVersion(repositoryRoot, signal) : null;
     const cachedNonGit = this.nonGitVersions.get(resolved);
     const nonGitVersion = cachedNonGit && cachedNonGit.expiresAt > Date.now()
       ? cachedNonGit.value : `nongit:${Math.floor(Date.now() / 1_000)}`;
@@ -95,7 +96,9 @@ export class RepositoryContextProvider {
     const version = git ?? nonGitVersion;
     let snapshot = this.cache.get(resolved, version);
     if (!snapshot) {
-      snapshot = git === null ? { files: await fallbackFiles(resolved, signal), diff: "" } : await loadGitSnapshot(resolved, signal);
+      snapshot = git === null || !repositoryRoot
+        ? { files: await fallbackFiles(resolved, signal), diff: "" }
+        : await loadGitSnapshot(repositoryRoot, signal);
       this.cache.set(resolved, version, snapshot);
     }
     const ranked = snapshot.files

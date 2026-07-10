@@ -17,6 +17,22 @@ function appendBounded(current: string, chunk: string, maximum: number): string 
   return bytes.subarray(bytes.byteLength - maximum).toString("utf8").replace(/^\uFFFD/, "");
 }
 
+export const MCP_INHERITED_ENV_ALLOWLIST = [
+  "PATH", "Path", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+  "SystemRoot", "SYSTEMROOT", "WINDIR", "ComSpec", "COMSPEC", "PATHEXT", "USERPROFILE"
+] as const;
+
+export function mcpProcessEnvironment(
+  configured: Readonly<Record<string, string>> = {},
+  source: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const inherited: NodeJS.ProcessEnv = {};
+  for (const key of MCP_INHERITED_ENV_ALLOWLIST) {
+    if (source[key] !== undefined) inherited[key] = source[key];
+  }
+  return { ...inherited, ...configured };
+}
+
 export class McpStdioTransport {
   private readonly decoder: JsonLineDecoder;
   private child?: ChildProcessWithoutNullStreams;
@@ -43,7 +59,7 @@ export class McpStdioTransport {
     if (this.child) throw new McpConnectionError("MCP stdio transport has already started.");
     const child = spawn(this.config.command, this.config.args ?? [], {
       cwd: path.resolve(this.config.cwd),
-      env: { ...process.env, ...this.config.env },
+      env: mcpProcessEnvironment(this.config.env),
       windowsHide: true,
       shell: false,
       detached: detachedProcessGroup(),

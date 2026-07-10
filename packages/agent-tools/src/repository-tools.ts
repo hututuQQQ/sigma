@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
-import { resolveWorkspacePath, runProcess } from "agent-platform";
+import { resolveWorkspacePath, runProcess, selfContainedGitRoot } from "agent-platform";
 import type { RegisteredEffectTool } from "./registry.js";
 
 function object(value: JsonValue): Record<string, JsonValue> {
@@ -26,8 +26,15 @@ function schema(input: Omit<ToolDescriptor, "inputSchema"> & { properties: Recor
   return { ...input, inputSchema: { type: "object", properties: input.properties, required: input.required ?? [], additionalProperties: false } };
 }
 
-function result(request: ToolRequest, startedAt: string, output: string, ok = true, diagnostics: string[] = []): ToolReceipt {
-  return { callId: request.callId, ok, output, observedEffects: ["filesystem.read"], artifacts: [], diagnostics, startedAt, completedAt: new Date().toISOString() };
+function result(
+  request: ToolRequest,
+  startedAt: string,
+  output: string,
+  ok = true,
+  diagnostics: string[] = [],
+  artifacts: string[] = []
+): ToolReceipt {
+  return { callId: request.callId, ok, output, observedEffects: ["filesystem.read"], artifacts, diagnostics, startedAt, completedAt: new Date().toISOString() };
 }
 
 const ignoredDirectories = new Set([".git", ".agent", "node_modules", "dist", "coverage"]);
@@ -150,6 +157,19 @@ function grepTool(): RegisteredEffectTool {
   };
 }
 
+const gitDiffPreviewCharacters = 32_000;
+const gitCaptureCharacters = 64 * 1024 * 1024;
+
+function gitDiffPreview(output: string, artifact: string): string {
+  const half = gitDiffPreviewCharacters / 2;
+  const omitted = output.length - gitDiffPreviewCharacters;
+  return [
+    output.slice(0, half),
+    `\n... [${omitted} characters omitted; complete Git diff artifact: ${artifact}] ...\n`,
+    output.slice(-half)
+  ].join("");
+}
+
 function gitReadTool(name: "git_status" | "git_diff", args: string[], description: string): RegisteredEffectTool {
   return {
     descriptor: schema({
@@ -158,8 +178,29 @@ function gitReadTool(name: "git_status" | "git_diff", args: string[], descriptio
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
-      const output = await runProcess({ executable: "git", args, cwd: context.workspacePath, timeoutMs: 30_000, signal: context.signal });
-      return result(request, startedAt, [output.stdout, output.stderr].filter(Boolean).join("\n"), output.exitCode === 0, [`exit_code=${output.exitCode}`]);
+      const repositoryRoot = await selfContainedGitRoot(context.workspacePath, context.signal);
+      if (!repositoryRoot) {
+        return result(request, startedAt, "Workspace is not a self-contained Git repository.", false, ["workspace_not_git_root"]);
+      }
+      const output = await runProcess({
+        executable: "git", args, cwd: repositoryRoot, timeoutMs: 30_000,
+        maxOutputBytes: name === "git_diff" ? gitCaptureCharacters : 2_000_000,
+        signal: context.signal
+      });
+      const complete = [output.stdout, output.stderr].filter(Boolean).join("\n");
+      const diagnostics = [`exit_code=${output.exitCode}`];
+      if (name !== "git_diff" || complete.length <= gitDiffPreviewCharacters) {
+        return result(request, startedAt, complete, output.exitCode === 0, diagnostics);
+      }
+      const artifact = await context.createArtifact({ name: "git-diff.patch", content: complete });
+      return result(
+        request,
+        startedAt,
+        gitDiffPreview(complete, artifact),
+        output.exitCode === 0,
+        [...diagnostics, `output_truncated=${complete.length - gitDiffPreviewCharacters}`, `artifact=${artifact}`],
+        [artifact]
+      );
     }
   };
 }

@@ -9,11 +9,12 @@ import { runReplayCommand } from "./commands/replay.js";
 import { runV2Command } from "./commands/run-v2.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
-import { loadCliConfig, parseArgs } from "./config.js";
+import { loadCliConfig, parseArgs, workspaceMcpTrustMessage } from "./config.js";
 import { createConfiguredRuntime } from "agent-runtime";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
+  stderr?: NodeJS.WritableStream;
 }
 
 function printHelp(): void {
@@ -40,6 +41,11 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   }
   const { flags } = parseArgs(argv);
   const cliConfig = loadCliConfig(flags);
+  const trustMessage = workspaceMcpTrustMessage(cliConfig);
+  if (trustMessage) {
+    (options.stderr ?? process.stderr).write(`${trustMessage}\n`);
+    return 2;
+  }
   const configured = await createConfiguredRuntime(cliConfig);
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,

@@ -14,8 +14,10 @@ import {
 } from "../packages/agent-context/src/index.js";
 import { runProcess, runtimeEnvironment, shellInvocation } from "../packages/agent-platform/src/index.js";
 import {
+  completionEvidenceError,
   EffectToolRegistry,
   isToolAllowed,
+  parseCompletionProposal,
   registerBuiltinTools,
   ResourceLockManager
 } from "../packages/agent-tools/src/index.js";
@@ -37,6 +39,30 @@ function request(callId: string, name: string, args: JsonValue): ToolRequest {
 }
 
 describe("context, platform, and repository tool capabilities", () => {
+  it("requires every completion criterion to have current successful evidence", () => {
+    expect(parseCompletionProposal({
+      summary: "bypass",
+      criteria: [{
+        criterion: "The requested change is complete.",
+        status: "not_applicable",
+        evidenceCallIds: [],
+        rationale: "claimed unnecessary"
+      }]
+    })).toBeNull();
+    const proposal = parseCompletionProposal({
+      summary: "verified",
+      criteria: [{
+        criterion: "The requested change is complete.",
+        status: "met",
+        evidenceCallIds: ["current-receipt"]
+      }]
+    });
+    expect(proposal).toMatchObject({ criteria: [{ rationale: "" }] });
+    expect(completionEvidenceError(proposal!, new Set(["current-receipt"]))).toBeNull();
+    expect(completionEvidenceError(proposal!, new Set(["older-run-receipt"])))
+      .toContain("current-receipt");
+  });
+
   it("loads nested instructions and retrieves Unicode repository context incrementally", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-context-"));
     await mkdir(path.join(workspace, "src", "nested"), { recursive: true });
@@ -84,6 +110,20 @@ describe("context, platform, and repository tool capabilities", () => {
     });
     expect(planned.messages.at(-1)?.content).toBe("new");
     expect(planned.budget.toolTokens).toBeGreaterThan(0);
+    const withoutReasoning = planContext({
+      system: [], dynamic: [],
+      history: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+    });
+    const withReasoning = planContext({
+      system: [], dynamic: [],
+      history: [
+        { role: "user", content: "question" },
+        { role: "assistant", content: "answer", reasoningContent: "reasoning ".repeat(20) }
+      ],
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+    });
+    expect(withReasoning.budget.historyTokens).toBeGreaterThan(withoutReasoning.budget.historyTokens);
     expect(() => planContext({
       system: [], dynamic: [], history: [{ role: "user", content: "x".repeat(1_000) }], tools: [],
       contextWindowTokens: 10, outputReserveTokens: 0

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ModelRequest, ModelStreamEvent } from "../packages/agent-protocol/src/index.js";
-import { OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
+import type { ModelGateway, ModelRequest, ModelStreamEvent } from "../packages/agent-protocol/src/index.js";
+import { createModelGateway, OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
 
 function request(): ModelRequest {
   return { messages: [{ role: "user", content: "hello" }], signal: new AbortController().signal };
@@ -30,7 +30,7 @@ function createGateway(fetchImpl: typeof fetch, options: Partial<OpenAIModelGate
   });
 }
 
-async function collectStream(model: OpenAIModelGateway, input: ModelRequest = request()): Promise<ModelStreamEvent[]> {
+async function collectStream(model: ModelGateway, input: ModelRequest = request()): Promise<ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
   for await (const event of model.stream(input)) events.push(event);
   return events;
@@ -61,6 +61,7 @@ describe("OpenAI-compatible model gateway", () => {
       choices: [{
         message: {
           content: null,
+          reasoning_content: "provider reasoning",
           tool_calls: [
             { id: "provided", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } },
             { function: { name: "opaque", arguments: "not-json" } },
@@ -89,7 +90,12 @@ describe("OpenAI-compatible model gateway", () => {
 
     const response = await model.complete({
       messages: [
-        { role: "assistant", content: "", toolCalls: [{ id: "call_1", name: "read_file", arguments: { path: "a.ts" } }] },
+        {
+          role: "assistant",
+          content: "",
+          reasoningContent: "prior reasoning",
+          toolCalls: [{ id: "call_1", name: "read_file", arguments: { path: "a.ts" } }]
+        },
         { role: "tool", content: "contents", toolCallId: "call_1" }
       ],
       tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
@@ -107,7 +113,11 @@ describe("OpenAI-compatible model gateway", () => {
       temperature: 0,
       tools: [{ type: "function", function: { name: "read_file" } }],
       messages: [
-        { role: "assistant", tool_calls: [{ id: "call_1", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } }] },
+        {
+          role: "assistant",
+          reasoning_content: "prior reasoning",
+          tool_calls: [{ id: "call_1", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } }]
+        },
         { role: "tool", tool_call_id: "call_1" }
       ]
     });
@@ -115,6 +125,7 @@ describe("OpenAI-compatible model gateway", () => {
     expect(response).toMatchObject({
       message: {
         content: "",
+        reasoningContent: "provider reasoning",
         toolCalls: [
           { id: "provided", name: "read_file", arguments: { path: "a.ts" } },
           { id: "call_1", name: "opaque", arguments: "not-json" }
@@ -124,6 +135,175 @@ describe("OpenAI-compatible model gateway", () => {
       inputTokens: 12,
       outputTokens: 4,
       raw: { provider_meta: { finite: 1, infinite: null, unsupported: null, nested: [true] } }
+    });
+  });
+
+  it("adapts DeepSeek developer messages and replays reasoning across tool turns", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const gateway = createModelGateway({
+      provider: "deepseek",
+      apiKey: "secret",
+      fetchImpl: (async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        attempt += 1;
+        return attempt === 1
+          ? streamResponse([
+              { choices: [{ delta: { reasoning_content: "inspect first" }, finish_reason: null }] },
+              {
+                choices: [{
+                  delta: {
+                    tool_calls: [{
+                      index: 0,
+                      id: "call_1",
+                      function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" }
+                    }]
+                  },
+                  finish_reason: "tool_calls"
+                }]
+              }
+            ], true)
+          : streamResponse([{ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] }], true);
+      }) as typeof fetch
+    });
+    const tools = [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }];
+    const initialMessages: ModelRequest["messages"] = [
+      { role: "system", content: "system contract" },
+      { role: "developer", content: "runtime context" },
+      { role: "user", content: "read a.ts" }
+    ];
+
+    const first = await collectStream(gateway, {
+      messages: initialMessages,
+      tools,
+      signal: new AbortController().signal
+    });
+    const firstDone = first.at(-1);
+    expect(firstDone).toMatchObject({
+      type: "done",
+      response: {
+        message: {
+          reasoningContent: "inspect first",
+          toolCalls: [{ id: "call_1", name: "read_file", arguments: { path: "a.ts" } }]
+        },
+        finishReason: "tool_calls"
+      }
+    });
+    if (firstDone?.type !== "done") throw new Error("Expected the first DeepSeek stream to complete.");
+
+    await collectStream(gateway, {
+      messages: [
+        ...initialMessages,
+        firstDone.response.message,
+        { role: "tool", content: "file contents", toolCallId: "call_1" }
+      ],
+      tools,
+      signal: new AbortController().signal
+    });
+
+    expect(bodies[0]).toMatchObject({
+      model: "deepseek-v4-pro",
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "system", content: "system contract" },
+        { role: "system", content: "runtime context" },
+        { role: "user", content: "read a.ts" }
+      ]
+    });
+    expect(bodies[0]).not.toHaveProperty("tool_choice");
+    expect(bodies[1]).not.toHaveProperty("tool_choice");
+    expect(bodies[1]).toMatchObject({
+      messages: expect.arrayContaining([expect.objectContaining({
+        role: "assistant",
+        content: "",
+        reasoning_content: "inspect first",
+        tool_calls: [expect.objectContaining({ id: "call_1" })]
+      })])
+    });
+  });
+
+  it("adapts GLM developer messages to the supported system wire role", async () => {
+    let body: Record<string, unknown> | undefined;
+    const gateway = createModelGateway({
+      provider: "glm",
+      apiKey: "secret",
+      fetchImpl: (async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse("ok");
+      }) as typeof fetch
+    });
+
+    await gateway.complete({
+      messages: [
+        { role: "system", content: "system contract" },
+        { role: "developer", content: "runtime context" },
+        { role: "user", content: "hello" }
+      ],
+      signal: new AbortController().signal
+    });
+
+    expect(body).toMatchObject({
+      messages: [
+        { role: "system", content: "system contract" },
+        { role: "system", content: "runtime context" },
+        { role: "user", content: "hello" }
+      ]
+    });
+  });
+
+  it("retries DeepSeek insufficient-system-resource finishes instead of returning protocol_error", async () => {
+    let completionAttempts = 0;
+    const completion = createModelGateway({
+      provider: "deepseek",
+      apiKey: "secret",
+      maxRetries: 1,
+      fetchImpl: (async () => {
+        completionAttempts += 1;
+        return completionAttempts === 1
+          ? new Response(JSON.stringify({
+              choices: [{ message: { content: "" }, finish_reason: "insufficient_system_resource" }]
+            }), { status: 200, headers: { "retry-after": "0" } })
+          : jsonResponse("recovered");
+      }) as typeof fetch
+    });
+    await expect(completion.complete(request())).resolves.toMatchObject({
+      message: { content: "recovered" },
+      finishReason: "stop"
+    });
+    expect(completionAttempts).toBe(2);
+
+    let streamAttempts = 0;
+    const streaming = createModelGateway({
+      provider: "deepseek",
+      apiKey: "secret",
+      maxRetries: 1,
+      fetchImpl: (async () => {
+        streamAttempts += 1;
+        return streamAttempts === 1
+          ? streamResponse([{ choices: [{ delta: {}, finish_reason: "insufficient_system_resource" }] }], true)
+          : streamResponse([{ choices: [{ delta: { content: "recovered" }, finish_reason: "stop" }] }], true);
+      }) as typeof fetch
+    });
+    await expect(collectStream(streaming)).resolves.toEqual([
+      { type: "content", delta: "recovered" },
+      expect.objectContaining({ type: "done", response: expect.objectContaining({ finishReason: "stop" }) })
+    ]);
+    expect(streamAttempts).toBe(2);
+  });
+
+  it("fails clearly when DeepSeek resource exhaustion exceeds the retry budget", async () => {
+    const model = createModelGateway({
+      provider: "deepseek",
+      apiKey: "secret",
+      maxRetries: 0,
+      fetchImpl: (async () => streamResponse([
+        { choices: [{ delta: {}, finish_reason: "insufficient_system_resource" }] }
+      ], true)) as typeof fetch
+    });
+
+    await expect(collectStream(model)).rejects.toMatchObject({
+      code: "provider_resource_exhausted",
+      message: "deepseek returned retryable finish reason 'insufficient_system_resource'."
     });
   });
 
@@ -282,6 +462,21 @@ describe("OpenAI-compatible model gateway", () => {
     }) as typeof fetch, { maxRetries: 3 });
 
     await expect(collectStream(model)).rejects.toThrow("restarted stream diverged before the prior stable boundary");
+    expect(attempts).toBe(2);
+  });
+
+  it("rejects a restarted stream that ends before the prior reasoning boundary", async () => {
+    let attempts = 0;
+    const model = createGateway((async () => {
+      attempts += 1;
+      return attempts === 1
+        ? streamResponse([{ choices: [{ delta: { reasoning_content: "thinking" }, finish_reason: null }] }], false)
+        : streamResponse([{ choices: [{ delta: { reasoning_content: "think" }, finish_reason: "stop" }] }], true);
+    }) as typeof fetch, { maxRetries: 3 });
+
+    await expect(collectStream(model)).rejects.toThrow(
+      "restarted reasoning stream ended before the prior stable boundary"
+    );
     expect(attempts).toBe(2);
   });
 

@@ -46,8 +46,7 @@ Workspace packages communicate through public exports, and the production depend
 
 A provider `stop` response or a natural-language claim does not finish a run. The agent must call `complete_task` with a non-empty summary and explicit acceptance criteria:
 
-- a `met` criterion must cite at least one successful tool receipt by call ID;
-- a `not_applicable` criterion must include a concrete rationale;
+- every criterion must be `met` and cite at least one successful current-run tool receipt by call ID;
 - unknown or failed receipt IDs reject the proposal;
 - non-detached children are joined before completion, and a failed child or retained, unintegrated writer worktree keeps the parent run open.
 
@@ -145,7 +144,9 @@ hard_deadline_ms = 120000
 shutdown_grace_ms = 750
 ```
 
-Sigma starts the configured executable directly, without a shell. MCP requests have cancellation, idle timeout, and absolute deadline handling; shutdown escalates to process-tree termination after the grace period. Remote side effects cannot be inferred or verified from a tool name, so configure `possible_effects`, `approval`, and `idempotent` conservatively. Global `permissionMode=deny` still denies prompt-gated MCP tools, while `permissionMode=auto` accepts them.
+Repository-level MCP configuration never starts on first use. Review `.agent/config.toml`, then explicitly grant durable trust with `--trust-workspace-mcp`; the grant is stored outside the repository and is valid only for the canonical workspace path and exact configuration digest. Any configuration change requires trust again. MCP supplied explicitly by a CLI flag, environment, or the user's home configuration is not treated as repository-authored.
+
+Sigma starts the configured executable directly, without a shell. Its working directory must resolve inside the workspace, and the child inherits only a small platform environment allowlist plus literal `env` entries from its configuration—not model keys or the rest of `process.env`. MCP requests have cancellation, idle timeout, and absolute deadline handling; shutdown escalates to process-tree termination after the grace period. Remote side effects cannot be inferred or verified from a tool name, so configure `possible_effects`, `approval`, and `idempotent` conservatively. Global `permissionMode=deny` still denies prompt-gated MCP tools, while `permissionMode=auto` accepts them.
 
 ## Permissions and containment
 

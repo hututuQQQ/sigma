@@ -17,7 +17,7 @@ import { lexicalScore, lexicalTokens, planContext } from "../packages/agent-cont
 import { resolveWorkspacePath } from "../packages/agent-platform/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { createRuntime, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
-import { EffectToolRegistry, registerBuiltinTools, registerCompletionTool } from "../packages/agent-tools/src/index.js";
+import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 
@@ -61,6 +61,20 @@ class FakeGateway implements ModelGateway {
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response.");
     if (response.finishReason === "stop") {
+      const ledger = request.messages.find((message) =>
+        message.content.includes("Current-run successful receipt ledger."))?.content ?? "";
+      const evidenceCallIds = [...ledger.matchAll(/^- (.+?) \(/gmu)].map((match) => match[1]);
+      if (evidenceCallIds.length === 0) {
+        this.responses.unshift(response);
+        return {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: `inspect-${this.requests.length}`, name: "list", arguments: { path: ".", limit: 20 } }]
+          },
+          finishReason: "tool_calls"
+        };
+      }
       return {
         message: {
           role: "assistant",
@@ -72,9 +86,8 @@ class FakeGateway implements ModelGateway {
               summary: response.message.content,
               criteria: [{
                 criterion: "The requested test workflow completed.",
-                status: "not_applicable",
-                evidenceCallIds: [],
-                rationale: "No repository evidence is required in this protocol-only test."
+                status: "met",
+                evidenceCallIds: [evidenceCallIds.at(-1)!]
               }]
             }
           }]
@@ -106,16 +119,20 @@ describe("Sigma v2 architecture", () => {
       deadlineAt: new Date(60_000).toISOString()
     });
     state = evolve(state, event(1, "user.message", { text: "review and propose a refactor" }));
-    state = evolve(state, event(2, "model.completed", {
+    state = evolve(state, event(2, "model.started", { turnId: 1, effectRevision: 1 }));
+    state = evolve(state, event(3, "model.completed", {
+      turnId: 1,
+      effectRevision: 1,
       message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }] },
       toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }]
     }));
-    state = evolve(state, event(3, "tool.completed", {
+    state = evolve(state, event(4, "tool.completed", {
+      turnId: 1, effectRevision: 1,
       callId: "complete", ok: true, output: JSON.stringify({ summary: "proposal", criteria: [] }),
       observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
     }));
     expect(state.phase).toBe("outcome_pending");
-    state = evolve(state, event(4, "run.completed", { message: "proposal" }));
+    state = evolve(state, event(5, "run.completed", { message: "proposal" }));
     expect(state.outcome).toMatchObject({ kind: "completed", message: "proposal" });
   });
 
@@ -227,6 +244,176 @@ describe("Sigma v2 architecture", () => {
     expect(gateway.requests).toHaveLength(2);
   });
 
+  it("treats completion as a commit barrier after same-turn evidence tools", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-barrier-"));
+    const gateway = new FakeGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "complete-with-evidence",
+            name: "complete_task",
+            arguments: {
+              summary: "Wrote result.txt.",
+              criteria: [{
+                criterion: "result.txt contains the requested content.",
+                status: "met",
+                evidenceCallIds: ["write-evidence"],
+                rationale: ""
+              }]
+            }
+          },
+          { id: "write-evidence", name: "write", arguments: { path: "result.txt", content: "done" } }
+        ]
+      },
+      finishReason: "tool_calls"
+    }]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "Wrote result.txt."
+    });
+    await expect(readFile(path.join(workspace, "result.txt"), "utf8")).resolves.toBe("done");
+    expect(gateway.requests).toHaveLength(1);
+    const lifecycle: string[] = [];
+    for await (const stored of store.events(session.sessionId)) {
+      if (stored.type.startsWith("tool.")) {
+        const payload = stored.payload as Record<string, unknown>;
+        lifecycle.push(`${stored.type}:${String(payload.callId)}`);
+      }
+    }
+    expect(lifecycle.indexOf("tool.completed:write-evidence"))
+      .toBeLessThan(lifecycle.indexOf("tool.requested:complete-with-evidence"));
+  });
+
+  it("rejects same-turn completion when its evidence tool fails", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-failure-barrier-"));
+    const complete = (id: string, evidenceCallIds: string[]): ModelResponse => ({
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id,
+          name: "complete_task",
+          arguments: {
+            summary: "Finished after valid evidence.",
+            criteria: [{ criterion: "Evidence succeeded.", status: "met", evidenceCallIds }]
+          }
+        }]
+      },
+      finishReason: "tool_calls"
+    });
+    const gateway = new FakeGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            ...complete("premature-completion", ["failed-evidence"]).message.toolCalls!,
+            { id: "failed-evidence", name: "missing_tool", arguments: {} }
+          ]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "valid-evidence", name: "list", arguments: { path: ".", limit: 20 } }]
+        },
+        finishReason: "tool_calls"
+      },
+      complete("valid-completion", ["valid-evidence"])
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify failure barrier" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "Finished after valid evidence."
+    });
+    const events: AgentEventEnvelope[] = [];
+    for await (const stored of store.events(session.sessionId)) events.push(stored);
+    expect(events.find((stored) => stored.type === "tool.failed"
+      && (stored.payload as { callId?: string }).callId === "premature-completion")?.payload)
+      .toMatchObject({ diagnostics: ["invalid_completion_evidence"] });
+    expect(events.filter((stored) => stored.type === "run.completed")).toHaveLength(1);
+  });
+
+  it("exposes exact successful receipt IDs and repairs invalid completion evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-completion-guidance-"));
+    await writeFile(path.join(workspace, "result.txt"), "done", "utf8");
+    const proposal = (id: string, evidenceCallIds: string[]): ModelResponse => ({
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id,
+          name: "complete_task",
+          arguments: {
+            summary: "Verified result.txt.",
+            criteria: [{
+              criterion: "result.txt contains done.",
+              status: "met",
+              evidenceCallIds
+            }]
+          }
+        }]
+      },
+      finishReason: "tool_calls"
+    });
+    const gateway = new FakeGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-evidence", name: "read", arguments: { path: "result.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      proposal("invalid-completion", ["read"]),
+      proposal("valid-completion", ["read-evidence"])
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify result.txt" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    expect(gateway.requests[1].messages.some((message) =>
+      message.role === "tool" && message.content.includes("Successful tool receipt ID: read-evidence"))).toBe(true);
+    expect(gateway.requests[1].messages.some((message) =>
+      message.content.includes("Only IDs in this ledger are valid completion evidence")
+      && message.content.includes("read-evidence"))).toBe(true);
+    expect(gateway.requests[2].messages.some((message) =>
+      message.role === "tool" && message.content.includes("available successful receipt list: read-evidence"))).toBe(true);
+  });
+
   it("serializes durable events emitted by parallel tool calls", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-parallel-"));
     await writeFile(path.join(workspace, "a.txt"), "a", "utf8");
@@ -266,11 +453,12 @@ describe("Sigma v2 architecture", () => {
   it("rehydrates the most recent outcome across multiple runs", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-v2-resume-"));
     const storeRootDir = path.join(workspace, ".agent");
+    const gateway = new FakeGateway([
+      { message: { role: "assistant", content: "first" }, finishReason: "stop" },
+      { message: { role: "assistant", content: "second" }, finishReason: "stop" }
+    ]);
     const firstRuntime = createRuntime({
-      gateway: new FakeGateway([
-        { message: { role: "assistant", content: "first" }, finishReason: "stop" },
-        { message: { role: "assistant", content: "second" }, finishReason: "stop" }
-      ]),
+      gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
@@ -282,6 +470,16 @@ describe("Sigma v2 architecture", () => {
     await expect(firstRuntime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed", message: "first" });
     await firstRuntime.command({ type: "submit", sessionId: session.sessionId, text: "two" });
     await expect(firstRuntime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed", message: "second" });
+    const secondRunFirstRequest = gateway.requests[2];
+    expect(secondRunFirstRequest.messages.some((message) =>
+      message.content.includes("Successful tool receipt ID: inspect-1"))).toBe(true);
+    expect(secondRunFirstRequest.messages.some((message) =>
+      message.content.includes("Current-run successful receipt ledger.")
+      && message.content.includes("inspect-1"))).toBe(false);
+    expect(gateway.requests[3].messages.some((message) =>
+      message.content.includes("Current-run successful receipt ledger.")
+      && message.content.includes("inspect-3")
+      && !message.content.includes("inspect-1"))).toBe(true);
 
     const resumed = createRuntime({
       gateway: new FakeGateway([]),
@@ -304,11 +502,14 @@ describe("Sigma v2 architecture", () => {
       event(1, "session.created", { workspacePath: pendingWorkspace, mode: "change" }),
       event(2, "run.started", { mode: "change", deadlineAt: future }),
       event(3, "user.message", { text: "finish" }),
-      event(4, "model.completed", {
+      event(4, "model.started", { turnId: 1, effectRevision: 3 }),
+      event(5, "model.completed", {
+        turnId: 1, effectRevision: 3,
         message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }] },
         toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }], finishReason: "tool_calls"
       }),
-      event(5, "tool.completed", {
+      event(6, "tool.completed", {
+        turnId: 1, effectRevision: 3,
         callId: "complete", ok: true, output: JSON.stringify({ summary: "already generated", criteria: [] }),
         observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
       })
@@ -374,14 +575,16 @@ describe("Sigma v2 architecture", () => {
       event(1, "session.created", { workspacePath: workspace, mode: "change" }),
       event(2, "run.started", { mode: "change" }),
       event(3, "user.message", { text: "write restored.txt" }),
-      event(4, "model.completed", {
+      event(4, "model.started", { turnId: 1, effectRevision: 3 }),
+      event(5, "model.completed", {
+        turnId: 1, effectRevision: 3,
         message: { role: "assistant", content: "", toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }] },
         finishReason: "tool_calls",
         toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }]
       }),
-      event(5, "tool.requested", { callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
-      event(6, "tool.approval_requested", { requestId: "restored-write", callId: "restored-write", toolName: "write" }),
-      event(7, "run.suspended", { requestId: "restored-write", message: "approval required" })
+      event(6, "tool.requested", { turnId: 1, effectRevision: 3, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
+      event(7, "tool.approval_requested", { turnId: 1, effectRevision: 3, requestId: "restored-write", callId: "restored-write", toolName: "write" }),
+      event(8, "run.suspended", { turnId: 1, effectRevision: 3, requestId: "restored-write", callId: "restored-write", message: "approval required" })
     ];
     for (const stored of persisted) await store.append(stored, stored.seq - 1);
     const runtime = createRuntime({
@@ -406,14 +609,16 @@ describe("Sigma v2 architecture", () => {
         event(1, "session.created", { workspacePath: workspace, mode: "change" }),
         event(2, "run.started", { mode: "change" }),
         event(3, "user.message", { text: "write result" }),
-        event(4, "model.completed", {
+        event(4, "model.started", { turnId: 1, effectRevision: 3 }),
+        event(5, "model.completed", {
+          turnId: 1, effectRevision: 3,
           message: { role: "assistant", content: "", toolCalls: [{ id: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }] },
           finishReason: "tool_calls",
           toolCalls: [{ id: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }]
         }),
-        event(5, "tool.requested", { callId: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }),
-        event(6, "tool.approval_requested", { requestId: "pending-write", callId: "pending-write", toolName: "write" }),
-        event(7, "run.suspended", { requestId: "pending-write", message: "approval required" })
+        event(6, "tool.requested", { turnId: 1, effectRevision: 3, callId: "pending-write", name: "write", arguments: { path: "result.txt", content: "x" } }),
+        event(7, "tool.approval_requested", { turnId: 1, effectRevision: 3, requestId: "pending-write", callId: "pending-write", toolName: "write" }),
+        event(8, "run.suspended", { turnId: 1, effectRevision: 3, requestId: "pending-write", callId: "pending-write", message: "approval required" })
       ];
       for (const stored of persisted) await store.append(stored, stored.seq - 1);
       return { storeRootDir, store };
@@ -455,7 +660,7 @@ describe("Sigma v2 architecture", () => {
       { message: { role: "assistant", content: "", toolCalls: [{ id: "boom", name: "explode", arguments: {} }] }, finishReason: "tool_calls" },
       { message: { role: "assistant", content: "Recovered from tool failure." }, finishReason: "stop" }
     ]);
-    const tools = new EffectToolRegistry();
+    const tools = registerBuiltinTools(new EffectToolRegistry());
     tools.register({
       descriptor: {
         name: "explode",
@@ -470,7 +675,6 @@ describe("Sigma v2 architecture", () => {
       },
       async execute() { throw new Error("expected explosion"); }
     });
-    registerCompletionTool(tools);
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway,
@@ -492,7 +696,7 @@ describe("Sigma v2 architecture", () => {
       { message: { role: "assistant", content: "", toolCalls: [{ id: "hang", name: "never_returns", arguments: {} }] }, finishReason: "tool_calls" },
       { message: { role: "assistant", content: "Handled the timeout." }, finishReason: "stop" }
     ]);
-    const tools = new EffectToolRegistry();
+    const tools = registerBuiltinTools(new EffectToolRegistry());
     tools.register({
       descriptor: {
         name: "never_returns", description: "test deadline", inputSchema: { type: "object" },
@@ -501,7 +705,6 @@ describe("Sigma v2 architecture", () => {
       },
       async execute() { return await new Promise(() => undefined); }
     });
-    registerCompletionTool(tools);
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway, store: new SegmentedJsonlStore({ rootDir: storeRootDir }), storeRootDir, tools,

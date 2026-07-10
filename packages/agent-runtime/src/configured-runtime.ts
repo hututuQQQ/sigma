@@ -1,5 +1,6 @@
 import path from "node:path";
-import type { McpServerConfigValue } from "agent-config";
+import { realpath } from "node:fs/promises";
+import type { McpConfigSource, McpServerConfigValue, WorkspaceMcpTrustAttestation } from "agent-config";
 import { createModelGateway, defaultModel } from "agent-model";
 import type { JsonValue, ModelGateway, RunStore } from "agent-protocol";
 import { SegmentedJsonlStore } from "agent-store";
@@ -11,6 +12,7 @@ import { createRuntime } from "./create-runtime.js";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
 import type { ChildJoinSummary } from "./types.js";
 import { auditDurableChildren } from "./durable-children.js";
+import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -23,6 +25,8 @@ export interface RuntimeCompositionConfig {
   maxParallelTools: number;
   maxParallelAgents: number;
   mcpServers: McpServerConfigValue[];
+  mcpSource: McpConfigSource;
+  workspaceMcpTrust?: WorkspaceMcpTrustAttestation;
 }
 
 export interface RuntimeFactoryDeps {
@@ -63,7 +67,10 @@ export async function createConfiguredRuntime(
   deps: RuntimeFactoryDeps = {},
   options: RuntimeFactoryOptions = {}
 ): Promise<ConfiguredRuntime> {
-  const workspace = path.resolve(config.workspace);
+  const workspace = await realpath(path.resolve(config.workspace));
+  if (options.connectMcp !== false && config.mcpServers.length > 0) {
+    await verifyWorkspaceMcpTrust(workspace, config.mcpSource, config.workspaceMcpTrust);
+  }
   const model = config.model === "auto" ? defaultModel(config.provider) : config.model;
   const gateway = deps.gatewayFactory?.({ provider: config.provider, model }) ?? createModelGateway({
     provider: config.provider,
@@ -95,7 +102,7 @@ export async function createConfiguredRuntime(
     runDeadlineMs: config.runDeadlineSec * 1_000,
     maxParallelTools: config.maxParallelTools,
     joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
-    cancelChildren: (parentId, reason) => { supervisor.cancelParent(parentId, reason); }
+    cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason)
   });
   runtimeReference.current = runtime;
   return { workspace, runtime, close: async () => await closeMcpClients(mcpClients) };

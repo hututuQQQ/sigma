@@ -30,6 +30,12 @@ export function createModelGateway(options: CreateGatewayOptions): ModelGateway 
       requestTimeoutMs: options.requestTimeoutMs,
       idleTimeoutMs: options.idleTimeoutMs,
       fetchImpl: options.fetchImpl,
+      wireProfile: {
+        developerRole: "system",
+        supportsToolChoice: false,
+        thinking: "enabled",
+        retryableFinishReasons: ["insufficient_system_resource"]
+      },
       capabilities: { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true }
     });
   }
@@ -43,6 +49,7 @@ export function createModelGateway(options: CreateGatewayOptions): ModelGateway 
     requestTimeoutMs: options.requestTimeoutMs,
     idleTimeoutMs: options.idleTimeoutMs,
     fetchImpl: options.fetchImpl,
+    wireProfile: { developerRole: "system" },
     capabilities: { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true }
   });
 }

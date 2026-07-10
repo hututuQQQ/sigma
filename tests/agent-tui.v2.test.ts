@@ -12,13 +12,26 @@ function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEven
   return { schemaVersion: 2, seq, eventId: `e-${seq}`, sessionId: "session", runId: "run", occurredAt: new Date(seq).toISOString(), type, authority: "runtime", payload };
 }
 
+function runEvent(
+  seq: number,
+  runId: string,
+  type: AgentEventEnvelope["type"],
+  payload: AgentEventEnvelope["payload"]
+): AgentEventEnvelope {
+  return { ...event(seq, type, payload), runId };
+}
+
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   private sessions = 0;
 
-  constructor(private readonly events: AgentEventEnvelope[] = [event(1, "session.created", {})]) {}
+  constructor(
+    private readonly events: AgentEventEnvelope[] = [event(1, "session.created", {})],
+    private readonly createGate: Promise<void> = Promise.resolve()
+  ) {}
 
   async createSession(_input: StartSession): Promise<SessionRef> {
+    await this.createGate;
     this.sessions += 1;
     return { sessionId: this.sessions === 1 ? "session" : `session-${this.sessions}`, runId: "run" };
   }
@@ -93,6 +106,76 @@ describe("Sigma v2 TUI", () => {
     expect(sanitizeTerminalText("a\tb\u0000c")).toBe("a    b�c");
   });
 
+  it("settles the matching model activity and reports each run failure once", () => {
+    let view = createPresentationState();
+    view = projectEvent(view, runEvent(1, "run-a", "model.started", { turnId: 1, model: "deepseek-v4-pro" }));
+    view = projectEvent(view, runEvent(2, "run-a", "model.delta", { turnId: 1, delta: "partial" }));
+    view = projectEvent(view, runEvent(3, "run-a", "model.failed", { turnId: 1, code: "bad_request", message: "first failure" }));
+    view = projectEvent(view, runEvent(4, "run-a", "run.failed", { code: "bad_request", message: "first failure" }));
+    view = projectEvent(view, runEvent(5, "run-b", "model.started", { turnId: 1, model: "glm-5" }));
+    view = projectEvent(view, runEvent(6, "run-b", "model.failed", { turnId: 1, code: "overloaded", message: "second failure" }));
+    view = projectEvent(view, runEvent(7, "run-b", "run.failed", { code: "overloaded", message: "second failure" }));
+
+    expect(view.activity.filter((item) => item.kind === "model")).toMatchObject([
+      { id: "model:run-a:1", title: "deepseek-v4-pro", detail: "bad_request: first failure", status: "failed" },
+      { id: "model:run-b:1", title: "glm-5", detail: "overloaded: second failure", status: "failed" }
+    ]);
+    expect(view.activity.some((item) => item.detail === "Generating response")).toBe(false);
+    expect(view.transcript.filter((item) => item.role === "system")).toHaveLength(2);
+    expect(view.transcript.filter((item) => item.streaming)).toHaveLength(0);
+  });
+
+  it("shows a generic run failure when no model failure preceded it", () => {
+    const view = projectEvent(createPresentationState(), event(1, "run.failed", {}));
+    expect(view.status).toBe("failed");
+    expect(view.transcript).toMatchObject([{
+      id: "error:run", role: "system", text: "Run failed without an error message.", streaming: false
+    }]);
+    expect(view.activity).toMatchObject([{
+      id: "run:run", kind: "diagnostic", title: "run failed", status: "failed"
+    }]);
+  });
+
+  it("renders the full provider root cause in red with bounded, sanitized wrapping", () => {
+    const rootCause = "messages[1].role: unknown variant `developer`, expected system, user, assistant, or tool";
+    const failure = `deepseek stream HTTP 400: ${"request body context ".repeat(24)}${rootCause}`;
+    let view = createPresentationState();
+    view = projectEvent(view, event(1, "model.started", { turnId: 1, model: "deepseek-v4-pro" }));
+    view = projectEvent(view, event(2, "model.delta", { turnId: 1, delta: "partial response" }));
+    view = projectEvent(view, event(3, "model.failed", { turnId: 1, code: "model_error", message: `${failure}\u001b[31m` }));
+    view = projectEvent(view, event(4, "run.failed", { code: "model_error", message: failure }));
+    const frame = renderFrame({ ...createTuiState(), sessionId: "session", view }, { width: 80, height: 18 });
+
+    expect(frame.split("\n")).toHaveLength(18);
+    expect(frame).toContain("\u001b[38;5;203merror");
+    expect(frame).toContain("messages[1].role");
+    expect(frame).toContain("`developer`");
+    expect(frame).not.toContain("Generating response");
+    expect(frame).not.toContain("\u001b[31m\u001b[0m");
+    expect(view.activity.at(-1)?.detail).toBe(`model_error: ${failure}\u001b[31m`);
+    expect(view.transcript.filter((item) => item.role === "system")).toHaveLength(1);
+    expect(view.transcript.some((item) => item.streaming)).toBe(false);
+  });
+
+  it("projects only diagnostics with user-meaningful detail", () => {
+    let view = createPresentationState();
+    view = projectEvent(view, event(1, "diagnostic", { kind: "steering.restart", turnId: 1 }));
+    view = projectEvent(view, event(2, "diagnostic", { kind: "nested_instructions_loaded", items: [] }));
+    view = projectEvent(view, event(3, "diagnostic", {
+      kind: "provider_notice",
+      diagnostics: ["retrying provider", "", 42, "root diagnostic remains visible"]
+    }));
+    expect(view.activity).toHaveLength(1);
+    expect(view.activity[0]).toMatchObject({
+      kind: "diagnostic",
+      title: "provider_notice",
+      detail: "retrying provider\nroot diagnostic remains visible"
+    });
+    const frame = renderFrame({ ...createTuiState(), view }, { width: 34, height: 8 });
+    expect(frame.split("\n")).toHaveLength(8);
+    expect(frame).toContain("root diagnostic remains visible");
+  });
+
   it("decodes chunked input and always restores terminal state", async () => {
     const runtime = new FakeRuntime();
     const rawModes: boolean[] = [];
@@ -111,6 +194,50 @@ describe("Sigma v2 TUI", () => {
     expect(rendered).toContain("\u001b[?1049l");
     expect(rendered).toContain("\u001b[?2004h");
     expect(rendered).toContain("\u001b[?2004l");
+  });
+
+  it("queues an immediate submission until the initial session is ready", async () => {
+    let releaseSession!: () => void;
+    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const runtime = new FakeRuntime([event(1, "session.created", {})], sessionGate);
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
+    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
+    const running = controller.run();
+
+    stdin.write("submitted before startup completes\r");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runtime.commands).toEqual([]);
+    releaseSession();
+    for (let attempt = 0; attempt < 50 && runtime.commands.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(runtime.commands).toContainEqual({
+      type: "submit", sessionId: "session", text: "submitted before startup completes", mode: "change"
+    });
+    stdin.write("/quit\r");
+    await running;
+  });
+
+  it("does not lose an early double interrupt while session creation is blocked", async () => {
+    let releaseSession!: () => void;
+    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const runtime = new FakeRuntime([event(1, "session.created", {})], sessionGate);
+    const rawModes: boolean[] = [];
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode: (mode: boolean) => rawModes.push(mode)
+    });
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
+    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout });
+    const running = controller.run();
+
+    stdin.write("\u0003\u0003");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseSession();
+    await running;
+    expect(rawModes).toEqual([true, false]);
+    expect(runtime.commands).toEqual([]);
   });
 
   it("routes resumed approvals without implicitly denying other input", async () => {

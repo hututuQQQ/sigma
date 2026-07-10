@@ -81,10 +81,10 @@ The automated suites cover:
 - checksummed segment rotation, concurrent append serialization, corrupt/torn tails, snapshots, artifacts, and stale append locks;
 - multi-run restore, durable deadlines, outcome-pending recovery, active-session ownership, command inboxes, pending approvals, and interrupted idempotent/non-idempotent tools;
 - effect-based permission/mode decisions, per-call contexts, resource locking, process cancellation, tool failures, workspace delta receipts, and nested `AGENTS.md` discovery;
-- stale-turn rejection after steering, nested-instruction replan-before-write, delegated write-scope enforcement, and tool idle/hard deadlines;
-- CJK/Unicode repository retrieval, provider-sized token fitting, low-authority conversation compaction, Git context, symlink/junction containment, and cache invalidation;
+- stale model/tool/outcome rejection after steering, protocol-safe closure of superseded tool calls, nested-instruction replan-before-write-or-completion, delegated write-scope enforcement, and tool idle/hard deadlines;
+- current-run-only completion receipts, same-turn completion barriers, strict met-criterion evidence, CJK/Unicode repository retrieval, provider-sized token fitting, atomic tool-call/result compaction, bounded large outputs, Git-root/workspace containment, symlink/junction containment, and cache invalidation;
 - child scheduling, durable FIFO follow-ups, parent cancellation/join behavior, crash-visible unresolved children, clean-repository worktrees, dirty/non-Git single-writer leases, delegated approval capabilities, scoped integration, and integration conflicts;
-- MCP initialize/tools/call flows, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
+- MCP initialize/tools/call flows, repository trust/digest invalidation, cwd containment, environment-secret isolation, malicious-config preflight, progress, pagination, protocol errors, cancellation, idle/deadline distinction, stderr bounds, shutdown, and tool-policy bridging;
 - CLI strict config precedence, init/replay/session commands, active-owner routing, output formats, exit codes, interactive approval, and provider failure;
 - TUI grapheme editing, CJK/emoji/flags/keycaps, bracketed paste, control-sequence sanitization, multiple approvals, queue routing, resize/cleanup, 10,000-event projection, render p95 under 16 ms in the unit-test environment, and heap growth under 150 MiB in that test;
 - packaged TUI startup and cleanup through a real Linux PTY and Windows ConPTY in CI;
@@ -98,7 +98,7 @@ Do not interpret the checks above as claims beyond their scope:
 
 - Sigma enforces workspace path containment and process cancellation, but does not currently configure an OS-level command sandbox. `agent doctor` reports this as a warning.
 - CI exercises packaged `/quit` startup and cleanup through Linux PTY and Windows ConPTY. It does not replace manual IME, rapid-resize, font, and terminal-emulator matrix signoff.
-- MCP policy trusts the configured `possible_effects` and cannot independently prove what a remote server does. Treat untrusted MCP servers as untrusted executables.
+- A trusted MCP process still runs with the user's OS authority. Repository MCP requires path-and-digest-bound trust and receives a restricted environment, but policy cannot independently prove what a remote server does.
 - A dirty/non-Git writer runs under an exclusive lease in the source workspace, not an isolated worktree. In that mode only path-addressable writes inside its required `writeScope` are allowed; broad process/MCP mutation tools are denied.
 - The default CI/product gate uses fake gateways. Only the explicit provider smoke proves current credentials and provider connectivity.
 - Cross-target package structure verification does not execute a foreign-platform wrapper.

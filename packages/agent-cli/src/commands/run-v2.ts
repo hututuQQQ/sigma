@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agent-protocol";
 import { createConfiguredRuntime, type ConfiguredRuntime, type InProcessRuntimeClient } from "agent-runtime";
-import { loadCliConfig, parseArgs, type CliConfig } from "../config.js";
+import { loadCliConfig, parseArgs, workspaceMcpTrustMessage, type CliConfig } from "../config.js";
 
 export interface RunV2Deps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
@@ -141,11 +141,17 @@ function nonInteractiveAsk(config: CliConfig, stdinTty: boolean, stdoutTty: bool
   return config.permissionMode === "ask" && (!stdinTty || !stdoutTty);
 }
 
-function writeNeedsInput(config: CliConfig, stdout: NodeJS.WritableStream, stderr: NodeJS.WritableStream): void {
+function writeNeedsInput(
+  config: CliConfig,
+  stdout: NodeJS.WritableStream,
+  stderr: NodeJS.WritableStream,
+  message = "Non-interactive ask mode cannot resolve tool approvals. Use --permission-mode auto or the TUI.",
+  finishReason = "permission_required"
+): void {
   const result = {
     status: "needs_input",
-    finishReason: "permission_required",
-    message: "Non-interactive ask mode cannot resolve tool approvals. Use --permission-mode auto or the TUI."
+    finishReason,
+    message
   };
   if (config.outputFormat === "json" || config.outputFormat === "stream-json") stdout.write(`${JSON.stringify(result)}\n`);
   else stderr.write(`${result.message}\n`);
@@ -169,6 +175,11 @@ export async function runV2Command(argv: string[], deps: RunV2Deps = {}): Promis
     const instruction = await instructionFromArgs(parsed.flags, parsed.positionals, stdin);
     if (!instruction) throw new Error("A non-empty instruction is required.");
     const mode = deps.mode ?? "change";
+    const trustMessage = workspaceMcpTrustMessage(config);
+    if (trustMessage) {
+      writeNeedsInput(config, stdout, stderr, trustMessage, "workspace_mcp_trust_required");
+      return 2;
+    }
     if (nonInteractiveAsk(config, stdin.isTTY === true, stdout.isTTY === true)) {
       writeNeedsInput(config, stdout, stderr);
       return 2;

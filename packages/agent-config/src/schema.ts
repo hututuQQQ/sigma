@@ -19,6 +19,15 @@ export interface McpServerConfigValue {
   shutdownGraceMs: number;
 }
 
+export interface WorkspaceMcpTrustAttestation {
+  required: true;
+  trusted: boolean;
+  canonicalWorkspacePath: string;
+  configDigest: string;
+}
+
+export type McpConfigSource = "none" | "flags" | "environment" | "home" | "workspace";
+
 export type ConfigValue = ConfigScalar | string[] | McpServerConfigValue[];
 
 export interface ConfigField<T extends ConfigValue = ConfigValue> {
@@ -143,6 +152,11 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "outputFormat", flag: "output-format", env: "SIGMA_OUTPUT_FORMAT", toml: "ui.output_format", description: "CLI output format", defaultValue: "text", parse: (raw) => enumValue(raw, "outputFormat", ["text", "json", "stream-json"] as const) },
   { key: "tuiFps", flag: "tui-fps", env: "SIGMA_TUI_FPS", toml: "tui.fps", description: "Maximum TUI frames per second", defaultValue: 30, parse: (raw) => numberValue(raw, "tuiFps", 1, 30) },
   { key: "mcpServers", flag: "mcp-server", kind: "repeatable", env: "SIGMA_MCP_SERVERS", toml: "mcp.servers", description: "MCP stdio server JSON (repeatable)", defaultValue: [], parse: mcpServersValue },
+  {
+    key: "trustWorkspaceMcp", flag: "trust-workspace-mcp", kind: "boolean",
+    description: "Trust this workspace's current MCP configuration", defaultValue: false,
+    parse: (raw) => booleanValue(raw, "trustWorkspaceMcp")
+  },
   booleanField("help", "help", "Show command help", "h"),
   booleanField("stdin", "stdin", "Read instruction from stdin"),
   { key: "prompt", flag: "prompt", description: "Inline instruction", defaultValue: "", parse: (raw) => stringValue(raw, "prompt", true), hidden: true },

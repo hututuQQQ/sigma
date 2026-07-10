@@ -90,6 +90,7 @@ describe("agent-config single-source schema", () => {
   it("renders help, commands, and TOML from the same declarations", () => {
     const help = configHelp();
     expect(help.some((line) => line.includes("--provider"))).toBe(true);
+    expect(help.some((line) => line.includes("--trust-workspace-mcp"))).toBe(true);
     expect(help.some((line) => line.includes("--prompt"))).toBe(false);
     const registry = new CommandRegistry();
     expect(registry.resolve("inspect")).toMatchObject({ handler: "run", mode: "analyze" });

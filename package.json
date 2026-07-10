@@ -20,7 +20,7 @@
     "lint:architecture": "node scripts/check-architecture.mjs",
     "lint": "pnpm typecheck && pnpm lint:eslint && pnpm lint:deps && pnpm lint:deadcode && pnpm lint:architecture",
     "clean": "pnpm -r run clean",
-    "tui:deepseek": "pnpm --filter agent-tui build && pnpm --filter agent-cli build && node scripts/run-tui-deepseek.mjs",
+    "tui:deepseek": "pnpm build && node scripts/run-tui-deepseek.mjs",
     "verify:product": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows:structure && pnpm product:readiness",
     "verify:release:windows": "pnpm lint && pnpm test:coverage && pnpm smoke:product && pnpm smoke:tui-product && pnpm verify:package:agent-cli:windows && pnpm smoke:provider -- --provider deepseek && node scripts/product-readiness-report.mjs --require-release-ready --require-provider-smoke",
     "package:agent-cli": "pnpm build && node scripts/package-agent-cli.mjs",

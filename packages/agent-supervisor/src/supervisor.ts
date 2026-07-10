@@ -192,6 +192,9 @@ export class AgentSupervisor implements SupervisorPort {
         void job.allocation.release().then((isolation) => {
           job.public.isolation = isolation;
           this.complete(job);
+        }).catch((error: unknown) => {
+          job.public.error = `Workspace cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+          this.complete(job);
         });
       } else if (!job.preparing) this.complete(job);
       return;
@@ -203,10 +206,12 @@ export class AgentSupervisor implements SupervisorPort {
     }
   }
 
-  cancelParent(parentId: string, reason = "parent cancelled children"): void {
-    for (const job of this.jobs.values()) {
-      if (job.public.parentId === parentId && !job.public.detached) this.cancel(job.public.id, reason);
-    }
+  async cancelParent(parentId: string, reason = "parent cancelled children"): Promise<void> {
+    const children = [...this.jobs.values()].filter((job) =>
+      job.public.parentId === parentId && !job.public.detached
+    );
+    for (const job of children) this.cancel(job.public.id, reason);
+    await Promise.all(children.map(async (job) => await job.completion));
   }
 
   async join(childId: string): Promise<ChildJob> {
@@ -338,16 +343,26 @@ export class AgentSupervisor implements SupervisorPort {
       }
     ).finally(async () => {
       job.mailbox.close();
-      job.public.isolation = await allocation.release();
-      this.running -= 1;
-      await this.publish(job, "child.completed", jsonValue({
-        status: job.public.status,
-        outcome: job.public.result?.outcome ?? null,
-        isolation: job.public.isolation ?? null,
-        error: job.public.error ?? null
-      })).catch((error) => { job.public.error = error instanceof Error ? error.message : String(error); });
-      this.complete(job);
-      this.schedule();
+      try {
+        try {
+          job.public.isolation = await allocation.release();
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          job.public.error = job.public.error ? `${job.public.error}; workspace cleanup failed: ${detail}`
+            : `Workspace cleanup failed: ${detail}`;
+          if (job.public.status === "completed") job.public.status = "failed";
+        }
+        await this.publish(job, "child.completed", jsonValue({
+          status: job.public.status,
+          outcome: job.public.result?.outcome ?? null,
+          isolation: job.public.isolation ?? null,
+          error: job.public.error ?? null
+        })).catch((error) => { job.public.error = error instanceof Error ? error.message : String(error); });
+      } finally {
+        this.running -= 1;
+        this.complete(job);
+        this.schedule();
+      }
     });
   }
 

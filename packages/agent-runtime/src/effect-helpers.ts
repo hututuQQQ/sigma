@@ -89,7 +89,12 @@ export function completionFailure(session: RuntimeSession, call: ModelToolCall, 
   if (!proposal) return failed(call, startedAt, "Completion proposal does not match the required schema.", "invalid_completion_proposal");
   const successful = new Set(session.state.receipts.filter((item) => item.ok).map((item) => item.callId));
   const evidenceError = completionEvidenceError(proposal, successful);
-  return evidenceError ? failed(call, startedAt, evidenceError, "invalid_completion_evidence") : null;
+  if (!evidenceError) return null;
+  const available = session.state.receipts.filter((item) => item.ok).slice(-20).map((item) => item.callId);
+  const guidance = available.length > 0
+    ? `Copy exact evidenceCallIds from this available successful receipt list: ${available.join(", ")}.`
+    : "No successful tool receipts are available yet; run the required inspection, mutation, or validation tool first.";
+  return failed(call, startedAt, `${evidenceError}\n${guidance}`, "invalid_completion_evidence");
 }
 
 function normalizedRelative(workspacePath: string, candidate: string): string | null {
@@ -125,7 +130,7 @@ export function lockKeys(session: RuntimeSession, descriptor: ToolDescriptor): s
 }
 
 export function requiresInstructionReplan(descriptor: ToolDescriptor): boolean {
-  const risky = new Set(["filesystem.write", "process.spawn", "agent.spawn", "network", "validation", "destructive", "open_world"]);
+  const risky = new Set(["filesystem.write", "process.spawn", "agent.spawn", "network", "validation", "outcome.propose", "destructive", "open_world"]);
   return descriptor.possibleEffects.some((effect) => risky.has(effect));
 }
 

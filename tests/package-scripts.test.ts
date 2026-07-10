@@ -14,7 +14,7 @@ describe("package scripts", () => {
       "bench:tb:deepseek:task": "node scripts/bench-terminal-bench.mjs --mode task --provider deepseek --model deepseek-v4-pro",
       "package:harbor-runtime": "node scripts/package-harbor-runtime.mjs",
       "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
-      "tui:deepseek": "pnpm --filter agent-tui build && pnpm --filter agent-cli build && node scripts/run-tui-deepseek.mjs"
+      "tui:deepseek": "pnpm build && node scripts/run-tui-deepseek.mjs"
     });
     expect(packageJson.scripts["bench:deepseek"]).not.toBe(packageJson.scripts["bench:tb:deepseek"]);
     expect(JSON.stringify(packageJson.scripts)).not.toContain("DEEPSEEK_API_KEY");

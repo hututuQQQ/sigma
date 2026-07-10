@@ -1,5 +1,6 @@
 import type { AgentEventEnvelope, AgentEventType, JsonValue } from "agent-protocol";
 import type { ActivityItem, ApprovalItem, PresentationState, TranscriptItem } from "./view-state.js";
+import { projectDiagnostic, projectModelFailed, projectRunFailed } from "./failure-projectors.js";
 
 function payload(event: AgentEventEnvelope): Record<string, JsonValue> {
   return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
@@ -185,6 +186,7 @@ const projectors: Partial<Record<AgentEventType, EventProjector>> = {
     transcript: appendDelta(state.transcript, event, data, text(data.delta))
   }),
   "model.completed": projectModelCompleted,
+  "model.failed": projectModelFailed,
   "tool.requested": projectToolActivity,
   "tool.started": projectToolActivity,
   "tool.completed": projectToolActivity,
@@ -197,7 +199,8 @@ const projectors: Partial<Record<AgentEventType, EventProjector>> = {
   "run.suspended": withStatus("needs_input"),
   "run.completed": withStatus("completed"),
   "run.cancelled": withStatus("cancelled"),
-  "run.failed": withStatus("failed")
+  "run.failed": projectRunFailed,
+  "diagnostic": projectDiagnostic
 };
 
 export function projectEvent(previous: PresentationState, event: AgentEventEnvelope): PresentationState {

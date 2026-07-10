@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -75,6 +75,55 @@ describe("agent-store crash and validation coverage", () => {
     const restored: number[] = [];
     for await (const item of store.events("tail")) restored.push(item.seq);
     expect(restored).toEqual([1, 2, 3]);
+  });
+
+  it("reconciles a durable event when its metadata replace failed", async () => {
+    const root = path.join(os.tmpdir(), `sigma-meta-crash-${Date.now()}-${Math.random()}`);
+    let armed = false;
+    let failed = false;
+    const store = new SegmentedJsonlStore({
+      rootDir: root,
+      replaceFile: async (source, target) => {
+        if (armed && !failed && target.endsWith("meta.json")) {
+          failed = true;
+          const durable = await readFile(path.join(root, "sessions-v2", "meta-crash", "events", "000001.jsonl"), "utf8");
+          expect(durable.trimEnd().split("\n")).toHaveLength(2);
+          throw Object.assign(new Error("injected metadata replace failure"), { code: "EIO" });
+        }
+        await rename(source, target);
+      }
+    });
+    await store.append(event("meta-crash", 1, "session.created"), 0);
+    armed = true;
+    await expect(store.append(event("meta-crash", 2), 1)).rejects.toThrow("injected metadata replace failure");
+
+    const recovered = new SegmentedJsonlStore({ rootDir: root });
+    await expect(recovered.append(event("meta-crash", 2), 1)).rejects.toThrow("actual 2");
+    await recovered.append(event("meta-crash", 3), 2);
+    const sequences: number[] = [];
+    for await (const stored of recovered.events("meta-crash")) sequences.push(stored.seq);
+    expect(sequences).toEqual([1, 2, 3]);
+    expect(new Set(sequences).size).toBe(sequences.length);
+  });
+
+  it("retries transient Windows-style atomic replace failures without exposing partial JSON", async () => {
+    const root = path.join(os.tmpdir(), `sigma-meta-retry-${Date.now()}-${Math.random()}`);
+    let attempts = 0;
+    const store = new SegmentedJsonlStore({
+      rootDir: root,
+      replaceFile: async (source, target) => {
+        attempts += 1;
+        if (attempts < 3) throw Object.assign(new Error("sharing violation"), { code: attempts === 1 ? "EPERM" : "EBUSY" });
+        await rename(source, target);
+      }
+    });
+
+    await store.append(event("meta-retry", 1, "session.created"), 0);
+    expect(attempts).toBe(3);
+    const directory = path.join(root, "sessions-v2", "meta-retry");
+    const meta = JSON.parse(await readFile(path.join(directory, "meta.json"), "utf8")) as { lastSeq: number };
+    expect(meta.lastSeq).toBe(1);
+    expect((await readdir(directory)).some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
   it("detects durable corruption and recovers stale locks", async () => {

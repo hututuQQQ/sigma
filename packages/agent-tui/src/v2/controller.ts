@@ -5,7 +5,6 @@ import { parseApprovalInput } from "./approval-input.js";
 import { backspace, composerText, insertText, moveCursor } from "./composer.js";
 import { renderFrame } from "./render.js";
 import { createTuiState, pendingApproval, reduceTui, type TuiState } from "./state.js";
-
 interface TtyInput extends NodeJS.ReadableStream {
   isTTY?: boolean;
   setRawMode?(mode: boolean): void;
@@ -40,6 +39,7 @@ export class TuiController {
   private readonly decoder = new StringDecoder("utf8");
   private inputBuffer = "";
   private inputTail = Promise.resolve();
+  private sessionReady: Promise<void> = Promise.resolve();
   constructor(private readonly options: TuiControllerOptions) {
     this.state = createTuiState(options.mode ?? "change");
     this.input = options.stdin ?? process.stdin;
@@ -49,20 +49,21 @@ export class TuiController {
   async run(): Promise<void> {
     if (!this.input.isTTY || this.output.columns === undefined) throw new Error("The TUI requires an interactive terminal.");
     this.active = true;
+    const exited = new Promise<void>((resolve) => { this.exitResolve = resolve; });
     try {
       this.input.setRawMode?.(true);
       this.input.resume();
       this.input.on("data", this.onData);
       this.output.on("resize", this.onResize);
       this.output.write("\u001b[?25l\u001b[?1049h\u001b[?2004h");
-      if (this.options.sessionId) {
-        await this.options.runtime.command({ type: "resume", sessionId: this.options.sessionId });
-        await this.attach(this.options.sessionId);
-      } else {
-        await this.newSession();
-      }
-      this.scheduleRender();
-      await new Promise<void>((resolve) => { this.exitResolve = resolve; });
+      const requestedSessionId = this.options.sessionId;
+      this.sessionReady = requestedSessionId ? (async () => {
+        await this.options.runtime.command({ type: "resume", sessionId: requestedSessionId });
+        await this.attach(requestedSessionId);
+      })() : this.newSession();
+      await this.sessionReady;
+      if (!this.state.stopped) this.scheduleRender();
+      await exited;
     } finally {
       await this.cleanup();
     }
@@ -73,16 +74,13 @@ export class TuiController {
     this.state = reduceTui(this.state, { type: "stop" });
     this.exitResolve?.();
   }
-
   private readonly onResize = (): void => this.scheduleRender();
-
   private readonly onData = (chunk: Buffer | string): void => {
     this.inputBuffer += Buffer.isBuffer(chunk) ? this.decoder.write(chunk) : chunk;
     this.inputTail = this.inputTail.then(() => this.drainInput()).catch((error) => {
       this.notice(error instanceof Error ? error.message : String(error));
     });
   };
-
   private async drainInput(): Promise<void> {
     const sequences = ["\u001b[200~", "\u001b[201~", "\u001b[5~", "\u001b[6~", "\u001b[A", "\u001b[B", "\u001b[C", "\u001b[D"];
     while (this.inputBuffer) {
@@ -142,8 +140,10 @@ export class TuiController {
 
   private async submitComposer(): Promise<void> {
     const text = composerText(this.state.composer).trim();
+    if (!text) return;
+    if (!this.state.sessionId) await this.sessionReady;
     const sessionId = this.state.sessionId;
-    if (!text || !sessionId) return;
+    if (!sessionId) return;
     this.state = reduceTui(this.state, { type: "submitted" });
     const approval = pendingApproval(this.state);
     const approvalDecision = approval ? parseApprovalInput(text, approval.requestId) : null;

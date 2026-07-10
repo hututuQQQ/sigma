@@ -1,4 +1,4 @@
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { runProcess, type ProcessResult } from "./process.js";
 
@@ -28,11 +28,44 @@ export async function resolveWorkspacePath(workspace: string, requested: string)
   return candidate;
 }
 
+export async function selfContainedGitRoot(workspace: string, signal?: AbortSignal): Promise<string | null> {
+  signal?.throwIfAborted();
+  const root = await realpath(path.resolve(workspace));
+  const marker = await lstat(path.join(root, ".git")).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!marker || marker.isSymbolicLink()) return null;
+  const processSignal = signal ?? new AbortController().signal;
+  const result = await runProcess({
+    executable: "git", args: ["rev-parse", "--show-toplevel"], cwd: root,
+    timeoutMs: 10_000, maxOutputBytes: 16_384, signal: processSignal
+  }).catch(() => {
+    processSignal.throwIfAborted();
+    return null;
+  });
+  processSignal.throwIfAborted();
+  if (!result || result.exitCode !== 0) return null;
+  const reported = result.stdout.trim();
+  if (!reported) return null;
+  const canonical = await realpath(path.resolve(root, reported)).catch(() => path.resolve(root, reported));
+  return path.relative(root, canonical) === "" ? root : null;
+}
+
 export async function gitPorcelain(workspace: string, signal: AbortSignal): Promise<ProcessResult> {
+  const root = await selfContainedGitRoot(workspace, signal);
+  if (!root) return {
+    exitCode: 128,
+    stdout: "",
+    stderr: "Workspace is not a self-contained Git repository.",
+    timedOut: false,
+    cancelled: false,
+    durationMs: 0
+  };
   return await runProcess({
     executable: "git",
     args: ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    cwd: workspace,
+    cwd: root,
     timeoutMs: 30_000,
     signal
   });

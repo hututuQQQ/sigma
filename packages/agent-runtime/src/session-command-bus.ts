@@ -1,13 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import {
+  acquireProcessOwnerLease,
+  inspectProcessOwner,
+  isProcessOwnerActive,
+  type ProcessOwnerLease,
+  type ProcessOwnerRecord
+} from "agent-platform";
 import type { RunCommand } from "agent-protocol";
 import { sessionDirectory } from "agent-store";
 
-interface OwnerRecord {
-  pid: number;
-  instanceId: string;
-  startedAt: string;
+export type OwnerRecord = ProcessOwnerRecord;
+
+export interface SessionCommandBusOptions {
+  claimTimeoutMs?: number;
+  malformedOwnerStaleMs?: number;
+  retryIntervalMs?: number;
 }
 
 function ownerPath(rootDir: string, sessionId: string): string {
@@ -18,27 +27,9 @@ function commandDirectory(rootDir: string, sessionId: string): string {
   return path.join(sessionDirectory(rootDir, sessionId), "commands");
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readOwner(rootDir: string, sessionId: string): Promise<OwnerRecord | null> {
-  try {
-    const value = JSON.parse(await readFile(ownerPath(rootDir, sessionId), "utf8")) as OwnerRecord;
-    return Number.isInteger(value.pid) && typeof value.instanceId === "string" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function activeSessionOwner(rootDir: string, sessionId: string): Promise<OwnerRecord | null> {
-  const owner = await readOwner(rootDir, sessionId);
-  return owner && processAlive(owner.pid) ? owner : null;
+  const observation = await inspectProcessOwner(ownerPath(rootDir, sessionId));
+  return observation.kind === "valid" && isProcessOwnerActive(observation) ? observation.owner : null;
 }
 
 export async function sendSessionCommand(rootDir: string, command: RunCommand): Promise<void> {
@@ -61,29 +52,32 @@ export async function sendSessionCommand(rootDir: string, command: RunCommand): 
 export class SessionCommandBus {
   private readonly instanceId = randomUUID();
   private readonly timers = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly leases = new Map<string, ProcessOwnerLease>();
   private readonly polling = new Set<string>();
 
-  constructor(private readonly rootDir: string, private readonly dispatch: (command: RunCommand) => Promise<void>) {}
+  constructor(
+    private readonly rootDir: string,
+    private readonly dispatch: (command: RunCommand) => Promise<void>,
+    private readonly options: SessionCommandBusOptions = {}
+  ) {}
 
   async claim(sessionId: string): Promise<void> {
     if (this.timers.has(sessionId)) return;
     const directory = sessionDirectory(this.rootDir, sessionId);
     await mkdir(directory, { recursive: true });
     const file = ownerPath(this.rootDir, sessionId);
-    const existing = await readOwner(this.rootDir, sessionId);
-    if (existing && processAlive(existing.pid)) throw new Error(`Session '${sessionId}' is active in process ${existing.pid}.`);
-    if (existing) await unlink(file).catch(() => undefined);
-    const handle = await open(file, "wx").catch(async (error: unknown) => {
-      const owner = await activeSessionOwner(this.rootDir, sessionId);
-      if (owner) throw new Error(`Session '${sessionId}' is active in process ${owner.pid}.`);
-      throw error;
+    const lease = await acquireProcessOwnerLease(file, {
+      pid: process.pid,
+      instanceId: this.instanceId,
+      startedAt: new Date().toISOString()
+    }, {
+      label: `Session '${sessionId}' runtime owner`,
+      timeoutMs: this.options.claimTimeoutMs,
+      malformedStaleMs: this.options.malformedOwnerStaleMs,
+      retryIntervalMs: this.options.retryIntervalMs,
+      activeOwner: "reject"
     });
-    try {
-      await handle.writeFile(`${JSON.stringify({ pid: process.pid, instanceId: this.instanceId, startedAt: new Date().toISOString() } satisfies OwnerRecord)}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
+    this.leases.set(sessionId, lease);
     const timer = setInterval(() => { void this.poll(sessionId).catch(() => undefined); }, 100);
     timer.unref();
     this.timers.set(sessionId, timer);
@@ -91,11 +85,14 @@ export class SessionCommandBus {
 
   async release(sessionId: string): Promise<void> {
     const timer = this.timers.get(sessionId);
-    if (!timer) return;
-    clearInterval(timer);
-    this.timers.delete(sessionId);
-    const owner = await readOwner(this.rootDir, sessionId);
-    if (owner?.instanceId === this.instanceId) await unlink(ownerPath(this.rootDir, sessionId)).catch(() => undefined);
+    if (timer) {
+      clearInterval(timer);
+      this.timers.delete(sessionId);
+    }
+    const lease = this.leases.get(sessionId);
+    if (!lease) return;
+    await lease.release();
+    this.leases.delete(sessionId);
   }
 
   private async poll(sessionId: string): Promise<void> {

@@ -2,6 +2,8 @@ import type { JsonValue, RunMode, ToolEffect } from "agent-protocol";
 import type { ChildAgentContext, ChildAgentFactory } from "agent-supervisor";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
 
+const CHILD_CLEANUP_DEADLINE_MS = 5_000;
+
 function childMode(metadata: JsonValue): RunMode {
   const values = metadata && typeof metadata === "object" && !Array.isArray(metadata)
     ? metadata as Record<string, JsonValue> : {};
@@ -50,6 +52,26 @@ async function forwardChildEvents(
   }
 }
 
+async function waitForSafeChildCleanup(
+  context: ChildAgentContext,
+  runtime: InProcessRuntimeClient,
+  sessionId: string
+): Promise<void> {
+  const deadline = AbortSignal.timeout(CHILD_CLEANUP_DEADLINE_MS);
+  try {
+    await runtime.waitForQuiescence(sessionId, deadline);
+  } catch (error) {
+    if (!deadline.aborted) throw error;
+    await context.notify({
+      kind: "child.cleanup_wait_exceeded",
+      childSessionId: sessionId,
+      deadlineMs: CHILD_CLEANUP_DEADLINE_MS,
+      policy: "The writer lease remains held until every cancelled operation has actually settled."
+    }).catch(() => undefined);
+    await runtime.waitForQuiescence(sessionId);
+  }
+}
+
 export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeClient): ChildAgentFactory {
   return async (context) => {
     const runtime = runtimeProvider();
@@ -64,12 +86,34 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
     await context.started(child.sessionId);
     const eventController = new AbortController();
     const childEvents = forwardChildEvents(context, runtime, child.sessionId, eventController.signal);
-    const onAbort = (): void => { void runtime.command({ type: "cancel", sessionId: child.sessionId, reason: "Parent cancelled child." }); };
+    let submit: Promise<void> | undefined;
+    let cancellation: Promise<void> | undefined;
+    const requestCancellation = (): Promise<void> => {
+      cancellation ??= (submit ?? Promise.resolve()).catch(() => undefined).then(async () => {
+        await runtime.command({ type: "cancel", sessionId: child.sessionId, reason: "Parent cancelled child." });
+      }).catch(async (error) => {
+        await context.notify({
+          kind: "child.cancel_failed",
+          childSessionId: child.sessionId,
+          message: error instanceof Error ? error.message : String(error)
+        }).catch(() => undefined);
+      });
+      return cancellation;
+    };
+    const onAbort = (): void => { void requestCancellation(); };
     context.signal.addEventListener("abort", onAbort, { once: true });
-    void forwardMailbox(context, runtime, child.sessionId);
+    void forwardMailbox(context, runtime, child.sessionId).catch(() => undefined);
     try {
-      await runtime.command({ type: "submit", sessionId: child.sessionId, text: childInstruction(context), mode });
-      const outcome = await runtime.waitForOutcome(child.sessionId, context.signal);
+      if (context.signal.aborted) {
+        await requestCancellation();
+      } else {
+        submit = runtime.command({ type: "submit", sessionId: child.sessionId, text: childInstruction(context), mode });
+        await submit;
+        if (context.signal.aborted) await requestCancellation();
+      }
+      const outcome = await runtime.waitForOutcome(child.sessionId);
+      if (context.signal.aborted) await requestCancellation();
+      await waitForSafeChildCleanup(context, runtime, child.sessionId);
       return {
         childId: context.childId,
         outcome,

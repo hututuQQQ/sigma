@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, open, readFile, realpath, rm, unlink } from "node:fs/promises";
+import { access, cp, mkdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolveWorkspacePath } from "agent-platform";
+import { acquireProcessOwnerLease, resolveWorkspacePath, selfContainedGitRoot } from "agent-platform";
 
 export type ChildRunIntent = "analyze" | "write";
 export type WorkspaceIsolationKind = "shared_read" | "git_worktree" | "exclusive_workspace";
@@ -108,27 +108,20 @@ function mutex(map: Map<string, AsyncMutex>, key: string): AsyncMutex {
 }
 
 function staticAllocation(isolation: ChildWorkspaceIsolation, unlock?: () => void | Promise<void>): WorkspaceAllocation {
-  let released = false;
+  let releasePromise: Promise<ChildWorkspaceIsolation> | undefined;
   return {
     workspacePath: isolation.executionWorkspacePath,
     isolation,
-    async release() {
-      if (!released) {
-        released = true;
+    release: () => releasePromise ??= (async () => {
+      try {
         await unlock?.();
+        return isolation;
+      } catch (error) {
+        releasePromise = undefined;
+        throw error;
       }
-      return isolation;
-    }
+    })()
   };
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function hasUserChanges(status: string): boolean {
@@ -159,36 +152,38 @@ function repositoryWriteScopes(isolation: ChildWorkspaceIsolation, scopes: strin
   return scopes.map((scope) => `${prefix}/${scope.replaceAll("\\", "/").replace(/^\.\//u, "")}`);
 }
 
+export interface WorkspaceIsolationManagerOptions {
+  writerLeaseTimeoutMs?: number;
+  malformedLockStaleMs?: number;
+  retryIntervalMs?: number;
+}
+
 export class WorkspaceIsolationManager {
   private readonly exclusive = new Map<string, AsyncMutex>();
   private readonly gitMutation = new Map<string, AsyncMutex>();
 
-  constructor(private readonly worktreeRoot = path.join(os.tmpdir(), "sigma-agent-worktrees")) {}
+  constructor(
+    private readonly worktreeRoot = path.join(os.tmpdir(), "sigma-agent-worktrees"),
+    private readonly options: WorkspaceIsolationManagerOptions = {}
+  ) {}
 
   private async acquireProcessWriterLease(workspace: string, signal?: AbortSignal): Promise<() => Promise<void>> {
     const directory = path.join(this.worktreeRoot, "writer-locks");
     const lockPath = path.join(directory, `${createHash("sha256").update(workspace).digest("hex")}.lock`);
-    await mkdir(directory, { recursive: true });
-    while (true) {
-      signal?.throwIfAborted();
-      try {
-        const handle = await open(lockPath, "wx");
-        await handle.writeFile(`${process.pid}\n`, "utf8");
-        await handle.sync();
-        return async () => {
-          await handle.close();
-          await unlink(lockPath).catch(() => undefined);
-        };
-      } catch (error) {
-        if ((error as { code?: unknown }).code !== "EEXIST") throw error;
-        const owner = Number.parseInt((await readFile(lockPath, "utf8").catch(() => "")).trim(), 10);
-        if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
-          await unlink(lockPath).catch(() => undefined);
-          continue;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-    }
+    const lease = await acquireProcessOwnerLease(lockPath, {
+      pid: process.pid,
+      instanceId: randomUUID(),
+      startedAt: new Date().toISOString()
+    }, {
+      label: "cross-process writer lease",
+      timeoutMs: this.options.writerLeaseTimeoutMs,
+      malformedStaleMs: this.options.malformedLockStaleMs,
+      retryIntervalMs: this.options.retryIntervalMs,
+      activeOwner: "wait",
+      allowLegacyPid: true,
+      signal
+    });
+    return lease.release;
   }
 
   private async exclusiveAllocation(
@@ -200,8 +195,11 @@ export class WorkspaceIsolationManager {
     try {
       const unlockProcess = await this.acquireProcessWriterLease(key, signal);
       return staticAllocation(isolation, async () => {
-        await unlockProcess();
-        unlockLocal();
+        try {
+          await unlockProcess();
+        } finally {
+          unlockLocal();
+        }
       });
     } catch (error) {
       unlockLocal();
@@ -258,9 +256,8 @@ export class WorkspaceIsolationManager {
 
   private async inspectRepository(source: string, signal?: AbortSignal): Promise<{ root: string; head: string; clean: boolean } | undefined> {
     try {
-      const root = await canonical(await runGit(["-C", source, "rev-parse", "--show-toplevel"], signal));
-      const relative = path.relative(root, source);
-      if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+      const root = await selfContainedGitRoot(source, signal);
+      if (!root) return undefined;
       const [head, status] = await Promise.all([
         runGit(["-C", root, "rev-parse", "HEAD"], signal),
         runGit(["-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], signal)
@@ -300,17 +297,18 @@ export class WorkspaceIsolationManager {
       worktreePath,
       baseHead
     };
-    let released = false;
+    let releasePromise: Promise<ChildWorkspaceIsolation> | undefined;
     return {
       workspacePath: executionWorkspacePath,
       isolation,
-      release: async () => {
-        if (released) return isolation;
-        released = true;
+      release: () => releasePromise ??= (async () => {
         const final = await this.cleanupWorktree(isolation, baseHead);
         Object.assign(isolation, final);
         return isolation;
-      }
+      })().catch((error: unknown) => {
+        releasePromise = undefined;
+        throw error;
+      })
     };
   }
 

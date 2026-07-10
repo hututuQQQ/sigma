@@ -11,6 +11,7 @@ export interface ModelToolCall {
 export interface ModelMessage {
   role: ModelRole;
   content: string;
+  reasoningContent?: string;
   toolCallId?: string;
   toolCalls?: ModelToolCall[];
 }

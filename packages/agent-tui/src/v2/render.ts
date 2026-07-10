@@ -57,8 +57,8 @@ function transcriptLines(view: PresentationState, width: number, rowLimit: numbe
   const lines: string[] = [];
   for (let index = view.transcript.length - 1; index >= 0 && lines.length < rowLimit; index -= 1) {
     const item = view.transcript[index];
-    const name = item.role === "user" ? "you" : "sigma";
-    const color = item.role === "user" ? ansi.cyan : ansi.green;
+    const name = item.role === "user" ? "you" : item.role === "system" ? "error" : "sigma";
+    const color = item.role === "user" ? ansi.cyan : item.role === "system" ? ansi.red : ansi.green;
     const bodyWidth = Math.max(1, width - name.length - 1);
     let byWidth = wrappedRows.get(item);
     if (!byWidth) {
@@ -75,14 +75,31 @@ function transcriptLines(view: PresentationState, width: number, rowLimit: numbe
   return lines.slice(-rowLimit);
 }
 
+function boundedWrap(value: string, width: number, maximumRows: number): string[] {
+  const rows = wrap(value, width);
+  if (rows.length <= maximumRows) return rows;
+  const leading = Math.ceil((maximumRows - 1) * 0.6);
+  const trailing = maximumRows - leading - 1;
+  return [...rows.slice(0, leading), truncate("…", width), ...rows.slice(-trailing)];
+}
+
+function activityItemLines(item: PresentationState["activity"][number], width: number): string[] {
+  const color = item.status === "failed" ? ansi.red : item.status === "running" ? ansi.yellow : ansi.dim;
+  const title = sanitizeTerminalText(item.title);
+  const detail = sanitizeTerminalText(item.detail);
+  if (item.status !== "failed" && item.kind !== "diagnostic") {
+    const shortTitle = truncate(title, Math.max(1, Math.floor(width * 0.55)));
+    const detailWidth = Math.max(0, width - cellWidth(shortTitle) - 3);
+    const shortDetail = detailWidth > 0 ? ` ${truncate(detail, detailWidth)}` : "";
+    return [`${color}· ${shortTitle}${shortDetail}${ansi.reset}`];
+  }
+  const body = detail ? `${title}: ${detail}` : title;
+  return boundedWrap(body, Math.max(1, width - 2), 6)
+    .map((row) => `${color}· ${row}${ansi.reset}`);
+}
+
 function activityLines(view: PresentationState, width: number): string[] {
-  return view.activity.slice(-8).map((item) => {
-    const color = item.status === "failed" ? ansi.red : item.status === "running" ? ansi.yellow : ansi.dim;
-    const title = truncate(sanitizeTerminalText(item.title), Math.max(1, Math.floor(width * 0.55)));
-    const detailWidth = Math.max(0, width - cellWidth(title) - 3);
-    const detail = detailWidth > 0 ? ` ${truncate(sanitizeTerminalText(item.detail), detailWidth)}` : "";
-    return `${color}· ${title}${detail}${ansi.reset}`;
-  });
+  return view.activity.slice(-8).flatMap((item) => activityItemLines(item, width));
 }
 
 function approvalLines(state: TuiState, width: number): string[] {

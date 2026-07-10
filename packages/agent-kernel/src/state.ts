@@ -10,8 +10,14 @@ export type KernelPhase =
   | "outcome_pending"
   | "terminal";
 
+export interface ActiveModelTurn {
+  turnId: number;
+  effectRevision: number;
+}
+
 export interface PendingTool {
   request: ToolRequest;
+  modelTurn: ActiveModelTurn;
   approval: "not_required" | "pending" | "allowed" | "denied";
   started: boolean;
 }
@@ -26,6 +32,7 @@ export interface KernelState {
   lastSeq: number;
   startedAt: string;
   deadlineAt: string;
+  activeModelTurn?: ActiveModelTurn;
   messages: ModelMessage[];
   pendingTools: PendingTool[];
   receipts: ToolReceipt[];

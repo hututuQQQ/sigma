@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,6 +35,12 @@ async function gitRepository(root: string): Promise<string> {
   git(repository, "add", "tracked.txt");
   git(repository, "commit", "-m", "initial");
   return repository;
+}
+
+async function writerLockPath(lockRoot: string, workspace: string): Promise<string> {
+  const canonical = await realpath(workspace);
+  const name = `${createHash("sha256").update(canonical).digest("hex")}.lock`;
+  return path.join(lockRoot, "writer-locks", name);
 }
 
 function result(context: ChildAgentContext): ChildAgentResult {
@@ -193,6 +200,84 @@ describe("AgentSupervisor writer isolation", () => {
     const second = await secondPromise;
     expect(second.isolation.kind).toBe("exclusive_workspace");
     await second.release();
+  });
+
+  it.each([
+    ["empty", ""],
+    ["truncated", '{"pid":'],
+    ["malformed", '{"pid":"not-a-number","instanceId":false}']
+  ])("recovers an old %s cross-process writer owner", async (_kind, contents) => {
+    const root = await fixture("malformed-writer-lock");
+    const workspace = path.join(root, "workspace");
+    const lockRoot = path.join(root, "isolation");
+    await mkdir(workspace);
+    const lockFile = await writerLockPath(lockRoot, workspace);
+    await mkdir(path.dirname(lockFile), { recursive: true });
+    await writeFile(lockFile, contents, "utf8");
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lockFile, old, old);
+    const manager = new WorkspaceIsolationManager(lockRoot, {
+      writerLeaseTimeoutMs: 250,
+      malformedLockStaleMs: 10,
+      retryIntervalMs: 5
+    });
+
+    const allocation = await manager.allocate({ childId: "recovery", workspacePath: workspace, intent: "write" });
+    const owner = JSON.parse(await readFile(lockFile, "utf8")) as { pid: number; instanceId: string };
+    expect(owner.pid).toBe(process.pid);
+    expect(owner.instanceId).not.toHaveLength(0);
+    await allocation.release();
+    expect(existsSync(lockFile)).toBe(false);
+  });
+
+  it("times out with an explicit diagnostic for a fresh malformed writer owner", async () => {
+    const root = await fixture("writer-lock-timeout");
+    const workspace = path.join(root, "workspace");
+    const lockRoot = path.join(root, "isolation");
+    await mkdir(workspace);
+    const lockFile = await writerLockPath(lockRoot, workspace);
+    await mkdir(path.dirname(lockFile), { recursive: true });
+    await writeFile(lockFile, "", "utf8");
+    const manager = new WorkspaceIsolationManager(lockRoot, {
+      writerLeaseTimeoutMs: 40,
+      malformedLockStaleMs: 60_000,
+      retryIntervalMs: 5
+    });
+
+    await expect(manager.allocate({ childId: "blocked", workspacePath: workspace, intent: "write" }))
+      .rejects.toThrow(/Timed out waiting for cross-process writer lease.*empty malformed owner/u);
+  });
+
+  it("settles failed cleanup and schedules the next child", async () => {
+    const root = await fixture("cleanup-failure-liveness");
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const isolation = {
+      kind: "shared_read" as const,
+      intent: "analyze" as const,
+      sourceWorkspacePath: workspace,
+      executionWorkspacePath: workspace,
+      cleanup: "not_required" as const
+    };
+    const manager = {
+      allocate: async () => ({
+        workspacePath: workspace,
+        isolation,
+        release: async () => { throw new Error("injected allocation cleanup failure"); }
+      })
+    } as unknown as WorkspaceIsolationManager;
+    const started: string[] = [];
+    const supervisor = new AgentSupervisor(async (context) => {
+      started.push(context.childId);
+      return result(context);
+    }, 1, manager);
+
+    const first = supervisor.spawn({ parentId: "parent", instruction: "first", workspacePath: workspace });
+    const second = supervisor.spawn({ parentId: "parent", instruction: "second", workspacePath: workspace });
+    const jobs = await Promise.all([supervisor.join(first.id), supervisor.join(second.id)]);
+    expect(started).toHaveLength(2);
+    expect(jobs.map((job) => job.status)).toEqual(["failed", "failed"]);
+    expect(jobs.every((job) => job.error?.includes("injected allocation cleanup failure"))).toBe(true);
   });
 
   it("cancels non-detached children and rejects parent join promptly when its signal aborts", async () => {

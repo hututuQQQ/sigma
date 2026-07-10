@@ -10,7 +10,6 @@ export function fakeToolTurn(toolCalls) {
 }
 
 export function fakeFinalTurn(content = "done", evidenceCallIds = []) {
-  const hasEvidence = evidenceCallIds.length > 0;
   return {
     message: {
       role: "assistant",
@@ -19,9 +18,9 @@ export function fakeFinalTurn(content = "done", evidenceCallIds = []) {
         summary: content,
         criteria: [{
           criterion: "The requested smoke workflow completed.",
-          status: hasEvidence ? "met" : "not_applicable",
+          status: "met",
           evidenceCallIds,
-          rationale: hasEvidence ? "Cited receipts demonstrate the result." : "This scripted protocol check requires no repository evidence."
+          rationale: "Cited current-run receipts demonstrate the result."
         }]
       })]
     },

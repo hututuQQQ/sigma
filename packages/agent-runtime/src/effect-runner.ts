@@ -2,23 +2,21 @@ import type {
   AgentEventEnvelope,
   AgentEventType,
   ContextAuthority,
-  ModelMessage,
-  ModelResponse,
   ModelToolCall,
-  ModelToolDefinition,
   RunOutcome,
   ToolDescriptor,
   ToolReceipt
 } from "agent-protocol";
-import { decide, type KernelEffect } from "agent-kernel";
-import { loadNestedInstructions, RepositoryContextProvider } from "agent-context";
+import { decide, type ActiveModelTurn, type KernelEffect } from "agent-kernel";
+import { loadNestedInstructions } from "agent-context";
 import { gitPorcelain } from "agent-platform";
 import { isToolAllowed, ResourceLockManager } from "agent-tools";
 import {
-  abortable, completionFailure, failed, fileFingerprint, lockKeys, mergeDelta, modelTools,
-  porcelainEntries, providerSizedPlan, requestTargets, requiresInstructionReplan, steeringRestart,
+  abortable, completionFailure, failed, fileFingerprint, lockKeys, mergeDelta,
+  porcelainEntries, requestTargets, requiresInstructionReplan, steeringRestart,
   workspaceDelta, writeScopeFailure
 } from "./effect-helpers.js";
+import { ModelEffectRunner } from "./model-effect-runner.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 
 type Emit = (
@@ -28,22 +26,46 @@ type Emit = (
   value: unknown
 ) => Promise<AgentEventEnvelope>;
 
+type ExecuteToolEffect = Extract<KernelEffect, { type: "execute_tool" }>;
+interface ToolAttempt { call: ModelToolCall; modelTurn: ActiveModelTurn }
+
+function attemptFromEffect(effect: ExecuteToolEffect): ToolAttempt {
+  return {
+    call: { id: effect.request.callId, name: effect.request.name, arguments: effect.request.arguments },
+    modelTurn: effect.modelTurn
+  };
+}
+
+function turnPayload(modelTurn: ActiveModelTurn): ActiveModelTurn {
+  return { turnId: modelTurn.turnId, effectRevision: modelTurn.effectRevision };
+}
+
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
   maxParallelTools: number;
   permissionMode: "ask" | "auto" | "deny";
   outputReserveTokens: number;
   emit: Emit;
-  finish(session: RuntimeSession, outcome: RunOutcome): Promise<void>;
+  finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean>;
   createArtifact(sessionId: string, content: string): Promise<string>;
 }
 
 export class EffectRunner {
   private readonly locks = new ResourceLockManager();
-  private readonly repositoryContext = new RepositoryContextProvider();
   private readonly unsettled = new Map<string, Promise<void>>();
+  private readonly sessionUnsettled = new Map<string, Set<Promise<void>>>();
+  private readonly models: ModelEffectRunner;
 
-  constructor(private readonly options: EffectRunnerOptions) {}
+  constructor(private readonly options: EffectRunnerOptions) {
+    this.models = new ModelEffectRunner(options);
+  }
+
+  async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> {
+    while (this.sessionUnsettled.get(sessionId)?.size) {
+      const pending = Promise.all([...this.sessionUnsettled.get(sessionId)!]).then(() => undefined);
+      await (signal ? abortable(pending, signal) : pending);
+    }
+  }
 
   async run(session: RuntimeSession, signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
@@ -63,17 +85,18 @@ export class EffectRunner {
           }
           outcome = { ...outcome, evidence: [...outcome.evidence, ...children.evidence] };
         }
-        await this.options.finish(session, outcome);
-        return;
-      }
-      if (effects.some((effect) => effect.type === "publish_outcome")) return;
-      if (effects.some((effect) => effect.type === "request_model")) {
-        await this.requestModel(session, signal);
+        if (await this.options.finish(session, outcome, terminal.revision)) return;
         continue;
       }
-      const tools = effects.filter((effect): effect is Extract<KernelEffect, { type: "execute_tool" }> => effect.type === "execute_tool");
+      if (effects.some((effect) => effect.type === "publish_outcome")) return;
+      const model = effects.find((effect): effect is Extract<KernelEffect, { type: "request_model" }> => effect.type === "request_model");
+      if (model) {
+        await this.models.request(session, signal, model);
+        continue;
+      }
+      const tools = effects.filter((effect): effect is ExecuteToolEffect => effect.type === "execute_tool");
       if (tools.length > 0) {
-        await this.executeTools(session, tools.map((effect) => ({ id: effect.request.callId, name: effect.request.name, arguments: effect.request.arguments })), signal);
+        await this.executeTools(session, tools.map(attemptFromEffect), signal);
         continue;
       }
       return;
@@ -81,157 +104,64 @@ export class EffectRunner {
     throw signal.reason ?? new Error("Run cancelled.");
   }
 
-  private async requestModel(session: RuntimeSession, signal: AbortSignal): Promise<void> {
-    const turnController = new AbortController();
-    session.turnController = turnController;
-    const turnSignal = AbortSignal.any([signal, turnController.signal]);
-    const turnId = ++session.modelTurn;
-    try {
-      await this.requestModelAttempt(session, turnId, turnSignal);
-    } catch (error) {
-      if (steeringRestart(turnSignal)) {
-        await this.options.emit(session, "diagnostic", "runtime", { kind: "steering.restart", turnId });
-        return;
-      }
-      const code = typeof (error as { code?: unknown })?.code === "string"
-        ? (error as { code: string }).code : "model_error";
-      await this.options.emit(session, "model.failed", "runtime", {
-        turnId,
-        code,
-        message: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
-  private async requestModelAttempt(session: RuntimeSession, turnId: number, turnSignal: AbortSignal): Promise<void> {
-    const descriptors = this.options.runtime.tools.descriptors().filter((item) => isToolAllowed(item, session.mode));
-    const tools = modelTools(descriptors);
-    const query = [...session.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
-    const dynamic = await this.repositoryContext.collect(session.workspacePath, query, turnSignal);
-    const plan = await providerSizedPlan(this.options.runtime.gateway, {
-      system: session.contextItems,
-      history: session.state.messages,
-      dynamic,
-      tools,
-      outputReserveTokens: this.options.outputReserveTokens
-    });
-    if (plan.summary && !session.loadedContextIds.has(plan.summary.id)) {
-      session.loadedContextIds.add(plan.summary.id);
-      await this.options.emit(session, "context.compacted", "runtime", {
-        item: plan.summary,
-        omittedHistoryTurns: plan.omittedHistoryTurns
-      });
-    }
-    turnSignal.throwIfAborted();
-    await this.options.emit(session, "model.started", "runtime", {
-      provider: this.options.runtime.gateway.provider,
-      model: this.options.runtime.gateway.model,
-      turnId,
-      contextBudget: plan.budget
-    });
-    const response = await this.streamModelResponse(session, turnId, plan.messages, tools, turnSignal);
-    turnSignal.throwIfAborted();
-    await this.options.emit(session, "model.completed", "runtime", {
-      model: this.options.runtime.gateway.model,
-      turnId,
-      text: response.message.content,
-      finishReason: response.finishReason,
-      message: response.message,
-      toolCalls: response.message.toolCalls ?? []
-    });
-    if (response.finishReason === "length") this.addContinuationContext(session);
-  }
-
-  private async streamModelResponse(
-    session: RuntimeSession,
-    turnId: number,
-    messages: ModelMessage[],
-    tools: ModelToolDefinition[],
-    signal: AbortSignal
-  ): Promise<ModelResponse> {
-    let response: ModelResponse | undefined;
-    let contentDelta = "";
-    let reasoningDelta = "";
-    let lastFlush = Date.now();
-    const flush = async (): Promise<void> => {
-      if (contentDelta) {
-        const value = contentDelta;
-        contentDelta = "";
-        await this.options.emit(session, "model.delta", "runtime", { turnId, delta: value });
-      }
-      if (reasoningDelta) {
-        const value = reasoningDelta;
-        reasoningDelta = "";
-        await this.options.emit(session, "model.reasoning_delta", "runtime", { turnId, delta: value });
-      }
-      lastFlush = Date.now();
-    };
-    for await (const event of this.options.runtime.gateway.stream({ messages, tools, signal })) {
-      if (signal.aborted) throw signal.reason;
-      if (event.type === "content") contentDelta += event.delta;
-      else if (event.type === "reasoning") reasoningDelta += event.delta;
-      else if (event.type === "done") response = event.response;
-      if (Date.now() - lastFlush >= 33) await flush();
-    }
-    signal.throwIfAborted();
-    await flush();
-    if (!response) throw new Error("Model stream ended without a final response.");
-    return response;
-  }
-
-  private addContinuationContext(session: RuntimeSession): void {
-    session.contextItems.push({
-      id: `runtime:continue:${session.seq}`,
-      authority: "runtime",
-      provenance: "model finish reason",
-      content: "The previous response reached its output limit. Continue from the exact stopping point without repeating completed work.",
-      tokenCount: 24,
-      priority: 950
-    });
-  }
-
-  private async executeTools(session: RuntimeSession, calls: ModelToolCall[], signal: AbortSignal): Promise<void> {
+  private async executeTools(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
     const turnController = session.turnController ?? new AbortController();
     session.turnController = turnController;
     const turnSignal = AbortSignal.any([signal, turnController.signal]);
     if (steeringRestart(turnSignal)) return;
     try {
       let loadedInstructions = false;
-      for (const call of calls) {
+      for (const { call } of attempts) {
         const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
         if (descriptor && await this.loadInstructions(session, call, descriptor)) loadedInstructions = true;
       }
-      const pending = [...calls];
+      const isCompletion = ({ call }: ToolAttempt): boolean => Boolean(
+        this.options.runtime.tools.descriptors().find((item) => item.name === call.name)
+          ?.possibleEffects.includes("outcome.propose")
+      );
+      const pending = attempts.filter((attempt) => !isCompletion(attempt));
+      const completions = attempts.filter(isCompletion);
+      const executeAttempt = async (attempt: ToolAttempt): Promise<void> => {
+        const { call, modelTurn } = attempt;
+        const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
+        if (loadedInstructions && descriptor && requiresInstructionReplan(descriptor)) {
+          const startedAt = new Date().toISOString();
+          await this.options.emit(session, "tool.requested", "runtime", {
+            callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
+          });
+          await this.emitReceipt(session, failed(
+            call,
+            startedAt,
+            "New nested project instructions were loaded. Re-evaluate the request and propose a new tool call that follows them.",
+            "nested_instructions_require_replan"
+          ), modelTurn);
+          return;
+        }
+        const receipt = await this.executeTool(session, attempt, turnSignal);
+        await this.emitReceipt(session, receipt, modelTurn);
+      };
       while (pending.length > 0) {
         if (steeringRestart(turnSignal)) return;
         const batch = pending.splice(0, this.options.maxParallelTools);
-        await Promise.all(batch.map(async (call) => {
-          const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
-          if (loadedInstructions && descriptor && requiresInstructionReplan(descriptor)) {
-            const startedAt = new Date().toISOString();
-            await this.options.emit(session, "tool.requested", "runtime", { callId: call.id, name: call.name, arguments: call.arguments });
-            await this.emitReceipt(session, failed(
-              call,
-              startedAt,
-              "New nested project instructions were loaded. Re-evaluate the request and propose a new tool call that follows them.",
-              "nested_instructions_require_replan"
-            ));
-            return;
-          }
-          const receipt = await this.executeTool(session, call, turnSignal);
-          await this.emitReceipt(session, receipt);
-        }));
+        await Promise.all(batch.map(executeAttempt));
+      }
+      for (const completion of completions) {
+        if (steeringRestart(turnSignal)) return;
+        await executeAttempt(completion);
       }
     } finally {
       if (session.turnController === turnController) session.turnController = null;
     }
   }
 
-  private async executeTool(session: RuntimeSession, call: ModelToolCall, signal: AbortSignal): Promise<ToolReceipt> {
+  private async executeTool(session: RuntimeSession, attempt: ToolAttempt, signal: AbortSignal): Promise<ToolReceipt> {
+    const { call, modelTurn } = attempt;
     const startedAt = new Date().toISOString();
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
     if (!descriptor) return failed(call, startedAt, `Unknown tool '${call.name}'.`, "unknown_tool");
-    await this.options.emit(session, "tool.requested", "runtime", { callId: call.id, name: call.name, arguments: call.arguments });
+    await this.options.emit(session, "tool.requested", "runtime", {
+      callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
+    });
     const cached = session.state.receipts.find((item) => item.callId === call.id);
     if (cached && descriptor.idempotent) return { ...cached, diagnostics: [...cached.diagnostics, "reused_idempotent_receipt"], completedAt: new Date().toISOString() };
     if (!isToolAllowed(descriptor, session.mode)) return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.mode} mode.`, "mode_denied");
@@ -241,11 +171,12 @@ export class EffectRunner {
     if (completionError) return completionError;
     try {
       const restored = session.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
-      const decision = restored === "allowed" ? "allow" : await this.approval(session, descriptor, call.id, signal);
+      const decision = restored === "allowed" ? "allow" : await this.approval(session, descriptor, call.id, modelTurn, signal);
       if (decision === "deny") return failed(call, startedAt, "Tool request denied.", "permission_denied");
       const keys = lockKeys(session, descriptor);
       await this.awaitSettled(keys, signal);
-      return await this.locks.withLocks(keys, async () => await this.executeLocked(session, call, descriptor, signal, keys));
+      return await this.locks.withLocks(keys, async () =>
+        await this.executeLocked(session, call, modelTurn, descriptor, signal, keys));
     } catch (error) {
       return failed(call, startedAt, error instanceof Error ? error.message : String(error), signal.aborted ? "tool_cancelled" : "tool_exception");
     }
@@ -277,11 +208,14 @@ export class EffectRunner {
   private async executeLocked(
     session: RuntimeSession,
     call: ModelToolCall,
+    modelTurn: ActiveModelTurn,
     descriptor: ToolDescriptor,
     signal: AbortSignal,
     resourceKeys: string[]
   ): Promise<ToolReceipt> {
-    await this.options.emit(session, "tool.started", "runtime", { callId: call.id, name: call.name });
+    await this.options.emit(session, "tool.started", "runtime", {
+      callId: call.id, name: call.name, ...turnPayload(modelTurn)
+    });
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
@@ -307,14 +241,19 @@ export class EffectRunner {
         runMode: session.mode,
         signal: controller.signal,
         heartbeat,
-        progress: async (update) => { heartbeat(); await this.options.emit(session, "tool.progress", "tool", { callId: call.id, name: call.name, ...update }); },
+        progress: async (update) => {
+          heartbeat();
+          await this.options.emit(session, "tool.progress", "tool", {
+            callId: call.id, name: call.name, ...turnPayload(modelTurn), ...update
+          });
+        },
         createArtifact: async (artifact) => await this.options.createArtifact(session.sessionId, artifact.content)
       });
       let receipt: ToolReceipt;
       try {
         receipt = await abortable(execution, controller.signal);
       } catch (error) {
-        if (controller.signal.aborted) this.quarantine(resourceKeys, execution);
+        if (controller.signal.aborted) this.quarantine(session.sessionId, resourceKeys, execution);
         throw error;
       }
       if (!before) return receipt;
@@ -339,8 +278,15 @@ export class EffectRunner {
     if (pending.length > 0) await abortable(Promise.all(pending).then(() => undefined), signal);
   }
 
-  private quarantine(keys: string[], operation: Promise<unknown>): void {
+  private quarantine(sessionId: string, keys: string[], operation: Promise<unknown>): void {
     const settled = operation.then(() => undefined, () => undefined);
+    const operations = this.sessionUnsettled.get(sessionId) ?? new Set<Promise<void>>();
+    operations.add(settled);
+    this.sessionUnsettled.set(sessionId, operations);
+    void settled.finally(() => {
+      operations.delete(settled);
+      if (operations.size === 0) this.sessionUnsettled.delete(sessionId);
+    });
     for (const key of keys) {
       const previous = this.unsettled.get(key);
       const combined = previous ? Promise.all([previous, settled]).then(() => undefined) : settled;
@@ -362,6 +308,7 @@ export class EffectRunner {
     session: RuntimeSession,
     descriptor: ToolDescriptor,
     requestId: string,
+    modelTurn: ActiveModelTurn,
     signal: AbortSignal
   ): Promise<"allow" | "deny" | "always_allow"> {
     if (descriptor.approval === "deny" || this.options.permissionMode === "deny") return "deny";
@@ -375,9 +322,12 @@ export class EffectRunner {
       callId: requestId,
       toolName: descriptor.name,
       effects: descriptor.possibleEffects,
-      reason: `Effects: ${descriptor.possibleEffects.join(", ")}`
+      reason: `Effects: ${descriptor.possibleEffects.join(", ")}`,
+      ...turnPayload(modelTurn)
     });
-    await this.options.emit(session, "run.suspended", "runtime", { requestId, message: `Approval required for ${descriptor.name}.` });
+    await this.options.emit(session, "run.suspended", "runtime", {
+      requestId, callId: requestId, message: `Approval required for ${descriptor.name}.`, ...turnPayload(modelTurn)
+    });
     try {
       return await abortable(pending, signal);
     } catch (error) {
@@ -385,15 +335,20 @@ export class EffectRunner {
       await this.options.emit(session, "tool.approval_resolved", "runtime", {
         requestId,
         callId: requestId,
-        decision: steeringRestart(signal) ? "superseded" : "cancelled"
+        decision: steeringRestart(signal) ? "superseded" : "cancelled",
+        ...turnPayload(modelTurn)
       });
       throw error;
     }
   }
 
-  private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt): Promise<void> {
-    const name = session.state.pendingTools.find((item) => item.request.callId === receipt.callId)?.request.name ?? "tool";
-    await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", { ...receipt, name });
+  private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
+    const name = session.state.pendingTools.find((item) => item.request.callId === receipt.callId
+      && item.modelTurn.turnId === modelTurn.turnId
+      && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
+    await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
+      ...receipt, name, ...turnPayload(modelTurn)
+    });
   }
 
 }

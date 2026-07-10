@@ -42,11 +42,14 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
       callId: pending.request.callId,
       toolName: pending.request.name,
       effects: descriptor?.possibleEffects ?? [],
-      reason: "The process stopped during a non-idempotent tool call. Explicit approval is required before retrying."
+      reason: "The process stopped during a non-idempotent tool call. Explicit approval is required before retrying.",
+      ...pending.modelTurn
     });
     await options.emit("run.suspended", "runtime", {
       requestId: pending.request.callId,
-      message: `Decide whether to retry interrupted tool '${pending.request.name}'.`
+      callId: pending.request.callId,
+      message: `Decide whether to retry interrupted tool '${pending.request.name}'.`,
+      ...pending.modelTurn
     });
     session.approvals.set(pending.request.callId, {
       effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined

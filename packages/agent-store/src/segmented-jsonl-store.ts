@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { acquireProcessOwnerLease } from "agent-platform";
 import { assertAgentEventEnvelope } from "agent-protocol";
 import type {
   AgentEventEnvelope,
@@ -10,6 +11,8 @@ import type {
   SnapshotEnvelope,
   StoreAppendResult
 } from "agent-protocol";
+import { atomicJson, type AtomicReplace } from "./durable-file.js";
+import { inspectDurableEventTail } from "./durable-tail.js";
 import { segmentName, sessionDirectory, snapshotName } from "./paths.js";
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
@@ -42,6 +45,7 @@ export interface SegmentedJsonlStoreOptions {
   rootDir: string;
   segmentBytes?: number;
   segmentEvents?: number;
+  replaceFile?: AtomicReplace;
 }
 
 function checksum(event: AgentEventEnvelope): string {
@@ -66,95 +70,35 @@ function parseRecord(line: string): AgentEventEnvelope {
   return parsed.event;
 }
 
-async function atomicJson(filePath: string, value: unknown): Promise<void> {
-  const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
-  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, "w");
-  try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, filePath);
-  const directoryHandle = await open(directory, "r").catch(() => null);
-  try {
-    await directoryHandle?.sync().catch((error: unknown) => {
-      const code = (error as { code?: unknown }).code;
-      if (code !== "EPERM" && code !== "EINVAL" && code !== "ENOTSUP") throw error;
-    });
-  } finally {
-    await directoryHandle?.close();
-  }
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function lockOwner(lockPath: string): Promise<number | null> {
-  const value = await readFile(lockPath, "utf8").catch(() => "");
-  const pid = Number.parseInt(value.split(/\s/u)[0] ?? "", 10);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-
 async function acquireSessionLock(directory: string): Promise<() => Promise<void>> {
   const lockPath = path.join(directory, ".append.lock");
-  const deadline = Date.now() + 10_000;
-  while (true) {
-    try {
-      const handle = await open(lockPath, "wx");
-      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, "utf8");
-      await handle.sync();
-      return async () => {
-        await handle.close();
-        await unlink(lockPath).catch(() => undefined);
-      };
-    } catch (error) {
-      if ((error as { code?: unknown }).code !== "EEXIST") throw error;
-      const age = Date.now() - await stat(lockPath).then((item) => item.mtimeMs, () => Date.now());
-      const owner = await lockOwner(lockPath);
-      if ((owner !== null && !processAlive(owner)) || (owner === null && age > 120_000)) {
-        await unlink(lockPath).catch(() => undefined);
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for session append lock '${lockPath}'.`, { cause: error });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-}
-
-async function hasIncompleteTail(filePath: string): Promise<boolean> {
-  const size = await stat(filePath).then((item) => item.size, () => 0);
-  if (size === 0) return false;
-  const handle = await open(filePath, "r");
-  try {
-    const byte = Buffer.allocUnsafe(1);
-    await handle.read(byte, 0, 1, size - 1);
-    return byte[0] !== 0x0a;
-  } finally {
-    await handle.close();
-  }
+  const lease = await acquireProcessOwnerLease(lockPath, {
+    pid: process.pid,
+    instanceId: randomUUID(),
+    startedAt: new Date().toISOString()
+  }, {
+    label: "session append lock",
+    timeoutMs: 10_000,
+    malformedStaleMs: 5_000,
+    retryIntervalMs: 10,
+    activeOwner: "wait",
+    allowLegacyPid: true
+  });
+  return lease.release;
 }
 
 export class SegmentedJsonlStore implements RunStore {
   private readonly rootDir: string;
   private readonly segmentBytes: number;
   private readonly segmentEvents: number;
+  private readonly replaceFile: AtomicReplace | undefined;
   private readonly queues = new Map<string, Promise<void>>();
 
   constructor(options: SegmentedJsonlStoreOptions) {
     this.rootDir = path.resolve(options.rootDir);
     this.segmentBytes = options.segmentBytes ?? DEFAULT_SEGMENT_BYTES;
     this.segmentEvents = options.segmentEvents ?? DEFAULT_SEGMENT_EVENTS;
+    this.replaceFile = options.replaceFile;
   }
 
   async append(event: AgentEventEnvelope, expectedSeq: number): Promise<StoreAppendResult> {
@@ -171,8 +115,8 @@ export class SegmentedJsonlStore implements RunStore {
     const release = await acquireSessionLock(directory);
     try {
     let meta = await this.readMeta(event.sessionId, event.occurredAt);
-    const currentSegment = path.join(directory, "events", segmentName(meta.segment));
-    if (meta.lastSeq !== expectedSeq || await hasIncompleteTail(currentSegment)) {
+    const tail = await inspectDurableEventTail(directory, parseRecord);
+    if (meta.lastSeq !== expectedSeq || tail.incomplete || tail.lastSeq !== meta.lastSeq || tail.segment !== meta.segment) {
       meta = await this.reconcileMeta(event.sessionId, event.occurredAt);
     }
     if (meta.lastSeq !== expectedSeq) throw new Error(`Session ${event.sessionId} sequence conflict: expected ${expectedSeq}, actual ${meta.lastSeq}.`);
@@ -203,7 +147,7 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: event.seq,
       segment,
       segmentEvents: segmentEvents + 1
-    } satisfies SessionMeta);
+    } satisfies SessionMeta, this.replaceFile);
     return { rotated };
     } finally {
       await release();
@@ -248,6 +192,9 @@ export class SegmentedJsonlStore implements RunStore {
       }
       try {
         const event = parseRecord(rawLine.trim());
+        if (event.seq !== cursor.lastValidSeq + 1) {
+          throw new Error(`Event sequence discontinuity: expected ${cursor.lastValidSeq + 1}, actual ${event.seq}.`);
+        }
         cursor.lastValidSeq = event.seq;
         validEvents += 1;
         validBytes += lineBytes;
@@ -290,7 +237,7 @@ export class SegmentedJsonlStore implements RunStore {
       : 0;
     const meta = await this.readMeta(sessionId, now);
     const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMeta;
-    await atomicJson(path.join(sessionDirectory(this.rootDir, sessionId), "meta.json"), reconciled);
+    await atomicJson(path.join(sessionDirectory(this.rootDir, sessionId), "meta.json"), reconciled, this.replaceFile);
     return reconciled;
   }
 
@@ -318,7 +265,7 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: lastValidSeq,
       segment,
       segmentEvents: validEvents
-    } satisfies SessionMeta);
+    } satisfies SessionMeta, this.replaceFile);
   }
 
   async writeSnapshot(snapshot: SnapshotEnvelope): Promise<void> {
@@ -326,7 +273,7 @@ export class SegmentedJsonlStore implements RunStore {
     await atomicJson(path.join(directory, snapshotName(snapshot.seq)), {
       checksum: snapshotChecksum(snapshot),
       snapshot
-    } satisfies StoredSnapshot);
+    } satisfies StoredSnapshot, this.replaceFile);
   }
 
   async latestSnapshot(sessionId: string): Promise<SnapshotEnvelope | null> {

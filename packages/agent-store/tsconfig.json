@@ -7,5 +7,5 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../agent-protocol" }]
+  "references": [{ "path": "../agent-protocol" }, { "path": "../agent-platform" }]
 }

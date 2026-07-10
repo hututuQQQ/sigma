@@ -10,7 +10,8 @@ import type {
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
-  ModelToolDefinition
+  ModelToolDefinition,
+  ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
 import { auditDurableChildren, createChildAgentFactory, createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -81,6 +82,65 @@ class ScriptedGateway implements ModelGateway {
   }
 }
 
+class FailingFirstGateway implements ModelGateway {
+  readonly provider = "test";
+  readonly model = "failing-first";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 32_000,
+    maxOutputTokens: 2_000,
+    tools: true,
+    parallelTools: true,
+    reasoning: false,
+    structuredOutput: false,
+    promptCache: false,
+    tokenizer: "approximate"
+  };
+  readonly firstStarted: Promise<void>;
+  readonly firstFailed: Promise<void>;
+  private startFirst!: () => void;
+  private releaseFirst!: () => void;
+  private observeFailure!: () => void;
+  private readonly firstGate: Promise<void>;
+  private requests = 0;
+
+  constructor() {
+    this.firstStarted = new Promise((resolve) => { this.startFirst = resolve; });
+    this.firstFailed = new Promise((resolve) => { this.observeFailure = resolve; });
+    this.firstGate = new Promise((resolve) => { this.releaseFirst = resolve; });
+  }
+
+  failFirst(): void { this.releaseFirst(); }
+
+  async complete(_request: ModelRequest): Promise<ModelResponse> {
+    throw new Error("Tests consume the streaming interface.");
+  }
+
+  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests += 1;
+    if (this.requests === 1) {
+      this.startFirst();
+      await this.firstGate;
+      this.observeFailure();
+      throw Object.assign(new Error("old turn failed"), { code: "old_turn_failure" });
+    }
+    const response = this.requests === 2
+      ? {
+        message: {
+          role: "assistant" as const,
+          content: "",
+          toolCalls: [{ id: "read-after-steer", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls" as const
+      }
+      : completion("steering survived stale failure", ["read-after-steer"]);
+    yield { type: "done", response };
+  }
+
+  async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
+    return JSON.stringify({ messages, tools }).length / 4;
+  }
+}
+
 async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Promise<AgentEventEnvelope[]> {
   const result: AgentEventEnvelope[] = [];
   for await (const event of store.events(sessionId)) result.push(event);
@@ -132,6 +192,122 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.contextItems).toContainEqual(expect.objectContaining({ id: "project:nested", content: "nested rule" }));
     expect(restored.state.messages.filter((message) => message.role === "user").map((message) => message.content))
       .toEqual(["initial", "first"]);
+  });
+
+  it("preserves assistant reasoning content when restoring a snapshot", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-reasoning-recovery-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const sessionId = "reasoning-session";
+    const runId = "reasoning-run";
+    const startedAt = new Date().toISOString();
+    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+    await store.append({
+      schemaVersion: 2,
+      seq: 1,
+      eventId: "reasoning-created",
+      sessionId,
+      runId,
+      occurredAt: startedAt,
+      type: "session.created",
+      authority: "runtime",
+      payload: { workspacePath: workspace, mode: "change" }
+    }, 0);
+    await store.writeSnapshot({
+      schemaVersion: 2,
+      sessionId,
+      seq: 1,
+      createdAt: startedAt,
+      state: {
+        schemaVersion: 2,
+        sessionId,
+        runId,
+        mode: "change",
+        phase: "ready_model",
+        revision: 1,
+        lastSeq: 1,
+        startedAt,
+        deadlineAt,
+        messages: [{ role: "assistant", content: "", reasoningContent: "durable reasoning" }],
+        pendingTools: [],
+        receipts: [],
+        evidence: [],
+        childIds: []
+      }
+    });
+
+    const restored = await restoreStoredSession(store, sessionId, 30_000);
+    expect(restored.state.messages).toEqual([
+      { role: "assistant", content: "", reasoningContent: "durable reasoning" }
+    ]);
+  });
+
+  it.each([
+    ["change", "analyze", "without a snapshot", false],
+    ["change", "analyze", "from an older snapshot", true],
+    ["analyze", "change", "without a snapshot", false],
+    ["analyze", "change", "from an older snapshot", true]
+  ] as const)("restores %s -> %s run mode %s", async (initialMode, currentMode, _scenario, withSnapshot) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-mode-recovery-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const sessionId = `mode-${initialMode}-${currentMode}-${withSnapshot}`;
+    const firstRunId = "first-run";
+    const currentRunId = "current-run";
+    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+    let seq = 0;
+    const append = async (
+      runId: string,
+      type: AgentEventEnvelope["type"],
+      payload: AgentEventEnvelope["payload"]
+    ): Promise<void> => {
+      const stored: AgentEventEnvelope = {
+        schemaVersion: 2,
+        seq: seq + 1,
+        eventId: `mode-event-${seq + 1}`,
+        sessionId,
+        runId,
+        occurredAt: new Date(Date.now() + seq).toISOString(),
+        type,
+        authority: type === "user.message" ? "user" : "runtime",
+        payload
+      };
+      await store.append(stored, seq);
+      seq += 1;
+    };
+    await append(firstRunId, "session.created", { workspacePath: workspace, mode: initialMode });
+    await append(firstRunId, "run.started", { mode: initialMode, deadlineAt });
+    await append(firstRunId, "user.message", { text: "first run" });
+    await append(firstRunId, "run.completed", { message: "first done" });
+    if (withSnapshot) {
+      await store.writeSnapshot({
+        schemaVersion: 2,
+        sessionId,
+        seq,
+        createdAt: new Date().toISOString(),
+        state: {
+          schemaVersion: 2,
+          sessionId,
+          runId: firstRunId,
+          mode: initialMode,
+          phase: "terminal",
+          revision: 4,
+          lastSeq: seq,
+          startedAt: new Date().toISOString(),
+          deadlineAt,
+          messages: [{ role: "user", content: "first run" }],
+          pendingTools: [],
+          receipts: [],
+          evidence: [],
+          childIds: [],
+          outcome: { kind: "completed", message: "first done", evidence: [] }
+        }
+      });
+    }
+    await append(currentRunId, "run.started", { mode: currentMode, deadlineAt });
+    await append(currentRunId, "user.message", { text: "current run" });
+
+    const restored = await restoreStoredSession(store, sessionId, 30_000);
+    expect(restored.mode).toBe(currentMode);
+    expect(restored.state).toMatchObject({ runId: currentRunId, mode: currentMode, phase: "ready_model" });
   });
 
   it("enforces child write scope before a shared-workspace mutation", async () => {
@@ -228,6 +404,201 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(steering).toEqual(messages);
     await expect(readFile(path.join(workspace, "stale.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(gateway.requests.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("does not let an old model failure overtake durable steering", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-steering-failure-race-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const append = store.append.bind(store);
+    let steeringAppendEntered!: () => void;
+    let releaseSteeringAppend!: () => void;
+    const appendEntered = new Promise<void>((resolve) => { steeringAppendEntered = resolve; });
+    const appendGate = new Promise<void>((resolve) => { releaseSteeringAppend = resolve; });
+    store.append = async (event, expectedSeq) => {
+      const result = await append(event, expectedSeq);
+      if (event.type !== "user.steer") return result;
+      steeringAppendEntered();
+      await appendGate;
+      return result;
+    };
+    const gateway = new FailingFirstGateway();
+    const runtime = createRuntime({
+      gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "initial instruction", mode: "analyze" });
+    await gateway.firstStarted;
+    const steering = runtime.command({ type: "steer", sessionId: session.sessionId, text: "replacement instruction" });
+    await appendEntered;
+    gateway.failFirst();
+    await gateway.firstFailed;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseSteeringAppend();
+    await steering;
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "steering survived stale failure"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "model.failed"
+      && (event.payload as { code?: string }).code === "old_turn_failure")).toBe(true);
+    expect(events.some((event) => event.type === "run.failed"
+      && (event.payload as { code?: string }).code === "old_turn_failure")).toBe(false);
+  });
+
+  it("does not let a stale successful tool receipt complete over newer steering", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-steering-tool-race-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const append = store.append.bind(store);
+    let steeringAppendEntered!: () => void;
+    let releaseSteeringAppend!: () => void;
+    const appendEntered = new Promise<void>((resolve) => { steeringAppendEntered = resolve; });
+    const appendGate = new Promise<void>((resolve) => { releaseSteeringAppend = resolve; });
+    store.append = async (event, expectedSeq) => {
+      const result = await append(event, expectedSeq);
+      if (event.type !== "user.steer") return result;
+      steeringAppendEntered();
+      await appendGate;
+      return result;
+    };
+    let slowStarted!: () => void;
+    let releaseSlow!: () => void;
+    const started = new Promise<void>((resolve) => { slowStarted = resolve; });
+    const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "slow_complete",
+        description: "Returns a delayed completion proposal for steering race coverage.",
+        inputSchema: { type: "object" },
+        possibleEffects: [],
+        executionMode: "sequential",
+        resourceKeys: [],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 10_000
+      },
+      async execute(request): Promise<ToolReceipt> {
+        slowStarted();
+        await slowGate;
+        const now = new Date().toISOString();
+        return {
+          callId: request.callId,
+          ok: true,
+          output: JSON.stringify({ summary: "obsolete completion" }),
+          observedEffects: ["outcome.propose"],
+          artifacts: [], diagnostics: [], startedAt: now, completedAt: now
+        };
+      }
+    });
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "old-complete", name: "slow_complete", arguments: {} }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "corrected-read", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("new steering completed", ["corrected-read"])
+    ]);
+    const runtime = createRuntime({
+      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "start old completion" });
+    await started;
+    const steering = runtime.command({
+      type: "steer", sessionId: session.sessionId, text: "Use the new acceptance criteria."
+    });
+    await appendEntered;
+    releaseSlow();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseSteeringAppend();
+    await steering;
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "new steering completed"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "old-complete")).toBe(true);
+    expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);
+    expect(events.find((event) => event.type === "run.completed")?.payload).toMatchObject({
+      message: "new steering completed"
+    });
+  });
+
+  it("does not commit an old outcome after steering wins a delayed child join", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-steering-outcome-race-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "old-read", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("obsolete joined outcome", ["old-read"]),
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "new-read", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("steering won outcome race", ["new-read"])
+    ]);
+    let joinStarted!: () => void;
+    let releaseJoin!: () => void;
+    const firstJoin = new Promise<void>((resolve) => { joinStarted = resolve; });
+    const joinGate = new Promise<void>((resolve) => { releaseJoin = resolve; });
+    let joins = 0;
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000,
+      joinChildren: async () => {
+        joins += 1;
+        if (joins === 1) {
+          joinStarted();
+          await joinGate;
+        }
+        return { failures: [], evidence: [] };
+      }
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "complete old outcome" });
+    await firstJoin;
+    await runtime.command({
+      type: "steer", sessionId: session.sessionId, text: "Replace the acceptance criteria before commit."
+    });
+    releaseJoin();
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "steering won outcome race"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    const completions = events.filter((event) => event.type === "run.completed");
+    expect(completions).toHaveLength(1);
+    expect(completions[0].payload).toMatchObject({ message: "steering won outcome race" });
   });
 
   it("supersedes a pending approval without implicitly approving or deadlocking", async () => {

@@ -41,10 +41,16 @@ function freshState(sessionId: string, event: AgentEventEnvelope, mode: RunMode,
   });
 }
 
-function nextRun(state: KernelState, event: AgentEventEnvelope, mode: RunMode, runDeadlineMs: number): KernelState {
-  if (event.runId === state.runId || state.phase !== "terminal") return state;
+function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
+  if (event.type !== "run.started" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return fallback;
+  const mode = (event.payload as Record<string, JsonValue>).mode;
+  return mode === "analyze" || mode === "change" ? mode : fallback;
+}
+
+function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: number): KernelState {
+  if (event.runId === state.runId || state.phase !== "terminal" || event.type !== "run.started") return state;
   return {
-    ...freshState(state.sessionId, event, mode, runDeadlineMs),
+    ...freshState(state.sessionId, event, eventRunMode(event, state.mode), runDeadlineMs),
     messages: state.messages,
     lastSeq: state.lastSeq
   };
@@ -97,8 +103,9 @@ function trackFollowUp(accumulator: RestoreAccumulator, event: AgentEventEnvelop
 
 function validMessage(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
-  const message = value as { role?: unknown; content?: unknown };
+  const message = value as { role?: unknown; content?: unknown; reasoningContent?: unknown };
   return typeof message.content === "string"
+    && (message.reasoningContent === undefined || typeof message.reasoningContent === "string")
     && typeof message.role === "string"
     && ["system", "developer", "user", "assistant", "tool"].includes(message.role);
 }
@@ -108,6 +115,8 @@ function validPendingTool(value: unknown): boolean {
   const pending = value as KernelState["pendingTools"][number];
   return Boolean(pending.request) && typeof pending.request.callId === "string"
     && typeof pending.request.name === "string" && typeof pending.started === "boolean"
+    && Boolean(pending.modelTurn) && Number.isInteger(pending.modelTurn.turnId)
+    && Number.isInteger(pending.modelTurn.effectRevision)
     && ["not_required", "pending", "allowed", "denied"].includes(pending.approval);
 }
 
@@ -119,7 +128,10 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
     Number.isInteger(state.revision), Number.isInteger(state.lastSeq), typeof state.deadlineAt === "string",
     Array.isArray(state.messages) && state.messages.every(validMessage),
     Array.isArray(state.pendingTools) && state.pendingTools.every(validPendingTool),
-    Array.isArray(state.receipts), Array.isArray(state.evidence), Array.isArray(state.childIds)
+    Array.isArray(state.receipts), Array.isArray(state.evidence), Array.isArray(state.childIds),
+    state.activeModelTurn === undefined || (
+      Number.isInteger(state.activeModelTurn.turnId) && Number.isInteger(state.activeModelTurn.effectRevision)
+    )
   ].every(Boolean);
 }
 
@@ -167,7 +179,7 @@ function replayEvent(
     return;
   }
   const previousRunId = accumulator.state.runId;
-  accumulator.state = nextRun(accumulator.state, event, accumulator.metadata.mode, runDeadlineMs);
+  accumulator.state = nextRun(accumulator.state, event, runDeadlineMs);
   if (accumulator.state.runId !== previousRunId) accumulator.modelTurn = 0;
   countModelTurn(accumulator, event);
   accumulator.state = evolve(accumulator.state, event);
@@ -190,6 +202,7 @@ export async function restoreStoredSession(store: RunStore, sessionId: string, r
   if (!accumulator.metadata || !accumulator.state) throw new Error(`Session '${sessionId}' was not found.`);
   return {
     ...accumulator.metadata,
+    mode: accumulator.state.mode,
     state: accumulator.state,
     modelTurn: accumulator.modelTurn,
     lastSeq: accumulator.lastSeq,

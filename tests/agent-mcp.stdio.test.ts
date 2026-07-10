@@ -18,7 +18,7 @@ import {
   stringValue,
   toolDefinition
 } from "../packages/agent-mcp/src/protocol-values.js";
-import { McpStdioTransport } from "../packages/agent-mcp/src/stdio-transport.js";
+import { McpStdioTransport, mcpProcessEnvironment } from "../packages/agent-mcp/src/stdio-transport.js";
 import type {
   McpCallToolResult,
   McpRequestOptions,
@@ -753,6 +753,39 @@ describe("MCP stdio client", () => {
     await backpressure.start();
     await backpressure.send({ jsonrpc: "2.0", method: "large", payload: "x".repeat(2 * 1024 * 1024) });
     await backpressure.close();
+  });
+
+  it("inherits only the MCP environment allowlist plus explicitly configured values", async () => {
+    expect(mcpProcessEnvironment({ MCP_EXPLICIT: "allowed" }, {
+      PATH: "safe-path",
+      DEEPSEEK_API_KEY: "deepseek-secret",
+      GLM_API_KEY: "glm-secret",
+      NODE_OPTIONS: "--require=malicious.cjs"
+    })).toEqual({ PATH: "safe-path", MCP_EXPLICIT: "allowed" });
+    const secretKey = `SIGMA_MCP_SECRET_${process.pid}`;
+    const previous = process.env[secretKey];
+    process.env[secretKey] = "must-not-leak";
+    const messages: unknown[] = [];
+    const script = `process.stdout.write(JSON.stringify({secret:process.env[${JSON.stringify(secretKey)}],explicit:process.env.MCP_EXPLICIT,path:Boolean(process.env.PATH||process.env.Path)})+"\\n");setInterval(()=>{},1000)`;
+    const transport = new McpStdioTransport({
+      name: "environment",
+      command: process.execPath,
+      args: ["-e", script],
+      cwd: process.cwd(),
+      env: { MCP_EXPLICIT: "allowed" }
+    }, {
+      onMessage: (message) => { messages.push(message); },
+      onFailure: () => undefined
+    }, 1_024, 1_024, 10);
+    try {
+      await transport.start();
+      await eventually(() => messages.length === 1);
+      expect(messages[0]).toEqual({ explicit: "allowed", path: true });
+    } finally {
+      await transport.close();
+      if (previous === undefined) delete process.env[secretKey];
+      else process.env[secretKey] = previous;
+    }
   });
 
   it("terminates the server process tree after graceful shutdown expires", async () => {

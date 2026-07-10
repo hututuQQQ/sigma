@@ -1,15 +1,16 @@
 import path from "node:path";
+import { realpath } from "node:fs/promises";
 import type { McpServerConfigValue } from "agent-config";
 import { McpStdioClient, McpToolBridge } from "agent-mcp";
 import type { ToolEffect } from "agent-protocol";
 import { registerToolExecutor, type EffectToolRegistry } from "agent-tools";
 
-function createClient(server: McpServerConfigValue, workspace: string): McpStdioClient {
+function createClient(server: McpServerConfigValue, cwd: string): McpStdioClient {
   return new McpStdioClient({
     name: server.name,
     command: server.command,
     args: server.args,
-    cwd: path.resolve(workspace, server.cwd),
+    cwd,
     env: server.env,
     timeouts: {
       idleTimeoutMs: server.idleTimeoutMs,
@@ -17,6 +18,20 @@ function createClient(server: McpServerConfigValue, workspace: string): McpStdio
       shutdownGraceMs: server.shutdownGraceMs
     }
   });
+}
+
+function containedBy(workspace: string, candidate: string): boolean {
+  const relative = path.relative(workspace, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+export async function resolveMcpWorkingDirectory(workspace: string, configuredCwd: string): Promise<string> {
+  const canonicalWorkspace = await realpath(path.resolve(workspace));
+  const canonicalCwd = await realpath(path.resolve(canonicalWorkspace, configuredCwd));
+  if (!containedBy(canonicalWorkspace, canonicalCwd)) {
+    throw new Error(`MCP working directory must stay inside the workspace: ${configuredCwd}`);
+  }
+  return canonicalCwd;
 }
 
 async function registerClient(client: McpStdioClient, server: McpServerConfigValue, tools: EffectToolRegistry): Promise<void> {
@@ -45,8 +60,12 @@ export async function connectMcpServers(
 ): Promise<McpStdioClient[]> {
   const clients: McpStdioClient[] = [];
   try {
-    for (const server of servers) {
-      const client = createClient(server, workspace);
+    const resolved = await Promise.all(servers.map(async (server) => ({
+      server,
+      cwd: await resolveMcpWorkingDirectory(workspace, server.cwd)
+    })));
+    for (const { server, cwd } of resolved) {
+      const client = createClient(server, cwd);
       clients.push(client);
       await registerClient(client, server, tools);
     }

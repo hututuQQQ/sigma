@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
-import type { AgentEventEnvelope, AgentEventType, ContextAuthority, JsonValue, RunCommand, RunOutcome } from "agent-protocol";
-import type { RuntimeClient, SessionOverview, SessionRef, StartSession } from "agent-protocol";
-import { createKernelState, evolve } from "agent-kernel";
 import { loadNestedInstructions } from "agent-context";
+import type { AgentEventEnvelope, AgentEventType, ContextAuthority, JsonValue, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession } from "agent-protocol";
+import { createKernelState, evolve } from "agent-kernel";
 import { ContentAddressedArtifactStore } from "agent-store";
 import { AsyncQueue } from "./async-queue.js";
 import { EffectRunner } from "./effect-runner.js";
 import { jsonValue } from "./json.js";
+import { newRuntimeSession } from "./new-runtime-session.js";
 import { baseContext } from "./runtime-context.js";
 import { persistRuntimeSnapshot } from "./runtime-snapshot.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
@@ -15,7 +14,6 @@ import { restoreStoredSession } from "./restore-session.js";
 import { SessionCommandBus } from "./session-command-bus.js";
 import { storedSessionOverview } from "./session-overview.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
-
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly emitQueues = new Map<string, Promise<void>>();
@@ -34,48 +32,14 @@ export class InProcessRuntimeClient implements RuntimeClient {
       permissionMode: options.permissionMode ?? "ask",
       outputReserveTokens: options.outputReserveTokens ?? Math.min(8_192, options.gateway.capabilities.maxOutputTokens),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
-      finish: async (session, outcome) => await this.finish(session, outcome),
+      finish: async (session, outcome, outcomeRevision) => await this.finish(session, outcome, outcomeRevision),
       createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content)
     });
   }
   async createSession(input: StartSession): Promise<SessionRef> {
-    const sessionId = randomUUID();
-    const runId = randomUUID();
-    const now = new Date().toISOString();
-    const state = createKernelState({
-      sessionId,
-      runId,
-      mode: input.mode,
-      startedAt: now,
-      deadlineAt: new Date(Date.now() + this.runDeadlineMs).toISOString()
-    });
-    const base = baseContext();
-    const project = await loadNestedInstructions({ workspacePath: input.workspacePath });
-    const session: RuntimeSession = {
-      sessionId,
-      runId,
-      modelTurn: 0,
-      workspacePath: path.resolve(input.workspacePath),
-      mode: input.mode,
-      writeScope: [...(input.writeScope ?? [])],
-      strictWriteScope: input.strictWriteScope === true,
-      state,
-      seq: 0,
-      controller: null,
-      turnController: null,
-      deadlineTimer: null,
-      running: null,
-      subscribers: new Set(),
-      approvals: new Map(),
-      alwaysAllowedEffects: new Set(),
-      steeringPending: 0,
-      followUps: [],
-      contextItems: [...base, ...project],
-      loadedContextIds: new Set([...base.map((item) => item.id), ...project.map((item) => item.id)]),
-      outcomeWaiters: []
-    };
-    this.sessions.set(sessionId, session);
-    await this.commandBus.claim(sessionId);
+    const session = await newRuntimeSession(input, this.runDeadlineMs);
+    this.sessions.set(session.sessionId, session);
+    await this.commandBus.claim(session.sessionId);
     try {
       await this.emit(session, "session.created", "runtime", {
         workspacePath: session.workspacePath,
@@ -85,11 +49,11 @@ export class InProcessRuntimeClient implements RuntimeClient {
         strictWriteScope: session.strictWriteScope
       });
     } catch (error) {
-      this.sessions.delete(sessionId);
-      await this.commandBus.release(sessionId);
+      this.sessions.delete(session.sessionId);
+      await this.commandBus.release(session.sessionId);
       throw error;
     }
-    return { sessionId, runId };
+    return { sessionId: session.sessionId, runId: session.runId };
   }
   async command(command: RunCommand): Promise<void> {
     if (command.type === "resume") return await this.handleResume(command);
@@ -112,29 +76,41 @@ export class InProcessRuntimeClient implements RuntimeClient {
   }
   private async handleCancel(session: RuntimeSession, command: Extract<RunCommand, { type: "cancel" }>): Promise<void> {
     const reason = command.reason ?? "Cancelled by user.";
-    await this.options.cancelChildren?.(session.sessionId, reason);
     session.controller?.abort(new Error(reason));
     for (const approval of session.approvals.values()) approval.resolve("deny");
+    await this.options.cancelChildren?.(session.sessionId, reason);
     if (!session.running && session.state.phase !== "terminal") await this.finish(session, { kind: "cancelled", reason });
   }
   private async handleApproval(session: RuntimeSession, command: Extract<RunCommand, { type: "approve" }>): Promise<void> {
     const approval = session.approvals.get(command.requestId);
-    if (!approval) throw new Error(`Unknown approval '${command.requestId}'.`);
+    const pendingTool = session.state.pendingTools.find((item) => item.request.callId === command.requestId);
+    if (!approval || !pendingTool) throw new Error(`Unknown approval '${command.requestId}'.`);
     session.approvals.delete(command.requestId);
     if (command.decision === "always_allow") session.alwaysAllowedEffects.add(approval.effects.slice().sort().join("\0"));
-    await this.emit(session, "tool.approval_resolved", "user", { requestId: command.requestId, callId: command.requestId, decision: command.decision });
+    await this.emit(session, "tool.approval_resolved", "user", {
+      requestId: command.requestId,
+      callId: command.requestId,
+      decision: command.decision,
+      ...pendingTool.modelTurn
+    });
     approval.resolve(command.decision);
-    if (approval.recovered && command.decision === "deny") await this.emitRecoveryDenial(session, command.requestId);
+    if (approval.recovered && command.decision === "deny") {
+      await this.emitRecoveryDenial(session, command.requestId, pendingTool.modelTurn);
+    }
     if (!session.running && session.state.phase !== "terminal") {
       session.lastOutcome = undefined;
       this.startRun(session);
     }
   }
-  private async emitRecoveryDenial(session: RuntimeSession, callId: string): Promise<void> {
+  private async emitRecoveryDenial(
+    session: RuntimeSession,
+    callId: string,
+    modelTurn: { turnId: number; effectRevision: number }
+  ): Promise<void> {
     const now = new Date().toISOString();
     await this.emit(session, "tool.failed", "runtime", {
       callId, name: "tool", ok: false, output: "Interrupted tool retry denied by user.", observedEffects: [],
-      artifacts: [], diagnostics: ["recovery_retry_denied"], startedAt: now, completedAt: now
+      artifacts: [], diagnostics: ["recovery_retry_denied"], startedAt: now, completedAt: now, ...modelTurn
     });
   }
 
@@ -226,6 +202,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     });
   }
 
+  async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
   async listSessions(limit = 20): Promise<SessionOverview[]> {
     const stored = (await this.options.store.listSessions()).slice(0, Math.max(1, limit));
     return await Promise.all(stored.map(async (item) => await storedSessionOverview(this.options.store, item)));
@@ -281,18 +258,42 @@ export class InProcessRuntimeClient implements RuntimeClient {
     }
   }
 
-  private async finish(session: RuntimeSession, outcome: RunOutcome): Promise<void> {
-    if (outcome.kind !== "completed") {
-      await this.options.cancelChildren?.(session.sessionId, `Parent run ended as ${outcome.kind}.`);
-    }
+  private async finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean> {
     const type: AgentEventType = outcome.kind === "completed" ? "run.completed"
       : outcome.kind === "cancelled" ? "run.cancelled"
         : outcome.kind === "needs_input" ? "run.suspended" : "run.failed";
-    await this.emit(session, type, "runtime", outcome);
+    const event = outcomeRevision === undefined
+      ? await this.emit(session, type, "runtime", outcome)
+      : await this.emitOutcomeIfCurrent(session, type, outcome, outcomeRevision);
+    const committed = outcome.kind === "needs_input"
+      ? session.state.phase === "needs_input"
+      : session.state.phase === "terminal";
+    if (!event || session.state.lastSeq !== event.seq || !committed) return false;
+    if (outcome.kind !== "completed") {
+      await this.options.cancelChildren?.(session.sessionId, `Parent run ended as ${outcome.kind}.`);
+    }
     session.lastOutcome = outcome;
     await this.writeSnapshot(session);
     await this.commandBus.release(session.sessionId);
     for (const waiter of session.outcomeWaiters.splice(0)) waiter(outcome);
+    return true;
+  }
+
+  private async emitOutcomeIfCurrent(
+    session: RuntimeSession,
+    type: AgentEventType,
+    outcome: RunOutcome,
+    outcomeRevision: number
+  ): Promise<AgentEventEnvelope | undefined> {
+    const previous = this.emitQueues.get(session.sessionId) ?? Promise.resolve();
+    let emitted: AgentEventEnvelope | undefined;
+    const current = previous.then(async () => {
+      if (session.state.phase !== "outcome_pending" || session.state.revision !== outcomeRevision) return;
+      emitted = await this.emitLocked(session, type, "runtime", { ...outcome, outcomeRevision });
+    });
+    this.emitQueues.set(session.sessionId, current.catch(() => undefined));
+    await current;
+    return emitted;
   }
 
   private async emit(

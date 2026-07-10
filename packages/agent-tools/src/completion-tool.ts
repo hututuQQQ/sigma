@@ -3,7 +3,7 @@ import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 export interface CompletionCriterion {
   criterion: string;
-  status: "met" | "not_applicable";
+  status: "met";
   evidenceCallIds: string[];
   rationale: string;
 }
@@ -24,14 +24,13 @@ export function parseCompletionProposal(value: JsonValue): CompletionProposal | 
   for (const raw of input.criteria) {
     const item = record(raw);
     if (!item || typeof item.criterion !== "string" || !item.criterion.trim()) return null;
-    if (item.status !== "met" && item.status !== "not_applicable") return null;
+    if (item.status !== "met") return null;
     if (!Array.isArray(item.evidenceCallIds) || item.evidenceCallIds.some((id) => typeof id !== "string")) return null;
-    if (typeof item.rationale !== "string") return null;
     criteria.push({
       criterion: item.criterion,
       status: item.status,
       evidenceCallIds: [...item.evidenceCallIds] as string[],
-      rationale: item.rationale
+      rationale: typeof item.rationale === "string" ? item.rationale : ""
     });
   }
   return { summary: input.summary, criteria };
@@ -42,9 +41,6 @@ export function completionEvidenceError(proposal: CompletionProposal, successful
     if (criterion.status === "met" && criterion.evidenceCallIds.length === 0) {
       return `Criterion '${criterion.criterion}' needs at least one successful tool receipt.`;
     }
-    if (criterion.status === "not_applicable" && !criterion.rationale.trim()) {
-      return `Criterion '${criterion.criterion}' needs a rationale when marked not_applicable.`;
-    }
     const missing = criterion.evidenceCallIds.filter((id) => !successfulCallIds.has(id));
     if (missing.length > 0) return `Criterion '${criterion.criterion}' cites unknown or failed receipts: ${missing.join(", ")}.`;
   }
@@ -54,23 +50,27 @@ export function completionEvidenceError(proposal: CompletionProposal, successful
 function completionTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
     name: "complete_task",
-    description: "Propose terminal completion with explicit acceptance criteria and successful tool-receipt evidence. Completion is rejected until this protocol is satisfied.",
+    description: "Propose terminal completion with explicit acceptance criteria and successful current-run tool-receipt evidence. Every criterion must be met. Copy exact opaque IDs from the current-run receipt ledger or 'Successful tool receipt ID:' results into evidenceCallIds; never invent labels, indexes, tool names, or older-run IDs. Completion is rejected until this protocol is satisfied.",
     inputSchema: {
       type: "object",
       properties: {
-        summary: { type: "string" },
+        summary: { type: "string", description: "Concise description of the completed result." },
         criteria: {
           type: "array",
           minItems: 1,
           items: {
             type: "object",
             properties: {
-              criterion: { type: "string" },
-              status: { type: "string", enum: ["met", "not_applicable"] },
-              evidenceCallIds: { type: "array", items: { type: "string" } },
-              rationale: { type: "string" }
+              criterion: { type: "string", description: "One concrete acceptance criterion." },
+              status: { type: "string", enum: ["met"], description: "Terminal completion accepts only criteria proven met by current-run receipts." },
+              evidenceCallIds: {
+                type: "array",
+                description: "Exact opaque IDs copied from successful tool receipt results. Do not use tool names, labels, or numeric indexes.",
+                items: { type: "string" }
+              },
+              rationale: { type: "string", description: "Optional concise explanation; omitted values default to an empty string." }
             },
-            required: ["criterion", "status", "evidenceCallIds", "rationale"],
+            required: ["criterion", "status", "evidenceCallIds"],
             additionalProperties: false
           }
         }

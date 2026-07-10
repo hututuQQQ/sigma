@@ -74,12 +74,22 @@ function complete(summary: string, evidenceCallIds: string[] = []): ModelRespons
           summary,
           criteria: [{
             criterion: "The requested CLI test task is complete.",
-            status: evidenceCallIds.length > 0 ? "met" : "not_applicable",
-            evidenceCallIds,
-            rationale: evidenceCallIds.length > 0 ? "The write receipt proves completion." : "No repository mutation is required."
+            status: "met",
+            evidenceCallIds
           }]
         }
       }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
+function evidenceRequest(callId: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: callId, name: "list", arguments: { path: ".", limit: 20 } }]
     },
     finishReason: "tool_calls"
   };
@@ -135,7 +145,9 @@ describe("run v2 command branch coverage", () => {
       "--prompt-file", prompt,
       "--workspace", root,
       "--permission-mode", "auto"
-    ], { stdin, stdout, stderr, mode: "analyze", gatewayFactory: gatewayFactory([complete("file complete")]) });
+    ], { stdin, stdout, stderr, mode: "analyze", gatewayFactory: gatewayFactory([
+      evidenceRequest("file-evidence"), complete("file complete", ["file-evidence"])
+    ]) });
     expect(code).toBe(0);
     expect(stdout.text()).toContain("file complete");
   });
@@ -151,7 +163,9 @@ describe("run v2 command branch coverage", () => {
       "--workspace", root,
       "--permission-mode", "auto",
       "--output-format", "stream-json"
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([complete("stream complete")]) });
+    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([
+      evidenceRequest("stream-evidence"), complete("stream complete", ["stream-evidence"])
+    ]) });
     expect(code).toBe(0);
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
     expect(records.some((record) => record.type === "model.started")).toBe(true);
@@ -175,7 +189,9 @@ describe("run v2 command branch coverage", () => {
       stdout,
       stderr,
       mode: "analyze",
-      gatewayFactory: gatewayFactory([complete("stdin complete")])
+      gatewayFactory: gatewayFactory([
+        evidenceRequest("stdin-evidence"), complete("stdin complete", ["stdin-evidence"])
+      ])
     });
     expect(code).toBe(0);
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "completed", finalMessage: "stdin complete" });
@@ -207,12 +223,15 @@ describe("run v2 command branch coverage", () => {
     const stdout = new Capture();
     stdout.isTTY = true;
     const stderr = new Capture();
-    const completion = allowed ? complete("approved complete", ["write-call"]) : complete("denied complete");
+    const completion = allowed ? complete("approved complete", ["write-call"]) : complete("denied complete", ["denial-evidence"]);
+    const script = allowed
+      ? [writeRequest(), completion]
+      : [writeRequest(), evidenceRequest("denial-evidence"), completion];
     const code = await runV2Command([
       "write approval result",
       "--workspace", root,
       "--permission-mode", "ask"
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([writeRequest(), completion]) });
+    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory(script) });
     expect(code).toBe(0);
     expect(stderr.text()).toContain(eventType);
     if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.txt"), "utf8"))).toBe("approved");

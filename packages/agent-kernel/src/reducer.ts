@@ -6,10 +6,9 @@ import type {
   ModelToolCall,
   RunOutcome,
   ToolEffect,
-  ToolReceipt,
-  ToolRequest
+  ToolReceipt
 } from "agent-protocol";
-import type { KernelState, PendingTool } from "./state.js";
+import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
 
 function objectPayload(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -39,16 +38,10 @@ function modelMessage(value: JsonValue | undefined): ModelMessage | null {
   return {
     role,
     content: text(item.content),
+    ...(typeof item.reasoningContent === "string" ? { reasoningContent: item.reasoningContent } : {}),
     ...(typeof item.toolCallId === "string" ? { toolCallId: item.toolCallId } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {})
   };
-}
-
-function toolRequest(value: JsonValue): ToolRequest | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const item = value as Record<string, JsonValue>;
-  if (typeof item.callId !== "string" || typeof item.name !== "string") return null;
-  return { callId: item.callId, name: item.name, arguments: item.arguments ?? null };
 }
 
 function toolReceipt(value: JsonValue): ToolReceipt | null {
@@ -80,12 +73,25 @@ function completionSummary(receipt: ToolReceipt): string | null {
   }
 }
 
+function receiptContent(receipt: ToolReceipt): string {
+  const status = receipt.ok ? "Successful" : "Failed";
+  return `${status} tool receipt ID: ${receipt.callId}\n${receipt.output}`;
+}
+
+function supersededToolMessages(state: KernelState): ModelMessage[] {
+  return state.pendingTools.map((pending) => ({
+    role: "tool",
+    toolCallId: pending.request.callId,
+    content: `Failed tool receipt ID: ${pending.request.callId}\nSuperseded by a newer user instruction; no successful receipt or side effect may be inferred.`
+  }));
+}
+
 function terminal(state: KernelState, outcome: RunOutcome): KernelState {
-  return { ...state, phase: "terminal", pendingTools: [], proposedOutcome: undefined, outcome };
+  return { ...state, phase: "terminal", activeModelTurn: undefined, pendingTools: [], proposedOutcome: undefined, outcome };
 }
 
 function propose(state: KernelState, outcome: RunOutcome): KernelState {
-  return { ...state, phase: "outcome_pending", proposedOutcome: outcome };
+  return { ...state, phase: "outcome_pending", activeModelTurn: undefined, proposedOutcome: outcome };
 }
 
 function nextPhase(pending: PendingTool[]): KernelState["phase"] {
@@ -94,14 +100,19 @@ function nextPhase(pending: PendingTool[]): KernelState["phase"] {
   return pending.length > 0 ? "tool_pending" : "ready_model";
 }
 
-function pendingFromCalls(calls: ModelToolCall[]): PendingTool[] {
+function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): PendingTool[] {
   const identifiers = new Set<string>();
   return calls.map((call): PendingTool => {
     if (identifiers.has(call.id)) {
       throw Object.assign(new Error(`Model returned duplicate tool call id '${call.id}'.`), { code: "protocol_error" });
     }
     identifiers.add(call.id);
-    return { request: { callId: call.id, name: call.name, arguments: call.arguments }, approval: "not_required", started: false };
+    return {
+      request: { callId: call.id, name: call.name, arguments: call.arguments },
+      modelTurn,
+      approval: "not_required",
+      started: false
+    };
   });
 }
 
@@ -113,8 +124,10 @@ type EventReducer = (
 
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
+  mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
   phase: state.messages.length > 0 ? "ready_model" : "idle",
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
+  activeModelTurn: undefined,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -127,10 +140,16 @@ const userInput: EventReducer = (state, _event, payload) => ({
 
 const steeringInput: EventReducer = (state, _event, payload) => ({
   ...state,
-  messages: [...state.messages, { role: "user", content: text(payload.text) }],
-  ...(state.phase === "model_in_flight" || state.phase === "tool_pending"
-    ? { phase: "ready_model" as const, pendingTools: [] }
-    : {})
+  messages: [
+    ...state.messages,
+    ...supersededToolMessages(state),
+    { role: "user", content: text(payload.text) }
+  ],
+  phase: "ready_model",
+  activeModelTurn: undefined,
+  pendingTools: [],
+  proposedOutcome: undefined,
+  outcome: undefined
 });
 
 const followUpInput: EventReducer = (state, event, payload) => payload.status === "queued"
@@ -156,52 +175,89 @@ function incompleteCompletion(state: KernelState, payload: Record<string, JsonVa
   };
 }
 
+function modelTurn(payload: Record<string, JsonValue>): { turnId: number; effectRevision: number } | null {
+  return Number.isInteger(payload.turnId) && Number.isInteger(payload.effectRevision)
+    ? { turnId: Number(payload.turnId), effectRevision: Number(payload.effectRevision) }
+    : null;
+}
+
+function isCurrentModelTurn(state: KernelState, payload: Record<string, JsonValue>): boolean {
+  const turn = modelTurn(payload);
+  return Boolean(turn && state.activeModelTurn
+    && turn.turnId === state.activeModelTurn.turnId
+    && turn.effectRevision === state.activeModelTurn.effectRevision);
+}
+
+function pendingForEvent(state: KernelState, payload: Record<string, JsonValue>): PendingTool | undefined {
+  const turn = modelTurn(payload);
+  const callId = text(payload.callId);
+  if (!turn || !callId) return undefined;
+  return state.pendingTools.find((item) => item.request.callId === callId
+    && item.modelTurn.turnId === turn.turnId
+    && item.modelTurn.effectRevision === turn.effectRevision);
+}
+
+function acceptsOutcomeRevision(state: KernelState, payload: Record<string, JsonValue>): boolean {
+  if (payload.outcomeRevision === undefined) return true;
+  return Number.isInteger(payload.outcomeRevision)
+    && payload.outcomeRevision === state.revision - 1
+    && state.phase === "outcome_pending";
+}
+
+const modelStarted: EventReducer = (state, _event, payload) => {
+  const turn = modelTurn(payload);
+  if (state.phase !== "ready_model" || !turn || turn.effectRevision !== state.revision - 1) return state;
+  return { ...state, phase: "model_in_flight", activeModelTurn: turn };
+};
+
 const modelCompleted: EventReducer = (state, _event, payload) => {
-  if (state.phase !== "model_in_flight") return state;
+  if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
   const message = modelMessage(payload.message);
   const messages = message ? [...state.messages, message] : state.messages;
   const calls = modelToolCalls(payload.toolCalls);
-  if (calls.length === 0) return incompleteCompletion(state, payload, messages);
-  const pendingTools = pendingFromCalls(calls);
-  return { ...state, messages, pendingTools, phase: "tool_pending" };
+  const modelTurn = state.activeModelTurn!;
+  const completedState = { ...state, activeModelTurn: undefined };
+  if (calls.length === 0) return incompleteCompletion(completedState, payload, messages);
+  const pendingTools = pendingFromCalls(calls, modelTurn);
+  return { ...completedState, messages, pendingTools, phase: "tool_pending" };
 };
 
-const modelFailed: EventReducer = (state, _event, payload) => !["ready_model", "model_in_flight"].includes(state.phase) ? state : propose(state, {
-  kind: "recoverable_failure",
-  code: text(payload.code) || "model_error",
-  message: text(payload.message)
-});
-
-const toolRequested: EventReducer = (state, event) => {
-  const request = toolRequest(event.payload);
-  if (!request || state.pendingTools.some((item) => item.request.callId === request.callId)) return state;
-  return {
-    ...state,
-    pendingTools: [...state.pendingTools, { request, approval: "not_required", started: false }],
-    phase: "tool_pending"
-  };
+const modelFailed: EventReducer = (state, _event, payload) => {
+  if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
+  return propose(state, {
+    kind: "recoverable_failure",
+    code: text(payload.code) || "model_error",
+    message: text(payload.message)
+  });
 };
+
+// model.completed is the authority that creates pending tool work. Requested
+// is a durable lifecycle marker and must never resurrect a superseded call.
+const toolRequested: EventReducer = (state) => state;
 
 const approvalRequested: EventReducer = (state, _event, payload) => {
-  const callId = text(payload.callId);
-  const pendingTools = state.pendingTools.map((item) => item.request.callId === callId
+  const pending = pendingForEvent(state, payload);
+  if (!pending) return state;
+  const pendingTools = state.pendingTools.map((item) => item === pending
     ? { ...item, approval: "pending" as const }
     : item);
   return { ...state, pendingTools, phase: "needs_input" };
 };
 
 const approvalResolved: EventReducer = (state, _event, payload) => {
-  const callId = text(payload.callId);
+  const pending = pendingForEvent(state, payload);
+  if (!pending) return state;
   const allowed = payload.decision === "allow" || payload.decision === "always_allow";
-  const pendingTools = state.pendingTools.map((item) => item.request.callId === callId
+  const pendingTools = state.pendingTools.map((item) => item === pending
     ? { ...item, approval: allowed ? "allowed" as const : "denied" as const }
     : item);
   return { ...state, pendingTools, phase: nextPhase(pendingTools), outcome: undefined };
 };
 
 const toolStarted: EventReducer = (state, _event, payload) => {
-  const callId = text(payload.callId);
-  const pendingTools = state.pendingTools.map((item) => item.request.callId === callId
+  const pending = pendingForEvent(state, payload);
+  if (!pending) return state;
+  const pendingTools = state.pendingTools.map((item) => item === pending
     ? { ...item, started: true }
     : item);
   return { ...state, pendingTools, phase: "tool_in_flight" };
@@ -209,11 +265,16 @@ const toolStarted: EventReducer = (state, _event, payload) => {
 
 const toolFinished: EventReducer = (state, event) => {
   const receipt = toolReceipt(event.payload);
-  if (!receipt) return state;
-  const pendingTools = state.pendingTools.filter((item) => item.request.callId !== receipt.callId);
+  const pending = pendingForEvent(state, objectPayload(event.payload));
+  if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
+  const pendingTools = state.pendingTools.filter((item) => item !== pending);
   const next: KernelState = {
     ...state,
-    messages: [...state.messages, { role: "tool", content: receipt.output, toolCallId: receipt.callId }],
+    messages: [...state.messages, {
+      role: "tool",
+      content: receiptContent(receipt),
+      toolCallId: receipt.callId
+    }],
     pendingTools,
     receipts: [...state.receipts, receipt],
     evidence: receipt.ok ? [...state.evidence, event.payload] : state.evidence,
@@ -223,7 +284,17 @@ const toolFinished: EventReducer = (state, event) => {
   return summary ? propose(next, { kind: "completed", message: summary, evidence: next.evidence }) : next;
 };
 
+const runSuspended: EventReducer = (state, _event, payload) => {
+  if (text(payload.callId) && !pendingForEvent(state, payload)) return state;
+  return {
+    ...state,
+    phase: "needs_input",
+    outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
+  };
+};
+
 const runFailed: EventReducer = (state, _event, payload) => {
+  if (!acceptsOutcomeRevision(state, payload)) return state;
   const outcome: RunOutcome = payload.kind === "recoverable_failure"
     ? {
       kind: "recoverable_failure",
@@ -235,9 +306,16 @@ const runFailed: EventReducer = (state, _event, payload) => {
   return terminal(state, outcome);
 };
 
+const runCompleted: EventReducer = (state, _event, payload) => acceptsOutcomeRevision(state, payload)
+  ? terminal(state, { kind: "completed", message: text(payload.message), evidence: state.evidence })
+  : state;
+
 const diagnostic: EventReducer = (state, _event, payload) => {
-  if (payload.kind === "steering.restart") return { ...state, phase: "ready_model", pendingTools: [], outcome: undefined };
-  if (payload.kind === "recovery.retry_model") return { ...state, phase: "ready_model", outcome: undefined };
+  // user.steer is the durable authority for superseding a turn. The later
+  // steering.restart event is observational only: applying it could erase a
+  // newer turn that completed while the cancelled provider was unwinding.
+  if (payload.kind === "steering.restart") return state;
+  if (payload.kind === "recovery.retry_model") return { ...state, phase: "ready_model", activeModelTurn: undefined, outcome: undefined };
   if (payload.kind === "child.join_failed") {
     const failures = Array.isArray(payload.failures) ? payload.failures.filter((item): item is string => typeof item === "string") : [];
     return {
@@ -268,7 +346,7 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "user.message": userInput,
   "user.steer": steeringInput,
   "user.follow_up": followUpInput,
-  "model.started": (state) => ({ ...state, phase: "model_in_flight" }),
+  "model.started": modelStarted,
   "model.completed": modelCompleted,
   "model.failed": modelFailed,
   "tool.requested": toolRequested,
@@ -277,21 +355,13 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "tool.started": toolStarted,
   "tool.completed": toolFinished,
   "tool.failed": toolFinished,
-  "run.suspended": (state, _event, payload) => ({
-    ...state,
-    phase: "needs_input",
-    outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
-  }),
+  "run.suspended": runSuspended,
   "run.cancelled": (state, _event, payload) => terminal(state, {
     kind: "cancelled",
     reason: text(payload.reason) || "cancelled"
   }),
   "run.failed": runFailed,
-  "run.completed": (state, _event, payload) => terminal(state, {
-    kind: "completed",
-    message: text(payload.message),
-    evidence: state.evidence
-  }),
+  "run.completed": runCompleted,
   diagnostic
 };
 

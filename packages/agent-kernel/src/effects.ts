@@ -1,10 +1,10 @@
 import type { ModelMessage, RunOutcome, ToolRequest } from "agent-protocol";
-import type { KernelState } from "./state.js";
+import type { ActiveModelTurn, KernelState } from "./state.js";
 
 export type KernelEffect =
   | { type: "request_model"; revision: number; messages: ModelMessage[] }
   | { type: "request_approval"; revision: number; request: ToolRequest }
-  | { type: "execute_tool"; revision: number; request: ToolRequest }
+  | { type: "execute_tool"; revision: number; request: ToolRequest; modelTurn: ActiveModelTurn }
   | { type: "finish_run"; revision: number; outcome: RunOutcome }
   | { type: "publish_outcome"; revision: number };
 
@@ -17,8 +17,10 @@ export function decide(state: KernelState): KernelEffect[] {
   if (state.phase === "tool_pending") {
     return state.pendingTools.flatMap((item): KernelEffect[] => {
       if (item.started || item.approval === "denied" || item.approval === "pending") return [];
-      if (item.approval === "not_required") return [{ type: "execute_tool", revision: state.revision, request: item.request }];
-      return [{ type: "execute_tool", revision: state.revision, request: item.request }];
+      if (item.approval === "not_required") return [{
+        type: "execute_tool", revision: state.revision, request: item.request, modelTurn: item.modelTurn
+      }];
+      return [{ type: "execute_tool", revision: state.revision, request: item.request, modelTurn: item.modelTurn }];
     });
   }
   return [];
