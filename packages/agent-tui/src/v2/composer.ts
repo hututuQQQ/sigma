@@ -54,15 +54,14 @@ function fullWidth(codePoint: number): boolean {
   return wideRanges.some(([start, end]) => codePoint >= start && codePoint <= end);
 }
 
+export function graphemeCellWidth(item: string): number {
+  const codePoint = item.codePointAt(0);
+  if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) return 0;
+  if (/\p{Extended_Pictographic}/u.test(item) || /^\p{Regional_Indicator}{2}$/u.test(item)
+    || item.includes("\u20e3") || (codePoint !== undefined && fullWidth(codePoint))) return 2;
+  return /^\p{Mark}+$/u.test(item) ? 0 : 1;
+}
+
 export function cellWidth(value: string): number {
-  let width = 0;
-  for (const item of graphemes(value)) {
-    const codePoint = item.codePointAt(0);
-    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) continue;
-    if (/\p{Extended_Pictographic}/u.test(item) || /^\p{Regional_Indicator}{2}$/u.test(item)
-      || item.includes("\u20e3") || (codePoint !== undefined && fullWidth(codePoint))) width += 2;
-    else if (/^\p{Mark}+$/u.test(item)) continue;
-    else width += 1;
-  }
-  return width;
+  return graphemes(value).reduce((width, item) => width + graphemeCellWidth(item), 0);
 }

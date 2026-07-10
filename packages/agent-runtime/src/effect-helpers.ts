@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import path from "node:path";
 import type {
   JsonValue, ModelGateway, ModelToolCall, ModelToolDefinition, ToolDescriptor, ToolReceipt, WorkspaceDelta
 } from "agent-protocol";
 import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
-import { resolveWorkspacePath } from "agent-platform";
+import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
 import { completionEvidenceError, parseCompletionProposal } from "agent-tools";
 import type { RuntimeSession } from "./types.js";
 
@@ -106,29 +105,25 @@ export function completionFailure(session: RuntimeSession, call: ModelToolCall, 
   return failed(call, startedAt, `${evidenceError}\n${guidance}`, "invalid_completion_evidence");
 }
 
-function normalizedRelative(workspacePath: string, candidate: string): string | null {
-  const relative = path.relative(workspacePath, path.resolve(workspacePath, candidate)).replaceAll("\\", "/");
-  return !relative || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative) ? null : relative;
-}
-
-function inWriteScope(file: string, scopes: readonly string[]): boolean {
-  return scopes.some((raw) => {
-    const scope = raw.replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/$/u, "");
-    return file === scope || file.startsWith(`${scope}/`);
-  });
-}
-
-export function writeScopeFailure(session: RuntimeSession, call: ModelToolCall, descriptor: ToolDescriptor, startedAt: string): ToolReceipt | null {
+export async function writeScopeFailure(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  descriptor: ToolDescriptor,
+  startedAt: string
+): Promise<ToolReceipt | null> {
   if (!session.strictWriteScope || !descriptor.possibleEffects.some((effect) => effect === "filesystem.write" || effect === "destructive")) return null;
   const input = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
     ? call.arguments as Record<string, JsonValue> : null;
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");
   const targets = (descriptor.writePathArguments ?? []).flatMap((key) => typeof input[key] === "string" ? [input[key] as string] : []);
   if (targets.length === 0) return failed(call, startedAt, `Tool '${call.name}' can write outside declared paths and is disabled in an exclusive shared workspace.`, "write_scope_denied");
-  const outside = targets.filter((target) => {
-    const relative = normalizedRelative(session.workspacePath, target);
-    return relative === null || !inWriteScope(relative, session.writeScope);
-  });
+  const scopes = await Promise.all(session.writeScope.map(async (scope) =>
+    await canonicalWorkspacePath(session.workspacePath, scope)));
+  const outside: string[] = [];
+  for (const target of targets) {
+    const canonical = await canonicalWorkspacePath(session.workspacePath, target).catch(() => null);
+    if (!canonical || !scopes.some((scope) => isInside(scope, canonical))) outside.push(target);
+  }
   return outside.length > 0 ? failed(call, startedAt, `Write target is outside the delegated scope: ${outside.join(", ")}.`, "write_scope_denied") : null;
 }
 

@@ -7,7 +7,7 @@ export function isInside(parent: string, candidate: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-export async function resolveWorkspacePath(workspace: string, requested: string): Promise<string> {
+export async function canonicalWorkspacePath(workspace: string, requested: string): Promise<string> {
   const root = await realpath(path.resolve(workspace));
   const candidate = path.resolve(root, requested);
   if (!isInside(root, candidate)) throw new Error(`Path escapes workspace: ${requested}`);
@@ -15,8 +15,9 @@ export async function resolveWorkspacePath(workspace: string, requested: string)
   while (true) {
     try {
       const resolvedAncestor = await realpath(ancestor);
-      if (!isInside(root, resolvedAncestor)) throw new Error(`Path resolves outside workspace through a link: ${requested}`);
-      break;
+      const canonical = path.resolve(resolvedAncestor, path.relative(ancestor, candidate));
+      if (!isInside(root, canonical)) throw new Error(`Path resolves outside workspace through a link: ${requested}`);
+      return canonical;
     } catch (error) {
       const code = (error as { code?: unknown }).code;
       if (code !== "ENOENT") throw error;
@@ -25,7 +26,10 @@ export async function resolveWorkspacePath(workspace: string, requested: string)
       ancestor = parent;
     }
   }
-  return candidate;
+}
+
+export async function resolveWorkspacePath(workspace: string, requested: string): Promise<string> {
+  return await canonicalWorkspacePath(workspace, requested);
 }
 
 export async function selfContainedGitRoot(workspace: string, signal?: AbortSignal): Promise<string | null> {
@@ -60,7 +64,9 @@ export async function gitPorcelain(workspace: string, signal: AbortSignal): Prom
     stderr: "Workspace is not a self-contained Git repository.",
     timedOut: false,
     cancelled: false,
-    durationMs: 0
+    durationMs: 0,
+    stdoutLimitReached: false,
+    outputTruncated: false
   };
   return await runProcess({
     executable: "git",

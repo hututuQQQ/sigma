@@ -92,9 +92,10 @@ async function streamSession(
   config: CliConfig,
   stdin: NodeJS.ReadableStream & { isTTY?: boolean },
   stdout: NodeJS.WritableStream,
-  stderr: NodeJS.WritableStream
+  stderr: NodeJS.WritableStream,
+  signal: AbortSignal
 ): Promise<void> {
-  for await (const event of runtime.subscribe(sessionId)) {
+  for await (const event of runtime.subscribe(sessionId, signal)) {
     writeEvent(event, config.outputFormat, stderr, stdout);
     if (event.type === "tool.approval_requested") await promptApproval(event, runtime, stdin, stderr);
     if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") break;
@@ -129,12 +130,19 @@ async function executeRun(
 ): Promise<number> {
   const { runtime, workspace } = configured;
   const session = await runtime.createSession({ workspacePath: workspace, mode, title: instruction.slice(0, 80) });
-  const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr);
-  await runtime.command({ type: "submit", sessionId: session.sessionId, text: instruction, mode });
-  const outcome = await runtime.waitForOutcome(session.sessionId);
-  await stream;
-  writeResult(outcome, session.sessionId, config.outputFormat, stdout);
-  return exitCode(outcome);
+  const streamAbort = new AbortController();
+  const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr, streamAbort.signal);
+  try {
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: instruction, mode });
+    const outcome = await runtime.waitForOutcome(session.sessionId);
+    streamAbort.abort();
+    await stream;
+    writeResult(outcome, session.sessionId, config.outputFormat, stdout);
+    return exitCode(outcome);
+  } finally {
+    streamAbort.abort();
+    await stream.catch(() => undefined);
+  }
 }
 
 function nonInteractiveAsk(config: CliConfig, stdinTty: boolean, stdoutTty: boolean): boolean {

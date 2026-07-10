@@ -1,5 +1,5 @@
 import path from "node:path";
-import { realpath } from "node:fs/promises";
+import { chmod, mkdir, realpath } from "node:fs/promises";
 import type { McpConfigSource, McpServerConfigValue, WorkspaceMcpTrustAttestation } from "agent-config";
 import { createModelGateway, defaultModel } from "agent-model";
 import type { JsonValue, ModelGateway, RunStore } from "agent-protocol";
@@ -13,6 +13,7 @@ import type { InProcessRuntimeClient } from "./runtime-client.js";
 import type { ChildJoinSummary } from "./types.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
+import { runtimeStateRoot } from "./runtime-state.js";
 
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -31,11 +32,13 @@ export interface RuntimeCompositionConfig {
 
 export interface RuntimeFactoryDeps {
   gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
+  stateRootDir?: string;
 }
 
 export interface ConfiguredRuntime {
   runtime: InProcessRuntimeClient;
   workspace: string;
+  storeRootDir: string;
   close(): Promise<void>;
 }
 
@@ -78,7 +81,9 @@ export async function createConfiguredRuntime(
     requestTimeoutMs: config.modelDeadlineSec * 1_000,
     idleTimeoutMs: config.streamIdleSec * 1_000
   });
-  const storeRootDir = path.join(workspace, ".agent");
+  const storeRootDir = path.resolve(deps.stateRootDir ?? runtimeStateRoot(workspace));
+  await mkdir(storeRootDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(storeRootDir, 0o700);
   const runtimeReference: { current?: InProcessRuntimeClient } = {};
   const supervisor = new AgentSupervisor(
     createChildAgentFactory(() => runtimeReference.current as InProcessRuntimeClient),
@@ -105,5 +110,5 @@ export async function createConfiguredRuntime(
     cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason)
   });
   runtimeReference.current = runtime;
-  return { workspace, runtime, close: async () => await closeMcpClients(mcpClients) };
+  return { workspace, storeRootDir, runtime, close: async () => await closeMcpClients(mcpClients) };
 }

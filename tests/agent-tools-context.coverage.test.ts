@@ -188,6 +188,13 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(listed.output).toContain("src/one.txt");
     const found = await tools.execute(request("grep", "grep", { query: "alpha", path: "src", limit: 20 }), context(workspace));
     expect(found.output).toContain("one.txt");
+    await writeFile(path.join(workspace, "src", "dense-a.txt"), "alpha\n".repeat(10), "utf8");
+    await writeFile(path.join(workspace, "src", "dense-b.txt"), "alpha\n".repeat(10), "utf8");
+    const limited = await tools.execute(request("grep-limited", "grep", {
+      query: "alpha", path: "src", limit: 7
+    }), context(workspace));
+    expect(limited.output.split(/\r?\n/u)).toHaveLength(7);
+    expect(limited.diagnostics).toContain("result_limit=7");
     const optionText = await tools.execute(request("grep-option", "grep", { query: "--pre=do-not-execute", path: "src" }), context(workspace));
     expect(optionText.output).toContain("options.txt");
     await expect(tools.execute(request("grep-escape", "grep", { query: "secret", path: ".." }), context(workspace))).rejects.toThrow(/escapes workspace/);

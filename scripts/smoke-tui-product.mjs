@@ -9,6 +9,7 @@ import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "./s
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactsDir = path.join(rootDir, ".artifacts", "smoke-tui-product");
 const workspace = path.join(artifactsDir, "workspace");
+process.env.SIGMA_STATE_HOME = path.join(artifactsDir, "private-state");
 
 class FakeInput extends PassThrough {
   constructor() { super(); this.isTTY = true; this.rawModes = []; }
@@ -35,10 +36,10 @@ async function main() {
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
   if (missing.length) throw new Error(`Built TUI product is missing:\n${missing.join("\n")}`);
-  const [{ TuiController }, { createRuntime }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all(entries.map((entry) => import(pathToFileURL(entry).href)));
+  const [{ TuiController }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all(entries.map((entry) => import(pathToFileURL(entry).href)));
   await rm(artifactsDir, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
-  const storeRootDir = path.join(workspace, ".agent");
+  const storeRootDir = runtimeStateRoot(workspace);
   const runtime = createRuntime({
     gateway: new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),

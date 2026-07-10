@@ -8,3 +8,4 @@ export * from "./composition-supervision.js";
 export * from "./provider-health.js";
 export * from "./durable-children.js";
 export * from "./workspace-mcp-trust.js";
+export * from "./runtime-state.js";

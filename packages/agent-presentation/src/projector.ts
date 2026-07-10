@@ -1,6 +1,9 @@
 import type { AgentEventEnvelope, AgentEventType, JsonValue } from "agent-protocol";
 import type { ActivityItem, ApprovalItem, PresentationState, TranscriptItem } from "./view-state.js";
 import { projectDiagnostic, projectModelFailed, projectRunFailed } from "./failure-projectors.js";
+import {
+  boundedPresentationText, maximumActivityDetailCharacters, maximumTranscriptCharacters
+} from "./bounds.js";
 
 function payload(event: AgentEventEnvelope): Record<string, JsonValue> {
   return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
@@ -29,12 +32,24 @@ function appendDelta(items: TranscriptItem[], event: AgentEventEnvelope, data: R
   const id = `assistant:${itemId(event, data)}`;
   const index = items.findIndex((item) => item.id === id && item.streaming);
   if (index === -1) {
-    const item: TranscriptItem = { id, role: "assistant", text: delta, streaming: true, occurredAt: event.occurredAt };
+    const item: TranscriptItem = {
+      id, role: "assistant", text: boundedPresentationText(delta, maximumTranscriptCharacters),
+      streaming: true, occurredAt: event.occurredAt
+    };
     return [...items, item].slice(-2_000);
   }
   const next = [...items];
-  next[index] = { ...items[index], text: `${items[index].text}${delta}` };
+  next[index] = {
+    ...items[index],
+    text: boundedPresentationText(`${items[index].text}${delta}`, maximumTranscriptCharacters)
+  };
   return next;
+}
+
+function boundedApprovals(items: ApprovalItem[]): ApprovalItem[] {
+  const pending = items.filter((item) => item.status === "pending");
+  const resolved = items.filter((item) => item.status !== "pending").slice(-256);
+  return [...resolved, ...pending];
 }
 
 type EventProjector = (
@@ -49,7 +64,7 @@ const projectUserInput: EventProjector = (state, event, data) => {
   const item: TranscriptItem = {
     id: event.eventId,
     role: "user",
-    text: text(data.text),
+    text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
   };
@@ -65,7 +80,7 @@ const projectFollowUp: EventProjector = (state, event, data) => {
   const item: TranscriptItem = {
     id,
     role: "user",
-    text: text(data.text),
+    text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
   };
@@ -93,7 +108,7 @@ const projectModelCompleted: EventProjector = (state, event, data) => {
     transcript.push({
       id: event.eventId,
       role: "assistant",
-      text: text(data.text),
+      text: boundedPresentationText(text(data.text), maximumTranscriptCharacters),
       streaming: false,
       occurredAt: event.occurredAt
     });
@@ -126,7 +141,9 @@ const projectToolActivity: EventProjector = (state, event, data) => {
       id: `tool:${callId}`,
       kind: "tool",
       title: text(data.name) || "tool",
-      detail: text(data.output) || text(data.message),
+      detail: boundedPresentationText(
+        text(data.output) || text(data.message), maximumActivityDetailCharacters
+      ),
       status: toolStatus(event.type),
       occurredAt: event.occurredAt
     })
@@ -136,12 +153,12 @@ const projectToolActivity: EventProjector = (state, event, data) => {
 const projectApprovalRequested: EventProjector = (state, _event, data) => ({
   ...state,
   status: "needs_input",
-  approvals: [...state.approvals.filter((item) => item.requestId !== text(data.requestId)), {
+  approvals: boundedApprovals([...state.approvals.filter((item) => item.requestId !== text(data.requestId)), {
     requestId: text(data.requestId),
     toolName: text(data.toolName),
     reason: text(data.reason),
     status: "pending"
-  }]
+  }])
 });
 
 const projectApprovalResolved: EventProjector = (state, _event, data) => {
@@ -151,7 +168,7 @@ const projectApprovalResolved: EventProjector = (state, _event, data) => {
   return {
     ...state,
     status: approvals.some((item) => item.status === "pending") ? "needs_input" : "running",
-    approvals
+    approvals: boundedApprovals(approvals)
   };
 };
 
@@ -181,7 +198,7 @@ const projectSuspended: EventProjector = (state, event, data) => {
   const item: TranscriptItem = {
     id: `input:${event.runId}:${text(data.requestId) || event.eventId}`,
     role: "assistant",
-    text: message,
+    text: boundedPresentationText(message, maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
   };

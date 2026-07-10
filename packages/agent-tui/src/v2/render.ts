@@ -1,12 +1,12 @@
 import type { PresentationState } from "agent-presentation";
-import { cellWidth, graphemes } from "./composer.js";
+import { cellWidth, graphemeCellWidth, graphemes } from "./composer.js";
 import type { TuiState } from "./state.js";
 
 const ansi = {
   reset: "\u001b[0m", dim: "\u001b[2m", cyan: "\u001b[38;5;81m", green: "\u001b[38;5;114m",
   yellow: "\u001b[38;5;221m", red: "\u001b[38;5;203m", inverse: "\u001b[7m", clear: "\u001b[2J\u001b[H"
 };
-const wrappedRows = new WeakMap<object, Map<number, string[]>>();
+const wrappedRows = new WeakMap<object, Map<string, string[]>>();
 const regexCodePoint = (hex: string): string => `\\u${hex}`;
 const escapeCode = regexCodePoint("001b");
 const bellCode = regexCodePoint("0007");
@@ -29,12 +29,24 @@ export function sanitizeTerminalText(value: string): string {
 
 function truncate(value: string, width: number): string {
   if (width <= 0) return "";
-  let result = "";
+  const result: string[] = [];
+  const widths: number[] = [];
+  let used = 0;
   for (const item of graphemes(value)) {
-    if (cellWidth(`${result}${item}`) > width) return width === 1 ? "…" : `${truncate(result, width - 1)}…`;
-    result += item;
+    const itemWidth = graphemeCellWidth(item);
+    if (used + itemWidth > width) {
+      if (width === 1) return "…";
+      while (used > width - 1 && result.length > 0) {
+        used -= widths.pop() ?? 0;
+        result.pop();
+      }
+      return `${result.join("")}…`;
+    }
+    result.push(item);
+    widths.push(itemWidth);
+    used += itemWidth;
   }
-  return result;
+  return result.join("");
 }
 
 function wrap(value: string, width: number): string[] {
@@ -42,15 +54,28 @@ function wrap(value: string, width: number): string[] {
   const lines: string[] = [];
   for (const source of value.split("\n")) {
     let current = "";
+    let currentWidth = 0;
     for (const item of graphemes(source)) {
-      if (cellWidth(`${current}${item}`) > width) {
+      const itemWidth = graphemeCellWidth(item);
+      if (currentWidth + itemWidth > width) {
         lines.push(current);
         current = item;
-      } else current += item;
+        currentWidth = itemWidth;
+      } else {
+        current += item;
+        currentWidth += itemWidth;
+      }
     }
     lines.push(current);
   }
   return lines.length > 0 ? lines : [""];
+}
+
+function wrapTail(value: string, width: number, maximumRows: number): string[] {
+  const maximumCharacters = Math.max(4_096, width * Math.max(1, maximumRows) * 4);
+  const clipped = value.length > maximumCharacters ? value.slice(-maximumCharacters) : value;
+  const rows = wrap(clipped, width);
+  return rows.length > maximumRows ? rows.slice(-maximumRows) : rows;
 }
 
 function transcriptLines(view: PresentationState, width: number, rowLimit: number): string[] {
@@ -60,15 +85,18 @@ function transcriptLines(view: PresentationState, width: number, rowLimit: numbe
     const name = item.role === "user" ? "you" : item.role === "system" ? "error" : "sigma";
     const color = item.role === "user" ? ansi.cyan : item.role === "system" ? ansi.red : ansi.green;
     const bodyWidth = Math.max(1, width - name.length - 1);
+    const remainingRows = Math.max(1, rowLimit - lines.length);
+    const cacheKey = `${bodyWidth}:${remainingRows}`;
     let byWidth = wrappedRows.get(item);
     if (!byWidth) {
       byWidth = new Map();
       wrappedRows.set(item, byWidth);
     }
-    let body = byWidth.get(bodyWidth);
+    let body = byWidth.get(cacheKey);
     if (!body) {
-      body = wrap(sanitizeTerminalText(item.text), bodyWidth);
-      byWidth.set(bodyWidth, body);
+      body = wrapTail(sanitizeTerminalText(item.text), bodyWidth, remainingRows);
+      if (byWidth.size >= 8) byWidth.clear();
+      byWidth.set(cacheKey, body);
     }
     lines.unshift(`${color}${name}${ansi.reset} ${body[0] ?? ""}`, ...body.slice(1).map((line) => `${" ".repeat(name.length + 1)}${line}`));
   }
@@ -114,16 +142,27 @@ function composerLine(state: TuiState, width: number): string {
   const approval = state.view.approvals.some((item) => item.status === "pending");
   const label = approval ? "approve [y/n/a]" : ">";
   const maximum = Math.max(1, width - label.length - 1);
-  let start = 0;
-  while (start < state.composer.cursor && cellWidth(state.composer.graphemes.slice(start, state.composer.cursor + 1).join("")) > maximum) start += 1;
+  const cursorCell = state.composer.cursor < state.composer.graphemes.length
+    ? cellWidth(state.composer.graphemes[state.composer.cursor]) : 1;
+  let start = state.composer.cursor;
+  let beforeWidth = 0;
+  while (start > 0) {
+    const previousWidth = cellWidth(state.composer.graphemes[start - 1]);
+    if (beforeWidth + previousWidth + cursorCell > maximum) break;
+    beforeWidth += previousWidth;
+    start -= 1;
+  }
   const visible: string[] = [];
+  let visibleWidth = 0;
   for (const raw of state.composer.graphemes.slice(start)) {
     const item = sanitizeTerminalText(raw).replace(/\n/gu, " ");
-    if (cellWidth(`${visible.join("")}${item}`) > maximum) break;
+    const itemWidth = cellWidth(item);
+    if (visibleWidth + itemWidth > maximum) break;
     visible.push(item);
+    visibleWidth += itemWidth;
   }
   const cursorIndex = state.composer.cursor - start;
-  if (cursorIndex >= visible.length && cellWidth(visible.join("")) < maximum) visible.push(" ");
+  if (cursorIndex >= visible.length && visibleWidth < maximum) visible.push(" ");
   const withCursor = visible.map((item, index) => index === cursorIndex ? `${ansi.inverse}${item}${ansi.reset}` : item).join("");
   return `${approval ? ansi.yellow : ansi.cyan}${label}${ansi.reset} ${withCursor}`;
 }
@@ -138,7 +177,8 @@ export function renderFrame(state: TuiState, options: { width: number; height: n
   const approvals = approvalLines(state, width).slice(0, approvalBudget);
   const available = Math.max(0, height - 2 - approvals.length - (notice ? 1 : 0));
   const activity = state.activityCollapsed ? [] : activityLines(state.view, width);
-  const allLines = [...transcriptLines(state.view, width, Math.max(1, available + state.scrollOffset + 16)), ...activity];
+  const transcriptBudget = Math.min(5_000, Math.max(1, available + state.scrollOffset + 16));
+  const allLines = [...transcriptLines(state.view, width, transcriptBudget), ...activity];
   const maximumScroll = Math.max(0, allLines.length - available);
   const end = allLines.length - Math.min(state.scrollOffset, maximumScroll);
   const visible = allLines.slice(Math.max(0, end - available), end);

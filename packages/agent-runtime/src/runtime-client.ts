@@ -21,6 +21,7 @@ import {
   waitForSessionOutcome
 } from "./runtime-waiters.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
+import { releaseRuntimeSession } from "./release-session.js";
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly emitQueues = new Map<string, Promise<void>>();
@@ -169,7 +170,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
   subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope> {
     return streamSessionEvents(this.options.store, this.sessions.get(sessionId), sessionId, signal);
   }
-
   async waitForOutcome(sessionId: string, signal?: AbortSignal): Promise<RunOutcome> {
     return await waitForSessionOutcome(this.required(sessionId), signal);
   }
@@ -188,11 +188,17 @@ export class InProcessRuntimeClient implements RuntimeClient {
     const stored = (await this.options.store.listSessions()).slice(0, Math.max(1, limit));
     return await Promise.all(stored.map(async (item) => await storedSessionOverview(this.options.store, item)));
   }
-
   sessionEvents(sessionId: string, afterSeq = 0): AsyncIterable<AgentEventEnvelope> {
     return this.options.store.events(sessionId, afterSeq);
   }
-
+  async releaseSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !await releaseRuntimeSession(session,
+      async () => await this.effects.waitForQuiescence(sessionId),
+      async () => await this.commandBus.release(sessionId))) return;
+    this.sessions.delete(sessionId);
+    this.emitQueues.delete(sessionId);
+  }
   async recordChildEvent(
     parentSessionId: string,
     type: "child.spawned" | "child.message" | "child.completed",
@@ -200,7 +206,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
   ): Promise<void> {
     await this.emit(this.required(parentSessionId), type, "runtime", payload);
   }
-
   private async run(session: RuntimeSession): Promise<void> {
     const controller = new AbortController();
     session.controller = controller;
@@ -238,7 +243,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       session.controller = null;
     }
   }
-
   private async finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean> {
     const type: AgentEventType = outcome.kind === "completed" ? "run.completed"
       : outcome.kind === "cancelled" ? "run.cancelled"

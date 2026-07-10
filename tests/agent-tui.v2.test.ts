@@ -23,6 +23,7 @@ function runEvent(
 
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
+  readonly released: string[] = [];
   private sessions = 0;
 
   constructor(
@@ -40,6 +41,7 @@ class FakeRuntime implements RuntimeClient {
   async waitForOutcome(): Promise<RunOutcome> { return { kind: "completed", message: "ok", evidence: [] }; }
   async listSessions(): Promise<SessionOverview[]> { return []; }
   async *sessionEvents(): AsyncIterable<AgentEventEnvelope> { /* no persisted events */ }
+  async releaseSession(sessionId: string): Promise<void> { this.released.push(sessionId); }
 }
 
 describe("Sigma v2 TUI", () => {
@@ -106,6 +108,23 @@ describe("Sigma v2 TUI", () => {
     }).sort((left, right) => left - right);
     expect(timings[Math.ceil(timings.length * 0.95) - 1]).toBeLessThan(16);
     expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(150 * 1024 * 1024);
+  });
+
+  it("renders one long streaming answer and a long composer in linear time", () => {
+    const view = projectEvent(createPresentationState(), event(1, "model.delta", {
+      turnId: 1,
+      delta: "长回答🙂".repeat(40_000)
+    }));
+    const state = {
+      ...createTuiState(),
+      sessionId: "session",
+      view,
+      composer: createComposer("输入内容界".repeat(10_000))
+    };
+    const started = performance.now();
+    const frame = renderFrame(state, { width: 120, height: 40 });
+    expect(performance.now() - started).toBeLessThan(150);
+    expect(frame.split("\n")).toHaveLength(40);
   });
 
   it("sanitizes terminal control injection and renders the approval inbox", () => {
@@ -232,6 +251,39 @@ describe("Sigma v2 TUI", () => {
     await running;
   });
 
+  it("coalesces renders while terminal output is backpressured", async () => {
+    const runtime = new FakeRuntime();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => undefined });
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
+    const originalWrite = stdout.write.bind(stdout);
+    let blockFrames = true;
+    let frameWrites = 0;
+    stdout.write = ((chunk: Uint8Array | string, ...args: unknown[]): boolean => {
+      const value = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      if (value.includes("\u001b[2J")) {
+        frameWrites += 1;
+        if (blockFrames) return false;
+      }
+      return originalWrite(chunk, ...(args as Parameters<typeof originalWrite>));
+    }) as typeof stdout.write;
+    const controller = new TuiController({ runtime, workspace: ".", stdin, stdout, maxFps: 30 });
+    const running = controller.run();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(frameWrites).toBe(1);
+
+    for (let index = 0; index < 100; index += 1) stdin.write("x");
+    stdout.emit("resize");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(frameWrites).toBe(1);
+
+    blockFrames = false;
+    stdout.emit("drain");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(frameWrites).toBe(2);
+    stdin.write("\u0003\u0003");
+    await running;
+  });
+
   it("does not lose an early double interrupt while session creation is blocked", async () => {
     let releaseSession!: () => void;
     const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
@@ -290,6 +342,7 @@ describe("Sigma v2 TUI", () => {
     expect(runtime.commands).toContainEqual({ type: "follow_up", sessionId: "session", text: "later" });
     expect(runtime.commands).toContainEqual({ type: "cancel", sessionId: "session", reason: "Replaced by /new from TUI." });
     expect(runtime.commands.some((command) => command.type === "steer" && command.text.includes("hello"))).toBe(true);
+    expect(runtime.released).toContain("session");
     expect(rawModes).toEqual([true, false]);
   });
 

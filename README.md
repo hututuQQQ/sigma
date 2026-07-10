@@ -159,7 +159,7 @@ Filesystem tools reject lexical and symlink/junction escapes from the workspace.
 ## Sessions and recovery
 
 ```text
-.agent/sessions-v2/<sessionId>/
+<user-state>/sigma/workspaces/<workspace-sha256>/sessions-v2/<sessionId>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json
@@ -172,7 +172,7 @@ Resume loads the newest valid snapshot, replays the remaining events, restores p
 
 Long histories are fitted with the gateway tokenizer contract. Older turns may be replaced in the request by a low-authority, provenance-tagged lossy summary; the full durable transcript remains in the store and `context.compacted` records the boundary.
 
-An on-disk owner record prevents two CLI processes from running the same session. `cancel` and `approval` commands for an active owner are delivered through a durable per-session command inbox. Old session directories are left untouched but are neither listed nor imported.
+Runtime state and its owner record live in the user's private state directory, outside the agent-writable workspace. The durable cross-process inbox accepts cancellation only; approvals, steering, and follow-ups must come through the controlling runtime/TUI and cannot be forged by writing a workspace file. Old workspace-local session directories are left untouched but are neither listed nor imported.
 
 ## Supervisor and writer isolation
 

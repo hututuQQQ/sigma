@@ -103,22 +103,22 @@ async function fallbackSearch(
   regex: boolean,
   limit: number,
   signal: AbortSignal
-): Promise<string[]> {
+): Promise<{ matches: string[]; truncated: boolean }> {
   const matcher = regex ? new RegExp(query, "u") : null;
   const files = await walk(workspace, searchPath, 20_000, signal);
   const matches: string[] = [];
   for (const file of files) {
-    if (matches.length >= limit) break;
+    if (matches.length > limit) break;
     const target = await resolveWorkspacePath(workspace, file);
     if ((await stat(target)).size > 2_000_000) continue;
     const content = await readFile(target, "utf8").catch(() => "");
     if (content.includes("\0")) continue;
     for (const [index, line] of content.split(/\r?\n/).entries()) {
       if (matcher ? matcher.test(line) : line.includes(query)) matches.push(`${file}:${index + 1}:${line}`);
-      if (matches.length >= limit) break;
+      if (matches.length > limit) break;
     }
   }
-  return matches;
+  return { matches: matches.slice(0, limit), truncated: matches.length > limit };
 }
 
 function grepTool(): RegisteredEffectTool {
@@ -140,19 +140,34 @@ function grepTool(): RegisteredEffectTool {
       const safeSearchPath = path.relative(workspaceRoot, resolvedSearchPath) || ".";
       const limit = integer(input, "limit", 500, 5_000);
       const regex = input.regex === true;
-      const argv = ["--line-number", "--column", "--no-heading", "--color", "never", "--max-count", String(limit)];
+      const argv = ["--line-number", "--column", "--no-heading", "--color", "never"];
       if (!regex) argv.push("--fixed-strings");
       const glob = text(input, "glob");
       if (glob) argv.push("--glob", glob);
       argv.push("--", query, safeSearchPath);
       try {
-        const output = await runProcess({ executable: "rg", args: argv, cwd: workspaceRoot, timeoutMs: 30_000, signal: context.signal });
-        if (output.exitCode === 0 || output.exitCode === 1) return result(request, startedAt, output.stdout.trim(), true, output.exitCode === 1 ? ["no_matches"] : []);
+        const output = await runProcess({
+          executable: "rg", args: argv, cwd: workspaceRoot, timeoutMs: 30_000,
+          maxStdoutLines: limit + 1, signal: context.signal
+        });
+        if (output.exitCode === 0 || output.exitCode === 1 || output.stdoutLimitReached) {
+          const matches = output.stdout.trimEnd().split(/\r?\n/u).filter(Boolean);
+          const truncated = matches.length > limit;
+          const diagnostics = [
+            ...(output.exitCode === 1 ? ["no_matches"] : []),
+            ...(truncated ? [`result_limit=${limit}`] : []),
+            ...(output.outputTruncated ? ["output_truncated=true"] : [])
+          ];
+          return result(request, startedAt, matches.slice(0, limit).join("\n"), true, diagnostics);
+        }
       } catch {
         // Use the portable scanner when ripgrep is unavailable.
       }
-      const matches = await fallbackSearch(workspaceRoot, safeSearchPath, query, regex, limit, context.signal);
-      return result(request, startedAt, matches.join("\n"), true, matches.length >= limit ? [`result_limit=${limit}`] : []);
+      const fallback = await fallbackSearch(workspaceRoot, safeSearchPath, query, regex, limit, context.signal);
+      return result(
+        request, startedAt, fallback.matches.join("\n"), true,
+        fallback.truncated ? [`result_limit=${limit}`] : []
+      );
     }
   };
 }

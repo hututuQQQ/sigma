@@ -110,6 +110,21 @@ function writeRequest(): ModelResponse {
   };
 }
 
+function userInputRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "need-target",
+        name: "request_user_input",
+        arguments: { message: "Which target should I change?" }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 async function workspace(prefix: string): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), prefix));
 }
@@ -210,6 +225,25 @@ describe("run v2 command branch coverage", () => {
       if (format === "text") expect(stderr.text()).toContain("cannot resolve tool approvals");
       else expect(JSON.parse(stdout.text())).toMatchObject({ status: "needs_input" });
     }
+  });
+
+  it("returns when the model requests user input during a non-TUI run", async () => {
+    const root = await workspace("sigma-run-model-input-");
+    const stdin = Object.assign(new PassThrough(), { isTTY: true });
+    const stdout = new Capture();
+    stdout.isTTY = true;
+    const stderr = new Capture();
+    const running = runV2Command([
+      "choose a target", "--workspace", root, "--permission-mode", "auto", "--output-format", "json"
+    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([userInputRequest()]) });
+    const code = await Promise.race([
+      running,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("run command hung after NeedsInput")), 2_000))
+    ]);
+    expect(code).toBe(2);
+    expect(JSON.parse(stdout.text())).toMatchObject({
+      status: "needs_input", finishReason: "needs_input", finalMessage: "Which target should I change?"
+    });
   });
 
   it.each([

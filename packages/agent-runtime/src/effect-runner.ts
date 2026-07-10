@@ -163,7 +163,7 @@ export class EffectRunner {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });
     if (!isToolAllowed(descriptor, session.mode)) return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.mode} mode.`, "mode_denied");
-    const scopeError = writeScopeFailure(session, call, descriptor, startedAt);
+    const scopeError = await writeScopeFailure(session, call, descriptor, startedAt);
     if (scopeError) return scopeError;
     const completionError = completionFailure(session, call, descriptor, startedAt);
     if (completionError) return completionError;
@@ -173,8 +173,10 @@ export class EffectRunner {
       if (decision === "deny") return failed(call, startedAt, "Tool request denied.", "permission_denied");
       const keys = lockKeys(session, descriptor);
       await this.awaitSettled(keys, signal);
-      return await this.locks.withLocks(keys, async () =>
-        await this.executeLocked(session, call, modelTurn, descriptor, signal, keys));
+      return await this.locks.withLocks(keys, async () => {
+        const currentScopeError = await writeScopeFailure(session, call, descriptor, startedAt);
+        return currentScopeError ?? await this.executeLocked(session, call, modelTurn, descriptor, signal, keys);
+      });
     } catch (error) {
       return failed(call, startedAt, error instanceof Error ? error.message : String(error), signal.aborted ? "tool_cancelled" : "tool_exception");
     }

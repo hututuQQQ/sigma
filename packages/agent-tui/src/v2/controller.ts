@@ -4,6 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 import { parseApprovalInput } from "./approval-input.js";
 import { backspace, composerText, insertText, moveCursor } from "./composer.js";
 import { renderFrame } from "./render.js";
+import { FrameScheduler } from "./frame-scheduler.js";
 import { createTuiState, pendingApproval, reduceTui, type TuiState } from "./state.js";
 interface TtyInput extends NodeJS.ReadableStream {
   isTTY?: boolean;
@@ -32,7 +33,7 @@ export class TuiController {
   private subscription?: AsyncIterator<AgentEventEnvelope>;
   private subscriptionAbort?: AbortController;
   private subscriptionEpoch = 0;
-  private renderTimer?: ReturnType<typeof setTimeout>;
+  private readonly renderer: FrameScheduler;
   private exitResolve?: () => void;
   private lastInterruptAt = 0;
   private active = false;
@@ -44,6 +45,11 @@ export class TuiController {
     this.state = createTuiState(options.mode ?? "change");
     this.input = options.stdin ?? process.stdin;
     this.output = options.stdout ?? process.stdout;
+    this.renderer = new FrameScheduler(
+      this.output,
+      () => renderFrame(this.state, { width: this.output.columns ?? 80, height: this.output.rows ?? 24 }),
+      options.maxFps
+    );
   }
 
   async run(): Promise<void> {
@@ -105,7 +111,6 @@ export class TuiController {
       await this.handleInput(character);
     }
   }
-
   private async handleInput(value: string): Promise<void> {
     if (value === "\u0003") {
       const now = Date.now();
@@ -137,7 +142,6 @@ export class TuiController {
     }
     this.scheduleRender();
   }
-
   private async submitComposer(): Promise<void> {
     const text = composerText(this.state.composer).trim();
     if (!text) return;
@@ -160,7 +164,6 @@ export class TuiController {
       : { type, sessionId, text, mode: this.state.mode });
     this.scheduleRender();
   }
-
   private async handleCommand(text: string): Promise<boolean> {
     if (text === "/quit" || text === "/exit") {
       this.stop();
@@ -190,17 +193,19 @@ export class TuiController {
     }
     return false;
   }
-
   private async newSession(): Promise<void> {
     const session = await this.options.runtime.createSession({ workspacePath: this.options.workspace, mode: this.state.mode });
     await this.attach(session.sessionId);
     this.notice("New session. Type a request and press Enter.");
   }
-
   private async attach(sessionId: string): Promise<void> {
+    const previousSessionId = this.state.sessionId;
     this.subscriptionEpoch += 1;
     this.subscriptionAbort?.abort();
     await this.subscription?.return?.();
+    if (previousSessionId && previousSessionId !== sessionId) {
+      await this.options.runtime.releaseSession?.(previousSessionId);
+    }
     this.state = reduceTui(this.state, { type: "session", sessionId });
     const epoch = this.subscriptionEpoch;
     this.subscriptionAbort = new AbortController();
@@ -227,19 +232,14 @@ export class TuiController {
   }
 
   private scheduleRender(): void {
-    if (!this.active || this.renderTimer) return;
-    const fps = Math.max(1, Math.min(30, this.options.maxFps ?? 30));
-    this.renderTimer = setTimeout(() => {
-      this.renderTimer = undefined;
-      this.output.write(renderFrame(this.state, { width: this.output.columns ?? 80, height: this.output.rows ?? 24 }));
-    }, Math.ceil(1_000 / fps));
+    if (this.active) this.renderer.schedule();
   }
 
   private async cleanup(): Promise<void> {
     this.active = false;
     this.subscriptionEpoch += 1;
     this.subscriptionAbort?.abort();
-    if (this.renderTimer) clearTimeout(this.renderTimer);
+    this.renderer.stop();
     await this.subscription?.return?.();
     this.input.off("data", this.onData);
     this.output.off("resize", this.onResize);

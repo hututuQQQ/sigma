@@ -1,5 +1,8 @@
 import type { AgentEventEnvelope, JsonValue } from "agent-protocol";
 import type { ActivityItem, PresentationState, TranscriptItem } from "./view-state.js";
+import {
+  boundedPresentationText, maximumActivityDetailCharacters, maximumTranscriptCharacters
+} from "./bounds.js";
 
 type EventData = Record<string, JsonValue>;
 
@@ -30,8 +33,8 @@ function upsertActivity(items: ActivityItem[], item: ActivityItem): ActivityItem
 function failureDetail(data: EventData, fallback: string): string {
   const message = text(data.message) || text(data.error);
   const code = text(data.code);
-  if (!message) return code || fallback;
-  return code && !message.includes(code) ? `${code}: ${message}` : message;
+  const detail = !message ? code || fallback : code && !message.includes(code) ? `${code}: ${message}` : message;
+  return boundedPresentationText(detail, maximumActivityDetailCharacters);
 }
 
 function closeStream(items: TranscriptItem[], event: AgentEventEnvelope, data: EventData): TranscriptItem[] {
@@ -45,7 +48,7 @@ function withRunError(items: TranscriptItem[], event: AgentEventEnvelope, detail
   const failure: TranscriptItem = {
     id,
     role: "system",
-    text: detail,
+    text: boundedPresentationText(detail, maximumTranscriptCharacters),
     streaming: false,
     occurredAt: event.occurredAt
   };
@@ -101,7 +104,9 @@ export function projectDiagnostic(
   data: EventData
 ): PresentationState {
   const values = [text(data.message), text(data.error), text(data.detail), ...strings(data.diagnostics), ...strings(data.failures)];
-  const detail = [...new Set(values.filter(Boolean))].join("\n");
+  const detail = boundedPresentationText(
+    [...new Set(values.filter(Boolean))].join("\n"), maximumActivityDetailCharacters
+  );
   if (!detail) return state;
   const kind = text(data.kind) || "diagnostic";
   const failed = Boolean(text(data.error)) || text(data.level) === "error" || kind.endsWith("failed") || strings(data.failures).length > 0;

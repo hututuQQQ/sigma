@@ -10,6 +10,7 @@ export interface ProcessRequest {
   timeoutMs: number;
   idleTimeoutMs?: number;
   maxOutputBytes?: number;
+  maxStdoutLines?: number;
   signal: AbortSignal;
 }
 
@@ -20,11 +21,57 @@ export interface ProcessResult {
   timedOut: boolean;
   cancelled: boolean;
   durationMs: number;
+  stdoutLimitReached: boolean;
+  outputTruncated: boolean;
 }
 
 function boundedAppend(current: string, chunk: string, maximum: number): string {
   const next = `${current}${chunk}`;
   return next.length <= maximum ? next : `[truncated ${next.length - maximum} chars]\n${next.slice(-maximum)}`;
+}
+
+class ProcessOutputCapture {
+  stdout = "";
+  stderr = "";
+  stdoutLimitReached = false;
+  outputTruncated = false;
+  private stdoutPending = "";
+  private stdoutLines = 0;
+
+  constructor(private readonly maximum: number, private readonly lineLimit?: number) {}
+
+  appendStdout(value: string): boolean {
+    if (this.lineLimit === undefined) {
+      this.append("stdout", value);
+      return false;
+    }
+    this.stdoutPending += value;
+    while (this.stdoutLines < this.lineLimit) {
+      const newline = this.stdoutPending.indexOf("\n");
+      if (newline < 0) break;
+      this.append("stdout", this.stdoutPending.slice(0, newline + 1));
+      this.stdoutPending = this.stdoutPending.slice(newline + 1);
+      this.stdoutLines += 1;
+    }
+    if (this.stdoutLines < this.lineLimit) return false;
+    this.stdoutPending = "";
+    this.stdoutLimitReached = true;
+    return true;
+  }
+
+  appendStderr(value: string): void { this.append("stderr", value); }
+
+  finish(): void {
+    if (this.lineLimit !== undefined && this.stdoutPending && this.stdoutLines < this.lineLimit) {
+      this.append("stdout", this.stdoutPending);
+      this.stdoutPending = "";
+    }
+  }
+
+  private append(stream: "stdout" | "stderr", value: string): void {
+    if (this[stream].length + value.length > this.maximum) this.outputTruncated = true;
+    this[stream] = boundedAppend(this[stream], value, this.maximum);
+  }
 }
 
 export function terminateProcessTree(child: ChildProcess, force = false): void {
@@ -59,8 +106,7 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
       shell: false,
       stdio: ["ignore", "pipe", "pipe"]
     });
-    let stdout = "";
-    let stderr = "";
+    const output = new ProcessOutputCapture(maxOutput, request.maxStdoutLines);
     let timedOut = false;
     let cancelled = false;
     let settled = false;
@@ -70,7 +116,12 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       request.signal.removeEventListener("abort", onAbort);
-      resolve({ exitCode, stdout, stderr, timedOut, cancelled, durationMs: Date.now() - startedAt });
+      output.finish();
+      resolve({
+        exitCode, stdout: output.stdout, stderr: output.stderr, timedOut, cancelled,
+        durationMs: Date.now() - startedAt,
+        stdoutLimitReached: output.stdoutLimitReached, outputTruncated: output.outputTruncated
+      });
     };
     const terminate = (): void => {
       if (child.exitCode !== null) return;
@@ -99,8 +150,14 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
       idleTimer.unref();
     };
     request.signal.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => { heartbeat(); stdout = boundedAppend(stdout, chunk.toString("utf8"), maxOutput); });
-    child.stderr.on("data", (chunk: Buffer) => { heartbeat(); stderr = boundedAppend(stderr, chunk.toString("utf8"), maxOutput); });
+    child.stdout.on("data", (chunk: Buffer) => {
+      heartbeat();
+      if (output.appendStdout(chunk.toString("utf8"))) terminate();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      heartbeat();
+      output.appendStderr(chunk.toString("utf8"));
+    });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;

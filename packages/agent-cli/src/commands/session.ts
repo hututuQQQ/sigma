@@ -1,6 +1,6 @@
 import type { AgentEventEnvelope, RuntimeClient, SessionOverview } from "agent-protocol";
-import path from "node:path";
-import { activeSessionOwner, sendSessionCommand } from "agent-runtime";
+import { realpath } from "node:fs/promises";
+import { activeSessionOwner, runtimeStateRoot, sendSessionCommand } from "agent-runtime";
 import { loadCliConfig, parseArgs } from "../config.js";
 import { createConfiguredRuntime } from "agent-runtime";
 
@@ -33,8 +33,10 @@ function presentation(session: SessionOverview): string {
 async function configured(argv: string[], deps: SessionCommandDeps): Promise<ConfiguredSessionCommand> {
   const parsed = parseArgs(argv);
   const config = loadCliConfig(parsed.flags);
-  const runtime = deps.runtime ?? (await createConfiguredRuntime(config, {}, { connectMcp: false })).runtime;
-  return { runtime, storeRootDir: path.join(config.workspace, ".agent"), ...parsed };
+  const configuredRuntime = deps.runtime ? undefined : await createConfiguredRuntime(config, {}, { connectMcp: false });
+  const runtime = deps.runtime ?? configuredRuntime!.runtime;
+  const workspace = await realpath(config.workspace);
+  return { runtime, storeRootDir: configuredRuntime?.storeRootDir ?? runtimeStateRoot(workspace), ...parsed };
 }
 
 function approvalDecision(flags: Record<string, unknown>): "allow" | "deny" | "always_allow" {
@@ -99,11 +101,7 @@ async function handleOwnedSession(
     return 0;
   }
   if (subcommand !== "approve") return undefined;
-  const requestId = requiredRequestId(parsed);
-  const decision = approvalDecision(parsed.flags);
-  await sendSessionCommand(parsed.storeRootDir, { type: "approve", sessionId, requestId, decision });
-  io.stdout.write(`${decision} requested for ${requestId}\n`);
-  return 0;
+  throw new Error("An active session approval must be answered in its controlling TUI; cross-process approval is disabled.");
 }
 
 async function handleStoredSession(

@@ -13,6 +13,7 @@ import type { RunCommand } from "agent-protocol";
 import { sessionDirectory } from "agent-store";
 
 export type OwnerRecord = ProcessOwnerRecord;
+export type ExternalSessionCommand = Extract<RunCommand, { type: "cancel" }>;
 
 export interface SessionCommandBusOptions {
   claimTimeoutMs?: number;
@@ -33,14 +34,14 @@ export async function activeSessionOwner(rootDir: string, sessionId: string): Pr
   return observation.kind === "valid" && isProcessOwnerActive(observation) ? observation.owner : null;
 }
 
-export async function sendSessionCommand(rootDir: string, command: RunCommand): Promise<void> {
+export async function sendSessionCommand(rootDir: string, command: ExternalSessionCommand): Promise<void> {
   if (!await activeSessionOwner(rootDir, command.sessionId)) throw new Error(`Session '${command.sessionId}' has no active runtime owner.`);
   const directory = commandDirectory(rootDir, command.sessionId);
-  await mkdir(directory, { recursive: true });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   const id = `${Date.now()}-${randomUUID()}`;
   const temporary = path.join(directory, `${id}.tmp`);
   const target = path.join(directory, `${id}.json`);
-  const handle = await open(temporary, "wx");
+  const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(command)}\n`, "utf8");
     await handle.sync();
@@ -60,7 +61,7 @@ export class SessionCommandBus {
 
   constructor(
     private readonly rootDir: string,
-    private readonly dispatch: (command: RunCommand) => Promise<void>,
+    private readonly dispatch: (command: ExternalSessionCommand) => Promise<void>,
     private readonly options: SessionCommandBusOptions = {}
   ) {}
 
@@ -128,17 +129,40 @@ export class SessionCommandBus {
       const source = path.join(directory, file);
       const processing = `${source}.${this.instanceId}.processing`;
       try { await rename(source, processing); } catch { continue; }
-      let dispatched = false;
       try {
-        const command = JSON.parse(await readFile(processing, "utf8")) as RunCommand;
-        if (command.sessionId !== sessionId) throw new Error("Session command inbox mismatch.");
+        const command = this.parseExternalCommand(await readFile(processing, "utf8"), sessionId);
         await this.dispatchContext.run(sessionId, async () => await this.dispatch(command));
-        dispatched = true;
-      } finally {
-        if (dispatched) await unlink(processing).catch(() => undefined);
-        else await rename(processing, source).catch(() => undefined);
+        await unlink(processing).catch(() => undefined);
+      } catch (error) {
+        if ((error as { code?: unknown }).code === "invalid_external_command") {
+          await unlink(processing).catch(() => undefined);
+        } else {
+          await rename(processing, source).catch(() => undefined);
+        }
       }
     }
+  }
+
+  private parseExternalCommand(source: string, sessionId: string): ExternalSessionCommand {
+    let value: unknown;
+    try { value = JSON.parse(source); } catch { throw this.invalidExternalCommand(); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw this.invalidExternalCommand();
+    const command = value as Partial<ExternalSessionCommand> & Record<string, unknown>;
+    if (command.type !== "cancel" || command.sessionId !== sessionId
+      || (command.reason !== undefined && typeof command.reason !== "string")) {
+      throw this.invalidExternalCommand();
+    }
+    return {
+      type: "cancel",
+      sessionId,
+      ...(typeof command.reason === "string" ? { reason: command.reason } : {})
+    };
+  }
+
+  private invalidExternalCommand(): Error {
+    return Object.assign(new Error("The external session inbox accepts cancellation only."), {
+      code: "invalid_external_command"
+    });
   }
 
   private async restoreInterruptedCommands(directory: string): Promise<void> {

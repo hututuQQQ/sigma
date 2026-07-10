@@ -31,4 +31,5 @@ export interface RuntimeClient {
   waitForOutcome(sessionId: string, signal?: AbortSignal): Promise<RunOutcome>;
   listSessions(limit?: number): Promise<SessionOverview[]>;
   sessionEvents(sessionId: string, afterSeq?: number): AsyncIterable<AgentEventEnvelope>;
+  releaseSession?(sessionId: string): Promise<void>;
 }

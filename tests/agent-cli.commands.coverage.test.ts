@@ -17,6 +17,7 @@ import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
+import { runtimeStateRoot } from "../packages/agent-runtime/src/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 class Capture extends Writable {
@@ -99,7 +100,7 @@ async function workspace(prefix: string): Promise<string> {
 }
 
 async function writeOwner(root: string, sessionId: string): Promise<void> {
-  const directory = path.join(root, ".agent", "sessions-v2", sessionId);
+  const directory = path.join(runtimeStateRoot(root), "sessions-v2", sessionId);
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, "runtime-owner.json"), JSON.stringify({
     pid: process.pid,
@@ -110,6 +111,7 @@ async function writeOwner(root: string, sessionId: string): Promise<void> {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("CLI init and replay branches", () => {
@@ -279,6 +281,7 @@ describe("CLI session branches", () => {
 
   it("routes active session commands through the durable owner inbox", async () => {
     const root = await workspace("sigma-session-owner-");
+    vi.stubEnv("SIGMA_STATE_HOME", path.join(root, "private-state"));
     const runtime = new FakeRuntime();
     await writeOwner(root, "active");
 
@@ -293,15 +296,13 @@ describe("CLI session branches", () => {
     const approval = new Capture();
     await expect(runSessionCommand([
       "approve", "active", "request-two", "--workspace", root, "--decision", "deny"
-    ], { runtime, stdout: approval })).resolves.toBe(0);
+    ], { runtime, stderr: approval })).resolves.toBe(1);
+    expect(approval.text()).toContain("controlling TUI");
 
-    const commandDir = path.join(root, ".agent", "sessions-v2", "active", "commands");
+    const commandDir = path.join(runtimeStateRoot(root), "sessions-v2", "active", "commands");
     const files = await readdir(commandDir);
     const commands = await Promise.all(files.map(async (file) => JSON.parse(await readFile(path.join(commandDir, file), "utf8")) as RunCommand));
-    expect(commands).toEqual(expect.arrayContaining([
-      { type: "cancel", sessionId: "active", reason: "operator" },
-      { type: "approve", sessionId: "active", requestId: "request-two", decision: "deny" }
-    ]));
+    expect(commands).toEqual([{ type: "cancel", sessionId: "active", reason: "operator" }]);
 
     const unknown = new Capture();
     await expect(runSessionCommand(["unknown", "active", "--workspace", root], {

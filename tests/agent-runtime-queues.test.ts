@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -538,9 +538,19 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
   it("enforces child write scope before a shared-workspace mutation", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-write-scope-"));
+    await mkdir(path.join(workspace, "allowed"), { recursive: true });
+    await mkdir(path.join(workspace, "other"), { recursive: true });
+    await symlink(
+      path.join(workspace, "other"), path.join(workspace, "allowed", "link"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
     const gateway = new ScriptedGateway([
       {
         message: { role: "assistant", content: "", toolCalls: [{ id: "outside", name: "write", arguments: { path: "outside.txt", content: "bad" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "linked", name: "write", arguments: { path: "allowed/link/escaped.txt", content: "bad" } }] },
         finishReason: "tool_calls"
       },
       {
@@ -561,6 +571,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write only inside allowed" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await expect(readFile(path.join(workspace, "outside.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(workspace, "other", "escaped.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(workspace, "allowed", "inside.txt"), "utf8")).resolves.toBe("good");
     const events = await storedEvents(store, session.sessionId);
     expect(events.some((event) => event.type === "tool.failed"

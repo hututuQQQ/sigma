@@ -9,6 +9,7 @@ import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "./s
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactsDir = path.join(rootDir, ".artifacts", "smoke-product");
 const workspace = path.join(artifactsDir, "workspace");
+process.env.SIGMA_STATE_HOME = path.join(artifactsDir, "private-state");
 
 class Capture extends Writable {
   constructor() { super(); this.chunks = []; }
@@ -36,7 +37,7 @@ async function main() {
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
   if (missing.length) throw new Error(`Built v2 product is missing:\n${missing.join("\n")}`);
-  const [{ runAgentCommand }, { createRuntime }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all([
+  const [{ runAgentCommand }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all([
     import(pathToFileURL(entries[0]).href),
     import(pathToFileURL(entries[1]).href),
     import(pathToFileURL(entries[2]).href),
@@ -48,7 +49,7 @@ async function main() {
   const initialized = await captureProcessWrites(() => runAgentCommand(["init", "--workspace", workspace, "--permission-mode", "auto"]));
   if (initialized.code !== 0) throw new Error(`init failed: ${initialized.stderr}`);
 
-  const storeRootDir = path.join(workspace, ".agent");
+  const storeRootDir = runtimeStateRoot(workspace);
   const runtime = createRuntime({
     gateway: new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
