@@ -12,6 +12,7 @@ import { sanitizeTerminalText } from "./terminal-text.js";
 import { createTuiTheme, type TuiTheme } from "./theme.js";
 import { TranscriptView } from "./transcript.js";
 import type { SubmissionKind, TuiAppOptions, TuiSnapshot, TuiViewActions } from "./types.js";
+import { WelcomeView } from "./welcome.js";
 import { configureWindowsConsoleUtf8 } from "./windows-console.js";
 
 function approvalChoice(name: string): number | undefined {
@@ -22,6 +23,7 @@ function approvalChoice(name: string): number | undefined {
 export class TuiView implements KeyRouterHost {
   private readonly theme: TuiTheme;
   private readonly transcript: TranscriptView;
+  private readonly welcome: WelcomeView;
   private readonly header: TextRenderable;
   private readonly activity: TextRenderable;
   private readonly queued: TextRenderable;
@@ -74,11 +76,17 @@ export class TuiView implements KeyRouterHost {
     renderer.root.flexDirection = "column";
     const main = new BoxRenderable(renderer, { id: "main", width: "100%", height: "100%", flexDirection: "column" });
     this.header = new TextRenderable(renderer, { id: "header", width: "100%", height: 1, truncate: true });
+    const content = new BoxRenderable(renderer, {
+      id: "content", width: "100%", flexGrow: 1, minHeight: 0
+    });
     const scroll = new ScrollBoxRenderable(renderer, {
       id: "conversation", width: "100%", flexGrow: 1, minHeight: 0, scrollY: true,
       stickyScroll: true, stickyStart: "bottom", viewportCulling: true
     });
     this.transcript = new TranscriptView(renderer, scroll.content, this.theme);
+    this.welcome = new WelcomeView(renderer, this.theme);
+    content.add(scroll);
+    content.add(this.welcome.box);
     this.activity = this.chromeText("activity", this.theme.warning);
     this.queued = this.chromeText("queued", this.theme.muted);
     this.notice = this.chromeText("notice", this.theme.warning);
@@ -93,7 +101,7 @@ export class TuiView implements KeyRouterHost {
     });
     this.footer = this.chromeText("footer", this.theme.muted);
     this.composerBox.add(this.composer);
-    for (const child of [this.header, scroll, this.activity, this.queued, this.notice, this.composerBox, this.footer]) main.add(child);
+    for (const child of [this.header, content, this.activity, this.queued, this.notice, this.composerBox, this.footer]) main.add(child);
     this.overlay = new OverlayView(renderer, this.theme);
     renderer.root.add(main); renderer.root.add(this.overlay.box);
     renderer.keyInput.on("keypress", this.onKey);
@@ -114,6 +122,7 @@ export class TuiView implements KeyRouterHost {
     this.snapshot = snapshot;
     this.transcript.sync(snapshot.presentation);
     this.header.content = headerText(snapshot, this.renderer.width);
+    this.welcome.update(snapshot.presentation, this.renderer.width, this.renderer.height);
     const activity = activityText(snapshot.presentation, this.activityExpanded);
     this.setChrome(this.activity, activity, this.activityExpanded ? 6 : 1, this.renderer.height >= 8);
     this.setChrome(this.queued, queuedText(snapshot.presentation), 3, this.renderer.height >= 8);

@@ -9,6 +9,7 @@ import { TuiSessionController } from "../packages/agent-tui/src/components/contr
 import { sanitizeTerminalText } from "../packages/agent-tui/src/components/terminal-text.js";
 import type { TuiSnapshot, TuiViewActions } from "../packages/agent-tui/src/components/types.js";
 import { TuiView } from "../packages/agent-tui/src/components/view.js";
+import { shouldShowWelcome } from "../packages/agent-tui/src/components/welcome.js";
 import { configureWindowsConsoleUtf8 } from "../packages/agent-tui/src/components/windows-console.js";
 
 function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): AgentEventEnvelope {
@@ -70,6 +71,32 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<v
 }
 
 describe("Sigma OpenTUI", () => {
+  it("limits branded welcome art to roomy empty idle sessions", () => {
+    const empty = createPresentationState();
+    expect(shouldShowWelcome(empty, 80, 24)).toBe(true);
+    expect(shouldShowWelcome(empty, 47, 24)).toBe(false);
+    expect(shouldShowWelcome(empty, 80, 15)).toBe(false);
+    expect(shouldShowWelcome({ ...empty, status: "running" }, 80, 24)).toBe(false);
+    expect(shouldShowWelcome({ ...empty, transcript: [{
+      id: "message", role: "user", text: "hi", streaming: false, occurredAt: "now"
+    }] }, 80, 24)).toBe(false);
+  });
+
+  it("shows branded welcome art until the conversation starts", async () => {
+    const empty = createPresentationState();
+    const harness = await viewHarness();
+    try {
+      expect(harness.setup.captureCharFrame()).toContain("Welcome to Sigma");
+      expect(harness.setup.captureCharFrame()).toContain("████████");
+
+      const active = projectEvent(empty, event(1, "user.message", { text: "Start working" }));
+      harness.view.update(snapshot(active));
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).not.toContain("Welcome to Sigma");
+      expect(harness.setup.captureCharFrame()).toContain("Start working");
+    } finally { harness.view.destroy(); }
+  });
+
   it("uses UTF-8 while rendering on Windows and restores both console code pages", () => {
     let input = 936;
     let output = 437;

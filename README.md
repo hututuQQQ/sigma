@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sigma-code-mark.png" alt="Sigma Code" width="160">
+</p>
+
 # Sigma Code
 
 Sigma Code is an event-sourced coding agent for DeepSeek and GLM. The shipped product has one kernel, one session format, and one terminal UI. Removed `agent-core`, `agent-ai`, controller/final-gate, and prior TUI components are not part of the runtime or portable package.
