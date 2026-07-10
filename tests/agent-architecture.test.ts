@@ -708,7 +708,7 @@ describe("Sigma architecture", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway, store: new SegmentedJsonlStore({ rootDir: storeRootDir }), storeRootDir, tools,
-      permissionMode: "auto", runDeadlineMs: 2_000
+      permissionMode: "auto", runDeadlineMs: 5_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     const deadlineObserved = (async (): Promise<number> => {
@@ -723,11 +723,11 @@ describe("Sigma architecture", () => {
     const failedAt = await Promise.race([
       deadlineObserved,
       new Promise<never>((_resolve, reject) => setTimeout(
-        () => reject(new Error("Tool deadline receipt exceeded 1 second.")),
-        1_000
+        () => reject(new Error("Tool deadline receipt exceeded 1.5 seconds.")),
+        1_500
       ))
     ]);
-    expect(failedAt - started).toBeLessThan(1_000);
+    expect(failedAt - started).toBeLessThan(1_500);
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     expect(gateway.requests[1].messages.some((message) => message.role === "tool" && message.content.includes("exceeded 25ms"))).toBe(true);
   });

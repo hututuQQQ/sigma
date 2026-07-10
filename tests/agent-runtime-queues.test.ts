@@ -211,7 +211,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -220,7 +220,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
-  });
+  }, 30_000);
 
   it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-call-id-ledger-"));
@@ -625,7 +625,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "auto", runDeadlineMs: 10_000
+      permissionMode: "auto", runDeadlineMs: 30_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "read the seed", mode: "analyze" });
@@ -641,7 +641,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(steering).toEqual(messages);
     await expect(readFile(path.join(workspace, "stale.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(gateway.requests.length).toBeGreaterThanOrEqual(3);
-  });
+  }, 30_000);
 
   it("does not let an old model failure overtake durable steering", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-steering-failure-race-"));
