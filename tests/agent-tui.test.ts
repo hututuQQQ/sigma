@@ -86,13 +86,27 @@ describe("Sigma OpenTUI", () => {
     const empty = createPresentationState();
     const harness = await viewHarness();
     try {
-      expect(harness.setup.captureCharFrame()).toContain("Welcome to Sigma");
-      expect(harness.setup.captureCharFrame()).toContain("████████");
+      const initialFrame = harness.setup.captureCharFrame();
+      const initialSpans = harness.setup.captureSpans().lines.flatMap((line) => line.spans);
+      const colors = new Set(initialSpans.flatMap((span) => [span.fg, span.bg])
+        .map((color) => color.toInts().slice(0, 3).join(",")));
+      expect(initialFrame).toContain("█▀▀ █ █▀▀ █▀▄▀█ ▄▀█");
+      expect(initialFrame).toContain("▄▄█ █ █▄█ █ ▀ █ █▀█");
+      expect(initialFrame).toContain("What do you want to build?");
+      expect(initialFrame).toContain("Type a task or / for commands");
+      expect(colors.has("82,199,196")).toBe(true);
+      expect(colors.has("255,122,131")).toBe(true);
+
+      harness.setup.resize(52, 18);
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).toContain(">_  Σ SIGMA");
+      expect(harness.setup.captureCharFrame()).not.toContain("█▀▀ █ █▀▀");
+      expect(harness.setup.captureCharFrame()).not.toContain("Type a task or / for commands");
 
       const active = projectEvent(empty, event(1, "user.message", { text: "Start working" }));
       harness.view.update(snapshot(active));
       await harness.setup.flush();
-      expect(harness.setup.captureCharFrame()).not.toContain("Welcome to Sigma");
+      expect(harness.setup.captureCharFrame()).not.toContain("What do you want to build?");
       expect(harness.setup.captureCharFrame()).toContain("Start working");
     } finally { harness.view.destroy(); }
   });
@@ -242,13 +256,18 @@ describe("Sigma OpenTUI", () => {
     process.env.NO_COLOR = "1";
     const harness = await viewHarness();
     try {
+      const welcomeSpans = harness.setup.captureSpans().lines.flatMap((line) => line.spans)
+        .filter((span) => span.text.trim().length > 0);
+      const sigmaColors = new Set(["95,215,255", "135,215,135", "255,215,95", "255,95,95", "138,138,138"]);
+      expect(harness.setup.captureCharFrame()).toMatch(/[▀▄█]/u);
+      expect(welcomeSpans.some((span) => sigmaColors.has(span.fg.toInts().slice(0, 3).join(",")))).toBe(false);
+
       let presentation = projectEvent(createPresentationState(), event(1, "user.message", { text: "plain user" }));
       presentation = projectEvent(presentation, event(2, "model.delta", { turnId: 1, delta: "# Plain assistant" }));
       harness.view.update(snapshot(presentation));
       await harness.setup.renderOnce();
       const visibleSpans = harness.setup.captureSpans().lines.flatMap((line) => line.spans)
         .filter((span) => span.text.trim().length > 0);
-      const sigmaColors = new Set(["95,215,255", "135,215,135", "255,215,95", "255,95,95", "138,138,138"]);
       expect(visibleSpans.some((span) => sigmaColors.has(span.fg.toInts().slice(0, 3).join(",")))).toBe(false);
       expect(harness.setup.captureCharFrame()).toContain("Plain assistant");
     } finally {
