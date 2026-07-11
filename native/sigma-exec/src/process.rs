@@ -233,6 +233,24 @@ impl BrokerState {
         process_json(&managed, params.stdout_offset, params.stderr_offset, None)
     }
 
+    pub fn release_process(&self, params: HandleParams) -> Result<Value, RpcError> {
+        let process = self.process(&params.handle_id)?;
+        let mut managed = process.lock().map_err(lock_error)?;
+        refresh(&mut managed)?;
+        if !managed.exited {
+            return Err(RpcError::new(
+                "process_running",
+                "a running process cannot be released",
+            ));
+        }
+        drop(managed);
+        self.processes
+            .lock()
+            .map_err(lock_error)?
+            .remove(&params.handle_id);
+        Ok(json!({ "released": true }))
+    }
+
     pub fn release_artifacts(&self, params: ReleaseArtifactParams) -> Result<Value, RpcError> {
         if params.artifact_ids.len() > 128 {
             return Err(RpcError::new(
@@ -718,6 +736,46 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+        state.shutdown();
+    }
+
+    #[test]
+    fn releases_only_terminal_background_processes() {
+        let state = BrokerState::new("release".into(), true);
+        let running = state.spawn(params(true)).unwrap();
+        let running_handle = running["handleId"].as_str().unwrap().to_owned();
+        let error = state
+            .release_process(HandleParams {
+                handle_id: running_handle.clone(),
+                stdout_offset: 0,
+                stderr_offset: 0,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "process_running");
+        state
+            .terminate(HandleParams {
+                handle_id: running_handle.clone(),
+                stdout_offset: 0,
+                stderr_offset: 0,
+            })
+            .unwrap();
+        state
+            .release_process(HandleParams {
+                handle_id: running_handle.clone(),
+                stdout_offset: 0,
+                stderr_offset: 0,
+            })
+            .unwrap();
+        assert!(
+            state
+                .poll(HandleParams {
+                    handle_id: running_handle,
+                    stdout_offset: 0,
+                    stderr_offset: 0,
+                })
+                .is_err()
+        );
+        assert!(state.processes.lock().unwrap().is_empty());
         state.shutdown();
     }
 }

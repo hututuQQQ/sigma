@@ -336,13 +336,18 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     });
     if (final) this.processRedaction.delete(handle.id);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
-    return {
+    const result: ProcessPollResult = {
       handle, state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
       stdout, stderr,
       stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
       outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
       ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
     };
+    if (final) {
+      await this.transport.request("process.release", { handleId: handle.id }, { timeoutMs: 5_000 });
+      this.cursors.delete(handle.id);
+    }
+    return result;
   }
 
   private assertRequiredSandbox(report: BrokerDoctorReport): void {

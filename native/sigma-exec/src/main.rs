@@ -73,6 +73,10 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
             request.params,
             "process.terminate params",
         )?),
+        "process.release" => state.release_process(decode::<HandleParams>(
+            request.params,
+            "process.release params",
+        )?),
         "artifact.release" => state.release_artifacts(decode::<ReleaseArtifactParams>(
             request.params,
             "artifact.release params",

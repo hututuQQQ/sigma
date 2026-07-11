@@ -123,7 +123,7 @@ const handle = request => {
       state: "exited", exitCode: 0, signal: null, durationMs: 4,
       stdout: output("def", 6), stderr: output("", 0)
     });
-  } else if (request.method === "process.write" || request.method === "cancel") {
+  } else if (request.method === "process.write" || request.method === "process.release" || request.method === "cancel") {
     ok(request, {});
   } else if (request.method === "artifact.release") {
     for (const artifactId of request.params.artifactIds || []) {
@@ -394,7 +394,7 @@ describe("SigmaExecBrokerClient", () => {
     await expect(client.poll(handle)).resolves.toMatchObject({ state: "running", stdout: "" });
     await client.write(handle, "input\n");
     await expect(client.poll(handle)).resolves.toMatchObject({ state: "exited", stdout: "******" });
-    await expect(client.terminate(handle)).resolves.toMatchObject({ state: "terminated" });
+    await expect(client.terminate(handle)).rejects.toBeInstanceOf(BrokerProcessLostError);
     await client.close();
   });
 
