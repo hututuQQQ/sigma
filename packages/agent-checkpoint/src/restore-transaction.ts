@@ -265,6 +265,7 @@ async function commitOperation(
     if (operation.current) {
       operation.backupIntent = true;
       await writeJournal(transactionPath, "applying", operations);
+      await fault(options, { point: "before_backup_move", path: operation.path, operationIndex: operation.index });
       await rename(pinned.targetPath, operation.backupPath);
       operation.backupMoved = true;
       await syncDirectory(pinned.parentPath);
@@ -275,6 +276,7 @@ async function commitOperation(
     if (operation.stagePath) {
       operation.installIntent = true;
       await writeJournal(transactionPath, "applying", operations);
+      await fault(options, { point: "before_install_move", path: operation.path, operationIndex: operation.index });
       await rename(operation.stagePath, pinned.targetPath);
       operation.installed = true;
       await syncDirectory(pinned.parentPath);

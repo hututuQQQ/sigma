@@ -75,7 +75,7 @@ export class BrokerOutputArtifactImporter {
   async consume(artifacts: readonly OutputArtifactValue[]): Promise<ProcessOutputArtifact[]> {
     const pending = artifacts.filter((artifact) => !this.consumed.has(artifact.artifactId));
     if (pending.length === 0) return [];
-    const imported: ProcessOutputArtifact[] = [];
+    const prepared: Array<{ imported: ProcessOutputArtifact; sourcePath: string }> = [];
     for (const artifact of pending) {
       const sourcePath = await this.validArtifactPath(artifact.path);
       if (artifact.sizeBytes > MAX_IMPORTED_ARTIFACT_BYTES) {
@@ -85,15 +85,18 @@ export class BrokerOutputArtifactImporter {
       const checksum = createHash("sha256").update(nativeBytes).digest("hex");
       if (checksum !== artifact.sha256) throw new BrokerProtocolError("Output artifact checksum mismatch.");
       const content = Buffer.from(this.redactor.redactText(nativeBytes.toString("utf8")), "utf8");
-      imported.push({
+      prepared.push({ sourcePath, imported: {
         brokerArtifactId: artifact.artifactId, name: artifact.name, stream: artifact.stream,
         brokerSha256: artifact.sha256, sizeBytes: content.byteLength,
         complete: artifact.complete, redactionLossy: artifact.redactionLossy, content
-      });
-      this.consumed.add(artifact.artifactId);
-      this.paths.set(artifact.artifactId, sourcePath);
+      } });
     }
-    return imported;
+    for (const { imported, sourcePath } of prepared) {
+      const artifactId = imported.brokerArtifactId;
+      this.consumed.add(artifactId);
+      this.paths.set(artifactId, sourcePath);
+    }
+    return prepared.map((item) => item.imported);
   }
 
   async acknowledge(artifactIds: readonly string[]): Promise<void> {

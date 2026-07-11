@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { lockWindowsDirectories, type WindowsDirectoryLock } from "agent-platform";
 import { AtomicPatchError } from "./atomic-patch-parser.js";
 
 interface DirectoryIdentity { dev: number; ino: number; mode: number; birthtimeMs: number }
@@ -35,6 +36,7 @@ export async function pinPatchParent(workspace: string, relative: string): Promi
   const paths = [workspace, ...parts.map((_part, index) => path.join(workspace, ...parts.slice(0, index + 1)))];
   const identities: DirectoryIdentity[] = [];
   const handles: FileHandle[] = [];
+  let windowsLock: WindowsDirectoryLock | undefined;
   let anchored = workspace;
   try {
     for (const [index, original] of paths.entries()) {
@@ -50,6 +52,7 @@ export async function pinPatchParent(workspace: string, relative: string): Promi
       handles.push(handle);
       anchored = `/proc/self/fd/${handle.fd}`;
     }
+    if (process.platform === "win32") windowsLock = lockWindowsDirectories(paths);
     return {
       targetPath: path.join(process.platform === "linux" ? anchored : paths.at(-1)!, name),
       verify: async () => {
@@ -59,9 +62,13 @@ export async function pinPatchParent(workspace: string, relative: string): Promi
           }
         }
       },
-      close: async () => { for (const handle of handles.reverse()) await handle.close().catch(() => undefined); }
+      close: async () => {
+        windowsLock?.close();
+        for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
+      }
     };
   } catch (error) {
+    windowsLock?.close();
     for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
     throw error;
   }

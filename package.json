@@ -36,7 +36,7 @@
     "package:harbor-runtime": "node scripts/package-harbor-runtime.mjs",
     "smoke:local": "pnpm build && node scripts/smoke-local.mjs",
     "smoke:local:fake": "pnpm smoke:product",
-    "smoke:product": "pnpm build && node scripts/smoke-product.mjs",
+    "smoke:product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-product.mjs",
     "smoke:tui-product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-tui-product.mjs",
     "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
     "product:readiness": "node scripts/product-readiness-report.mjs",

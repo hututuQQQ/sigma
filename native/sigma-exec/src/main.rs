@@ -113,6 +113,7 @@ fn handle_request(state: Arc<BrokerState>, writer: SharedWriter, request: Reques
         Ok(result) => send_result(&writer, request_id, result),
         Err(error) => send_error(&writer, request_id, error),
     }
+    state.finish_request(request_id);
 }
 
 fn instance_id() -> String {
@@ -281,6 +282,10 @@ fn main() {
             state.shutdown();
             thread::sleep(Duration::from_millis(100));
             return;
+        }
+        if let Err(error) = state.begin_request(request.request_id, &request.method) {
+            send_error(&writer, request.request_id, error);
+            continue;
         }
         let request_state = state.clone();
         let request_writer = writer.clone();

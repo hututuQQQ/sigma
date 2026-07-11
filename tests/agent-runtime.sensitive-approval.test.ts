@@ -137,6 +137,38 @@ describe("sensitive per-call approvals", () => {
     }
   );
 
+  it("does not charge explicit human approval wait time to the active run deadline", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-deadline-"));
+    fixtures.push(root);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([networkTurn("slow-human"), fakeFinalTurn()]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker([]) }),
+      store,
+      storeRootDir: path.join(root, "state"),
+      permissionMode: "ask",
+      runDeadlineMs: 2_000
+    });
+    const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
+    const requested = (async () => {
+      for await (const event of runtime.subscribe(session.sessionId)) {
+        if (event.type === "tool.approval_requested") return;
+      }
+    })();
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Wait for my approval." });
+    await requested;
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
+    await runtime.command({
+      type: "approve", sessionId: session.sessionId, requestId: "slow-human", decision: "allow"
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    const stored = await events(store, session.sessionId);
+    expect(stored.find((event) => event.type === "run.suspended")?.payload)
+      .toMatchObject({ remainingDeadlineMs: expect.any(Number) });
+    expect(stored.find((event) => event.type === "tool.approval_resolved")?.payload)
+      .toMatchObject({ deadlineAt: expect.any(String) });
+  });
+
   it("deny mode blocks sensitive calls without producing a grant", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-network-deny-"));
     fixtures.push(root);

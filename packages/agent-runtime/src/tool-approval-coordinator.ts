@@ -10,6 +10,7 @@ import { turnPayload } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profilePermissionMode } from "./profile-policy.js";
 import type { RuntimeSession } from "./types.js";
+import { armRunDeadline, pauseRunDeadline, resumedDeadlineAt } from "./run-deadline.js";
 
 export interface ApprovalRequest {
   call: ModelToolCall;
@@ -83,23 +84,28 @@ export class ToolApprovalCoordinator {
     let resolve!: (value: "allow" | "deny" | "always_allow") => void;
     const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
     session.approvals.set(requestId, { effects, resolve });
+    const remainingDeadlineMs = pauseRunDeadline(session);
     await this.options.emit(session, "tool.approval_requested", "runtime", {
       requestId, callId: requestId, toolName: descriptor.name, arguments: request.arguments,
       effects, reason: `Effects: ${effects.join(", ")}`, ...turnPayload(modelTurn)
     });
     await this.options.emit(session, "run.suspended", "runtime", {
       requestId, callId: requestId, message: `Approval required for ${descriptor.name}.`,
+      remainingDeadlineMs,
       ...turnPayload(modelTurn)
     });
     try {
       return await abortable(pending, signal);
     } catch (error) {
       session.approvals.delete(requestId);
+      const deadlineAt = session.approvals.size === 0 ? resumedDeadlineAt(session) : undefined;
       await this.options.emit(session, "tool.approval_resolved", "runtime", {
         requestId, callId: requestId,
         decision: steeringRestart(signal) ? "superseded" : "cancelled",
+        ...(deadlineAt ? { deadlineAt } : {}),
         ...turnPayload(modelTurn)
       });
+      if (deadlineAt) armRunDeadline(session);
       throw error;
     }
   }

@@ -106,6 +106,9 @@ export interface BrokerSandboxReport {
     noNewPrivileges: boolean;
     seccompFilter: boolean;
     lessPrivilegedAppContainer: boolean;
+    mountNamespace: boolean;
+    pidNamespace: boolean;
+    networkNamespace: boolean;
   };
 }
 

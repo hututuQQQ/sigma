@@ -114,8 +114,16 @@ export class BrokerLspTransport implements LspTransport {
 
   private async start(signal?: AbortSignal): Promise<ProcessHandle> {
     if (this.closed) throw new Error("LSP transport is closed.");
-    this.starting ??= this.spawn(signal);
-    return await this.starting;
+    if (this.handle) return this.handle;
+    if (this.starting) return await this.starting;
+    const starting = this.spawn(signal);
+    this.starting = starting;
+    try {
+      return await starting;
+    } catch (error) {
+      if (this.starting === starting) this.starting = undefined;
+      throw error;
+    }
   }
 
   private async spawn(signal?: AbortSignal): Promise<ProcessHandle> {
@@ -137,9 +145,14 @@ export class BrokerLspTransport implements LspTransport {
       maxOutputBytes: 64 * 1024 * 1024,
       outputRedaction: "framed_jsonrpc"
     }, { signal: signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal });
-    if (this.closed) {
-      await this.broker.terminate(handle).catch(() => undefined);
-      throw new Error("LSP transport closed while the language server was starting.");
+    if (this.closed || signal?.aborted || this.lifecycle.signal.aborted) {
+      const result = await this.broker.terminate(handle).catch(() => undefined);
+      const artifactIds = result?.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
+      if (artifactIds.length > 0) {
+        await this.broker.releaseOutputArtifacts?.(artifactIds).catch(() => undefined);
+      }
+      throw signal?.reason ?? this.lifecycle.signal.reason
+        ?? new Error("LSP transport closed while the language server was starting.");
     }
     this.handle = handle;
     return handle;

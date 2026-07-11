@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { access, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -27,6 +28,7 @@ import {
   parseProcessValue,
   parseSpawnedProcess
 } from "../packages/agent-execution/src/values.js";
+import { BrokerOutputArtifactImporter } from "../packages/agent-execution/src/output-artifact-import.js";
 import type {
   ExecutionPolicy,
   ProcessSpawnRequest,
@@ -270,6 +272,51 @@ describe("agent-execution environment and redaction", () => {
     expect(preservingPartial.push("abc", { final: true })).toBe("***");
     expect(preservingPartial.push("abc", { discontinuity: true })).toBe("***");
   });
+
+  it("validates and redacts every JSON-RPC structural string", () => {
+    const stream = new SecretRedactor({ secret: "secret-value" }).createFramedJsonRpcStream();
+    const framed = (value: unknown): string => {
+      const body = Buffer.from(JSON.stringify(value), "utf8");
+      return `Content-Length: ${body.byteLength}\r\n\r\n${body.toString("utf8")}`;
+    };
+    const output = stream.push(framed({
+      jsonrpc: "2.0", id: "secret-value", method: "workspace/secret-value", params: {}
+    }), { final: true });
+    expect(output).not.toContain("secret-value");
+    expect(output).toContain("[REDACTED:secret]");
+    for (const invalid of [
+      { jsonrpc: "1.0", id: 1, result: null },
+      { jsonrpc: "2.0", id: { secret: "secret-value" }, result: null },
+      { jsonrpc: "2.0", method: { secret: "secret-value" }, params: {} },
+      { jsonrpc: "2.0", id: 1, error: { code: "secret-value", message: "failure" } }
+    ]) {
+      expect(() => new SecretRedactor({ secret: "secret-value" })
+        .createFramedJsonRpcStream().push(framed(invalid), { final: true }))
+        .toThrow(BrokerProtocolError);
+    }
+  });
+});
+
+describe("BrokerOutputArtifactImporter", () => {
+  it("commits a multi-artifact import only after the whole batch validates", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-batch-"));
+    const stdoutPath = path.join(root, "stdout.log");
+    const stderrPath = path.join(root, "stderr.log");
+    await writeFile(stdoutPath, "stdout", "utf8");
+    await writeFile(stderrPath, "stderr", "utf8");
+    const value = (artifactId: string, stream: "stdout" | "stderr", filePath: string, content: string) => ({
+      artifactId, name: `${stream}.log`, stream, path: filePath,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      sizeBytes: Buffer.byteLength(content), complete: true, redacted: true, redactionLossy: false
+    });
+    const stdout = value("stdout-id", "stdout", stdoutPath, "stdout");
+    const invalidStderr = { ...value("stderr-id", "stderr", stderrPath, "stderr"), sha256: "0".repeat(64) };
+    const importer = new BrokerOutputArtifactImporter(new SecretRedactor({}), async () => undefined);
+    await importer.configureRoot(root);
+    await expect(importer.consume([stdout, invalidStderr])).rejects.toThrow(/checksum/u);
+    await expect(importer.consume([stdout])).resolves.toMatchObject([{ brokerArtifactId: "stdout-id" }]);
+    await importer.cleanup();
+  });
 });
 
 describe("agent-execution protocol validation", () => {
@@ -300,7 +347,10 @@ describe("agent-execution protocol validation", () => {
           landlockAbi: 4,
           noNewPrivileges: true,
           seccompFilter: true,
-          lessPrivilegedAppContainer: false
+          lessPrivilegedAppContainer: false,
+          mountNamespace: true,
+          pidNamespace: true,
+          networkNamespace: true
         }
       },
       capabilities: { foreground: true, background: true, stdin: true, pty: false, networkModes: ["none"] }
@@ -311,7 +361,10 @@ describe("agent-execution protocol validation", () => {
       landlockAbi: 4,
       noNewPrivileges: true,
       seccompFilter: true,
-      lessPrivilegedAppContainer: false
+      lessPrivilegedAppContainer: false,
+      mountNamespace: true,
+      pidNamespace: true,
+      networkNamespace: true
     });
     expect(parseDoctor({
       ...doctor,

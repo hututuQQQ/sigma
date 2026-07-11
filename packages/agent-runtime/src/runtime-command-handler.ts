@@ -8,6 +8,7 @@ import type { SessionCommandBus } from "./session-command-bus.js";
 import type { ApprovalWaiter, RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { recordReviewerWaiver } from "./review-waiver-command.js";
+import { armRunDeadline, resumedDeadlineAt } from "./run-deadline.js";
 
 export interface RuntimeCommandHandlerOptions {
   runDeadlineMs: number;
@@ -63,10 +64,12 @@ async function persistApprovalResolution(
 ): Promise<void> {
   approval.resolving = true;
   try {
+    const deadlineAt = session.approvals.size === 1 ? resumedDeadlineAt(session) : undefined;
     await emit(session, "tool.approval_resolved", "user", {
       requestId,
       callId: approval.external?.callId ?? requestId,
       decision,
+      ...(deadlineAt ? { deadlineAt } : {}),
       ...(pendingTool ? pendingTool.modelTurn : {
         childId: approval.external?.childId,
         delegated: true
@@ -104,6 +107,7 @@ export class RuntimeCommandHandler {
       this.options.emit, session, command.requestId, approval, pendingTool, decision
     );
     session.approvals.delete(command.requestId);
+    if (session.approvals.size === 0) armRunDeadline(session);
     installCallGrant(session, command.requestId, approval, decision, Boolean(pendingTool));
     if (decision === "always_allow") {
       session.alwaysAllowedEffects.add(approval.effects.slice().sort().join("\0"));

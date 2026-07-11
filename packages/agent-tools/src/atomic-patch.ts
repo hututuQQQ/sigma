@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { WorkspaceDelta } from "agent-protocol";
 import { readPatchFile, samePatchFile } from "./atomic-patch-file-state.js";
 import { AtomicPatchError, parseUnifiedPatch, type FilePatch, type HunkLine, type PatchHunk } from "./atomic-patch-parser.js";
 import { commitPreparedPatch, type AtomicPatchCleanupWarning } from "./atomic-patch-transaction.js";
+import { pinPatchParent } from "./atomic-patch-path-safety.js";
 import type {
   AtomicPatchMutation, PatchOriginalFile, PreparedPatchChange
 } from "./atomic-patch-types.js";
@@ -296,10 +297,45 @@ async function assertWorkspaceRestored(
   }
 }
 
+async function assertInstalledChange(workspace: string, change: PreparedPatchChange): Promise<void> {
+  const current = await readPatchFile(workspace, change.target);
+  if (!current.exists || current.kind !== change.kind
+    || !current.bytes.equals(Buffer.from(change.content!, "utf8"))) {
+    throw new AtomicPatchError(`Patch postimage does not match the prepared content: ${change.target}`);
+  }
+  if (process.platform !== "win32" && change.kind === "file"
+    && (current.mode & 0o7777) !== (change.mode! & 0o7777)) {
+    throw new AtomicPatchError(`Patch postimage mode does not match: ${change.target}`);
+  }
+}
+
+async function ensurePrivateTransactionDirectory(workspace: string, relative: string): Promise<void> {
+  const pinned = await pinPatchParent(workspace, relative);
+  try {
+    await pinned.verify();
+    const current = await lstat(pinned.targetPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!current) await mkdir(pinned.targetPath, { mode: 0o700 });
+    else if (!current.isDirectory() || current.isSymbolicLink()) {
+      throw new AtomicPatchError(`Patch transaction directory is unsafe: ${relative}`);
+    }
+    await pinned.verify();
+  } finally {
+    await pinned.close();
+  }
+}
+
+async function patchTransactionPath(workspace: string): Promise<string> {
+  await ensurePrivateTransactionDirectory(workspace, ".agent");
+  await ensurePrivateTransactionDirectory(workspace, ".agent/patch-transactions");
+  return path.join(workspace, ".agent", "patch-transactions", `patch-${randomUUID()}`);
+}
+
 function summarizeChange(
   change: PreparedPatchChange,
   preimageHashes: Record<string, string>,
-  postimageHashes: Record<string, string>,
   delta: WorkspaceDelta
 ): void {
   if (change.source) preimageHashes[change.source] = hash(change.original.bytes);
@@ -310,18 +346,24 @@ function summarizeChange(
     delta.deleted.push(change.source!);
     delta.added.push(change.target!);
   }
-  if (change.target) postimageHashes[change.target] = hash(Buffer.from(change.content!, "utf8"));
 }
 
-function patchResult(
+async function patchResult(
+  workspace: string,
   changes: readonly PreparedPatchChange[],
   touched: ReadonlySet<string>,
   cleanupWarning?: AtomicPatchCleanupWarning
-): AtomicPatchResult {
+): Promise<AtomicPatchResult> {
   const preimageHashes: Record<string, string> = {};
   const postimageHashes: Record<string, string> = {};
   const delta: WorkspaceDelta = { added: [], modified: [], deleted: [] };
-  for (const change of changes) summarizeChange(change, preimageHashes, postimageHashes, delta);
+  for (const change of changes) summarizeChange(change, preimageHashes, delta);
+  for (const change of changes) {
+    if (!change.target) continue;
+    const actual = await readPatchFile(workspace, change.target);
+    if (!actual.exists) throw new AtomicPatchError(`Patch postimage disappeared: ${change.target}`);
+    postimageHashes[change.target] = hash(actual.bytes);
+  }
   for (const values of [delta.added, delta.modified, delta.deleted]) values.sort();
   return {
     files: [...touched].sort(), delta, preimageHashes, postimageHashes,
@@ -339,7 +381,7 @@ export async function applyUnifiedPatch(
   const changes = await Promise.all(patches.map(async (patch) =>
     await prepare(workspace, patch, options.preimageHashes ?? {})));
   const touched = uniqueTouched(changes);
-  const transaction = path.join(workspace, `.sigma-patch-${randomUUID()}`);
+  const transaction = await patchTransactionPath(workspace);
   const cleanupWarning = await commitPreparedPatch({
     workspace, transaction, changes,
     beforeCommit: options.beforeCommit,
@@ -348,8 +390,9 @@ export async function applyUnifiedPatch(
       assertAllUnchanged: async () => await assertPreparedChangesUnchanged(workspace, changes),
       assertSourceUnchanged: async (change) => await assertSourceUnchanged(workspace, change),
       assertTargetAbsent: async (change) => await assertTargetAbsent(workspace, change),
+      assertInstalled: async (change) => await assertInstalledChange(workspace, change),
       assertRestored: async () => await assertWorkspaceRestored(workspace, changes)
     }
   });
-  return patchResult(changes, touched, cleanupWarning);
+  return await patchResult(workspace, changes, touched, cleanupWarning);
 }

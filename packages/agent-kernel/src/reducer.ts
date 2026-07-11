@@ -79,6 +79,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
   phase: state.messages.length > 0 ? "ready_model" : "idle",
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
+  deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   completionRepairAttempts: 0,
@@ -228,13 +229,15 @@ const approvalRequested: EventReducer = (state, _event, payload) => {
 };
 
 const approvalResolved: EventReducer = (state, _event, payload) => {
+  const deadlineAt = typeof payload.deadlineAt === "string" ? payload.deadlineAt : undefined;
+  const resumed = deadlineAt ? { ...state, deadlineAt, deadlineRemainingMs: undefined } : state;
   const pending = pendingForEvent(state, payload);
-  if (!pending) return state;
+  if (!pending) return resumed;
   const allowed = payload.decision === "allow" || payload.decision === "always_allow";
-  const pendingTools = state.pendingTools.map((item) => item === pending
+  const pendingTools = resumed.pendingTools.map((item) => item === pending
     ? { ...item, approval: allowed ? "allowed" as const : "denied" as const }
     : item);
-  return { ...state, pendingTools, phase: nextPhase(pendingTools), outcome: undefined };
+  return { ...resumed, pendingTools, phase: nextPhase(pendingTools), outcome: undefined };
 };
 
 const toolStarted: EventReducer = (state, _event, payload) => {
@@ -279,6 +282,8 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   if (text(payload.callId) && !pendingForEvent(state, payload)) return state;
   return {
     ...state,
+    ...(Number.isSafeInteger(payload.remainingDeadlineMs) && Number(payload.remainingDeadlineMs) >= 1
+      ? { deadlineRemainingMs: Number(payload.remainingDeadlineMs) } : {}),
     phase: "needs_input",
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,

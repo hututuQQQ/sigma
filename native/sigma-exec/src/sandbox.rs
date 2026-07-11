@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{create_dir, read_dir, read_to_string, remove_dir, remove_file, write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,6 +95,9 @@ struct SandboxStatus {
     no_new_privileges: bool,
     seccomp_filter: bool,
     less_privileged_appcontainer: bool,
+    mount_namespace: bool,
+    pid_namespace: bool,
+    network_namespace: bool,
 }
 
 static STATUS: OnceLock<Mutex<Option<SandboxStatus>>> = OnceLock::new();
@@ -161,6 +166,9 @@ pub fn doctor_report() -> Value {
                 "noNewPrivileges": status.no_new_privileges,
                 "seccompFilter": status.seccomp_filter,
                 "lessPrivilegedAppContainer": status.less_privileged_appcontainer,
+                "mountNamespace": status.mount_namespace,
+                "pidNamespace": status.pid_namespace,
+                "networkNamespace": status.network_namespace,
             },
         },
         "capabilities": {
@@ -638,8 +646,7 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
 #[cfg(target_os = "linux")]
 fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
     const HELPER_MOUNT: &str = "/.sigma-exec";
-    let bwrap = find_in_path("bwrap")
-        .ok_or_else(|| RpcError::new("sandbox_unavailable", "bubblewrap not found"))?;
+    let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
     command.args(["--die-with-parent", "--new-session", "--unshare-all"]);
     if params.policy.network == NetworkMode::Full {
@@ -767,12 +774,57 @@ fn bind_protected(command: &mut Command, params: &ProcessParams) -> Result<(), R
 }
 
 #[cfg(target_os = "linux")]
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|path| path.join(name))
-            .find(|candidate| candidate.is_file())
-    })
+fn trusted_bwrap() -> Result<PathBuf, String> {
+    trusted_bwrap_from(&[
+        PathBuf::from("/usr/bin/bwrap"),
+        PathBuf::from("/bin/bwrap"),
+        PathBuf::from("/usr/local/bin/bwrap"),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_bwrap_from(candidates: &[PathBuf]) -> Result<PathBuf, String> {
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|error| format!("cannot canonicalize '{}': {error}", candidate.display()))?;
+        let metadata = canonical
+            .metadata()
+            .map_err(|error| format!("cannot inspect '{}': {error}", canonical.display()))?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0
+        {
+            rejected.push(canonical.display().to_string());
+            continue;
+        }
+        let mut ancestor = canonical.parent();
+        let mut safe = true;
+        while let Some(directory) = ancestor {
+            let info = directory
+                .metadata()
+                .map_err(|error| format!("cannot inspect '{}': {error}", directory.display()))?;
+            if !info.is_dir() || info.uid() != 0 || info.permissions().mode() & 0o022 != 0 {
+                safe = false;
+                break;
+            }
+            ancestor = directory.parent();
+        }
+        if safe {
+            return Ok(canonical);
+        }
+        rejected.push(canonical.display().to_string());
+    }
+    if rejected.is_empty() {
+        Err("bubblewrap was not found at a trusted system path".into())
+    } else {
+        Err(format!(
+            "bubblewrap failed trusted owner/permission checks: {}",
+            rejected.join(", ")
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -786,18 +838,24 @@ fn linux_system_roots() -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn detect_sandbox() -> SandboxStatus {
-    let Some(bwrap) = find_in_path("bwrap") else {
-        return SandboxStatus {
-            available: false,
-            backend: "bubblewrap",
-            self_test_passed: false,
-            setup_required: true,
-            reason: Some("bubblewrap is not installed".into()),
-            landlock_abi: None,
-            no_new_privileges: false,
-            seccomp_filter: false,
-            less_privileged_appcontainer: false,
-        };
+    let bwrap = match trusted_bwrap() {
+        Ok(value) => value,
+        Err(error) => {
+            return SandboxStatus {
+                available: false,
+                backend: "bubblewrap",
+                self_test_passed: false,
+                setup_required: true,
+                reason: Some(error),
+                landlock_abi: None,
+                no_new_privileges: false,
+                seccomp_filter: false,
+                less_privileged_appcontainer: false,
+                mount_namespace: false,
+                pid_namespace: false,
+                network_namespace: false,
+            };
+        }
     };
     let base_passed = Command::new(&bwrap)
         .args([
@@ -845,6 +903,15 @@ fn detect_sandbox() -> SandboxStatus {
             .map(|report| report.seccomp_filter)
             .unwrap_or(false),
         less_privileged_appcontainer: false,
+        mount_namespace: hardening_report
+            .map(|report| report.mount_namespace)
+            .unwrap_or(false),
+        pid_namespace: hardening_report
+            .map(|report| report.pid_namespace)
+            .unwrap_or(false),
+        network_namespace: hardening_report
+            .map(|report| report.network_namespace)
+            .unwrap_or(false),
     }
 }
 
@@ -903,6 +970,9 @@ fn detect_sandbox() -> SandboxStatus {
             no_new_privileges: false,
             seccomp_filter: false,
             less_privileged_appcontainer: true,
+            mount_namespace: false,
+            pid_namespace: false,
+            network_namespace: false,
         },
         Err(error) => SandboxStatus {
             available: false,
@@ -914,6 +984,9 @@ fn detect_sandbox() -> SandboxStatus {
             no_new_privileges: false,
             seccomp_filter: false,
             less_privileged_appcontainer: false,
+            mount_namespace: false,
+            pid_namespace: false,
+            network_namespace: false,
         },
     }
 }
@@ -930,6 +1003,9 @@ fn detect_sandbox() -> SandboxStatus {
         no_new_privileges: false,
         seccomp_filter: false,
         less_privileged_appcontainer: false,
+        mount_namespace: false,
+        pid_namespace: false,
+        network_namespace: false,
     }
 }
 
@@ -1007,5 +1083,23 @@ mod tests {
         assert!(!root.join(".git").exists());
         assert!(!root.join(".agent").exists());
         std::fs::remove_dir_all(&root).expect("remove test workspace");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_a_path_controlled_bubblewrap_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "sigma-untrusted-bwrap-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fake = root.join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = trusted_bwrap_from(&[fake]).unwrap_err();
+        assert!(error.contains("trusted owner/permission"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -75,6 +75,7 @@ pub struct BrokerState {
     sequence: AtomicU64,
     processes: Mutex<HashMap<String, Arc<Mutex<ManagedProcess>>>>,
     requests: Mutex<HashMap<u64, String>>,
+    exec_requests: Mutex<HashSet<u64>>,
     cancelled_requests: Mutex<HashSet<u64>>,
     artifact_root: PathBuf,
     artifacts: Mutex<HashMap<String, PathBuf>>,
@@ -93,6 +94,7 @@ impl BrokerState {
             sequence: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
+            exec_requests: Mutex::new(HashSet::new()),
             cancelled_requests: Mutex::new(HashSet::new()),
             artifact_root,
             artifacts: Mutex::new(HashMap::new()),
@@ -102,6 +104,32 @@ impl BrokerState {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub fn begin_request(&self, request_id: u64, method: &str) -> Result<(), RpcError> {
+        if method != "exec" {
+            return Ok(());
+        }
+        let mut active = self.exec_requests.lock().map_err(lock_error)?;
+        if !active.insert(request_id) {
+            return Err(RpcError::new(
+                "broker_protocol_error",
+                format!("duplicate active request id {request_id}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn finish_request(&self, request_id: u64) {
+        if let Ok(mut active) = self.exec_requests.lock() {
+            active.remove(&request_id);
+        }
+        if let Ok(mut cancelled) = self.cancelled_requests.lock() {
+            cancelled.remove(&request_id);
+        }
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.remove(&request_id);
+        }
     }
 
     pub fn artifact_root(&self) -> &PathBuf {
@@ -181,10 +209,6 @@ impl BrokerState {
         let result = process_json(&managed, 0, 0, Some((timed_out, idle_timed_out)))?;
         drop(managed);
         self.requests
-            .lock()
-            .map_err(lock_error)?
-            .remove(&request_id);
-        self.cancelled_requests
             .lock()
             .map_err(lock_error)?
             .remove(&request_id);
@@ -282,7 +306,12 @@ impl BrokerState {
             if !managed.exited {
                 terminate(&mut managed, true)?;
             }
-        } else {
+        } else if self
+            .exec_requests
+            .lock()
+            .map_err(lock_error)?
+            .contains(&params.target_request_id)
+        {
             let mut cancelled = self.cancelled_requests.lock().map_err(lock_error)?;
             if cancelled.len() >= 4096 {
                 return Err(RpcError::new(
@@ -722,6 +751,7 @@ mod tests {
     #[test]
     fn cancellation_arriving_before_spawn_is_not_lost() {
         let state = BrokerState::new("test".into(), true);
+        state.begin_request(7, "exec").unwrap();
         state
             .cancel(CancelParams {
                 target_request_id: 7,
@@ -736,7 +766,33 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+        state.finish_request(7);
         state.shutdown();
+    }
+
+    #[test]
+    fn cancellation_of_non_exec_or_completed_requests_does_not_create_tombstones() {
+        let state = BrokerState::new("cancel-scope".into(), true);
+        for target_request_id in 1..=5_000 {
+            state.cancel(CancelParams { target_request_id }).unwrap();
+        }
+        assert!(state.cancelled_requests.lock().unwrap().is_empty());
+        state.begin_request(6_000, "doctor").unwrap();
+        state
+            .cancel(CancelParams {
+                target_request_id: 6_000,
+            })
+            .unwrap();
+        assert!(state.cancelled_requests.lock().unwrap().is_empty());
+        state.begin_request(7_000, "exec").unwrap();
+        state
+            .cancel(CancelParams {
+                target_request_id: 7_000,
+            })
+            .unwrap();
+        assert!(state.cancelled_requests.lock().unwrap().contains(&7_000));
+        state.finish_request(7_000);
+        assert!(state.cancelled_requests.lock().unwrap().is_empty());
     }
 
     #[test]

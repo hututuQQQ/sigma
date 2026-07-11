@@ -10,20 +10,43 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 function redactError(value: unknown, redactor: SecretRedactor): unknown {
-  if (!record(value)) return redactor.redactJsonValue(value);
+  if (!record(value)) throw new BrokerProtocolError("Framed JSON-RPC error must be an object.");
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    output[key] = key === "code" ? item : redactor.redactJsonValue(item);
+    if (key === "code") {
+      if (!Number.isInteger(item)) throw new BrokerProtocolError("Framed JSON-RPC error.code must be an integer.");
+      output[key] = item;
+    } else output[key] = redactor.redactJsonValue(item);
   }
   return output;
 }
 
+function validateEnvelope(value: Record<string, unknown>): void {
+  if (value.jsonrpc !== "2.0") throw new BrokerProtocolError("Framed JSON-RPC jsonrpc must equal '2.0'.");
+  const id = value.id;
+  if (Object.hasOwn(value, "id") && id !== null && typeof id !== "string" && typeof id !== "number") {
+    throw new BrokerProtocolError("Framed JSON-RPC id must be a string, number, or null.");
+  }
+  if (typeof id === "number" && !Number.isFinite(id)) {
+    throw new BrokerProtocolError("Framed JSON-RPC numeric id must be finite.");
+  }
+  if (Object.hasOwn(value, "method") && typeof value.method !== "string") {
+    throw new BrokerProtocolError("Framed JSON-RPC method must be a string.");
+  }
+}
+
 function redactMessage(value: unknown, redactor: SecretRedactor): unknown {
-  if (Array.isArray(value)) return value.map((item) => redactMessage(item, redactor));
+  if (Array.isArray(value)) {
+    if (value.length === 0) throw new BrokerProtocolError("Framed JSON-RPC batch must not be empty.");
+    return value.map((item) => redactMessage(item, redactor));
+  }
   if (!record(value)) throw new BrokerProtocolError("Framed JSON-RPC output must contain an object or batch.");
+  validateEnvelope(value);
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    if (["jsonrpc", "id", "method"].includes(key)) output[key] = item;
+    if (key === "jsonrpc") output[key] = item;
+    else if (key === "id") output[key] = typeof item === "string" ? redactor.redactJsonValue(item) : item;
+    else if (key === "method") output[key] = redactor.redactJsonValue(item);
     else if (key === "error") output[key] = redactError(item, redactor);
     else output[key] = redactor.redactJsonValue(item);
   }

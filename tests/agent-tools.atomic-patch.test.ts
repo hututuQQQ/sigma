@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -26,7 +26,45 @@ describe("applyUnifiedPatch", () => {
     ].join("\n"), { preimageHashes: { "one.txt": before } });
     expect(result.delta).toEqual({ added: [], modified: ["one.txt"], deleted: [] });
     expect(result.preimageHashes["one.txt"]).toBe(before);
+    expect(result.postimageHashes["one.txt"]).toBe(
+      createHash("sha256").update("alpha\r\ngamma\r\n").digest("hex")
+    );
     await expect(readFile(path.join(root, "one.txt"), "utf8")).resolves.toBe("alpha\r\ngamma\r\n");
+  });
+
+  it("rejects staged content replacement and restores the original", async () => {
+    const root = await workspace();
+    await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
+    await expect(applyUnifiedPatch(root, [
+      "--- a/target.txt", "+++ b/target.txt", "@@ -1 +1 @@", "-before", "+expected"
+    ].join("\n"), {
+      beforeCommit: async () => {
+        const transactions = path.join(root, ".agent", "patch-transactions");
+        const transaction = (await readdir(transactions)).find((entry) => entry.startsWith("patch-"));
+        await writeFile(path.join(transactions, transaction!, "staged", "0"), "attacker\n", "utf8");
+      }
+    })).rejects.toThrow(/installed path changed|postimage|prepared content/iu);
+    await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("before\n");
+  });
+
+  it.runIf(process.platform !== "win32")("rejects a staged file replaced by a symlink", async () => {
+    const root = await workspace();
+    const outside = path.join(await workspace(), "outside.txt");
+    await writeFile(outside, "attacker\n", "utf8");
+    await expect(applyUnifiedPatch(root, [
+      "diff --git a/new.txt b/new.txt", "new file mode 100644",
+      "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+expected"
+    ].join("\n"), {
+      beforeCommit: async () => {
+        const transactions = path.join(root, ".agent", "patch-transactions");
+        const transaction = (await readdir(transactions)).find((entry) => entry.startsWith("patch-"));
+        const staged = path.join(transactions, transaction!, "staged", "0");
+        await rm(staged);
+        await symlink(outside, staged, "file");
+      }
+    })).rejects.toThrow(/installed path changed/iu);
+    await expect(lstat(path.join(root, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(outside, "utf8")).resolves.toBe("attacker\n");
   });
 
   it("preflights every hunk before making any filesystem change", async () => {
@@ -274,4 +312,29 @@ describe("applyUnifiedPatch", () => {
     })).rejects.toBeInstanceOf(AtomicPatchError);
     await expect(readFile(path.join(outside, "file.txt"), "utf8")).resolves.toBe("outside\n");
   });
+
+  it.runIf(process.platform === "win32")(
+    "locks a patch parent across the verify-to-rename window",
+    async () => {
+      const root = await workspace();
+      const outside = await mkdtemp(path.join(os.tmpdir(), "sigma-patch-locked-outside-"));
+      const nested = path.join(root, "nested");
+      await mkdir(nested);
+      await writeFile(path.join(nested, "file.txt"), "inside\n", "utf8");
+      await writeFile(path.join(outside, "file.txt"), "outside\n", "utf8");
+      let attempted = false;
+      await expect(applyUnifiedPatch(root,
+        "--- a/nested/file.txt\n+++ b/nested/file.txt\n@@ -1 +1 @@\n-inside\n+changed", {
+          beforeMutation: async ({ phase }) => {
+            if (phase !== "backup_source_pinned") return;
+            attempted = true;
+            await rename(nested, `${nested}-displaced`);
+            await symlink(outside, nested, "junction");
+          }
+        })).rejects.toThrow();
+      expect(attempted).toBe(true);
+      await expect(readFile(path.join(nested, "file.txt"), "utf8")).resolves.toBe("inside\n");
+      await expect(readFile(path.join(outside, "file.txt"), "utf8")).resolves.toBe("outside\n");
+    }
+  );
 });

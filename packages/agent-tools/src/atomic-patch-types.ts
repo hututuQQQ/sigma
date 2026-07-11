@@ -22,7 +22,9 @@ export interface PreparedPatchChange {
 export type AtomicPatchMutationPhase =
   | "create_parent"
   | "backup_source"
+  | "backup_source_pinned"
   | "install_target"
+  | "install_target_pinned"
   | "remove_installed"
   | "restore_source"
   | "remove_created_parent";
@@ -43,5 +45,6 @@ export interface AtomicPatchTransactionValidators {
   assertAllUnchanged(): Promise<void>;
   assertSourceUnchanged(change: PreparedPatchChange): Promise<void>;
   assertTargetAbsent(change: PreparedPatchChange): Promise<void>;
+  assertInstalled(change: PreparedPatchChange): Promise<void>;
   assertRestored(): Promise<void>;
 }

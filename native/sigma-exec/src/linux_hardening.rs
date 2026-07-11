@@ -78,6 +78,9 @@ pub(crate) struct HardeningReport {
     pub seccomp_filter: bool,
     pub landlock_write_denied: bool,
     pub dangerous_syscall_denied: bool,
+    pub mount_namespace: bool,
+    pub pid_namespace: bool,
+    pub network_namespace: bool,
 }
 
 pub(crate) fn try_run_internal_mode() -> Option<i32> {
@@ -421,9 +424,9 @@ fn run_probe(arguments: Vec<OsString>) -> i32 {
 }
 
 fn hardening_probe(arguments: Vec<OsString>) -> io::Result<HardeningReport> {
-    if arguments.len() != 2 {
+    if arguments.len() != 5 {
         return Err(invalid(
-            "hardening probe requires allowed and denied directories",
+            "hardening probe requires allowed/denied directories and parent mount/PID/network namespaces",
         ));
     }
     let allowed = PathBuf::from(&arguments[0]).join("allowed-write");
@@ -448,12 +451,18 @@ fn hardening_probe(arguments: Vec<OsString>) -> io::Result<HardeningReport> {
     };
     let dangerous_syscall_denied =
         mount_result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+    let namespace_changed = |name: &str, parent: &OsStr| -> io::Result<bool> {
+        Ok(fs::read_link(format!("/proc/self/ns/{name}"))?.as_os_str() != parent)
+    };
     Ok(HardeningReport {
         landlock_abi: landlock_abi()?,
         no_new_privileges,
         seccomp_filter,
         landlock_write_denied,
         dangerous_syscall_denied,
+        mount_namespace: namespace_changed("mnt", &arguments[2])?,
+        pid_namespace: namespace_changed("pid", &arguments[3])?,
+        network_namespace: namespace_changed("net", &arguments[4])?,
     })
 }
 
@@ -477,6 +486,9 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
     ));
     let allowed = root.join("allowed");
     let denied = root.join("denied");
+    let parent_mount = fs::read_link("/proc/self/ns/mnt").map_err(|error| error.to_string())?;
+    let parent_pid = fs::read_link("/proc/self/ns/pid").map_err(|error| error.to_string())?;
+    let parent_network = fs::read_link("/proc/self/ns/net").map_err(|error| error.to_string())?;
     fs::create_dir_all(&allowed).map_err(|error| error.to_string())?;
     fs::create_dir_all(&denied).map_err(|error| error.to_string())?;
     let output = Command::new(bwrap)
@@ -493,6 +505,9 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
         .arg(&allowed)
         .arg("--bind")
         .arg(&denied)
+        .arg(parent_mount)
+        .arg(parent_pid)
+        .arg(parent_network)
         .arg(&denied)
         .args(["--proc", "/proc", "--dev", "/dev", "--"])
         .arg(&helper)
@@ -526,6 +541,9 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
         || !report.seccomp_filter
         || !report.landlock_write_denied
         || !report.dangerous_syscall_denied
+        || !report.mount_namespace
+        || !report.pid_namespace
+        || !report.network_namespace
     {
         return Err(format!("hardening self-test assertions failed: {report:?}"));
     }

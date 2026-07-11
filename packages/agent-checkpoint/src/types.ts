@@ -70,7 +70,9 @@ export interface CheckpointManagerOptions {
 
 export type CheckpointRestoreFaultPoint =
   | "before_commit"
+  | "before_backup_move"
   | "after_backup"
+  | "before_install_move"
   | "after_install"
   | "before_record"
   | "before_rollback"

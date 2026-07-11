@@ -375,6 +375,31 @@ describe("agent-code-intel", () => {
     await client.close();
   });
 
+  it("retries a transient first language-server spawn failure", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-retry-"));
+    class RetryBroker extends FakeLspBroker {
+      attempts = 0;
+      override async spawn(request: ProcessSpawnRequest): Promise<ProcessHandle> {
+        this.attempts += 1;
+        if (this.attempts === 1) throw new Error("transient spawn failure");
+        return await super.spawn(request);
+      }
+    }
+    const broker = new RetryBroker();
+    const transport = new BrokerLspTransport({
+      broker, workspacePath: workspace,
+      preset: {
+        id: "typescript", languages: ["typescript"], executable: process.execPath,
+        args: ["server.mjs", "--stdio"], source: "configured", available: true
+      }
+    });
+    const initialize = Buffer.from(encodeLspMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+    await expect(transport.write(initialize)).rejects.toThrow("transient spawn failure");
+    await expect(transport.write(initialize)).resolves.toBeUndefined();
+    expect(broker.attempts).toBe(2);
+    await transport.close();
+  });
+
   it("applies an LSP rename as one atomic workspace patch", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-rename-"));
     const target = path.join(workspace, "fixture.ts");

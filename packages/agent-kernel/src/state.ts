@@ -56,6 +56,8 @@ export interface KernelState {
   lastSeq: number;
   startedAt: string;
   deadlineAt: string;
+  /** Active runtime milliseconds preserved while waiting for explicit user approval. */
+  deadlineRemainingMs?: number;
   activeModelTurn?: ActiveModelTurn;
   /** True once any content or reasoning from the active provider attempt is durable. */
   activeModelSemanticDelta?: boolean;
@@ -154,6 +156,11 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
+function validDeadlineState(state: Record<string, unknown>): boolean {
+  return typeof state.deadlineAt === "string" && (state.deadlineRemainingMs === undefined
+    || (Number.isSafeInteger(state.deadlineRemainingMs) && Number(state.deadlineRemainingMs) >= 1));
+}
+
 export function isKernelStateV2(value: unknown): value is KernelStateV2 {
   const state = record(value);
   if (!state || state.schemaVersion !== LEGACY_KERNEL_STATE_VERSION_V2) return false;
@@ -168,7 +175,7 @@ export function isKernelStateV2(value: unknown): value is KernelStateV2 {
     Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
     Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
     typeof state.startedAt === "string",
-    typeof state.deadlineAt === "string",
+    validDeadlineState(state),
     Array.isArray(state.messages),
     Array.isArray(state.pendingTools),
     Array.isArray(state.toolCallIds),
@@ -195,7 +202,7 @@ export function isKernelState(value: unknown): value is KernelState {
     Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
     Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
     typeof state.startedAt === "string",
-    typeof state.deadlineAt === "string",
+    validDeadlineState(state),
     state.activeModelSemanticDelta === undefined || typeof state.activeModelSemanticDelta === "boolean",
     Array.isArray(state.messages),
     Array.isArray(state.pendingTools),

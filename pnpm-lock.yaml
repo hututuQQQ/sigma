@@ -48,7 +48,11 @@ importers:
         specifier: 0.25.10
         version: 0.25.10
 
-  packages/agent-checkpoint: {}
+  packages/agent-checkpoint:
+    dependencies:
+      agent-platform:
+        specifier: workspace:*
+        version: link:../agent-platform
 
   packages/agent-cli:
     dependencies:

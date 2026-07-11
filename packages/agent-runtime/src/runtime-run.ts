@@ -2,6 +2,7 @@ import type { RunOutcome } from "agent-protocol";
 import type { EffectRunner } from "./effect-runner.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { RuntimeSession } from "./types.js";
+import { armRunDeadline } from "./run-deadline.js";
 
 export interface RuntimeRunOptions {
   hooks: RuntimeHookCoordinator;
@@ -22,11 +23,7 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
     session.controller = null;
     return;
   }
-  session.deadlineTimer = setTimeout(() => {
-    const error = new Error(`Run exceeded its durable deadline ${session.state.deadlineAt}.`);
-    error.name = "TimeoutError";
-    controller.abort(error);
-  }, remainingMs);
+  armRunDeadline(session);
   try {
     await options.hooks.dispatch(session, "run_start", {
       sessionId: session.sessionId,

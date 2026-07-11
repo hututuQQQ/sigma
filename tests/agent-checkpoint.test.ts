@@ -422,6 +422,40 @@ describe("CheckpointManager", () => {
     await expect(transactional.list(checkpoint.sessionId)).resolves.toContainEqual(expect.objectContaining({ status: "sealed" }));
   });
 
+  it.runIf(process.platform === "win32")(
+    "locks every restore parent across the verify-to-rename window",
+    async () => {
+      const { root, workspace, manager } = await fixture();
+      const outside = path.join(root, "locked-race-outside");
+      const nested = path.join(workspace, "locked-parent");
+      await mkdir(outside);
+      await mkdir(nested);
+      await writeFile(path.join(nested, "inside.txt"), "before", "utf8");
+      await writeFile(path.join(outside, "sentinel.txt"), "outside", "utf8");
+      const checkpoint = await manager.create({
+        sessionId: "session-locked-parent", runId: "run-locked-parent",
+        workspacePath: workspace, scopePaths: ["locked-parent/inside.txt"], baseSeq: 1
+      });
+      await writeFile(path.join(nested, "inside.txt"), "after", "utf8");
+      await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+      let swapAttempted = false;
+      const transactional = new CheckpointManager({
+        rootDir: path.join(root, "state"),
+        restoreFaultInjector: async ({ point }) => {
+          if (point !== "before_backup_move") return;
+          swapAttempted = true;
+          await rename(nested, `${nested}-displaced`);
+          await symlink(outside, nested, "junction");
+        }
+      });
+      await expect(transactional.undoLatest(checkpoint.sessionId)).rejects.toThrow();
+      expect(swapAttempted).toBe(true);
+      await expect(readFile(path.join(outside, "sentinel.txt"), "utf8")).resolves.toBe("outside");
+      await expect(readFile(path.join(outside, "inside.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(path.join(nested, "inside.txt"), "utf8")).resolves.toBe("after");
+    }
+  );
+
   it("never follows a linked .agent directory while creating its restore journal", async () => {
     const { root, workspace, manager } = await fixture();
     const outside = path.join(root, "agent-link-outside");

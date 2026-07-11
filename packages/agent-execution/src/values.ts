@@ -165,7 +165,10 @@ export function parseDoctor(input: unknown): BrokerDoctorReport {
         lessPrivilegedAppContainer: booleanValue(
           hardening.lessPrivilegedAppContainer,
           "sandbox.hardening.lessPrivilegedAppContainer"
-        )
+        ),
+        mountNamespace: booleanValue(hardening.mountNamespace, "sandbox.hardening.mountNamespace"),
+        pidNamespace: booleanValue(hardening.pidNamespace, "sandbox.hardening.pidNamespace"),
+        networkNamespace: booleanValue(hardening.networkNamespace, "sandbox.hardening.networkNamespace")
       } } : {})
     },
     capabilities: {

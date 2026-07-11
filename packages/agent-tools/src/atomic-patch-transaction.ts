@@ -154,6 +154,9 @@ async function moveSource(
   const pinned = await pinPatchParent(options.workspace, change.source!);
   try {
     await pinned.verify();
+    await runHook(options.beforeMutation, {
+      direction: "commit", phase: "backup_source_pinned", changeIndex, relativePath: change.source!
+    });
     await rename(pinned.targetPath, saved);
     await pinned.verify();
   } finally {
@@ -178,7 +181,16 @@ async function installTarget(
   const pinned = await pinPatchParent(options.workspace, change.target!);
   try {
     await pinned.verify();
-    await rename(path.join(staged, String(changeIndex)), pinned.targetPath);
+    await assertInstalledTarget(change, path.join(staged, String(changeIndex)), change.target!);
+    await runHook(options.beforeMutation, {
+      direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
+    });
+    if (change.kind === "symlink") await symlink(change.content!, pinned.targetPath);
+    else {
+      const permissions = change.mode! & 0o7777;
+      await writeFile(pinned.targetPath, change.content!, { encoding: "utf8", mode: permissions, flag: "wx" });
+      await chmod(pinned.targetPath, permissions);
+    }
     await pinned.verify();
   } finally {
     await pinned.close();
@@ -355,7 +367,15 @@ export async function commitPreparedPatch(
   const staged = path.join(options.transaction, "staged");
   const backup = path.join(options.transaction, "backup");
   try {
-    await mkdir(options.transaction, { mode: 0o700 });
+    const relative = relativeFrom(options.workspace, options.transaction);
+    const pinned = await pinPatchParent(options.workspace, relative);
+    try {
+      await pinned.verify();
+      await mkdir(pinned.targetPath, { mode: 0o700 });
+      await pinned.verify();
+    } finally {
+      await pinned.close();
+    }
   } catch (error) {
     throw patchError(error);
   }
@@ -367,6 +387,9 @@ export async function commitPreparedPatch(
   const state: TransactionState = { installed: [], moved: [], createdParents: [] };
   try {
     await installChanges(options, staged, backup, state);
+    for (const change of options.changes) {
+      if (change.target) await options.validators.assertInstalled(change);
+    }
   } catch (error) {
     const rollbackErrors = await rollbackChanges(options, state);
     if (rollbackErrors.length > 0) throw new AtomicPatchRollbackError(error, rollbackErrors, options.transaction);
