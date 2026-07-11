@@ -116,6 +116,7 @@ jobs:
         with:
           name: sigma-code-linux-x64
           if-no-files-found: error
+          include-hidden-files: true
           path: |
             .artifacts/agent-cli-linux-x64.tgz
             .artifacts/agent-cli-linux-x64.tgz.sha256
@@ -239,6 +240,7 @@ jobs:
         with:
           name: sigma-code-win32-x64-preview
           if-no-files-found: error
+          include-hidden-files: true
           path: |
             .artifacts/agent-cli-win32-x64.zip
             .artifacts/agent-cli-win32-x64.zip.sha256
