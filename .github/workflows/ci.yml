@@ -57,6 +57,7 @@ jobs:
           cargo fmt --manifest-path native/sigma-exec/Cargo.toml -- --check
           cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
           cargo clippy --locked --manifest-path native/sigma-exec/Cargo.toml --all-targets -- -D warnings
+          cargo build --locked --manifest-path native/sigma-exec/Cargo.toml
           mkdir -p .artifacts
           pnpm test:coverage:native-protocol
       - name: Real Linux hardening self-test
