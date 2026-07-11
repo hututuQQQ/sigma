@@ -295,7 +295,7 @@ describe("durable child identity and crash recovery", () => {
     });
 
     const childLedger = createBudgetLedger();
-    childLedger.consumed.inputTokens = 11;
+    childLedger.consumed.inputTokens = 111;
     childLedger.reserved.inputTokens = 17;
     childLedger.consumed.toolCalls = 2;
     childLedger.reserved.toolCalls = 1;
@@ -376,7 +376,7 @@ describe("durable child identity and crash recovery", () => {
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
     expect(session.state.budget.reserved).toMatchObject({ inputTokens: 0, toolCalls: 0, children: 0 });
-    expect(session.state.budget.consumed).toMatchObject({ inputTokens: 28, toolCalls: 3, children: 2 });
+    expect(session.state.budget.consumed).toMatchObject({ inputTokens: 128, toolCalls: 3, children: 2 });
     expect(session.state.budget.reservations[0]?.status).toBe("committed");
     expect(session.state.plan.nodes[0]).toMatchObject({
       status: "blocked",

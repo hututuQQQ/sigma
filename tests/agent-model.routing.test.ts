@@ -246,8 +246,8 @@ describe("capability-aware model routing", () => {
     );
     expect(() => unpriced.resolve("main", { remainingBudgetMicroUsd: 10_000 })).toThrow("no eligible candidates");
     expect(modelReservationEstimate(first, { estimatedInputTokens: 100, maxOutputTokens: 50 })).toMatchObject({
-      inputTokens: 120,
-      outputTokens: 60
+      inputTokens: 150,
+      outputTokens: 75
     });
 
     const cumulative = router.resolve("main", {
@@ -283,7 +283,7 @@ describe("capability-aware model routing", () => {
     const plan = await routed.budgetPlan([{ role: "user", content: "hello" }], [], 100, 10_000);
     expect(plan.estimatedInputTokens).toBe(2);
     expect(plan.reservedInputTokens).toBeGreaterThan(plan.estimatedInputTokens * 2);
-    expect(plan.reservedOutputTokens).toBe(240);
+    expect(plan.reservedOutputTokens).toBe(300);
     expect(plan.reservedCostMicroUsd).toBeGreaterThan(0);
     expect(routed.routingIdentity()).toEqual({ role: "child_analyze", routeId: "main" });
   });

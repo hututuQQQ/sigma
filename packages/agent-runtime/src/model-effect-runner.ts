@@ -25,6 +25,7 @@ interface PreparedModelTurn {
 
 interface ModelReservationState {
   settled: boolean;
+  response?: ModelResponse;
 }
 
 function evidenceLedger(session: RuntimeSession): ContextItem | undefined {
@@ -161,9 +162,9 @@ export class ModelEffectRunner {
       plan.messages,
       tools,
       this.options.outputReserveTokens,
-      session.state.budget.limits.costMicroUsd
+      Math.max(0, session.state.budget.limits.costMicroUsd
         - session.state.budget.consumed.costMicroUsd
-        - session.state.budget.reserved.costMicroUsd
+        - session.state.budget.reserved.costMicroUsd)
     );
     const turn = { messages: plan.messages, tools, budget };
     const requestId = `${session.runId}:${turnId}`;
@@ -184,14 +185,15 @@ export class ModelEffectRunner {
     const state: ModelReservationState = { settled: false };
     try {
       const response = await this.stream(
-        session, turnId, turn.messages, turn.tools, signal, turn.budget.routeConstraints
+        session, turnId, turn.messages, turn.tools, signal, turn.budget.routeConstraints, state
       );
-      signal.throwIfAborted();
       await this.completeReservation(
         session, turnId, effectRevision, signal, turn, requestId, reservationId, response, startedAt, state
       );
     } catch (error) {
-      if (!state.settled) await this.commitFailure(session, turn, requestId, reservationId, startedAt, error);
+      if (!state.settled && !state.response) {
+        await this.commitFailure(session, turn, requestId, reservationId, startedAt, error);
+      }
       throw error;
     }
   }
@@ -208,7 +210,6 @@ export class ModelEffectRunner {
     startedAt: number,
     state: ModelReservationState
   ): Promise<void> {
-    await this.emitResolvedRoute(session, response);
     const usage = successfulModelUsage(
       session,
       session.gateway,
@@ -219,8 +220,9 @@ export class ModelEffectRunner {
       performance.now() - startedAt,
       session.modelRole
     );
-    await this.options.budgets.commit(session, reservationId, consumedBudget(usage, turn.budget));
+    await this.options.budgets.commitMeasured(session, reservationId, consumedBudget(usage, turn.budget));
     state.settled = true;
+    await this.emitResolvedRoute(session, response);
     await this.options.emit(session, "usage.recorded", "runtime", usage);
     await this.options.emit(session, "model.completed", "runtime", {
       model: usage.modelId,
@@ -284,7 +286,8 @@ export class ModelEffectRunner {
     messages: ModelMessage[],
     tools: ModelToolDefinition[],
     signal: AbortSignal,
-    routeConstraints?: ModelRouteConstraints
+    routeConstraints: ModelRouteConstraints | undefined,
+    state: ModelReservationState
   ): Promise<ModelResponse> {
     let response: ModelResponse | undefined;
     let contentDelta = "";
@@ -321,10 +324,13 @@ export class ModelEffectRunner {
       if (signal.aborted) throw signal.reason;
       if (event.type === "content") contentDelta += event.delta;
       else if (event.type === "reasoning") reasoningDelta += event.delta;
-      else if (event.type === "done") response = event.response;
+      else if (event.type === "done") {
+        response = event.response;
+        state.response = event.response;
+      }
       if (Date.now() - lastFlush >= 33) await flush();
     }
-    signal.throwIfAborted();
+    if (!response) signal.throwIfAborted();
     await flush();
     if (!response) throw new Error("Model stream ended without a final response.");
     return response;

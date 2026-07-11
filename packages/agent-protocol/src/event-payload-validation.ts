@@ -153,6 +153,23 @@ function budgetExhaustedPayload(payload: unknown): boolean {
     && nonNegativeInteger(item.available));
 }
 
+function budgetOverrunPayload(payload: unknown): boolean {
+  const item = record(payload);
+  if (!item || !text(item.reservationId) || !Array.isArray(item.dimensions) || item.dimensions.length === 0) return false;
+  return item.dimensions.every((value) => {
+    const dimension = record(value);
+    return Boolean(dimension && text(dimension.dimension)
+      && ["inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children"]
+        .includes(String(dimension.dimension))
+      && nonNegativeInteger(dimension.reserved)
+      && nonNegativeInteger(dimension.actual)
+      && nonNegativeInteger(dimension.overReservation)
+      && nonNegativeInteger(dimension.limit)
+      && nonNegativeInteger(dimension.consumed)
+      && nonNegativeInteger(dimension.overLimit));
+  });
+}
+
 function reviewStartedPayload(payload: unknown): boolean {
   const item = record(payload);
   return Boolean(item && text(item.reviewerId) && textArray(item.workspaceDeltaEvidenceIds));
@@ -177,6 +194,7 @@ const VALIDATORS: Partial<Record<string, PayloadValidator>> = {
   "budget.committed": budgetPayload,
   "budget.released": budgetPayload,
   "budget.exhausted": budgetExhaustedPayload,
+  "budget.overrun": budgetOverrunPayload,
   "budget.limit_increased": (payload) => isBudgetLedgerState(record(payload)?.ledger),
   "process.spawned": processSpawnedPayload,
   "process.output": processOutputPayload,

@@ -66,9 +66,9 @@ export class ChildBudgetControl {
     const consumed = Object.fromEntries(BUDGET_KEYS.map((key) => {
       const raw = reported[key] ?? 0;
       const amount = key === "children" ? raw + 1 : raw;
-      return [key, Math.min(reservation.requested[key], Math.max(0, Number.isSafeInteger(amount) ? amount : 0))];
+      return [key, Math.max(0, Number.isSafeInteger(amount) ? amount : 0)];
     })) as unknown as BudgetAmounts;
-    await this.budgets.commit(session, reservation.reservationId, consumed);
+    await this.budgets.commitMeasured(session, reservation.reservationId, consumed);
   }
 
   async release(session: RuntimeSession, childId: string): Promise<void> {

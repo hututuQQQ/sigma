@@ -64,8 +64,11 @@ function assertUniqueProcessIds(state: KernelState): void {
 
 function assertBudgetLimits(state: KernelState): void {
   for (const dimension of ["inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children"] as const) {
-    if (state.budget.consumed[dimension] + state.budget.reserved[dimension] > state.budget.limits[dimension]) {
-      throw new Error(`Budget dimension '${dimension}' exceeds its hard limit.`);
+    const active = state.budget.reservations
+      .filter((reservation) => reservation.status === "reserved")
+      .reduce((total, reservation) => total + reservation.requested[dimension], 0);
+    if (active !== state.budget.reserved[dimension]) {
+      throw new Error(`Budget dimension '${dimension}' does not match its active reservations.`);
     }
   }
 }

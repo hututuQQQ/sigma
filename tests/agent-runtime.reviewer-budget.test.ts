@@ -43,7 +43,8 @@ class ReviewerGateway implements ModelGateway {
 
   constructor(
     private readonly failure?: Error,
-    private readonly content = '{"verdict":"approved","findings":[]}'
+    private readonly content = '{"verdict":"approved","findings":[]}',
+    private readonly reportedInputTokens = 80
   ) {}
 
   async complete(_request: ModelRequest): Promise<ModelResponse> {
@@ -53,7 +54,7 @@ class ReviewerGateway implements ModelGateway {
       message: { role: "assistant", content: this.content },
       finishReason: "stop",
       usage: {
-        inputTokens: 80,
+        inputTokens: this.reportedInputTokens,
         outputTokens: 10,
         reasoningTokens: 0,
         cacheReadTokens: 0,
@@ -297,6 +298,18 @@ describe("independent reviewer budget accounting", () => {
     expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
+  it("settles provider-reported reviewer usage above its reservation", async () => {
+    const target = runtimeSession();
+    const gateway = new ReviewerGateway(undefined, undefined, 175);
+    const { budgets, emit } = harness(target);
+
+    await new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets)
+      .maybeReview(target, new AbortController().signal);
+
+    expect(target.state.budget.consumed.inputTokens).toBe(175);
+    expect(target.state.budget.reserved.inputTokens).toBe(0);
+  });
+
   it("settles a failed reviewer attempt conservatively without approving it", async () => {
     const target = runtimeSession();
     const gateway = new ReviewerGateway(new Error("provider unavailable"));
@@ -307,7 +320,7 @@ describe("independent reviewer budget accounting", () => {
 
     expect(gateway.calls).toBe(1);
     expect(target.state.budget.reserved.inputTokens).toBe(0);
-    expect(target.state.budget.consumed).toMatchObject({ inputTokens: 120, outputTokens: 0, modelTurns: 1 });
+    expect(target.state.budget.consumed).toMatchObject({ inputTokens: 150, outputTokens: 0, modelTurns: 1 });
     expect(target.state.usage[0]).toMatchObject({ role: "reviewer", providerReported: false });
     expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({
       status: "failed",

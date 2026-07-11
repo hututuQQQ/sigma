@@ -100,6 +100,13 @@ function payloadFor(type: AgentEventType): unknown {
   }
   if (type === "budget.limit_increased") return { ledger: createBudgetLedger(), increase: { toolCalls: 1 } };
   if (type === "budget.exhausted") return { dimension: "toolCalls", requested: 1, available: 0 };
+  if (type === "budget.overrun") return {
+    reservationId: "reservation",
+    dimensions: [{
+      dimension: "inputTokens", reserved: 120, actual: 130, overReservation: 10,
+      limit: 125, consumed: 130, overLimit: 5
+    }]
+  };
   if (type === "process.spawned") return { processId: "process", executionId: "execution", mode: "background" };
   if (type === "process.output") return { processId: "process", stream: "stdout", chunk: "output" };
   if (type === "process.exited") return { processId: "process", exitCode: 0 };

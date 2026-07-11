@@ -77,6 +77,7 @@ export const AGENT_EVENT_TYPES = [
   "budget.committed",
   "budget.released",
   "budget.exhausted",
+  "budget.overrun",
   "budget.limit_increased",
   "checkpoint.created",
   "checkpoint.sealed",
@@ -193,6 +194,18 @@ export interface AgentEventPayloadMap {
   "budget.committed": { ledger: BudgetLedgerState; reservationId: string };
   "budget.released": { ledger: BudgetLedgerState; reservationId: string };
   "budget.exhausted": JsonPayload & { dimension: string; requested: number; available: number };
+  "budget.overrun": JsonPayload & {
+    reservationId: string;
+    dimensions: Array<{
+      dimension: string;
+      reserved: number;
+      actual: number;
+      overReservation: number;
+      limit: number;
+      consumed: number;
+      overLimit: number;
+    }>;
+  };
   "budget.limit_increased": JsonPayload & { ledger: BudgetLedgerState };
   "checkpoint.created": CheckpointRef;
   "checkpoint.sealed": CheckpointRef;

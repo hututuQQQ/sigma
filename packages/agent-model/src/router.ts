@@ -131,8 +131,14 @@ function capabilityFailure(spec: ModelSpec, required: Partial<ModelCapabilities>
   return undefined;
 }
 
+export const APPROXIMATE_TOKEN_RESERVATION_MARGIN = 1.5;
+
+function tokenizerMargin(spec: ModelSpec): number {
+  return spec.tokenizer.accuracy === "approximate" ? APPROXIMATE_TOKEN_RESERVATION_MARGIN : 1;
+}
+
 function contextRequirement(spec: ModelSpec, constraints: ModelRouteConstraints): number {
-  const margin = spec.tokenizer.accuracy === "approximate" ? 1.2 : 1;
+  const margin = tokenizerMargin(spec);
   const input = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
   const output = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
   return input + output;
@@ -148,7 +154,7 @@ export function modelReservationEstimate(
   spec: ModelSpec,
   constraints: Pick<ModelRouteConstraints, "estimatedInputTokens" | "maxOutputTokens">
 ): ModelReservationEstimate {
-  const margin = spec.tokenizer.accuracy === "approximate" ? 1.2 : 1;
+  const margin = tokenizerMargin(spec);
   const inputTokens = Math.ceil((constraints.estimatedInputTokens ?? 0) * margin);
   const outputTokens = Math.ceil((constraints.maxOutputTokens ?? spec.capabilities.maxOutputTokens) * margin);
   if (!spec.pricing) return { inputTokens, outputTokens, costMicroUsd: null };

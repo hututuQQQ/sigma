@@ -181,9 +181,9 @@ export class ReviewCoordinator {
       await this.recoverInterruptedReview(session, reviewer, reviewerId, input, requestId, prior);
       return;
     }
-    const remainingCost = session.state.budget.limits.costMicroUsd
+    const remainingCost = Math.max(0, session.state.budget.limits.costMicroUsd
       - session.state.budget.consumed.costMicroUsd
-      - session.state.budget.reserved.costMicroUsd;
+      - session.state.budget.reserved.costMicroUsd);
     const prepared = await reviewer.prepareReview(input, remainingCost);
     const reservationId = await this.budgets!.reserve(session, ownerId, prepared.budget.reserved);
     await this.emit(session, "review.started", "runtime", {
@@ -211,7 +211,7 @@ export class ReviewCoordinator {
       return;
     }
     const usage = stableUsage(result.usage, requestId);
-    await this.budgets!.commit(session, reservationId, consumedBudget(usage, prepared.budget));
+    await this.budgets!.commitMeasured(session, reservationId, consumedBudget(usage, prepared.budget));
     await this.emit(session, "usage.recorded", "runtime", usage);
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session, result.evidence, input.workspaceDeltas

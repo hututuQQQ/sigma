@@ -447,6 +447,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
 
     const ledger = createBudgetLedger();
     ledger.reserved.inputTokens = 100;
+    ledger.reservations.push({
+      reservationId: "reservation",
+      ownerId: "model:request",
+      status: "reserved",
+      requested: { ...ledger.reserved },
+      consumed: { ...ledger.consumed },
+      createdAt: "2026-01-01T00:00:00.000Z"
+    });
     state = apply(state, "budget.reserved", { reservationId: "reservation", ledger } as unknown as JsonValue);
     expect(state.budget.reserved.inputTokens).toBe(100);
 
@@ -605,10 +613,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       [{ ...base, budget: { ...base.budget, reservations: [reservation, { ...reservation }] } }, "Duplicate budget"],
       [{ ...base, budget: {
         ...base.budget,
-        limits: { ...base.budget.limits, inputTokens: 1 },
-        consumed: { ...base.budget.consumed, inputTokens: 1 },
         reserved: { ...base.budget.reserved, inputTokens: 1 }
-      } }, "exceeds its hard limit"],
+      } }, "does not match its active reservations"],
       [{ ...base, toolCallIds: ["same", "same"] }, "Duplicate run tool"],
       [{ ...base, phase: "tool_pending", pendingTools: [{
         request: { callId: "missing", name: "read", arguments: null },

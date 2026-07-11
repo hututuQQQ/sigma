@@ -56,14 +56,14 @@ class HookGateway implements ModelGateway {
   readonly requests: ModelRequest[] = [];
   countCalls = 0;
 
-  constructor(private readonly content: string) {}
+  constructor(private readonly content: string, private readonly usage = modelUsage) {}
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     this.requests.push(request);
     return {
       message: { role: "assistant", content: this.content },
       finishReason: "stop",
-      usage: modelUsage
+      usage: this.usage
     };
   }
 
@@ -196,7 +196,7 @@ describe("production agent-profile hook runner", () => {
   it("resolves the hook target profile deterministically and shares the session budget", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-profile-hook-route-"));
     fixtures.push(root);
-    const gateway = new HookGateway("{}");
+    const gateway = new HookGateway("{}", { ...modelUsage, inputTokens: 175 });
     const rootProfile = profile("root", ["model-policy"]);
     const policyProfile = profile("policy");
     const routed: Array<{ role: string; profileId?: string }> = [];
@@ -218,7 +218,7 @@ describe("production agent-profile hook runner", () => {
     const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     expect(routed).toContainEqual({ role: "planner", profileId: "policy" });
     expect(runtime.sessionBudget(session.sessionId)).toMatchObject({
-      consumed: { inputTokens: 12, outputTokens: 3, modelTurns: 1 },
+      consumed: { inputTokens: 175, outputTokens: 3, modelTurns: 1 },
       reserved: { inputTokens: 0, outputTokens: 0, modelTurns: 0 }
     });
   });

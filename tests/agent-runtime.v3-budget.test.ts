@@ -50,6 +50,49 @@ function controller(target: RuntimeSession): BudgetController {
 }
 
 describe("V3 shared budget ledger", () => {
+  it("reconciles provider-measured usage above its reservation without discarding the charge", async () => {
+    const target = session(limits({ inputTokens: 1_000 }));
+    const events: string[] = [];
+    const budgets = new BudgetController(async (_session, type, _authority, value) => {
+      events.push(type);
+      if (type === "budget.reserved" || type === "budget.committed") {
+        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+      }
+      return event();
+    });
+    const reservationId = await budgets.reserve(target, "model:measured", {
+      inputTokens: 120, costMicroUsd: 120, modelTurns: 1
+    });
+    await expect(budgets.commitMeasured(target, reservationId, {
+      inputTokens: 130, costMicroUsd: 130, modelTurns: 1
+    })).resolves.toMatchObject({
+      overReservation: { inputTokens: 10, costMicroUsd: 10 }, overLimit: {}
+    });
+    expect(target.state.budget.consumed.inputTokens).toBe(130);
+    expect(target.state.budget.consumed.costMicroUsd).toBe(130);
+    expect(target.state.budget.reserved.inputTokens).toBe(0);
+    expect(events).toEqual(["budget.reserved", "budget.committed"]);
+  });
+
+  it("records measured overrun and rejects subsequent admission with non-negative availability", async () => {
+    const target = session(limits({ inputTokens: 125 }));
+    const overruns: unknown[] = [];
+    const budgets = new BudgetController(async (_session, type, _authority, value) => {
+      if (type === "budget.committed" || type === "budget.reserved") {
+        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+      } else if (type === "budget.overrun") overruns.push(value);
+      return event();
+    });
+    const reservationId = await budgets.reserve(target, "model:overrun", { inputTokens: 120, modelTurns: 1 });
+    await budgets.commitMeasured(target, reservationId, { inputTokens: 130, modelTurns: 1 });
+    expect(overruns).toContainEqual(expect.objectContaining({
+      reservationId,
+      dimensions: [expect.objectContaining({ dimension: "inputTokens", overLimit: 5 })]
+    }));
+    await expect(budgets.reserve(target, "model:next", { inputTokens: 1 }))
+      .rejects.toMatchObject({ code: "budget_exhausted", available: 0 });
+  });
+
   it("allows only an explicit additive user budget increase without resetting usage", async () => {
     const target = session(limits({ inputTokens: 100, maxDepth: 2 }));
     target.state.budget.consumed.inputTokens = 25;

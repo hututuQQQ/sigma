@@ -18,6 +18,22 @@ const DIMENSIONS = [
   "inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children"
 ] as const satisfies readonly (keyof BudgetAmounts)[];
 
+export interface MeasuredBudgetOverrun {
+  dimension: keyof BudgetAmounts;
+  reserved: number;
+  actual: number;
+  overReservation: number;
+  limit: number;
+  consumed: number;
+  overLimit: number;
+}
+
+export interface MeasuredBudgetSettlement {
+  overReservation: Partial<BudgetAmounts>;
+  overLimit: Partial<BudgetAmounts>;
+  overruns: readonly MeasuredBudgetOverrun[];
+}
+
 export class BudgetExceededError extends Error {
   readonly code = "budget_exhausted";
 
@@ -124,6 +140,51 @@ export class BudgetController {
       }
       const next = settle(ledger, reservation, "committed", actual);
       await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+    });
+  }
+
+  async commitMeasured(
+    session: RuntimeSession,
+    reservationId: string,
+    actualInput: Partial<BudgetAmounts>
+  ): Promise<MeasuredBudgetSettlement> {
+    return await this.serial(session.sessionId, async () => {
+      const ledger = session.state.budget;
+      const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
+      if (!reservation || reservation.status !== "reserved") {
+        throw new Error(`Unknown active budget reservation '${reservationId}'.`);
+      }
+      const actual = amounts(actualInput);
+      const next = settle(ledger, reservation, "committed", actual);
+      const overruns = DIMENSIONS.flatMap((dimension): MeasuredBudgetOverrun[] => {
+        const overReservation = Math.max(0, actual[dimension] - reservation.requested[dimension]);
+        const overLimit = Math.max(0, next.consumed[dimension] + next.reserved[dimension] - next.limits[dimension]);
+        return overReservation === 0 && overLimit === 0 ? [] : [{
+          dimension,
+          reserved: reservation.requested[dimension],
+          actual: actual[dimension],
+          overReservation,
+          limit: next.limits[dimension],
+          consumed: next.consumed[dimension],
+          overLimit
+        }];
+      });
+      await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+      const overLimitDimensions = overruns.filter((item) => item.overLimit > 0);
+      if (overLimitDimensions.length > 0) {
+        await this.emit(session, "budget.overrun", "runtime", {
+          reservationId,
+          dimensions: overLimitDimensions
+        });
+      }
+      return {
+        overReservation: Object.fromEntries(overruns
+          .filter((item) => item.overReservation > 0)
+          .map((item) => [item.dimension, item.overReservation])) as Partial<BudgetAmounts>,
+        overLimit: Object.fromEntries(overLimitDimensions
+          .map((item) => [item.dimension, item.overLimit])) as Partial<BudgetAmounts>,
+        overruns
+      };
     });
   }
 
@@ -248,7 +309,7 @@ export class BudgetController {
     await this.assertDepthLocked(session, requiredDepth);
     for (const dimension of DIMENSIONS) {
       const used = ledger.consumed[dimension] + ledger.reserved[dimension];
-      const available = ledger.limits[dimension] - used;
+      const available = Math.max(0, ledger.limits[dimension] - used);
       if (requested[dimension] > available) {
         await this.emit(session, "budget.exhausted", "runtime", {
           dimension, requested: requested[dimension], available

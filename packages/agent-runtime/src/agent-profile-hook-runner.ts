@@ -13,7 +13,7 @@ import type {
   ModelRequest,
   ModelResponse
 } from "agent-protocol";
-import type { ModelRouteConstraints } from "agent-model";
+import { APPROXIMATE_TOKEN_RESERVATION_MARGIN, type ModelRouteConstraints } from "agent-model";
 import type { BudgetController } from "./budget-controller.js";
 import {
   consumedBudget,
@@ -271,11 +271,11 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
     const maxOutputTokens = Math.min(
       this.options.maxOutputTokens ?? 2_048,
       gateway.capabilities.maxOutputTokens,
-      Math.max(1, Math.floor(remainingOutputTokens / 1.2))
+      Math.max(1, Math.floor(remainingOutputTokens / APPROXIMATE_TOKEN_RESERVATION_MARGIN))
     );
-    const remainingCost = session.state.budget.limits.costMicroUsd
+    const remainingCost = Math.max(0, session.state.budget.limits.costMicroUsd
       - session.state.budget.consumed.costMicroUsd
-      - session.state.budget.reserved.costMicroUsd;
+      - session.state.budget.reserved.costMicroUsd);
     let prepared;
     try {
       prepared = await prepareModelBudget(gateway, hookMessages, [], maxOutputTokens, remainingCost);
@@ -323,7 +323,7 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
       performance.now() - startedAt,
       "planner"
     );
-    await this.options.budgets.commit(session, reservationId, consumedBudget(usage, prepared));
+    await this.options.budgets.commitMeasured(session, reservationId, consumedBudget(usage, prepared));
     await this.options.emit(session, "usage.recorded", "runtime", usage);
     return this.outputResult(response, request.policy.maxOutputBytes, startedAt);
   }
