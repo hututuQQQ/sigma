@@ -15,6 +15,7 @@ import {
   type McpClientHooks,
   type McpNotification,
   type McpProgress,
+  type McpProcessExecution,
   type McpRequestOptions,
   type McpServerInfo,
   type McpStdioServerConfig,
@@ -30,6 +31,8 @@ interface PendingRequest {
   progressToken: string;
   cancellable: boolean;
   idleTimeoutMs: number;
+  hardDeadlineAt: number;
+  hardDeadlineMs: number;
   resolve(value: unknown): void;
   reject(error: Error): void;
   onProgress?: McpRequestOptions["onProgress"];
@@ -63,7 +66,8 @@ export class McpStdioClient {
 
   constructor(
     private readonly config: McpStdioServerConfig,
-    private readonly hooks: McpClientHooks = {}
+    private readonly hooks: McpClientHooks = {},
+    execution?: McpProcessExecution
   ) {
     const settings = resolveMcpClientSettings(config);
     this.timeouts = settings.timeouts;
@@ -72,7 +76,7 @@ export class McpStdioClient {
       onMessage: (message) => this.handleMessage(message),
       onFailure: (error) => this.fail(error, false),
       onStderr: hooks.onStderr
-    }, settings.maxMessageBytes, settings.maxStderrBytes, settings.timeouts.shutdownGraceMs);
+    }, settings.maxMessageBytes, settings.maxStderrBytes, settings.timeouts.shutdownGraceMs, execution);
   }
 
   get state(): ClientState { return this.stateValue; }
@@ -172,6 +176,8 @@ export class McpStdioClient {
         progressToken,
         cancellable: settings.cancellable !== false && method !== "initialize",
         idleTimeoutMs,
+        hardDeadlineAt: performance.now() + hardDeadlineMs,
+        hardDeadlineMs,
         resolve,
         reject,
         onProgress: settings.onProgress,
@@ -195,10 +201,15 @@ export class McpStdioClient {
 
   private armIdle(pending: PendingRequest): void {
     clearTimeout(pending.idleTimer);
-    pending.idleTimer = setTimeout(() => this.cancelPending(pending, new McpTimeoutError(
-      "idle",
-      `MCP '${pending.method}' was idle for ${pending.idleTimeoutMs}ms.`
-    )), pending.idleTimeoutMs);
+    pending.idleTimer = setTimeout(() => {
+      const deadlineElapsed = performance.now() >= pending.hardDeadlineAt;
+      this.cancelPending(pending, new McpTimeoutError(
+        deadlineElapsed ? "deadline" : "idle",
+        deadlineElapsed
+          ? `MCP '${pending.method}' exceeded its ${pending.hardDeadlineMs}ms hard deadline.`
+          : `MCP '${pending.method}' was idle for ${pending.idleTimeoutMs}ms.`
+      ));
+    }, pending.idleTimeoutMs);
     pending.idleTimer.unref();
   }
 

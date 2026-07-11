@@ -111,7 +111,7 @@ describe("CLI init and replay branches", () => {
     expect(help.text()).toContain("agent init");
 
     const json = new Capture();
-    await expect(runInitCommand(["--workspace", root, "--profile", "ci", "--json"], { stdout: json })).resolves.toBe(0);
+    await expect(runInitCommand(["--workspace", root, "--init-profile", "ci", "--json"], { stdout: json })).resolves.toBe(0);
     expect(JSON.parse(json.text())).toMatchObject({ ok: true, profile: "ci" });
     expect(await readFile(path.join(root, ".agent", "config.toml"), "utf8")).toContain('mode = "auto"');
 
@@ -121,7 +121,7 @@ describe("CLI init and replay branches", () => {
 
     const forced = new Capture();
     await expect(runInitCommand([
-      "--workspace", root, "--profile", "team", "--permission-mode", "deny", "--force"
+      "--workspace", root, "--init-profile", "team", "--permission-mode", "deny", "--force"
     ], { stdout: forced })).resolves.toBe(0);
     expect(forced.text()).toContain("initialized");
     expect(await readFile(path.join(root, ".agent", "config.toml"), "utf8")).toContain('mode = "deny"');
@@ -129,7 +129,7 @@ describe("CLI init and replay branches", () => {
 
   it("reports invalid init options", async () => {
     const stderr = new Capture();
-    await expect(runInitCommand(["--profile", "unknown"], { stderr })).resolves.toBe(1);
+    await expect(runInitCommand(["--init-profile", "unknown"], { stderr })).resolves.toBe(1);
     expect(stderr.text()).toContain("must be one of");
   });
 
@@ -259,10 +259,55 @@ describe("CLI session branches", () => {
     expect(runtime.commands.at(-1)).toEqual({
       type: "approve", sessionId: "defaults", requestId: "request-default", decision: "allow"
     });
+    await expect(runSessionCommand([
+      "recover", "stored", "checkpoint-one", "--restore"
+    ], { runtime, stdout: new Capture() })).resolves.toBe(0);
+    expect(runtime.commands.at(-1)).toEqual({
+      type: "checkpoint_recovery",
+      sessionId: "stored",
+      checkpointId: "checkpoint-one",
+      decision: "restore"
+    });
+    await expect(runSessionCommand([
+      "budget", "stored", "--max-input-tokens", "500", "--max-agent-depth", "1"
+    ], { runtime, stdout: new Capture() })).resolves.toBe(0);
+    expect(runtime.commands.at(-1)).toEqual({
+      type: "budget_increase", sessionId: "stored", increase: { inputTokens: 500, maxDepth: 1 }
+    });
+    await expect(runSessionCommand([
+      "waive-reviewer", "stored", "checkpoint-three", "--reason", "Reviewed directly by the operator."
+    ], { runtime, stdout: new Capture() })).resolves.toBe(0);
+    expect(runtime.commands.at(-1)).toEqual({
+      type: "reviewer_waiver",
+      sessionId: "stored",
+      checkpointId: "checkpoint-three",
+      reason: "Reviewed directly by the operator."
+    });
+    await expect(runSessionCommand([
+      "waive-reviewer", "stored", "--reason", "Use the latest pending checkpoint."
+    ], { runtime, stdout: new Capture() })).resolves.toBe(0);
+    expect(runtime.commands.at(-1)).toEqual({
+      type: "reviewer_waiver", sessionId: "stored", reason: "Use the latest pending checkpoint."
+    });
 
     const missingRequest = new Capture();
     await expect(runSessionCommand(["approve", "stored"], { runtime, stderr: missingRequest })).resolves.toBe(1);
     expect(missingRequest.text()).toContain("requires a request id");
+    const invalidRecovery = new Capture();
+    await expect(runSessionCommand([
+      "recover", "stored", "checkpoint-one", "--restore", "--keep"
+    ], { runtime, stderr: invalidRecovery })).resolves.toBe(1);
+    expect(invalidRecovery.text()).toContain("exactly one");
+    const invalidBudget = new Capture();
+    await expect(runSessionCommand([
+      "budget", "stored", "--max-tool-calls", "-1"
+    ], { runtime, stderr: invalidBudget })).resolves.toBe(1);
+    expect(invalidBudget.text()).toContain("maxToolCalls");
+    const invalidWaiver = new Capture();
+    await expect(runSessionCommand([
+      "waive-reviewer", "stored"
+    ], { runtime, stderr: invalidWaiver })).resolves.toBe(1);
+    expect(invalidWaiver.text()).toContain("requires --reason");
     const unknown = new Capture();
     await expect(runSessionCommand(["unknown", "stored"], { runtime, stderr: unknown })).resolves.toBe(1);
     expect(unknown.text()).toContain("Unknown session command");
@@ -295,7 +340,33 @@ describe("CLI session branches", () => {
     ], { runtime, stderr: approval, activeSessionOwner: activeOwner })).resolves.toBe(1);
     expect(approval.text()).toContain("controlling TUI");
 
-    expect(sent).toEqual([{ type: "cancel", sessionId: "active", reason: "operator" }]);
+    await expect(runSessionCommand([
+      "recover", "active", "checkpoint-two", "--workspace", root, "--keep"
+    ], { runtime, stdout: new Capture(), activeSessionOwner: activeOwner, sendSessionCommand: sendCommand })).resolves.toBe(0);
+    await expect(runSessionCommand([
+      "budget", "active", "--workspace", root, "--max-model-turns", "8"
+    ], { runtime, stdout: new Capture(), activeSessionOwner: activeOwner, sendSessionCommand: sendCommand })).resolves.toBe(0);
+    await expect(runSessionCommand([
+      "waive-reviewer", "active", "checkpoint-three", "--workspace", root,
+      "--reason", "Explicit operator decision."
+    ], { runtime, stdout: new Capture(), activeSessionOwner: activeOwner, sendSessionCommand: sendCommand })).resolves.toBe(0);
+
+    expect(sent).toEqual([
+      { type: "cancel", sessionId: "active", reason: "operator" },
+      {
+        type: "checkpoint_recovery",
+        sessionId: "active",
+        checkpointId: "checkpoint-two",
+        decision: "keep"
+      },
+      { type: "budget_increase", sessionId: "active", increase: { modelTurns: 8 } },
+      {
+        type: "reviewer_waiver",
+        sessionId: "active",
+        checkpointId: "checkpoint-three",
+        reason: "Explicit operator decision."
+      }
+    ]);
 
     const unknown = new Capture();
     await expect(runSessionCommand(["unknown", "active", "--workspace", root], {

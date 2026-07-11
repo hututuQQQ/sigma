@@ -5,7 +5,7 @@ export interface CommandDefinition {
   aliases?: string[];
   summary: string;
   mode?: RunMode;
-  handler: "run" | "tui" | "session" | "replay" | "doctor" | "version" | "init" | "completion";
+  handler: "run" | "tui" | "session" | "replay" | "doctor" | "sandbox" | "version" | "init" | "config" | "completion";
   sessionAction?: "list" | "cancel" | "resume" | "approve";
 }
 
@@ -20,8 +20,10 @@ export const SIGMA_COMMANDS: readonly CommandDefinition[] = [
   { name: "approval", summary: "Resolve a pending approval", handler: "session", sessionAction: "approve" },
   { name: "replay", summary: "Replay an event stream", handler: "replay" },
   { name: "doctor", summary: "Check runtime configuration", handler: "doctor" },
+  { name: "sandbox", summary: "Check or prepare the native execution sandbox", handler: "sandbox" },
   { name: "version", summary: "Print version information", handler: "version" },
   { name: "init", summary: "Create .agent/config.toml", handler: "init" },
+  { name: "config", summary: "Inspect or migrate configuration", handler: "config" },
   { name: "completion", summary: "Generate shell completion", handler: "completion" }
 ];
 

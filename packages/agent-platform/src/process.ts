@@ -1,9 +1,23 @@
-import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
+import type {
+  BrokerRequestOptions,
+  ExecutionRequest,
+  ExecutionResult,
+  ProcessHandle,
+  ProcessPollResult
+} from "agent-execution";
+import { BrokerCancelledError } from "agent-execution";
 import type { ShellKind } from "./environment.js";
 
+export interface ProcessExecutionPort {
+  readonly lostProcessHandles?: readonly ProcessHandle[];
+  execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
+  terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
+  releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
+}
+
 export interface ProcessRequest {
+  execution: ProcessExecutionPort;
   executable: string;
   args: string[];
   cwd: string;
@@ -13,6 +27,11 @@ export interface ProcessRequest {
   maxOutputBytes?: number;
   maxStdoutLines?: number;
   signal: AbortSignal;
+  readRoots?: string[];
+  writeRoots?: string[];
+  protectedPaths?: string[];
+  network?: "none" | "full";
+  networkApproved?: boolean;
 }
 
 export interface ProcessResult {
@@ -26,163 +45,92 @@ export interface ProcessResult {
   outputTruncated: boolean;
 }
 
-function boundedAppend(current: string, chunk: string, maximum: number): string {
-  const next = `${current}${chunk}`;
-  return next.length <= maximum ? next : `[truncated ${next.length - maximum} chars]\n${next.slice(-maximum)}`;
-}
+export class ProcessExecutionUnavailableError extends Error {
+  readonly code = "sandbox_unavailable";
 
-class ProcessOutputCapture {
-  stdout = "";
-  stderr = "";
-  stdoutLimitReached = false;
-  outputTruncated = false;
-  private stdoutPending = "";
-  private stdoutLines = 0;
-
-  constructor(private readonly maximum: number, private readonly lineLimit?: number) {}
-
-  appendStdout(value: string): boolean {
-    if (this.lineLimit === undefined) {
-      this.append("stdout", value);
-      return false;
-    }
-    this.stdoutPending += value;
-    while (this.stdoutLines < this.lineLimit) {
-      const newline = this.stdoutPending.indexOf("\n");
-      if (newline < 0) break;
-      this.append("stdout", this.stdoutPending.slice(0, newline + 1));
-      this.stdoutPending = this.stdoutPending.slice(newline + 1);
-      this.stdoutLines += 1;
-    }
-    if (this.stdoutLines < this.lineLimit) return false;
-    this.stdoutPending = "";
-    this.stdoutLimitReached = true;
-    return true;
-  }
-
-  appendStderr(value: string): void { this.append("stderr", value); }
-
-  finish(): void {
-    if (this.lineLimit !== undefined && this.stdoutPending && this.stdoutLines < this.lineLimit) {
-      this.append("stdout", this.stdoutPending);
-      this.stdoutPending = "";
-    }
-  }
-
-  private append(stream: "stdout" | "stderr", value: string): void {
-    if (this[stream].length + value.length > this.maximum) this.outputTruncated = true;
-    this[stream] = boundedAppend(this[stream], value, this.maximum);
+  constructor() {
+    super("Process execution requires an explicitly injected sandbox execution port.");
+    this.name = "ProcessExecutionUnavailableError";
   }
 }
 
-function finishDecodedOutput(
-  output: ProcessOutputCapture,
-  stdoutDecoder: StringDecoder,
-  stderrDecoder: StringDecoder
-): void {
-  const stdoutTail = stdoutDecoder.end();
-  const stderrTail = stderrDecoder.end();
-  if (stdoutTail) output.appendStdout(stdoutTail);
-  if (stderrTail) output.appendStderr(stderrTail);
-  output.finish();
+function limitedLines(value: string, maximum: number | undefined): { value: string; limited: boolean } {
+  if (maximum === undefined) return { value, limited: false };
+  let lines = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "\n") continue;
+    lines += 1;
+    if (lines === maximum && index + 1 < value.length) {
+      return { value: value.slice(0, index + 1), limited: true };
+    }
+  }
+  return { value, limited: false };
 }
 
-export function terminateProcessTree(child: ChildProcess, force = false): void {
-  if (child.exitCode !== null || !child.pid) return;
-  if (process.platform === "win32") {
-    const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
-      windowsHide: true,
-      shell: false,
-      stdio: "ignore"
-    });
-    killer.on("error", () => { child.kill(); });
-    return;
-  }
-  const signal = force ? "SIGKILL" : "SIGTERM";
-  try {
-    process.kill(-child.pid, signal);
-  } catch {
-    child.kill(signal);
-  }
+function executionRequest(request: ProcessRequest): ExecutionRequest {
+  const cwd = path.resolve(request.cwd);
+  const readRoots = (request.readRoots ?? [cwd]).map((root) => path.resolve(root));
+  const writeRoots = (request.writeRoots ?? []).map((root) => path.resolve(root));
+  const network = request.network ?? "none";
+  return {
+    command: {
+      executable: request.executable,
+      args: request.args,
+      cwd,
+      ...(request.env ? { environment: { overrides: request.env } } : {})
+    },
+    policy: {
+      sandbox: "required",
+      network,
+      networkApproved: network === "full" && request.networkApproved === true,
+      readRoots,
+      writeRoots,
+      protectedPaths: request.protectedPaths ?? [path.join(cwd, ".git"), path.join(cwd, ".agent")]
+    },
+    timeoutMs: request.timeoutMs,
+    idleTimeoutMs: request.idleTimeoutMs,
+    maxOutputBytes: request.maxOutputBytes
+  };
 }
 
 export async function runProcess(request: ProcessRequest): Promise<ProcessResult> {
-  if (request.signal.aborted) throw request.signal.reason ?? new Error("Process cancelled.");
-  const startedAt = Date.now();
-  const maxOutput = request.maxOutputBytes ?? 1_000_000;
-  return await new Promise<ProcessResult>((resolve, reject) => {
-    const child = spawn(request.executable, request.args, {
-      cwd: path.resolve(request.cwd),
-      env: { ...process.env, ...request.env },
-      windowsHide: true,
-      detached: process.platform !== "win32",
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    const output = new ProcessOutputCapture(maxOutput, request.maxStdoutLines);
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    let timedOut = false;
-    let cancelled = false;
-    let settled = false;
-    const finish = (exitCode: number | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (idleTimer) clearTimeout(idleTimer);
-      request.signal.removeEventListener("abort", onAbort);
-      finishDecodedOutput(output, stdoutDecoder, stderrDecoder);
-      resolve({
-        exitCode, stdout: output.stdout, stderr: output.stderr, timedOut, cancelled,
-        durationMs: Date.now() - startedAt,
-        stdoutLimitReached: output.stdoutLimitReached, outputTruncated: output.outputTruncated
-      });
+  request.signal.throwIfAborted();
+  if (!request.execution) throw new ProcessExecutionUnavailableError();
+  const startedAt = performance.now();
+  let result: ExecutionResult;
+  try {
+    result = await request.execution.execute(executionRequest(request), { signal: request.signal });
+  } catch (error) {
+    const cancelled = error instanceof BrokerCancelledError
+      || (error !== null && typeof error === "object"
+        && (error as { code?: unknown }).code === "broker_cancelled");
+    if (!cancelled) throw error;
+    return {
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      cancelled: true,
+      durationMs: Math.max(0, performance.now() - startedAt),
+      stdoutLimitReached: false,
+      outputTruncated: false
     };
-    const terminate = (): void => {
-      if (child.exitCode !== null) return;
-      terminateProcessTree(child);
-      setTimeout(() => terminateProcessTree(child, true), 750).unref();
-    };
-    const onAbort = (): void => {
-      cancelled = true;
-      terminate();
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      terminate();
-    }, request.timeoutMs);
-    timer.unref();
-    const onIdle = (): void => {
-      timedOut = true;
-      terminate();
-    };
-    let idleTimer = request.idleTimeoutMs ? setTimeout(onIdle, request.idleTimeoutMs) : undefined;
-    idleTimer?.unref();
-    const heartbeat = (): void => {
-      if (!idleTimer || !request.idleTimeoutMs) return;
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(onIdle, request.idleTimeoutMs);
-      idleTimer.unref();
-    };
-    request.signal.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      heartbeat();
-      if (output.appendStdout(stdoutDecoder.write(chunk))) terminate();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      heartbeat();
-      output.appendStderr(stderrDecoder.write(chunk));
-    });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (idleTimer) clearTimeout(idleTimer);
-      request.signal.removeEventListener("abort", onAbort);
-      reject(error);
-    });
-    child.on("close", (code) => finish(code));
-  });
+  }
+  const artifactIds = result.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
+  if (artifactIds.length > 0) {
+    await request.execution.releaseOutputArtifacts?.(artifactIds).catch(() => undefined);
+  }
+  const stdout = limitedLines(result.stdout, request.maxStdoutLines);
+  return {
+    exitCode: result.exitCode,
+    stdout: stdout.value,
+    stderr: result.stderr,
+    timedOut: result.timedOut || result.idleTimedOut,
+    cancelled: result.cancelled,
+    durationMs: result.durationMs,
+    stdoutLimitReached: stdout.limited,
+    outputTruncated: result.outputTruncated || stdout.limited
+  };
 }
 
 export function shellInvocation(shell: ShellKind, command: string): { executable: string; args: string[] } {

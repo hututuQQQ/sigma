@@ -14,39 +14,17 @@ import {
   toolBatchSignature
 } from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
+import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
+import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
 
-function objectPayload(value: JsonValue): Record<string, JsonValue> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+function objectPayload(value: unknown): Record<string, JsonValue> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, JsonValue>
+    : {};
 }
 
 function text(value: JsonValue | undefined): string {
   return typeof value === "string" ? value : "";
-}
-
-function modelToolCalls(value: JsonValue | undefined): ModelToolCall[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((raw): ModelToolCall[] => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-    const call = raw as Record<string, JsonValue>;
-    return typeof call.id === "string" && typeof call.name === "string"
-      ? [{ id: call.id, name: call.name, arguments: call.arguments ?? null }]
-      : [];
-  });
-}
-
-function modelMessage(value: JsonValue | undefined): ModelMessage | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const item = value as Record<string, JsonValue>;
-  const role = item.role;
-  if (role !== "system" && role !== "developer" && role !== "user" && role !== "assistant" && role !== "tool") return null;
-  const toolCalls = modelToolCalls(item.toolCalls);
-  return {
-    role,
-    content: text(item.content),
-    ...(typeof item.reasoningContent === "string" ? { reasoningContent: item.reasoningContent } : {}),
-    ...(typeof item.toolCallId === "string" ? { toolCallId: item.toolCallId } : {}),
-    ...(toolCalls.length > 0 ? { toolCalls } : {})
-  };
 }
 
 function supersededToolMessages(state: KernelState): ModelMessage[] {
@@ -58,11 +36,25 @@ function supersededToolMessages(state: KernelState): ModelMessage[] {
 }
 
 function terminal(state: KernelState, outcome: RunOutcome): KernelState {
-  return { ...state, phase: "terminal", activeModelTurn: undefined, pendingTools: [], proposedOutcome: undefined, outcome };
+  return {
+    ...state,
+    phase: "terminal",
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    pendingTools: [],
+    proposedOutcome: undefined,
+    outcome
+  };
 }
 
 function propose(state: KernelState, outcome: RunOutcome): KernelState {
-  return { ...state, phase: "outcome_pending", activeModelTurn: undefined, proposedOutcome: outcome };
+  return {
+    ...state,
+    phase: "outcome_pending",
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    proposedOutcome: outcome
+  };
 }
 
 function nextPhase(pending: PendingTool[]): KernelState["phase"] {
@@ -80,18 +72,16 @@ function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): P
   }));
 }
 
-type EventReducer = (
-  state: KernelState,
-  event: AgentEventEnvelope,
-  payload: Record<string, JsonValue>
-) => KernelState;
+type EventReducer = KernelEventReducer;
 
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
   mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
   phase: state.messages.length > 0 ? "ready_model" : "idle",
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
+  deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
+  activeModelSemanticDelta: undefined,
   completionRepairAttempts: 0,
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
@@ -104,6 +94,8 @@ const runStarted: EventReducer = (state, _event, payload) => ({
 const userInput: EventReducer = (state, _event, payload) => ({
   ...state,
   phase: "ready_model",
+  activeModelTurn: undefined,
+  activeModelSemanticDelta: undefined,
   messages: [...state.messages, { role: "user", content: text(payload.text) }],
   completionRepairAttempts: 0,
   continuationAttempts: 0,
@@ -123,6 +115,7 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   ],
   phase: "ready_model",
   activeModelTurn: undefined,
+  activeModelSemanticDelta: undefined,
   pendingTools: [],
   completionRepairAttempts: 0,
   continuationAttempts: 0,
@@ -136,19 +129,6 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
 const followUpInput: EventReducer = (state, event, payload) => payload.status === "queued"
   ? state
   : userInput(state, event, payload);
-
-function modelTurn(payload: Record<string, JsonValue>): { turnId: number; effectRevision: number } | null {
-  return Number.isInteger(payload.turnId) && Number.isInteger(payload.effectRevision)
-    ? { turnId: Number(payload.turnId), effectRevision: Number(payload.effectRevision) }
-    : null;
-}
-
-function isCurrentModelTurn(state: KernelState, payload: Record<string, JsonValue>): boolean {
-  const turn = modelTurn(payload);
-  return Boolean(turn && state.activeModelTurn
-    && turn.turnId === state.activeModelTurn.turnId
-    && turn.effectRevision === state.activeModelTurn.effectRevision);
-}
 
 function pendingForEvent(state: KernelState, payload: Record<string, JsonValue>): PendingTool | undefined {
   const turn = modelTurn(payload);
@@ -169,7 +149,13 @@ function acceptsOutcomeRevision(state: KernelState, payload: Record<string, Json
 const modelStarted: EventReducer = (state, _event, payload) => {
   const turn = modelTurn(payload);
   if (state.phase !== "ready_model" || !turn || turn.effectRevision !== state.revision - 1) return state;
-  return { ...state, phase: "model_in_flight", activeModelTurn: turn };
+  return { ...state, phase: "model_in_flight", activeModelTurn: turn, activeModelSemanticDelta: false };
+};
+
+const modelSemanticDelta: EventReducer = (state, _event, payload) => {
+  if (state.phase !== "model_in_flight" || !state.activeModelTurn
+    || payload.turnId !== state.activeModelTurn.turnId) return state;
+  return { ...state, activeModelSemanticDelta: true };
 };
 
 const modelCompleted: EventReducer = (state, _event, payload) => {
@@ -178,7 +164,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
   const messages = message ? [...state.messages, message] : state.messages;
   const calls = modelToolCalls(payload.toolCalls);
   const modelTurn = state.activeModelTurn!;
-  const completedState = { ...state, activeModelTurn: undefined };
+  const completedState = { ...state, activeModelTurn: undefined, activeModelSemanticDelta: undefined };
   if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
   const identifiers = calls.map((call) => call.id);
   const seen = new Set(state.toolCallIds);
@@ -243,13 +229,15 @@ const approvalRequested: EventReducer = (state, _event, payload) => {
 };
 
 const approvalResolved: EventReducer = (state, _event, payload) => {
+  const deadlineAt = typeof payload.deadlineAt === "string" ? payload.deadlineAt : undefined;
+  const resumed = deadlineAt ? { ...state, deadlineAt, deadlineRemainingMs: undefined } : state;
   const pending = pendingForEvent(state, payload);
-  if (!pending) return state;
+  if (!pending) return resumed;
   const allowed = payload.decision === "allow" || payload.decision === "always_allow";
-  const pendingTools = state.pendingTools.map((item) => item === pending
+  const pendingTools = resumed.pendingTools.map((item) => item === pending
     ? { ...item, approval: allowed ? "allowed" as const : "denied" as const }
     : item);
-  return { ...state, pendingTools, phase: nextPhase(pendingTools), outcome: undefined };
+  return { ...resumed, pendingTools, phase: nextPhase(pendingTools), outcome: undefined };
 };
 
 const toolStarted: EventReducer = (state, _event, payload) => {
@@ -275,7 +263,9 @@ const toolFinished: EventReducer = (state, event) => {
     }],
     pendingTools,
     receipts: [...state.receipts, receipt],
-    evidence: receipt.ok ? [...state.evidence, event.payload] : state.evidence,
+    // Receipt evidence is untrusted tool output. Only separately emitted,
+    // authority-checked evidence.recorded/review events enter the ledger.
+    evidence: state.evidence,
     completionRepairAttempts: 0,
     continuationAttempts: 0,
     phase: nextPhase(pendingTools)
@@ -292,8 +282,11 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   if (text(payload.callId) && !pendingForEvent(state, payload)) return state;
   return {
     ...state,
+    ...(Number.isSafeInteger(payload.remainingDeadlineMs) && Number(payload.remainingDeadlineMs) >= 1
+      ? { deadlineRemainingMs: Number(payload.remainingDeadlineMs) } : {}),
     phase: "needs_input",
     activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
     proposedOutcome: undefined,
     outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
   };
@@ -312,25 +305,31 @@ const runFailed: EventReducer = (state, _event, payload) => {
   return terminal(state, outcome);
 };
 
-const runCompleted: EventReducer = (state, _event, payload) => acceptsOutcomeRevision(state, payload)
-  ? terminal(state, {
-    kind: "completed",
-    message: text(payload.message),
-    evidence: Array.isArray(payload.evidence) ? payload.evidence : state.evidence
-  })
-  : state;
+const runCompleted: EventReducer = (state, _event, payload) => {
+  if (!Number.isInteger(payload.outcomeRevision) || !acceptsOutcomeRevision(state, payload)
+    || state.proposedOutcome?.kind !== "completed") return state;
+  return terminal(state, { ...state.proposedOutcome, evidence: state.evidence });
+};
 
 const diagnostic: EventReducer = (state, _event, payload) => {
   // user.steer is the durable authority for superseding a turn. The later
   // steering.restart event is observational only: applying it could erase a
   // newer turn that completed while the cancelled provider was unwinding.
   if (payload.kind === "steering.restart") return state;
-  if (payload.kind === "recovery.retry_model") return { ...state, phase: "ready_model", activeModelTurn: undefined, outcome: undefined };
+  if (payload.kind === "recovery.retry_model") return {
+    ...state,
+    phase: "ready_model",
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    outcome: undefined
+  };
   if (payload.kind === "child.join_failed") {
     const failures = Array.isArray(payload.failures) ? payload.failures.filter((item): item is string => typeof item === "string") : [];
     return {
       ...state,
       phase: "ready_model",
+      activeModelTurn: undefined,
+      activeModelSemanticDelta: undefined,
       proposedOutcome: undefined,
       outcome: undefined,
       messages: [...state.messages, {
@@ -357,6 +356,8 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "user.steer": steeringInput,
   "user.follow_up": followUpInput,
   "model.started": modelStarted,
+  "model.delta": modelSemanticDelta,
+  "model.reasoning_delta": modelSemanticDelta,
   "model.completed": modelCompleted,
   "model.failed": modelFailed,
   "tool.requested": toolRequested,
@@ -372,13 +373,17 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   }),
   "run.failed": runFailed,
   "run.completed": runCompleted,
+  ...durableReducers,
   diagnostic
 };
 
 export function evolve(previous: KernelState, event: AgentEventEnvelope): KernelState {
   if (event.sessionId !== previous.sessionId) throw new Error("Kernel event session mismatch.");
   if (event.seq <= previous.lastSeq) throw new Error(`Kernel event sequence must increase: ${event.seq} <= ${previous.lastSeq}`);
-  if (previous.phase === "terminal") return previous;
+  // A terminal run may still be awaiting a user follow-up. The reviewer
+  // waiver is the sole post-terminal evidence event and remains authority-
+  // checked by its durable reducer; model/tool events stay inert.
+  if (previous.phase === "terminal" && event.type !== "review.waived") return previous;
   const state: KernelState = { ...previous, revision: previous.revision + 1, lastSeq: event.seq };
   const reducer = reducers[event.type];
   return reducer ? reducer(state, event, objectPayload(event.payload)) : state;

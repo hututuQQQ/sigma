@@ -4,7 +4,15 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "./smoke-fake-model.mjs";
+import {
+  createSmokeReviewer,
+  fakeFinalTurn,
+  fakeToolCall,
+  fakeToolTurn,
+  fakeValidationTurn,
+  registerSmokeValidator,
+  SmokeFakeGateway
+} from "./smoke-fake-model.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactsDir = path.join(rootDir, ".artifacts", "smoke-product");
@@ -53,11 +61,13 @@ async function main() {
   const runtime = createRuntime({
     gateway: new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
-      fakeFinalTurn("Product smoke completed.", ["write-smoke"])
+      fakeValidationTurn("validate-smoke", [{ path: "hello.txt", expected: "hello world" }]),
+      fakeFinalTurn("Product smoke completed.")
     ]),
     store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
     storeRootDir,
-    tools: registerBuiltinTools(new EffectToolRegistry()),
+    tools: registerSmokeValidator(registerBuiltinTools(new EffectToolRegistry())),
+    reviewer: createSmokeReviewer(),
     permissionMode: "auto",
     runDeadlineMs: 30_000
   });

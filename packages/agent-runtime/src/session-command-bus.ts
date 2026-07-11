@@ -13,7 +13,9 @@ import type { RunCommand } from "agent-protocol";
 import { sessionDirectory } from "agent-store";
 
 export type OwnerRecord = ProcessOwnerRecord;
-export type ExternalSessionCommand = Extract<RunCommand, { type: "cancel" }>;
+export type ExternalSessionCommand = Extract<RunCommand, {
+  type: "cancel" | "checkpoint_recovery" | "budget_increase" | "reviewer_waiver";
+}>;
 
 export interface SessionCommandBusOptions {
   claimTimeoutMs?: number;
@@ -148,19 +150,50 @@ export class SessionCommandBus {
     try { value = JSON.parse(source); } catch { throw this.invalidExternalCommand(); }
     if (!value || typeof value !== "object" || Array.isArray(value)) throw this.invalidExternalCommand();
     const command = value as Partial<ExternalSessionCommand> & Record<string, unknown>;
-    if (command.type !== "cancel" || command.sessionId !== sessionId
-      || (command.reason !== undefined && typeof command.reason !== "string")) {
-      throw this.invalidExternalCommand();
-    }
+    if (command.sessionId !== sessionId) throw this.invalidExternalCommand();
+    if (command.type === "cancel") return this.parseCancellation(command, sessionId);
+    if (command.type === "budget_increase") return this.parseBudgetIncrease(command, sessionId);
+    if (command.type === "checkpoint_recovery") return this.parseCheckpointRecovery(command, sessionId);
+    if (command.type === "reviewer_waiver") return this.parseReviewerWaiver(command, sessionId);
+    throw this.invalidExternalCommand();
+  }
+
+  private parseCancellation(command: Record<string, unknown>, sessionId: string): ExternalSessionCommand {
+    if (command.reason !== undefined && typeof command.reason !== "string") throw this.invalidExternalCommand();
+    return { type: "cancel", sessionId, ...(typeof command.reason === "string" ? { reason: command.reason } : {}) };
+  }
+
+  private parseBudgetIncrease(command: Record<string, unknown>, sessionId: string): ExternalSessionCommand {
+    const increase = command.increase;
+    if (!increase || typeof increase !== "object" || Array.isArray(increase)) throw this.invalidExternalCommand();
+    const allowed = new Set(["inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children", "maxDepth"]);
+    const entries = Object.entries(increase);
+    if (entries.length === 0 || entries.some(([key, value]) =>
+      !allowed.has(key) || !Number.isSafeInteger(value) || Number(value) < 0)
+      || !entries.some(([, value]) => Number(value) > 0)) throw this.invalidExternalCommand();
+    return { type: "budget_increase", sessionId, increase: { ...increase } };
+  }
+
+  private parseCheckpointRecovery(command: Record<string, unknown>, sessionId: string): ExternalSessionCommand {
+    if (typeof command.checkpointId !== "string" || !command.checkpointId
+      || (command.decision !== "restore" && command.decision !== "keep")) throw this.invalidExternalCommand();
+    return { type: "checkpoint_recovery", sessionId, checkpointId: command.checkpointId, decision: command.decision };
+  }
+
+  private parseReviewerWaiver(command: Record<string, unknown>, sessionId: string): ExternalSessionCommand {
+    if (typeof command.reason !== "string" || !command.reason.trim() || command.reason.trim().length > 2_000
+      || (command.checkpointId !== undefined
+        && (typeof command.checkpointId !== "string" || !command.checkpointId.trim()))) throw this.invalidExternalCommand();
     return {
-      type: "cancel",
+      type: "reviewer_waiver",
       sessionId,
-      ...(typeof command.reason === "string" ? { reason: command.reason } : {})
+      reason: command.reason,
+      ...(typeof command.checkpointId === "string" ? { checkpointId: command.checkpointId } : {})
     };
   }
 
   private invalidExternalCommand(): Error {
-    return Object.assign(new Error("The external session inbox accepts cancellation only."), {
+    return Object.assign(new Error("The external session inbox accepts cancellation, budget increases, reviewer waivers, and user checkpoint recovery only."), {
       code: "invalid_external_command"
     });
   }

@@ -1,10 +1,10 @@
-import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
+import type { EvidenceKind, EvidenceRef, JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 export interface CompletionCriterion {
   criterion: string;
   status: "met";
-  evidenceCallIds: string[];
+  evidence: EvidenceRef[];
   rationale: string;
 }
 
@@ -17,6 +17,22 @@ function record(value: JsonValue): Record<string, JsonValue> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
+const EVIDENCE_KINDS: readonly EvidenceKind[] = [
+  "workspace_delta", "command", "validation", "diagnostic", "review", "checkpoint", "child_outcome", "user_waiver"
+];
+
+function evidenceReferences(value: JsonValue | undefined): EvidenceRef[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const references: EvidenceRef[] = [];
+  for (const raw of value) {
+    const item = record(raw);
+    if (!item || typeof item.evidenceId !== "string" || !item.evidenceId.trim()
+      || typeof item.kind !== "string" || !EVIDENCE_KINDS.includes(item.kind as EvidenceKind)) return null;
+    references.push({ evidenceId: item.evidenceId, kind: item.kind as EvidenceKind });
+  }
+  return references;
+}
+
 export function parseCompletionProposal(value: JsonValue): CompletionProposal | null {
   const input = record(value);
   if (!input || typeof input.summary !== "string" || !input.summary.trim() || !Array.isArray(input.criteria) || input.criteria.length === 0) return null;
@@ -25,24 +41,29 @@ export function parseCompletionProposal(value: JsonValue): CompletionProposal | 
     const item = record(raw);
     if (!item || typeof item.criterion !== "string" || !item.criterion.trim()) return null;
     if (item.status !== "met") return null;
-    if (!Array.isArray(item.evidenceCallIds) || item.evidenceCallIds.some((id) => typeof id !== "string")) return null;
+    const evidence = evidenceReferences(item.evidence);
+    if (!evidence) return null;
     criteria.push({
       criterion: item.criterion,
       status: item.status,
-      evidenceCallIds: [...item.evidenceCallIds] as string[],
+      evidence,
       rationale: typeof item.rationale === "string" ? item.rationale : ""
     });
   }
   return { summary: input.summary, criteria };
 }
 
-export function completionEvidenceError(proposal: CompletionProposal, successfulCallIds: ReadonlySet<string>): string | null {
+export function completionEvidenceError(
+  proposal: CompletionProposal,
+  availableEvidence: ReadonlyMap<string, EvidenceKind>
+): string | null {
   for (const criterion of proposal.criteria) {
-    if (criterion.status === "met" && criterion.evidenceCallIds.length === 0) {
-      return `Criterion '${criterion.criterion}' needs at least one successful tool receipt.`;
+    const invalid = criterion.evidence.filter((reference) =>
+      availableEvidence.get(reference.evidenceId) !== reference.kind);
+    if (invalid.length > 0) {
+      return `Criterion '${criterion.criterion}' cites unavailable or mismatched durable evidence: ${invalid
+        .map((item) => `${item.evidenceId}:${item.kind}`).join(", ")}.`;
     }
-    const missing = criterion.evidenceCallIds.filter((id) => !successfulCallIds.has(id));
-    if (missing.length > 0) return `Criterion '${criterion.criterion}' cites unknown or failed receipts: ${missing.join(", ")}.`;
   }
   return null;
 }
@@ -50,7 +71,7 @@ export function completionEvidenceError(proposal: CompletionProposal, successful
 function completionTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
     name: "complete_task",
-    description: "Propose terminal completion with explicit acceptance criteria and successful current-run tool-receipt evidence. Every criterion must be met. Copy exact opaque IDs from the current-run receipt ledger or 'Successful tool receipt ID:' results into evidenceCallIds; never invent labels, indexes, tool names, or older-run IDs. Completion is rejected until this protocol is satisfied.",
+    description: "Propose terminal completion with explicit acceptance criteria and typed durable evidence from the current run. Every criterion must be met. Copy exact evidenceId and kind pairs from the current-run durable evidence ledger; never invent or reuse older-run evidence.",
     inputSchema: {
       type: "object",
       properties: {
@@ -63,14 +84,23 @@ function completionTool(): RegisteredEffectTool {
             properties: {
               criterion: { type: "string", description: "One concrete acceptance criterion." },
               status: { type: "string", enum: ["met"], description: "Terminal completion accepts only criteria proven met by current-run receipts." },
-              evidenceCallIds: {
+              evidence: {
                 type: "array",
-                description: "Exact opaque IDs copied from successful tool receipt results. Do not use tool names, labels, or numeric indexes.",
-                items: { type: "string" }
+                minItems: 1,
+                description: "Typed durable evidence references copied from the current-run evidence ledger.",
+                items: {
+                  type: "object",
+                  properties: {
+                    evidenceId: { type: "string" },
+                    kind: { type: "string", enum: [...EVIDENCE_KINDS] }
+                  },
+                  required: ["evidenceId", "kind"],
+                  additionalProperties: false
+                }
               },
               rationale: { type: "string", description: "Optional concise explanation; omitted values default to an empty string." }
             },
-            required: ["criterion", "status", "evidenceCallIds"],
+            required: ["criterion", "status", "evidence"],
             additionalProperties: false
           }
         }

@@ -1,15 +1,39 @@
 import { describe, expect, it } from "vitest";
-import type { AgentEventEnvelope, AgentEventType, JsonValue } from "../packages/agent-protocol/src/index.js";
+import {
+  EVENT_SCHEMA_VERSION,
+  createBudgetLedger,
+  type AgentEventEnvelope,
+  type AgentEventType,
+  type EvidenceRecord,
+  type JsonValue
+} from "../packages/agent-protocol/src/index.js";
 import {
   assertKernelInvariants,
   createKernelState,
   decide,
   evolve,
+  isKernelState,
   isStaleEffect,
   isTerminal,
   rehydrate,
-  type KernelState
+  upcastKernelStateV2,
+  type KernelState,
+  type KernelStateV2
 } from "../packages/agent-kernel/src/index.js";
+
+function diagnosticEvidence(id = "evidence"): EvidenceRecord {
+  return {
+    evidenceId: id,
+    sessionId: "session",
+    runId: "run",
+    kind: "diagnostic",
+    status: "passed",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    producer: { authority: "runtime" },
+    summary: "checked",
+    data: { source: "test", diagnostic: { ok: true } }
+  };
+}
 
 function initial(): KernelState {
   return createKernelState({
@@ -23,7 +47,7 @@ function initial(): KernelState {
 
 function envelope(state: KernelState, type: AgentEventType, payload: JsonValue = {}): AgentEventEnvelope {
   return {
-    schemaVersion: 2,
+    schemaVersion: EVENT_SCHEMA_VERSION,
     seq: state.lastSeq + 1,
     eventId: `event-${state.lastSeq + 1}`,
     sessionId: state.sessionId,
@@ -127,6 +151,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.phase).toBe("ready_model");
     state = startModel(state);
     expect(state.phase).toBe("model_in_flight");
+    expect(state.activeModelSemanticDelta).toBe(false);
+    state = apply(state, "model.delta", { turnId: 1, delta: "durable" });
+    expect(state.activeModelSemanticDelta).toBe(true);
     state = settleModel(state, "model.completed", {
       message: {
         role: "assistant",
@@ -139,6 +166,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       finishReason: "tool_calls"
     });
     expect(state.phase).toBe("tool_pending");
+    expect(state.activeModelSemanticDelta).toBeUndefined();
     expect(state.pendingTools[0].request.callId).toBe("call");
     expect(state.messages.at(-1)).toMatchObject({
       role: "assistant",
@@ -244,7 +272,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(initial(), "run.failed", { kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" }).outcome)
       .toEqual({ kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" });
     expect(apply(initial(), "run.failed", { kind: "fatal" }).outcome).toMatchObject({ kind: "fatal", code: "runtime_error" });
-    expect(apply(initial(), "run.completed", { message: "ok" }).outcome).toMatchObject({ kind: "completed", message: "ok" });
+    expect(apply(initial(), "run.completed", { message: "forged", evidence: [], outcomeRevision: 0 }).phase).toBe("idle");
 
     const terminalEvent = envelope(cancelled, "diagnostic");
     expect(evolve(cancelled, terminalEvent)).toBe(cancelled);
@@ -272,10 +300,11 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = toolEvent(state, "tool.approval_resolved", "call", { decision: "always_allow" });
     state = toolEvent(state, "tool.completed", "call", {
       ok: true, output: "contents", observedEffects: ["filesystem.read"], artifacts: [], diagnostics: [],
+      evidence: [diagnosticEvidence("read-evidence")],
       startedAt: "start", completedAt: "end"
     });
     expect(state).toMatchObject({ phase: "ready_model", receipts: [{ callId: "call", ok: true }] });
-    expect(state.evidence).toHaveLength(1);
+    expect(state.evidence).toHaveLength(0);
     expect(state.messages.at(-1)).toMatchObject({ role: "tool", toolCallId: "call" });
     expect(state.messages.at(-1)?.content).toBe("Successful tool receipt ID: call\ncontents");
 
@@ -319,10 +348,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
-      message: "committed", outcomeRevision: committedRevision, evidence: [{ childId: "durable-child" }]
+      message: "committed", outcomeRevision: committedRevision, evidence: [diagnosticEvidence("durable-child")]
     })).toMatchObject({
       phase: "terminal",
-      outcome: { kind: "completed", message: "committed", evidence: [{ childId: "durable-child" }] }
+      outcome: { kind: "completed", message: "evidence-backed result", evidence: [] }
     });
     expect(apply(completion, "run.completed", {
       message: "stale", outcomeRevision: committedRevision - 1
@@ -384,6 +413,128 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
+  it("reduces V3 evidence, usage, plan, budget, checkpoint, and review authorities", () => {
+    let state = apply(initial(), "evidence.recorded", diagnosticEvidence("direct"));
+    state = apply(state, "evidence.recorded", diagnosticEvidence("direct"));
+    expect(state.evidence.map((item) => item.evidenceId)).toEqual(["direct"]);
+    state = apply(state, "evidence.recorded", { ...diagnosticEvidence("old-run"), runId: "old-run" });
+    expect(state.evidence.map((item) => item.evidenceId)).toEqual(["direct"]);
+
+    state = apply(state, "usage.recorded", {
+      usageId: "usage-1", requestId: "request", sessionId: "session", runId: "run", role: "orchestrator",
+      routeId: "route", providerId: "deepseek", modelId: "model", tokenizerId: "approx", tokenizerAccuracy: "approximate",
+      providerReported: false, inputTokens: 10, outputTokens: 2, reasoningTokens: 0, cacheReadTokens: 0,
+      cacheWriteTokens: 0, costMicroUsd: 100, latencyMs: 20, attempt: 1, occurredAt: "2026-01-01T00:00:00.000Z"
+    });
+    expect(state.usage).toHaveLength(1);
+
+    state = apply(state, "plan.updated", {
+      previousRevision: 0,
+      plan: {
+        revision: 1,
+        goal: "ship V3",
+        activeNodeId: "r0",
+        nodes: [{
+          id: "r0", title: "protocol", dependencies: [], status: "in_progress",
+          owner: { kind: "root" }, acceptanceCriteria: ["typed"], evidence: []
+        }]
+      }
+    });
+    expect(state.plan).toMatchObject({ revision: 1, activeNodeId: "r0" });
+    const stalePlan = apply(state, "plan.updated", { previousRevision: 0, plan: { revision: 2, goal: "stale", nodes: [] } });
+    expect(stalePlan.plan).toBe(state.plan);
+    state = stalePlan;
+
+    const ledger = createBudgetLedger();
+    ledger.reserved.inputTokens = 100;
+    ledger.reservations.push({
+      reservationId: "reservation",
+      ownerId: "model:request",
+      status: "reserved",
+      requested: { ...ledger.reserved },
+      consumed: { ...ledger.consumed },
+      createdAt: "2026-01-01T00:00:00.000Z"
+    });
+    state = apply(state, "budget.reserved", { reservationId: "reservation", ledger } as unknown as JsonValue);
+    expect(state.budget.reserved.inputTokens).toBe(100);
+
+    state = apply(state, "checkpoint.created", {
+      checkpointId: "checkpoint", sessionId: "session", runId: "run", status: "open",
+      createdAt: "2026-01-01T00:00:00.000Z", preManifestDigest: "a".repeat(64)
+    });
+    expect(state.checkpointHead).toMatchObject({ checkpointId: "checkpoint", status: "open" });
+    const wrongStatus = apply(state, "checkpoint.sealed", {
+      checkpointId: "checkpoint", sessionId: "session", runId: "run", status: "open",
+      createdAt: "2026-01-01T00:00:00.000Z", preManifestDigest: "a".repeat(64)
+    });
+    expect(wrongStatus.checkpointHead?.status).toBe("open");
+    state = wrongStatus;
+
+    const waiver: EvidenceRecord = {
+      evidenceId: "waiver", kind: "user_waiver", status: "informational",
+      sessionId: "session", runId: "run",
+      createdAt: "2026-01-01T00:00:00.000Z", producer: { authority: "user" }, summary: "waived",
+      data: { scope: "review", reason: "explicit" }
+    };
+    const runtimeWaiver = apply(state, "review.waived", waiver);
+    expect(runtimeWaiver.evidence.some((item) => item.evidenceId === "waiver")).toBe(false);
+    state = evolve(runtimeWaiver, { ...envelope(runtimeWaiver, "review.waived", waiver), authority: "user" });
+    expect(state.evidence.some((item) => item.evidenceId === "waiver")).toBe(true);
+    const secondWaiver = { ...waiver, evidenceId: "second-waiver" };
+    state = evolve(state, { ...envelope(state, "review.waived", secondWaiver), authority: "user" });
+    expect(state.evidence.filter((item) => item.kind === "user_waiver")).toHaveLength(1);
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+    expect(isKernelState(state)).toBe(true);
+
+    const terminal = apply(initial(), "run.failed", {
+      kind: "recoverable_failure", code: "review_required", message: "await follow-up"
+    });
+    const forgedTerminalWaiver = evolve(terminal, {
+      ...envelope(terminal, "review.waived", waiver), authority: "tool"
+    });
+    expect(forgedTerminalWaiver.evidence).toEqual([]);
+    const userTerminalWaiver = evolve(forgedTerminalWaiver, {
+      ...envelope(forgedTerminalWaiver, "review.waived", waiver), authority: "user"
+    });
+    expect(userTerminalWaiver.phase).toBe("terminal");
+    expect(userTerminalWaiver.evidence).toContainEqual(waiver);
+  });
+
+  it("upcasts explicit V2 kernel state without treating old snapshots as V3", () => {
+    const current = initial();
+    const v2: KernelStateV2 = {
+      schemaVersion: 2,
+      sessionId: current.sessionId,
+      runId: current.runId,
+      mode: current.mode,
+      phase: current.phase,
+      revision: current.revision,
+      lastSeq: current.lastSeq,
+      startedAt: current.startedAt,
+      deadlineAt: current.deadlineAt,
+      messages: current.messages,
+      pendingTools: current.pendingTools,
+      toolCallIds: current.toolCallIds,
+      receipts: current.receipts,
+      evidence: [{ legacy: true }],
+      childIds: current.childIds,
+      completionRepairAttempts: current.completionRepairAttempts,
+      continuationAttempts: current.continuationAttempts,
+      repeatedToolBatchCount: current.repeatedToolBatchCount,
+      receiptCountAtLastUserInput: current.receiptCountAtLastUserInput
+    };
+    expect(isKernelState(v2)).toBe(false);
+    const upgraded = upcastKernelStateV2(v2);
+    expect(upgraded).toMatchObject({
+      schemaVersion: 4,
+      plan: { revision: 0, nodes: [] },
+      usage: [],
+      frozenSkills: [],
+      evidence: [{ kind: "diagnostic", data: { source: "v2-kernel-snapshot", diagnostic: { legacy: true } } }]
+    });
+    expect(isKernelState(upgraded)).toBe(true);
+  });
+
   it("rehydrates deterministically and checks state invariants", () => {
     const first = envelope(initial(), "user.message", { text: "hello" });
     const second = { ...envelope({ ...initial(), lastSeq: 1 }, "model.started", { turnId: 1, effectRevision: 1 }), seq: 2 };
@@ -416,5 +567,335 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toThrow("active model turn must agree");
     expect(() => assertKernelInvariants({ ...initial(), phase: "needs_input", outcome: { kind: "needs_input", requestId: "x", message: "x" } })).not.toThrow();
     expect(() => assertKernelInvariants({ ...initial(), phase: "terminal", outcome: { kind: "completed", message: "x", evidence: [] } })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...initial(), activeProcessIds: ["duplicate", "duplicate"]
+    })).toThrow("Duplicate active process IDs");
+  });
+
+  it("rejects corrupt durable ledgers before a resumed run can execute", () => {
+    const base = initial();
+    const usage = {
+      usageId: "usage", requestId: "request", sessionId: "session", runId: "run", role: "orchestrator" as const,
+      routeId: "route", providerId: "deepseek", modelId: "model", tokenizerId: "approx",
+      tokenizerAccuracy: "approximate" as const, providerReported: false, inputTokens: 1, outputTokens: 0,
+      reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicroUsd: 0, latencyMs: 1,
+      attempt: 1, occurredAt: "2026-01-01T00:00:00.000Z"
+    };
+    const waiver = {
+      evidenceId: "waiver", sessionId: "session", runId: "run", kind: "user_waiver" as const,
+      status: "informational" as const, createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "user" as const }, summary: "waived", data: { scope: "review" as const, reason: "operator" }
+    };
+    const reservation = {
+      reservationId: "reservation", ownerId: "owner", status: "reserved" as const,
+      requested: { inputTokens: 1, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 },
+      consumed: { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 },
+      createdAt: "2026-01-01T00:00:00.000Z"
+    };
+    const invalidStates: Array<[KernelState, string]> = [
+      [{ ...base, schemaVersion: 2 } as unknown as KernelState, "schema version"],
+      [{ ...base, plan: { revision: 0, goal: "", activeNodeId: "missing", nodes: [] } }, "plan graph"],
+      [{ ...base, budget: { ...base.budget, consumed: { inputTokens: -1 } } as never }, "budget ledger"],
+      [{ ...base, checkpointHead: { checkpointId: "bad" } as never }, "checkpoint head"],
+      [{ ...base, checkpointHead: {
+        checkpointId: "checkpoint", sessionId: "other", runId: "run", status: "open",
+        createdAt: "2026-01-01T00:00:00.000Z", preManifestDigest: "digest"
+      } }, "checkpoint head"],
+      [{ ...base, evidence: [{} as EvidenceRecord] }, "evidence ledger"],
+      [{ ...base, mutationEvidence: [{} as EvidenceRecord] }, "mutation evidence ledger"],
+      [{ ...base, mutationEvidence: [{ ...waiver, sessionId: "other" }] }, "mutation evidence must belong"],
+      [{ ...base, mutationEvidence: [waiver, { ...waiver }] }, "Duplicate kernel mutation evidence"],
+      [{ ...base, evidence: [{ ...diagnosticEvidence(), sessionId: "other" }] }, "active session"],
+      [{ ...base, evidence: [waiver, { ...waiver, evidenceId: "waiver-two" }] }, "at most one"],
+      [{ ...base, evidence: [diagnosticEvidence(), diagnosticEvidence()] }, "Duplicate kernel evidence"],
+      [{ ...base, usage: [{} as never] }, "usage ledger"],
+      [{ ...base, usage: [usage, { ...usage }] }, "Duplicate kernel usage"],
+      [{ ...base, budget: { ...base.budget, reservations: [reservation, { ...reservation }] } }, "Duplicate budget"],
+      [{ ...base, budget: {
+        ...base.budget,
+        reserved: { ...base.budget.reserved, inputTokens: 1 }
+      } }, "does not match its active reservations"],
+      [{ ...base, toolCallIds: ["same", "same"] }, "Duplicate run tool"],
+      [{ ...base, phase: "tool_pending", pendingTools: [{
+        request: { callId: "missing", name: "read", arguments: null },
+        modelTurn: { turnId: 1, effectRevision: 1 }, approval: "allowed", started: false
+      }] }, "run tool-call ledger"],
+      [{ ...base, phase: "tool_pending", toolCallIds: ["invalid-revision"], pendingTools: [{
+        request: { callId: "invalid-revision", name: "read", arguments: null },
+        modelTurn: { turnId: 1, effectRevision: Number.NaN }, approval: "allowed", started: false
+      }] }, "valid originating model turn"]
+    ];
+    for (const [state, message] of invalidStates) {
+      expect(() => assertKernelInvariants(state), message).toThrow(message);
+    }
+  });
+
+  it("enforces authority and identity on every durable reducer family", () => {
+    let state = initial();
+    const toolEvidence = {
+      ...diagnosticEvidence("tool-evidence"),
+      producer: { authority: "tool" as const }
+    };
+    state = evolve(state, { ...envelope(state, "evidence.recorded", toolEvidence), authority: "tool" });
+    expect(state.evidence.map((item) => item.evidenceId)).toEqual(["tool-evidence"]);
+    const forbiddenReview = {
+      ...toolEvidence, evidenceId: "forged-review", kind: "review" as const,
+      data: { reviewerId: "tool", verdict: "approved" as const, findings: [], workspaceDeltaEvidenceIds: [] }
+    };
+    expect(evolve(state, { ...envelope(state, "evidence.recorded", forbiddenReview), authority: "tool" }).evidence)
+      .toHaveLength(1);
+    const review: EvidenceRecord = {
+      evidenceId: "review", sessionId: "session", runId: "run", kind: "review", status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z", producer: { authority: "runtime" }, summary: "approved",
+      data: { reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: ["tool-evidence"] }
+    };
+    state = apply(state, "review.completed", review);
+    expect(state.evidence.map((item) => item.evidenceId)).toEqual(["tool-evidence", "review"]);
+    expect(apply(state, "evidence.recorded", { ...review, evidenceId: "runtime-forgery" }).evidence).toHaveLength(2);
+
+    const usage = {
+      usageId: "usage", requestId: "request", sessionId: "session", runId: "run", role: "orchestrator",
+      routeId: "route", providerId: "deepseek", modelId: "model", tokenizerId: "approx", tokenizerAccuracy: "approximate",
+      providerReported: false, inputTokens: 1, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0,
+      cacheWriteTokens: 0, costMicroUsd: 0, latencyMs: 1, attempt: 1, occurredAt: "2026-01-01T00:00:00.000Z"
+    } as const;
+    state = apply(state, "usage.recorded", usage);
+    expect(apply(state, "usage.recorded", usage).usage).toHaveLength(1);
+    expect(apply(state, "usage.recorded", { ...usage, usageId: "other", sessionId: "other" }).usage).toHaveLength(1);
+
+    expect(apply(state, "plan.updated", { previousRevision: "0", plan: null }).plan).toBe(state.plan);
+    expect(apply(state, "budget.released", { ledger: null }).budget).toBe(state.budget);
+    const increased = createBudgetLedger({ ...state.budget.limits, toolCalls: state.budget.limits.toolCalls + 1 });
+    expect(apply(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }).budget)
+      .toBe(state.budget);
+    state = evolve(state, {
+      ...envelope(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }), authority: "user"
+    });
+    expect(state.budget.limits.toolCalls).toBe(increased.limits.toolCalls);
+
+    const checkpointBase = {
+      checkpointId: "checkpoint", sessionId: "session", runId: "run",
+      createdAt: "2026-01-01T00:00:00.000Z", preManifestDigest: "a".repeat(64)
+    };
+    state = apply(state, "checkpoint.sealed", {
+      ...checkpointBase, status: "sealed", sealedAt: "2026-01-01T00:00:00.000Z", postManifestDigest: "b".repeat(64)
+    });
+    expect(state.checkpointHead?.status).toBe("sealed");
+    state = apply(state, "checkpoint.restored", {
+      ...checkpointBase, status: "restored", restoredAt: "2026-01-01T00:00:00.000Z", postManifestDigest: "b".repeat(64)
+    });
+    expect(state.checkpointHead?.status).toBe("restored");
+    expect(apply(state, "checkpoint.restored", { ...checkpointBase, status: "open" }).checkpointHead?.status).toBe("restored");
+    expect(apply(state, "checkpoint.restored", {
+      ...checkpointBase, sessionId: "other", status: "restored", restoredAt: "2026-01-01T00:00:00.000Z"
+    }).checkpointHead?.status).toBe("restored");
+
+    expect(apply(state, "profile.resolved", { profileId: 1 }).frozenProfile).toBeUndefined();
+    state = apply(state, "profile.resolved", {
+      profileId: "secure", digest: "digest", artifactId: "artifact", source: "workspace"
+    });
+    expect(state.frozenProfile).toMatchObject({ qualifiedName: "secure", source: "workspace" });
+    expect(apply(state, "skill.loaded", { qualifiedName: "bad", digest: 1 }).frozenSkills).toHaveLength(0);
+    state = apply(state, "skill.loaded", {
+      qualifiedName: "workspace:review", digest: "digest", artifactId: "artifact", source: "workspace"
+    });
+    expect(state.frozenSkills).toHaveLength(1);
+    expect(apply(state, "customization.frozen", {
+      artifactId: "bad", digest: "bad", skillCount: 0, hookCount: 0
+    }).frozenCustomization).toBeUndefined();
+    state = apply(state, "customization.frozen", {
+      artifactId: "c".repeat(64), digest: "d".repeat(64), skillCount: 1, hookCount: 1
+    });
+    expect(state.frozenCustomization).toEqual({ artifactId: "c".repeat(64), digest: "d".repeat(64) });
+    expect(apply(state, "skill.loaded", {
+      qualifiedName: "workspace:review", digest: "digest-two", artifactId: "artifact-two", source: "home"
+    }).frozenSkills).toHaveLength(1);
+
+    state = apply(state, "process.spawned", {
+      processId: "process-1", executionId: "spawn", mode: "background"
+    });
+    expect(state.activeProcessIds).toEqual(["process-1"]);
+    expect(apply(state, "process.spawned", {
+      processId: "process-1", executionId: "spawn-again", mode: "background"
+    }).activeProcessIds).toEqual(["process-1"]);
+    expect(apply(state, "process.spawned", {
+      processId: 1, executionId: "invalid", mode: "background"
+    }).activeProcessIds).toEqual(["process-1"]);
+    expect(evolve(state, {
+      ...envelope(state, "process.spawned", {
+        processId: "wrong-run", executionId: "spawn", mode: "background"
+      }),
+      runId: "other"
+    }).activeProcessIds).toEqual(["process-1"]);
+    expect(evolve(state, {
+      ...envelope(state, "process.lost", { processId: "process-1", reason: "forged" }),
+      authority: "tool"
+    }).activeProcessIds).toEqual(["process-1"]);
+    state = apply(state, "process.exited", { processId: "process-1", exitCode: 0 });
+    expect(state.activeProcessIds).toEqual([]);
+    state = apply(state, "process.spawned", {
+      processId: "process-2", executionId: "spawn", mode: "pty"
+    });
+    state = apply(state, "process.lost", { processId: "process-2", reason: "broker ended" });
+    expect(state.activeProcessIds).toEqual([]);
+  });
+
+  it("reconciles a restored checkpoint across runs without discarding shared evidence", () => {
+    const restoredDelta: EvidenceRecord = {
+      evidenceId: "restored-delta", sessionId: "session", runId: "old-run",
+      kind: "workspace_delta", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" }, summary: "restored mutation",
+      data: { checkpointId: "restored-checkpoint", delta: { added: [], modified: ["old.ts"], deleted: [] } }
+    };
+    const survivorDelta: EvidenceRecord = {
+      ...restoredDelta,
+      evidenceId: "survivor-delta",
+      summary: "surviving mutation",
+      data: { checkpointId: "survivor-checkpoint", delta: { added: [], modified: ["keep.ts"], deleted: [] } }
+    };
+    const sharedValidation: EvidenceRecord = {
+      evidenceId: "shared-validation", sessionId: "session", runId: "old-run",
+      kind: "validation", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool" }, summary: "validated both",
+      data: { validator: "tests", workspaceDeltaEvidenceIds: ["restored-delta", "survivor-delta"] }
+    };
+    const sharedReview: EvidenceRecord = {
+      evidenceId: "shared-review", sessionId: "session", runId: "old-run",
+      kind: "review", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" }, summary: "reviewed both",
+      data: {
+        reviewerId: "reviewer", verdict: "approved", findings: [],
+        workspaceDeltaEvidenceIds: ["restored-delta", "survivor-delta"]
+      }
+    };
+    const restoredOnlyValidation: EvidenceRecord = {
+      ...sharedValidation,
+      evidenceId: "restored-only-validation",
+      summary: "validated only the restored delta",
+      data: { validator: "targeted-tests", workspaceDeltaEvidenceIds: ["restored-delta"] }
+    };
+    const restoredOnlyReview: EvidenceRecord = {
+      ...sharedReview,
+      evidenceId: "restored-only-review",
+      summary: "reviewed only the restored delta",
+      data: {
+        reviewerId: "reviewer", verdict: "approved", findings: [],
+        workspaceDeltaEvidenceIds: ["restored-delta"]
+      }
+    };
+    const targetedWaiver: EvidenceRecord = {
+      evidenceId: "targeted-waiver", sessionId: "session", runId: "old-run",
+      kind: "user_waiver", status: "informational", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "user" }, summary: "waived restored checkpoint",
+      data: { scope: "review", reason: "explicit", checkpointId: "restored-checkpoint" }
+    };
+    const unboundWaiver: EvidenceRecord = {
+      ...targetedWaiver,
+      evidenceId: "unbound-waiver",
+      summary: "legacy unbound waiver",
+      data: { scope: "review", reason: "legacy" }
+    };
+    const currentRunEvidence: EvidenceRecord[] = [
+      { ...sharedValidation, runId: "run" },
+      { ...restoredOnlyValidation, runId: "run" },
+      { ...sharedReview, runId: "run" },
+      { ...restoredOnlyReview, runId: "run" },
+      { ...targetedWaiver, runId: "run" },
+      diagnosticEvidence("unrelated-diagnostic")
+    ];
+    const mutationEvidence = [
+      restoredDelta, survivorDelta, sharedValidation, restoredOnlyValidation,
+      sharedReview, restoredOnlyReview, targetedWaiver, unboundWaiver
+    ];
+    const state = { ...initial(), evidence: currentRunEvidence, mutationEvidence };
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+    const restored = {
+      checkpointId: "restored-checkpoint", sessionId: "session", runId: "old-run",
+      status: "restored" as const, createdAt: "2026-01-01T00:00:00.000Z",
+      sealedAt: "2026-01-01T00:00:01.000Z", restoredAt: "2026-01-01T00:00:02.000Z",
+      preManifestDigest: "a".repeat(64), postManifestDigest: "b".repeat(64)
+    };
+    const forged = evolve(state, {
+      ...envelope(state, "checkpoint.restored", restored), authority: "tool"
+    });
+    expect(forged.checkpointHead).toBeUndefined();
+    expect(forged.mutationEvidence).toEqual(state.mutationEvidence);
+
+    const reconciled = evolve(state, envelope(state, "checkpoint.restored", restored));
+    expect(reconciled.checkpointHead).toMatchObject({
+      checkpointId: "restored-checkpoint", status: "restored", runId: state.runId
+    });
+    expect(reconciled.mutationEvidence.map((item) => item.evidenceId)).toEqual([
+      "survivor-delta", "shared-validation", "shared-review", "unbound-waiver"
+    ]);
+    expect(reconciled.evidence.map((item) => item.evidenceId)).toEqual([
+      "shared-validation", "shared-review", "unrelated-diagnostic"
+    ]);
+    expect(reconciled.mutationEvidence.find((item) => item.kind === "validation")?.data)
+      .toMatchObject({ workspaceDeltaEvidenceIds: ["survivor-delta"] });
+    expect(reconciled.mutationEvidence.find((item) => item.kind === "review")?.data)
+      .toMatchObject({ workspaceDeltaEvidenceIds: ["survivor-delta"] });
+    expect(reconciled.evidence.find((item) => item.kind === "validation")?.data)
+      .toMatchObject({ workspaceDeltaEvidenceIds: ["survivor-delta"] });
+    expect(reconciled.evidence.find((item) => item.kind === "review")?.data)
+      .toMatchObject({ workspaceDeltaEvidenceIds: ["survivor-delta"] });
+    expect(() => assertKernelInvariants(reconciled)).not.toThrow();
+
+    const replayed = evolve(reconciled, {
+      ...envelope(reconciled, "checkpoint.restored", restored), authority: "user"
+    });
+    expect(replayed.evidence).toEqual(reconciled.evidence);
+    expect(replayed.mutationEvidence).toEqual(reconciled.mutationEvidence);
+    expect(replayed.checkpointHead).toEqual(reconciled.checkpointHead);
+
+    const crossRunSeal = apply(replayed, "checkpoint.sealed", {
+      ...restored, status: "sealed", sealedAt: "2026-01-01T00:00:03.000Z"
+    });
+    expect(crossRunSeal.checkpointHead).toEqual(replayed.checkpointHead);
+    const foreignRunRestore = evolve(crossRunSeal, {
+      ...envelope(crossRunSeal, "checkpoint.restored", restored), runId: "foreign-run"
+    });
+    expect(foreignRunRestore.checkpointHead).toEqual(replayed.checkpointHead);
+    expect(apply(foreignRunRestore, "checkpoint.restored", { malformed: true }).checkpointHead)
+      .toEqual(replayed.checkpointHead);
+    expect(() => evolve(foreignRunRestore, {
+      ...envelope(foreignRunRestore, "checkpoint.restored", restored), sessionId: "foreign-session"
+    })).toThrow("Kernel event session mismatch");
+  });
+
+  it("freezes builtin identities and only complete skill execution manifests", () => {
+    let state = initial();
+    const forgedByUser = evolve(state, {
+      ...envelope(state, "evidence.recorded", diagnosticEvidence("user-forgery")), authority: "user"
+    });
+    expect(forgedByUser.evidence).toEqual([]);
+
+    state = apply(forgedByUser, "profile.resolved", {
+      profileId: "builtin:secure", digest: "profile-digest", artifactId: "profile-artifact", source: "builtin"
+    });
+    expect(state.frozenProfile).toMatchObject({ qualifiedName: "builtin:secure", source: "builtin" });
+
+    state = apply(state, "skill.loaded", {
+      qualifiedName: "builtin:typescript", digest: "skill-digest", artifactId: "skill-artifact", source: "builtin",
+      executionManifestArtifactId: "a".repeat(64), executionManifestDigest: "b".repeat(64)
+    });
+    expect(state.frozenSkills.at(-1)).toMatchObject({
+      qualifiedName: "builtin:typescript", source: "builtin",
+      executionManifestArtifactId: "a".repeat(64), executionManifestDigest: "b".repeat(64)
+    });
+
+    state = apply(state, "skill.loaded", {
+      qualifiedName: "workspace:invalid-artifact", digest: "skill-digest", artifactId: "skill-artifact",
+      source: "workspace", executionManifestArtifactId: "not-a-digest", executionManifestDigest: "b".repeat(64)
+    });
+    state = apply(state, "skill.loaded", {
+      qualifiedName: "workspace:missing-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      source: "workspace", executionManifestArtifactId: "c".repeat(64)
+    });
+    state = apply(state, "skill.loaded", {
+      qualifiedName: "workspace:invalid-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      source: "workspace", executionManifestArtifactId: "c".repeat(64), executionManifestDigest: "not-a-digest"
+    });
+    expect(state.frozenSkills.slice(-3).every((item) => item.executionManifestArtifactId === undefined)).toBe(true);
   });
 });

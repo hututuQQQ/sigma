@@ -1,7 +1,12 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
-import { resolveWorkspacePath, runProcess, selfContainedGitRoot } from "agent-platform";
+import {
+  resolveWorkspacePath,
+  runProcess,
+  selfContainedGitRoot,
+  type ProcessExecutionPort
+} from "agent-platform";
 import type { RegisteredEffectTool } from "./registry.js";
 
 function object(value: JsonValue): Record<string, JsonValue> {
@@ -121,7 +126,7 @@ async function fallbackSearch(
   return { matches: matches.slice(0, limit), truncated: matches.length > limit };
 }
 
-function grepTool(): RegisteredEffectTool {
+function grepTool(execution?: ProcessExecutionPort): RegisteredEffectTool {
   return {
     descriptor: schema({
       name: "grep",
@@ -146,7 +151,9 @@ function grepTool(): RegisteredEffectTool {
       if (glob) argv.push("--glob", glob);
       argv.push("--", query, safeSearchPath);
       try {
+        if (!execution) throw new Error("Sandboxed process execution is unavailable.");
         const output = await runProcess({
+          execution,
           executable: "rg", args: argv, cwd: workspaceRoot, timeoutMs: 30_000,
           maxStdoutLines: limit + 1, signal: context.signal
         });
@@ -185,7 +192,12 @@ function gitDiffPreview(output: string, artifact: string): string {
   ].join("");
 }
 
-function gitReadTool(name: "git_status" | "git_diff", args: string[], description: string): RegisteredEffectTool {
+function gitReadTool(
+  name: "git_status" | "git_diff",
+  args: string[],
+  description: string,
+  execution?: ProcessExecutionPort
+): RegisteredEffectTool {
   return {
     descriptor: schema({
       name, description, properties: {}, possibleEffects: ["filesystem.read", "process.spawn.readonly"], executionMode: "parallel",
@@ -193,11 +205,13 @@ function gitReadTool(name: "git_status" | "git_diff", args: string[], descriptio
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
-      const repositoryRoot = await selfContainedGitRoot(context.workspacePath, context.signal);
+      const repositoryRoot = execution
+        ? await selfContainedGitRoot(context.workspacePath, context.signal, execution) : null;
       if (!repositoryRoot) {
         return result(request, startedAt, "Workspace is not a self-contained Git repository.", false, ["workspace_not_git_root"]);
       }
       const output = await runProcess({
+        execution: execution!,
         executable: "git", args, cwd: repositoryRoot, timeoutMs: 30_000,
         maxOutputBytes: name === "git_diff" ? gitCaptureCharacters : 2_000_000,
         signal: context.signal
@@ -220,11 +234,11 @@ function gitReadTool(name: "git_status" | "git_diff", args: string[], descriptio
   };
 }
 
-export function repositoryTools(): RegisteredEffectTool[] {
+export function repositoryTools(execution?: ProcessExecutionPort): RegisteredEffectTool[] {
   return [
     listTool(),
-    grepTool(),
-    gitReadTool("git_status", ["status", "--short", "--branch"], "Show the repository branch and working-tree status without changing it."),
-    gitReadTool("git_diff", ["diff", "--no-ext-diff", "--stat", "--patch"], "Show the current unstaged Git diff without changing it.")
+    grepTool(execution),
+    gitReadTool("git_status", ["status", "--short", "--branch"], "Show the repository branch and working-tree status without changing it.", execution),
+    gitReadTool("git_diff", ["diff", "--no-ext-diff", "--stat", "--patch"], "Show the current unstaged Git diff without changing it.", execution)
   ];
 }

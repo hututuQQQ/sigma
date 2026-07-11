@@ -2,7 +2,13 @@ import type { JsonValue, ModelMessage, ModelToolCall, RunOutcome, ToolReceipt } 
 import type { KernelState } from "./state.js";
 
 function propose(state: KernelState, outcome: RunOutcome): KernelState {
-  return { ...state, phase: "outcome_pending", activeModelTurn: undefined, proposedOutcome: outcome };
+  return {
+    ...state,
+    phase: "outcome_pending",
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined,
+    proposedOutcome: outcome
+  };
 }
 
 export function completionSummary(receipt: ToolReceipt): string | null {

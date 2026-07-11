@@ -8,10 +8,14 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
+    { "path": "../agent-code-intel" },
     { "path": "../agent-config" },
+    { "path": "../agent-execution" },
+    { "path": "../agent-extensions" },
     { "path": "../agent-presentation" },
     { "path": "../agent-protocol" },
     { "path": "../agent-runtime" },
+    { "path": "../agent-store" },
     { "path": "../agent-tui" }
   ]
 }

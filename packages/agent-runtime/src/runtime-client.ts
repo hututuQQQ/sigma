@@ -1,39 +1,111 @@
-import { randomUUID } from "node:crypto";
-import { loadNestedInstructions } from "agent-context";
-import type { AgentEventEnvelope, AgentEventType, ContextAuthority, JsonValue, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession } from "agent-protocol";
-import { evolve } from "agent-kernel";
+import { type AgentEventEnvelope, type AgentEventOf, type AgentEventPayloadMap, type AgentEventType, type BudgetLedgerState, type ContextAuthority, type JsonValue, type RunCommand, type RunOutcome, type RuntimeClient, type SessionOverview, type SessionRef, type StartSession } from "agent-protocol";
 import { ContentAddressedArtifactStore } from "agent-store";
 import { EffectRunner } from "./effect-runner.js";
-import { jsonValue } from "./json.js";
 import { newRuntimeSession } from "./new-runtime-session.js";
-import { baseContext } from "./runtime-context.js";
-import { persistRuntimeSnapshot } from "./runtime-snapshot.js";
-import { beginNextRun, recoveryDenialPayload } from "./run-transitions.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
-import { restoreStoredSession } from "./restore-session.js";
 import { SessionCommandBus } from "./session-command-bus.js";
-import { storedSessionOverview } from "./session-overview.js";
+import { combinedSessionEvents, ensureSessionPromoted, listCombinedSessions } from "./session-catalog.js";
 import { streamSessionEvents } from "./runtime-stream.js";
-import {
-  resolveOutcomeWaiters,
-  settleIdleWaiters,
-  waitForSessionIdleOutcome,
-  waitForSessionOutcome
-} from "./runtime-waiters.js";
+import { waitForSessionIdleOutcome, waitForSessionOutcome } from "./runtime-waiters.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import { releaseRuntimeSession } from "./release-session.js";
+import { BudgetController } from "./budget-controller.js";
+import { RuntimeControlService } from "./runtime-control.js";
+import { ModelReviewer } from "./reviewer.js";
+import { handleChildEvent } from "./child-event-handler.js";
+import { reconcileInterruptedChildren } from "./durable-children.js";
+import { RuntimeHookCoordinator } from "./runtime-hooks.js";
+import { ModelAgentProfileHookRunner } from "./agent-profile-hook-runner.js";
+import { runRuntimeSession } from "./runtime-run.js";
+import { terminateRunProcesses } from "./process-cleanup.js";
+import { requestDelegatedApproval as awaitDelegatedApproval } from "./delegated-approval.js";
+import { RuntimeCommandHandler } from "./runtime-command-handler.js";
+import { RuntimeEventLog } from "./runtime-event-log.js";
+import { hydrateRuntimeSession } from "./runtime-session-restore.js";
+import { RuntimeRunScheduler } from "./runtime-run-scheduler.js";
+import { initializeRuntimeSession } from "./runtime-session-initialization.js";
+import { restoreRuntimeCustomization } from "./runtime-customization-restore.js";
+import { finishRuntimeSession } from "./runtime-session-finish.js";
+import { RuntimeCheckpointCoordinator } from "./runtime-checkpoint-coordinator.js";
+import {
+  assertProfileResources,
+  constrainBudget,
+  resolveHookProfile,
+  resolveChildProfile,
+  roleForMode,
+  type SessionProfileSelection
+} from "./session-profile.js";
+import { createCheckpointManager } from "./runtime-checkpoint-manager.js";
+import { FrozenWorkspaceHookMaterializer } from "./frozen-hook-assets.js";
+import { FrozenSkillMaterializer } from "./frozen-skill-assets.js";
+import { ChildCheckpointRecoveryCoordinator } from "./child-workspace-recovery.js";
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
-  private readonly emitQueues = new Map<string, Promise<void>>();
   private readonly artifacts: ContentAddressedArtifactStore;
   private readonly effects: EffectRunner;
   private readonly runDeadlineMs: number;
   private readonly commandBus: SessionCommandBus;
-
+  private readonly control: RuntimeControlService;
+  private readonly budgets: BudgetController;
+  private readonly hooks: RuntimeHookCoordinator;
+  private readonly commands: RuntimeCommandHandler;
+  private readonly events: RuntimeEventLog;
+  private readonly runs: RuntimeRunScheduler;
+  private readonly checkpoints: RuntimeCheckpointCoordinator;
+  private readonly checkpointManager: ReturnType<typeof createCheckpointManager>;
+  private readonly childCheckpointRecovery: ChildCheckpointRecoveryCoordinator;
+  private readonly profileHookRecovery?: ModelAgentProfileHookRunner;
   constructor(private readonly options: RuntimeOptions & { storeRootDir: string }) {
+    assertProfileResources(options, options.profile);
     this.artifacts = new ContentAddressedArtifactStore(options.storeRootDir);
     this.runDeadlineMs = options.runDeadlineMs ?? 900_000;
+    this.events = new RuntimeEventLog(options.store);
     this.commandBus = new SessionCommandBus(options.storeRootDir, async (command) => await this.command(command));
+    this.commands = new RuntimeCommandHandler({
+      runDeadlineMs: this.runDeadlineMs,
+      commandBus: this.commandBus,
+      cancelChildren: options.cancelChildren,
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
+      finish: async (session, outcome) => await this.finish(session, outcome),
+      start: (session) => this.startRun(session)
+    });
+    if (options.hooks?.some((hook) => hook.kind === "command") && !options.hookRunner) {
+      throw new Error("A hookRunner is required when command hooks are configured.");
+    }
+    this.budgets = new BudgetController(async (session, type, authority, value) =>
+      await this.emit(session, type, authority, value));
+    const productionProfileRunner = options.agentProfileHookRunner ? undefined : new ModelAgentProfileHookRunner({
+      session: (sessionId) => this.required(sessionId),
+      resolveProfile: (session, profileId) => resolveHookProfile(options, session, profileId),
+      gateway: (session, profile) => options.gatewayForRole?.("planner", profile) ?? session.gateway,
+      budgets: this.budgets,
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    });
+    this.profileHookRecovery = productionProfileRunner;
+    const agentProfileRunner = options.agentProfileHookRunner ?? productionProfileRunner;
+    const hookMaterializer = new FrozenWorkspaceHookMaterializer(options.storeRootDir, this.artifacts);
+    this.hooks = new RuntimeHookCoordinator({
+      definitions: options.hooks ?? [],
+      runner: options.hookRunner ?? { run: async () => ({ ok: false, error: "Hook runner is unavailable.", durationMs: 0 }) },
+      ...(agentProfileRunner ? { agentProfileRunner } : {}),
+      materializeWorkspaceHook: (session, hook) => hookMaterializer.materialize(session.workspacePath, session.sessionId, hook),
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    });
+    this.checkpointManager = createCheckpointManager(options);
+    this.control = new RuntimeControlService({
+      checkpoints: this.checkpointManager,
+      skills: options.skills,
+      budgets: this.budgets,
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
+      createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
+      readArtifact: async (sessionId, artifactId) => (await this.artifacts.get(sessionId, artifactId)).toString("utf8"),
+      skillMaterializer: new FrozenSkillMaterializer(options.storeRootDir, this.artifacts),
+      planChanged: async (session, previousRevision, plan) => {
+        await this.hooks.dispatch(session, "plan_changed", {
+          previousRevision, plan, source: "tool"
+        }, session.controller?.signal ?? new AbortController().signal);
+      }
+    });
     this.effects = new EffectRunner({
       runtime: options,
       maxParallelTools: options.maxParallelTools ?? 4,
@@ -41,20 +113,90 @@ export class InProcessRuntimeClient implements RuntimeClient {
       outputReserveTokens: options.outputReserveTokens ?? Math.min(8_192, options.gateway.capabilities.maxOutputTokens),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
       finish: async (session, outcome, outcomeRevision) => await this.finish(session, outcome, outcomeRevision),
-      createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content)
+      createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
+      control: this.control,
+      budgets: this.budgets,
+      reviewer: options.reviewer ?? new ModelReviewer(options.gateway),
+      reviewerForSession: options.reviewerForSession,
+      hooks: this.hooks
     });
+    this.runs = new RuntimeRunScheduler({
+      runDeadlineMs: this.runDeadlineMs,
+      commandBus: this.commandBus,
+      run: async (session) => await this.run(session),
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
+      finish: async (session, outcome) => await this.finish(session, outcome),
+      waitForQuiescence: async (sessionId) => await this.effects.waitForQuiescence(sessionId)
+    });
+    this.checkpoints = new RuntimeCheckpointCoordinator(
+      this.effects,
+      this.control,
+      options.hasActiveChildren
+    );
+    this.childCheckpointRecovery = new ChildCheckpointRecoveryCoordinator({ store: options.store, checkpoints: this.checkpointManager, coordinator: this.checkpoints, control: this.control, emit: async (session, type, authority, value) => await this.emit(session, type, authority, value) });
   }
-  async createSession(input: StartSession): Promise<SessionRef> {
-    const session = await newRuntimeSession(input, this.runDeadlineMs);
+  async createSession(input: StartSession, allocatedBudget = this.options.budgetLimits): Promise<SessionRef> {
+    return await this.createSessionWithProfile(input, constrainBudget(allocatedBudget, this.options.profile), {
+      profile: this.options.profile,
+      profileSource: this.options.profileSource
+    }, "orchestrator");
+  }
+
+  async createChildSession(
+    parentSessionId: string,
+    input: StartSession,
+    allocatedBudget: import("agent-protocol").BudgetLimits | undefined,
+    requestedProfileId?: string | null,
+    workspaceLeaseInherited = false
+  ): Promise<SessionRef> {
+    if (input.reviewerWaiverReason?.trim()) {
+      throw Object.assign(new Error("Child agents cannot waive independent review."), {
+        code: "reviewer_waiver_user_only"
+      });
+    }
+    const selection = resolveChildProfile(this.options, this.required(parentSessionId), requestedProfileId);
+    return await this.createSessionWithProfile(
+      input,
+      constrainBudget(allocatedBudget, selection.profile),
+      selection,
+      roleForMode(input.mode),
+      workspaceLeaseInherited,
+      parentSessionId
+    );
+  }
+
+  private async createSessionWithProfile(
+    input: StartSession,
+    allocatedBudget: import("agent-protocol").BudgetLimits | undefined,
+    selection: SessionProfileSelection,
+    modelRole: import("agent-protocol").ModelExecutionRole,
+    workspaceLeaseInherited = false,
+    parentSessionId?: string
+  ): Promise<SessionRef> {
+    assertProfileResources(this.options, selection.profile);
+    const gateway = this.options.gatewayForRole?.(modelRole, selection.profile) ?? this.options.gateway;
+    const session = await newRuntimeSession(input, this.runDeadlineMs, allocatedBudget, {
+      gateway,
+      modelRole,
+      profile: selection.profile,
+      profileSource: selection.profileSource,
+      workspaceLeaseInherited,
+      ...(parentSessionId ? { parentSessionId } : {})
+    });
     this.sessions.set(session.sessionId, session);
     await this.commandBus.claim(session.sessionId);
     try {
-      await this.emit(session, "session.created", "runtime", {
-        workspacePath: session.workspacePath,
-        mode: input.mode,
-        title: input.title ?? "",
-        writeScope: session.writeScope,
-        strictWriteScope: session.strictWriteScope
+      await initializeRuntimeSession(session, input, {
+        profile: session.profile,
+        profileSource: session.profileSource,
+        availableProfiles: this.options.availableProfiles,
+        skills: this.options.skills,
+        hooks: this.options.hooks,
+        hookArtifacts: this.options.hookArtifacts,
+        putArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
+        emit: async (target, type, authority, value) => await this.emit(target, type, authority, value),
+        dispatchHook: async (target, event, value, signal) =>
+          await this.hooks.dispatch(target, event, value, signal)
       });
     } catch (error) {
       this.sessions.delete(session.sessionId);
@@ -66,13 +208,36 @@ export class InProcessRuntimeClient implements RuntimeClient {
   async command(command: RunCommand): Promise<void> {
     if (command.type === "resume") return await this.handleResume(command);
     const session = this.required(command.sessionId);
-    if (command.type === "cancel") return await this.handleCancel(session, command);
-    if (command.type === "approve") return await this.handleApproval(session, command);
-    if (command.type === "steer") return await this.handleSteer(session, command.text);
-    if (command.type === "follow_up") return await this.handleFollowUp(session, command.text);
-    await this.handleSubmit(session, command);
+    if (command.type === "checkpoint_recovery") {
+      await this.checkpoints.resolveOpen(session, command.checkpointId, command.decision);
+      session.lastOutcome = undefined;
+      await this.recoverSession(session);
+      return;
+    }
+    if (command.type === "budget_increase") {
+      if (session.parentSessionId || session.modelRole === "child_analyze" || session.modelRole === "child_write") {
+        const ancestry = session.parentSessionId ? ` of '${session.parentSessionId}'` : "";
+        throw Object.assign(new Error(
+          `Only a root session may increase budget limits; '${session.sessionId}' is a child${ancestry}.`
+        ), { code: "budget_increase_root_only" });
+      }
+      await this.budgets.increaseLimits(session, command.increase);
+      return;
+    }
+    if (session.openCheckpointRecovery) {
+      throw Object.assign(new Error(
+        `Checkpoint ${session.openCheckpointRecovery.checkpointId} requires an explicit user restore or keep decision.`
+      ), { code: "checkpoint_recovery_required" });
+    }
+    if (command.type === "reviewer_waiver") return await this.commands.reviewerWaiver(session, command);
+    if (command.type === "cancel") return await this.commands.cancel(session, command);
+    if (command.type === "approve") return await this.commands.approval(session, command);
+    if (command.type === "steer") return await this.commands.steer(session, command.text);
+    if (command.type === "follow_up") return await this.commands.followUp(session, command.text);
+    await this.commands.submit(session, command);
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
+    await ensureSessionPromoted(this.options.storeRootDir, command.sessionId);
     await this.commandBus.claim(command.sessionId);
     try {
       await this.resume(command.sessionId);
@@ -82,91 +247,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       throw error;
     }
   }
-  private async handleCancel(session: RuntimeSession, command: Extract<RunCommand, { type: "cancel" }>): Promise<void> {
-    const reason = command.reason ?? "Cancelled by user.";
-    session.controller?.abort(new Error(reason));
-    for (const approval of session.approvals.values()) approval.resolve("deny");
-    await this.options.cancelChildren?.(session.sessionId, reason);
-    if (!session.running && session.state.phase !== "terminal") await this.finish(session, { kind: "cancelled", reason });
-  }
-  private async handleApproval(session: RuntimeSession, command: Extract<RunCommand, { type: "approve" }>): Promise<void> {
-    const approval = session.approvals.get(command.requestId);
-    const pendingTool = session.state.pendingTools.find((item) => item.request.callId === command.requestId);
-    if (!approval || !pendingTool) throw new Error(`Unknown approval '${command.requestId}'.`);
-    session.approvals.delete(command.requestId);
-    if (command.decision === "always_allow") session.alwaysAllowedEffects.add(approval.effects.slice().sort().join("\0"));
-    await this.emit(session, "tool.approval_resolved", "user", {
-      requestId: command.requestId,
-      callId: command.requestId,
-      decision: command.decision,
-      ...pendingTool.modelTurn
-    });
-    approval.resolve(command.decision);
-    if (approval.recovered && command.decision === "deny") {
-      await this.emit(
-        session,
-        "tool.failed",
-        "runtime",
-        recoveryDenialPayload(command.requestId, pendingTool.modelTurn)
-      );
-    }
-    if (!session.running && session.state.phase !== "terminal") {
-      session.lastOutcome = undefined;
-      this.startRun(session);
-    }
-  }
-  private async handleSteer(session: RuntimeSession, text: string): Promise<void> {
-    if (session.steeringPending >= 256) throw new Error("Steering queue is full (256 messages).");
-    session.steeringPending += 1;
-    try {
-      await this.emit(session, "user.steer", "user", { text });
-      const reason = Object.assign(new Error("Active model/tool turn was superseded by user steering."), {
-        code: "steering_restart"
-      });
-      session.turnController?.abort(reason);
-    } finally {
-      session.steeringPending -= 1;
-    }
-  }
-
-  private async handleFollowUp(session: RuntimeSession, text: string): Promise<void> {
-    if (session.followUps.length >= 256) throw new Error("Follow-up queue is full (256 messages).");
-    if (session.running) {
-      const followUp = { id: randomUUID(), text };
-      await this.emit(session, "user.follow_up", "user", { text, queueId: followUp.id, status: "queued" });
-      session.followUps.push(followUp);
-      return;
-    }
-    if (session.state.phase === "terminal") {
-      await this.commandBus.claim(session.sessionId);
-      beginNextRun(session, session.mode, this.runDeadlineMs);
-    } else if (session.state.phase === "needs_input") {
-      await this.commandBus.claim(session.sessionId);
-      session.lastOutcome = undefined;
-    }
-    await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
-    await this.emit(session, "user.follow_up", "user", { text, queueId: randomUUID(), status: "delivered" });
-    this.startRun(session);
-  }
-
-  private async handleSubmit(session: RuntimeSession, command: Extract<RunCommand, { type: "submit" }>): Promise<void> {
-    if (session.running && session.state.phase === "terminal") await session.running;
-    if (session.running) {
-      await this.handleSteer(session, command.text);
-      return;
-    }
-    if (session.state.phase === "terminal") {
-      await this.commandBus.claim(session.sessionId);
-      beginNextRun(session, command.mode ?? session.mode, this.runDeadlineMs);
-    } else if (session.state.phase === "needs_input") {
-      await this.commandBus.claim(session.sessionId);
-      session.lastOutcome = undefined;
-    }
-    await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
-    await this.emit(session, "user.message", "user", { text: command.text });
-    this.startRun(session);
-  }
-
   subscribe(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEventEnvelope> {
     return streamSessionEvents(this.options.store, this.sessions.get(sessionId), sessionId, signal);
   }
@@ -185,11 +265,10 @@ export class InProcessRuntimeClient implements RuntimeClient {
 
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
   async listSessions(limit = 20): Promise<SessionOverview[]> {
-    const stored = (await this.options.store.listSessions()).slice(0, Math.max(1, limit));
-    return await Promise.all(stored.map(async (item) => await storedSessionOverview(this.options.store, item)));
+    return await listCombinedSessions(this.options.store, this.options.storeRootDir, limit);
   }
   sessionEvents(sessionId: string, afterSeq = 0): AsyncIterable<AgentEventEnvelope> {
-    return this.options.store.events(sessionId, afterSeq);
+    return combinedSessionEvents(this.options.store, this.options.storeRootDir, sessionId, afterSeq);
   }
   async releaseSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -197,157 +276,109 @@ export class InProcessRuntimeClient implements RuntimeClient {
       async () => await this.effects.waitForQuiescence(sessionId),
       async () => await this.commandBus.release(sessionId))) return;
     this.sessions.delete(sessionId);
-    this.emitQueues.delete(sessionId);
+    this.events.forget(sessionId);
+  }
+  sessionBudget(sessionId: string): BudgetLedgerState {
+    return structuredClone(this.required(sessionId).state.budget);
+  }
+  async undoLatestCheckpoint(sessionId: string): Promise<import("agent-protocol").CheckpointRef> {
+    return await this.checkpoints.undoLatest(this.required(sessionId));
   }
   async recordChildEvent(
     parentSessionId: string,
     type: "child.spawned" | "child.message" | "child.completed",
     payload: JsonValue
   ): Promise<void> {
-    await this.emit(this.required(parentSessionId), type, "runtime", payload);
+    const session = this.required(parentSessionId);
+    await handleChildEvent(
+      session,
+      type,
+      payload,
+      this.control,
+      async (target, eventType, authority, value) => await this.emit(target, eventType, authority, value)
+    );
+  }
+  async requestDelegatedApproval(
+    parentSessionId: string,
+    request: import("./delegated-approval.js").DelegatedApprovalRequest,
+    signal: AbortSignal
+  ): Promise<"allow" | "deny"> {
+    return await awaitDelegatedApproval(
+      this.required(parentSessionId), request, signal,
+      async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    );
   }
   private async run(session: RuntimeSession): Promise<void> {
-    const controller = new AbortController();
-    session.controller = controller;
-    const remainingMs = Date.parse(session.state.deadlineAt) - Date.now();
-    if (remainingMs <= 0) {
-      await this.finish(session, {
-        kind: "recoverable_failure",
-        code: "budget_exhausted",
-        message: `Run deadline ${session.state.deadlineAt} has already elapsed.`
-      });
-      session.controller = null;
-      return;
-    }
-    session.deadlineTimer = setTimeout(() => {
-      const error = new Error(`Run exceeded its durable deadline ${session.state.deadlineAt}.`);
-      error.name = "TimeoutError";
-      controller.abort(error);
-    }, remainingMs);
-    try {
-      await this.effects.run(session, controller.signal);
-    } catch (error) {
-      if (controller.signal.aborted) {
-        const reason = controller.signal.reason instanceof Error ? controller.signal.reason : new Error("Run cancelled.");
-        const outcome: RunOutcome = reason.name === "TimeoutError"
-          ? { kind: "recoverable_failure", code: "budget_exhausted", message: reason.message }
-          : { kind: "cancelled", reason: reason.message };
-        await this.finish(session, outcome);
-      } else {
-        const code = typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : "runtime_error";
-        await this.finish(session, { kind: "recoverable_failure", code, message: error instanceof Error ? error.message : String(error) });
-      }
-    } finally {
-      if (session.deadlineTimer) clearTimeout(session.deadlineTimer);
-      session.deadlineTimer = null;
-      session.controller = null;
-    }
+    await runRuntimeSession({
+      hooks: this.hooks,
+      effects: this.effects,
+      finish: async (target, outcome) => await this.finish(target, outcome)
+    }, session);
   }
   private async finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean> {
-    const type: AgentEventType = outcome.kind === "completed" ? "run.completed"
-      : outcome.kind === "cancelled" ? "run.cancelled"
-        : outcome.kind === "needs_input" ? "run.suspended" : "run.failed";
-    const event = outcomeRevision === undefined
-      ? await this.emit(session, type, "runtime", outcome)
-      : await this.emitOutcomeIfCurrent(session, type, outcome, outcomeRevision);
-    const committed = outcome.kind === "needs_input"
-      ? session.state.phase === "needs_input"
-      : session.state.phase === "terminal";
-    if (!event || session.state.lastSeq !== event.seq || !committed) return false;
-    if (outcome.kind !== "completed") {
-      await this.options.cancelChildren?.(session.sessionId, `Parent run ended as ${outcome.kind}.`);
-    }
-    session.lastOutcome = outcome;
-    await this.writeSnapshot(session);
-    if (session.followUps.length === 0) await this.commandBus.release(session.sessionId);
-    resolveOutcomeWaiters(session, event.runId, outcome);
-    return true;
+    return await finishRuntimeSession({
+      hooks: this.hooks,
+      events: this.events,
+      commandBus: this.commandBus,
+      cancelChildren: this.options.cancelChildren,
+      beforeOutcome: async (target, finalOutcome) => await terminateRunProcesses(
+        target,
+        finalOutcome,
+        this.options.execution,
+        async (current, type, authority, value) => await this.emit(current, type, authority, value)
+      )
+    }, session, outcome, outcomeRevision);
   }
 
-  private async emitOutcomeIfCurrent(
+  private async emit<TType extends AgentEventType>(
     session: RuntimeSession,
-    type: AgentEventType,
-    outcome: RunOutcome,
-    outcomeRevision: number
-  ): Promise<AgentEventEnvelope | undefined> {
-    const previous = this.emitQueues.get(session.sessionId) ?? Promise.resolve();
-    let emitted: AgentEventEnvelope | undefined;
-    const current = previous.then(async () => {
-      if (session.state.phase !== "outcome_pending" || session.state.revision !== outcomeRevision) return;
-      emitted = await this.emitLocked(session, type, "runtime", { ...outcome, outcomeRevision });
-    });
-    this.emitQueues.set(session.sessionId, current.catch(() => undefined));
-    await current;
-    return emitted;
-  }
-
-  private async emit(
-    session: RuntimeSession,
-    type: AgentEventType,
+    type: TType,
     authority: Exclude<ContextAuthority, "external_verifier">,
-    value: unknown
-  ): Promise<AgentEventEnvelope> {
-    const previous = this.emitQueues.get(session.sessionId) ?? Promise.resolve();
-    let emitted!: AgentEventEnvelope;
-    const current = previous.then(async () => {
-      emitted = await this.emitLocked(session, type, authority, value);
-    });
-    this.emitQueues.set(session.sessionId, current.catch(() => undefined));
-    await current;
-    return emitted;
-  }
-
-  private async emitLocked(
-    session: RuntimeSession,
-    type: AgentEventType,
-    authority: Exclude<ContextAuthority, "external_verifier">,
-    value: unknown
-  ): Promise<AgentEventEnvelope> {
-    const expectedSeq = session.seq;
-    const event: AgentEventEnvelope = {
-      schemaVersion: 2,
-      seq: expectedSeq + 1,
-      eventId: randomUUID(),
-      sessionId: session.sessionId,
-      runId: session.runId,
-      occurredAt: new Date().toISOString(),
-      type,
-      authority,
-      payload: jsonValue(value)
-    };
-    const append = await this.options.store.append(event, expectedSeq);
-    session.seq = event.seq;
-    session.state = evolve(session.state, event);
-    for (const subscriber of session.subscribers) subscriber.push(event);
-    if (append.rotated || event.seq % 250 === 0) await this.writeSnapshot(session);
-    return event;
-  }
-
-  private async writeSnapshot(session: RuntimeSession): Promise<void> {
-    await persistRuntimeSnapshot(this.options.store, session);
+    value: AgentEventPayloadMap[NoInfer<TType>]
+  ): Promise<AgentEventOf<TType>> {
+    return await this.events.emit(session, type, authority, value);
   }
 
   private async resume(sessionId: string): Promise<void> {
     if (this.sessions.has(sessionId)) return;
-    const restored = await restoreStoredSession(this.options.store, sessionId, this.runDeadlineMs);
-    const { workspacePath, state, modelTurn, lastSeq, followUps, writeScope, strictWriteScope, contextItems } = restored;
-    const project = await loadNestedInstructions({ workspacePath });
-    const base = baseContext();
-    const session: RuntimeSession = {
-      sessionId, runId: state.runId, modelTurn,
-      workspacePath, mode: state.mode, writeScope, strictWriteScope, state, seq: lastSeq,
-      controller: null, turnController: null, deadlineTimer: null, running: null, subscribers: new Set(), approvals: new Map(),
-      alwaysAllowedEffects: new Set(), steeringPending: 0, followUps, contextItems: [...base, ...project, ...contextItems],
-      loadedContextIds: new Set([...base, ...project, ...contextItems].map((item) => item.id)), outcomeWaiters: [], idleWaiters: [], lastOutcome: state.outcome
-    };
+    const session = await hydrateRuntimeSession(this.options.store, sessionId, this.runDeadlineMs, {
+      gateway: this.options.gateway,
+      profile: this.options.profile,
+      profileSource: this.options.profileSource
+    });
+    await restoreRuntimeCustomization(session, this.artifacts, this.options);
     this.sessions.set(sessionId, session);
+    const recovery = await this.control.recoverOpen(session);
+    if (recovery.kind === "needs_input") {
+      await this.childCheckpointRecovery.suspendOwnCheckpoint(session, {
+        checkpointId: recovery.checkpointId,
+        currentManifestDigest: recovery.currentManifestDigest
+      });
+      return;
+    }
     await this.recoverSession(session);
   }
 
   private async recoverSession(session: RuntimeSession): Promise<void> {
+    await this.profileHookRecovery?.recoverInterrupted(session);
+    const hasLiveChildren = await this.options.hasActiveChildren?.(session.sessionId) ?? false;
+    if (!hasLiveChildren) {
+      if (await this.childCheckpointRecovery.recover(session)) return;
+      await reconcileInterruptedChildren(
+        this.options.store,
+        session,
+        this.control,
+        async (target, type, authority, value) => await this.emit(target, type, authority, value)
+      );
+    }
     await recoverInterruptedSession(session, {
       descriptors: this.options.tools.descriptors(),
       emit: async (type, authority, payload) => await this.emit(session, type, authority, payload),
+      settleToolBudget: async (callId, disposition, checkpointId) =>
+        await this.budgets.settleInterruptedTool(session, callId, disposition, checkpointId),
+      settleEligibleToolBudgets: async () => await this.effects.settleMutationBudgets(session),
+      settleModelBudget: async (requestId) =>
+        await this.budgets.settleInterruptedModel(session, requestId),
       start: () => this.startRun(session)
     });
   }
@@ -357,44 +388,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (!session) throw new Error(`Unknown session '${sessionId}'.`);
     return session;
   }
-
   private startRun(session: RuntimeSession): void {
-    if (session.running) return;
-    session.runError = undefined;
-    const task = this.drainRuns(session);
-    session.running = task;
-    void task.then(
-      async () => await this.settleRunTask(session, task),
-      async (error) => await this.settleRunTask(session, task, error)
-    ).catch(() => undefined);
-  }
-
-  private async drainRuns(session: RuntimeSession): Promise<void> {
-    while (true) {
-      await this.run(session);
-      const next = session.followUps.shift();
-      if (!next) return;
-      try {
-        await this.commandBus.claim(session.sessionId);
-        beginNextRun(session, session.mode, this.runDeadlineMs);
-        await this.emit(session, "run.started", "runtime", { mode: session.mode, deadlineAt: session.state.deadlineAt });
-        await this.emit(session, "user.follow_up", "user", { text: next.text, queueId: next.id, status: "delivered" });
-      } catch (error) {
-        if (session.state.phase === "terminal") beginNextRun(session, session.mode, this.runDeadlineMs);
-        await this.finish(session, {
-          kind: "recoverable_failure",
-          code: "follow_up_handoff_failed",
-          message: error instanceof Error ? error.message : String(error)
-        });
-        return;
-      }
-    }
-  }
-
-  private async settleRunTask(session: RuntimeSession, task: Promise<void>, error?: unknown): Promise<void> {
-    await this.effects.waitForQuiescence(session.sessionId).catch(() => undefined);
-    if (session.running !== task) return;
-    session.running = null;
-    settleIdleWaiters(session, error);
+    this.runs.start(session);
   }
 }

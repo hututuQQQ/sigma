@@ -100,6 +100,11 @@ function directSourceViolation(specifier, owner, byName) {
   return undefined;
 }
 
+function childProcessViolation(specifier, record) {
+  if (specifier !== "node:child_process" && specifier !== "child_process") return false;
+  return record.name !== "agent-execution";
+}
+
 const records = await packageRecords();
 const byName = new Map(records.map((record) => [record.name, record]));
 const violations = packageCycles(records).map((cycle) => `package dependency cycle: ${cycle}`);
@@ -115,8 +120,14 @@ for (const record of records) {
     }
     const owner = { ...record, file };
     for (const specifier of importSpecifiers(source)) {
+      if (specifier === "node:child_process" && record.name !== "agent-execution") {
+        violations.push(`${relative}: only agent-execution may import node:child_process`);
+      }
       const target = directSourceViolation(specifier, owner, byName);
       if (target) violations.push(`${relative}: imports private source from ${target} via ${specifier}`);
+      if (childProcessViolation(specifier, record)) {
+        violations.push(`${relative}: imports ${specifier}; arbitrary process creation is owned exclusively by agent-execution`);
+      }
     }
   }
 }

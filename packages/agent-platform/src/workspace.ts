@@ -1,6 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
-import { runProcess, type ProcessResult } from "./process.js";
+import { runProcess, type ProcessExecutionPort, type ProcessResult } from "./process.js";
 
 export function isInside(parent: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
@@ -32,7 +32,11 @@ export async function resolveWorkspacePath(workspace: string, requested: string)
   return await canonicalWorkspacePath(workspace, requested);
 }
 
-export async function selfContainedGitRoot(workspace: string, signal?: AbortSignal): Promise<string | null> {
+export async function selfContainedGitRoot(
+  workspace: string,
+  signal: AbortSignal | undefined,
+  execution: ProcessExecutionPort
+): Promise<string | null> {
   signal?.throwIfAborted();
   const root = await realpath(path.resolve(workspace));
   const marker = await lstat(path.join(root, ".git")).catch((error: NodeJS.ErrnoException) => {
@@ -42,6 +46,7 @@ export async function selfContainedGitRoot(workspace: string, signal?: AbortSign
   if (!marker || marker.isSymbolicLink()) return null;
   const processSignal = signal ?? new AbortController().signal;
   const result = await runProcess({
+    execution,
     executable: "git", args: ["rev-parse", "--show-toplevel"], cwd: root,
     timeoutMs: 10_000, maxOutputBytes: 16_384, signal: processSignal
   }).catch(() => {
@@ -56,8 +61,12 @@ export async function selfContainedGitRoot(workspace: string, signal?: AbortSign
   return path.relative(root, canonical) === "" ? root : null;
 }
 
-export async function gitPorcelain(workspace: string, signal: AbortSignal): Promise<ProcessResult> {
-  const root = await selfContainedGitRoot(workspace, signal);
+export async function gitPorcelain(
+  workspace: string,
+  signal: AbortSignal,
+  execution: ProcessExecutionPort
+): Promise<ProcessResult> {
+  const root = await selfContainedGitRoot(workspace, signal, execution);
   if (!root) return {
     exitCode: 128,
     stdout: "",
@@ -69,6 +78,7 @@ export async function gitPorcelain(workspace: string, signal: AbortSignal): Prom
     outputTruncated: false
   };
   return await runProcess({
+    execution,
     executable: "git",
     args: ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     cwd: root,

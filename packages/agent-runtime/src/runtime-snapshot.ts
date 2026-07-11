@@ -1,10 +1,11 @@
-import type { RunStore, SnapshotEnvelope } from "agent-protocol";
+import { SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION, type RunStore, type SnapshotEnvelope } from "agent-protocol";
 import { jsonValue } from "./json.js";
 import type { RuntimeSession } from "./types.js";
 
 export async function persistRuntimeSnapshot(store: RunStore, session: RuntimeSession): Promise<void> {
   const snapshot: SnapshotEnvelope = {
-    schemaVersion: 2,
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    storeLayoutVersion: STORE_LAYOUT_VERSION,
     sessionId: session.sessionId,
     seq: session.seq,
     createdAt: new Date().toISOString(),

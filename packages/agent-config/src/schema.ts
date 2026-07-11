@@ -1,3 +1,11 @@
+import {
+  modelRoutesValue,
+  modelSpecsValue,
+  type ModelRouteConfigValue,
+  type ModelSpecConfigValue
+} from "./model-catalog.js";
+import { assertMcpPersistentEffectsAllowed } from "agent-protocol";
+
 export type ConfigScalar = string | number | boolean;
 export type ConfigToolEffect =
   | "filesystem.read" | "filesystem.write" | "process.spawn" | "process.spawn.readonly"
@@ -26,9 +34,17 @@ export interface WorkspaceMcpTrustAttestation {
   configDigest: string;
 }
 
+export interface WorkspaceCustomizationTrustAttestation {
+  required: true;
+  trusted: boolean;
+  canonicalWorkspacePath: string;
+  customizationDigest: string;
+}
+
 export type McpConfigSource = "none" | "flags" | "environment" | "home" | "workspace";
 
-export type ConfigValue = ConfigScalar | string[] | McpServerConfigValue[];
+export type ConfigValue = ConfigScalar | string[] | McpServerConfigValue[]
+  | ModelSpecConfigValue[] | ModelRouteConfigValue[];
 
 export interface ConfigField<T extends ConfigValue = ConfigValue> {
   key: string;
@@ -52,6 +68,8 @@ export interface ConfigSources {
 }
 
 export type ResolvedConfig = Record<string, ConfigValue>;
+
+export const CONFIG_SCHEMA_VERSION = 3 as const;
 
 function stringValue(raw: unknown, key: string, allowEmpty = false): string {
   if (typeof raw !== "string" || (!allowEmpty && !raw.trim())) throw new Error(`Configuration '${key}' requires a${allowEmpty ? "" : " non-empty"} string.`);
@@ -114,9 +132,14 @@ function mcpServersValue(raw: unknown): McpServerConfigValue[] {
     names.add(name);
     const rawEnv = server.env === undefined ? {} : objectValue(server.env, `mcpServers[${index}].env`);
     const env = Object.fromEntries(Object.entries(rawEnv).map(([key, value]) => [key, stringValue(value, `mcpServers[${index}].env.${key}`, true)]));
-    const possibleEffects = server.possible_effects === undefined
-      ? ["network", "open_world"] as ConfigToolEffect[]
-      : stringArray(server.possible_effects, `mcpServers[${index}].possible_effects`).map((effect) => enumValue(effect, "MCP effect", EFFECTS));
+    if (server.possible_effects === undefined) {
+      assertMcpPersistentEffectsAllowed(name, undefined);
+    }
+    const possibleEffects = stringArray(
+      server.possible_effects,
+      `mcpServers[${index}].possible_effects`
+    ).map((effect) => enumValue(effect, "MCP effect", EFFECTS));
+    assertMcpPersistentEffectsAllowed(name, possibleEffects);
     return {
       name,
       command: stringValue(server.command, `mcpServers[${index}].command`),
@@ -140,22 +163,58 @@ const booleanField = (key: string, flag: string, description: string, shortFlag?
 });
 
 export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
+  { key: "configSchemaVersion", flag: "config-schema-version", toml: "schema_version", description: "Configuration schema version", defaultValue: CONFIG_SCHEMA_VERSION, parse: (raw) => {
+    const value = numberValue(raw, "configSchemaVersion", 2, CONFIG_SCHEMA_VERSION);
+    if (!Number.isInteger(value)) throw new Error("Configuration 'configSchemaVersion' requires an integer.");
+    return value;
+  }, hidden: true },
   { key: "provider", flag: "provider", env: "SIGMA_PROVIDER", toml: "model.provider", description: "Model provider", defaultValue: "deepseek", parse: (raw) => enumValue(raw, "provider", ["deepseek", "glm"] as const) },
   { key: "model", flag: "model", env: "SIGMA_MODEL", toml: "model.name", description: "Model name (auto selects provider default)", defaultValue: "auto", parse: (raw) => stringValue(raw, "model") },
+  {
+    key: "modelSpecs", flag: "model-spec", kind: "repeatable", env: "SIGMA_MODEL_SPECS", toml: "model.specs",
+    description: "Model catalog spec JSON (repeatable)", defaultValue: [], parse: modelSpecsValue, hidden: true
+  },
+  {
+    key: "modelRoutes", flag: "model-route", kind: "repeatable", env: "SIGMA_MODEL_ROUTES", toml: "model.routes",
+    description: "Model route JSON (repeatable)", defaultValue: [], parse: modelRoutesValue, hidden: true
+  },
+  { key: "agentProfile", flag: "agent-profile", env: "SIGMA_AGENT_PROFILE", toml: "agent.profile", description: "Resolved Agent Profile identifier", defaultValue: "standard", parse: (raw) => stringValue(raw, "agentProfile") },
   { key: "workspace", flag: "workspace", env: "SIGMA_WORKSPACE", toml: "workspace.path", description: "Workspace path", defaultValue: ".", parse: (raw) => stringValue(raw, "workspace") },
   { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode", defaultValue: "ask", parse: (raw) => enumValue(raw, "permissionMode", ["ask", "auto", "deny"] as const) },
+  { key: "sandboxMode", flag: "sandbox", env: "SIGMA_SANDBOX", toml: "security.sandbox", description: "Process sandbox policy", defaultValue: "required", parse: (raw) => enumValue(raw, "sandboxMode", ["required"] as const) },
+  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
+  { key: "allowUnsafeHostExec", flag: "allow-unsafe-host-exec", kind: "boolean", toml: "security.allow_unsafe_host_exec", description: "Home-only opt-in for unsafe host execution", defaultValue: false, parse: (raw) => booleanValue(raw, "allowUnsafeHostExec"), hidden: true },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model request deadline in seconds", defaultValue: 300, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
   { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 60, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
   { key: "maxParallelTools", flag: "max-parallel-tools", env: "SIGMA_MAX_PARALLEL_TOOLS", toml: "tools.max_parallel", description: "Maximum parallel tool calls", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelTools", 1, 32) },
   { key: "maxParallelAgents", flag: "max-parallel-agents", env: "SIGMA_MAX_PARALLEL_AGENTS", toml: "agents.max_parallel", description: "Maximum parallel child agents", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelAgents", 1, 32) },
+  { key: "maxInputTokens", flag: "max-input-tokens", env: "SIGMA_MAX_INPUT_TOKENS", toml: "budget.max_input_tokens", description: "Session-tree input token budget", defaultValue: 8_000_000, parse: (raw) => numberValue(raw, "maxInputTokens", 1) },
+  { key: "maxOutputTokens", flag: "max-output-tokens", env: "SIGMA_MAX_OUTPUT_TOKENS", toml: "budget.max_output_tokens", description: "Session-tree output token budget", defaultValue: 1_000_000, parse: (raw) => numberValue(raw, "maxOutputTokens", 1) },
+  { key: "maxCostMicroUsd", flag: "max-cost-micro-usd", env: "SIGMA_MAX_COST_MICRO_USD", toml: "budget.max_cost_micro_usd", description: "Session-tree cost budget in micro-USD", defaultValue: 50_000_000, parse: (raw) => numberValue(raw, "maxCostMicroUsd", 1) },
+  { key: "maxModelTurns", flag: "max-model-turns", env: "SIGMA_MAX_MODEL_TURNS", toml: "budget.max_model_turns", description: "Session-tree model turn budget", defaultValue: 256, parse: (raw) => numberValue(raw, "maxModelTurns", 1) },
+  { key: "maxToolCalls", flag: "max-tool-calls", env: "SIGMA_MAX_TOOL_CALLS", toml: "budget.max_tool_calls", description: "Session-tree tool call budget", defaultValue: 2_048, parse: (raw) => numberValue(raw, "maxToolCalls", 1) },
+  { key: "maxChildren", flag: "max-children", env: "SIGMA_MAX_CHILDREN", toml: "budget.max_children", description: "Session-tree child budget", defaultValue: 32, parse: (raw) => numberValue(raw, "maxChildren", 0) },
+  { key: "maxDepth", flag: "max-agent-depth", env: "SIGMA_MAX_AGENT_DEPTH", toml: "budget.max_depth", description: "Maximum child-agent depth", defaultValue: 4, parse: (raw) => numberValue(raw, "maxDepth", 0) },
+  { key: "checkpointMaxFiles", flag: "checkpoint-max-files", env: "SIGMA_CHECKPOINT_MAX_FILES", toml: "checkpoint.max_files", description: "Maximum files in a mutation checkpoint", defaultValue: 250_000, parse: (raw) => numberValue(raw, "checkpointMaxFiles", 1) },
+  { key: "checkpointMaxBytes", flag: "checkpoint-max-bytes", env: "SIGMA_CHECKPOINT_MAX_BYTES", toml: "checkpoint.max_bytes", description: "Maximum checkpoint preimage bytes", defaultValue: 2_147_483_648, parse: (raw) => numberValue(raw, "checkpointMaxBytes", 1) },
   { key: "outputFormat", flag: "output-format", env: "SIGMA_OUTPUT_FORMAT", toml: "ui.output_format", description: "CLI output format", defaultValue: "text", parse: (raw) => enumValue(raw, "outputFormat", ["text", "json", "stream-json"] as const) },
+  { key: "outputSchema", flag: "output-schema", env: "SIGMA_OUTPUT_SCHEMA", toml: "ui.output_schema", description: "JSON output schema version", defaultValue: 3, parse: (raw) => {
+    const value = numberValue(raw, "outputSchema", 2, 3);
+    if (value !== 2 && value !== 3) throw new Error("Configuration 'outputSchema' must be 2 or 3.");
+    return value;
+  } },
   { key: "tuiFps", flag: "tui-fps", env: "SIGMA_TUI_FPS", toml: "tui.fps", description: "Maximum TUI frames per second", defaultValue: 30, parse: (raw) => numberValue(raw, "tuiFps", 1, 30) },
   { key: "mcpServers", flag: "mcp-server", kind: "repeatable", env: "SIGMA_MCP_SERVERS", toml: "mcp.servers", description: "MCP stdio server JSON (repeatable)", defaultValue: [], parse: mcpServersValue },
   {
     key: "trustWorkspaceMcp", flag: "trust-workspace-mcp", kind: "boolean",
     description: "Trust this workspace's current MCP configuration", defaultValue: false,
     parse: (raw) => booleanValue(raw, "trustWorkspaceMcp")
+  },
+  {
+    key: "trustWorkspaceCustomization", flag: "trust-workspace-customization", kind: "boolean",
+    description: "Trust this workspace's current profiles, hooks, and skills", defaultValue: false,
+    parse: (raw) => booleanValue(raw, "trustWorkspaceCustomization")
   },
   booleanField("help", "help", "Show command help", "h"),
   booleanField("stdin", "stdin", "Read instruction from stdin"),
@@ -167,7 +226,15 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   booleanField("force", "force", "Overwrite an existing file"),
   booleanField("latest", "latest", "Select the latest session"),
   booleanField("timeline", "timeline", "Include event timeline"),
-  { key: "profile", flag: "profile", description: "Initialization profile", defaultValue: "local", parse: (raw) => enumValue(raw, "profile", ["local", "team", "ci"] as const), hidden: true },
+  booleanField("unsafeHostExec", "unsafe-host-exec", "Request one-time unsafe host execution"),
+  booleanField("reviewerWaiver", "waive-reviewer", "Request a one-time human reviewer waiver"),
+  booleanField("dryRun", "dry-run", "Validate without writing"),
+  { ...booleanField("restore", "restore", "Safely restore an interrupted checkpoint"), hidden: true },
+  { ...booleanField("keep", "keep", "Keep an interrupted checkpoint delta"), hidden: true },
+  booleanField("check", "check", "Check whether migration is required"),
+  booleanField("write", "write", "Write a migration result"),
+  booleanField("all", "all", "Select all records"),
+  { key: "initProfile", flag: "init-profile", description: "Initialization profile", defaultValue: "local", parse: (raw) => enumValue(raw, "initProfile", ["local", "team", "ci"] as const), hidden: true },
   { key: "limit", flag: "limit", description: "Result count limit", defaultValue: 20, parse: (raw) => numberValue(raw, "limit", 1, 1_000), hidden: true },
   { key: "sessionId", flag: "session", description: "Session identifier", defaultValue: "", parse: (raw) => stringValue(raw, "sessionId", true), hidden: true },
   { key: "decision", flag: "decision", description: "Approval decision", defaultValue: "allow", parse: (raw) => enumValue(raw, "decision", ["allow", "deny", "always_allow"] as const), hidden: true },
@@ -197,6 +264,34 @@ function validateTomlKeys(source: Record<string, unknown> | undefined, schema: r
   visit(source);
 }
 
+const WORKSPACE_NUMERIC_CAPS = new Set([
+  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "maxParallelTools", "maxParallelAgents",
+  "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls",
+  "maxChildren", "maxDepth", "checkpointMaxFiles", "checkpointMaxBytes"
+]);
+
+const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, ask: 1, auto: 2 };
+const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, full: 1 };
+
+function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, workspaceRaw: unknown): ConfigValue {
+  const workspaceValue = field.parse(workspaceRaw);
+  if (WORKSPACE_NUMERIC_CAPS.has(field.key)) {
+    return Math.min(Number(baseline), Number(workspaceValue));
+  }
+  if (field.key === "permissionMode") {
+    return PERMISSION_STRICTNESS[String(workspaceValue)] < PERMISSION_STRICTNESS[String(baseline)]
+      ? workspaceValue : baseline;
+  }
+  if (field.key === "networkMode") {
+    return NETWORK_STRICTNESS[String(workspaceValue)] < NETWORK_STRICTNESS[String(baseline)]
+      ? workspaceValue : baseline;
+  }
+  if (field.key === "allowUnsafeHostExec") {
+    return baseline === true && workspaceValue === true;
+  }
+  return workspaceValue;
+}
+
 export function resolveConfig(sources: ConfigSources, schema = SIGMA_CONFIG_SCHEMA): ResolvedConfig {
   const knownFlags = new Set(schema.map((field) => field.flag));
   for (const flag of Object.keys(sources.flags ?? {})) {
@@ -206,12 +301,17 @@ export function resolveConfig(sources: ConfigSources, schema = SIGMA_CONFIG_SCHE
   validateTomlKeys(sources.home, schema, "home");
   const result: ResolvedConfig = {};
   for (const field of schema) {
-    const raw = sources.flags?.[field.flag]
-      ?? (field.env ? sources.env?.[field.env] : undefined)
-      ?? nestedValue(sources.workspace, field.toml)
-      ?? nestedValue(sources.home, field.toml)
-      ?? field.defaultValue;
-    result[field.key] = field.parse(raw);
+    const explicit = sources.flags?.[field.flag]
+      ?? (field.env ? sources.env?.[field.env] : undefined);
+    if (explicit !== undefined) {
+      result[field.key] = field.parse(explicit);
+      continue;
+    }
+    const workspaceRaw = nestedValue(sources.workspace, field.toml);
+    const baseline = field.parse(nestedValue(sources.home, field.toml) ?? field.defaultValue);
+    result[field.key] = workspaceRaw === undefined
+      ? baseline
+      : restrictWorkspaceValue(field, baseline, workspaceRaw);
   }
   return result;
 }

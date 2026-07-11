@@ -12,13 +12,13 @@ export async function runInitCommand(argv: string[], deps: InitDeps = {}): Promi
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   if (argv.includes("--help") || argv.includes("-h")) {
-    stdout.write("agent init [--workspace <path>] [--profile local|team|ci] [--provider deepseek|glm] [--model <name>] [--permission-mode ask|auto|deny] [--force] [--json]\n");
+    stdout.write("agent init [--workspace <path>] [--init-profile local|team|ci] [--provider deepseek|glm] [--model <name>] [--permission-mode ask|auto|deny] [--force] [--json]\n");
     return 0;
   }
   try {
     const { flags } = parseArgs(argv);
     const config = loadCliConfig(flags);
-    const profile = typeof flags.profile === "string" ? flags.profile : "local";
+    const profile = typeof flags["init-profile"] === "string" ? flags["init-profile"] : "local";
     const permissionMode = flags["permission-mode"] === undefined && profile === "ci" ? "auto" : config.permissionMode;
     const directory = path.join(config.workspace, ".agent");
     const configPath = path.join(directory, "config.toml");
@@ -32,7 +32,7 @@ export async function runInitCommand(argv: string[], deps: InitDeps = {}): Promi
       model: config.model,
       workspace: ".",
       permissionMode
-    }, `Sigma Code 2.0 workspace configuration (profile: ${profile})`), "utf8");
+    }, `Sigma Code 3.0 workspace configuration (init profile: ${profile})`), "utf8");
     if (flags.json === true) stdout.write(`${JSON.stringify({ ok: true, configPath, profile })}\n`);
     else stdout.write(`initialized ${configPath}\n`);
     return 0;

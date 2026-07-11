@@ -3,7 +3,10 @@ import { createInterface } from "node:readline/promises";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agent-protocol";
 import { createConfiguredRuntime, type ConfiguredRuntime, type InProcessRuntimeClient } from "agent-runtime";
-import { loadCliConfig, parseArgs, workspaceMcpTrustMessage, type CliConfig } from "../config.js";
+import {
+  loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage, type CliConfig
+} from "../config.js";
+import { outputError, outputEvent, outputResult } from "../output-schema.js";
 
 export interface RunCommandDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
@@ -70,9 +73,10 @@ async function promptApproval(
   }
 }
 
-function writeEvent(event: AgentEventEnvelope, format: string, stderr: NodeJS.WritableStream, stdout: NodeJS.WritableStream): void {
+function writeEvent(event: AgentEventEnvelope, config: CliConfig, stderr: NodeJS.WritableStream, stdout: NodeJS.WritableStream): void {
+  const format = config.outputFormat;
   if (format === "stream-json") {
-    stdout.write(`${JSON.stringify(event)}\n`);
+    stdout.write(`${JSON.stringify(outputEvent(event, config.outputSchema))}\n`);
     return;
   }
   if (format === "json") return;
@@ -96,7 +100,7 @@ async function streamSession(
   signal: AbortSignal
 ): Promise<void> {
   for await (const event of runtime.subscribe(sessionId, signal)) {
-    writeEvent(event, config.outputFormat, stderr, stdout);
+    writeEvent(event, config, stderr, stdout);
     if (event.type === "tool.approval_requested") await promptApproval(event, runtime, stdin, stderr);
     if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") break;
   }
@@ -105,7 +109,7 @@ async function streamSession(
 function writeResult(
   outcome: RunOutcome,
   sessionId: string,
-  format: CliConfig["outputFormat"],
+  config: CliConfig,
   stdout: NodeJS.WritableStream
 ): void {
   const result = {
@@ -114,8 +118,9 @@ function writeResult(
     sessionId,
     finalMessage: outcomeMessage(outcome)
   };
-  if (format === "json") stdout.write(`${JSON.stringify(result)}\n`);
-  else if (format === "stream-json") stdout.write(`${JSON.stringify({ type: "result", result })}\n`);
+  if (config.outputFormat === "json" || config.outputFormat === "stream-json") {
+    stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
+  }
   else stdout.write(`\n${result.finalMessage}\n`);
 }
 
@@ -129,7 +134,12 @@ async function executeRun(
   stderr: NodeJS.WritableStream
 ): Promise<number> {
   const { runtime, workspace } = configured;
-  const session = await runtime.createSession({ workspacePath: workspace, mode, title: instruction.slice(0, 80) });
+  const session = await runtime.createSession({
+    workspacePath: workspace,
+    mode,
+    title: instruction.slice(0, 80),
+    ...(config.reviewerWaiver ? { reviewerWaiverReason: "Explicit --waive-reviewer CLI flag." } : {})
+  });
   const streamAbort = new AbortController();
   const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr, streamAbort.signal);
   try {
@@ -137,7 +147,7 @@ async function executeRun(
     const outcome = await runtime.waitForOutcome(session.sessionId);
     streamAbort.abort();
     await stream;
-    writeResult(outcome, session.sessionId, config.outputFormat, stdout);
+    writeResult(outcome, session.sessionId, config, stdout);
     return exitCode(outcome);
   } finally {
     streamAbort.abort();
@@ -161,7 +171,9 @@ function writeNeedsInput(
     finishReason,
     message
   };
-  if (config.outputFormat === "json" || config.outputFormat === "stream-json") stdout.write(`${JSON.stringify(result)}\n`);
+  if (config.outputFormat === "json" || config.outputFormat === "stream-json") {
+    stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
+  }
   else stderr.write(`${result.message}\n`);
 }
 
@@ -169,10 +181,27 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function writeRunError(
+  error: unknown,
+  output: Pick<CliConfig, "outputFormat" | "outputSchema"> | undefined,
+  stdout: NodeJS.WritableStream,
+  stderr: NodeJS.WritableStream
+): void {
+  const message = errorMessage(error);
+  if (output?.outputFormat !== "stream-json") {
+    stderr.write(`${message}\n`);
+    return;
+  }
+  const code = typeof (error as { code?: unknown })?.code === "string"
+    ? (error as { code: string }).code : "cli_error";
+  stdout.write(`${JSON.stringify(outputError({ code, message }, output.outputSchema))}\n`);
+}
+
 export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Promise<number> {
   const stdin = deps.stdin ?? processStdin;
   const stdout = deps.stdout ?? processStdout;
   const stderr = deps.stderr ?? processStderr;
+  let errorOutput: Pick<CliConfig, "outputFormat" | "outputSchema"> | undefined;
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
       stdout.write(`Usage: agent ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);
@@ -180,12 +209,21 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
     }
     const parsed = parseArgs(argv);
     const config = loadCliConfig(parsed.flags);
+    errorOutput = config;
     const instruction = await instructionFromArgs(parsed.flags, parsed.positionals, stdin);
     if (!instruction) throw new Error("A non-empty instruction is required.");
     const mode = deps.mode ?? "change";
-    const trustMessage = workspaceMcpTrustMessage(config);
+    const mcpTrustMessage = workspaceMcpTrustMessage(config);
+    const customizationTrustMessage = workspaceCustomizationTrustMessage(config);
+    const trustMessage = mcpTrustMessage ?? customizationTrustMessage;
     if (trustMessage) {
-      writeNeedsInput(config, stdout, stderr, trustMessage, "workspace_mcp_trust_required");
+      writeNeedsInput(
+        config,
+        stdout,
+        stderr,
+        trustMessage,
+        mcpTrustMessage ? "workspace_mcp_trust_required" : "workspace_customization_trust_required"
+      );
       return 2;
     }
     if (nonInteractiveAsk(config, stdin.isTTY === true, stdout.isTTY === true)) {
@@ -199,7 +237,7 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
       await configured.close();
     }
   } catch (error) {
-    stderr.write(`${errorMessage(error)}\n`);
+    writeRunError(error, errorOutput, stdout, stderr);
     return 1;
   }
 }

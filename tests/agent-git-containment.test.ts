@@ -8,8 +8,16 @@ import { RepositoryContextProvider } from "../packages/agent-context/src/index.j
 import { gitPorcelain, selfContainedGitRoot } from "../packages/agent-platform/src/index.js";
 import { WorkspaceIsolationManager } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { createHostExecutionBroker, type HostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 const fixtures: string[] = [];
+const brokers: HostExecutionBroker[] = [];
+
+function execution(): HostExecutionBroker {
+  const broker = createHostExecutionBroker();
+  brokers.push(broker);
+  return broker;
+}
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true }).trim();
@@ -52,6 +60,7 @@ function toolContext(
 }
 
 afterEach(async () => {
+  await Promise.all(brokers.splice(0).map(async (broker) => await broker.close()));
   for (const root of fixtures.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -68,27 +77,28 @@ describe("Git workspace containment", () => {
     await writeFile(path.join(outer, "outside-secret.txt"), "PARENT_SECRET_MUST_NOT_LEAK\n", "utf8");
 
     const signal = new AbortController().signal;
-    await expect(selfContainedGitRoot(workspace, signal)).resolves.toBeNull();
-    await expect(gitPorcelain(workspace, signal)).resolves.toMatchObject({
+    const broker = execution();
+    await expect(selfContainedGitRoot(workspace, signal, broker)).resolves.toBeNull();
+    await expect(gitPorcelain(workspace, signal, broker)).resolves.toMatchObject({
       exitCode: 128,
       stdout: "",
       stderr: "Workspace is not a self-contained Git repository."
     });
-    const contextItems = await new RepositoryContextProvider().collect(workspace, "secret", signal);
+    const contextItems = await new RepositoryContextProvider(broker).collect(workspace, "secret", signal);
     const contextText = contextItems.map((item) => item.content).join("\n");
     expect(contextText).toContain("inside.txt");
     expect(contextText).not.toContain("outside-secret.txt");
     expect(contextText).not.toContain("PARENT_SECRET_MUST_NOT_LEAK");
     expect(contextItems.some((item) => item.provenance === "current Git diff")).toBe(false);
 
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker });
     const status = await tools.execute(request("status", "git_status"), toolContext(workspace));
     const diff = await tools.execute(request("diff", "git_diff"), toolContext(workspace));
     expect(status).toMatchObject({ ok: false, diagnostics: ["workspace_not_git_root"] });
     expect(diff).toMatchObject({ ok: false, diagnostics: ["workspace_not_git_root"] });
     expect(`${status.output}\n${diff.output}`).not.toContain("PARENT_SECRET_MUST_NOT_LEAK");
 
-    const allocation = await new WorkspaceIsolationManager(path.join(outer, "isolation")).allocate({
+    const allocation = await new WorkspaceIsolationManager(path.join(outer, "isolation"), { execution: broker }).allocate({
       childId: "child",
       workspacePath: workspace,
       intent: "write"
@@ -110,16 +120,19 @@ describe("Git workspace containment", () => {
     await writeFile(path.join(workspace, "tracked.txt"), "SELF_CONTAINED_CHANGE\n", "utf8");
 
     const signal = new AbortController().signal;
-    await expect(selfContainedGitRoot(workspace, signal)).resolves.toBe(await realpath(workspace));
-    const contextItems = await new RepositoryContextProvider().collect(workspace, "tracked", signal);
+    const broker = execution();
+    await expect(selfContainedGitRoot(workspace, signal, broker)).resolves.toBe(await realpath(workspace));
+    const contextItems = await new RepositoryContextProvider(broker).collect(workspace, "tracked", signal);
     expect(contextItems.find((item) => item.provenance === "current Git diff")?.content).toContain("SELF_CONTAINED_CHANGE");
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker });
     await expect(tools.execute(request("status", "git_status"), toolContext(workspace))).resolves.toMatchObject({ ok: true });
     await expect(tools.execute(request("diff", "git_diff"), toolContext(workspace))).resolves.toMatchObject({ ok: true });
 
     git(workspace, "add", ".");
     git(workspace, "commit", "-qm", "change");
-    const allocation = await new WorkspaceIsolationManager(path.join(path.dirname(workspace), "worktrees")).allocate({
+    const allocation = await new WorkspaceIsolationManager(
+      path.join(path.dirname(workspace), "worktrees"), { execution: broker }
+    ).allocate({
       childId: "clean-child",
       workspacePath: workspace,
       intent: "write"
@@ -140,7 +153,8 @@ describe("Git workspace containment", () => {
     await writeFile(path.join(workspace, "large.txt"), `${changed}\n`, "utf8");
 
     const artifacts = new Map<string, string>();
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const broker = execution();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker });
     const receipt = await tools.execute(request("large-diff", "git_diff"), toolContext(workspace, artifacts));
     const complete = artifacts.get("git-diff.patch");
     expect(receipt.ok).toBe(true);

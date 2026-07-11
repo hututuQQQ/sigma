@@ -1,9 +1,21 @@
 import { randomUUID } from "node:crypto";
-import type { AgentEventEnvelope, ContextItem, JsonValue, RunMode, RunStore } from "agent-protocol";
-import { assertKernelInvariants, createKernelState, evolve, type KernelState } from "agent-kernel";
+import {
+  SNAPSHOT_SCHEMA_VERSION,
+  STORE_LAYOUT_VERSION,
+  type AgentEventEnvelope,
+  type ContextItem,
+  type JsonValue,
+  type ModelExecutionRole,
+  type RunMode,
+  type RunStore,
+  type SnapshotEnvelope
+} from "agent-protocol";
+import { assertKernelInvariants, createKernelState, evolve, isKernelState, type KernelState } from "agent-kernel";
+import { jsonValue } from "./json.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
+  parentSessionId?: string;
   mode: RunMode;
   state: KernelState;
   modelTurn: number;
@@ -11,24 +23,35 @@ export interface RestoredSessionData {
   followUps: Array<{ id: string; text: string }>;
   writeScope: string[];
   strictWriteScope: boolean;
+  modelRole: ModelExecutionRole;
   contextItems: ContextItem[];
 }
 
 function createdData(event: AgentEventEnvelope | undefined): {
   workspacePath: string;
+  parentSessionId?: string;
   mode: RunMode;
   writeScope: string[];
   strictWriteScope: boolean;
+  modelRole: ModelExecutionRole;
 } | null {
   if (!event || event.type !== "session.created" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return null;
   const value = event.payload as Record<string, JsonValue>;
   return {
     workspacePath: typeof value.workspacePath === "string" ? value.workspacePath : ".",
+    ...(typeof value.parentSessionId === "string" && value.parentSessionId
+      ? { parentSessionId: value.parentSessionId } : {}),
     mode: value.mode === "analyze" ? "analyze" : "change",
     writeScope: Array.isArray(value.writeScope)
       ? value.writeScope.filter((item): item is string => typeof item === "string") : [],
-    strictWriteScope: value.strictWriteScope === true
+    strictWriteScope: value.strictWriteScope === true,
+    modelRole: modelExecutionRole(value.modelRole)
   };
+}
+
+function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
+  return value === "planner" || value === "reviewer" || value === "child_analyze"
+    || value === "child_write" || value === "summarizer" ? value : "orchestrator";
 }
 
 function freshState(sessionId: string, event: AgentEventEnvelope, mode: RunMode, runDeadlineMs: number): KernelState {
@@ -52,7 +75,15 @@ function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: n
   return {
     ...freshState(state.sessionId, event, eventRunMode(event, state.mode), runDeadlineMs),
     messages: state.messages,
-    lastSeq: state.lastSeq
+    lastSeq: state.lastSeq,
+    plan: state.plan,
+    budget: state.budget,
+    frozenProfile: state.frozenProfile,
+    frozenCustomization: state.frozenCustomization,
+    frozenSkills: state.frozenSkills,
+    activeProcessIds: state.activeProcessIds,
+    mutationEvidence: state.mutationEvidence,
+    usage: state.usage
   };
 }
 
@@ -101,40 +132,8 @@ function trackFollowUp(accumulator: RestoreAccumulator, event: AgentEventEnvelop
   if (payload.status === "delivered") accumulator.followUps.delete(payload.queueId);
 }
 
-function validMessage(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const message = value as { role?: unknown; content?: unknown; reasoningContent?: unknown };
-  return typeof message.content === "string"
-    && (message.reasoningContent === undefined || typeof message.reasoningContent === "string")
-    && typeof message.role === "string"
-    && ["system", "developer", "user", "assistant", "tool"].includes(message.role);
-}
-
-function validPendingTool(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const pending = value as KernelState["pendingTools"][number];
-  return Boolean(pending.request) && typeof pending.request.callId === "string"
-    && typeof pending.request.name === "string" && typeof pending.started === "boolean"
-    && Boolean(pending.modelTurn) && Number.isInteger(pending.modelTurn.turnId)
-    && Number.isInteger(pending.modelTurn.effectRevision)
-    && ["not_required", "pending", "allowed", "denied"].includes(pending.approval);
-}
-
 function validSnapshotShape(state: KernelState, sessionId: string): boolean {
-  const phases = ["idle", "ready_model", "model_in_flight", "tool_pending", "tool_in_flight", "needs_input", "outcome_pending", "terminal"];
-  return [
-    state.schemaVersion === 2, state.sessionId === sessionId, typeof state.runId === "string",
-    state.mode === "analyze" || state.mode === "change", phases.includes(state.phase),
-    Number.isInteger(state.revision), Number.isInteger(state.lastSeq), typeof state.deadlineAt === "string",
-    Array.isArray(state.messages) && state.messages.every(validMessage),
-    Array.isArray(state.pendingTools) && state.pendingTools.every(validPendingTool), Array.isArray(state.toolCallIds),
-    Array.isArray(state.receipts), Array.isArray(state.evidence), Array.isArray(state.childIds),
-    Number.isInteger(state.completionRepairAttempts), Number.isInteger(state.continuationAttempts),
-    Number.isInteger(state.repeatedToolBatchCount), Number.isInteger(state.receiptCountAtLastUserInput),
-    state.activeModelTurn === undefined || (
-      Number.isInteger(state.activeModelTurn.turnId) && Number.isInteger(state.activeModelTurn.effectRevision)
-    )
-  ].every(Boolean);
+  return isKernelState(state) && state.sessionId === sessionId;
 }
 
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
@@ -146,6 +145,7 @@ function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>
       ? stored.toolCallIds
       : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
         ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
+    activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
     completionRepairAttempts: Number.isInteger(stored.completionRepairAttempts) ? stored.completionRepairAttempts : 0,
     continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
     repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
@@ -199,17 +199,48 @@ function replayEvent(
   accumulator.state = evolve(accumulator.state, event);
 }
 
-export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
-  const snapshot = await store.latestSnapshot(sessionId);
-  const restoredSnapshot = snapshotState(snapshot, sessionId);
-  const accumulator: RestoreAccumulator = {
+function emptyAccumulator(state?: KernelState): RestoreAccumulator {
+  return {
     metadata: null,
-    state: restoredSnapshot,
+    state,
     modelTurn: 0,
     lastSeq: 0,
     followUps: new Map(),
     contextItems: new Map()
   };
+}
+
+export interface V3SnapshotRebuildInput {
+  sessionId: string;
+  lastSeq: number;
+  events(): AsyncIterable<AgentEventEnvelope>;
+}
+
+/** Replays promoted events through the V3 kernel instead of trusting a V2 snapshot. */
+export async function rebuildV3SnapshotFromEvents(
+  input: V3SnapshotRebuildInput,
+  runDeadlineMs = 30 * 60 * 1_000
+): Promise<SnapshotEnvelope> {
+  const accumulator = emptyAccumulator();
+  for await (const event of input.events()) replayEvent(accumulator, event, 0, runDeadlineMs);
+  if (!accumulator.metadata || !accumulator.state || accumulator.lastSeq !== input.lastSeq) {
+    throw new Error(`Promoted session '${input.sessionId}' did not replay to seq ${input.lastSeq}.`);
+  }
+  assertKernelInvariants(accumulator.state);
+  return {
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    storeLayoutVersion: STORE_LAYOUT_VERSION,
+    sessionId: input.sessionId,
+    seq: input.lastSeq,
+    createdAt: new Date().toISOString(),
+    state: jsonValue({ ...accumulator.state, lastSeq: input.lastSeq })
+  };
+}
+
+export async function restoreStoredSession(store: RunStore, sessionId: string, runDeadlineMs: number): Promise<RestoredSessionData> {
+  const snapshot = await store.latestSnapshot(sessionId);
+  const restoredSnapshot = snapshotState(snapshot, sessionId);
+  const accumulator = emptyAccumulator(restoredSnapshot);
   for await (const event of store.events(sessionId)) {
     replayEvent(accumulator, event, restoredSnapshot ? snapshot?.seq ?? 0 : 0, runDeadlineMs);
   }

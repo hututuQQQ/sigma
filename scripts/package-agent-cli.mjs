@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -8,8 +9,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const pinnedNodeVersion = "v26.4.0";
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
-export const supportedTargetArchitectures = new Set(["x64", "arm64"]);
+export const supportedTargetArchitectures = new Set(["x64"]);
+export const supportedReleaseTargets = new Set(["linux-x64", "win32-x64"]);
+export const v3PortablePackages = Object.freeze([
+  "agent-execution",
+  "agent-code-intel",
+  "agent-checkpoint",
+  "agent-extensions"
+]);
 const require = createRequire(import.meta.url);
+const portableLanguageAssets = Object.freeze({
+  typescriptServer: "node_modules/agent-code-intel/dist/typescript-server.mjs",
+  typescriptEngine: "node_modules/typescript/lib/typescript.js",
+  pyrightServer: "node_modules/pyright/langserver.index.js"
+});
 
 export function normalizeTargetArch(value = "x64") {
   const targetArch = String(value || "x64").trim();
@@ -40,6 +53,13 @@ function resolvePlatformArch(targetPlatform = "linux", targetArch = "x64") {
     targetPlatform: "linux",
     targetArch: normalizeTargetArch(platformValue)
   };
+}
+
+function assertReleaseTarget(targetPlatform, targetArch) {
+  const target = `${targetPlatform}-${targetArch}`;
+  if (!supportedReleaseTargets.has(target)) {
+    throw new Error(`Unsupported Sigma Code release target '${target}'. Tier 1 targets: ${[...supportedReleaseTargets].join(", ")}.`);
+  }
 }
 
 export function agentCliBundleName(targetPlatform = "linux", targetArch = "x64") {
@@ -106,6 +126,28 @@ export async function workspaceRuntimePackages(rootDir, entryPackage = "agent-cl
     }
   }
   return [...discovered].sort((left, right) => left.localeCompare(right, "en"));
+}
+
+async function workspaceRelease(rootDir) {
+  const candidates = [path.join(rootDir, "package.json"), path.join(rootDir, "packages", "agent-cli", "package.json")];
+  for (const manifestPath of candidates) {
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const version = String(manifest.version ?? "");
+    if (version) return { version, isV3: /^3\./.test(version) };
+  }
+  throw new Error(`Could not determine the Sigma Code release version below ${rootDir}.`);
+}
+
+async function v3RuntimePackages(rootDir, discovered, isV3) {
+  if (!isV3) return discovered;
+  const result = new Set(discovered);
+  for (const packageName of v3PortablePackages) {
+    const manifestPath = path.join(rootDir, "packages", packageName, "package.json");
+    if (!existsSync(manifestPath)) throw new Error(`V3 portable package '${packageName}' is missing.`);
+    result.add(packageName);
+  }
+  return [...result].sort((left, right) => left.localeCompare(right, "en"));
 }
 
 function packageJsonPath(packageName, ownerManifest) {
@@ -458,6 +500,431 @@ async function copyNodeRuntime(rootDir, artifactsDir, bundleDir, targetPlatform,
   }
 }
 
+function parseExpectedSha256(value, label, archiveName) {
+  const line = String(value ?? "").split(/\r?\n/).find((candidate) => candidate.includes(archiveName))
+    ?? String(value ?? "").trim();
+  const match = line.match(/\b([a-fA-F0-9]{64})\b/);
+  if (!match) throw new Error(`${label} does not contain a SHA-256 digest for ${archiveName}.`);
+  return match[1].toLowerCase();
+}
+
+async function verifyNodeRuntimeArchive(nodeRuntime, env, checksumDownloader = async (url) => {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`download failed with HTTP ${response.status}`);
+  return await response.text();
+}) {
+  const archiveName = path.basename(nodeRuntime.runtimeArchive);
+  const configured = env.NODE_RUNTIME_SHA256;
+  const sidecarPath = `${nodeRuntime.runtimeArchive}.sha256`;
+  let expected;
+  let verificationSource;
+  if (configured) {
+    expected = parseExpectedSha256(configured, "NODE_RUNTIME_SHA256", archiveName);
+    verificationSource = "env";
+  } else if (existsSync(sidecarPath)) {
+    expected = parseExpectedSha256(await readFile(sidecarPath, "utf8"), sidecarPath, archiveName);
+    verificationSource = "sidecar";
+  } else if (nodeRuntime.runtimeUrl) {
+    const checksumUrl = new URL("SHASUMS256.txt", nodeRuntime.runtimeUrl).href;
+    expected = parseExpectedSha256(await checksumDownloader(checksumUrl), checksumUrl, archiveName);
+    verificationSource = checksumUrl;
+  } else {
+    throw new Error([
+      `No trusted SHA-256 was provided for Node runtime archive ${archiveName}.`,
+      "Set NODE_RUNTIME_SHA256 or create an adjacent .sha256 sidecar."
+    ].join("\n"));
+  }
+  const actual = await sha256File(nodeRuntime.runtimeArchive);
+  if (actual !== expected) throw new Error(`Node runtime archive SHA-256 mismatch for ${archiveName}: expected ${expected}, received ${actual}.`);
+  return { sha256: actual, verificationSource };
+}
+
+function sigmaExecFileName(targetPlatform) {
+  return targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec";
+}
+
+function defaultSigmaExecPath(rootDir, targetPlatform) {
+  return path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecFileName(targetPlatform));
+}
+
+async function readExecutableBytes(handle, length, position, filePath) {
+  const buffer = Buffer.alloc(length);
+  const { bytesRead } = await handle.read(buffer, 0, length, position);
+  if (bytesRead !== length) {
+    throw new Error(`sigma-exec has a truncated executable header: ${filePath}`);
+  }
+  return buffer;
+}
+
+function executableArchitecture(machine, format) {
+  const architectures = format === "PE"
+    ? new Map([[0x8664, "x64"], [0xaa64, "arm64"], [0x014c, "x86"]])
+    : new Map([[0x003e, "x64"], [0x00b7, "arm64"], [0x0003, "x86"]]);
+  return architectures.get(machine) ?? `unknown-0x${machine.toString(16).padStart(4, "0")}`;
+}
+
+export async function inspectSigmaExecBinary(filePath) {
+  const handle = await open(filePath, "r");
+  try {
+    const prefix = await readExecutableBytes(handle, 20, 0, filePath);
+    if (prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+      const elfClass = prefix[4];
+      const byteOrder = prefix[5];
+      if (elfClass !== 2) throw new Error(`sigma-exec ELF binary must be 64-bit: ${filePath}`);
+      if (byteOrder !== 1 && byteOrder !== 2) throw new Error(`sigma-exec ELF binary has an invalid byte order: ${filePath}`);
+      const elfType = byteOrder === 1 ? prefix.readUInt16LE(16) : prefix.readUInt16BE(16);
+      if (elfType !== 2 && elfType !== 3) {
+        throw new Error(`sigma-exec ELF binary is not an executable or shared-object image: ${filePath}`);
+      }
+      const machine = byteOrder === 1 ? prefix.readUInt16LE(18) : prefix.readUInt16BE(18);
+      return {
+        format: "ELF",
+        machine: `0x${machine.toString(16).padStart(4, "0")}`,
+        targetPlatform: "linux",
+        targetArch: executableArchitecture(machine, "ELF")
+      };
+    }
+    if (prefix[0] === 0x4d && prefix[1] === 0x5a) {
+      const dosHeader = await readExecutableBytes(handle, 64, 0, filePath);
+      const peOffset = dosHeader.readUInt32LE(0x3c);
+      if (peOffset < 64) throw new Error(`sigma-exec has an invalid PE header offset: ${filePath}`);
+      const peHeader = await readExecutableBytes(handle, 26, peOffset, filePath);
+      if (!peHeader.subarray(0, 4).equals(Buffer.from([0x50, 0x45, 0x00, 0x00]))) {
+        throw new Error(`sigma-exec has an invalid PE signature: ${filePath}`);
+      }
+      const machine = peHeader.readUInt16LE(4);
+      const optionalHeaderSize = peHeader.readUInt16LE(20);
+      const characteristics = peHeader.readUInt16LE(22);
+      const optionalHeaderMagic = peHeader.readUInt16LE(24);
+      if (optionalHeaderSize < 2 || (characteristics & 0x0002) === 0 || optionalHeaderMagic !== 0x020b) {
+        throw new Error(`sigma-exec PE binary is not a 64-bit executable image: ${filePath}`);
+      }
+      return {
+        format: "PE",
+        machine: `0x${machine.toString(16).padStart(4, "0")}`,
+        targetPlatform: "win32",
+        targetArch: executableArchitecture(machine, "PE")
+      };
+    }
+    throw new Error(`sigma-exec is not a recognized ELF or PE executable: ${filePath}`);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env) {
+  const configured = env.SIGMA_EXEC_BINARY;
+  const source = configured ? path.resolve(rootDir, configured) : defaultSigmaExecPath(rootDir, targetPlatform);
+  if (!existsSync(source)) {
+    throw new Error([
+      `The required ${sigmaExecFileName(targetPlatform)} broker is missing: ${source}`,
+      "Run pnpm build:native:sigma-exec on the target platform or set SIGMA_EXEC_BINARY to a target-native binary."
+    ].join("\n"));
+  }
+  const destination = path.join(bundleDir, "bin", sigmaExecFileName(targetPlatform));
+  await cp(source, destination);
+  let binaryTarget;
+  try {
+    binaryTarget = await inspectSigmaExecBinary(destination);
+  } catch (error) {
+    await rm(destination, { force: true });
+    throw error;
+  }
+  if (binaryTarget.targetPlatform !== targetPlatform || binaryTarget.targetArch !== targetArch) {
+    await rm(destination, { force: true });
+    throw new Error([
+      `sigma-exec binary target mismatch: expected ${targetPlatform}-${targetArch},`,
+      `detected ${binaryTarget.targetPlatform}-${binaryTarget.targetArch} (${binaryTarget.format} machine ${binaryTarget.machine}): ${source}`
+    ].join(" "));
+  }
+  if (targetPlatform !== "win32") await chmod(destination, 0o755).catch(() => undefined);
+  return { source, sourceKind: configured ? "env" : "workspace-build", destination, binaryTarget };
+}
+
+async function copyTokenizerAssets(rootDir, bundleDir) {
+  const source = path.join(rootDir, "assets", "tokenizers");
+  if (!existsSync(source)) throw new Error(`Required tokenizer assets are missing: ${source}`);
+  const destination = path.join(bundleDir, "assets", "tokenizers");
+  await mkdir(path.dirname(destination), { recursive: true });
+  await cp(source, destination, { recursive: true });
+  return destination;
+}
+
+async function sha256File(filePath) {
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
+async function integrityEntries(bundleDir, roots) {
+  const entries = [];
+  async function visit(absolute) {
+    const stats = await lstat(absolute);
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Portable integrity roots must not contain symbolic links: ${path.relative(bundleDir, absolute)}`);
+    }
+    if (stats.isDirectory()) {
+      for (const entry of (await readdir(absolute, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name, "en"))) {
+        await visit(path.join(absolute, entry.name));
+      }
+      return;
+    }
+    if (!stats.isFile()) return;
+    entries.push({
+      path: path.relative(bundleDir, absolute).replaceAll(path.sep, "/"),
+      size: stats.size,
+      sha256: await sha256File(absolute)
+    });
+  }
+  for (const relative of roots) {
+    const absolute = path.join(bundleDir, ...relative.split("/"));
+    if (!existsSync(absolute)) throw new Error(`Required portable asset is missing: ${relative}`);
+    await visit(absolute);
+  }
+  return entries.sort((left, right) => left.path.localeCompare(right.path, "en"));
+}
+
+function portableAssetComponent(entry, targetPlatform, targetArch, options) {
+  return {
+    type: "file",
+    "bom-ref": `sigma:file:${entry.path}`,
+    name: options.name,
+    ...(options.version ? { version: options.version } : {}),
+    scope: "required",
+    hashes: [{ alg: "SHA-256", content: entry.sha256 }],
+    properties: [
+      { name: "sigma:asset-kind", value: options.kind },
+      { name: "sigma:path", value: entry.path },
+      { name: "sigma:target-platform", value: targetPlatform },
+      { name: "sigma:target-arch", value: targetArch },
+      ...(options.properties ?? [])
+    ]
+  };
+}
+
+async function writePortableSbom(
+  rootDir,
+  bundleDir,
+  packageNames,
+  targetPlatform,
+  targetArch,
+  sigmaExec,
+  nodeArchiveIntegrity
+) {
+  const components = new Map();
+  for (const packageName of packageNames) {
+    const manifest = JSON.parse(await readFile(path.join(rootDir, "packages", packageName, "package.json"), "utf8"));
+    components.set(`${manifest.name}@${manifest.version}`, {
+      type: packageName === "agent-cli" ? "application" : "library",
+      name: manifest.name,
+      version: String(manifest.version),
+      scope: "required"
+    });
+  }
+  const graph = await runtimeDependencyGraph(rootDir, packageNames, targetPlatform, targetArch);
+  for (const node of graph.nodes) {
+    components.set(`${node.name}@${node.version}`, {
+      type: "library",
+      name: node.name,
+      version: node.version,
+      scope: "required"
+    });
+  }
+  const releaseVersion = (JSON.parse(await readFile(path.join(rootDir, "package.json"), "utf8"))).version;
+  const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
+  const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
+  const assetEntries = await integrityEntries(bundleDir, [
+    nodePath,
+    brokerPath,
+    ...Object.values(portableLanguageAssets),
+    "assets/tokenizers"
+  ]);
+  const assetsByPath = new Map(assetEntries.map((entry) => [entry.path, entry]));
+  components.set("sigma:bundled-node", portableAssetComponent(
+    assetsByPath.get(nodePath),
+    targetPlatform,
+    targetArch,
+    {
+      kind: "node-runtime",
+      name: "node-runtime",
+      version: pinnedNodeVersion,
+      properties: [{ name: "sigma:archive-sha256", value: nodeArchiveIntegrity.sha256 }]
+    }
+  ));
+  components.set("sigma:sigma-exec", portableAssetComponent(
+    assetsByPath.get(brokerPath),
+    targetPlatform,
+    targetArch,
+    {
+      kind: "native-broker",
+      name: "sigma-exec",
+      version: releaseVersion,
+      properties: [
+        { name: "sigma:binary-format", value: sigmaExec.binaryTarget.format },
+        { name: "sigma:machine", value: sigmaExec.binaryTarget.machine }
+      ]
+    }
+  ));
+  const codeIntelManifest = JSON.parse(await readFile(
+    path.join(rootDir, "packages", "agent-code-intel", "package.json"),
+    "utf8"
+  ));
+  for (const asset of [
+    {
+      path: portableLanguageAssets.typescriptServer,
+      kind: "language-server",
+      name: "sigma-typescript-language-server",
+      version: String(codeIntelManifest.version)
+    },
+    {
+      path: portableLanguageAssets.typescriptEngine,
+      kind: "language-service-engine",
+      name: "typescript",
+      version: String(codeIntelManifest.dependencies?.typescript ?? "")
+    },
+    {
+      path: portableLanguageAssets.pyrightServer,
+      kind: "language-server",
+      name: "pyright",
+      version: String(codeIntelManifest.dependencies?.pyright ?? "")
+    }
+  ]) {
+    components.set(`sigma:language-asset:${asset.path}`, portableAssetComponent(
+      assetsByPath.get(asset.path),
+      targetPlatform,
+      targetArch,
+      { kind: asset.kind, name: asset.name, version: asset.version }
+    ));
+  }
+  for (const entry of assetEntries.filter((candidate) => candidate.path.startsWith("assets/tokenizers/"))) {
+    components.set(`sigma:tokenizer:${entry.path}`, portableAssetComponent(
+      entry,
+      targetPlatform,
+      targetArch,
+      { kind: "tokenizer", name: path.posix.basename(entry.path) }
+    ));
+  }
+  const sbom = {
+    bomFormat: "CycloneDX",
+    specVersion: "1.5",
+    version: 1,
+    metadata: {
+      component: {
+        type: "application",
+        name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
+        version: releaseVersion
+      },
+      properties: [
+        { name: "sigma:target-platform", value: targetPlatform },
+        { name: "sigma:target-arch", value: targetArch }
+      ]
+    },
+    components: [...components.values()].sort((left, right) => {
+      const leftId = left["bom-ref"] ?? `${left.name}@${left.version}`;
+      const rightId = right["bom-ref"] ?? `${right.name}@${right.version}`;
+      return leftId.localeCompare(rightId, "en");
+    })
+  };
+  const sbomPath = path.join(bundleDir, "sbom.cdx.json");
+  await writeFile(sbomPath, `${JSON.stringify(sbom, null, 2)}\n`, "utf8");
+  return sbomPath;
+}
+
+async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, tokenizerAssets) {
+  const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
+  const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
+  const roots = [
+    nodePath,
+    brokerPath,
+    portableLanguageAssets.typescriptServer,
+    "node_modules/typescript",
+    "node_modules/pyright",
+    "sbom.cdx.json",
+    ...(tokenizerAssets ? ["assets/tokenizers"] : [])
+  ];
+  const manifest = {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    targetPlatform,
+    targetArch,
+    entries: await integrityEntries(bundleDir, roots)
+  };
+  const manifestPath = path.join(bundleDir, "integrity-manifest.json");
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const byPath = new Map(manifest.entries.map((entry) => [entry.path, entry]));
+  return {
+    manifest,
+    manifestPath,
+    manifestSha256: await sha256File(manifestPath),
+    node: byPath.get(nodePath),
+    sigmaExec: byPath.get(brokerPath),
+    languageServerAssets: Object.fromEntries(
+      Object.entries(portableLanguageAssets).map(([name, assetPath]) => [name, byPath.get(assetPath)])
+    )
+  };
+}
+
+function windowsAuthenticode(nodePath, brokerPath, targetPlatform) {
+  if (targetPlatform !== "win32") return { required: false, authenticodeVerified: true, status: "not-applicable" };
+  if (process.platform !== "win32") {
+    return { required: true, authenticodeVerified: false, status: "not-verified-cross-platform" };
+  }
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$node = Get-AuthenticodeSignature -LiteralPath ${psQuote(nodePath)}`,
+    `$broker = Get-AuthenticodeSignature -LiteralPath ${psQuote(brokerPath)}`,
+    "[pscustomobject]@{ node = [string]$node.Status; sigmaExec = [string]$broker.Status } | ConvertTo-Json -Compress"
+  ].join("; ");
+  try {
+    const result = runPowerShell(script, "failed to inspect Authenticode signatures");
+    const signatures = JSON.parse(result.stdout.trim());
+    const authenticodeVerified = signatures.node === "Valid" && signatures.sigmaExec === "Valid";
+    return {
+      required: true,
+      authenticodeVerified,
+      status: authenticodeVerified ? "verified" : "unsigned-preview",
+      signatures
+    };
+  } catch (error) {
+    return {
+      required: true,
+      authenticodeVerified: false,
+      status: "inspection-failed",
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function writeReleaseSidecars(outputPath, sbomPath, release, targetPlatform, targetArch, integrity, signing, nodeArchiveIntegrity) {
+  const archiveSha256 = await sha256File(outputPath);
+  const checksumPath = `${outputPath}.sha256`;
+  const sbomOutputPath = outputPath.replace(/\.(?:zip|tgz)$/i, ".sbom.cdx.json");
+  const provenancePath = outputPath.replace(/\.(?:zip|tgz)$/i, ".provenance.json");
+  await writeFile(checksumPath, `${archiveSha256}  ${path.basename(outputPath)}\n`, "utf8");
+  await cp(sbomPath, sbomOutputPath);
+  const provenance = {
+    _type: "https://in-toto.io/Statement/v1",
+    subject: [{ name: path.basename(outputPath), digest: { sha256: archiveSha256 } }],
+    predicateType: "https://slsa.dev/provenance/v1",
+    predicate: {
+      buildDefinition: {
+        buildType: "https://sigma-code.dev/build-types/portable-cli/v3",
+        externalParameters: { version: release.version, targetPlatform, targetArch },
+        resolvedDependencies: [
+          { uri: "pkg:generic/node-runtime-archive", digest: { sha256: nodeArchiveIntegrity.sha256 } },
+          { uri: `file:bin/${targetPlatform === "win32" ? "node.exe" : "node"}`, digest: { sha256: integrity.node.sha256 } },
+          { uri: "pkg:generic/sigma-exec", digest: { sha256: integrity.sigmaExec.sha256 } },
+          { uri: "file:integrity-manifest.json", digest: { sha256: integrity.manifestSha256 } }
+        ]
+      },
+      runDetails: {
+        builder: { id: "https://sigma-code.dev/builders/local-portable-packager/v3" },
+        metadata: { invocationId: `${release.version}:${targetPlatform}:${targetArch}`, signing }
+      }
+    }
+  };
+  await writeFile(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`, "utf8");
+  return { archiveSha256, checksumPath, sbomOutputPath, provenancePath };
+}
+
 function createAgentWrapper() {
   return `#!/usr/bin/env sh
 set -eu
@@ -470,13 +937,10 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$PRG")" && pwd)
 
-if [ -x "$SCRIPT_DIR/node" ]; then
-  NODE="$SCRIPT_DIR/node"
-elif command -v node >/dev/null 2>&1; then
-  NODE="$(command -v node)"
-else
-  echo "Sigma agent cannot start: no bundled node and no system node found." >&2
-  exit 127
+NODE="$SCRIPT_DIR/node"
+if [ ! -x "$NODE" ]; then
+  echo "Sigma Code cannot start: the bundled Node runtime is missing or not executable." >&2
+  exit 126
 fi
 
 if [ "\${1:-}" = "tui" ]; then
@@ -491,15 +955,9 @@ function createAgentCmdWrapper() {
 setlocal
 set "SCRIPT_DIR=%~dp0"
 set "NODE_EXE=%SCRIPT_DIR%node.exe"
-if exist "%NODE_EXE%" goto run
-where node >nul 2>nul
-if errorlevel 1 (
-  echo Sigma agent cannot start: no bundled node.exe and no system node found. 1>&2
-  exit /b 127
-)
-for /f "delims=" %%i in ('where node') do (
-  set "NODE_EXE=%%i"
-  goto run
+if not exist "%NODE_EXE%" (
+  echo Sigma Code cannot start: the bundled Node runtime is missing. 1>&2
+  exit /b 126
 )
 :run
 if /I "%~1"=="tui" goto run_tui
@@ -538,7 +996,7 @@ ${agent} inspect "Review the architecture" --workspace ${workspace}
 ${agent} sessions --workspace ${workspace}
 \`\`\`
 
-The wrapper uses the bundled Node runtime when available and falls back to a system \`node\` on PATH.
+The wrapper requires the pinned bundled Node runtime. It never falls back to a system \`node\` on PATH. The archive also includes the target-native \`sigma-exec\` broker, pinned TypeScript/Python language-server assets, and the versioned offline tokenizer-estimator asset; their SHA-256 values are recorded in \`integrity-manifest.json\`.
 
 ## Provider Keys
 
@@ -569,6 +1027,11 @@ function createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatfor
   }
 
   const bundleDir = path.join(artifactsDir, bundleName);
+  const tarZip = spawnSync("tar", ["-a", "-cf", outputPath, "-C", artifactsDir, bundleName], {
+    cwd: rootDir,
+    encoding: "utf8"
+  });
+  if (!tarZip.error && tarZip.status === 0) return;
   try {
     runPowerShell(
       `$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath ${psQuote(bundleDir)} -DestinationPath ${psQuote(outputPath)} -Force`,
@@ -577,6 +1040,7 @@ function createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatfor
   } catch (powerShellError) {
     runZip(["-qr", outputPath, bundleName], [
       "failed to create agent-cli Windows zip",
+      tarZip.stderr || tarZip.stdout || tarZip.error?.message,
       powerShellError instanceof Error ? powerShellError.message : String(powerShellError)
     ].join("\n"), artifactsDir);
   }
@@ -603,11 +1067,16 @@ export async function packageAgentCli(options = {}) {
   const env = options.env ?? process.env;
   const targetPlatform = normalizeTargetPlatform(env.AGENT_TARGET_PLATFORM ?? options.targetPlatform ?? "linux");
   const targetArch = normalizeTargetArch(env.AGENT_TARGET_ARCH ?? options.targetArch ?? "x64");
+  assertReleaseTarget(targetPlatform, targetArch);
   const artifactsDir = options.artifactsDir ? path.resolve(options.artifactsDir) : path.join(rootDir, ".artifacts");
   const bundleName = agentCliBundleName(targetPlatform, targetArch);
   const bundleDir = path.join(artifactsDir, bundleName);
   const outputPath = archivePathForTarget(artifactsDir, bundleName, targetPlatform);
-  const packages = await workspaceRuntimePackages(rootDir);
+  const checksumPath = `${outputPath}.sha256`;
+  const sbomOutputPath = outputPath.replace(/\.(?:zip|tgz)$/i, ".sbom.cdx.json");
+  const provenancePath = outputPath.replace(/\.(?:zip|tgz)$/i, ".provenance.json");
+  const release = await workspaceRelease(rootDir);
+  const packages = await v3RuntimePackages(rootDir, await workspaceRuntimePackages(rootDir), release.isV3);
 
   for (const packageName of packages) {
     assertBuiltPackage(rootDir, packageName);
@@ -615,6 +1084,9 @@ export async function packageAgentCli(options = {}) {
 
   await rm(bundleDir, { recursive: true, force: true });
   await rm(outputPath, { force: true });
+  await rm(checksumPath, { force: true });
+  await rm(sbomOutputPath, { force: true });
+  await rm(provenancePath, { force: true });
   await mkdir(path.join(bundleDir, "bin"), { recursive: true });
   await mkdir(path.join(bundleDir, "packages"), { recursive: true });
   await mkdir(path.join(bundleDir, "node_modules"), { recursive: true });
@@ -629,7 +1101,6 @@ export async function packageAgentCli(options = {}) {
   await deployRuntimeDependencies(
     rootDir, packages, path.join(bundleDir, "node_modules"), targetPlatform, targetArch
   );
-
   const nodeRuntime = await copyNodeRuntime(
     rootDir,
     artifactsDir,
@@ -640,13 +1111,37 @@ export async function packageAgentCli(options = {}) {
     options.downloader,
     options.nodeVersionProbe ?? inspectBundledNodeVersion
   );
+  const nodeArchiveIntegrity = release.isV3
+    ? await verifyNodeRuntimeArchive(nodeRuntime, env, options.nodeChecksumDownloader)
+    : null;
+  const sigmaExec = release.isV3
+    ? await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env)
+    : null;
+  const tokenizerAssets = release.isV3 ? await copyTokenizerAssets(rootDir, bundleDir) : null;
+  const sbomPath = release.isV3
+    ? await writePortableSbom(
+        rootDir,
+        bundleDir,
+        packages,
+        targetPlatform,
+        targetArch,
+        sigmaExec,
+        nodeArchiveIntegrity
+      )
+    : null;
+  const integrity = release.isV3
+    ? await writeIntegrityManifest(bundleDir, targetPlatform, targetArch, tokenizerAssets)
+    : null;
+  const signing = release.isV3
+    ? windowsAuthenticode(nodeRuntime.bundledNodePath, sigmaExec.destination, targetPlatform)
+    : null;
 
   await writeFile(
     path.join(bundleDir, "package.json"),
     `${JSON.stringify(
       {
         name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
-        version: "2.0.0",
+        version: release.version,
         private: true,
         type: "module",
         bin: {
@@ -676,17 +1171,74 @@ export async function packageAgentCli(options = {}) {
     path.join(bundleDir, "package-metadata.json"),
     `${JSON.stringify(
       {
+        schemaVersion: release.isV3 ? 3 : 2,
+        productVersion: release.version,
+        releaseChannel: release.version.includes("-") ? release.version.split("-")[1].split(".")[0] : "stable",
+        tier: "tier1",
         targetPlatform,
         targetArch,
         node: {
           version: pinnedNodeVersion,
           runtimeUrl: nodeRuntime.runtimeUrl,
-          cachePath: nodeRuntime.cachePath,
-          runtimeTarball: nodeRuntime.runtimeTarball,
+          archive: path.basename(nodeRuntime.runtimeArchive),
+          archiveSha256: nodeArchiveIntegrity?.sha256,
+          archiveVerificationSource: nodeArchiveIntegrity?.verificationSource,
           downloaded: nodeRuntime.downloaded,
           source: nodeRuntime.source,
-          versionOutput: nodeRuntime.nodeVersionOutput
-        }
+          versionOutput: nodeRuntime.nodeVersionOutput,
+          ...(integrity?.node ? { sha256: integrity.node.sha256, size: integrity.node.size } : {})
+        },
+        ...(integrity ? {
+          sigmaExec: {
+            path: `bin/${sigmaExecFileName(targetPlatform)}`,
+            sha256: integrity.sigmaExec.sha256,
+            size: integrity.sigmaExec.size,
+            source: sigmaExec.sourceKind,
+            targetPlatform: sigmaExec.binaryTarget.targetPlatform,
+            targetArch: sigmaExec.binaryTarget.targetArch,
+            format: sigmaExec.binaryTarget.format,
+            machine: sigmaExec.binaryTarget.machine
+          },
+          assets: {
+            languageServers: [
+              {
+                id: "typescript",
+                implementation: "sigma-typescript-language-server",
+                ...integrity.languageServerAssets.typescriptServer
+              },
+              {
+                id: "python",
+                implementation: "pyright",
+                ...integrity.languageServerAssets.pyrightServer
+              }
+            ],
+            languageServiceEngines: [
+              {
+                id: "typescript",
+                implementation: "typescript",
+                ...integrity.languageServerAssets.typescriptEngine
+              }
+            ],
+            tokenizerAssets: tokenizerAssets !== null
+          },
+          integrity: {
+            algorithm: "sha256",
+            manifest: "integrity-manifest.json",
+            manifestSha256: integrity.manifestSha256,
+            entries: integrity.manifest.entries.length
+          },
+          sbom: {
+            format: "CycloneDX",
+            specVersion: "1.5",
+            path: "sbom.cdx.json"
+          },
+          signing,
+          sidecars: {
+            checksum: path.basename(checksumPath),
+            sbom: path.basename(sbomOutputPath),
+            provenance: path.basename(provenancePath)
+          }
+        } : {})
       },
       null,
       2
@@ -695,7 +1247,23 @@ export async function packageAgentCli(options = {}) {
   );
 
   createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir);
-  return { artifactsDir, bundleName, bundleDir, outputPath, targetPlatform, targetArch, ...nodeRuntime };
+  const sidecars = release.isV3
+    ? await writeReleaseSidecars(outputPath, sbomPath, release, targetPlatform, targetArch, integrity, signing, nodeArchiveIntegrity)
+    : null;
+  return {
+    artifactsDir,
+    bundleName,
+    bundleDir,
+    outputPath,
+    targetPlatform,
+    targetArch,
+    version: release.version,
+    sigmaExec,
+    integrity,
+    signing,
+    sidecars,
+    ...nodeRuntime
+  };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

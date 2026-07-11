@@ -6,6 +6,8 @@ import { createRuntime } from "../packages/agent-runtime/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "../scripts/smoke-fake-model.mjs";
+import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
+import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 
 describe("generic fake model smoke", () => {
   it("drives normal multi-turn tool execution without task-identity branching", async () => {
@@ -14,14 +16,16 @@ describe("generic fake model smoke", () => {
     const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("read-input", "read", { path: "input.txt" })]),
       fakeToolTurn([fakeToolCall("edit-input", "edit", { path: "input.txt", oldText: "before", newText: "after" })]),
-      fakeFinalTurn("The requested change is complete.", ["edit-input"])
+      validationTurn("validate-input", [{ path: "input.txt", expected: "after\n" }]),
+      fakeFinalTurn("The requested change is complete.")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
+      reviewer: createApprovingReviewer(),
       permissionMode: "auto",
       runDeadlineMs: 30_000
     });
@@ -29,6 +33,6 @@ describe("generic fake model smoke", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect the workspace and make the requested change.", mode: "change" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await expect(readFile(path.join(workspace, "input.txt"), "utf8")).resolves.toBe("after\n");
-    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests).toHaveLength(4);
   });
 });

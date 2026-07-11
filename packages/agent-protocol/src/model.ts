@@ -35,6 +35,19 @@ export interface ModelCapabilities {
 
 export type ModelFinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "protocol_error";
 
+export interface ModelResponseUsage {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  providerReported: boolean;
+  costMicroUsd: number | null;
+  latencyMs: number;
+  /** Zero-based retry index within the selected provider/model. */
+  retryAttempt: number;
+}
+
 export interface ModelRequest {
   messages: ModelMessage[];
   tools?: ModelToolDefinition[];
@@ -46,7 +59,11 @@ export interface ModelRequest {
 export interface ModelResponse {
   message: ModelMessage;
   finishReason: ModelFinishReason;
+  /** Required V3 accounting data; gateways estimate conservatively when providers omit usage. */
+  usage: ModelResponseUsage;
+  /** @deprecated V2 compatibility projection. */
   inputTokens?: number;
+  /** @deprecated V2 compatibility projection. */
   outputTokens?: number;
   raw?: JsonValue;
 }

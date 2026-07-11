@@ -17,6 +17,9 @@ import { createChildAgentFactory, createRuntime } from "../packages/agent-runtim
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor, WorkspaceIsolationManager } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
+import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
+import { typedCompletion } from "./helpers/typed-evidence.js";
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   let resolve!: (value: T) => void;
@@ -31,17 +34,15 @@ function toolTurn(id: string, name: string, argumentsValue: object): ModelRespon
   };
 }
 
-function completion(evidenceCallId: string): ModelResponse {
-  return toolTurn("complete-second", "complete_task", {
+function completion(): (request: ModelRequest) => ModelResponse {
+  return (request) => typedCompletion(request, {
+    id: "complete-second",
     summary: "Second writer completed after the cancelled writer settled.",
-    criteria: [{
-      criterion: "The second writer ran safely.",
-      status: "met",
-      evidenceCallIds: [evidenceCallId],
-      rationale: ""
-    }]
+    criterion: "The second writer ran safely."
   });
 }
+
+type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
 
 class ChildGateway implements ModelGateway {
   readonly provider = "test";
@@ -57,16 +58,16 @@ class ChildGateway implements ModelGateway {
     tokenizer: "approximate"
   };
 
-  constructor(private readonly responses: ModelResponse[]) {}
+  constructor(private readonly responses: ScriptedResponse[]) {}
 
   async complete(_request: ModelRequest): Promise<ModelResponse> {
     throw new Error("The test consumes streaming responses.");
   }
 
-  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    const response = this.responses.shift();
-    if (!response) throw new Error("No child response remains.");
-    yield { type: "done", response };
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const scripted = this.responses.shift();
+    if (!scripted) throw new Error("No child response remains.");
+    yield { type: "done", response: typeof scripted === "function" ? scripted(request) : scripted };
   }
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
@@ -103,7 +104,8 @@ describe("child cancellation cleanup ordering", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const slowStarted = deferred<void>();
     const slowRelease = deferred<ToolReceipt>();
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const execution = createHostExecutionBroker();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: execution });
     tools.register({
       descriptor: {
         name: "slow_writer",
@@ -140,22 +142,26 @@ describe("child cancellation cleanup ordering", () => {
       gateway: new ChildGateway([
         toolTurn("slow-call", "slow_writer", { path: "first.txt" }),
         toolTurn("quick-call", "quick_observation", {}),
-        completion("quick-call")
+        completion()
       ]),
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
       tools,
+      reviewer: createApprovingReviewer(),
+      execution,
       permissionMode: "auto",
       runDeadlineMs: 10_000
     });
+    const firstParent = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    const secondParent = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const runChild = createChildAgentFactory(() => runtime);
     const started: string[] = [];
     const supervisor = new AgentSupervisor(async (context) => {
       started.push(context.childId);
       return await runChild(context);
-    }, 2, new WorkspaceIsolationManager(path.join(root, "isolation")));
+    }, 2, new WorkspaceIsolationManager(path.join(root, "isolation"), { execution }));
     const first = supervisor.spawn({
-      parentId: "parent",
+      parentId: firstParent.sessionId,
       instruction: "run the slow writer",
       workspacePath: workspace,
       intent: "write",
@@ -164,7 +170,7 @@ describe("child cancellation cleanup ordering", () => {
     });
     await within(slowStarted.promise);
     const second = supervisor.spawn({
-      parentId: "next-parent",
+      parentId: secondParent.sessionId,
       instruction: "observe the workspace",
       workspacePath: workspace,
       intent: "write",
@@ -173,7 +179,7 @@ describe("child cancellation cleanup ordering", () => {
     });
 
     let parentCancellationSettled = false;
-    const parentCancellation = supervisor.cancelParent("parent", "cancel the first writer").then(() => {
+    const parentCancellation = supervisor.cancelParent(firstParent.sessionId, "cancel the first writer").then(() => {
       parentCancellationSettled = true;
     });
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -188,5 +194,6 @@ describe("child cancellation cleanup ordering", () => {
       result: { outcome: { kind: "completed" } }
     });
     expect(started).toEqual([first.id, second.id]);
+    await execution.close();
   });
 });

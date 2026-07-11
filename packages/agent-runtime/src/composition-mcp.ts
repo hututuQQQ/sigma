@@ -2,10 +2,16 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import type { McpServerConfigValue } from "agent-config";
 import { McpStdioClient, McpToolBridge } from "agent-mcp";
-import type { ToolEffect } from "agent-protocol";
+import type { ExecutionBroker } from "agent-execution";
+import { assertMcpPersistentEffectsAllowed, type ToolEffect } from "agent-protocol";
 import { registerToolExecutor, type EffectToolRegistry } from "agent-tools";
 
-function createClient(server: McpServerConfigValue, cwd: string): McpStdioClient {
+function createClient(
+  server: McpServerConfigValue,
+  cwd: string,
+  workspace: string,
+  execution: ExecutionBroker
+): McpStdioClient {
   return new McpStdioClient({
     name: server.name,
     command: server.command,
@@ -16,6 +22,16 @@ function createClient(server: McpServerConfigValue, cwd: string): McpStdioClient
       idleTimeoutMs: server.idleTimeoutMs,
       hardDeadlineMs: server.hardDeadlineMs,
       shutdownGraceMs: server.shutdownGraceMs
+    }
+  }, {}, {
+    broker: execution,
+    possibleEffects: server.possibleEffects as ToolEffect[],
+    policy: {
+      sandbox: "required",
+      network: "none",
+      readRoots: [workspace],
+      writeRoots: [],
+      protectedPaths: [path.join(workspace, ".git"), path.join(workspace, ".agent")]
     }
   });
 }
@@ -35,6 +51,7 @@ export async function resolveMcpWorkingDirectory(workspace: string, configuredCw
 }
 
 async function registerClient(client: McpStdioClient, server: McpServerConfigValue, tools: EffectToolRegistry): Promise<void> {
+  assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects as ToolEffect[]);
   await client.connect();
   const bridge = await McpToolBridge.create(client, {
     namespace: `mcp_${server.name}`,
@@ -56,16 +73,20 @@ export async function closeMcpClients(clients: readonly McpStdioClient[]): Promi
 export async function connectMcpServers(
   servers: readonly McpServerConfigValue[],
   workspace: string,
-  tools: EffectToolRegistry
+  tools: EffectToolRegistry,
+  execution: ExecutionBroker
 ): Promise<McpStdioClient[]> {
   const clients: McpStdioClient[] = [];
   try {
+    for (const server of servers) {
+      assertMcpPersistentEffectsAllowed(server.name, server.possibleEffects as ToolEffect[]);
+    }
     const resolved = await Promise.all(servers.map(async (server) => ({
       server,
       cwd: await resolveMcpWorkingDirectory(workspace, server.cwd)
     })));
     for (const { server, cwd } of resolved) {
-      const client = createClient(server, cwd);
+      const client = createClient(server, cwd, workspace, execution);
       clients.push(client);
       await registerClient(client, server, tools);
     }

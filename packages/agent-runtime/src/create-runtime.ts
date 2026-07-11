@@ -1,17 +1,8 @@
-import type { ModelGateway, RunStore, ToolExecutor } from "agent-protocol";
 import { InProcessRuntimeClient } from "./runtime-client.js";
-import type { ChildJoinSummary } from "./types.js";
+import type { RuntimeOptions } from "./types.js";
 
-export interface CreateRuntimeOptions {
-  gateway: ModelGateway;
-  store: RunStore;
+export interface CreateRuntimeOptions extends RuntimeOptions {
   storeRootDir: string;
-  tools: ToolExecutor;
-  permissionMode?: "ask" | "auto" | "deny";
-  runDeadlineMs?: number;
-  maxParallelTools?: number;
-  joinChildren?(parentSessionId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
-  cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
 }
 
 export function createRuntime(options: CreateRuntimeOptions): InProcessRuntimeClient {

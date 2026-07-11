@@ -10,10 +10,22 @@ import {
   WorkspaceIsolationManager,
   type ChildAgentContext,
   type ChildAgentResult,
-  type ChildJob
+  type ChildJob,
+  type WorkspaceIsolationManagerOptions
 } from "../packages/agent-supervisor/src/index.js";
+import { createHostExecutionBroker, type HostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 const fixtures: string[] = [];
+const brokers: HostExecutionBroker[] = [];
+
+function isolationManager(
+  root: string,
+  options: WorkspaceIsolationManagerOptions = {}
+): WorkspaceIsolationManager {
+  const execution = createHostExecutionBroker();
+  brokers.push(execution);
+  return new WorkspaceIsolationManager(root, { ...options, execution });
+}
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true }).trim();
@@ -72,6 +84,7 @@ async function until(predicate: () => boolean, timeoutMs = 5_000): Promise<void>
 }
 
 afterEach(async () => {
+  await Promise.all(brokers.splice(0).map(async (broker) => await broker.close()));
   for (const root of fixtures.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -87,7 +100,7 @@ describe("AgentSupervisor writer isolation", () => {
       contexts.push(context);
       await release.promise;
       return result(context);
-    }, 4, new WorkspaceIsolationManager(path.join(root, "worktrees")));
+    }, 4, isolationManager(path.join(root, "worktrees")));
 
     const first = supervisor.spawn({ parentId: "parent", instruction: "first", workspacePath: repository, intent: "write" });
     const second = supervisor.spawn({ parentId: "parent", instruction: "second", workspacePath: repository, intent: "write" });
@@ -117,7 +130,7 @@ describe("AgentSupervisor writer isolation", () => {
         git(context.workspacePath, "commit", "-m", "child change");
       }
       return result(context);
-    }, 2, new WorkspaceIsolationManager(path.join(root, "worktrees")));
+    }, 2, isolationManager(path.join(root, "worktrees")));
 
     const uncommitted = supervisor.spawn({ parentId: "parent", instruction: "uncommitted", workspacePath: repository, intent: "write" });
     const committed = supervisor.spawn({ parentId: "parent", instruction: "committed", workspacePath: repository, intent: "write" });
@@ -158,7 +171,7 @@ describe("AgentSupervisor writer isolation", () => {
         analyzeContexts.push(context);
       }
       return result(context);
-    }, 4, new WorkspaceIsolationManager(path.join(root, "worktrees")));
+    }, 4, isolationManager(path.join(root, "worktrees")));
 
     const first = supervisor.spawn({ parentId: "parent", instruction: "writer one", workspacePath: workspace, intent: "write" });
     await until(() => writerContexts.length === 1);
@@ -186,8 +199,8 @@ describe("AgentSupervisor writer isolation", () => {
     const workspace = path.join(root, "workspace");
     const lockRoot = path.join(root, "isolation");
     await mkdir(workspace);
-    const firstManager = new WorkspaceIsolationManager(lockRoot);
-    const secondManager = new WorkspaceIsolationManager(lockRoot);
+    const firstManager = isolationManager(lockRoot);
+    const secondManager = isolationManager(lockRoot);
     const first = await firstManager.allocate({ childId: "first", workspacePath: workspace, intent: "write" });
     let secondAcquired = false;
     const secondPromise = secondManager.allocate({ childId: "second", workspacePath: workspace, intent: "write" }).then((value) => {
@@ -216,7 +229,7 @@ describe("AgentSupervisor writer isolation", () => {
     await writeFile(lockFile, contents, "utf8");
     const old = new Date(Date.now() - 60_000);
     await utimes(lockFile, old, old);
-    const manager = new WorkspaceIsolationManager(lockRoot, {
+    const manager = isolationManager(lockRoot, {
       writerLeaseTimeoutMs: 250,
       malformedLockStaleMs: 10,
       retryIntervalMs: 5
@@ -238,7 +251,7 @@ describe("AgentSupervisor writer isolation", () => {
     const lockFile = await writerLockPath(lockRoot, workspace);
     await mkdir(path.dirname(lockFile), { recursive: true });
     await writeFile(lockFile, "", "utf8");
-    const manager = new WorkspaceIsolationManager(lockRoot, {
+    const manager = isolationManager(lockRoot, {
       writerLeaseTimeoutMs: 40,
       malformedLockStaleMs: 60_000,
       retryIntervalMs: 5
@@ -293,7 +306,7 @@ describe("AgentSupervisor writer isolation", () => {
         else context.signal.addEventListener("abort", onAbort, { once: true });
       });
       return result(context);
-    }, 1, new WorkspaceIsolationManager(path.join(root, "worktrees")));
+    }, 1, isolationManager(path.join(root, "worktrees")));
     const running = supervisor.spawn({ parentId: "parent", instruction: "running", workspacePath: workspace, intent: "analyze" });
     const queued = supervisor.spawn({ parentId: "parent", instruction: "queued", workspacePath: workspace, intent: "analyze" });
     await until(() => started.length === 1);

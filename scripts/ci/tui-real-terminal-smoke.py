@@ -225,6 +225,20 @@ def isolated_environment(home: Path, state_home: Path) -> dict[str, str]:
     return env
 
 
+def remove_temporary_tree(path: Path) -> None:
+    target = f"\\\\?\\{path.resolve()}" if os.name == "nt" else str(path)
+    for attempt in range(6):
+        try:
+            shutil.rmtree(target)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
@@ -242,7 +256,16 @@ def main() -> None:
     cli = args.cli.resolve()
     if not node.is_file() or not cli.is_file():
         raise FileNotFoundError(f"Missing smoke entry: node={node}, cli={cli}")
-    with tempfile.TemporaryDirectory(prefix="sigma-tui-terminal-") as temporary:
+    temporary_parent: Path | None = None
+    if os.name == "nt":
+        # Keep artifact paths below the legacy MAX_PATH boundary used by
+        # Python's Windows cleanup implementation.
+        temporary_parent = root / ".artifacts" / "tui-terminal"
+        temporary_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="sigma-tui-", dir=temporary_parent,
+        ignore_cleanup_errors=os.name == "nt",
+    ) as temporary:
         temporary_path = Path(temporary)
         workspace = temporary_path / "workspace"
         home = temporary_path / "home"
@@ -260,6 +283,7 @@ def main() -> None:
                 f"missing={missing}, store={(state_home / 'workspaces').is_dir()}, output={escaped_tail(transcript)}"
             )
         print(f"PASS real terminal /quit smoke backend={terminal.backend} bytes={len(transcript.encode('utf-8'))}")
+        remove_temporary_tree(temporary_path)
 
 
 if __name__ == "__main__":

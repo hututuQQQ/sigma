@@ -1,10 +1,10 @@
-import type { JsonValue, ToolEffect, ToolReceipt } from "agent-protocol";
+import { isEvidenceRecord, type JsonValue, type ToolEffect, type ToolReceipt } from "agent-protocol";
 
 function text(value: JsonValue | undefined): string {
   return typeof value === "string" ? value : "";
 }
 
-export function toolReceipt(value: JsonValue): ToolReceipt | null {
+export function toolReceipt(value: unknown): ToolReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const item = value as Record<string, JsonValue>;
   if (typeof item.callId !== "string" || typeof item.ok !== "boolean") return null;
@@ -17,6 +17,7 @@ export function toolReceipt(value: JsonValue): ToolReceipt | null {
       : [],
     artifacts: Array.isArray(item.artifacts) ? item.artifacts.filter((entry): entry is string => typeof entry === "string") : [],
     diagnostics: Array.isArray(item.diagnostics) ? item.diagnostics.filter((entry): entry is string => typeof entry === "string") : [],
+    evidence: Array.isArray(item.evidence) ? item.evidence.filter(isEvidenceRecord) : [],
     startedAt: text(item.startedAt),
     completedAt: text(item.completedAt)
   };

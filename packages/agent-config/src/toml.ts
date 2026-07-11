@@ -23,17 +23,25 @@ export function renderConfigToml(overrides: Partial<Record<string, ConfigValue>>
   let mcpServers: McpServerConfigValue[] = [];
   for (const field of SIGMA_CONFIG_SCHEMA) {
     if (!field.toml) continue;
+    if (field.key === "allowUnsafeHostExec") continue;
     const value = overrides[field.key] ?? field.defaultValue;
     if (field.key === "mcpServers") {
       mcpServers = value as McpServerConfigValue[];
       continue;
     }
-    const [section, key] = field.toml.split(".");
+    const parts = field.toml.split(".");
+    if (parts.length === 1) {
+      const lines = sections.get("") ?? [];
+      lines.push(`${parts[0]} = ${scalar(value as string | number | boolean | string[])}`);
+      sections.set("", lines);
+      continue;
+    }
+    const [section, key] = parts;
     const lines = sections.get(section) ?? [];
     lines.push(`${key} = ${scalar(value as string | number | boolean | string[])}`);
     sections.set(section, lines);
   }
-  const blocks = [...sections].map(([section, lines]) => `[${section}]\n${lines.join("\n")}`);
+  const blocks = [...sections].map(([section, lines]) => section ? `[${section}]\n${lines.join("\n")}` : lines.join("\n"));
   if (mcpServers.length > 0) blocks.push(mcpServers.map(mcpServer).join("\n\n"));
   return `${comment ? `# ${comment}\n\n` : ""}${blocks.join("\n\n")}\n`;
 }

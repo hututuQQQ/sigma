@@ -37,16 +37,36 @@ async function createIndex(workspace, count) {
 }
 
 const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repo-100k-"));
+const execution = {
+  async execute(request) {
+    if (request.command.executable !== "git") {
+      throw new Error(`100k repository performance execution denied '${request.command.executable}'.`);
+    }
+    const started = performance.now();
+    const stdout = await git(request.command.cwd, request.command.args ?? []);
+    return {
+      state: "exited", exitCode: 0, signal: null, durationMs: performance.now() - started,
+      timedOut: false, idleTimedOut: false, cancelled: false, stdout, stderr: "",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0, outputTruncated: false
+    };
+  }
+};
 try {
   await createIndex(workspace, 100_000);
   const beforeHeap = process.memoryUsage().heapUsed;
   const started = performance.now();
-  const items = await new RepositoryContextProvider().collect(workspace, "files 099999", new AbortController().signal);
+  const items = await new RepositoryContextProvider(execution).collect(
+    workspace, "files 099999", new AbortController().signal
+  );
   const durationMs = performance.now() - started;
   const heapDelta = Math.max(0, process.memoryUsage().heapUsed - beforeHeap);
   const indexed = items.some((item) => item.content.includes("Repository files (100000"));
   if (!indexed || durationMs > 30_000 || heapDelta > 300 * 1024 * 1024) {
-    throw new Error(`100k repository performance failed: indexed=${indexed} durationMs=${durationMs.toFixed(1)} heapDelta=${heapDelta}`);
+    const repositorySummary = items.find((item) => item.id.startsWith("repo:index:"))?.content.split("\n", 1)[0] ?? "missing";
+    throw new Error(
+      `100k repository performance failed: indexed=${indexed} durationMs=${durationMs.toFixed(1)} `
+      + `heapDelta=${heapDelta} repositorySummary=${repositorySummary}`
+    );
   }
   console.log(`PASS 100k repository context durationMs=${durationMs.toFixed(1)} heapDeltaMiB=${(heapDelta / 1024 / 1024).toFixed(1)}`);
 } finally {

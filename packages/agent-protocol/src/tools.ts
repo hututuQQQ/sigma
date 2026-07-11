@@ -1,4 +1,14 @@
 import type { JsonValue } from "./json.js";
+import type {
+  ArtifactRef,
+  BudgetLedgerState,
+  CheckpointRef,
+  EvidenceRecord,
+  BudgetAmounts,
+  BudgetLimits,
+  PlanGraph
+} from "./domain.js";
+import type { RunMode } from "./outcomes.js";
 
 export type ToolEffect =
   | "filesystem.read"
@@ -10,6 +20,7 @@ export type ToolEffect =
   | "validation"
   | "outcome.propose"
   | "outcome.request_input"
+  | "runtime.control"
   | "destructive"
   | "open_world";
 
@@ -18,6 +29,10 @@ export interface ToolDescriptor {
   description: string;
   inputSchema: { [key: string]: JsonValue };
   possibleEffects: ToolEffect[];
+  /** Modes in which this tool may be planned, independent of maximum effects. */
+  availableModes?: RunMode[];
+  /** Conservative presentation boundary; per-call policy uses ToolCallPlan.exactEffects. */
+  maximumEffects?: ToolEffect[];
   executionMode: "parallel" | "sequential" | "exclusive";
   resourceKeys: string[];
   contextPathArguments?: string[];
@@ -26,6 +41,27 @@ export interface ToolDescriptor {
   idempotent: boolean;
   timeoutMs: number;
   idleTimeoutMs?: number;
+  prepare?(argumentsValue: JsonValue, context: ToolPreparationContext): Promise<ToolCallPlan> | ToolCallPlan;
+}
+
+export interface ToolPreparationContext {
+  sessionId: string;
+  runId: string;
+  workspacePath: string;
+  runMode: RunMode;
+  /** Read-only session authority used while dynamically planning resources
+   * whose paths are intentionally not model-addressable. */
+  runtimeControl?: RuntimeControlPort;
+}
+
+export interface ToolCallPlan {
+  exactEffects: ToolEffect[];
+  readPaths: string[];
+  writePaths: string[];
+  network: "none" | "full";
+  processMode: "none" | "pipe" | "pty" | "background";
+  checkpointScope: string[];
+  idempotence: "read_only" | "replay_safe" | "non_replayable";
 }
 
 export interface ToolRequest {
@@ -40,16 +76,55 @@ export interface WorkspaceDelta {
   deleted: string[];
 }
 
+export interface ToolOutcome {
+  status: "succeeded" | "failed";
+  output: string;
+  diagnosticCodes: string[];
+}
+
 export interface ToolReceipt {
   callId: string;
   ok: boolean;
   output: string;
+  /** V3 typed outcome; optional only on legacy executor input and normalized before durable emission. */
+  outcome?: ToolOutcome;
   observedEffects: ToolEffect[];
+  /** V3 exact post-execution effects. observedEffects remains as the V2 projection. */
+  actualEffects?: ToolEffect[];
   workspaceDelta?: WorkspaceDelta;
   artifacts: string[];
+  artifactRefs?: ArtifactRef[];
   diagnostics: string[];
+  /** Typed durable evidence. Optional only while V2 tool executors migrate. */
+  evidence?: EvidenceRecord[];
   startedAt: string;
   completedAt: string;
+}
+
+export interface RuntimeControlPort {
+  readPlan(): Promise<PlanGraph>;
+  updatePlan(input: { expectedRevision: number; plan: PlanGraph }): Promise<PlanGraph>;
+  readBudget(): Promise<BudgetLedgerState>;
+  listCheckpoints(): Promise<CheckpointRef[]>;
+  createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
+  loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
+  resolveLoadedSkillResource(input: {
+    qualifiedName: string;
+    relativePath: string;
+    purpose: "plan" | "execute";
+  }): Promise<LoadedSkillResourceAccess>;
+  reserveChildBudget(childId: string, allocation?: Partial<BudgetLimits>): Promise<BudgetLimits>;
+  settleChildBudget(childId: string, consumed?: Partial<BudgetAmounts>): Promise<void>;
+  releaseChildBudget(childId: string): Promise<void>;
+  rollbackChildPlanAssignment(childId: string, nodeIds: string[], previousPlan: PlanGraph): Promise<PlanGraph>;
+}
+
+export interface LoadedSkillResourceAccess {
+  qualifiedName: string;
+  relativePath: string;
+  absolutePath: string;
+  readRoot: string;
+  digest: string;
 }
 
 export interface ToolExecutionContext {
@@ -57,13 +132,24 @@ export interface ToolExecutionContext {
   runId: string;
   workspacePath: string;
   runMode: import("./outcomes.js").RunMode;
+  /** Ephemeral, call-bound human authorization. Never persisted or restored. */
+  approval?: ToolCallApproval;
   signal: AbortSignal;
   heartbeat(): void;
   progress(update: { message: string; percent?: number }): Promise<void>;
-  createArtifact(input: { name: string; content: string }): Promise<string>;
+  createArtifact(input: { name: string; content: string | Uint8Array }): Promise<string>;
+  runtimeControl?: RuntimeControlPort;
+}
+
+export interface ToolCallApproval {
+  callId: string;
+  authority: "user";
+  networkApproved: boolean;
+  unsafeHostExecApproved: boolean;
 }
 
 export interface ToolExecutor {
   descriptors(): readonly ToolDescriptor[];
+  prepare?(request: ToolRequest, context: ToolPreparationContext): Promise<ToolCallPlan>;
   execute(request: ToolRequest, context: ToolExecutionContext): Promise<ToolReceipt>;
 }

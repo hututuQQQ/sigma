@@ -17,6 +17,10 @@ import { createChildAgentFactory, createRuntime } from "../packages/agent-runtim
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor, WorkspaceIsolationManager } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
+import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
+import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
+import { typedCompletion } from "./helpers/typed-evidence.js";
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", ["-C", cwd, ...args], { windowsHide: true });
@@ -29,17 +33,34 @@ function writeTurn(id: string, file: string, content: string): ModelResponse {
   };
 }
 
-function completeTurn(id: string, summary: string, evidenceCallId: string): ModelResponse {
+function completeTurn(id: string, summary: string): (request: ModelRequest) => ModelResponse {
+  return (request) => typedCompletion(request, { id, summary, criterion: summary });
+}
+
+type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
+
+function reopenPlanTurn(): ModelResponse {
   return {
     message: {
       role: "assistant",
       content: "",
       toolCalls: [{
-        id,
-        name: "complete_task",
+        id: "reopen-plan-for-follow-up",
+        name: "update_plan",
         arguments: {
-          summary,
-          criteria: [{ criterion: summary, status: "met", evidenceCallIds: [evidenceCallId] }]
+          expectedRevision: 2,
+          goal: "Complete the accepted follow-up request.",
+          activeNodeId: "root",
+          nodes: [{
+            id: "root",
+            title: "Write second.txt for the follow-up",
+            dependencies: [],
+            status: "in_progress",
+            owner: { kind: "root" },
+            acceptanceCriteria: ["second.txt contains the requested follow-up content."],
+            evidence: [],
+            reopenReason: "The user accepted an additional follow-up workspace change."
+          }]
         }
       }]
     },
@@ -64,8 +85,9 @@ class FollowUpGateway implements ModelGateway {
   private startFirst!: () => void;
   private releaseFirst!: () => void;
   private readonly firstGate: Promise<void>;
+  private requestCount = 0;
 
-  constructor(private readonly responses: ModelResponse[]) {
+  constructor(private readonly responses: ScriptedResponse[]) {
     this.firstStarted = new Promise((resolve) => { this.startFirst = resolve; });
     this.firstGate = new Promise((resolve) => { this.releaseFirst = resolve; });
   }
@@ -76,14 +98,15 @@ class FollowUpGateway implements ModelGateway {
     throw new Error("The test consumes streaming responses.");
   }
 
-  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    if (this.responses.length === 4) {
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requestCount += 1;
+    if (this.requestCount === 1) {
       this.startFirst();
       await this.firstGate;
     }
-    const response = this.responses.shift();
-    if (!response) throw new Error("No child follow-up response remains.");
-    yield { type: "done", response };
+    const scripted = this.responses.shift();
+    if (!scripted) throw new Error("No child follow-up response remains.");
+    yield { type: "done", response: typeof scripted === "function" ? scripted(request) : scripted };
   }
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
@@ -105,26 +128,33 @@ describe("child follow-up lifecycle", () => {
 
     const gateway = new FollowUpGateway([
       writeTurn("write-first", "first.txt", "first"),
-      completeTurn("complete-first", "first run complete", "write-first"),
+      validationTurn("validate-first", [{ path: "first.txt", expected: "first" }]),
+      completeTurn("complete-first", "first run complete"),
+      reopenPlanTurn(),
       writeTurn("write-second", "second.txt", "second"),
-      completeTurn("complete-second", "follow-up run complete", "write-second")
+      validationTurn("validate-second", [{ path: "second.txt", expected: "second" }]),
+      completeTurn("complete-second", "follow-up run complete")
     ]);
+    const execution = createHostExecutionBroker();
     const storeRootDir = path.join(repository, ".agent");
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry(), { broker: execution })),
+      reviewer: createApprovingReviewer(),
+      execution,
       permissionMode: "auto",
       runDeadlineMs: 10_000
     });
+    const parent = await runtime.createSession({ workspacePath: repository, mode: "change" });
     const supervisor = new AgentSupervisor(
       createChildAgentFactory(() => runtime),
       1,
-      new WorkspaceIsolationManager(path.join(root, "worktrees"))
+      new WorkspaceIsolationManager(path.join(root, "worktrees"), { execution })
     );
     const child = supervisor.spawn({
-      parentId: "parent",
+      parentId: parent.sessionId,
       instruction: "write first.txt",
       workspacePath: repository,
       intent: "write",
@@ -151,5 +181,6 @@ describe("child follow-up lifecycle", () => {
     await expect(supervisor.integrate(child.id)).resolves.toMatchObject({ isolation: { cleanup: "integrated" } });
     await expect(readFile(path.join(repository, "first.txt"), "utf8")).resolves.toBe("first");
     await expect(readFile(path.join(repository, "second.txt"), "utf8")).resolves.toBe("second");
+    await execution.close();
   });
 });

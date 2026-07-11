@@ -2,9 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { acquireProcessOwnerLease } from "agent-platform";
-import { assertAgentEventEnvelope } from "agent-protocol";
+import {
+  EVENT_SCHEMA_VERSION,
+  SNAPSHOT_SCHEMA_VERSION,
+  STORE_LAYOUT_VERSION,
+  assertAgentEventEnvelope,
+  assertSnapshotEnvelope
+} from "agent-protocol";
 import type {
-  AgentEventEnvelope,
+  AnyTypedAgentEvent,
   ExternalEvaluationReport,
   EvaluationSink,
   RunStore,
@@ -13,12 +19,14 @@ import type {
 } from "agent-protocol";
 import { atomicJson, type AtomicReplace } from "./durable-file.js";
 import { inspectDurableEventTail } from "./durable-tail.js";
-import { segmentName, sessionDirectory, snapshotName } from "./paths.js";
+import { segmentName, sessionDirectory, sessionsDirectory, snapshotName } from "./paths.js";
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEGMENT_EVENTS = 10_000;
-interface SessionMeta {
-  schemaVersion: 2;
+export interface SessionMetaV3 {
+  schemaVersion: typeof STORE_LAYOUT_VERSION;
+  eventSchemaVersion: typeof EVENT_SCHEMA_VERSION;
+  snapshotSchemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
   sessionId: string;
   createdAt: string;
   updatedAt: string;
@@ -29,7 +37,7 @@ interface SessionMeta {
 
 interface StoredRecord {
   checksum: string;
-  event: AgentEventEnvelope;
+  event: AnyTypedAgentEvent;
 }
 
 interface StoredSnapshot {
@@ -48,7 +56,24 @@ export interface SegmentedJsonlStoreOptions {
   replaceFile?: AtomicReplace;
 }
 
-function checksum(event: AgentEventEnvelope): string {
+export function isSessionMetaV3(value: unknown, sessionId?: string): value is SessionMetaV3 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const meta = value as Record<string, unknown>;
+  return [
+    meta.schemaVersion === STORE_LAYOUT_VERSION,
+    meta.eventSchemaVersion === EVENT_SCHEMA_VERSION,
+    meta.snapshotSchemaVersion === SNAPSHOT_SCHEMA_VERSION,
+    typeof meta.sessionId === "string" && meta.sessionId.length > 0,
+    sessionId === undefined || meta.sessionId === sessionId,
+    typeof meta.createdAt === "string" && Number.isFinite(Date.parse(meta.createdAt)),
+    typeof meta.updatedAt === "string" && Number.isFinite(Date.parse(meta.updatedAt)),
+    Number.isSafeInteger(meta.lastSeq) && Number(meta.lastSeq) >= 0,
+    Number.isSafeInteger(meta.segment) && Number(meta.segment) >= 1,
+    Number.isSafeInteger(meta.segmentEvents) && Number(meta.segmentEvents) >= 0
+  ].every(Boolean);
+}
+
+function checksum(event: AnyTypedAgentEvent): string {
   return createHash("sha256").update(JSON.stringify(event)).digest("hex");
 }
 
@@ -56,11 +81,11 @@ function snapshotChecksum(snapshot: SnapshotEnvelope): string {
   return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
 }
 
-function storedLine(event: AgentEventEnvelope): string {
+function storedLine(event: AnyTypedAgentEvent): string {
   return `${JSON.stringify({ checksum: checksum(event), event } satisfies StoredRecord)}\n`;
 }
 
-function parseRecord(line: string): AgentEventEnvelope {
+function parseRecord(line: string): AnyTypedAgentEvent {
   const parsed = JSON.parse(line) as StoredRecord;
   if (!parsed || typeof parsed !== "object" || !parsed.event || typeof parsed.checksum !== "string") {
     throw new Error("Invalid event record envelope.");
@@ -100,7 +125,7 @@ export class SegmentedJsonlStore implements RunStore {
     this.replaceFile = options.replaceFile;
   }
 
-  async append(event: AgentEventEnvelope, expectedSeq: number): Promise<StoreAppendResult> {
+  async append(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
     assertAgentEventEnvelope(event);
     const previous = this.queues.get(event.sessionId) ?? Promise.resolve();
     const current = previous.then(() => this.appendLocked(event, expectedSeq));
@@ -108,7 +133,7 @@ export class SegmentedJsonlStore implements RunStore {
     return await current;
   }
 
-  private async appendLocked(event: AgentEventEnvelope, expectedSeq: number): Promise<StoreAppendResult> {
+  private async appendLocked(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
     const directory = sessionDirectory(this.rootDir, event.sessionId);
     await mkdir(path.join(directory, "events"), { recursive: true });
     const release = await acquireSessionLock(directory);
@@ -146,14 +171,14 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: event.seq,
       segment,
       segmentEvents: segmentEvents + 1
-    } satisfies SessionMeta, this.replaceFile);
+    } satisfies SessionMetaV3, this.replaceFile);
     return { rotated };
     } finally {
       await release();
     }
   }
 
-  async *events(sessionId: string, afterSeq = 0, recoverTail = false): AsyncIterable<AgentEventEnvelope> {
+  async *events(sessionId: string, afterSeq = 0, recoverTail = false): AsyncIterable<AnyTypedAgentEvent> {
     const eventsDir = path.join(sessionDirectory(this.rootDir, sessionId), "events");
     const files = (await readdir(eventsDir).catch(() => []))
       .filter((name) => /^\d{6}\.jsonl$/.test(name))
@@ -176,7 +201,7 @@ export class SegmentedJsonlStore implements RunStore {
     afterSeq: number,
     recoverTail: boolean,
     cursor: EventCursor
-  ): AsyncIterable<AgentEventEnvelope> {
+  ): AsyncIterable<AnyTypedAgentEvent> {
     const filePath = path.join(eventsDir, fileName);
     const content = await readFile(filePath, "utf8");
     const lines = content.split("\n");
@@ -225,7 +250,7 @@ export class SegmentedJsonlStore implements RunStore {
     }
   }
 
-  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMeta> {
+  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMetaV3> {
     let lastSeq = 0;
     for await (const event of this.events(sessionId, 0, true)) lastSeq = event.seq;
     const eventsDir = path.join(sessionDirectory(this.rootDir, sessionId), "events");
@@ -235,7 +260,7 @@ export class SegmentedJsonlStore implements RunStore {
       ? (await readFile(path.join(eventsDir, files.at(-1)!), "utf8")).split("\n").filter((line) => line.trim()).length
       : 0;
     const meta = await this.readMeta(sessionId, now);
-    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMeta;
+    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMetaV3;
     await atomicJson(path.join(sessionDirectory(this.rootDir, sessionId), "meta.json"), reconciled, this.replaceFile);
     return reconciled;
   }
@@ -264,10 +289,11 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: lastValidSeq,
       segment,
       segmentEvents: validEvents
-    } satisfies SessionMeta, this.replaceFile);
+    } satisfies SessionMetaV3, this.replaceFile);
   }
 
   async writeSnapshot(snapshot: SnapshotEnvelope): Promise<void> {
+    assertSnapshotEnvelope(snapshot);
     const directory = path.join(sessionDirectory(this.rootDir, snapshot.sessionId), "snapshots");
     await atomicJson(path.join(directory, snapshotName(snapshot.seq)), {
       checksum: snapshotChecksum(snapshot),
@@ -284,7 +310,8 @@ export class SegmentedJsonlStore implements RunStore {
     for (const file of files) {
       try {
         const stored = JSON.parse(await readFile(path.join(directory, file), "utf8")) as StoredSnapshot;
-        if (stored.snapshot?.schemaVersion === 2 && stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
+        assertSnapshotEnvelope(stored.snapshot);
+        if (stored.snapshot.sessionId === sessionId && snapshotChecksum(stored.snapshot) === stored.checksum) {
           return stored.snapshot;
         }
       } catch {
@@ -295,11 +322,12 @@ export class SegmentedJsonlStore implements RunStore {
   }
 
   async listSessions(): Promise<Array<{ sessionId: string; updatedAt: string; lastSeq: number }>> {
-    const root = path.join(this.rootDir, "sessions");
+    const root = sessionsDirectory(this.rootDir);
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
     const sessions = await Promise.all(entries.filter((item) => item.isDirectory()).map(async (item) => {
       try {
-        const meta = JSON.parse(await readFile(path.join(root, item.name, "meta.json"), "utf8")) as SessionMeta;
+        const meta = JSON.parse(await readFile(path.join(root, item.name, "meta.json"), "utf8")) as unknown;
+        if (!isSessionMetaV3(meta, item.name)) return null;
         return { sessionId: meta.sessionId, updatedAt: meta.updatedAt, lastSeq: meta.lastSeq };
       } catch {
         return null;
@@ -309,13 +337,25 @@ export class SegmentedJsonlStore implements RunStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  private async readMeta(sessionId: string, now: string): Promise<SessionMeta> {
+  private async readMeta(sessionId: string, now: string): Promise<SessionMetaV3> {
     const metaPath = path.join(sessionDirectory(this.rootDir, sessionId), "meta.json");
     try {
-      return JSON.parse(await readFile(metaPath, "utf8")) as SessionMeta;
+      const parsed = JSON.parse(await readFile(metaPath, "utf8")) as unknown;
+      if (!isSessionMetaV3(parsed, sessionId)) throw new Error("invalid V3 metadata shape");
+      return parsed;
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") {
-        return { schemaVersion: 2, sessionId, createdAt: now, updatedAt: now, lastSeq: 0, segment: 1, segmentEvents: 0 };
+        return {
+          schemaVersion: STORE_LAYOUT_VERSION,
+          eventSchemaVersion: EVENT_SCHEMA_VERSION,
+          snapshotSchemaVersion: SNAPSHOT_SCHEMA_VERSION,
+          sessionId,
+          createdAt: now,
+          updatedAt: now,
+          lastSeq: 0,
+          segment: 1,
+          segmentEvents: 0
+        };
       }
       throw new Error(`Session metadata is corrupt for '${sessionId}'.`, { cause: error });
     }

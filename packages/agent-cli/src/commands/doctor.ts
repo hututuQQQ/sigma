@@ -1,10 +1,40 @@
 import { access } from "node:fs/promises";
-import { checkProviderHealth } from "agent-runtime";
+import { discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
+import type { ExecutionBroker } from "agent-execution";
+import { checkProviderHealth, LazyExecutionBroker } from "agent-runtime";
 import { loadCliConfig, parseArgs } from "../config.js";
 
 interface DoctorDeps {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
+  executionBroker?: ExecutionBroker;
+  languageServers?: LanguageServerPreset[];
+}
+
+async function sandboxCheck(broker: ExecutionBroker): Promise<DoctorCheck> {
+  try {
+    const report = await broker.doctor();
+    const ready = report.sandbox.available && report.sandbox.selfTestPassed;
+    return {
+      name: "sandbox",
+      status: ready ? "ok" : "warning",
+      message: ready
+        ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; pty=${String(report.capabilities.pty)}`
+        : `${report.sandbox.backend} unavailable: ${report.sandbox.reason ?? "self-test failed"}`
+    };
+  } catch (error) {
+    return { name: "sandbox", status: "warning", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function languageServerChecks(presets: LanguageServerPreset[]): DoctorCheck[] {
+  return presets.map((preset) => ({
+    name: `lsp_${preset.id}`,
+    status: preset.available ? "ok" : preset.id === "typescript" || preset.id === "python" ? "error" : "warning",
+    message: preset.available
+      ? `${preset.source}: ${preset.executable}`
+      : preset.unavailableReason ?? "language server unavailable"
+  }));
 }
 
 interface DoctorCheck {
@@ -79,13 +109,20 @@ export async function runDoctorCommand(argv: string[], deps: DoctorDeps = {}): P
   try {
     const { flags } = parseArgs(argv);
     const config = loadCliConfig(flags);
+    const ownedBroker = deps.executionBroker ? undefined : new LazyExecutionBroker({
+      sandboxMode: "unsafe",
+      allowUnsafeHostExec: false
+    });
+    const broker = deps.executionBroker ?? ownedBroker!;
     const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
-    checks.push({ name: "tool_isolation", status: "warning", message: "Tool effects and workspace containment are enforced; OS-level sandboxing is not configured." });
+    checks.push(await sandboxCheck(broker));
+    checks.push(...languageServerChecks(deps.languageServers ?? discoverLanguageServers()));
     checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
     const strict = flags.strict === true;
     const outcome = reportStatus(checks, strict);
     const report = { status: outcome.status, strict, checks };
     writeReport(stdout, report, checks, flags.json === true);
+    await ownedBroker?.close();
     return outcome.failed ? 1 : 0;
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
