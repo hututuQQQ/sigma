@@ -492,35 +492,14 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
     fs::create_dir_all(&allowed).map_err(|error| error.to_string())?;
     fs::create_dir_all(&denied).map_err(|error| error.to_string())?;
     let output = Command::new(bwrap)
-        .args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
-            "--ro-bind",
-            "/",
-            "/",
-            "--bind",
-        ])
-        .arg(&allowed)
-        .arg(&allowed)
-        .arg("--bind")
-        .arg(&denied)
-        .arg(parent_mount)
-        .arg(parent_pid)
-        .arg(parent_network)
-        .arg(&denied)
-        .args(["--proc", "/proc", "--dev", "/dev", "--"])
-        .arg(&helper)
-        .arg(INTERNAL_HARDENED_LAUNCHER)
-        .arg("--read")
-        .arg("/")
-        .arg("--write")
-        .arg(&allowed)
-        .arg("--")
-        .arg(&helper)
-        .arg(INTERNAL_HARDENING_PROBE)
-        .arg(&allowed)
-        .arg(&denied)
+        .args(self_test_arguments(
+            &helper,
+            &allowed,
+            &denied,
+            &parent_mount,
+            &parent_pid,
+            &parent_network,
+        ))
         .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("hardening self-test launch failed: {error}"));
@@ -550,6 +529,51 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
     Ok(report)
 }
 
+fn self_test_arguments(
+    helper: &Path,
+    allowed: &Path,
+    denied: &Path,
+    parent_mount: &OsStr,
+    parent_pid: &OsStr,
+    parent_network: &OsStr,
+) -> Vec<OsString> {
+    [
+        OsString::from("--die-with-parent"),
+        OsString::from("--new-session"),
+        OsString::from("--unshare-all"),
+        OsString::from("--ro-bind"),
+        OsString::from("/"),
+        OsString::from("/"),
+        OsString::from("--bind"),
+        allowed.as_os_str().to_owned(),
+        allowed.as_os_str().to_owned(),
+        OsString::from("--bind"),
+        denied.as_os_str().to_owned(),
+        denied.as_os_str().to_owned(),
+        OsString::from("--proc"),
+        OsString::from("/proc"),
+        OsString::from("--dev"),
+        OsString::from("/dev"),
+        OsString::from("--"),
+        helper.as_os_str().to_owned(),
+        OsString::from(INTERNAL_HARDENED_LAUNCHER),
+        OsString::from("--read"),
+        OsString::from("/"),
+        OsString::from("--write"),
+        allowed.as_os_str().to_owned(),
+        OsString::from("--"),
+        helper.as_os_str().to_owned(),
+        OsString::from(INTERNAL_HARDENING_PROBE),
+        allowed.as_os_str().to_owned(),
+        denied.as_os_str().to_owned(),
+        parent_mount.to_owned(),
+        parent_pid.to_owned(),
+        parent_network.to_owned(),
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -557,6 +581,43 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_test_argv_keeps_binds_and_probe_namespace_arguments_in_order() {
+        let arguments = self_test_arguments(
+            Path::new("/sigma-exec"),
+            Path::new("/tmp/allowed"),
+            Path::new("/tmp/denied"),
+            OsStr::new("mnt:[1]"),
+            OsStr::new("pid:[2]"),
+            OsStr::new("net:[3]"),
+        );
+        let values = arguments
+            .iter()
+            .map(|item| item.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &values[6..12],
+            [
+                "--bind",
+                "/tmp/allowed",
+                "/tmp/allowed",
+                "--bind",
+                "/tmp/denied",
+                "/tmp/denied",
+            ]
+        );
+        assert_eq!(
+            &values[26..],
+            [
+                "/tmp/allowed",
+                "/tmp/denied",
+                "mnt:[1]",
+                "pid:[2]",
+                "net:[3]",
+            ]
+        );
+    }
 
     #[test]
     fn launcher_parser_requires_roots_delimiter_and_command() {

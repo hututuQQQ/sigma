@@ -44,6 +44,9 @@ export class BrokerTransport {
   private nextId = 1;
   private state: TransportState = "new";
   private writeChain = Promise.resolve();
+  private closePromise?: Promise<void>;
+  private closingRequested = false;
+  private childClosed = false;
 
   constructor(
     private readonly options: SigmaExecBrokerClientOptions,
@@ -66,6 +69,7 @@ export class BrokerTransport {
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.child = child;
+    this.childClosed = false;
     this.state = "running";
     child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
     child.stderr.on("data", (chunk: Buffer) => this.stderrBuffer.append(chunk));
@@ -95,15 +99,38 @@ export class BrokerTransport {
   }
 
   async close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    await this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     if (this.state === "closed") return;
+    this.closingRequested = true;
+    const child = this.child;
+    const grace = this.options.shutdownGraceMs ?? 750;
     if (this.state === "running") {
-      try { await this.request("shutdown", {}, { timeoutMs: this.options.shutdownGraceMs ?? 750 }); } catch { /* kill below */ }
+      try { await this.request("shutdown", {}, { timeoutMs: grace }); } catch { /* terminate below */ }
     }
     this.state = "closing";
-    const child = this.child;
-    if (child && child.exitCode === null) child.kill();
     this.rejectPending(new BrokerConnectionError("Broker transport closed."));
+    if (!child || this.childClosed) {
+      this.state = "closed";
+      return;
+    }
+    if (!await this.waitForChildClose(child, grace)) child.kill();
+    if (!await this.waitForChildClose(child, 5_000)) {
+      throw new BrokerConnectionError("sigma-exec did not release its process handle during shutdown.");
+    }
     this.state = "closed";
+  }
+
+  private async waitForChildClose(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+    if (this.childClosed) return true;
+    return await new Promise<boolean>((resolve) => {
+      const done = (): void => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => { child.removeListener("close", done); resolve(false); }, timeoutMs);
+      child.once("close", done);
+    });
   }
 
   private async send(id: number, method: string, params: Record<string, unknown>): Promise<void> {
@@ -178,7 +205,12 @@ export class BrokerTransport {
   }
 
   private onClose(code: number | null, signal: NodeJS.Signals | null): void {
-    if (this.state === "closing" || this.state === "closed") return;
+    this.childClosed = true;
+    if (this.closingRequested || this.state === "closing" || this.state === "closed") {
+      this.rejectPending(new BrokerConnectionError("Broker transport closed."));
+      this.state = "closed";
+      return;
+    }
     try {
       this.decoder.end();
       this.fail(new BrokerConnectionError(`sigma-exec exited unexpectedly (code=${String(code)}, signal=${String(signal)}).`));

@@ -553,7 +553,9 @@ describe("SigmaExecBrokerClient", () => {
     await expect(client.spawn({ ...request, command: { ...request.command, stdin: "bad\0input" } })).rejects.toBeInstanceOf(BrokerPolicyError);
     await expect(client.spawn({ ...request, policy: { ...request.policy, readRoots: [] } })).rejects.toBeInstanceOf(BrokerPolicyError);
     await expect(client.execute({ ...request, timeoutMs: 0 })).rejects.toBeInstanceOf(BrokerPolicyError);
+    const closingStarted = performance.now();
     await client.close();
+    expect(performance.now() - closingStarted).toBeGreaterThanOrEqual(15);
     await client.close();
   });
 

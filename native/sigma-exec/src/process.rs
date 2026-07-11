@@ -502,15 +502,15 @@ fn refresh(process: &mut ManagedProcess) -> Result<(), RpcError> {
         return Ok(());
     }
     if let Some(status) = process.child.try_wait()? {
-        set_exit(process, status);
+        set_exit(process, status)?;
     }
     Ok(())
 }
 
-fn set_exit(process: &mut ManagedProcess, status: ExitStatus) {
+fn set_exit(process: &mut ManagedProcess, status: ExitStatus) -> Result<(), RpcError> {
     process.exited = true;
     process.exit_code = status.code();
-    process._guard.cleanup_descendants();
+    process._guard.cleanup_descendants()?;
     for capture in process.capture_threads.drain(..) {
         let _ = capture.join();
     }
@@ -540,17 +540,18 @@ fn set_exit(process: &mut ManagedProcess, status: ExitStatus) {
         use std::os::unix::process::ExitStatusExt;
         process.signal = status.signal().map(|signal| format!("SIG{signal}"));
     }
+    Ok(())
 }
 
 fn terminate(process: &mut ManagedProcess, cancelled: bool) -> Result<(), RpcError> {
     process.cancelled |= cancelled;
     process.terminated = true;
     process.stdin.take();
-    process._guard.terminate(&mut process.child);
+    process._guard.terminate(&mut process.child)?;
     let deadline = Instant::now() + Duration::from_millis(750);
     loop {
         if let Some(status) = process.child.try_wait()? {
-            set_exit(process, status);
+            set_exit(process, status)?;
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -558,10 +559,10 @@ fn terminate(process: &mut ManagedProcess, cancelled: bool) -> Result<(), RpcErr
         }
         thread::sleep(Duration::from_millis(10));
     }
-    process._guard.force_terminate(&mut process.child);
+    process._guard.force_terminate(&mut process.child)?;
     process.child.kill()?;
     let status = process.child.wait()?;
-    set_exit(process, status);
+    set_exit(process, status)?;
     Ok(())
 }
 

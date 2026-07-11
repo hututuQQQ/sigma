@@ -45,20 +45,70 @@ impl PlatformGuard {
         }
     }
 
-    pub(crate) fn terminate(&self, _child: &mut Child) {
+    fn terminate_job_and_wait(&self) -> Result<(), RpcError> {
+        use std::mem::size_of;
+        use std::ptr::null_mut;
+        use std::thread;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::JobObjects::*;
         unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle as _, 1);
+            if TerminateJobObject(self.handle as _, 1) == 0 {
+                return Err(RpcError::new(
+                    "process_containment_failed",
+                    format!(
+                        "TerminateJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(750);
+        loop {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle as _,
+                    JobObjectBasicAccountingInformation,
+                    &mut accounting as *mut _ as *mut _,
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(RpcError::new(
+                    "process_containment_failed",
+                    format!(
+                        "QueryInformationJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+            if accounting.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RpcError::new(
+                    "process_containment_failed",
+                    format!(
+                        "Windows Job Object retained {} active processes after termination",
+                        accounting.ActiveProcesses
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
-    pub(crate) fn force_terminate(&self, child: &mut Child) {
-        self.terminate(child);
+    pub(crate) fn terminate(&self, _child: &mut Child) -> Result<(), RpcError> {
+        self.terminate_job_and_wait()
     }
 
-    pub(crate) fn cleanup_descendants(&self) {
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle as _, 1);
-        }
+    pub(crate) fn force_terminate(&self, child: &mut Child) -> Result<(), RpcError> {
+        self.terminate(child)
+    }
+
+    pub(crate) fn cleanup_descendants(&self) -> Result<(), RpcError> {
+        self.terminate_job_and_wait()
     }
 }
 
@@ -84,7 +134,7 @@ impl PlatformGuard {
         })
     }
 
-    pub(crate) fn terminate(&self, child: &mut Child) {
+    pub(crate) fn terminate(&self, child: &mut Child) -> Result<(), RpcError> {
         #[cfg(unix)]
         unsafe {
             if libc::kill(-self.process_group, libc::SIGTERM) != 0 {
@@ -95,9 +145,10 @@ impl PlatformGuard {
         {
             let _ = child.kill();
         }
+        Ok(())
     }
 
-    pub(crate) fn force_terminate(&self, child: &mut Child) {
+    pub(crate) fn force_terminate(&self, child: &mut Child) -> Result<(), RpcError> {
         #[cfg(unix)]
         unsafe {
             if libc::kill(-self.process_group, libc::SIGKILL) != 0 {
@@ -108,20 +159,22 @@ impl PlatformGuard {
         {
             let _ = child.kill();
         }
+        Ok(())
     }
 
-    pub(crate) fn cleanup_descendants(&self) {
+    pub(crate) fn cleanup_descendants(&self) -> Result<(), RpcError> {
         #[cfg(unix)]
         unsafe {
             libc::kill(-self.process_group, libc::SIGKILL);
         }
+        Ok(())
     }
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 impl Drop for PlatformGuard {
     fn drop(&mut self) {
-        self.cleanup_descendants();
+        let _ = self.cleanup_descendants();
     }
 }
 
@@ -178,23 +231,25 @@ impl PlatformGuard {
         })
     }
 
-    pub(crate) fn terminate(&mut self, child: &mut Child) {
+    pub(crate) fn terminate(&mut self, child: &mut Child) -> Result<(), RpcError> {
         unsafe {
             if libc::kill(-self.process_group, libc::SIGTERM) != 0 {
                 let _ = child.kill();
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn force_terminate(&mut self, child: &mut Child) {
+    pub(crate) fn force_terminate(&mut self, child: &mut Child) -> Result<(), RpcError> {
         unsafe {
             if libc::kill(-self.process_group, libc::SIGKILL) != 0 {
                 let _ = child.kill();
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn cleanup_descendants(&mut self) {
+    pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
         unsafe {
             libc::kill(-self.process_group, libc::SIGKILL);
         }
@@ -202,13 +257,14 @@ impl PlatformGuard {
             let _ = watchdog.kill();
             let _ = watchdog.wait();
         }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for PlatformGuard {
     fn drop(&mut self) {
-        self.cleanup_descendants();
+        let _ = self.cleanup_descendants();
     }
 }
 

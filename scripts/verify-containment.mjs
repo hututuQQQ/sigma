@@ -62,8 +62,8 @@ async function main() {
   } finally {
     await execution.close();
     await Promise.all([
-      rm(workspace, { recursive: true, force: true }),
-      rm(external, { recursive: true, force: true })
+      rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+      rm(external, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
     ]);
   }
 }
