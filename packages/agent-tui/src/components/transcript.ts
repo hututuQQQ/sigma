@@ -13,11 +13,21 @@ interface MessageNode {
   combined: boolean;
 }
 
-const maximumMountedMessages = 400;
-const maximumRenderedMessageCharacters = 12 * 1024;
+const maximumMountedMessages = 120;
+const maximumRenderedMessageCharacters = 6 * 1024;
+
+function boundedMessageText(value: string): string {
+  if (value.length <= maximumRenderedMessageCharacters) return value;
+  const marker = "\n... [middle omitted in terminal view] ...\n";
+  const available = maximumRenderedMessageCharacters - marker.length;
+  const leading = Math.floor(available / 4);
+  return `${value.slice(0, leading)}${marker}${value.slice(-(available - leading))}`;
+}
 
 function renderedMessageText(value: string): string {
-  const content = sanitizeTerminalText(value);
+  // Bound first so sanitizing a very large streaming answer remains proportional
+  // to the content that can actually be mounted in the terminal.
+  const content = sanitizeTerminalText(boundedMessageText(value));
   if (content.length <= maximumRenderedMessageCharacters) return content;
   const marker = "\n… [middle omitted in terminal view] …\n";
   const available = maximumRenderedMessageCharacters - marker.length;

@@ -185,6 +185,11 @@ export class HostExecutionBroker implements ExecutionBroker {
     };
     child.stdout.on("data", (chunk: Buffer) => append(record.stdout, chunk));
     child.stderr.on("data", (chunk: Buffer) => append(record.stderr, chunk));
+    // A short-lived command may close its pipe before execute() finishes
+    // forwarding optional stdin. Writable callbacks still receive failures;
+    // this listener prevents the stream's parallel error event from escaping
+    // the test broker as an uncaught EPIPE.
+    child.stdin.on("error", () => undefined);
     child.on("close", (code, signal) => {
       record.state = record.terminated ? "terminated" : "exited";
       record.exitCode = code;
