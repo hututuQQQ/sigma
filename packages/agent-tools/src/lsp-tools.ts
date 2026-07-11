@@ -174,12 +174,12 @@ function collectWorkspaceEdits(edit: LspWorkspaceEdit): Map<string, LspTextEdit[
 
 async function safeWorkspaceFile(workspace: string, uri: string): Promise<string> {
   const absolute = fileURLToPath(uri);
-  const relative = path.relative(workspace, absolute).replaceAll("\\", "/");
+  const root = await realpath(workspace);
+  const relative = path.relative(root, absolute).replaceAll("\\", "/");
   if (!relative || relative.startsWith("../") || path.isAbsolute(relative)
     || relative === ".git" || relative.startsWith(".git/") || relative === ".agent" || relative.startsWith(".agent/")) {
     throw new Error(`LSP edit escapes or targets a protected workspace path: ${uri}`);
   }
-  const root = await realpath(workspace);
   let current = root;
   for (const component of relative.split("/")) {
     current = path.join(current, component);

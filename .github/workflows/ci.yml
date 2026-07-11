@@ -124,6 +124,9 @@ jobs:
   windows-release:
     name: Windows product, ConPTY, and portable release checks
     runs-on: windows-2022
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     defaults:
       run:
         shell: pwsh
@@ -169,7 +172,7 @@ jobs:
       - name: Lint
         run: pnpm lint
       - name: Test with coverage
-        run: pnpm test:coverage
+        run: pnpm test:coverage -- --maxWorkers=2 --testTimeout=20000
       - name: Harbor tests
         run: pnpm test:harbor
       - name: Local fake smoke

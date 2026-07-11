@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { CheckpointManager, CheckpointRecord } from "agent-checkpoint";
 import type { JsonValue, RunOutcome, RunStore } from "agent-protocol";
@@ -22,9 +23,9 @@ function failedOrInterrupted(child: DurableChild): boolean {
   return !child.completed || child.completed.status !== "completed";
 }
 
-function sameWorkspace(left: string, right: string): boolean {
-  const normalizedLeft = path.resolve(left);
-  const normalizedRight = path.resolve(right);
+async function sameWorkspace(left: string, right: string): Promise<boolean> {
+  const normalizedLeft = await realpath(path.resolve(left));
+  const normalizedRight = await realpath(path.resolve(right));
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
@@ -41,7 +42,7 @@ async function exclusiveWriterSession(
     return payload.mode === "change" && payload.strictWriteScope === true
       && payload.parentSessionId === parent.sessionId
       && typeof payload.workspacePath === "string"
-      && sameWorkspace(payload.workspacePath, parent.workspacePath);
+      && await sameWorkspace(payload.workspacePath, parent.workspacePath);
   }
   return false;
 }
@@ -78,7 +79,7 @@ async function latestUnresolvedMutation(
   const records = [...await checkpoints.list(childSessionId)].reverse();
   for (const stored of records) {
     if (stored.status === "restored" || alreadyImported(session, childSessionId, stored.checkpointId)) continue;
-    if (!sameWorkspace(stored.workspacePath, session.workspacePath)) {
+    if (!await sameWorkspace(stored.workspacePath, session.workspacePath)) {
       throw Object.assign(new Error(
         `Child checkpoint ${stored.checkpointId} is outside its parent workspace.`
       ), { code: "child_checkpoint_workspace_mismatch" });

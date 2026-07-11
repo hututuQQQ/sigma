@@ -6,6 +6,7 @@ import type {
   ProcessHandle,
   ProcessPollResult
 } from "agent-execution";
+import { BrokerCancelledError } from "agent-execution";
 import type { ShellKind } from "./environment.js";
 
 export interface ProcessExecutionPort {
@@ -95,7 +96,26 @@ function executionRequest(request: ProcessRequest): ExecutionRequest {
 export async function runProcess(request: ProcessRequest): Promise<ProcessResult> {
   request.signal.throwIfAborted();
   if (!request.execution) throw new ProcessExecutionUnavailableError();
-  const result = await request.execution.execute(executionRequest(request), { signal: request.signal });
+  const startedAt = performance.now();
+  let result: ExecutionResult;
+  try {
+    result = await request.execution.execute(executionRequest(request), { signal: request.signal });
+  } catch (error) {
+    const cancelled = error instanceof BrokerCancelledError
+      || (error !== null && typeof error === "object"
+        && (error as { code?: unknown }).code === "broker_cancelled");
+    if (!cancelled) throw error;
+    return {
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      cancelled: true,
+      durationMs: Math.max(0, performance.now() - startedAt),
+      stdoutLimitReached: false,
+      outputTruncated: false
+    };
+  }
   const artifactIds = result.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
   if (artifactIds.length > 0) {
     await request.execution.releaseOutputArtifacts?.(artifactIds).catch(() => undefined);

@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import { resolveWorkspacePath } from "agent-platform";
@@ -26,8 +26,9 @@ function stringArg(input: Record<string, JsonValue>, key: string): string {
 }
 
 async function writableTarget(workspacePath: string, requestedPath: string): Promise<string> {
+  const workspace = await realpath(workspacePath);
   const target = await resolveWorkspacePath(workspacePath, requestedPath);
-  const relative = path.relative(workspacePath, target).split(path.sep);
+  const relative = path.relative(workspace, target).split(path.sep);
   const root = relative[0]?.toLowerCase();
   if (root === ".git" || root === ".agent") {
     throw Object.assign(new Error(`Protected workspace metadata is read-only: ${requestedPath}`), {

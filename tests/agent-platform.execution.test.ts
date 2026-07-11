@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ExecutionRequest, ExecutionResult } from "../packages/agent-execution/src/index.js";
+import {
+  BrokerCancelledError,
+  type ExecutionRequest,
+  type ExecutionResult
+} from "../packages/agent-execution/src/index.js";
 import {
   ProcessExecutionUnavailableError,
   runProcess,
@@ -75,5 +79,25 @@ describe("agent-platform execution boundary", () => {
       executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"]
     });
     expect(shellInvocation("bash", "echo ok")).toEqual({ executable: "bash", args: ["-lc", "echo ok"] });
+  });
+
+  it("normalizes broker cancellation into the process result contract", async () => {
+    const execution: ProcessExecutionPort = {
+      execute: async () => { throw new BrokerCancelledError(); }
+    };
+    await expect(runProcess({
+      execution,
+      executable: "tool",
+      args: [],
+      cwd: process.cwd(),
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })).resolves.toMatchObject({
+      exitCode: null,
+      cancelled: true,
+      timedOut: false,
+      stdout: "",
+      stderr: ""
+    });
   });
 });

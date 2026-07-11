@@ -57,7 +57,7 @@ export class BrokerOutputArtifactImporter {
       throw new BrokerProtocolError("Broker artifactRoot must be an absolute path.");
     }
     const resolved = path.resolve(value);
-    if (!pathWithin(resolved, os.tmpdir()) || !path.basename(resolved).startsWith("sigma-exec-artifacts-")) {
+    if (!path.basename(resolved).startsWith("sigma-exec-artifacts-")) {
       throw new BrokerProtocolError("Broker artifactRoot is outside the dedicated temporary root.");
     }
     const info = await lstat(resolved).catch(() => undefined);
@@ -65,7 +65,8 @@ export class BrokerOutputArtifactImporter {
       throw new BrokerProtocolError("Broker artifactRoot must be an existing non-symlink directory.");
     }
     const canonical = await realpath(resolved);
-    if (!pathWithin(canonical, os.tmpdir())) {
+    const temporaryRoot = await realpath(os.tmpdir());
+    if (!pathWithin(canonical, temporaryRoot)) {
       throw new BrokerProtocolError("Broker artifactRoot resolves outside the system temporary directory.");
     }
     this.artifactRoot = canonical;
