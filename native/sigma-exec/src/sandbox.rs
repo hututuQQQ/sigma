@@ -608,24 +608,6 @@ fn configure_common(command: &mut Command, params: &ProcessParams) {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            let broker_pid = unsafe { libc::getpid() };
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != broker_pid {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "sigma-exec exited while launching a child process",
-                        ));
-                    }
-                    Ok(())
-                });
-            }
-        }
     }
     #[cfg(windows)]
     {
