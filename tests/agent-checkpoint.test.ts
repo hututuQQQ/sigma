@@ -2,6 +2,7 @@ import {
   chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, truncate, writeFile
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -307,6 +308,87 @@ describe("CheckpointManager", () => {
 
     await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
     await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("finalizes a schema v2 verified restore journal before the next checkpoint operation", async () => {
+    const { workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-verified-finalize", runId: "run-verified-finalize",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 1
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
+    const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    await writeFile(path.join(workspace, "existing.txt"), "before", "utf8");
+    const restored = { ...sealed, status: "restored" as const, restoredAt: new Date().toISOString() };
+    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-verified");
+    await mkdir(transaction, { recursive: true });
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 2,
+      phase: "verified",
+      finalization: { record: restored, desiredManifestDigest: sealed.preManifestDigest },
+      operations: []
+    }), "utf8");
+
+    await manager.create({
+      sessionId: checkpoint.sessionId, runId: "run-after-recovery",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 2
+    });
+    await expect(manager.list(checkpoint.sessionId)).resolves.toContainEqual(expect.objectContaining({
+      checkpointId: checkpoint.checkpointId,
+      status: "restored"
+    }));
+    await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("recovers finalization after a subprocess is killed at the verified boundary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checkpoint-hard-crash-"));
+    const stateRoot = path.join(root, "state");
+    const workspace = path.join(root, "workspace");
+    const marker = path.join(root, "verified.marker");
+    const fixturePath = path.resolve("tests", "fixtures", "checkpoint-verified-crash.mjs");
+    const child = spawn(process.execPath, [fixturePath, stateRoot, workspace, marker], {
+      cwd: path.resolve("."),
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    await expect(readFile(marker, "utf8")).resolves.toBe("verified");
+    expect(result.code === 0).toBe(false);
+    expect(stderr).not.toContain("Error:");
+
+    const manager = new CheckpointManager({ rootDir: stateRoot });
+    await manager.create({
+      sessionId: "session-verified-crash",
+      runId: "run-after-hard-crash",
+      workspacePath: workspace,
+      scopePaths: ["target.txt"],
+      baseSeq: 2
+    });
+    const records = await manager.list("session-verified-crash");
+    expect(records[0]).toMatchObject({ status: "restored" });
+    await expect(readFile(path.join(workspace, "target.txt"), "utf8")).resolves.toBe("before");
+    await expect(readdir(path.join(workspace, ".agent", "checkpoint-transactions"))).resolves.toEqual([]);
+  });
+
+  it("preserves a legacy verified journal that lacks finalization data", async () => {
+    const { workspace, manager } = await fixture();
+    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-legacy-verified");
+    await mkdir(transaction, { recursive: true });
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 1,
+      phase: "verified",
+      operations: []
+    }), "utf8");
+
+    await expect(manager.create({
+      sessionId: "session-legacy-verified", runId: "run-legacy-verified",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
+    })).rejects.toMatchObject({ code: "checkpoint_recovery_failed", transactionPath: transaction });
+    await expect(lstat(transaction)).resolves.toBeDefined();
   });
 
   it("surfaces a typed recovery error and never marks restored when rollback itself fails", async () => {

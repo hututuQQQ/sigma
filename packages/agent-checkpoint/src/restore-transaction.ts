@@ -1,12 +1,13 @@
-import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, rename, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { durableReplaceFile, syncDirectory } from "agent-platform";
 import { pinCheckpointParent } from "./path-safety.js";
 import {
   CheckpointConflictError,
   CheckpointRecoveryError,
   type CheckpointEntry,
   type CheckpointManifest,
+  type CheckpointRecord,
   type CheckpointRestoreFaultEvent
 } from "./types.js";
 import { stageRestoreEntry, validateRestoreCas, type RestoreCasReader } from "./restore-cas.js";
@@ -30,8 +31,14 @@ export interface RestoreTransactionOptions {
   current: CheckpointManifest;
   readCas: RestoreCasReader;
   capture(ignoredRootName?: string): Promise<CheckpointManifest>;
-  finalize?: () => Promise<void>;
+  finalization: RestoreFinalization;
+  finalize: () => Promise<void>;
   faultInjector?: (event: CheckpointRestoreFaultEvent) => void | Promise<void>;
+}
+
+export interface RestoreFinalization {
+  record: CheckpointRecord;
+  desiredManifestDigest: string;
 }
 
 function compareText(left: string, right: string): number {
@@ -179,10 +186,15 @@ async function pathExists(target: string): Promise<boolean> {
   });
 }
 
-function journalValue(phase: string, operations: RestoreOperation[]): string {
+function journalValue(
+  phase: string,
+  operations: RestoreOperation[],
+  finalization: RestoreFinalization
+): string {
   return JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     phase,
+    finalization,
     operations: operations.map((operation) => ({
       path: operation.path,
       index: operation.index,
@@ -196,31 +208,14 @@ function journalValue(phase: string, operations: RestoreOperation[]): string {
   }, null, 2);
 }
 
-async function writeJournal(transactionPath: string, phase: string, operations: RestoreOperation[]): Promise<void> {
+async function writeJournal(
+  transactionPath: string,
+  phase: string,
+  operations: RestoreOperation[],
+  finalization: RestoreFinalization
+): Promise<void> {
   const target = path.join(transactionPath, "journal.json");
-  const temporary = `${target}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.writeFile(journalValue(phase, operations), "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, target);
-  await syncDirectory(transactionPath);
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, "r").catch((error: NodeJS.ErrnoException) => {
-    if (["EINVAL", "ENOTSUP", "EPERM", "EISDIR"].includes(error.code ?? "")) return null;
-    throw error;
-  });
-  if (!handle) return;
-  try {
-    await handle.sync().catch((error: NodeJS.ErrnoException) => {
-      if (!["EINVAL", "ENOTSUP", "EPERM"].includes(error.code ?? "")) throw error;
-    });
-  } finally { await handle.close(); }
+  await durableReplaceFile(target, journalValue(phase, operations, finalization), { mode: 0o600 });
 }
 
 async function ensureInternalDirectory(workspacePath: string, relative: string): Promise<void> {
@@ -264,24 +259,24 @@ async function commitOperation(
     }
     if (operation.current) {
       operation.backupIntent = true;
-      await writeJournal(transactionPath, "applying", operations);
+      await writeJournal(transactionPath, "applying", operations, options.finalization);
       await fault(options, { point: "before_backup_move", path: operation.path, operationIndex: operation.index });
       await rename(pinned.targetPath, operation.backupPath);
       operation.backupMoved = true;
       await syncDirectory(pinned.parentPath);
       await syncDirectory(path.dirname(operation.backupPath));
-      await writeJournal(transactionPath, "applying", operations);
+      await writeJournal(transactionPath, "applying", operations, options.finalization);
       await fault(options, { point: "after_backup", path: operation.path, operationIndex: operation.index });
     }
     if (operation.stagePath) {
       operation.installIntent = true;
-      await writeJournal(transactionPath, "applying", operations);
+      await writeJournal(transactionPath, "applying", operations, options.finalization);
       await fault(options, { point: "before_install_move", path: operation.path, operationIndex: operation.index });
       await rename(operation.stagePath, pinned.targetPath);
       operation.installed = true;
       await syncDirectory(pinned.parentPath);
       await syncDirectory(path.dirname(operation.stagePath));
-      await writeJournal(transactionPath, "applying", operations);
+      await writeJournal(transactionPath, "applying", operations, options.finalization);
       await fault(options, { point: "after_install", path: operation.path, operationIndex: operation.index });
     }
     await pinned.verify();
@@ -311,7 +306,7 @@ async function rollback(
   transactionPath: string
 ): Promise<void> {
   await fault(options, { point: "before_rollback" });
-  await writeJournal(transactionPath, "rolling_back", operations);
+  await writeJournal(transactionPath, "rolling_back", operations, options.finalization);
   for (const operation of [...operations].reverse()) {
     if (!operation.backupMoved && !operation.installed) continue;
     const pinned = await pinCheckpointParent(options.workspacePath, operation.path);
@@ -326,7 +321,7 @@ async function rollback(
       operation.backupMoved = false;
       operation.installIntent = false;
       operation.backupIntent = false;
-      await writeJournal(transactionPath, "rolling_back", operations);
+      await writeJournal(transactionPath, "rolling_back", operations, options.finalization);
       await pinned.verify();
     } finally {
       await pinned.close();
@@ -352,7 +347,7 @@ export async function restoreCheckpointTransaction(options: RestoreTransactionOp
   let finalized = false;
   try {
     operations = await createOperations(options, transactionPath);
-    await writeJournal(transactionPath, "staged", operations);
+    await writeJournal(transactionPath, "staged", operations, options.finalization);
     await fault(options, { point: "before_commit" });
     if (!manifestEqual(await options.capture(), options.current)) {
       throw new CheckpointConflictError("Workspace changed while checkpoint restore was staged.");
@@ -362,11 +357,11 @@ export async function restoreCheckpointTransaction(options: RestoreTransactionOp
     if (!manifestEqual(await options.capture(), options.desired)) {
       throw new CheckpointConflictError("Workspace does not match the complete restored checkpoint image.");
     }
-    await writeJournal(transactionPath, "verified", operations);
+    await writeJournal(transactionPath, "verified", operations, options.finalization);
     await fault(options, { point: "before_record" });
-    await options.finalize?.();
+    await options.finalize();
     finalized = true;
-    await writeJournal(transactionPath, "finalized", operations);
+    await writeJournal(transactionPath, "finalized", operations, options.finalization);
     await rm(transactionPath, { recursive: true, force: true });
   } catch (error) {
     if (finalized) {
