@@ -496,9 +496,9 @@ pub(crate) fn self_test(bwrap: &Path) -> Result<HardeningReport, String> {
             &helper,
             &allowed,
             &denied,
-            &parent_mount,
-            &parent_pid,
-            &parent_network,
+            parent_mount.as_os_str(),
+            parent_pid.as_os_str(),
+            parent_network.as_os_str(),
         ))
         .stdin(Stdio::null())
         .output()
