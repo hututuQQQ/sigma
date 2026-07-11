@@ -124,14 +124,15 @@ jobs:
   windows-release:
     name: Windows product, ConPTY, and portable release checks
     runs-on: windows-2022
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+      - name: Configure canonical runner temp directory
+        run: |
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
