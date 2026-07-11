@@ -229,6 +229,10 @@ fn run_mcp_readonly_probe<R: BufRead, W: Write>(
 
 fn main() {
     #[cfg(target_os = "linux")]
+    if let Some(code) = platform::try_run_internal_mode() {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "linux")]
     if let Some(code) = linux_hardening::try_run_internal_mode() {
         std::process::exit(code);
     }
