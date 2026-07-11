@@ -31,6 +31,8 @@ interface PendingRequest {
   progressToken: string;
   cancellable: boolean;
   idleTimeoutMs: number;
+  hardDeadlineAt: number;
+  hardDeadlineMs: number;
   resolve(value: unknown): void;
   reject(error: Error): void;
   onProgress?: McpRequestOptions["onProgress"];
@@ -174,6 +176,8 @@ export class McpStdioClient {
         progressToken,
         cancellable: settings.cancellable !== false && method !== "initialize",
         idleTimeoutMs,
+        hardDeadlineAt: performance.now() + hardDeadlineMs,
+        hardDeadlineMs,
         resolve,
         reject,
         onProgress: settings.onProgress,
@@ -197,10 +201,15 @@ export class McpStdioClient {
 
   private armIdle(pending: PendingRequest): void {
     clearTimeout(pending.idleTimer);
-    pending.idleTimer = setTimeout(() => this.cancelPending(pending, new McpTimeoutError(
-      "idle",
-      `MCP '${pending.method}' was idle for ${pending.idleTimeoutMs}ms.`
-    )), pending.idleTimeoutMs);
+    pending.idleTimer = setTimeout(() => {
+      const deadlineElapsed = performance.now() >= pending.hardDeadlineAt;
+      this.cancelPending(pending, new McpTimeoutError(
+        deadlineElapsed ? "deadline" : "idle",
+        deadlineElapsed
+          ? `MCP '${pending.method}' exceeded its ${pending.hardDeadlineMs}ms hard deadline.`
+          : `MCP '${pending.method}' was idle for ${pending.idleTimeoutMs}ms.`
+      ));
+    }, pending.idleTimeoutMs);
     pending.idleTimer.unref();
   }
 
