@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  applyUnifiedPatch, AtomicPatchError, AtomicPatchRollbackError
+  applyUnifiedPatch, AtomicPatchError, AtomicPatchRecoveryError, AtomicPatchRollbackError
 } from "../packages/agent-tools/src/atomic-patch.js";
 
 async function workspace(): Promise<string> {
@@ -156,6 +157,103 @@ describe("applyUnifiedPatch", () => {
     expect(rollbackError.rollbackErrors.length).toBeGreaterThan(0);
     await expect(lstat(rollbackError.recoveryPath)).resolves.toBeDefined();
     await rm(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["backup_source_moved", "restore_source"],
+    ["install_target_moved", "remove_installed"]
+  ] as const)("recovers a durable %s intent before the next patch", async (commitPhase, rollbackPhase) => {
+    const root = await workspace();
+    await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
+    const patch = [
+      "--- a/target.txt", "+++ b/target.txt", "@@ -1 +1 @@", "-before", "+after"
+    ].join("\n");
+    const failure = await applyUnifiedPatch(root, patch, {
+      beforeMutation: async (operation) => {
+        if (operation.direction === "commit" && operation.phase === commitPhase) {
+          throw new Error(`crash after ${commitPhase}`);
+        }
+        if (operation.direction === "rollback" && operation.phase === rollbackPhase) {
+          throw new Error("simulated process loss before rollback");
+        }
+      }
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AtomicPatchRollbackError);
+
+    await applyUnifiedPatch(root, patch);
+    await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("after\n");
+    await expect(readdir(path.join(root, ".agent", "patch-transactions"))).resolves.toEqual([]);
+  });
+
+  it("recovers a created-parent intent before applying the next patch", async () => {
+    const root = await workspace();
+    const patch = [
+      "diff --git a/nested/new.txt b/nested/new.txt", "new file mode 100644",
+      "--- /dev/null", "+++ b/nested/new.txt", "@@ -0,0 +1 @@", "+created"
+    ].join("\n");
+    const failure = await applyUnifiedPatch(root, patch, {
+      beforeMutation: async (operation) => {
+        if (operation.direction === "commit" && operation.phase === "create_parent_created") {
+          throw new Error("crash after mkdir");
+        }
+        if (operation.direction === "rollback" && operation.phase === "remove_created_parent") {
+          throw new Error("simulated process loss before parent rollback");
+        }
+      }
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AtomicPatchRollbackError);
+
+    await applyUnifiedPatch(root, patch);
+    await expect(readFile(path.join(root, "nested", "new.txt"), "utf8")).resolves.toBe("created\n");
+  });
+
+  it("fails closed and preserves corrupt or ambiguous recovery state", async () => {
+    const root = await workspace();
+    const transaction = path.join(root, ".agent", "patch-transactions", "patch-corrupt");
+    await mkdir(transaction, { recursive: true });
+    await writeFile(path.join(transaction, "journal.json"), "{not-json", "utf8");
+    const patch = [
+      "diff --git a/new.txt b/new.txt", "new file mode 100644",
+      "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+new"
+    ].join("\n");
+    await expect(applyUnifiedPatch(root, patch)).rejects.toBeInstanceOf(AtomicPatchRecoveryError);
+    await expect(lstat(transaction)).resolves.toBeDefined();
+    await expect(lstat(path.join(root, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    "create_parent_created",
+    "backup_source_moved",
+    "install_target_moved"
+  ] as const)("recovers after a subprocess is killed at %s", async (phase) => {
+    const root = await workspace();
+    const marker = path.join(root, `${phase}.marker`);
+    const nested = phase === "create_parent_created";
+    if (!nested) await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
+    const patch = nested ? [
+      "diff --git a/nested/new.txt b/nested/new.txt", "new file mode 100644",
+      "--- /dev/null", "+++ b/nested/new.txt", "@@ -0,0 +1 @@", "+created"
+    ].join("\n") : [
+      "--- a/target.txt", "+++ b/target.txt", "@@ -1 +1 @@", "-before", "+after"
+    ].join("\n");
+    const fixturePath = path.resolve("tests", "fixtures", "atomic-patch-crash.mjs");
+    const child = spawn(process.execPath, [
+      fixturePath, root, marker, phase, Buffer.from(patch, "utf8").toString("base64url")
+    ], { cwd: path.resolve("."), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+    await expect(readFile(marker, "utf8")).resolves.toBe(phase);
+    expect(code === 0).toBe(false);
+    expect(stderr).not.toContain("Error:");
+
+    await applyUnifiedPatch(root, patch);
+    if (nested) {
+      await expect(readFile(path.join(root, "nested", "new.txt"), "utf8")).resolves.toBe("created\n");
+    } else {
+      await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("after\n");
+    }
+    await expect(readdir(path.join(root, ".agent", "patch-transactions"))).resolves.toEqual([]);
   });
 
   it("creates, deletes and renames files in one transaction", async () => {

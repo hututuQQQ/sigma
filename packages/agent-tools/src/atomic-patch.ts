@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { WorkspaceDelta } from "agent-protocol";
 import { readPatchFile, samePatchFile } from "./atomic-patch-file-state.js";
+import { recoverAtomicPatchTransactions } from "./atomic-patch-journal.js";
 import { AtomicPatchError, parseUnifiedPatch, type FilePatch, type HunkLine, type PatchHunk } from "./atomic-patch-parser.js";
 import { commitPreparedPatch, type AtomicPatchCleanupWarning } from "./atomic-patch-transaction.js";
 import { pinPatchParent } from "./atomic-patch-path-safety.js";
@@ -12,8 +13,8 @@ import type {
 
 export { AtomicPatchError, parseUnifiedPatch } from "./atomic-patch-parser.js";
 export { AtomicPatchCleanupError, AtomicPatchRollbackError } from "./atomic-patch-transaction.js";
+export { AtomicPatchRecoveryError, recoverAtomicPatchTransactions } from "./atomic-patch-journal.js";
 export type { AtomicPatchMutation } from "./atomic-patch-types.js";
-
 export interface AtomicPatchOptions {
   preimageHashes?: Record<string, string>;
   /** Test/integration synchronization point; callers cannot supply this through the model tool schema. */
@@ -377,6 +378,7 @@ export async function applyUnifiedPatch(
   options: AtomicPatchOptions = {}
 ): Promise<AtomicPatchResult> {
   const workspace = await realpath(path.resolve(workspacePath));
+  await recoverAtomicPatchTransactions(workspace);
   const patches = parseUnifiedPatch(source);
   const changes = await Promise.all(patches.map(async (patch) =>
     await prepare(workspace, patch, options.preimageHashes ?? {})));

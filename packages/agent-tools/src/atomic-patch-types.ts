@@ -21,10 +21,13 @@ export interface PreparedPatchChange {
 
 export type AtomicPatchMutationPhase =
   | "create_parent"
+  | "create_parent_created"
   | "backup_source"
   | "backup_source_pinned"
+  | "backup_source_moved"
   | "install_target"
   | "install_target_pinned"
+  | "install_target_moved"
   | "remove_installed"
   | "restore_source"
   | "remove_created_parent";

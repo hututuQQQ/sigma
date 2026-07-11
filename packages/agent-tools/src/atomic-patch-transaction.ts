@@ -1,21 +1,19 @@
-import { chmod, lstat, mkdir, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, rename, rm, symlink } from "node:fs/promises";
 import path from "node:path";
+import { durableReplaceFile, syncDirectory } from "agent-platform";
 import { readPatchPath } from "./atomic-patch-file-state.js";
+import {
+  createPatchJournal,
+  recoverAtomicPatchTransaction,
+  writePatchJournal,
+  type AtomicPatchJournal,
+  type AtomicPatchJournalOperation
+} from "./atomic-patch-journal.js";
 import { AtomicPatchError } from "./atomic-patch-parser.js";
 import { pinPatchParent } from "./atomic-patch-path-safety.js";
 import type {
   AtomicPatchMutation, AtomicPatchTransactionHooks, AtomicPatchTransactionValidators, PreparedPatchChange
 } from "./atomic-patch-types.js";
-
-interface InstalledTarget { absolutePath: string; relativePath: string; changeIndex: number }
-interface MovedSource { target: string; backup: string; relativePath: string; changeIndex: number }
-interface CreatedParent { absolutePath: string; relativePath: string; changeIndex: number }
-
-interface TransactionState {
-  installed: InstalledTarget[];
-  moved: MovedSource[];
-  createdParents: CreatedParent[];
-}
 
 export interface AtomicPatchCleanupWarning {
   transactionPath: string;
@@ -81,17 +79,24 @@ async function runHook(
   await hook?.(operation);
 }
 
+async function syncFile(target: string): Promise<void> {
+  const handle = await open(target, "r+");
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
 async function stageChanges(staged: string, changes: readonly PreparedPatchChange[]): Promise<void> {
   for (const [index, change] of changes.entries()) {
     if (!change.target) continue;
     const candidate = path.join(staged, String(index));
     if (change.kind === "symlink") {
       await symlink(change.content!, candidate);
+      await syncDirectory(staged);
       continue;
     }
     const permissions = change.mode! & 0o7777;
-    await writeFile(candidate, change.content!, { encoding: "utf8", mode: permissions });
+    await durableReplaceFile(candidate, change.content!, { mode: permissions });
     await chmod(candidate, permissions);
+    await syncFile(candidate);
   }
 }
 
@@ -107,11 +112,22 @@ async function existingDirectory(absolute: string, relative: string): Promise<bo
   return true;
 }
 
+function journalOperation(journal: AtomicPatchJournal, changeIndex: number): AtomicPatchJournalOperation {
+  const operation = journal.operations.find((item) => item.changeIndex === changeIndex);
+  if (!operation) throw new AtomicPatchError(`Patch journal is missing change ${changeIndex}.`);
+  return operation;
+}
+
+async function persistApplying(options: AtomicPatchTransactionOptions, journal: AtomicPatchJournal): Promise<void> {
+  journal.phase = "applying";
+  await writePatchJournal(options.transaction, journal);
+}
+
 async function ensureTargetParents(
   options: AtomicPatchTransactionOptions,
   relative: string,
   changeIndex: number,
-  created: CreatedParent[]
+  journal: AtomicPatchJournal
 ): Promise<void> {
   const parts = relative.split("/").slice(0, -1);
   let current = options.workspace;
@@ -119,21 +135,39 @@ async function ensureTargetParents(
     current = path.join(current, part);
     if (await existingDirectory(current, relative)) continue;
     const relativeParent = relativeFrom(options.workspace, current);
+    const parent = { relativePath: relativeParent, changeIndex, createIntent: true, created: false };
+    journal.parents.push(parent);
+    await persistApplying(options, journal);
     await runHook(options.beforeMutation, {
       direction: "commit", phase: "create_parent", changeIndex, relativePath: relativeParent
     });
+    const pinned = await pinPatchParent(options.workspace, relativeParent);
     try {
-      const pinned = await pinPatchParent(options.workspace, relativeParent);
+      await pinned.verify();
       try {
-        await pinned.verify();
         await mkdir(pinned.targetPath, { mode: 0o700 });
-        await pinned.verify();
-      } finally {
-        await pinned.close();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST"
+          && await existingDirectory(current, relative)) {
+          journal.parents.splice(journal.parents.indexOf(parent), 1);
+          await persistApplying(options, journal);
+          continue;
+        }
+        if (await existingDirectory(current, relative).catch(() => false)) {
+          parent.created = true;
+          await persistApplying(options, journal).catch(() => undefined);
+        }
+        throw error;
       }
-      created.push({ absolutePath: current, relativePath: relativeParent, changeIndex });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !(await existingDirectory(current, relative))) throw error;
+      await syncDirectory(path.dirname(pinned.targetPath));
+      await runHook(options.beforeMutation, {
+        direction: "commit", phase: "create_parent_created", changeIndex, relativePath: relativeParent
+      });
+      parent.created = true;
+      await persistApplying(options, journal);
+      await pinned.verify();
+    } finally {
+      await pinned.close();
     }
   }
 }
@@ -143,107 +177,33 @@ async function moveSource(
   backup: string,
   change: PreparedPatchChange,
   changeIndex: number,
-  moved: MovedSource[]
+  journal: AtomicPatchJournal
 ): Promise<void> {
   await runHook(options.beforeMutation, {
     direction: "commit", phase: "backup_source", changeIndex, relativePath: change.source!
   });
   await options.validators.assertSourceUnchanged(change);
-  const target = path.join(options.workspace, ...change.source!.split("/"));
   const saved = path.join(backup, String(changeIndex));
+  const operation = journalOperation(journal, changeIndex);
   const pinned = await pinPatchParent(options.workspace, change.source!);
   try {
     await pinned.verify();
+    operation.backupIntent = true;
+    await persistApplying(options, journal);
     await runHook(options.beforeMutation, {
       direction: "commit", phase: "backup_source_pinned", changeIndex, relativePath: change.source!
     });
     await rename(pinned.targetPath, saved);
-    await pinned.verify();
-  } finally {
-    await pinned.close();
-  }
-  moved.push({ target, backup: saved, relativePath: change.source!, changeIndex });
-}
-
-async function installTarget(
-  options: AtomicPatchTransactionOptions,
-  staged: string,
-  change: PreparedPatchChange,
-  changeIndex: number,
-  state: TransactionState
-): Promise<void> {
-  await ensureTargetParents(options, change.target!, changeIndex, state.createdParents);
-  await runHook(options.beforeMutation, {
-    direction: "commit", phase: "install_target", changeIndex, relativePath: change.target!
-  });
-  await options.validators.assertTargetAbsent(change);
-  const target = path.join(options.workspace, ...change.target!.split("/"));
-  const pinned = await pinPatchParent(options.workspace, change.target!);
-  try {
-    await pinned.verify();
-    await assertInstalledTarget(change, path.join(staged, String(changeIndex)), change.target!);
+    await syncDirectory(path.dirname(pinned.targetPath));
+    await syncDirectory(path.dirname(saved));
     await runHook(options.beforeMutation, {
-      direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
+      direction: "commit", phase: "backup_source_moved", changeIndex, relativePath: change.source!
     });
-    if (change.kind === "symlink") await symlink(change.content!, pinned.targetPath);
-    else {
-      const permissions = change.mode! & 0o7777;
-      await writeFile(pinned.targetPath, change.content!, { encoding: "utf8", mode: permissions, flag: "wx" });
-      await chmod(pinned.targetPath, permissions);
-    }
+    operation.backupMoved = true;
+    await persistApplying(options, journal);
     await pinned.verify();
   } finally {
     await pinned.close();
-  }
-  state.installed.push({ absolutePath: target, relativePath: change.target!, changeIndex });
-}
-
-async function installChanges(
-  options: AtomicPatchTransactionOptions,
-  staged: string,
-  backup: string,
-  state: TransactionState
-): Promise<void> {
-  for (const [index, change] of options.changes.entries()) {
-    if (change.source) await moveSource(options, backup, change, index, state.moved);
-    if (change.target) await installTarget(options, staged, change, index, state);
-  }
-}
-
-async function captureRollback(
-  errors: Error[],
-  label: string,
-  action: () => Promise<void>
-): Promise<void> {
-  try {
-    await action();
-  } catch (error) {
-    errors.push(errorFrom(error, label));
-  }
-}
-
-async function rollbackInstalled(
-  options: AtomicPatchTransactionOptions,
-  state: TransactionState,
-  errors: Error[]
-): Promise<void> {
-  for (let index = state.installed.length - 1; index >= 0; index -= 1) {
-    const item = state.installed[index]!;
-    await captureRollback(errors, `Could not remove installed target '${item.relativePath}'`, async () => {
-      await runHook(options.beforeMutation, {
-        direction: "rollback", phase: "remove_installed",
-        changeIndex: item.changeIndex, relativePath: item.relativePath
-      });
-      const pinned = await pinPatchParent(options.workspace, item.relativePath);
-      try {
-        await pinned.verify();
-        await assertInstalledTarget(options.changes[item.changeIndex]!, pinned.targetPath, item.relativePath);
-        await rm(pinned.targetPath, { force: true, recursive: false });
-        await pinned.verify();
-      } finally {
-        await pinned.close();
-      }
-    });
   }
 }
 
@@ -255,80 +215,61 @@ async function assertInstalledTarget(
   const current = await readPatchPath(absolute, relative);
   if (!current.exists || current.kind !== change.kind
     || !current.bytes.equals(Buffer.from(change.content!, "utf8"))) {
-    throw new AtomicPatchError(`Installed path changed before rollback: ${relative}`);
+    throw new AtomicPatchError(`Installed path changed before commit: ${relative}`);
   }
   if (process.platform !== "win32" && change.kind === "file"
     && (current.mode & 0o7777) !== (change.mode! & 0o7777)) {
-    throw new AtomicPatchError(`Installed file mode changed before rollback: ${relative}`);
+    throw new AtomicPatchError(`Installed file mode changed before commit: ${relative}`);
   }
 }
 
-async function rollbackMoved(
+async function installTarget(
   options: AtomicPatchTransactionOptions,
-  state: TransactionState,
-  errors: Error[]
+  staged: string,
+  change: PreparedPatchChange,
+  changeIndex: number,
+  journal: AtomicPatchJournal
 ): Promise<void> {
-  for (let index = state.moved.length - 1; index >= 0; index -= 1) {
-    const item = state.moved[index]!;
-    await captureRollback(errors, `Could not restore source '${item.relativePath}'`, async () => {
-      await runHook(options.beforeMutation, {
-        direction: "rollback", phase: "restore_source",
-        changeIndex: item.changeIndex, relativePath: item.relativePath
-      });
-      const pinned = await pinPatchParent(options.workspace, item.relativePath);
-      try {
-        await pinned.verify();
-        const existing = await lstat(pinned.targetPath).catch((error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return null;
-          throw error;
-        });
-        if (existing) throw new AtomicPatchError(`Restore destination is occupied: ${item.relativePath}`);
-        await rename(item.backup, pinned.targetPath);
-        await pinned.verify();
-      } finally {
-        await pinned.close();
-      }
+  await ensureTargetParents(options, change.target!, changeIndex, journal);
+  await runHook(options.beforeMutation, {
+    direction: "commit", phase: "install_target", changeIndex, relativePath: change.target!
+  });
+  await options.validators.assertTargetAbsent(change);
+  const candidate = path.join(staged, String(changeIndex));
+  await assertInstalledTarget(change, candidate, change.target!);
+  const operation = journalOperation(journal, changeIndex);
+  const pinned = await pinPatchParent(options.workspace, change.target!);
+  try {
+    await pinned.verify();
+    operation.installIntent = true;
+    await persistApplying(options, journal);
+    await runHook(options.beforeMutation, {
+      direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
     });
+    await rename(candidate, pinned.targetPath);
+    await syncDirectory(path.dirname(candidate));
+    await syncDirectory(path.dirname(pinned.targetPath));
+    await runHook(options.beforeMutation, {
+      direction: "commit", phase: "install_target_moved", changeIndex, relativePath: change.target!
+    });
+    operation.installed = true;
+    await persistApplying(options, journal);
+    await pinned.verify();
+  } finally {
+    await pinned.close();
   }
 }
 
-async function rollbackCreatedParents(
+async function installChanges(
   options: AtomicPatchTransactionOptions,
-  state: TransactionState,
-  errors: Error[]
+  staged: string,
+  backup: string,
+  journal: AtomicPatchJournal
 ): Promise<void> {
-  for (let index = state.createdParents.length - 1; index >= 0; index -= 1) {
-    const item = state.createdParents[index]!;
-    await captureRollback(errors, `Could not remove created parent '${item.relativePath}'`, async () => {
-      await runHook(options.beforeMutation, {
-        direction: "rollback", phase: "remove_created_parent",
-        changeIndex: item.changeIndex, relativePath: item.relativePath
-      });
-      const pinned = await pinPatchParent(options.workspace, item.relativePath);
-      try {
-        await pinned.verify();
-        if (!(await existingDirectory(pinned.targetPath, item.relativePath))) {
-          throw new AtomicPatchError(`Created parent disappeared before rollback: ${item.relativePath}`);
-        }
-        await rmdir(pinned.targetPath);
-        await pinned.verify();
-      } finally {
-        await pinned.close();
-      }
-    });
+  for (const [index, change] of options.changes.entries()) {
+    if (change.source) await moveSource(options, backup, change, index, journal);
+    if (change.target) await installTarget(options, staged, change, index, journal);
   }
-}
-
-async function rollbackChanges(
-  options: AtomicPatchTransactionOptions,
-  state: TransactionState
-): Promise<Error[]> {
-  const errors: Error[] = [];
-  await rollbackInstalled(options, state, errors);
-  await rollbackMoved(options, state, errors);
-  await rollbackCreatedParents(options, state, errors);
-  await captureRollback(errors, "Workspace restoration verification failed", options.validators.assertRestored);
-  return errors;
 }
 
 async function cleanup(transaction: string): Promise<Error | undefined> {
@@ -343,19 +284,19 @@ async function cleanup(transaction: string): Promise<Error | undefined> {
 async function initializeTransaction(
   options: AtomicPatchTransactionOptions,
   staged: string,
-  backup: string
+  backup: string,
+  journal: AtomicPatchJournal
 ): Promise<void> {
   await mkdir(staged, { mode: 0o700 });
   await mkdir(backup, { mode: 0o700 });
   await stageChanges(staged, options.changes);
   await options.beforeCommit?.();
   await options.validators.assertAllUnchanged();
+  journal.phase = "prepared";
+  await writePatchJournal(options.transaction, journal);
 }
 
-async function throwAfterCleanup(
-  primary: unknown,
-  transaction: string
-): Promise<never> {
+async function throwAfterCleanup(primary: unknown, transaction: string): Promise<never> {
   const cleanupError = await cleanup(transaction);
   if (cleanupError) throw new AtomicPatchCleanupError(primary, cleanupError, transaction);
   throw patchError(primary);
@@ -372,6 +313,7 @@ export async function commitPreparedPatch(
     try {
       await pinned.verify();
       await mkdir(pinned.targetPath, { mode: 0o700 });
+      await syncDirectory(path.dirname(pinned.targetPath));
       await pinned.verify();
     } finally {
       await pinned.close();
@@ -379,21 +321,31 @@ export async function commitPreparedPatch(
   } catch (error) {
     throw patchError(error);
   }
+  const journal = createPatchJournal(options.changes);
   try {
-    await initializeTransaction(options, staged, backup);
+    await writePatchJournal(options.transaction, journal);
   } catch (error) {
     return await throwAfterCleanup(error, options.transaction);
   }
-  const state: TransactionState = { installed: [], moved: [], createdParents: [] };
   try {
-    await installChanges(options, staged, backup, state);
+    await initializeTransaction(options, staged, backup, journal);
+    await installChanges(options, staged, backup, journal);
     for (const change of options.changes) {
       if (change.target) await options.validators.assertInstalled(change);
     }
+    journal.phase = "committed";
+    await writePatchJournal(options.transaction, journal);
   } catch (error) {
-    const rollbackErrors = await rollbackChanges(options, state);
-    if (rollbackErrors.length > 0) throw new AtomicPatchRollbackError(error, rollbackErrors, options.transaction);
-    return await throwAfterCleanup(error, options.transaction);
+    try {
+      await recoverAtomicPatchTransaction(options.workspace, options.transaction, options.beforeMutation);
+    } catch (rollbackError) {
+      throw new AtomicPatchRollbackError(
+        error,
+        [errorFrom(rollbackError, "Durable patch recovery failed")],
+        options.transaction
+      );
+    }
+    throw patchError(error);
   }
   const cleanupError = await cleanup(options.transaction);
   return cleanupError ? { transactionPath: options.transaction, error: cleanupError.message } : undefined;
