@@ -7,12 +7,10 @@ import {
   type ChildWorkspaceIsolation,
   type WorkspaceAllocation
 } from "./workspace-isolation.js";
-
 export interface ChildMessage {
   type: "follow_up" | "cancel";
   text?: string;
 }
-
 export interface ChildAgentContext {
   childId: string;
   parentId: string;
@@ -30,8 +28,8 @@ export interface ChildAgentContext {
   notify(payload: JsonValue): Promise<void>;
   settling(): void;
 }
-
 export interface SpawnChildInput {
+  childId?: string;
   parentId: string;
   instruction: string;
   workspacePath: string;
@@ -139,7 +137,9 @@ export class AgentSupervisor implements SupervisorPort {
   }
 
   private createJob(input: SpawnChildInput): InternalJob {
-    const id = randomUUID();
+    const id = input.childId ?? randomUUID();
+    if (!/^[0-9a-f-]{36}$/iu.test(id)) throw new Error("Child id must be a UUID.");
+    if (this.jobs.has(id)) throw new Error(`Duplicate child '${id}'.`);
     const mailbox = new AsyncMailbox<ChildMessage>();
     const controller = new AbortController();
     const job: ChildJob = {
@@ -174,7 +174,10 @@ export class AgentSupervisor implements SupervisorPort {
       intent: job.intent,
       writeScope: job.public.writeScope,
       delegatedEffects: job.input.delegatedEffects ?? [],
-      detached: job.public.detached
+      detached: job.public.detached,
+      // Recovery needs the allocation and delegated Plan nodes even if the
+      // process dies before a child.completed event can be published.
+      metadata: job.input.metadata ?? null
     };
   }
 
@@ -194,12 +197,12 @@ export class AgentSupervisor implements SupervisorPort {
       if (job.allocation) {
         void job.allocation.release().then((isolation) => {
           job.public.isolation = isolation;
-          this.complete(job);
+          return this.completeBeforeLaunch(job);
         }).catch((error: unknown) => {
           job.public.error = `Workspace cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
-          this.complete(job);
+          return this.completeBeforeLaunch(job);
         });
-      } else if (!job.preparing) this.complete(job);
+      } else if (!job.preparing) void this.completeBeforeLaunch(job);
       return;
     }
     try { if (job.acceptingMessages) job.mailbox.send({ type: "cancel", text: reason }); }
@@ -286,7 +289,7 @@ export class AgentSupervisor implements SupervisorPort {
       job.public.isolation = { ...allocation.isolation };
       if (job.controller.signal.aborted || job.public.status === "cancelled") {
         job.public.isolation = await allocation.release();
-        this.complete(job);
+        await this.completeBeforeLaunch(job);
         return;
       }
       this.schedule();
@@ -294,7 +297,7 @@ export class AgentSupervisor implements SupervisorPort {
       job.preparing = false;
       job.public.status = job.controller.signal.aborted ? "cancelled" : "failed";
       if (!job.controller.signal.aborted) job.public.error = error instanceof Error ? error.message : String(error);
-      this.complete(job);
+      await this.completeBeforeLaunch(job);
     }
   }
 
@@ -358,12 +361,7 @@ export class AgentSupervisor implements SupervisorPort {
             : `Workspace cleanup failed: ${detail}`;
           if (job.public.status === "completed") job.public.status = "failed";
         }
-        await this.publish(job, "child.completed", jsonValue({
-          status: job.public.status,
-          outcome: job.public.result?.outcome ?? null,
-          isolation: job.public.isolation ?? null,
-          error: job.public.error ?? null
-        })).catch((error) => { job.public.error = error instanceof Error ? error.message : String(error); });
+        await this.publishCompletion(job);
       } finally {
         this.running -= 1;
         this.complete(job);
@@ -376,6 +374,22 @@ export class AgentSupervisor implements SupervisorPort {
     if (job.settled) return;
     job.settled = true;
     job.finish(cloneJob(job.public));
+  }
+
+  private async completeBeforeLaunch(job: InternalJob): Promise<void> {
+    await this.publishCompletion(job);
+    this.complete(job);
+  }
+
+  private async publishCompletion(job: InternalJob): Promise<void> {
+    await this.publish(job, "child.completed", jsonValue({
+      status: job.public.status,
+      outcome: job.public.result?.outcome ?? null,
+      report: job.public.result?.report ?? null,
+      metadata: job.input.metadata ?? null,
+      isolation: job.public.isolation ?? null,
+      error: job.public.error ?? null
+    })).catch((error) => { job.public.error = error instanceof Error ? error.message : String(error); });
   }
 
   private async publish(job: InternalJob, type: ChildSupervisorEvent["type"], payload: JsonValue): Promise<void> {

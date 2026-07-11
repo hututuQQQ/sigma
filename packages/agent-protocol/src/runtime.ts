@@ -1,4 +1,5 @@
 import type { AgentEventEnvelope } from "./events.js";
+import type { CheckpointRef } from "./domain.js";
 import type { RunCommand, RunMode, RunOutcome } from "./outcomes.js";
 
 export interface SessionRef {
@@ -12,6 +13,7 @@ export interface StartSession {
   title?: string;
   writeScope?: string[];
   strictWriteScope?: boolean;
+  reviewerWaiverReason?: string;
 }
 
 export interface SessionOverview {
@@ -32,4 +34,6 @@ export interface RuntimeClient {
   listSessions(limit?: number): Promise<SessionOverview[]>;
   sessionEvents(sessionId: string, afterSeq?: number): AsyncIterable<AgentEventEnvelope>;
   releaseSession?(sessionId: string): Promise<void>;
+  /** User control-plane operation; never exposed as a model tool. */
+  undoLatestCheckpoint?(sessionId: string): Promise<CheckpointRef>;
 }

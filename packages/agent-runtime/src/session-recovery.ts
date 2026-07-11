@@ -1,23 +1,98 @@
-import type { AgentEventEnvelope, AgentEventType, ContextAuthority, ToolDescriptor } from "agent-protocol";
+import { randomUUID } from "node:crypto";
+import type {
+  BudgetAmounts,
+  ToolDescriptor,
+  UsageRecord
+} from "agent-protocol";
+import { recoveryResultLostPayload } from "./run-transitions.js";
 import type { RuntimeSession } from "./types.js";
+import type { BoundRuntimeEventEmitter } from "./runtime-event-emitter.js";
 
 interface RecoveryOptions {
   descriptors: readonly ToolDescriptor[];
-  emit(
-    type: AgentEventType,
-    authority: Exclude<ContextAuthority, "external_verifier">,
-    payload: unknown
-  ): Promise<AgentEventEnvelope>;
+  emit: BoundRuntimeEventEmitter;
+  settleToolBudget(callId: string, disposition: "commit" | "release", checkpointId?: string): Promise<void>;
+  settleEligibleToolBudgets(): Promise<void>;
+  settleModelBudget(requestId: string): Promise<BudgetAmounts | undefined>;
   start(): void;
+}
+
+function mutating(descriptor: ToolDescriptor | undefined): boolean {
+  return Boolean(descriptor?.possibleEffects.some((effect) =>
+    ["filesystem.write", "process.spawn", "destructive", "open_world"].includes(effect)));
+}
+
+function mustNotReplay(session: RuntimeSession, descriptor: ToolDescriptor | undefined): boolean {
+  if (!descriptor?.idempotent) return true;
+  const checkpointStatus = session.state.checkpointHead?.status;
+  return mutating(descriptor) && (checkpointStatus === "sealed" || checkpointStatus === "restored");
+}
+
+function interruptedModelUsage(
+  session: RuntimeSession,
+  requestId: string,
+  charged: BudgetAmounts
+): UsageRecord {
+  const routed = session.gateway as typeof session.gateway & {
+    routingIdentity?(): { role: UsageRecord["role"]; routeId: string };
+  };
+  const identity = routed.routingIdentity?.();
+  return {
+    usageId: randomUUID(),
+    requestId,
+    sessionId: session.sessionId,
+    runId: session.runId,
+    role: identity?.role ?? session.modelRole,
+    routeId: identity?.routeId ?? "recovery/default",
+    providerId: session.gateway.provider,
+    modelId: session.gateway.model,
+    tokenizerId: "recovery/conservative",
+    tokenizerAccuracy: "approximate",
+    providerReported: false,
+    inputTokens: charged.inputTokens,
+    outputTokens: charged.outputTokens,
+    reasoningTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costMicroUsd: charged.costMicroUsd,
+    latencyMs: 0,
+    attempt: Math.max(1, charged.modelTurns),
+    occurredAt: new Date().toISOString()
+  };
+}
+
+async function recoverInterruptedModel(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
+  const active = session.state.activeModelTurn;
+  if (!active) throw new Error("Interrupted model state is missing its active turn.");
+  const requestId = `${session.runId}:${active.turnId}`;
+  const charged = await options.settleModelBudget(requestId);
+  if (charged && !session.state.usage.some((item) => item.requestId === requestId)) {
+    await options.emit("usage.recorded", "runtime", interruptedModelUsage(session, requestId, charged));
+  }
+  if (session.state.activeModelSemanticDelta) {
+    await options.emit("run.suspended", "runtime", {
+      requestId: `model-recovery:${requestId}`,
+      message: "The interrupted model attempt produced durable content or reasoning. It will not be replayed automatically; send a follow-up to continue."
+    });
+    return;
+  }
+  await options.emit("diagnostic", "runtime", {
+    kind: "recovery.retry_model",
+    message: "Retrying an interrupted model attempt with no durable semantic delta from the last durable boundary."
+  });
 }
 
 export async function recoverInterruptedSession(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
   if (session.state.phase === "terminal") return;
-  if (session.state.phase === "model_in_flight") {
-    await options.emit("diagnostic", "runtime", {
-      kind: "recovery.retry_model",
-      message: "Retrying an interrupted model attempt from the last durable boundary."
+  const lostProcessIds = [...session.state.activeProcessIds];
+  for (const processId of lostProcessIds) {
+    await options.emit("process.lost", "runtime", {
+      processId,
+      reason: "The runtime restarted; background process handles are valid only for the runtime lifecycle that created them."
     });
+  }
+  if (session.state.phase === "model_in_flight") {
+    await recoverInterruptedModel(session, options);
   }
   for (const pending of [...session.state.pendingTools]) {
     const descriptor = options.descriptors.find((item) => item.name === pending.request.name);
@@ -27,34 +102,36 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
       });
       continue;
     }
-    if (!pending.started) continue;
-    if (descriptor?.idempotent) {
+    if (!pending.started) {
+      await options.settleToolBudget(pending.request.callId, "release");
+      continue;
+    }
+    if (!mustNotReplay(session, descriptor)) {
+      await options.settleToolBudget(pending.request.callId, "release");
       await options.emit("diagnostic", "runtime", {
         kind: "recovery.reset_tool", callId: pending.request.callId, approval: "not_required"
       });
       continue;
     }
-    await options.emit("diagnostic", "runtime", {
-      kind: "recovery.reset_tool", callId: pending.request.callId, approval: "pending"
-    });
-    await options.emit("tool.approval_requested", "runtime", {
-      requestId: pending.request.callId,
-      callId: pending.request.callId,
-      toolName: pending.request.name,
-      arguments: pending.request.arguments,
-      effects: descriptor?.possibleEffects ?? [],
-      reason: "The process stopped during a non-idempotent tool call. Explicit approval is required before retrying.",
-      ...pending.modelTurn
-    });
-    await options.emit("run.suspended", "runtime", {
-      requestId: pending.request.callId,
-      callId: pending.request.callId,
-      message: `Decide whether to retry interrupted tool '${pending.request.name}'.`,
-      ...pending.modelTurn
-    });
-    session.approvals.set(pending.request.callId, {
-      effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined
-    });
+    await options.settleToolBudget(
+      pending.request.callId,
+      "commit",
+      mutating(descriptor) ? session.state.checkpointHead?.checkpointId : undefined
+    );
+    await options.emit(
+      "tool.failed",
+      "runtime",
+      recoveryResultLostPayload(pending.request.callId, pending.modelTurn)
+    );
   }
+  if (lostProcessIds.length > 0) {
+    await options.emit("run.suspended", "runtime", {
+      requestId: `process-recovery:${lostProcessIds[0]}`,
+      processIds: lostProcessIds,
+      message: "Background processes were lost across runtime restart and were not replayed. Send a follow-up after reviewing their last durable output."
+    });
+    return;
+  }
+  await options.settleEligibleToolBudgets();
   if (["ready_model", "tool_pending", "outcome_pending"].includes(session.state.phase)) options.start();
 }

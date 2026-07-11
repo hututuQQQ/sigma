@@ -1,6 +1,7 @@
 {
   "name": "agent-cli",
-  "version": "2.0.0",
+  "version": "3.0.0-beta.1",
+  "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,10 +21,14 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\""
   },
   "dependencies": {
+    "agent-code-intel": "workspace:*",
     "agent-config": "workspace:*",
+    "agent-execution": "workspace:*",
+    "agent-extensions": "workspace:*",
     "agent-presentation": "workspace:*",
     "agent-protocol": "workspace:*",
     "agent-runtime": "workspace:*",
+    "agent-store": "workspace:*",
     "agent-tui": "workspace:*",
     "smol-toml": "^1.7.0"
   },

@@ -15,6 +15,7 @@ import {
   type McpClientHooks,
   type McpNotification,
   type McpProgress,
+  type McpProcessExecution,
   type McpRequestOptions,
   type McpServerInfo,
   type McpStdioServerConfig,
@@ -63,7 +64,8 @@ export class McpStdioClient {
 
   constructor(
     private readonly config: McpStdioServerConfig,
-    private readonly hooks: McpClientHooks = {}
+    private readonly hooks: McpClientHooks = {},
+    execution?: McpProcessExecution
   ) {
     const settings = resolveMcpClientSettings(config);
     this.timeouts = settings.timeouts;
@@ -72,7 +74,7 @@ export class McpStdioClient {
       onMessage: (message) => this.handleMessage(message),
       onFailure: (error) => this.fail(error, false),
       onStderr: hooks.onStderr
-    }, settings.maxMessageBytes, settings.maxStderrBytes, settings.timeouts.shutdownGraceMs);
+    }, settings.maxMessageBytes, settings.maxStderrBytes, settings.timeouts.shutdownGraceMs, execution);
   }
 
   get state(): ClientState { return this.stateValue; }

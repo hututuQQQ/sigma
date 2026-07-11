@@ -1,9 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
 import { access, cp, mkdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireProcessOwnerLease, resolveWorkspacePath, selfContainedGitRoot } from "agent-platform";
+import {
+  acquireProcessOwnerLease,
+  resolveWorkspacePath,
+  selfContainedGitRoot,
+  type ProcessExecutionPort
+} from "agent-platform";
+import { runGit } from "./git-execution.js";
 import { nulPaths, outsideWriteScope } from "./integration-paths.js";
 
 export type ChildRunIntent = "analyze" | "write";
@@ -76,21 +81,6 @@ class AsyncMutex {
   }
 }
 
-async function runGit(args: string[], signal?: AbortSignal): Promise<string> {
-  signal?.throwIfAborted();
-  return await new Promise<string>((resolve, reject) => {
-    execFile("git", args, {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-      signal,
-      windowsHide: true
-    }, (error, stdout) => {
-      if (error) reject(error);
-      else resolve(stdout.trim());
-    });
-  });
-}
-
 async function canonical(candidate: string): Promise<string> {
   const resolved = path.resolve(candidate);
   try {
@@ -136,6 +126,7 @@ export interface WorkspaceIsolationManagerOptions {
   writerLeaseTimeoutMs?: number;
   malformedLockStaleMs?: number;
   retryIntervalMs?: number;
+  execution?: ProcessExecutionPort;
 }
 
 export class WorkspaceIsolationManager {
@@ -235,11 +226,12 @@ export class WorkspaceIsolationManager {
 
   private async inspectRepository(source: string, signal?: AbortSignal): Promise<{ root: string; head: string; clean: boolean } | undefined> {
     try {
-      const root = await selfContainedGitRoot(source, signal);
+      const root = this.options.execution
+        ? await selfContainedGitRoot(source, signal, this.options.execution) : undefined;
       if (!root) return undefined;
       const [head, status] = await Promise.all([
-        runGit(["-C", root, "rev-parse", "HEAD"], signal),
-        runGit(["-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], signal)
+        runGit(this.options.execution, ["-C", root, "rev-parse", "HEAD"], root, signal),
+        runGit(this.options.execution, ["-C", root, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"], root, signal)
       ]);
       return { root, head, clean: !hasUserChanges(status) };
     } catch {
@@ -260,7 +252,13 @@ export class WorkspaceIsolationManager {
     await mkdir(path.dirname(worktreePath), { recursive: true });
     const unlockGit = await mutex(this.gitMutation, repositoryRoot).acquire(signal);
     try {
-      await runGit(["-C", repositoryRoot, "worktree", "add", "--detach", worktreePath, baseHead], signal);
+      await runGit(
+        this.options.execution,
+        ["-C", repositoryRoot, "worktree", "add", "--detach", worktreePath, baseHead],
+        repositoryRoot,
+        signal,
+        [repositoryRoot, path.dirname(worktreePath)]
+      );
     } finally {
       unlockGit();
     }
@@ -300,8 +298,8 @@ export class WorkspaceIsolationManager {
     }
     try {
       const [head, status] = await Promise.all([
-        runGit(["-C", worktreePath, "rev-parse", "HEAD"]),
-        runGit(["-C", worktreePath, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"])
+        runGit(this.options.execution, ["-C", worktreePath, "rev-parse", "HEAD"], worktreePath),
+        runGit(this.options.execution, ["-C", worktreePath, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], worktreePath)
       ]);
       if (status.length > 0) {
         return { ...isolation, cleanup: "retained", reason: "Worktree contains modified, untracked, or ignored files." };
@@ -311,8 +309,8 @@ export class WorkspaceIsolationManager {
       }
       const unlockGit = await mutex(this.gitMutation, isolation.repositoryRoot!).acquire();
       try {
-        await runGit(["-C", isolation.repositoryRoot!, "worktree", "remove", worktreePath]);
-        await runGit(["-C", isolation.repositoryRoot!, "worktree", "prune"]);
+        await runGit(this.options.execution, ["-C", isolation.repositoryRoot!, "worktree", "remove", worktreePath], isolation.repositoryRoot!, undefined, [isolation.repositoryRoot!]);
+        await runGit(this.options.execution, ["-C", isolation.repositoryRoot!, "worktree", "prune"], isolation.repositoryRoot!, undefined, [isolation.repositoryRoot!]);
       } finally {
         unlockGit();
       }
@@ -340,17 +338,17 @@ export class WorkspaceIsolationManager {
       unlockProcess = await this.acquireProcessWriterLease(isolation.repositoryRoot, signal);
       unlockGit = await mutex(this.gitMutation, isolation.repositoryRoot).acquire(signal);
       const [sourceHead, sourceStatus] = await Promise.all([
-        runGit(["-C", isolation.repositoryRoot, "rev-parse", "HEAD"], signal),
-        runGit(["-C", isolation.repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], signal)
+        runGit(this.options.execution, ["-C", isolation.repositoryRoot, "rev-parse", "HEAD"], isolation.repositoryRoot, signal),
+        runGit(this.options.execution, ["-C", isolation.repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all"], isolation.repositoryRoot, signal)
       ]);
       if (sourceHead !== isolation.baseHead || hasUserChanges(sourceStatus)) {
         throw new Error("Source workspace changed after child isolation; refusing unsafe integration.");
       }
       const [copyOutput, deleteOutput, untrackedOutput, ignoredOutput] = await Promise.all([
-        runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRTUXB", isolation.baseHead], signal),
-        runGit(["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", isolation.baseHead], signal),
-        runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--exclude-standard", "-z"], signal),
-        runGit(["-C", isolation.worktreePath, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], signal)
+        runGit(this.options.execution, ["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACMRTUXB", isolation.baseHead], isolation.worktreePath, signal),
+        runGit(this.options.execution, ["-C", isolation.worktreePath, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", isolation.baseHead], isolation.worktreePath, signal),
+        runGit(this.options.execution, ["-C", isolation.worktreePath, "ls-files", "--others", "--exclude-standard", "-z"], isolation.worktreePath, signal),
+        runGit(this.options.execution, ["-C", isolation.worktreePath, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], isolation.worktreePath, signal)
       ]);
       const ignored = nulPaths(ignoredOutput);
       if (ignored.length > 0) throw new Error(`Child produced ignored files that require manual review: ${ignored.join(", ")}`);
@@ -367,8 +365,8 @@ export class WorkspaceIsolationManager {
       for (const file of deletions) {
         await rm(await resolveWorkspacePath(isolation.repositoryRoot, file), { force: true, recursive: true });
       }
-      await runGit(["-C", isolation.repositoryRoot, "worktree", "remove", "--force", isolation.worktreePath], signal);
-      await runGit(["-C", isolation.repositoryRoot, "worktree", "prune"], signal);
+      await runGit(this.options.execution, ["-C", isolation.repositoryRoot, "worktree", "remove", "--force", isolation.worktreePath], isolation.repositoryRoot, signal, [isolation.repositoryRoot]);
+      await runGit(this.options.execution, ["-C", isolation.repositoryRoot, "worktree", "prune"], isolation.repositoryRoot, signal, [isolation.repositoryRoot]);
       return { ...isolation, cleanup: "integrated", reason: `Integrated ${copies.length} changed and ${deletions.length} deleted files.` };
     } finally {
       unlockGit?.();

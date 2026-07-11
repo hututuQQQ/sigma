@@ -6,12 +6,13 @@ import type {
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
+import { assertMcpPersistentEffectsAllowed } from "agent-protocol";
 import { McpProtocolError } from "./errors.js";
 import { McpStdioClient } from "./stdio-client.js";
 import type { McpContentBlock, McpRequestOptions, McpToolBridgeOptions, McpToolDefinition, McpToolPolicy } from "./types.js";
 
 const DEFAULT_POLICY: McpToolPolicy = {
-  possibleEffects: ["network", "open_world"],
+  possibleEffects: [],
   executionMode: "sequential",
   approval: "prompt",
   idempotent: false,
@@ -75,7 +76,7 @@ export class McpToolBridge implements ToolExecutor {
     const policy: McpToolPolicy = {
       ...DEFAULT_POLICY,
       ...options.policy,
-      possibleEffects: [...(options.policy?.possibleEffects ?? DEFAULT_POLICY.possibleEffects)]
+      possibleEffects: [...options.policy.possibleEffects]
     };
     if (!Number.isFinite(policy.timeoutMs) || policy.timeoutMs <= 0) throw new Error("MCP tool timeout must be positive.");
     for (const tool of tools) {
@@ -103,6 +104,7 @@ export class McpToolBridge implements ToolExecutor {
     options: McpToolBridgeOptions,
     requestOptions: McpRequestOptions = {}
   ): Promise<McpToolBridge> {
+    assertMcpPersistentEffectsAllowed(options.namespace, options.policy?.possibleEffects);
     return new McpToolBridge(client, await client.listTools(requestOptions), options);
   }
 

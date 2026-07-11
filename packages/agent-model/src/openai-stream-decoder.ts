@@ -1,5 +1,8 @@
 import type { ModelStreamEvent, ModelToolCall } from "agent-protocol";
 import { normalizedFinishReason, parseArguments, providerFinishError } from "./openai-wire.js";
+import type { RawUsage, UnnormalizedModelResponse } from "./usage.js";
+
+export type RawDoneStreamEvent = { type: "done"; response: UnnormalizedModelResponse };
 
 export interface StreamProgress {
   deliveredContent: string;
@@ -31,6 +34,9 @@ export class StreamDecoder {
   private reasoningObserved = false;
   private inputTokens: number | undefined;
   private outputTokens: number | undefined;
+  private reasoningTokens: number | undefined;
+  private cacheReadTokens: number | undefined;
+  private cacheWriteTokens: number | undefined;
   private finish: unknown;
 
   constructor(
@@ -48,7 +54,7 @@ export class StreamDecoder {
     return events;
   }
 
-  done(): ModelStreamEvent {
+  done(): RawDoneStreamEvent {
     const calls = finalizeCalls(this.calls);
     this.assertStableBoundary();
     if (typeof this.finish === "string" && this.retryableFinishReasons.has(this.finish)) {
@@ -67,6 +73,16 @@ export class StreamDecoder {
     } };
   }
 
+  rawUsage(): RawUsage {
+    return {
+      inputTokens: this.inputTokens,
+      outputTokens: this.outputTokens,
+      reasoningTokens: this.reasoningTokens,
+      cacheReadTokens: this.cacheReadTokens,
+      cacheWriteTokens: this.cacheWriteTokens
+    };
+  }
+
   private assertStableBoundary(): void {
     if (this.content !== this.progress.deliveredContent) {
       this.status.retryAllowed = false;
@@ -82,9 +98,14 @@ export class StreamDecoder {
     const usage = chunk.usage && typeof chunk.usage === "object" ? chunk.usage as Record<string, unknown> : {};
     const hasInput = typeof usage.prompt_tokens === "number";
     const hasOutput = typeof usage.completion_tokens === "number";
+    const inputDetails = objectOrEmpty(usage.prompt_tokens_details);
+    const outputDetails = objectOrEmpty(usage.completion_tokens_details);
     if (!hasInput && !hasOutput) return [];
     this.inputTokens = hasInput ? usage.prompt_tokens as number : this.inputTokens;
     this.outputTokens = hasOutput ? usage.completion_tokens as number : this.outputTokens;
+    this.reasoningTokens = numberOrPrevious(outputDetails.reasoning_tokens, this.reasoningTokens);
+    this.cacheReadTokens = numberOrPrevious(inputDetails.cached_tokens, this.cacheReadTokens);
+    this.cacheWriteTokens = numberOrPrevious(inputDetails.cache_creation_tokens, this.cacheWriteTokens);
     return [{ type: "usage", inputTokens: this.inputTokens, outputTokens: this.outputTokens }];
   }
 
@@ -138,4 +159,12 @@ export class StreamDecoder {
     }
     return events;
   }
+}
+
+function objectOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function numberOrPrevious(value: unknown, previous: number | undefined): number | undefined {
+  return typeof value === "number" ? value : previous;
 }

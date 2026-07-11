@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "sigma/cjk-byte-v1",
+  "accuracy": "approximate",
+  "algorithm": "utf8-byte-and-script-weighted-estimate",
+  "safetyMarginPercent": 20,
+  "description": "Pinned offline metadata for Sigma Code's conservative DeepSeek and GLM token estimator. It is not presented as an exact provider tokenizer.",
+  "testVectors": [
+    { "text": "hello", "minimumTokens": 2, "maximumTokens": 5 },
+    { "text": "你好，Sigma", "minimumTokens": 4, "maximumTokens": 10 }
+  ]
+}

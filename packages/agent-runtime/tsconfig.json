@@ -8,14 +8,18 @@
   },
   "include": ["src/**/*.ts"],
   "references": [
+    { "path": "../agent-checkpoint" },
+    { "path": "../agent-code-intel" },
     { "path": "../agent-config" },
     { "path": "../agent-protocol" },
     { "path": "../agent-kernel" },
     { "path": "../agent-store" },
     { "path": "../agent-platform" },
     { "path": "../agent-context" },
+    { "path": "../agent-execution" },
     { "path": "../agent-mcp" },
     { "path": "../agent-model" },
+    { "path": "../agent-extensions" },
     { "path": "../agent-supervisor" },
     { "path": "../agent-tools" }
   ]

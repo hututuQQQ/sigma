@@ -4,7 +4,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, unlink, utimes, writeFile } from
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SessionCommandBus, activeSessionOwner, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
+import {
+  SessionCommandBus,
+  activeSessionOwner,
+  sendSessionCommand,
+  type ExternalSessionCommand
+} from "../packages/agent-runtime/src/index.js";
 import { acquireProcessOwnerLease } from "../packages/agent-platform/src/index.js";
 import { sessionDirectory } from "../packages/agent-store/src/index.js";
 
@@ -36,6 +41,58 @@ afterEach(async () => {
 });
 
 describe("SessionCommandBus runtime ownership", () => {
+  it("delivers typed user recovery and budget control commands to the active owner", async () => {
+    const root = await fixture();
+    const sessionId = "checkpoint-recovery-command";
+    const dispatched: ExternalSessionCommand[] = [];
+    const bus = new SessionCommandBus(root, async (command) => { dispatched.push(command); }, {
+      claimTimeoutMs: 100,
+      retryIntervalMs: 5
+    });
+    await bus.claim(sessionId);
+    await sendSessionCommand(root, {
+      type: "checkpoint_recovery",
+      sessionId,
+      checkpointId: "checkpoint-one",
+      decision: "restore"
+    });
+    const firstDeadline = Date.now() + 1_000;
+    while (dispatched.length < 1 && Date.now() < firstDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await sendSessionCommand(root, {
+      type: "budget_increase",
+      sessionId,
+      increase: { inputTokens: 2_000, maxDepth: 1 }
+    });
+    await sendSessionCommand(root, {
+      type: "reviewer_waiver",
+      sessionId,
+      checkpointId: "checkpoint-two",
+      reason: "Operator accepted this exact change once."
+    });
+    const deadline = Date.now() + 1_000;
+    while (dispatched.length < 3 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(dispatched).toEqual([
+      {
+        type: "checkpoint_recovery",
+        sessionId,
+        checkpointId: "checkpoint-one",
+        decision: "restore"
+      },
+      { type: "budget_increase", sessionId, increase: { inputTokens: 2_000, maxDepth: 1 } },
+      {
+        type: "reviewer_waiver",
+        sessionId,
+        checkpointId: "checkpoint-two",
+        reason: "Operator accepted this exact change once."
+      }
+    ]);
+    await bus.release(sessionId);
+  });
+
   it("keeps ownership until an in-flight dispatch finishes during release", async () => {
     const root = await fixture();
     const sessionId = "release-during-dispatch";

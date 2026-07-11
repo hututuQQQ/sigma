@@ -12,14 +12,23 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
+import { EVENT_SCHEMA_VERSION } from "../packages/agent-protocol/src/index.js";
 import { createKernelState, evolve } from "../packages/agent-kernel/src/index.js";
 import { lexicalScore, lexicalTokens, planContext } from "../packages/agent-context/src/index.js";
 import { resolveWorkspacePath } from "../packages/agent-platform/src/index.js";
-import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
-import { createRuntime, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
+import { SegmentedJsonlStore, sessionDirectory } from "../packages/agent-store/src/index.js";
+import { createRuntime as createBaseRuntime, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
+import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
+import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
+import { currentRunEvidence, typedCompletion } from "./helpers/typed-evidence.js";
+
+const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
+  ...options,
+  reviewer: createApprovingReviewer()
+});
 
 function event(
   seq: number,
@@ -27,7 +36,7 @@ function event(
   payload: AgentEventEnvelope["payload"] = {}
 ): AgentEventEnvelope {
   return {
-    schemaVersion: 2,
+    schemaVersion: EVENT_SCHEMA_VERSION,
     seq,
     eventId: `event-${seq}`,
     sessionId: "session",
@@ -61,10 +70,8 @@ class FakeGateway implements ModelGateway {
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response.");
     if (response.finishReason === "stop") {
-      const ledger = request.messages.find((message) =>
-        message.content.includes("Current-run successful receipt ledger."))?.content ?? "";
-      const evidenceCallIds = [...ledger.matchAll(/^- (.+?) \(/gmu)].map((match) => match[1]);
-      if (evidenceCallIds.length === 0) {
+      const evidence = currentRunEvidence(request);
+      if (evidence.length === 0) {
         this.responses.unshift(response);
         return {
           message: {
@@ -75,25 +82,11 @@ class FakeGateway implements ModelGateway {
           finishReason: "tool_calls"
         };
       }
-      return {
-        message: {
-          role: "assistant",
-          content: "",
-          toolCalls: [{
-            id: `complete-${this.requests.length}`,
-            name: "complete_task",
-            arguments: {
-              summary: response.message.content,
-              criteria: [{
-                criterion: "The requested test workflow completed.",
-                status: "met",
-                evidenceCallIds: [evidenceCallIds.at(-1)!]
-              }]
-            }
-          }]
-        },
-        finishReason: "tool_calls"
-      };
+      return typedCompletion(request, {
+        id: `complete-${this.requests.length}`,
+        summary: response.message.content,
+        criterion: "The requested test workflow completed."
+      });
     }
     return response;
   }
@@ -107,6 +100,35 @@ class FakeGateway implements ModelGateway {
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
     return JSON.stringify({ messages, tools }).length / 4;
   }
+}
+
+function reopenRootPlan(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "reopen-root-plan",
+        name: "update_plan",
+        arguments: {
+          expectedRevision: 2,
+          goal: "Complete the second submitted instruction.",
+          activeNodeId: "root",
+          nodes: [{
+            id: "root",
+            title: "Complete the second run",
+            dependencies: [],
+            status: "in_progress",
+            owner: { kind: "root" },
+            acceptanceCriteria: ["The second instruction is completed with fresh evidence."],
+            evidence: [],
+            reopenReason: "The user submitted a new instruction after the first run completed."
+          }]
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
 }
 
 describe("Sigma architecture", () => {
@@ -132,7 +154,7 @@ describe("Sigma architecture", () => {
       observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
     }));
     expect(state.phase).toBe("outcome_pending");
-    state = evolve(state, event(5, "run.completed", { message: "proposal" }));
+    state = evolve(state, event(5, "run.completed", { message: "proposal", outcomeRevision: 4 }));
     expect(state.outcome).toMatchObject({ kind: "completed", message: "proposal" });
   });
 
@@ -172,7 +194,7 @@ describe("Sigma architecture", () => {
     const store = new SegmentedJsonlStore({ rootDir: root, segmentBytes: 600 });
     await store.append(event(1, "session.created"), 0);
     await store.append(event(2, "run.started"), 1);
-    const eventsPath = path.join(root, "sessions", "session", "events", "000001.jsonl");
+    const eventsPath = path.join(sessionDirectory(root, "session"), "events", "000001.jsonl");
     await writeFile(eventsPath, `${await readFile(eventsPath, "utf8")}{"torn"`, "utf8");
     const restored: AgentEventEnvelope[] = [];
     for await (const restoredEvent of store.events("session")) restored.push(restoredEvent);
@@ -186,7 +208,7 @@ describe("Sigma architecture", () => {
   it("reconciles both store commit crash windows and serializes independent writers", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-store-commit-"));
     const first = new SegmentedJsonlStore({ rootDir: root });
-    const metaPath = path.join(root, "sessions", "session", "meta.json");
+    const metaPath = path.join(sessionDirectory(root, "session"), "meta.json");
     await first.append(event(1, "session.created"), 0);
     await first.append(event(2, "diagnostic", { completeLine: true }), 1);
 
@@ -225,6 +247,7 @@ describe("Sigma architecture", () => {
         },
         finishReason: "tool_calls"
       },
+      validationTurn("validate-result", [{ path: "result.txt", expected: "done" }]),
       { message: { role: "assistant", content: "Implemented and verified." }, finishReason: "stop" }
     ]);
     const storeRootDir = path.join(workspace, ".agent");
@@ -233,7 +256,7 @@ describe("Sigma architecture", () => {
       gateway,
       store,
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto",
       runDeadlineMs: 10_000
     });
@@ -241,10 +264,10 @@ describe("Sigma architecture", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await expect(readFile(path.join(workspace, "result.txt"), "utf8")).resolves.toBe("done");
-    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests).toHaveLength(3);
   });
 
-  it("treats completion as a commit barrier after same-turn evidence tools", async () => {
+  it("defers completion until same-turn tool evidence is durable", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-barrier-"));
     const gateway = new FakeGateway([{
       message: {
@@ -259,7 +282,7 @@ describe("Sigma architecture", () => {
               criteria: [{
                 criterion: "result.txt contains the requested content.",
                 status: "met",
-                evidenceCallIds: ["write-evidence"],
+                evidence: [{ evidenceId: "not-yet-durable", kind: "diagnostic" }],
                 rationale: ""
               }]
             }
@@ -268,14 +291,17 @@ describe("Sigma architecture", () => {
         ]
       },
       finishReason: "tool_calls"
-    }]);
+    },
+    validationTurn("validate-same-turn-result", [{ path: "result.txt", expected: "done" }]),
+    { message: { role: "assistant", content: "Wrote result.txt." }, finishReason: "stop" }
+    ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway,
       store,
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto",
       runDeadlineMs: 10_000
     });
@@ -285,7 +311,7 @@ describe("Sigma architecture", () => {
       kind: "completed", message: "Wrote result.txt."
     });
     await expect(readFile(path.join(workspace, "result.txt"), "utf8")).resolves.toBe("done");
-    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(3);
     const lifecycle: string[] = [];
     for await (const stored of store.events(session.sessionId)) {
       if (stored.type.startsWith("tool.")) {
@@ -299,7 +325,7 @@ describe("Sigma architecture", () => {
 
   it("rejects same-turn completion when its evidence tool fails", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-failure-barrier-"));
-    const complete = (id: string, evidenceCallIds: string[]): ModelResponse => ({
+    const complete = (id: string, evidenceId: string): ModelResponse => ({
       message: {
         role: "assistant",
         content: "",
@@ -308,7 +334,11 @@ describe("Sigma architecture", () => {
           name: "complete_task",
           arguments: {
             summary: "Finished after valid evidence.",
-            criteria: [{ criterion: "Evidence succeeded.", status: "met", evidenceCallIds }]
+            criteria: [{
+              criterion: "Evidence succeeded.",
+              status: "met",
+              evidence: [{ evidenceId, kind: "diagnostic" }]
+            }]
           }
         }]
       },
@@ -320,7 +350,7 @@ describe("Sigma architecture", () => {
           role: "assistant",
           content: "",
           toolCalls: [
-            ...complete("premature-completion", ["failed-evidence"]).message.toolCalls!,
+            ...complete("premature-completion", "failed-evidence").message.toolCalls!,
             { id: "failed-evidence", name: "missing_tool", arguments: {} }
           ]
         },
@@ -334,7 +364,7 @@ describe("Sigma architecture", () => {
         },
         finishReason: "tool_calls"
       },
-      complete("valid-completion", ["valid-evidence"])
+      { message: { role: "assistant", content: "Finished after valid evidence." }, finishReason: "stop" }
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
@@ -359,10 +389,10 @@ describe("Sigma architecture", () => {
     expect(events.filter((stored) => stored.type === "run.completed")).toHaveLength(1);
   });
 
-  it("exposes exact successful receipt IDs and repairs invalid completion evidence", async () => {
+  it("exposes typed durable evidence and repairs invalid completion evidence", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-guidance-"));
     await writeFile(path.join(workspace, "result.txt"), "done", "utf8");
-    const proposal = (id: string, evidenceCallIds: string[]): ModelResponse => ({
+    const proposal = (id: string, evidenceId: string): ModelResponse => ({
       message: {
         role: "assistant",
         content: "",
@@ -374,7 +404,7 @@ describe("Sigma architecture", () => {
             criteria: [{
               criterion: "result.txt contains done.",
               status: "met",
-              evidenceCallIds
+              evidence: [{ evidenceId, kind: "diagnostic" }]
             }]
           }
         }]
@@ -390,8 +420,8 @@ describe("Sigma architecture", () => {
         },
         finishReason: "tool_calls"
       },
-      proposal("invalid-completion", ["read"]),
-      proposal("valid-completion", ["read-evidence"])
+      proposal("invalid-completion", "invented-evidence"),
+      { message: { role: "assistant", content: "Verified result.txt." }, finishReason: "stop" }
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
@@ -405,13 +435,14 @@ describe("Sigma architecture", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify result.txt" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    const durable = currentRunEvidence(gateway.requests[1]);
+    expect(durable).toHaveLength(1);
     expect(gateway.requests[1].messages.some((message) =>
-      message.role === "tool" && message.content.includes("Successful tool receipt ID: read-evidence"))).toBe(true);
-    expect(gateway.requests[1].messages.some((message) =>
-      message.content.includes("Only IDs in this ledger are valid completion evidence")
-      && message.content.includes("read-evidence"))).toBe(true);
+      message.content.includes("Current-run typed durable evidence ledger.")
+      && message.content.includes(`${durable[0]!.evidenceId} (${durable[0]!.kind},`))).toBe(true);
     expect(gateway.requests[2].messages.some((message) =>
-      message.role === "tool" && message.content.includes("available successful receipt list: read-evidence"))).toBe(true);
+      message.role === "tool"
+      && message.content.includes(`${durable[0]!.evidenceId}:${durable[0]!.kind}`))).toBe(true);
   });
 
   it("serializes durable events emitted by parallel tool calls", async () => {
@@ -455,6 +486,7 @@ describe("Sigma architecture", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const gateway = new FakeGateway([
       { message: { role: "assistant", content: "first" }, finishReason: "stop" },
+      reopenRootPlan(),
       { message: { role: "assistant", content: "second" }, finishReason: "stop" }
     ]);
     const firstRuntime = createRuntime({
@@ -473,13 +505,13 @@ describe("Sigma architecture", () => {
     const secondRunFirstRequest = gateway.requests[2];
     expect(secondRunFirstRequest.messages.some((message) =>
       message.content.includes("Successful tool receipt ID: inspect-1"))).toBe(true);
-    expect(secondRunFirstRequest.messages.some((message) =>
-      message.content.includes("Current-run successful receipt ledger.")
-      && message.content.includes("inspect-1"))).toBe(false);
-    expect(gateway.requests[3].messages.some((message) =>
-      message.content.includes("Current-run successful receipt ledger.")
-      && message.content.includes("inspect-3")
-      && !message.content.includes("inspect-1"))).toBe(true);
+    const firstRunEvidence = currentRunEvidence(gateway.requests[1]);
+    expect(firstRunEvidence.length).toBeGreaterThan(0);
+    expect(currentRunEvidence(secondRunFirstRequest)).toEqual([]);
+    const secondRunEvidence = currentRunEvidence(gateway.requests[3]);
+    expect(secondRunEvidence.length).toBeGreaterThan(0);
+    expect(secondRunEvidence.map((item) => item.evidenceId))
+      .not.toContain(firstRunEvidence.at(-1)!.evidenceId);
 
     const resumed = createRuntime({
       gateway: new FakeGateway([]),
@@ -573,25 +605,45 @@ describe("Sigma architecture", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const persisted = [
       event(1, "session.created", { workspacePath: workspace, mode: "change" }),
-      event(2, "run.started", { mode: "change" }),
-      event(3, "user.message", { text: "write restored.txt" }),
-      event(4, "model.started", { turnId: 1, effectRevision: 3 }),
-      event(5, "model.completed", {
-        turnId: 1, effectRevision: 3,
+      event(2, "plan.updated", {
+        previousRevision: 0,
+        plan: {
+          revision: 1,
+          goal: "write restored.txt",
+          activeNodeId: "root",
+          nodes: [{
+            id: "root",
+            title: "write restored.txt",
+            dependencies: [],
+            status: "in_progress",
+            owner: { kind: "root" },
+            acceptanceCriteria: ["restored.txt contains ok"],
+            evidence: []
+          }]
+        }
+      }),
+      event(3, "run.started", { mode: "change" }),
+      event(4, "user.message", { text: "write restored.txt" }),
+      event(5, "model.started", { turnId: 1, effectRevision: 4 }),
+      event(6, "model.completed", {
+        turnId: 1, effectRevision: 4,
         message: { role: "assistant", content: "", toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }] },
         finishReason: "tool_calls",
         toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }]
       }),
-      event(6, "tool.requested", { turnId: 1, effectRevision: 3, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
-      event(7, "tool.approval_requested", { turnId: 1, effectRevision: 3, requestId: "restored-write", callId: "restored-write", toolName: "write" }),
-      event(8, "run.suspended", { turnId: 1, effectRevision: 3, requestId: "restored-write", callId: "restored-write", message: "approval required" })
+      event(7, "tool.requested", { turnId: 1, effectRevision: 4, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
+      event(8, "tool.approval_requested", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", toolName: "write" }),
+      event(9, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", message: "approval required" })
     ];
     for (const stored of persisted) await store.append(stored, stored.seq - 1);
     const runtime = createRuntime({
-      gateway: new FakeGateway([{ message: { role: "assistant", content: "restored" }, finishReason: "stop" }]),
+      gateway: new FakeGateway([
+        validationTurn("validate-restored-write", [{ path: "restored.txt", expected: "ok" }]),
+        { message: { role: "assistant", content: "restored" }, finishReason: "stop" }
+      ]),
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "ask",
       runDeadlineMs: 10_000
     });

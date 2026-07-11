@@ -8,7 +8,6 @@ supportedArchitectures:
   cpu:
     - current
     - x64
-    - arm64
   libc:
     - current
     - glibc

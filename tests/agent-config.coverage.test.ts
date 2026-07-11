@@ -31,10 +31,41 @@ describe("agent-config single-source schema", () => {
       workspace: { model: { provider: "deepseek", name: "workspace-model" }, tools: { max_parallel: 7 } },
       home: { model: { provider: "deepseek", name: "home-model" }, permissions: { mode: "deny" } }
     });
-    expect(values).toMatchObject({ provider: "glm", model: "env-model", runDeadlineSec: 42, maxParallelTools: 7, permissionMode: "deny" });
+    expect(values).toMatchObject({ provider: "glm", model: "env-model", runDeadlineSec: 42, maxParallelTools: 4, permissionMode: "deny" });
     expect(() => resolveConfig({ workspace: { model: { unknown: true } } })).toThrow("Unknown workspace configuration key");
     expect(() => resolveConfig({ home: { surprise: {} } })).toThrow("Unknown home configuration key");
     expect(() => resolveConfig({ flags: { surprise: true } })).toThrow("Unknown option");
+  });
+
+  it("only lets workspace configuration narrow authority and resource caps", () => {
+    const values = resolveConfig({
+      home: {
+        permissions: { mode: "deny" }, security: { network: "none", allow_unsafe_host_exec: true },
+        budget: { max_input_tokens: 1_000, max_tool_calls: 20 }, checkpoint: { max_files: 100 }
+      },
+      workspace: {
+        permissions: { mode: "auto" }, security: { network: "full", allow_unsafe_host_exec: false },
+        budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
+        agents: { max_parallel: 2 }
+      }
+    });
+    expect(values).toMatchObject({
+      permissionMode: "deny", networkMode: "none", allowUnsafeHostExec: false,
+      maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
+    });
+
+    const narrowed = resolveConfig({
+      home: { permissions: { mode: "auto" }, security: { network: "full" }, budget: { max_input_tokens: 2_000 } },
+      workspace: { permissions: { mode: "ask" }, security: { network: "none" }, budget: { max_input_tokens: 1_000 } }
+    });
+    expect(narrowed).toMatchObject({ permissionMode: "ask", networkMode: "none", maxInputTokens: 1_000 });
+
+    const explicit = resolveConfig({
+      flags: { "permission-mode": "auto", "max-input-tokens": 3_000 },
+      env: { SIGMA_NETWORK: "full" },
+      workspace: { permissions: { mode: "deny" }, security: { network: "none" }, budget: { max_input_tokens: 1_000 } }
+    });
+    expect(explicit).toMatchObject({ permissionMode: "auto", networkMode: "full", maxInputTokens: 3_000 });
   });
 
   it("validates every scalar boundary", () => {
@@ -84,7 +115,53 @@ describe("agent-config single-source schema", () => {
     expect(() => resolveConfig({ flags: { "tui-fps": "31" } })).toThrow("1 to 30");
     expect(() => parseMcp([{ ...raw, env: "bad" }])).toThrow("object");
     expect(() => parseMcp([{ ...raw, possible_effects: ["unknown"] }])).toThrow("must be one of");
+    expect(() => parseMcp([{ name: "implicit", command: "node" }])).toThrowError(expect.objectContaining({
+      code: "mcp_effects_required"
+    }));
+    for (const effect of ["filesystem.write", "destructive", "open_world"]) {
+      expect(() => parseMcp([{ ...raw, possible_effects: [effect] }])).toThrowError(expect.objectContaining({
+        code: "mcp_persistent_effect_forbidden",
+        forbiddenEffects: [effect]
+      }));
+    }
     expect(() => parseMcp([{ ...raw, timeout_ms: 0 }])).toThrow("number");
+  });
+
+  it("parses strict model specs and route catalogs from configuration", () => {
+    const rawSpec = {
+      id: "deepseek/custom",
+      provider: "deepseek",
+      upstream_model: "custom",
+      capabilities: {
+        context_window_tokens: 100_000, max_output_tokens: 10_000, tools: true,
+        parallel_tools: false, reasoning: true, structured_output: true,
+        prompt_cache: false, tokenizer: "approximate"
+      },
+      tokenizer: { id: "custom-tokenizer", accuracy: "exact", asset_digest: "a".repeat(64) },
+      pricing: {
+        input_micro_usd_per_million: 10, output_micro_usd_per_million: 20,
+        cache_read_micro_usd_per_million: 1, effective_at: "2026-01-01"
+      }
+    };
+    const rawRoute = {
+      id: "analysis", candidates: ["deepseek/custom"],
+      required_capabilities: { tools: true, context_window_tokens: 50_000 },
+      require_exact_tokenizer: true, fallback_on: ["timeout"], max_attempts: 1
+    };
+    const values = resolveConfig({ workspace: { model: { specs: [rawSpec], routes: [rawRoute] } } });
+    expect(values.modelSpecs).toEqual([expect.objectContaining({
+      id: "deepseek/custom", providerId: "deepseek",
+      tokenizer: expect.objectContaining({ accuracy: "exact" })
+    })]);
+    expect(values.modelRoutes).toEqual([expect.objectContaining({
+      id: "analysis", requireExactTokenizer: true,
+      requiredCapabilities: expect.objectContaining({ tools: true, contextWindowTokens: 50_000 })
+    })]);
+    const specParser = SIGMA_CONFIG_SCHEMA.find((item) => item.key === "modelSpecs")!.parse;
+    const routeParser = SIGMA_CONFIG_SCHEMA.find((item) => item.key === "modelRoutes")!.parse;
+    expect(() => specParser([{ ...rawSpec, surprise: true }])).toThrow("Unknown configuration key");
+    expect(() => routeParser([{ ...rawRoute, fallback_on: ["auth"] }])).toThrow("must be one of");
+    expect(() => routeParser([{ ...rawRoute, candidates: ["same", "same"] }])).toThrow("duplicates");
   });
 
   it("renders help, commands, and TOML from the same declarations", () => {
@@ -100,11 +177,13 @@ describe("agent-config single-source schema", () => {
       { name: "same", summary: "two", handler: "doctor" }
     ])).toThrow("Duplicate command");
 
-    const server = resolveConfig({ flags: { "mcp-server": ["{\"name\":\"tooling\",\"command\":\"node\"}"] } }).mcpServers as McpServerConfigValue[];
+    const server = resolveConfig({ flags: { "mcp-server": [
+      "{\"name\":\"tooling\",\"command\":\"node\",\"possible_effects\":[\"filesystem.read\"]}"
+    ] } }).mcpServers as McpServerConfigValue[];
     const toml = renderConfigToml({ provider: "glm", workspace: ".", mcpServers: server }, "generated");
     expect(toml).toContain("# generated");
     expect(toml).toContain("[model]\nprovider = \"glm\"");
     expect(toml).toContain("[[mcp.servers]]");
-    expect(toml).toContain("possible_effects = [\"network\", \"open_world\"]");
+    expect(toml).toContain("possible_effects = [\"filesystem.read\"]");
   });
 });

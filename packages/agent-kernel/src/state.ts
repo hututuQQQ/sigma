@@ -1,4 +1,28 @@
-import type { JsonValue, ModelMessage, RunMode, RunOutcome, ToolRequest, ToolReceipt } from "agent-protocol";
+import {
+  KERNEL_STATE_VERSION,
+  LEGACY_KERNEL_STATE_VERSION_V2,
+  createBudgetLedger,
+  createEmptyPlan,
+  isBudgetLedgerState,
+  isCheckpointRef,
+  isEvidenceRecord,
+  isPlanGraph,
+  isUsageRecord,
+  type BudgetLedgerState,
+  type CheckpointRef,
+  type DiagnosticEvidence,
+  type EvidenceRecord,
+  type FrozenArtifactRef,
+  type FrozenCustomizationRef,
+  type JsonValue,
+  type ModelMessage,
+  type PlanGraph,
+  type RunMode,
+  type RunOutcome,
+  type ToolRequest,
+  type ToolReceipt,
+  type UsageRecord
+} from "agent-protocol";
 
 export type KernelPhase =
   | "idle"
@@ -23,7 +47,47 @@ export interface PendingTool {
 }
 
 export interface KernelState {
-  schemaVersion: 2;
+  schemaVersion: typeof KERNEL_STATE_VERSION;
+  sessionId: string;
+  runId: string;
+  mode: RunMode;
+  phase: KernelPhase;
+  revision: number;
+  lastSeq: number;
+  startedAt: string;
+  deadlineAt: string;
+  activeModelTurn?: ActiveModelTurn;
+  /** True once any content or reasoning from the active provider attempt is durable. */
+  activeModelSemanticDelta?: boolean;
+  messages: ModelMessage[];
+  pendingTools: PendingTool[];
+  toolCallIds: string[];
+  receipts: ToolReceipt[];
+  /** Session-scoped mutation evidence retained across follow-up runs so
+   * validation/review obligations cannot be erased by a run boundary. */
+  mutationEvidence: EvidenceRecord[];
+  evidence: EvidenceRecord[];
+  usage: UsageRecord[];
+  plan: PlanGraph;
+  budget: BudgetLedgerState;
+  checkpointHead?: CheckpointRef;
+  frozenProfile?: FrozenArtifactRef;
+  frozenCustomization?: FrozenCustomizationRef;
+  frozenSkills: FrozenArtifactRef[];
+  activeProcessIds: string[];
+  childIds: string[];
+  completionRepairAttempts: number;
+  continuationAttempts: number;
+  repeatedToolBatchCount: number;
+  receiptCountAtLastUserInput: number;
+  lastToolBatchSignature?: string;
+  proposedOutcome?: RunOutcome;
+  outcome?: RunOutcome;
+}
+
+/** Exact persisted V2 shape, retained solely for explicit migration. */
+export interface KernelStateV2 {
+  schemaVersion: typeof LEGACY_KERNEL_STATE_VERSION_V2;
   sessionId: string;
   runId: string;
   mode: RunMode;
@@ -58,7 +122,7 @@ export interface CreateKernelStateOptions {
 
 export function createKernelState(options: CreateKernelStateOptions): KernelState {
   return {
-    schemaVersion: 2,
+    schemaVersion: KERNEL_STATE_VERSION,
     sessionId: options.sessionId,
     runId: options.runId,
     mode: options.mode,
@@ -71,12 +135,156 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     pendingTools: [],
     toolCallIds: [],
     receipts: [],
+    mutationEvidence: [],
     evidence: [],
+    usage: [],
+    plan: createEmptyPlan(),
+    budget: createBudgetLedger(),
+    frozenSkills: [],
+    activeProcessIds: [],
     childIds: [],
     completionRepairAttempts: 0,
     continuationAttempts: 0,
     repeatedToolBatchCount: 0,
     receiptCountAtLastUserInput: 0
+  };
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+export function isKernelStateV2(value: unknown): value is KernelStateV2 {
+  const state = record(value);
+  if (!state || state.schemaVersion !== LEGACY_KERNEL_STATE_VERSION_V2) return false;
+  const phases: readonly KernelPhase[] = [
+    "idle", "ready_model", "model_in_flight", "tool_pending", "tool_in_flight", "needs_input", "outcome_pending", "terminal"
+  ];
+  return [
+    typeof state.sessionId === "string" && state.sessionId.length > 0,
+    typeof state.runId === "string" && state.runId.length > 0,
+    state.mode === "analyze" || state.mode === "change",
+    phases.includes(state.phase as KernelPhase),
+    Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
+    Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
+    typeof state.startedAt === "string",
+    typeof state.deadlineAt === "string",
+    Array.isArray(state.messages),
+    Array.isArray(state.pendingTools),
+    Array.isArray(state.toolCallIds),
+    Array.isArray(state.receipts),
+    Array.isArray(state.evidence),
+    Array.isArray(state.childIds),
+    [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
+      state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
+  ].every(Boolean);
+}
+
+export function assertKernelStateV2(value: unknown): asserts value is KernelStateV2 {
+  if (!isKernelStateV2(value)) throw new Error("Invalid KernelState V2.");
+}
+
+export function isKernelState(value: unknown): value is KernelState {
+  const state = record(value);
+  if (!state || state.schemaVersion !== KERNEL_STATE_VERSION) return false;
+  return [
+    typeof state.sessionId === "string" && state.sessionId.length > 0,
+    typeof state.runId === "string" && state.runId.length > 0,
+    state.mode === "analyze" || state.mode === "change",
+    typeof state.phase === "string",
+    Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
+    Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
+    typeof state.startedAt === "string",
+    typeof state.deadlineAt === "string",
+    state.activeModelSemanticDelta === undefined || typeof state.activeModelSemanticDelta === "boolean",
+    Array.isArray(state.messages),
+    Array.isArray(state.pendingTools),
+    Array.isArray(state.toolCallIds),
+    Array.isArray(state.receipts),
+    Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord),
+    Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord),
+    Array.isArray(state.usage) && state.usage.every(isUsageRecord),
+    isPlanGraph(state.plan),
+    isBudgetLedgerState(state.budget),
+    state.checkpointHead === undefined || isCheckpointRef(state.checkpointHead),
+    validFrozenState(state),
+    Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
+    Array.isArray(state.childIds),
+    [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
+      state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
+  ].every(Boolean);
+}
+
+function validFrozenState(state: Record<string, unknown>): boolean {
+  return [
+    state.frozenProfile === undefined || isFrozenArtifactRef(state.frozenProfile),
+    state.frozenCustomization === undefined || isFrozenCustomizationRef(state.frozenCustomization),
+    Array.isArray(state.frozenSkills) && state.frozenSkills.every(isFrozenArtifactRef)
+  ].every(Boolean);
+}
+
+function isFrozenArtifactRef(value: unknown): value is FrozenArtifactRef {
+  const item = record(value);
+  if (!item) return false;
+  const manifestAbsent = item?.executionManifestArtifactId === undefined
+    && item?.executionManifestDigest === undefined;
+  const manifestPresent = [
+    typeof item.executionManifestArtifactId === "string",
+    typeof item.executionManifestArtifactId === "string"
+      && /^[a-f0-9]{64}$/u.test(item.executionManifestArtifactId),
+    typeof item.executionManifestDigest === "string",
+    typeof item.executionManifestDigest === "string"
+      && /^[a-f0-9]{64}$/u.test(item.executionManifestDigest)
+  ].every(Boolean);
+  return [
+    typeof item.artifactId === "string" && item.artifactId.length > 0,
+    typeof item.digest === "string" && item.digest.length > 0,
+    ["home", "workspace", "builtin"].includes(String(item.source)),
+    typeof item.qualifiedName === "string" && item.qualifiedName.length > 0,
+    manifestAbsent || manifestPresent
+  ].every(Boolean);
+}
+
+function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationRef {
+  const item = record(value);
+  return Boolean(item && typeof item.artifactId === "string" && /^[a-f0-9]{64}$/u.test(item.artifactId)
+    && typeof item.digest === "string" && /^[a-f0-9]{64}$/u.test(item.digest));
+}
+
+export function assertKernelState(value: unknown): asserts value is KernelState {
+  if (!isKernelState(value)) throw new Error("Invalid KernelState V4.");
+}
+
+function legacyEvidence(value: JsonValue, index: number, state: KernelStateV2): DiagnosticEvidence {
+  return {
+    evidenceId: `v2:${state.sessionId}:${index + 1}`,
+    sessionId: state.sessionId,
+    runId: state.runId,
+    kind: "diagnostic",
+    status: "informational",
+    createdAt: state.startedAt,
+    producer: { authority: "runtime", id: "v2-kernel-upcast" },
+    summary: "Evidence retained from a V2 kernel snapshot.",
+    data: { source: "v2-kernel-snapshot", diagnostic: value }
+  };
+}
+
+/**
+ * Explicit in-memory upcast for diagnostics/import tooling. Session promotion
+ * should normally rebuild V3 state by replaying upcast events instead.
+ */
+export function upcastKernelStateV2(state: KernelStateV2): KernelState {
+  assertKernelStateV2(state);
+  return {
+    ...state,
+    schemaVersion: KERNEL_STATE_VERSION,
+    mutationEvidence: [],
+    evidence: state.evidence.map((item, index) => legacyEvidence(item, index, state)),
+    usage: [],
+    plan: createEmptyPlan(),
+    budget: createBudgetLedger(),
+    frozenSkills: [],
+    activeProcessIds: []
   };
 }
 

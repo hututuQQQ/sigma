@@ -14,27 +14,33 @@ import type {
   ModelToolDefinition,
   ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
-import { auditDurableChildren, createChildAgentFactory, createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
+import {
+  EVENT_SCHEMA_VERSION,
+  SNAPSHOT_SCHEMA_VERSION,
+  STORE_LAYOUT_VERSION
+} from "../packages/agent-protocol/src/index.js";
+import { createKernelState } from "../packages/agent-kernel/src/index.js";
+import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
+import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
+import { typedCompletion } from "./helpers/typed-evidence.js";
 
-function completion(summary: string, evidenceCallIds: string[]): ModelResponse {
-  return {
-    message: {
-      role: "assistant",
-      content: "",
-      toolCalls: [{
-        id: `complete-${summary}`,
-        name: "complete_task",
-        arguments: {
-          summary,
-          criteria: [{ criterion: "Requested work is complete.", status: "met", evidenceCallIds, rationale: "" }]
-        }
-      }]
-    },
-    finishReason: "tool_calls"
-  };
+const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
+  ...options,
+  reviewer: createApprovingReviewer()
+});
+
+type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
+
+function completion(summary: string): (request: ModelRequest) => ModelResponse {
+  return (request) => typedCompletion(request, {
+    id: `complete-${summary}`,
+    summary,
+    criterion: "Requested work is complete."
+  });
 }
 
 class ScriptedGateway implements ModelGateway {
@@ -56,7 +62,7 @@ class ScriptedGateway implements ModelGateway {
   private releaseFirst!: () => void;
   private readonly firstGate: Promise<void>;
 
-  constructor(private readonly responses: ModelResponse[], private readonly blockFirst = false) {
+  constructor(private readonly responses: ScriptedResponse[], private readonly blockFirst = false) {
     this.firstStarted = new Promise((resolve) => { this.startFirst = resolve; });
     this.firstGate = new Promise((resolve) => { this.releaseFirst = resolve; });
   }
@@ -73,9 +79,9 @@ class ScriptedGateway implements ModelGateway {
       this.startFirst();
       if (this.blockFirst) await this.firstGate;
     }
-    const response = this.responses.shift();
-    if (!response) throw new Error("No scripted response remains.");
-    yield { type: "done", response };
+    const scripted = this.responses.shift();
+    if (!scripted) throw new Error("No scripted response remains.");
+    yield { type: "done", response: typeof scripted === "function" ? scripted(request) : scripted };
   }
 
   async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
@@ -116,7 +122,7 @@ class FailingFirstGateway implements ModelGateway {
     throw new Error("Tests consume the streaming interface.");
   }
 
-  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests += 1;
     if (this.requests === 1) {
       this.startFirst();
@@ -133,7 +139,7 @@ class FailingFirstGateway implements ModelGateway {
         },
         finishReason: "tool_calls" as const
       }
-      : completion("steering survived stale failure", ["read-after-steer"]);
+      : completion("steering survived stale failure")(request);
     yield { type: "done", response };
   }
 
@@ -267,7 +273,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
       kind: "recoverable_failure", code: "agent_no_progress"
     });
     const events = await storedEvents(store, session.sessionId);
-    expect(events.filter((event) => event.type === "tool.completed")).toHaveLength(2);
+    const receipts = events.filter((event) => event.type === "tool.completed");
+    expect(receipts).toHaveLength(2);
+    expect(receipts.every((event) => (event.payload as { outcome?: unknown }).outcome
+      && (event.payload as { outcome: { status?: unknown } }).outcome.status === "succeeded")).toBe(true);
   });
 
   it("removes aborted outcome waiters", async () => {
@@ -297,7 +306,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     execFileSync("git", ["-C", workspace, "add", "tracked.txt"], { windowsHide: true });
     execFileSync("git", ["-C", workspace, "commit", "-m", "initial"], { windowsHide: true });
     await writeFile(path.join(workspace, "victim.txt"), "remove me", "utf8");
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const tools = registerContentValidator(registerBuiltinTools(new EffectToolRegistry()));
     tools.register({
       descriptor: {
         name: "remove_fixture", description: "Remove the fixture file.", inputSchema: { type: "object" },
@@ -318,7 +327,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "remove-victim", name: "remove_fixture", arguments: {} }] },
         finishReason: "tool_calls"
       },
-      completion("removed victim", ["remove-victim"])
+      validationTurn("validate-removal", [{ path: "victim.txt", absent: true }]),
+      completion("removed victim")
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -327,9 +337,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "remove victim" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
-    const receipt = (await storedEvents(store, session.sessionId)).find((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "remove-victim");
-    expect(receipt?.payload).toMatchObject({ workspaceDelta: { deleted: ["victim.txt"] } });
+    const deltaEvidence = (await storedEvents(store, session.sessionId)).find((event) =>
+      event.type === "evidence.recorded"
+      && (event.payload as { kind?: string }).kind === "workspace_delta");
+    expect(deltaEvidence?.payload).toMatchObject({
+      kind: "workspace_delta",
+      data: { delta: { deleted: ["victim.txt"] } }
+    });
   });
 
   it("restores joined child completion evidence from the durable outcome", async () => {
@@ -343,7 +357,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
           message: { role: "assistant", content: "", toolCalls: [{ id: "read-for-evidence", name: "read", arguments: { path: "seed.txt" } }] },
           finishReason: "tool_calls"
         },
-        completion("joined evidence", ["read-for-evidence"])
+        completion("joined evidence")
       ]),
       store: firstStore,
       storeRootDir,
@@ -356,7 +370,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await first.command({ type: "submit", sessionId: session.sessionId, text: "inspect with child evidence" });
     await expect(first.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "completed",
-      evidence: expect.arrayContaining([{ childId: "durable-child", status: "completed" }])
+      evidence: expect.arrayContaining([expect.objectContaining({
+        kind: "child_outcome",
+        status: "passed",
+        data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      })])
     });
 
     const resumed = createRuntime({
@@ -370,7 +388,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await resumed.command({ type: "resume", sessionId: session.sessionId });
     await expect(resumed.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "completed",
-      evidence: expect.arrayContaining([{ childId: "durable-child", status: "completed" }])
+      evidence: expect.arrayContaining([expect.objectContaining({
+        kind: "child_outcome",
+        status: "passed",
+        data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      })])
     });
   });
 
@@ -382,7 +404,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     let seq = 0;
     const append = async (type: AgentEventEnvelope["type"], payload: AgentEventEnvelope["payload"]): Promise<void> => {
       const event: AgentEventEnvelope = {
-        schemaVersion: 2,
+        schemaVersion: EVENT_SCHEMA_VERSION,
         seq: seq + 1,
         eventId: `event-${seq + 1}`,
         sessionId,
@@ -409,7 +431,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
       }]
     });
     await store.writeSnapshot({
-      schemaVersion: 2, sessionId, seq, createdAt: new Date().toISOString(),
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId, seq, createdAt: new Date().toISOString(),
       state: { schemaVersion: 2, sessionId, messages: "invalid" }
     });
 
@@ -428,7 +451,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const startedAt = new Date().toISOString();
     const deadlineAt = new Date(Date.now() + 30_000).toISOString();
     await store.append({
-      schemaVersion: 2,
+      schemaVersion: EVENT_SCHEMA_VERSION,
       seq: 1,
       eventId: "reasoning-created",
       sessionId,
@@ -438,27 +461,20 @@ describe("runtime queues and non-blocking instruction steering", () => {
       authority: "runtime",
       payload: { workspacePath: workspace, mode: "change" }
     }, 0);
+    const snapshotState = {
+      ...createKernelState({ sessionId, runId, mode: "change", startedAt, deadlineAt }),
+      phase: "ready_model" as const,
+      revision: 1,
+      lastSeq: 1,
+      messages: [{ role: "assistant" as const, content: "", reasoningContent: "durable reasoning" }]
+    };
     await store.writeSnapshot({
-      schemaVersion: 2,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId,
       seq: 1,
       createdAt: startedAt,
-      state: {
-        schemaVersion: 2,
-        sessionId,
-        runId,
-        mode: "change",
-        phase: "ready_model",
-        revision: 1,
-        lastSeq: 1,
-        startedAt,
-        deadlineAt,
-        messages: [{ role: "assistant", content: "", reasoningContent: "durable reasoning" }],
-        pendingTools: [],
-        receipts: [],
-        evidence: [],
-        childIds: []
-      }
+      state: snapshotState
     });
 
     const restored = await restoreStoredSession(store, sessionId, 30_000);
@@ -486,7 +502,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       payload: AgentEventEnvelope["payload"]
     ): Promise<void> => {
       const stored: AgentEventEnvelope = {
-        schemaVersion: 2,
+        schemaVersion: EVENT_SCHEMA_VERSION,
         seq: seq + 1,
         eventId: `mode-event-${seq + 1}`,
         sessionId,
@@ -502,30 +518,53 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await append(firstRunId, "session.created", { workspacePath: workspace, mode: initialMode });
     await append(firstRunId, "run.started", { mode: initialMode, deadlineAt });
     await append(firstRunId, "user.message", { text: "first run" });
-    await append(firstRunId, "run.completed", { message: "first done" });
+    await append(firstRunId, "model.started", { turnId: 1, effectRevision: 3 });
+    await append(firstRunId, "model.completed", {
+      turnId: 1,
+      effectRevision: 3,
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "complete-first", name: "complete_task", arguments: {} }]
+      },
+      toolCalls: [{ id: "complete-first", name: "complete_task", arguments: {} }],
+      finishReason: "tool_calls"
+    });
+    await append(firstRunId, "tool.completed", {
+      turnId: 1,
+      effectRevision: 3,
+      callId: "complete-first",
+      ok: true,
+      output: JSON.stringify({ summary: "first done", criteria: [] }),
+      observedEffects: ["outcome.propose"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    await append(firstRunId, "run.completed", { message: "first done", outcomeRevision: seq });
     if (withSnapshot) {
-      await store.writeSnapshot({
-        schemaVersion: 2,
-        sessionId,
-        seq,
-        createdAt: new Date().toISOString(),
-        state: {
-          schemaVersion: 2,
+      const firstRunState = {
+        ...createKernelState({
           sessionId,
           runId: firstRunId,
           mode: initialMode,
-          phase: "terminal",
-          revision: 4,
-          lastSeq: seq,
           startedAt: new Date().toISOString(),
-          deadlineAt,
-          messages: [{ role: "user", content: "first run" }],
-          pendingTools: [],
-          receipts: [],
-          evidence: [],
-          childIds: [],
-          outcome: { kind: "completed", message: "first done", evidence: [] }
-        }
+          deadlineAt
+        }),
+        phase: "terminal" as const,
+        revision: seq,
+        lastSeq: seq,
+        messages: [{ role: "user" as const, content: "first run" }],
+        outcome: { kind: "completed" as const, message: "first done", evidence: [] }
+      };
+      await store.writeSnapshot({
+        schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+        storeLayoutVersion: STORE_LAYOUT_VERSION,
+        sessionId,
+        seq,
+        createdAt: new Date().toISOString(),
+        state: firstRunState
       });
     }
     await append(currentRunId, "run.started", { mode: currentMode, deadlineAt });
@@ -557,12 +596,14 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "inside", name: "write", arguments: { path: "allowed/inside.txt", content: "good" } }] },
         finishReason: "tool_calls"
       },
-      completion("scoped write completed", ["inside"])
+      validationTurn("validate-scoped-write", [{ path: "allowed/inside.txt", expected: "good" }]),
+      completion("scoped write completed")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
-      gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
+      gateway, store, storeRootDir,
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto", runDeadlineMs: 10_000
     });
     const session = await runtime.createSession({
@@ -585,7 +626,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     let seq = 0;
     const append = async (type: "child.spawned" | "child.completed" | "child.message", detail: Record<string, unknown>): Promise<void> => {
       const event = {
-        schemaVersion: 2 as const, seq: seq + 1, eventId: `child-event-${seq + 1}`, parentSessionId,
+        schemaVersion: EVENT_SCHEMA_VERSION, seq: seq + 1, eventId: `child-event-${seq + 1}`, parentSessionId,
         sessionId: parentSessionId, runId: "parent-run", occurredAt: new Date(Date.now() + seq).toISOString(),
         type, authority: "runtime" as const, payload: { childId: "child-1", payload: detail }
       };
@@ -619,7 +660,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "read-seed", name: "read", arguments: { path: "seed.txt" } }] },
         finishReason: "tool_calls"
       },
-      completion("steering preserved", ["read-seed"])
+      completion("steering preserved")
     ], true);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
@@ -681,7 +722,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     const events = await storedEvents(store, session.sessionId);
     expect(events.some((event) => event.type === "model.failed"
-      && (event.payload as { code?: string }).code === "old_turn_failure")).toBe(true);
+      && (event.payload as { code?: string }).code === "old_turn_failure")).toBe(false);
     expect(events.some((event) => event.type === "run.failed"
       && (event.payload as { code?: string }).code === "old_turn_failure")).toBe(false);
   });
@@ -748,7 +789,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      completion("new steering completed", ["corrected-read"])
+      completion("new steering completed")
     ]);
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 10_000
@@ -770,7 +811,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     const events = await storedEvents(store, session.sessionId);
     expect(events.some((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "old-complete")).toBe(true);
+      && (event.payload as { callId?: string }).callId === "old-complete")).toBe(false);
     expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);
     expect(events.find((event) => event.type === "run.completed")?.payload).toMatchObject({
       message: "new steering completed"
@@ -790,7 +831,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      completion("obsolete joined outcome", ["old-read"]),
+      completion("obsolete joined outcome"),
       {
         message: {
           role: "assistant", content: "",
@@ -798,7 +839,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      completion("steering won outcome race", ["new-read"])
+      completion("steering won outcome race")
     ]);
     let joinStarted!: () => void;
     let releaseJoin!: () => void;
@@ -850,7 +891,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "corrected-read", name: "read", arguments: { path: "seed.txt" } }] },
         finishReason: "tool_calls"
       },
-      completion("approval steering completed", ["corrected-read"])
+      completion("approval steering completed")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
@@ -886,12 +927,17 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const gateway = new ScriptedGateway([
       { message: { role: "assistant", content: "", toolCalls: calls }, finishReason: "tool_calls" },
       { message: { role: "assistant", content: "", toolCalls: replannedCalls }, finishReason: "tool_calls" },
-      completion("both writes completed", replannedCalls.map((call) => call.id))
+      validationTurn("validate-both-writes", [
+        { path: "nested/a.txt", expected: "a" },
+        { path: "nested/b.txt", expected: "b" }
+      ]),
+      completion("both writes completed")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
-      gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
+      gateway, store, storeRootDir,
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "ask", runDeadlineMs: 10_000, maxParallelTools: 4
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
@@ -931,9 +977,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     ];
     const gateway = new ScriptedGateway([
       { message: { role: "assistant", content: "", toolCalls: calls }, finishReason: "tool_calls" },
-      completion("receipts persisted", calls.map((call) => call.id))
+      validationTurn("validate-parallel-writes", [
+        { path: "fast.txt", expected: "fast_side_effect" },
+        { path: "approved.txt", expected: "approval_side_effect" }
+      ]),
+      completion("receipts persisted")
     ]);
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    const tools = registerContentValidator(registerBuiltinTools(new EffectToolRegistry()));
     const sideEffectTool = (name: string, approval: "auto" | "prompt", file: string) => ({
       descriptor: {
         name, description: name, inputSchema: { type: "object" as const }, possibleEffects: ["filesystem.write" as const],
@@ -986,17 +1036,19 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      completion("child completed", ["child-write"])
+      validationTurn("validate-child-write", [{ path: "child.txt", expected: "child" }]),
+      completion("child completed")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "ask",
       runDeadlineMs: 10_000
     });
+    const parent = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const messages: unknown[] = [];
     const supervisor = new AgentSupervisor(
       createChildAgentFactory(() => runtime),
@@ -1005,7 +1057,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       async (event) => { messages.push(event); }
     );
     const child = supervisor.spawn({
-      parentId: "parent",
+      parentId: parent.sessionId,
       instruction: "write child.txt",
       workspacePath: workspace,
       intent: "write",

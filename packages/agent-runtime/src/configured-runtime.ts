@@ -1,8 +1,17 @@
 import path from "node:path";
 import { chmod, mkdir, realpath } from "node:fs/promises";
-import type { McpConfigSource, McpServerConfigValue, WorkspaceMcpTrustAttestation } from "agent-config";
-import { createModelGateway, defaultModel } from "agent-model";
+import type {
+  McpConfigSource,
+  McpServerConfigValue,
+  ModelRouteConfigValue,
+  ModelSpecConfigValue,
+  WorkspaceCustomizationTrustAttestation,
+  WorkspaceMcpTrustAttestation
+} from "agent-config";
 import type { JsonValue, ModelGateway, RunStore } from "agent-protocol";
+import type { ExecutionBroker } from "agent-execution";
+import type { HookDefinition, HookRunnerPort } from "agent-extensions";
+import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
@@ -14,6 +23,13 @@ import type { ChildJoinSummary } from "./types.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { runtimeStateRoot } from "./runtime-state.js";
+import { LazyExecutionBroker } from "./execution-composition.js";
+import { resolveRuntimeCustomization, type RuntimeCustomization } from "./customization.js";
+import { BrokerCommandHookRunner } from "./hook-runner.js";
+import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
+import { ModelReviewer } from "./reviewer.js";
+import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-trust.js";
+import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
 
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -28,21 +44,49 @@ export interface RuntimeCompositionConfig {
   mcpServers: McpServerConfigValue[];
   mcpSource: McpConfigSource;
   workspaceMcpTrust?: WorkspaceMcpTrustAttestation;
+  workspaceCustomizationTrust?: WorkspaceCustomizationTrustAttestation;
+  agentProfile?: string;
+  sandboxMode?: "required";
+  networkMode?: "none" | "full";
+  allowUnsafeHostExec?: boolean;
+  unsafeHostExecRequested?: boolean;
+  reviewerWaiver?: boolean;
+  legacySingleModelRoute?: boolean;
+  modelSpecs?: readonly ModelSpecConfigValue[];
+  modelRoutes?: readonly ModelRouteConfigValue[];
+  budget?: {
+    maxInputTokens: number; maxOutputTokens: number; maxCostMicroUsd: number;
+    maxModelTurns: number; maxToolCalls: number; maxChildren: number; maxDepth: number;
+  };
+  checkpoint?: { maxFiles: number; maxBytes: number };
 }
 
 export interface RuntimeFactoryDeps {
   gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
   stateRootDir?: string;
+  executionBroker?: ExecutionBroker;
+  hookDefinitions?: readonly HookDefinition[];
+  hookRunner?: HookRunnerPort;
+  agentProfileHookRunner?: HookRunnerPort;
 }
 
 export interface ConfiguredRuntime {
   runtime: InProcessRuntimeClient;
   workspace: string;
   storeRootDir: string;
+  execution: ExecutionBroker;
   close(): Promise<void>;
 }
 
 export interface RuntimeFactoryOptions { connectMcp?: boolean; }
+
+interface PreparedComposition {
+  workspace: string;
+  storeRootDir: string;
+  customization: RuntimeCustomization;
+  execution: ExecutionBroker;
+  hookRunner: HookRunnerPort;
+}
 
 async function joinChildren(supervisor: AgentSupervisor, store: RunStore, parentId: string, signal: AbortSignal): Promise<ChildJoinSummary> {
   const jobs = await supervisor.joinParent(parentId, signal);
@@ -70,45 +114,162 @@ export async function createConfiguredRuntime(
   deps: RuntimeFactoryDeps = {},
   options: RuntimeFactoryOptions = {}
 ): Promise<ConfiguredRuntime> {
-  const workspace = await realpath(path.resolve(config.workspace));
-  if (options.connectMcp !== false && config.mcpServers.length > 0) {
-    await verifyWorkspaceMcpTrust(workspace, config.mcpSource, config.workspaceMcpTrust);
-  }
-  const model = config.model === "auto" ? defaultModel(config.provider) : config.model;
-  const gateway = deps.gatewayFactory?.({ provider: config.provider, model }) ?? createModelGateway({
-    provider: config.provider,
-    model: config.model === "auto" ? undefined : model,
-    requestTimeoutMs: config.modelDeadlineSec * 1_000,
-    idleTimeoutMs: config.streamIdleSec * 1_000
+  const prepared = await prepareComposition(config, deps, options);
+  const { workspace, storeRootDir, customization, execution, hookRunner } = prepared;
+  const gateways = createRoleGateways(config, deps, customization);
+  const runtimeReference: { current?: InProcessRuntimeClient } = {};
+  const supervisor = createSupervisor(config, execution, runtimeReference);
+  const tools = createTools(config, execution, supervisor);
+  const mcpClients = options.connectMcp === false
+    ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
+  const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+  const runtime = createRuntime({
+    gateway: gateways.orchestrator,
+    store,
+    storeRootDir,
+    tools,
+    permissionMode: customization.permissionMode,
+    runDeadlineMs: config.runDeadlineSec * 1_000,
+    maxParallelTools: config.maxParallelTools,
+    budgetLimits: customization.budgetLimits,
+    checkpointMaxFiles: config.checkpoint?.maxFiles,
+    checkpointMaxBytes: config.checkpoint?.maxBytes,
+    profile: customization.profile,
+    profileSource: customization.profileSource,
+    availableProfiles: customization.availableProfiles,
+    gatewayForRole: gateways.forRole,
+    execution,
+    skills: customization.skills,
+    hooks: customization.hookDefinitions,
+    hookArtifacts: customization.hookArtifacts,
+    hookRunner,
+    agentProfileHookRunner: deps.agentProfileHookRunner,
+    reviewer: new ModelReviewer(gateways.reviewer, reviewerRouteId(customization.profile)),
+    reviewerForSession: (session) => new ModelReviewer(
+      gateways.forRole("reviewer", session.profile),
+      reviewerRouteId(session.profile)
+    ),
+    joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
+    cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason),
+    hasActiveChildren: (parentId) => supervisor.list(parentId)
+      .some((child) => child.status === "queued" || child.status === "running")
   });
-  const storeRootDir = path.resolve(deps.stateRootDir ?? runtimeStateRoot(workspace));
+  runtimeReference.current = runtime;
+  return {
+    workspace,
+    storeRootDir,
+    runtime,
+    execution,
+    close: async () => {
+      await closeMcpClients(mcpClients);
+      await execution.close();
+    }
+  };
+}
+
+async function prepareComposition(
+  config: RuntimeCompositionConfig,
+  deps: RuntimeFactoryDeps,
+  options: RuntimeFactoryOptions
+): Promise<PreparedComposition> {
+  const workspace = await realpath(path.resolve(config.workspace));
+  await verifyMcpTrust(config, options, workspace);
+  const storeRootDir = await prepareStoreRoot(deps.stateRootDir ?? runtimeStateRoot(workspace));
+  const customization = await resolveRuntimeCustomization(config, workspace, undefined, deps.hookDefinitions);
+  verifyCustomization(config, workspace, customization);
+  const execution = deps.executionBroker ?? new LazyExecutionBroker({
+    sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
+    allowUnsafeHostExec: config.allowUnsafeHostExec === true
+  });
+  return {
+    workspace,
+    storeRootDir,
+    customization,
+    execution,
+    hookRunner: createHookRunner(config, deps, workspace, storeRootDir, customization, execution)
+  };
+}
+
+async function verifyMcpTrust(
+  config: RuntimeCompositionConfig,
+  options: RuntimeFactoryOptions,
+  workspace: string
+): Promise<void> {
+  if (options.connectMcp === false || config.mcpServers.length === 0) return;
+  await verifyWorkspaceMcpTrust(workspace, config.mcpSource, config.workspaceMcpTrust);
+}
+
+async function prepareStoreRoot(configuredRoot: string): Promise<string> {
+  const storeRootDir = path.resolve(configuredRoot);
   await mkdir(storeRootDir, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") await chmod(storeRootDir, 0o700);
-  const runtimeReference: { current?: InProcessRuntimeClient } = {};
-  const supervisor = new AgentSupervisor(
+  return storeRootDir;
+}
+
+function verifyCustomization(
+  config: RuntimeCompositionConfig,
+  workspace: string,
+  customization: RuntimeCustomization
+): void {
+  verifyWorkspaceCustomizationTrust(
+    workspace,
+    customization.workspaceExecutableHookIds,
+    config.workspaceCustomizationTrust,
+    customization.workspaceExecutableHookArtifacts
+  );
+}
+
+function createHookRunner(
+  config: RuntimeCompositionConfig,
+  deps: RuntimeFactoryDeps,
+  workspace: string,
+  storeRootDir: string,
+  customization: RuntimeCustomization,
+  execution: ExecutionBroker
+): HookRunnerPort {
+  return deps.hookRunner ?? new BrokerCommandHookRunner(
+    execution,
+    workspace,
+    undefined,
+    process.env,
+    (hookId) => {
+      if (!customization.workspaceExecutableHookIds.includes(hookId)) return;
+      verifyCustomization(config, workspace, customization);
+    },
+    frozenHookExecutionRoot(storeRootDir)
+  );
+}
+
+function createSupervisor(
+  config: RuntimeCompositionConfig,
+  execution: ExecutionBroker,
+  runtimeReference: { current?: InProcessRuntimeClient }
+): AgentSupervisor {
+  return new AgentSupervisor(
     createChildAgentFactory(() => runtimeReference.current as InProcessRuntimeClient),
     config.maxParallelAgents,
-    new WorkspaceIsolationManager(),
+    new WorkspaceIsolationManager(undefined, { execution }),
     async (event) => {
       const runtime = runtimeReference.current;
       if (!runtime) throw new Error("Runtime is not ready to record child events.");
       await runtime.recordChildEvent(event.parentId, event.type, { childId: event.childId, payload: event.payload });
     }
   );
-  const tools = registerSupervisorTools(registerBuiltinTools(new EffectToolRegistry()), supervisor);
-  const mcpClients = options.connectMcp === false ? [] : await connectMcpServers(config.mcpServers, workspace, tools);
-  const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-  const runtime = createRuntime({
-    gateway,
-    store,
-    storeRootDir,
-    tools,
-    permissionMode: config.permissionMode,
-    runDeadlineMs: config.runDeadlineSec * 1_000,
-    maxParallelTools: config.maxParallelTools,
-    joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
-    cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason)
+}
+
+function createTools(
+  config: RuntimeCompositionConfig,
+  execution: ExecutionBroker,
+  supervisor: AgentSupervisor
+): EffectToolRegistry {
+  const builtins = registerBuiltinTools(new EffectToolRegistry(), {
+    broker: execution,
+    sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
+    networkMode: config.networkMode ?? "none",
+    codeIntel: {
+      presets: discoverLanguageServers(),
+      additionalReadRoots: [defaultBundledLanguageServerRoot()].filter((value): value is string => Boolean(value))
+    }
   });
-  runtimeReference.current = runtime;
-  return { workspace, storeRootDir, runtime, close: async () => await closeMcpClients(mcpClients) };
+  return registerSupervisorTools(builtins, supervisor);
 }

@@ -1,4 +1,5 @@
 import type { JsonValue, ToolEffect } from "agent-protocol";
+import type { ExecutionBroker, ExecutionPolicy } from "agent-execution";
 
 export const MCP_LATEST_PROTOCOL_VERSION = "2025-11-25";
 export const MCP_SUPPORTED_PROTOCOL_VERSIONS = [
@@ -31,6 +32,14 @@ export interface McpStdioServerConfig {
   timeouts?: Partial<McpTimeoutConfig>;
   maxMessageBytes?: number;
   maxStderrBytes?: number;
+}
+
+export interface McpProcessExecution {
+  broker: ExecutionBroker;
+  policy: ExecutionPolicy;
+  /** Declared server-wide effects. Checked again immediately before process spawn. */
+  possibleEffects: ToolEffect[];
+  pollIntervalMs?: number;
 }
 
 export interface McpServerInfo {
@@ -102,5 +111,5 @@ export interface McpToolPolicy {
 
 export interface McpToolBridgeOptions {
   namespace: string;
-  policy?: Partial<McpToolPolicy>;
+  policy: Pick<McpToolPolicy, "possibleEffects"> & Partial<Omit<McpToolPolicy, "possibleEffects">>;
 }

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { currentRunEvidence } from "./helpers/typed-evidence.js";
 import type { ModelCapabilities, ModelGateway, ModelMessage, ModelRequest, ModelResponse, ModelStreamEvent, ModelToolDefinition } from "../packages/agent-protocol/src/index.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runDoctorCommand } from "../packages/agent-cli/src/commands/doctor.js";
@@ -25,6 +26,22 @@ class Capture extends Writable {
   text(): string { return Buffer.concat(this.chunks).toString("utf8"); }
 }
 
+const FIXTURE_USAGE = {
+  inputTokens: 0,
+  outputTokens: 0,
+  reasoningTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  providerReported: true,
+  costMicroUsd: 0,
+  latencyMs: 0,
+  retryAttempt: 0
+} as const;
+
+function withFixtureUsage(response: ModelResponse): ModelResponse {
+  return response.usage ? response : { ...response, usage: FIXTURE_USAGE };
+}
+
 class FakeGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "fake";
@@ -37,21 +54,19 @@ class FakeGateway implements ModelGateway {
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response.");
     if (response.finishReason === "stop") {
-      const ledger = request.messages.find((message) =>
-        message.content.includes("Current-run successful receipt ledger."))?.content ?? "";
-      const evidenceCallIds = [...ledger.matchAll(/^- (.+?) \(/gmu)].map((match) => match[1]);
-      if (evidenceCallIds.length === 0) {
+      const evidence = currentRunEvidence(request);
+      if (evidence.length === 0) {
         this.responses.unshift(response);
-        return {
+        return withFixtureUsage({
           message: {
             role: "assistant",
             content: "",
             toolCalls: [{ id: `inspect-cli-${request.messages.length}`, name: "list", arguments: { path: ".", limit: 20 } }]
           },
           finishReason: "tool_calls"
-        };
+        } as ModelResponse);
       }
-      return {
+      return withFixtureUsage({
         message: {
           role: "assistant",
           content: "",
@@ -63,15 +78,15 @@ class FakeGateway implements ModelGateway {
               criteria: [{
                 criterion: "The CLI protocol workflow completed.",
                 status: "met",
-                evidenceCallIds: [evidenceCallIds.at(-1)!]
+                evidence: [evidence.at(-1)!]
               }]
             }
           }]
         },
         finishReason: "tool_calls"
-      };
+      } as ModelResponse);
     }
-    return response;
+    return withFixtureUsage(response);
   }
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     const response = await this.complete(request);

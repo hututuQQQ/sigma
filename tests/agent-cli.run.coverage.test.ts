@@ -13,6 +13,7 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { describe, expect, it } from "vitest";
+import { typedCompletion } from "./helpers/typed-evidence.js";
 
 class Capture extends Writable {
   readonly chunks: Buffer[] = [];
@@ -28,6 +29,24 @@ class Capture extends Writable {
   }
 }
 
+const FIXTURE_USAGE = {
+  inputTokens: 0,
+  outputTokens: 0,
+  reasoningTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  providerReported: true,
+  costMicroUsd: 0,
+  latencyMs: 0,
+  retryAttempt: 0
+} as const;
+
+function withFixtureUsage(response: ModelResponse): ModelResponse {
+  return response.usage ? response : { ...response, usage: FIXTURE_USAGE };
+}
+
+type ScriptedResponse = ModelResponse | Error | ((request: ModelRequest) => ModelResponse);
+
 class ScriptedGateway implements ModelGateway {
   readonly provider = "scripted";
   readonly model = "scripted";
@@ -42,13 +61,13 @@ class ScriptedGateway implements ModelGateway {
     tokenizer: "approximate"
   };
 
-  constructor(private readonly script: Array<ModelResponse | Error>) {}
+  constructor(private readonly script: ScriptedResponse[]) {}
 
-  async complete(_request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest): Promise<ModelResponse> {
     const next = this.script.shift();
     if (next instanceof Error) throw next;
     if (!next) throw new Error("Scripted gateway exhausted.");
-    return next;
+    return withFixtureUsage(typeof next === "function" ? next(request) : next);
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
@@ -62,26 +81,12 @@ class ScriptedGateway implements ModelGateway {
   }
 }
 
-function complete(summary: string, evidenceCallIds: string[] = []): ModelResponse {
-  return {
-    message: {
-      role: "assistant",
-      content: "",
-      toolCalls: [{
-        id: `complete-${summary}`,
-        name: "complete_task",
-        arguments: {
-          summary,
-          criteria: [{
-            criterion: "The requested CLI test task is complete.",
-            status: "met",
-            evidenceCallIds
-          }]
-        }
-      }]
-    },
-    finishReason: "tool_calls"
-  };
+function complete(summary: string): (request: ModelRequest) => ModelResponse {
+  return (request) => typedCompletion(request, {
+    id: `complete-${summary}`,
+    summary,
+    criterion: "The requested CLI test task is complete."
+  });
 }
 
 function evidenceRequest(callId: string): ModelResponse {
@@ -103,7 +108,7 @@ function writeRequest(): ModelResponse {
       toolCalls: [{
         id: "write-call",
         name: "write",
-        arguments: { path: "approval-result.txt", content: "approved" }
+        arguments: { path: "approval-result.md", content: "approved" }
       }]
     },
     finishReason: "tool_calls"
@@ -129,7 +134,7 @@ async function workspace(prefix: string): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
-function gatewayFactory(script: Array<ModelResponse | Error>): () => ModelGateway {
+function gatewayFactory(script: ScriptedResponse[]): () => ModelGateway {
   return () => new ScriptedGateway(script);
 }
 
@@ -161,7 +166,7 @@ describe("run command branch coverage", () => {
       "--workspace", root,
       "--permission-mode", "auto"
     ], { stdin, stdout, stderr, mode: "analyze", gatewayFactory: gatewayFactory([
-      evidenceRequest("file-evidence"), complete("file complete", ["file-evidence"])
+      evidenceRequest("file-evidence"), complete("file complete")
     ]) });
     expect(code).toBe(0);
     expect(stdout.text()).toContain("file complete");
@@ -179,7 +184,7 @@ describe("run command branch coverage", () => {
       "--permission-mode", "auto",
       "--output-format", "stream-json"
     ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([
-      evidenceRequest("stream-evidence"), complete("stream complete", ["stream-evidence"])
+      evidenceRequest("stream-evidence"), complete("stream complete")
     ]) });
     expect(code).toBe(0);
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
@@ -205,7 +210,7 @@ describe("run command branch coverage", () => {
       stderr,
       mode: "analyze",
       gatewayFactory: gatewayFactory([
-        evidenceRequest("stdin-evidence"), complete("stdin complete", ["stdin-evidence"])
+        evidenceRequest("stdin-evidence"), complete("stdin complete")
       ])
     });
     expect(code).toBe(0);
@@ -257,18 +262,19 @@ describe("run command branch coverage", () => {
     const stdout = new Capture();
     stdout.isTTY = true;
     const stderr = new Capture();
-    const completion = allowed ? complete("approved complete", ["write-call"]) : complete("denied complete", ["denial-evidence"]);
+    const completion = allowed ? complete("approved complete") : complete("denied complete");
     const script = allowed
       ? [writeRequest(), completion]
       : [writeRequest(), evidenceRequest("denial-evidence"), completion];
     const code = await runCommand([
       "write approval result",
       "--workspace", root,
-      "--permission-mode", "ask"
+      "--permission-mode", "ask",
+      ...(allowed ? ["--waive-reviewer"] : [])
     ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory(script) });
     expect(code).toBe(0);
     expect(stderr.text()).toContain(eventType);
-    if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.txt"), "utf8"))).toBe("approved");
+    if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.md"), "utf8"))).toBe("approved");
   });
 
   it("maps model failures to an error result and exit code one", async () => {
@@ -284,7 +290,10 @@ describe("run command branch coverage", () => {
       "--output-format", "json"
     ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([new Error("provider unavailable")]) });
     expect(code).toBe(1);
-    expect(JSON.parse(stdout.text())).toMatchObject({ status: "error", finalMessage: "provider unavailable" });
+    expect(JSON.parse(stdout.text())).toMatchObject({
+      status: "error",
+      finalMessage: "Model route 'default' failed on 'deepseek/deepseek-v4-pro' (protocol)."
+    });
   });
 
   it("reports prompt-file read failures through stderr", async () => {
@@ -295,5 +304,17 @@ describe("run command branch coverage", () => {
       stderr
     })).resolves.toBe(1);
     expect(stderr.text()).toBeTruthy();
+  });
+
+  it("emits a typed stream-json error envelope for pre-run failures", async () => {
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true });
+    await expect(runCommand([
+      "--prompt-file", path.join(os.tmpdir(), "missing-sigma-stream-prompt"),
+      "--output-format", "stream-json"
+    ], { stdin, stdout, stderr })).resolves.toBe(1);
+    expect(JSON.parse(stdout.text())).toMatchObject({ schemaVersion: 3, kind: "error", type: "error" });
+    expect(stderr.text()).toBe("");
   });
 });

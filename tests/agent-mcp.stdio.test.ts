@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { JsonValue, ToolExecutionContext } from "../packages/agent-protocol/src/index.js";
+import type { JsonValue, ToolEffect, ToolExecutionContext } from "../packages/agent-protocol/src/index.js";
 import {
   McpConnectionError,
   McpProtocolError,
@@ -25,6 +25,21 @@ import type {
   McpStdioServerConfig,
   McpToolDefinition
 } from "../packages/agent-mcp/src/types.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
+
+function mcpExecution() {
+  return {
+    broker: createHostExecutionBroker(),
+    possibleEffects: ["filesystem.read" as const],
+    policy: {
+      sandbox: "required" as const,
+      network: "none" as const,
+      readRoots: [process.cwd()],
+      writeRoots: []
+    },
+    pollIntervalMs: 2
+  };
+}
 
 const SERVER = String.raw`
 const { spawn } = require("node:child_process");
@@ -181,7 +196,7 @@ function createClient(
     args: ["-e", SERVER, mode],
     cwd: process.cwd(),
     timeouts: { idleTimeoutMs: 250, hardDeadlineMs: 2_000, shutdownGraceMs: 50, ...timeouts }
-  }, hooks);
+  }, hooks, mcpExecution());
 }
 
 function createAdvancedClient(
@@ -196,7 +211,7 @@ function createAdvancedClient(
     cwd: process.cwd(),
     timeouts: { idleTimeoutMs: 250, hardDeadlineMs: 2_000, shutdownGraceMs: 50 },
     ...overrides
-  }, hooks);
+  }, hooks, mcpExecution());
 }
 
 function executionContext(
@@ -418,12 +433,14 @@ describe("MCP protocol normalization", () => {
     const structured = await McpToolBridge.create(fakeBridgeClient(tools.slice(0, 1), {
       content: [],
       structuredContent: { answer: 42 }
-    }), { namespace: "structured" });
+    }), { namespace: "structured", policy: { possibleEffects: ["filesystem.read"] } });
     await expect(structured.execute(
       { callId: "structured", name: "structured__alpha_one", arguments: {} },
       executionContext(new AbortController().signal)
     )).resolves.toMatchObject({ ok: true, output: "{\"answer\":42}", diagnostics: [] });
-    const empty = await McpToolBridge.create(fakeBridgeClient(tools.slice(0, 1), { content: [] }), { namespace: "empty" });
+    const empty = await McpToolBridge.create(fakeBridgeClient(tools.slice(0, 1), { content: [] }), {
+      namespace: "empty", policy: { possibleEffects: ["filesystem.read"] }
+    });
     await expect(empty.execute(
       { callId: "empty", name: "empty__alpha_one", arguments: {} },
       executionContext(new AbortController().signal)
@@ -432,19 +449,39 @@ describe("MCP protocol normalization", () => {
 
   it("rejects ambiguous bridge namespaces, names, and policies", async () => {
     const single: McpToolDefinition[] = [{ name: "tool", inputSchema: {} }];
-    await expect(McpToolBridge.create(fakeBridgeClient(single, { content: [] }), { namespace: "..." }))
+    const undeclared = fakeBridgeClient(single, { content: [] });
+    const undeclaredList = vi.spyOn(undeclared, "listTools");
+    await expect(McpToolBridge.create(undeclared, {
+      namespace: "scope", policy: {} as { possibleEffects: ToolEffect[] }
+    })).rejects.toMatchObject({ code: "mcp_effects_required" });
+    expect(undeclaredList).not.toHaveBeenCalled();
+    for (const effect of ["filesystem.write", "destructive", "open_world"] as const) {
+      const forbidden = fakeBridgeClient(single, { content: [] });
+      const forbiddenList = vi.spyOn(forbidden, "listTools");
+      await expect(McpToolBridge.create(forbidden, {
+        namespace: "scope", policy: { possibleEffects: [effect] }
+      })).rejects.toMatchObject({ code: "mcp_persistent_effect_forbidden", forbiddenEffects: [effect] });
+      expect(forbiddenList).not.toHaveBeenCalled();
+    }
+    await expect(McpToolBridge.create(fakeBridgeClient(single, { content: [] }), {
+      namespace: "...", policy: { possibleEffects: ["filesystem.read"] }
+    }))
       .rejects.toThrow("namespace is required");
     await expect(McpToolBridge.create(fakeBridgeClient(single, { content: [] }), {
       namespace: "scope",
-      policy: { timeoutMs: 0 }
+      policy: { possibleEffects: ["filesystem.read"], timeoutMs: 0 }
     })).rejects.toThrow("timeout must be positive");
     await expect(McpToolBridge.create(fakeBridgeClient([
       { name: "same.name", inputSchema: {} },
       { name: "same_name", inputSchema: {} }
-    ], { content: [] }), { namespace: "scope" })).rejects.toThrow("Duplicate MCP tool");
+    ], { content: [] }), {
+      namespace: "scope", policy: { possibleEffects: ["filesystem.read"] }
+    })).rejects.toThrow("Duplicate MCP tool");
     await expect(McpToolBridge.create(fakeBridgeClient([
       { name: "x".repeat(80), inputSchema: {} }
-    ], { content: [] }), { namespace: "scope" })).rejects.toThrow("cannot be represented safely");
+    ], { content: [] }), {
+      namespace: "scope", policy: { possibleEffects: ["filesystem.read"] }
+    })).rejects.toThrow("cannot be represented safely");
   });
 });
 
@@ -682,6 +719,40 @@ describe("MCP stdio client", () => {
     expect(missing.state).toBe("closed");
   });
 
+  it("rejects unsafe persistent capabilities before the transport spawns a process", async () => {
+    for (const effect of ["filesystem.write", "destructive", "open_world"] as const) {
+      const execution = mcpExecution();
+      const spawn = vi.spyOn(execution.broker, "spawn");
+      const client = new McpStdioClient({
+        name: `forbidden-${effect}`,
+        command: process.execPath,
+        args: ["-e", "process.stdin.resume()"],
+        cwd: process.cwd()
+      }, {}, { ...execution, possibleEffects: [effect] });
+      await expect(client.connect()).rejects.toMatchObject({
+        code: "mcp_persistent_effect_forbidden",
+        forbiddenEffects: [effect]
+      });
+      expect(spawn).not.toHaveBeenCalled();
+      await execution.broker.close();
+    }
+
+    const execution = mcpExecution();
+    const spawn = vi.spyOn(execution.broker, "spawn");
+    const client = new McpStdioClient({
+      name: "write-root",
+      command: process.execPath,
+      args: ["-e", "process.stdin.resume()"],
+      cwd: process.cwd()
+    }, {}, {
+      ...execution,
+      policy: { ...execution.policy, writeRoots: [process.cwd()] }
+    });
+    await expect(client.connect()).rejects.toMatchObject({ code: "mcp_write_roots_forbidden" });
+    expect(spawn).not.toHaveBeenCalled();
+    await execution.broker.close();
+  });
+
   it("bounds stderr even when diagnostic hooks throw", async () => {
     const seen = vi.fn(() => { throw new Error("diagnostic hook failure"); });
     const client = createAdvancedClient("stderr", { onStderr: seen }, { maxStderrBytes: 8 });
@@ -713,7 +784,7 @@ describe("MCP stdio client", () => {
       onMessage: () => undefined,
       onFailure: () => undefined,
       onStderr: (text) => seen.push(text)
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     try {
       await transport.start();
       await eventually(() => transport.stderr === "中文 🚀");
@@ -734,7 +805,7 @@ describe("MCP stdio client", () => {
     const transport = new McpStdioTransport(config, {
       onMessage: () => undefined,
       onFailure: () => undefined
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     await expect(transport.send({ jsonrpc: "2.0", method: "before-start" })).rejects.toBeInstanceOf(McpConnectionError);
     await transport.start();
     expect(transport.processId).toBeTypeOf("number");
@@ -752,7 +823,7 @@ describe("MCP stdio client", () => {
     }, {
       onMessage: (message) => { messages.push(message); },
       onFailure: (error) => { failures.push(error); }
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     await tail.start();
     await eventually(() => messages.length === 1 && failures.length === 1);
     expect(messages).toEqual([{ tail: true }]);
@@ -766,7 +837,7 @@ describe("MCP stdio client", () => {
     }, {
       onMessage: () => undefined,
       onFailure: (error) => { invalidTailFailures.push(error); }
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     await invalidTail.start();
     await eventually(() => invalidTailFailures.length > 0);
     expect(invalidTailFailures[0]).toBeInstanceOf(McpProtocolError);
@@ -778,7 +849,7 @@ describe("MCP stdio client", () => {
     }, {
       onMessage: () => undefined,
       onFailure: () => undefined
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     await backpressure.start();
     await backpressure.send({ jsonrpc: "2.0", method: "large", payload: "x".repeat(2 * 1024 * 1024) });
     await backpressure.close();
@@ -805,7 +876,7 @@ describe("MCP stdio client", () => {
     }, {
       onMessage: (message) => { messages.push(message); },
       onFailure: () => undefined
-    }, 1_024, 1_024, 10);
+    }, 1_024, 1_024, 10, mcpExecution());
     try {
       await transport.start();
       await eventually(() => messages.length === 1);

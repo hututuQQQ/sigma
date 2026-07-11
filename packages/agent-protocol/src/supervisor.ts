@@ -2,6 +2,7 @@ import type { JsonValue } from "./json.js";
 import type { ToolEffect } from "./tools.js";
 
 export interface SupervisorSpawnInput {
+  childId?: string;
   parentId: string;
   instruction: string;
   workspacePath: string;

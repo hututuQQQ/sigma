@@ -1,18 +1,28 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, cp, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { packageAgentCli, pinnedNodeVersion } from "../scripts/package-agent-cli.mjs";
-import { runTargetWrapperVersion, verifyAgentCliPackage } from "../scripts/verify-agent-cli-package.mjs";
+import {
+  runTargetWrapperVersion,
+  verifyAgentCliPackage,
+  verifyPortableSbomComponents
+} from "../scripts/verify-agent-cli-package.mjs";
 
-async function writeBuiltPackage(rootDir: string, packageName: string, dependencies: Record<string, string> = {}) {
+async function writeBuiltPackage(
+  rootDir: string,
+  packageName: string,
+  dependencies: Record<string, string> = {},
+  version = "2.0.0"
+) {
   const packageDir = path.join(rootDir, "packages", packageName);
   await mkdir(path.join(packageDir, "dist"), { recursive: true });
   const distIndex = packageName === "agent-cli"
     ? [
         "if (process.argv[2] === 'version' && process.argv.includes('--json')) {",
-        "  process.stdout.write(JSON.stringify({ product: 'Sigma Code', package: { name: 'agent-cli', version: '2.0.0' }, runtime: { node: process.version } }) + '\\n');",
+        `  process.stdout.write(JSON.stringify({ product: 'Sigma Code', package: { name: 'agent-cli', version: '${version}' }, runtime: { node: process.version } }) + '\\n');`,
         "}",
         "export {};",
         ""
@@ -24,7 +34,7 @@ async function writeBuiltPackage(rootDir: string, packageName: string, dependenc
     `${JSON.stringify(
       {
         name: packageName,
-        version: "2.0.0",
+        version,
         type: "module",
         main: "./dist/index.js",
         dependencies
@@ -126,7 +136,85 @@ async function writePackageFixture() {
   return rootDir;
 }
 
+async function writeMinimalExecutable(
+  filePath: string,
+  targetPlatform: "linux" | "win32",
+  targetArch: "x64" | "arm64" = "x64"
+) {
+  if (targetPlatform === "linux") {
+    const header = Buffer.alloc(64);
+    Buffer.from([0x7f, 0x45, 0x4c, 0x46]).copy(header, 0);
+    header[4] = 2;
+    header[5] = 1;
+    header[6] = 1;
+    header.writeUInt16LE(3, 16);
+    header.writeUInt16LE(targetArch === "x64" ? 0x003e : 0x00b7, 18);
+    await writeFile(filePath, header);
+    return;
+  }
+  const header = Buffer.alloc(0x9a);
+  header.write("MZ", 0, "ascii");
+  header.writeUInt32LE(0x80, 0x3c);
+  header.write("PE\0\0", 0x80, "binary");
+  header.writeUInt16LE(targetArch === "x64" ? 0x8664 : 0xaa64, 0x84);
+  header.writeUInt16LE(1, 0x86);
+  header.writeUInt16LE(0x00f0, 0x94);
+  header.writeUInt16LE(0x0002, 0x96);
+  header.writeUInt16LE(0x020b, 0x98);
+  await writeFile(filePath, header);
+}
+
+async function writeV3PackageFixture(
+  brokerTarget: "linux" | "win32" = "linux",
+  brokerArch: "x64" | "arm64" = "x64"
+) {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-v3-"));
+  const version = "3.0.0-beta.1";
+  await writeFile(path.join(rootDir, "package.json"), `${JSON.stringify({ name: "sigma", version, private: true })}\n`, "utf8");
+  await writeBuiltPackage(rootDir, "agent-protocol", {}, version);
+  await writeBuiltPackage(rootDir, "agent-execution", {}, version);
+  await writeBuiltPackage(rootDir, "agent-checkpoint", {}, version);
+  await writeBuiltPackage(rootDir, "agent-extensions", {}, version);
+  await writeBuiltPackage(rootDir, "agent-code-intel", {
+    pyright: "1.1.411",
+    typescript: "5.9.3"
+  }, version);
+  await writeFile(
+    path.join(rootDir, "packages", "agent-code-intel", "dist", "typescript-server.mjs"),
+    "export {};\n",
+    "utf8"
+  );
+  await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" }, version);
+  await writeBuiltPackage(rootDir, "agent-cli", { "agent-runtime": "workspace:*" }, version);
+  const modules = path.join(rootDir, "packages", "agent-code-intel", "node_modules");
+  for (const [name, packageVersion, entry] of [
+    ["pyright", "1.1.411", "langserver.index.js"],
+    ["typescript", "5.9.3", "lib/typescript.js"]
+  ] as const) {
+    const packageDir = path.join(modules, name);
+    await writeExternalPackage(packageDir, { name, version: packageVersion });
+    const entryPath = path.join(packageDir, ...entry.split("/"));
+    await mkdir(path.dirname(entryPath), { recursive: true });
+    await writeFile(entryPath, "export {};\n", "utf8");
+  }
+  const tokenizerAsset = path.join(rootDir, "assets", "tokenizers", "sigma-cjk-byte-v1.json");
+  await mkdir(path.dirname(tokenizerAsset), { recursive: true });
+  await writeFile(tokenizerAsset, `${JSON.stringify({
+    schemaVersion: 1,
+    id: "sigma/cjk-byte-v1",
+    accuracy: "approximate",
+    safetyMarginPercent: 20
+  })}\n`, "utf8");
+  const broker = path.join(rootDir, "sigma-exec");
+  await writeMinimalExecutable(broker, brokerTarget, brokerArch);
+  return { rootDir, broker, version };
+}
+
 describe("package-agent-cli", () => {
+  it("rejects non-Tier-1 architectures", async () => {
+    await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
+  });
+
   it("creates the Linux x64 artifact with bin/agent and bundled node", async () => {
     const rootDir = await writePackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
@@ -144,10 +232,10 @@ describe("package-agent-cli", () => {
     await expect(stat(path.join(result.bundleDir, "bin", "node"))).resolves.toBeTruthy();
 
     const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent"), "utf8");
-    expect(wrapper).toContain('if [ -x "$SCRIPT_DIR/node" ]; then');
+    expect(wrapper).toContain('if [ ! -x "$NODE" ]; then');
     expect(wrapper).toContain('NODE="$SCRIPT_DIR/node"');
-    expect(wrapper).toContain("elif command -v node >/dev/null 2>&1; then");
-    expect(wrapper).toContain("Sigma agent cannot start: no bundled node and no system node found.");
+    expect(wrapper).not.toContain("command -v node");
+    expect(wrapper).toContain("Sigma Code cannot start: the bundled Node runtime is missing or not executable.");
     expect(wrapper).toContain('exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"');
 
     const listing = spawnSync("tar", ["-tzf", result.outputPath], { encoding: "utf8" });
@@ -318,6 +406,107 @@ describe("package-agent-cli", () => {
     expect(report.entries).toBeGreaterThan(10);
   });
 
+  it("rejects a renamed sigma-exec binary for a different target", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("win32");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
+
+    await expect(packageAgentCli({
+      rootDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        NODE_RUNTIME_SHA256: runtimeSha256,
+        SIGMA_EXEC_BINARY: broker
+      }
+    })).rejects.toThrow("sigma-exec binary target mismatch: expected linux-x64, detected win32-x64");
+  });
+
+  it("rejects a sigma-exec binary for a different architecture", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux", "arm64");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
+
+    await expect(packageAgentCli({
+      rootDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        NODE_RUNTIME_SHA256: runtimeSha256,
+        SIGMA_EXEC_BINARY: broker
+      }
+    })).rejects.toThrow("sigma-exec binary target mismatch: expected linux-x64, detected linux-arm64");
+  });
+
+  it("packages V3 broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
+    const { rootDir, broker, version } = await writeV3PackageFixture();
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
+    const artifactsDir = path.join(rootDir, ".artifacts");
+    const packaged = await packageAgentCli({
+      rootDir,
+      artifactsDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        NODE_RUNTIME_SHA256: runtimeSha256,
+        SIGMA_EXEC_BINARY: broker
+      }
+    });
+    const report = await verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      env: {}
+    });
+
+    expect(report).toMatchObject({
+      ok: true,
+      checks: {
+        bundledNode: true,
+        noSystemNodeFallback: true,
+        sigmaExec: true,
+        languageServerAssets: true,
+        tokenizerAssets: true,
+        integrity: true,
+        sbom: true,
+        provenance: true,
+        archiveChecksum: true
+      },
+      metadata: {
+        schemaVersion: 3,
+        productVersion: version,
+        node: { archiveSha256: runtimeSha256 },
+        sigmaExec: { source: "env" }
+      }
+    });
+    expect(report.sidecars).toMatchObject({
+      portableAssets: 6,
+      tokenizerAssets: 1
+    });
+    expect(report.sidecars.components).toBeGreaterThanOrEqual(11);
+
+    const sbom = JSON.parse(await readFile(path.join(packaged.bundleDir, "sbom.cdx.json"), "utf8"));
+    const integrity = JSON.parse(await readFile(path.join(packaged.bundleDir, "integrity-manifest.json"), "utf8"));
+    const metadata = JSON.parse(await readFile(path.join(packaged.bundleDir, "package-metadata.json"), "utf8"));
+    const missingBroker = structuredClone(sbom);
+    missingBroker.components = missingBroker.components.filter(
+      (component: { properties?: Array<{ name: string; value: string }> }) =>
+        !component.properties?.some((property) => property.name === "sigma:path" && property.value === "bin/sigma-exec")
+    );
+    expect(() => verifyPortableSbomComponents(missingBroker, integrity, metadata, "linux", "x64"))
+      .toThrow("CycloneDX SBOM is missing portable asset component bin/sigma-exec");
+
+    const forgedTokenizer = structuredClone(sbom);
+    const tokenizer = forgedTokenizer.components.find(
+      (component: { properties?: Array<{ name: string; value: string }> }) =>
+        component.properties?.some((property) => property.name === "sigma:asset-kind" && property.value === "tokenizer")
+    );
+    tokenizer.hashes[0].content = "0".repeat(64);
+    expect(() => verifyPortableSbomComponents(forgedTokenizer, integrity, metadata, "linux", "x64"))
+      .toThrow("SHA-256 does not match integrity metadata");
+  });
+
   windowsZipFixtureIt("creates and verifies the Windows x64 artifact with agent.cmd and bundled node.exe", async () => {
     const rootDir = await writePackageFixture();
     const runtimeArchive = await writeFakeWindowsNodeRuntimeZip(rootDir);
@@ -341,7 +530,7 @@ describe("package-agent-cli", () => {
 
     const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent.cmd"), "utf8");
     expect(wrapper).toContain("set \"NODE_EXE=%SCRIPT_DIR%node.exe\"");
-    expect(wrapper).toContain("where node");
+    expect(wrapper).not.toContain("where node");
     expect(wrapper).toContain("\"%NODE_EXE%\" \"%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js\" %*");
 
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");

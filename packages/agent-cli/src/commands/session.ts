@@ -1,6 +1,17 @@
-import type { AgentEventEnvelope, RuntimeClient, SessionOverview } from "agent-protocol";
+import type {
+  AgentEventEnvelope,
+  BudgetLimits,
+  RuntimeClient,
+  SessionOverview
+} from "agent-protocol";
 import { realpath } from "node:fs/promises";
-import { activeSessionOwner, runtimeStateRoot, sendSessionCommand } from "agent-runtime";
+import {
+  activeSessionOwner,
+  rebuildV3SnapshotFromEvents,
+  runtimeStateRoot,
+  sendSessionCommand
+} from "agent-runtime";
+import { promoteV2Session, V2ReadOnlySessionStore } from "agent-store";
 import { loadCliConfig, parseArgs } from "../config.js";
 import { createConfiguredRuntime } from "agent-runtime";
 
@@ -84,6 +95,55 @@ function requiredRequestId(parsed: ConfiguredSessionCommand): string {
   return requestId;
 }
 
+function checkpointRecovery(parsed: ConfiguredSessionCommand): {
+  checkpointId: string;
+  decision: "restore" | "keep";
+} {
+  const checkpointId = parsed.positionals[1];
+  if (!checkpointId) throw new Error("session recover requires a checkpoint id.");
+  const restore = parsed.flags.restore === true;
+  const keep = parsed.flags.keep === true;
+  if (restore === keep) throw new Error("session recover requires exactly one of --restore or --keep.");
+  return { checkpointId, decision: restore ? "restore" : "keep" };
+}
+
+function reviewerWaiver(parsed: ConfiguredSessionCommand): {
+  reason: string;
+  checkpointId?: string;
+} {
+  const reason = typeof parsed.flags.reason === "string" ? parsed.flags.reason.trim() : "";
+  if (!reason || reason.length > 2_000) {
+    throw new Error("session waive-reviewer requires --reason with 1 to 2,000 characters.");
+  }
+  const checkpointId = parsed.positionals[1]?.trim();
+  return { reason, ...(checkpointId ? { checkpointId } : {}) };
+}
+
+const BUDGET_FLAGS = {
+  "max-input-tokens": "inputTokens",
+  "max-output-tokens": "outputTokens",
+  "max-cost-micro-usd": "costMicroUsd",
+  "max-model-turns": "modelTurns",
+  "max-tool-calls": "toolCalls",
+  "max-children": "children",
+  "max-agent-depth": "maxDepth"
+} as const satisfies Record<string, keyof BudgetLimits>;
+
+function budgetIncrease(flags: Record<string, unknown>): Partial<BudgetLimits> {
+  const increase: Partial<BudgetLimits> = {};
+  for (const [flag, dimension] of Object.entries(BUDGET_FLAGS)) {
+    const raw = flags[flag];
+    if (raw === undefined) continue;
+    const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`--${flag} must be a non-negative integer.`);
+    increase[dimension] = value;
+  }
+  if (!Object.values(increase).some((value) => value > 0)) {
+    throw new Error("session budget requires at least one positive limit increase.");
+  }
+  return increase;
+}
+
 async function handleOwnedSession(
   subcommand: string,
   parsed: ConfiguredSessionCommand,
@@ -101,6 +161,28 @@ async function handleOwnedSession(
       type: "cancel", sessionId, reason: cancellationReason(parsed.flags)
     });
     io.stdout.write(`cancel requested ${sessionId}\n`);
+    return 0;
+  }
+  if (subcommand === "recover") {
+    const recovery = checkpointRecovery(parsed);
+    await sendCommand(parsed.storeRootDir, {
+      type: "checkpoint_recovery",
+      sessionId,
+      ...recovery
+    });
+    io.stdout.write(`${recovery.decision} requested ${recovery.checkpointId}\n`);
+    return 0;
+  }
+  if (subcommand === "budget") {
+    const increase = budgetIncrease(parsed.flags);
+    await sendCommand(parsed.storeRootDir, { type: "budget_increase", sessionId, increase });
+    io.stdout.write(`budget increase requested ${sessionId} ${JSON.stringify(increase)}\n`);
+    return 0;
+  }
+  if (subcommand === "waive-reviewer") {
+    const waiver = reviewerWaiver(parsed);
+    await sendCommand(parsed.storeRootDir, { type: "reviewer_waiver", sessionId, ...waiver });
+    io.stdout.write(`reviewer waiver requested ${waiver.checkpointId ?? "latest-pending"}\n`);
     return 0;
   }
   if (subcommand !== "approve") return undefined;
@@ -130,6 +212,34 @@ async function handleStoredSession(
     io.stdout.write(`${decision} ${requestId}\n`);
     return 0;
   }
+  if (subcommand === "undo") {
+    if (!parsed.runtime.undoLatestCheckpoint) throw new Error("This runtime does not support safe checkpoint undo.");
+    const restored = await parsed.runtime.undoLatestCheckpoint(sessionId);
+    io.stdout.write(`restored ${restored.checkpointId}\n`);
+    return 0;
+  }
+  if (subcommand === "recover") {
+    const recovery = checkpointRecovery(parsed);
+    await parsed.runtime.command({
+      type: "checkpoint_recovery",
+      sessionId,
+      ...recovery
+    });
+    io.stdout.write(`${recovery.decision} ${recovery.checkpointId}\n`);
+    return 0;
+  }
+  if (subcommand === "budget") {
+    const increase = budgetIncrease(parsed.flags);
+    await parsed.runtime.command({ type: "budget_increase", sessionId, increase });
+    io.stdout.write(`budget increased ${sessionId} ${JSON.stringify(increase)}\n`);
+    return 0;
+  }
+  if (subcommand === "waive-reviewer") {
+    const waiver = reviewerWaiver(parsed);
+    await parsed.runtime.command({ type: "reviewer_waiver", sessionId, ...waiver });
+    io.stdout.write(`reviewer waived ${waiver.checkpointId ?? "latest-pending"}\n`);
+    return 0;
+  }
   throw new Error(`Unknown session command '${subcommand}'.`);
 }
 
@@ -137,6 +247,26 @@ async function executeSessionCommand(argv: string[], deps: SessionCommandDeps, i
   const [subcommand = "list", ...rest] = argv;
   if (subcommand === "list") return await runSessionsCommand(rest, deps);
   const parsed = await configured(rest, deps);
+  if (subcommand === "migrate") {
+    const requested = parsed.positionals[0];
+    const legacy = new V2ReadOnlySessionStore(parsed.storeRootDir);
+    const sessionIds = parsed.flags.all === true
+      ? (await legacy.listSessions()).map((item) => item.sessionId)
+      : requested ? [requested] : [];
+    if (sessionIds.length === 0) throw new Error("session migrate requires a session id or --all.");
+    const results = [];
+    for (const id of sessionIds) {
+      results.push(await promoteV2Session({
+        rootDir: parsed.storeRootDir,
+        sessionId: id,
+        dryRun: parsed.flags["dry-run"] === true,
+        rebuildSnapshot: rebuildV3SnapshotFromEvents
+      }));
+    }
+    if (parsed.flags.json === true) io.stdout.write(`${JSON.stringify({ results })}\n`);
+    else for (const result of results) io.stdout.write(`${result.status} ${result.sessionId} events=${result.eventCount} seq=${result.lastSeq}\n`);
+    return 0;
+  }
   const sessionId = await targetSession(parsed.runtime, parsed.positionals[0], parsed.flags.latest === true);
   if (subcommand === "show") return await showSession(parsed, sessionId, io);
   const owner = await (deps.activeSessionOwner ?? activeSessionOwner)(parsed.storeRootDir, sessionId);
@@ -168,7 +298,7 @@ export async function runSessionsCommand(argv: string[], deps: SessionCommandDep
 export async function runSessionCommand(argv: string[], deps: SessionCommandDeps = {}): Promise<number> {
   const io = streams(deps);
   if (argv.includes("--help") || argv.includes("-h")) {
-    io.stdout.write("agent session <list|show|resume|cancel|approve> [session] [request-id] [flags]\n");
+    io.stdout.write("agent session <list|show|resume|cancel|approve|undo|recover|budget|waive-reviewer|migrate> [session] [request-or-checkpoint-id] [flags]\n");
     return 0;
   }
   try {

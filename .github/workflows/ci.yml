@@ -11,11 +11,14 @@ permissions:
 env:
   NODE_VERSION: 26.4.0
   PNPM_VERSION: 11.7.0
+  RUST_VERSION: 1.96.0
+  RUST_COVERAGE_TOOLCHAIN: nightly-2026-07-01
+  CARGO_LLVM_COV_VERSION: 0.8.6
 
 jobs:
   build-test:
     name: Ubuntu product and portable release checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,12 +28,30 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@${PNPM_VERSION} --activate
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup toolchain install "${RUST_COVERAGE_TOOLCHAIN}" --profile minimal --component llvm-tools-preview
+          cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
+      - name: Install Linux sandbox test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
       - name: Verify pinned toolchain
         run: |
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(pnpm --version)" = "${PNPM_VERSION}"
+          test "$(rustc --version | awk '{print $2}')" = "${RUST_VERSION}"
       - name: Install
         run: pnpm install --frozen-lockfile
+      - name: Native broker tests and lint
+        run: |
+          cargo fmt --manifest-path native/sigma-exec/Cargo.toml -- --check
+          cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
+          cargo clippy --locked --manifest-path native/sigma-exec/Cargo.toml --all-targets -- -D warnings
+          mkdir -p .artifacts
+          pnpm test:coverage:native-protocol
       - name: Prepare package Node runtime
         run: |
           NODE_DIR="node-$(node --version)-linux-x64"
@@ -39,6 +60,7 @@ jobs:
           chmod +x ".artifacts/ci-node-runtime/${NODE_DIR}/bin/node"
           tar -cJf ".artifacts/ci-node-runtime.tar.xz" -C ".artifacts/ci-node-runtime" "${NODE_DIR}"
           echo "NODE_RUNTIME_TARBALL=${GITHUB_WORKSPACE}/.artifacts/ci-node-runtime.tar.xz" >> "$GITHUB_ENV"
+          echo "NODE_RUNTIME_SHA256=$(sha256sum .artifacts/ci-node-runtime.tar.xz | awk '{print $1}')" >> "$GITHUB_ENV"
       - name: Build
         run: pnpm build
       - name: Lint
@@ -57,6 +79,18 @@ jobs:
         env:
           AGENT_REQUIRE_TARGET_WRAPPER: "1"
         run: pnpm verify:package:agent-cli
+      - name: Required Linux namespace, Landlock, seccomp, and PTY security test
+        run: >-
+          python3 scripts/ci/linux-sandbox-smoke.py
+          --broker .artifacts/agent-cli-linux-x64/bin/sigma-exec
+          --output .artifacts/sandbox-smoke-linux-x64.json
+      - name: Required bundled TypeScript, Pyright, and MCP sandbox smoke
+        run: >-
+          node scripts/ci/lsp-sandbox-smoke.mjs
+          --bundle .artifacts/agent-cli-linux-x64
+          --broker .artifacts/agent-cli-linux-x64/bin/sigma-exec
+          --target-platform linux
+          --output .artifacts/lsp-sandbox-smoke-linux-x64.json
       - name: Real PTY /quit smoke on packaged CLI
         run: >-
           python3 scripts/ci/tui-real-terminal-smoke.py
@@ -64,10 +98,28 @@ jobs:
           --cli .artifacts/agent-cli-linux-x64/packages/agent-cli/dist/index.js
       - name: 100k-file repository performance
         run: node scripts/perf-repository-100k.mjs
+      - name: 100k-event V2 promotion memory and source-integrity gate
+        run: pnpm perf:migration-v2-100k
       - name: Package Harbor runtime
         run: pnpm package:harbor-runtime
       - name: Product readiness
-        run: pnpm product:readiness
+        run: pnpm product:readiness -- --target-platform linux --target-arch x64
+      - name: Upload Linux x64 release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigma-code-linux-x64
+          if-no-files-found: error
+          path: |
+            .artifacts/agent-cli-linux-x64.tgz
+            .artifacts/agent-cli-linux-x64.tgz.sha256
+            .artifacts/agent-cli-linux-x64.sbom.cdx.json
+            .artifacts/agent-cli-linux-x64.provenance.json
+            .artifacts/agent-cli-package-verify-linux-x64.json
+            .artifacts/sandbox-smoke-linux-x64.json
+            .artifacts/lsp-sandbox-smoke-linux-x64.json
+            .artifacts/sigma-exec-branch-coverage.json
+            .artifacts/migration-v2-100k.json
+            .artifacts/product-readiness-linux-x64.*
 
   windows-release:
     name: Windows product, ConPTY, and portable release checks
@@ -84,6 +136,12 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@$env:PNPM_VERSION --activate
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+          rustup toolchain install $env:RUST_COVERAGE_TOOLCHAIN --profile minimal --component llvm-tools-preview
+          cargo install cargo-llvm-cov --version $env:CARGO_LLVM_COV_VERSION --locked
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -91,8 +149,17 @@ jobs:
         run: |
           if ((node --version).Trim() -ne "v$env:NODE_VERSION") { throw "Unexpected Node version: $(node --version)" }
           if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version: $(pnpm --version)" }
+          $rustVersion = ((rustc --version) -split ' ')[1]
+          if ($rustVersion -ne $env:RUST_VERSION) { throw "Unexpected Rust version: $rustVersion" }
       - name: Install
         run: pnpm install --frozen-lockfile
+      - name: Native broker tests and lint
+        run: |
+          cargo fmt --manifest-path native/sigma-exec/Cargo.toml -- --check
+          cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
+          cargo clippy --locked --manifest-path native/sigma-exec/Cargo.toml --all-targets -- -D warnings
+          New-Item -ItemType Directory -Path .artifacts -Force | Out-Null
+          pnpm test:coverage:native-protocol
       - name: Install pinned ConPTY smoke dependency
         run: >-
           python -m pip install --disable-pip-version-check --only-binary=:all:
@@ -125,15 +192,50 @@ jobs:
             throw "Prepared Windows runtime does not match v$env:NODE_VERSION"
           }
           Compress-Archive -LiteralPath $runtimeDir -DestinationPath $archive -CompressionLevel Optimal
+          $archiveSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "NODE_RUNTIME_SHA256=$archiveSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Verify portable Windows agent CLI and wrapper
         env:
           NODE_RUNTIME_ARCHIVE: ${{ steps.windows-node.outputs.archive }}
         run: pnpm verify:package:agent-cli:windows
+      - name: Required AppContainer and ConPTY security self-test
+        run: |
+          $report = & .\.artifacts\agent-cli-win32-x64\bin\agent.cmd sandbox setup --json | ConvertFrom-Json
+          if (-not $report.ready) { throw "Required Windows sandbox is not ready: $($report.reason)" }
+          if ($report.backend -notmatch "appcontainer" -or $report.backend -notmatch "conpty") {
+            throw "Unexpected Windows sandbox backend: $($report.backend)"
+          }
+          python scripts/ci/windows-sandbox-smoke.py --broker .artifacts/agent-cli-win32-x64/bin/sigma-exec.exe --node .artifacts/agent-cli-win32-x64/bin/node.exe --output .artifacts/sandbox-smoke-win32-x64.json
+      - name: Required bundled TypeScript, Pyright, and MCP sandbox smoke
+        run: >-
+          node scripts/ci/lsp-sandbox-smoke.mjs
+          --bundle .artifacts/agent-cli-win32-x64
+          --broker .artifacts/agent-cli-win32-x64/bin/sigma-exec.exe
+          --target-platform win32
+          --output .artifacts/lsp-sandbox-smoke-win32-x64.json
       - name: Real ConPTY /quit smoke on packaged CLI
         run: >-
           python scripts/ci/tui-real-terminal-smoke.py
           --node .artifacts/agent-cli-win32-x64/bin/node.exe
           --cli .artifacts/agent-cli-win32-x64/packages/agent-cli/dist/index.js
+      - name: 100k-event V2 promotion memory and source-integrity gate
+        run: pnpm perf:migration-v2-100k
       - name: Product readiness
-        run: pnpm product:readiness
+        run: pnpm product:readiness -- --target-platform win32 --target-arch x64
+      - name: Upload Windows x64 preview evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigma-code-win32-x64-preview
+          if-no-files-found: error
+          path: |
+            .artifacts/agent-cli-win32-x64.zip
+            .artifacts/agent-cli-win32-x64.zip.sha256
+            .artifacts/agent-cli-win32-x64.sbom.cdx.json
+            .artifacts/agent-cli-win32-x64.provenance.json
+            .artifacts/agent-cli-package-verify-win32-x64.json
+            .artifacts/sandbox-smoke-win32-x64.json
+            .artifacts/lsp-sandbox-smoke-win32-x64.json
+            .artifacts/sigma-exec-branch-coverage.json
+            .artifacts/migration-v2-100k.json
+            .artifacts/product-readiness-win32-x64.*

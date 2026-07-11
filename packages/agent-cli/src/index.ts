@@ -4,12 +4,16 @@ import { fileURLToPath } from "node:url";
 import { CommandRegistry, SIGMA_CONFIG_SCHEMA, configHelp, type CommandDefinition } from "agent-config";
 import type { TuiAppOptions } from "agent-tui";
 import { runDoctorCommand } from "./commands/doctor.js";
+import { runSandboxCommand } from "./commands/sandbox.js";
+import { runConfigCommand } from "./commands/config.js";
 import { runInitCommand } from "./commands/init.js";
 import { runReplayCommand } from "./commands/replay.js";
 import { runCommand } from "./commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "./commands/session.js";
 import { runVersionCommand } from "./commands/version.js";
-import { loadCliConfig, parseArgs, workspaceMcpTrustMessage } from "./config.js";
+import {
+  loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
+} from "./config.js";
 import { createConfiguredRuntime } from "agent-runtime";
 
 export interface AgentCliMainOptions {
@@ -19,7 +23,7 @@ export interface AgentCliMainOptions {
 
 function printHelp(): void {
   const commands = new CommandRegistry().definitions();
-  process.stdout.write(`Sigma Code 2.0\n\nUsage: agent <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
+  process.stdout.write(`Sigma Code 3.0\n\nUsage: agent <command> [options]\n\nCommands:\n${commands.map((item) => `  ${item.name.padEnd(10)} ${item.summary}`).join("\n")}\n\nConfiguration:\n${configHelp().join("\n")}\n`);
 }
 
 function completionScript(shell: string): string {
@@ -41,7 +45,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   }
   const { flags } = parseArgs(argv);
   const cliConfig = loadCliConfig(flags);
-  const trustMessage = workspaceMcpTrustMessage(cliConfig);
+  const trustMessage = workspaceMcpTrustMessage(cliConfig) ?? workspaceCustomizationTrustMessage(cliConfig);
   if (trustMessage) {
     (options.stderr ?? process.stderr).write(`${trustMessage}\n`);
     return 2;
@@ -79,8 +83,10 @@ async function dispatchCommand(
       : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv);
     case "replay": return await runReplayCommand(argv);
     case "doctor": return await runDoctorCommand(argv);
+    case "sandbox": return await runSandboxCommand(argv);
     case "version": return await runVersionCommand(argv);
     case "init": return await runInitCommand(argv);
+    case "config": return await runConfigCommand(argv);
     case "completion":
       process.stdout.write(completionScript(argv[0] ?? ""));
       return 0;

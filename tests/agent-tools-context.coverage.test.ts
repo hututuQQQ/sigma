@@ -22,6 +22,9 @@ import {
   registerSupervisorTools,
   ResourceLockManager
 } from "../packages/agent-tools/src/index.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
+
+const execution = createHostExecutionBroker();
 
 function context(workspacePath: string, signal = new AbortController().signal): ToolExecutionContext {
   return {
@@ -46,7 +49,7 @@ describe("context, platform, and repository tool capabilities", () => {
       criteria: [{
         criterion: "The requested change is complete.",
         status: "not_applicable",
-        evidenceCallIds: [],
+        evidence: [],
         rationale: "claimed unnecessary"
       }]
     })).toBeNull();
@@ -55,13 +58,13 @@ describe("context, platform, and repository tool capabilities", () => {
       criteria: [{
         criterion: "The requested change is complete.",
         status: "met",
-        evidenceCallIds: ["current-receipt"]
+        evidence: [{ evidenceId: "current-evidence", kind: "diagnostic" }]
       }]
     });
     expect(proposal).toMatchObject({ criteria: [{ rationale: "" }] });
-    expect(completionEvidenceError(proposal!, new Set(["current-receipt"]))).toBeNull();
-    expect(completionEvidenceError(proposal!, new Set(["older-run-receipt"])))
-      .toContain("current-receipt");
+    expect(completionEvidenceError(proposal!, new Map([["current-evidence", "diagnostic"]]))).toBeNull();
+    expect(completionEvidenceError(proposal!, new Map([["older-run-evidence", "diagnostic"]])))
+      .toContain("current-evidence");
   });
 
   it("loads nested instructions and retrieves Unicode repository context incrementally", async () => {
@@ -74,7 +77,9 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(instructions.map((item) => item.content)).toEqual(["root rule", "source rule"]);
 
     const signal = new AbortController().signal;
-    const git = async (args: string[]) => await runProcess({ executable: "git", args, cwd: workspace, timeoutMs: 10_000, signal });
+    const git = async (args: string[]) => await runProcess({
+      execution, executable: "git", args, cwd: workspace, timeoutMs: 10_000, signal
+    });
     await git(["init", "-q"]);
     await git(["config", "user.email", "sigma@example.invalid"]);
     await git(["config", "user.name", "Sigma"]);
@@ -82,7 +87,7 @@ describe("context, platform, and repository tool capabilities", () => {
     await git(["commit", "-qm", "initial"]);
     await writeFile(path.join(workspace, "src", "nested", "agent.ts"), "// 修复核心代理阻塞\nexport const agent = false;\n", "utf8");
 
-    const provider = new RepositoryContextProvider();
+    const provider = new RepositoryContextProvider(execution);
     const first = await provider.collect(workspace, "核心代理阻塞", signal);
     const second = await provider.collect(workspace, "核心代理阻塞", signal);
     expect(first.find((item) => item.provenance === "incremental repository index")?.content).toContain("src/nested/agent.ts");
@@ -171,8 +176,9 @@ describe("context, platform, and repository tool capabilities", () => {
     await writeFile(path.join(workspace, "src", "two.md"), "alpha\n", "utf8");
     await writeFile(path.join(workspace, "src", "options.txt"), "--pre=do-not-execute\n", "utf8");
     const signal = new AbortController().signal;
-    await runProcess({ executable: "git", args: ["init", "-q"], cwd: workspace, timeoutMs: 10_000, signal });
-    const tools = registerBuiltinTools(new EffectToolRegistry());
+    await runProcess({ execution, executable: "git", args: ["init", "-q"], cwd: workspace, timeoutMs: 10_000, signal });
+    await mkdir(path.join(workspace, ".agent"), { recursive: true });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: execution });
     expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["complete_task", "request_user_input"]));
     const supervisor: SupervisorPort = {
       spawnDurable: async () => ({ id: "child" }), followUp: () => undefined,
@@ -205,13 +211,60 @@ describe("context, platform, and repository tool capabilities", () => {
     const validation = await tools.execute(request("validate", "validate", {
       executable: process.execPath, args: ["-e", "process.stdout.write('validated')"], timeoutMs: 5_000
     }), context(workspace));
-    expect(validation).toMatchObject({ ok: true, observedEffects: ["process.spawn", "validation"] });
+    const validationPlan = await tools.prepare!(request("validate-plan", "validate", {
+      executable: process.execPath, args: ["-e", "process.stdout.write('validated')"], timeoutMs: 5_000
+    }), {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
+    });
+    expect(validation).toMatchObject({ ok: true, observedEffects: validationPlan.exactEffects });
     expect(validation.output).toBe("validated");
+    expect(validationPlan).toMatchObject({
+      exactEffects: ["process.spawn.readonly", "validation"],
+      writePaths: [],
+      checkpointScope: []
+    });
+    const scopedProcessPlan = await tools.prepare!(request("scoped-process", "exec", {
+      executable: process.execPath, args: ["--version"], writePaths: ["src"]
+    }), {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
+    });
+    expect(scopedProcessPlan).toMatchObject({
+      exactEffects: ["process.spawn", "filesystem.write"],
+      writePaths: ["src"],
+      checkpointScope: ["src"]
+    });
+    const ptyPlan = await tools.prepare!(request("pty-process", "process_spawn", {
+      executable: process.execPath, pty: true
+    }), {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
+    });
+    expect(ptyPlan).toMatchObject({ processMode: "pty", writePaths: [], checkpointScope: [] });
+    const unsafeTools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: execution, sandboxMode: "unsafe"
+    });
+    await expect(unsafeTools.prepare!(request("unsafe-background", "process_spawn", {
+      executable: process.execPath
+    }), {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
+    })).rejects.toMatchObject({ code: "policy_denied" });
     await expect(tools.execute(request("missing", "missing", {}), context(workspace))).rejects.toThrow("Unknown tool");
     expect(isToolAllowed(tools.descriptor("write")!, "analyze")).toBe(false);
-    expect(isToolAllowed(tools.descriptor("validate")!, "analyze")).toBe(false);
+    expect(isToolAllowed(tools.descriptor("validate")!, "analyze")).toBe(true);
+    const analyzeValidationPlan = await tools.prepare!(request("analyze-validation", "validate", {
+      executable: process.execPath, args: ["--version"]
+    }), {
+      sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze"
+    });
+    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation"]);
+    expect(analyzeValidationPlan.writePaths).toEqual([]);
     expect(isToolAllowed(tools.descriptor("read")!, "analyze")).toBe(true);
     expect(isToolAllowed({ ...tools.descriptor("read")!, approval: "deny" }, "change")).toBe(false);
+    await expect(tools.execute(request("write-git", "write", {
+      path: ".git/model-owned", content: "forbidden"
+    }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
+    await expect(tools.execute(request("write-agent", "write", {
+      path: ".agent/config.toml", content: "forbidden"
+    }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
   });
 
   it("rejects nested instruction links that escape the workspace", async () => {
@@ -231,16 +284,19 @@ describe("context, platform, and repository tool capabilities", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-process-"));
     const controller = new AbortController();
     const cancelled = runProcess({
+      execution,
       executable: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"], cwd: workspace,
       timeoutMs: 5_000, signal: controller.signal
     });
     setTimeout(() => controller.abort(new Error("stop")), 20);
     await expect(cancelled).resolves.toMatchObject({ cancelled: true });
     await expect(runProcess({
+      execution,
       executable: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"], cwd: workspace,
       timeoutMs: 20, signal: new AbortController().signal
     })).resolves.toMatchObject({ timedOut: true });
     await expect(runProcess({
+      execution,
       executable: "definitely-missing-sigma-command", args: [], cwd: workspace, timeoutMs: 100,
       signal: new AbortController().signal
     })).rejects.toThrow();
@@ -272,6 +328,7 @@ describe("context, platform, and repository tool capabilities", () => {
       "}, 2);"
     ].join("\n");
     const result = await runProcess({
+      execution,
       executable: process.execPath,
       args: ["-e", script],
       cwd: workspace,

@@ -1,0 +1,37 @@
+[package]
+name = "sigma-exec"
+version = "3.0.0-beta.1"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.177"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Com",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_Threading"
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

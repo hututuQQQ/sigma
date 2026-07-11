@@ -52,7 +52,58 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       hostCli: true,
       targetWrapper: targetWrapper.ok === true
     },
+    metadata: {
+      schemaVersion: 2,
+      sigmaExec: { sha256: "a".repeat(64) },
+      node: { sha256: "c".repeat(64) },
+      signing: { authenticodeVerified: targetPlatform === "win32" }
+    },
     targetWrapper
+  });
+  await writeJson(path.join(artifactsDir, `sandbox-smoke-${targetPlatform}-x64.json`), {
+    schemaVersion: 1,
+    ready: true,
+    targetPlatform,
+    targetArch: "x64",
+    brokerSha256: "a".repeat(64),
+    backend: targetPlatform === "win32" ? "lpac+appcontainer+job-object+conpty" : "namespace+landlock+seccomp+pty"
+  });
+  await writeJson(path.join(artifactsDir, `lsp-sandbox-smoke-${targetPlatform}-x64.json`), {
+    schemaVersion: 1,
+    kind: "lspSandboxSmoke",
+    ready: true,
+    targetPlatform,
+    targetArch: "x64",
+    brokerPlatform: targetPlatform === "win32" ? "windows" : "linux",
+    brokerArchitecture: "x86_64",
+    brokerSha256: "a".repeat(64),
+    bundledNodeSha256: "c".repeat(64),
+    sandbox: { required: true, network: "none", writeRoots: [], selfTestPassed: true },
+    checks: {
+      typescript: { ready: true }, pyright: { ready: true },
+      mcp: {
+        ready: true, processStarted: true, initializeWriteDenied: true,
+        idleWriteDenied: true, spawnCalls: 0
+      }
+    }
+  });
+  await writeJson(path.join(artifactsDir, "migration-v2-100k.json"), {
+    schemaVersion: 1,
+    kind: "v2Migration100k",
+    ok: true,
+    events: 100_000,
+    elapsedMs: 5_000,
+    peakRssMiB: 200,
+    sourceUnchanged: true
+  });
+  await writeJson(path.join(artifactsDir, "sigma-exec-branch-coverage.json"), {
+    data: [{ files: [{
+      filename: path.join(rootDir, "native", "sigma-exec", "src", "protocol.rs"),
+      summary: {
+        branches: { count: 12, covered: 12, notcovered: 0, percent: 100 },
+        lines: { count: 177, covered: 177, percent: 100 }
+      }
+    }] }]
   });
   if (providerSmoke) {
     await writeJson(path.join(artifactsDir, "smoke-provider", "provider-smoke.json"), providerSmoke);
@@ -79,11 +130,13 @@ describe("product readiness report", () => {
         tuiSmoke: { sessionId: "tui-session" }
       }
     });
-    expect(report.releaseNotes[0]).toContain("Windows CLI wrapper is not proven");
-    expect(report.releaseNotes[1]).toContain("Live provider smoke is not proven");
+    expect(report.releaseNotes[0]).toContain("win32-x64 CLI wrapper is not proven");
+    expect(report.releaseNotes.some((item) => item.includes("Live provider smoke is not proven"))).toBe(true);
     expect(report.checks.every((item) => item.ok)).toBe(true);
-    expect(report.releaseChecks.some((item) => item.name === "package:targetPlatform" && item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "package:tier1Target" && item.ok)).toBe(true);
     expect(report.releaseChecks.some((item) => item.name === "providerSmoke:present" && !item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "sandboxSmoke:ready" && item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:ready" && item.ok)).toBe(true);
   });
 
   it("marks release-ready when the target wrapper passed", async () => {
@@ -119,7 +172,7 @@ describe("product readiness report", () => {
     });
   });
 
-  it("does not mark a Linux package as this Windows MVP release target", async () => {
+  it("marks Linux x64 as an independent Tier 1 release target", async () => {
     const { rootDir, artifactsDir } = await fixture({
       ok: true,
       status: "passed",
@@ -139,15 +192,98 @@ describe("product readiness report", () => {
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
 
     expect(report).toMatchObject({
-      status: "internal-ready",
+      status: "release-ready",
       internalReady: true,
-      releaseReady: false
+      releaseReady: true
     });
     expect(report.releaseChecks).toContainEqual({
-      name: "package:targetPlatform",
-      ok: false,
-      detail: "linux"
+      name: "package:tier1Target",
+      ok: true,
+      detail: "linux-x64"
     });
+  });
+
+  it("does not reuse readiness evidence from a different release target", async () => {
+    const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
+
+    const report = await buildProductReadinessReport({
+      rootDir,
+      artifactsDir,
+      targetPlatform: "linux",
+      targetArch: "x64"
+    });
+
+    expect(report.internalReady).toBe(false);
+    expect(report.checks).toContainEqual({
+      name: "package:requestedTarget",
+      ok: false,
+      detail: "requested=linux-x64, evidence=win32-x64"
+    });
+  });
+
+  it("binds V3 sandbox smoke evidence to the broker digest in the verified package", async () => {
+    const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
+    const rootPackagePath = path.join(rootDir, "package.json");
+    const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
+    rootPackage.version = "3.0.0-beta.1";
+    await writeJson(rootPackagePath, rootPackage);
+    const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
+    const packaged = JSON.parse(await readFile(packagePath, "utf8"));
+    packaged.metadata.schemaVersion = 3;
+    packaged.metadata.sigmaExec = { sha256: "b".repeat(64) };
+    await writeJson(packagePath, packaged);
+
+    const report = await buildProductReadinessReport({ rootDir, artifactsDir });
+    expect(report.releaseChecks).toContainEqual({
+      name: "sandboxSmoke:brokerDigest",
+      ok: false,
+      detail: `expected=${"b".repeat(64)}, evidence=${"a".repeat(64)}`
+    });
+    expect(report.releaseReady).toBe(false);
+  });
+
+  it("binds bundled LSP evidence to the package target, broker, Node, and sandbox policy", async () => {
+    const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
+    const rootPackagePath = path.join(rootDir, "package.json");
+    const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
+    rootPackage.version = "3.0.0-beta.1";
+    await writeJson(rootPackagePath, rootPackage);
+    const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
+    const packageReport = JSON.parse(await readFile(packagePath, "utf8"));
+    packageReport.metadata.schemaVersion = 2;
+    packageReport.metadata.productVersion = "3.0.0-beta.1";
+    packageReport.integrity = { manifestDigest: "b".repeat(64), manifest: { entries: [
+      { path: "node_modules/agent-code-intel/dist/typescript-server.mjs", sha256: "e".repeat(64) },
+      { path: "node_modules/pyright/langserver.index.js", sha256: "f".repeat(64) }
+    ] } };
+    await writeJson(packagePath, packageReport);
+    const evidencePath = path.join(artifactsDir, "lsp-sandbox-smoke-win32-x64.json");
+    const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+    evidence.productVersion = "3.0.0-beta.1";
+    evidence.assets = {
+      typescriptLanguageServerSha256: "0".repeat(64),
+      pyrightSha256: "f".repeat(64)
+    };
+    evidence.integrityManifestSha256 = "b".repeat(64);
+    evidence.checks.languageServerDiscovery = true;
+    evidence.brokerSha256 = "d".repeat(64);
+    evidence.sandbox.writeRoots = ["unexpected"];
+    await writeJson(evidencePath, evidence);
+
+    const report = await buildProductReadinessReport({ rootDir, artifactsDir });
+
+    expect(report.releaseChecks).toContainEqual({
+      name: "lspSandboxSmoke:brokerDigest",
+      ok: false,
+      detail: `expected=${"a".repeat(64)}, evidence=${"d".repeat(64)}`
+    });
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:policy" && !item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:typescriptDigest" && !item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:pyrightDigest" && item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:productVersion" && item.ok)).toBe(true);
+    expect(report.releaseChecks.some((item) => item.name === "lspSandboxSmoke:integrityManifestDigest" && item.ok)).toBe(true);
+    expect(report.checks.some((item) => item.name === "package:schemaVersion" && !item.ok)).toBe(true);
+    expect(report.releaseReady).toBe(false);
   });
 
   it("writes JSON and Markdown and can require release readiness", async () => {

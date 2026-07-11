@@ -1,9 +1,9 @@
-import type { JsonValue } from "./json.js";
+import type { EvidenceRecord } from "./domain.js";
 
 export type RunMode = "analyze" | "change";
 
 export type RunOutcome =
-  | { kind: "completed"; message: string; evidence: JsonValue[] }
+  | { kind: "completed"; message: string; evidence: EvidenceRecord[] }
   | { kind: "needs_input"; requestId: string; message: string }
   | { kind: "cancelled"; reason: string }
   | { kind: "recoverable_failure"; code: string; message: string; resumeToken?: string }
@@ -14,5 +14,26 @@ export type RunCommand =
   | { type: "steer"; sessionId: string; text: string }
   | { type: "follow_up"; sessionId: string; text: string }
   | { type: "approve"; sessionId: string; requestId: string; decision: "allow" | "deny" | "always_allow" }
+  /** User-only control-plane decision for an interrupted open checkpoint. */
+  | {
+    type: "checkpoint_recovery";
+    sessionId: string;
+    checkpointId: string;
+    decision: "restore" | "keep";
+  }
+  /** User-only additive increase; profiles, hooks, and models cannot issue this command. */
+  | {
+    type: "budget_increase";
+    sessionId: string;
+    increase: Partial<import("./domain.js").BudgetLimits>;
+  }
+  /** User-only, one-shot waiver for one pending independent-review obligation. */
+  | {
+    type: "reviewer_waiver";
+    sessionId: string;
+    reason: string;
+    /** Defaults to the latest pending non-documentation checkpoint. */
+    checkpointId?: string;
+  }
   | { type: "cancel"; sessionId: string; reason?: string }
   | { type: "resume"; sessionId: string };

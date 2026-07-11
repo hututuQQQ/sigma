@@ -1,10 +1,19 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
-import { resolveWorkspacePath, runProcess, runShell, runtimeEnvironment, type ShellKind } from "agent-platform";
+import { resolveWorkspacePath } from "agent-platform";
+import type { ExecutionBroker } from "agent-execution";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 import { repositoryTools } from "./repository-tools.js";
 import { registerCompletionTool } from "./completion-tool.js";
+import { applyUnifiedPatch, parseUnifiedPatch } from "./atomic-patch.js";
+import { registerControlTools } from "./control-tools.js";
+import {
+  executionTools,
+  unavailableExecutionBroker,
+  type ExecutionToolOptions
+} from "./execution-tools.js";
+import { codeIntelTool, type CodeIntelToolOptions } from "./lsp-tools.js";
 
 function args(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -14,6 +23,18 @@ function stringArg(input: Record<string, JsonValue>, key: string): string {
   const value = input[key];
   if (typeof value !== "string") throw new Error(`Tool argument '${key}' must be a string.`);
   return value;
+}
+
+async function writableTarget(workspacePath: string, requestedPath: string): Promise<string> {
+  const target = await resolveWorkspacePath(workspacePath, requestedPath);
+  const relative = path.relative(workspacePath, target).split(path.sep);
+  const root = relative[0]?.toLowerCase();
+  if (root === ".git" || root === ".agent") {
+    throw Object.assign(new Error(`Protected workspace metadata is read-only: ${requestedPath}`), {
+      code: "protected_path"
+    });
+  }
+  return target;
 }
 
 function descriptor(input: Omit<ToolDescriptor, "inputSchema"> & { properties: Record<string, JsonValue>; required?: string[] }): ToolDescriptor {
@@ -38,9 +59,11 @@ function receipt(
     ok: input.ok ?? true,
     output: input.output ?? "",
     observedEffects: input.observedEffects ?? [],
+    actualEffects: input.actualEffects ?? input.observedEffects ?? [],
     workspaceDelta: input.workspaceDelta,
     artifacts: input.artifacts ?? [],
     diagnostics: input.diagnostics ?? [],
+    evidence: input.evidence ?? [],
     startedAt,
     completedAt: new Date().toISOString()
   };
@@ -94,7 +117,7 @@ function writeTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
       const relative = stringArg(input, "path");
-      const target = await resolveWorkspacePath(context.workspacePath, relative);
+      const target = await writableTarget(context.workspacePath, relative);
       const existed = await stat(target).then(() => true, () => false);
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, stringArg(input, "content"), "utf8");
@@ -127,7 +150,7 @@ function editTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
       const relative = stringArg(input, "path");
-      const target = await resolveWorkspacePath(context.workspacePath, relative);
+      const target = await writableTarget(context.workspacePath, relative);
       const content = await readFile(target, "utf8");
       const oldText = stringArg(input, "oldText");
       const first = content.indexOf(oldText);
@@ -143,111 +166,82 @@ function editTool(): RegisteredEffectTool {
   };
 }
 
-function execTool(): RegisteredEffectTool {
+function applyPatchTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor({
-      name: "exec",
-      description: "Execute an argv command without an implicit shell.",
-      properties: { executable: { type: "string" }, args: { type: "array", items: { type: "string" } }, cwd: { type: "string" } },
-      required: ["executable"],
-      possibleEffects: ["process.spawn", "filesystem.write"],
-      executionMode: "exclusive",
-      resourceKeys: ["workspace:process"],
-      contextPathArguments: ["cwd"],
-      approval: "prompt",
-      idempotent: false,
-      timeoutMs: 600_000,
-      idleTimeoutMs: 120_000
-    }),
-    async execute(request, context) {
-      const startedAt = new Date().toISOString();
-      const input = args(request.arguments);
-      const cwd = await resolveWorkspacePath(context.workspacePath, typeof input.cwd === "string" ? input.cwd : ".");
-      const argv = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === "string") : [];
-      const result = await runProcess({ executable: stringArg(input, "executable"), args: argv, cwd, timeoutMs: 600_000, idleTimeoutMs: 120_000, signal: context.signal });
-      return receipt(request, startedAt, {
-        ok: result.exitCode === 0 && !result.timedOut && !result.cancelled,
-        output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
-        observedEffects: ["process.spawn"],
-        diagnostics: result.timedOut ? ["process timed out"] : result.cancelled ? ["process cancelled"] : []
-      });
-    }
-  };
-}
-
-function shellTool(): RegisteredEffectTool {
-  return {
-    descriptor: descriptor({
-      name: "shell",
-      description: "Execute a command in an explicitly selected shell.",
-      properties: { shell: { type: "string", enum: ["powershell", "cmd", "bash"] }, command: { type: "string" }, cwd: { type: "string" } },
-      required: ["shell", "command"],
-      possibleEffects: ["process.spawn", "filesystem.write"],
-      executionMode: "exclusive",
-      resourceKeys: ["workspace:process"],
-      contextPathArguments: ["cwd"],
-      approval: "prompt",
-      idempotent: false,
-      timeoutMs: 600_000,
-      idleTimeoutMs: 120_000
-    }),
-    async execute(request, context) {
-      const startedAt = new Date().toISOString();
-      const input = args(request.arguments);
-      const requestedShell = stringArg(input, "shell") as ShellKind;
-      if (!["powershell", "cmd", "bash"].includes(requestedShell)) throw new Error(`Unsupported shell '${requestedShell}'.`);
-      if (process.platform !== "win32" && requestedShell !== "bash") throw new Error(`${requestedShell} is only supported on Windows.`);
-      const cwd = await resolveWorkspacePath(context.workspacePath, typeof input.cwd === "string" ? input.cwd : ".");
-      const result = await runShell(requestedShell, stringArg(input, "command"), { cwd, timeoutMs: 600_000, idleTimeoutMs: 120_000, signal: context.signal });
-      return receipt(request, startedAt, {
-        ok: result.exitCode === 0 && !result.timedOut && !result.cancelled,
-        output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
-        observedEffects: ["process.spawn"],
-        diagnostics: [`platform=${runtimeEnvironment().platform}`, `shell=${requestedShell}`]
-      });
-    }
-  };
-}
-
-function validateTool(): RegisteredEffectTool {
-  return {
-    descriptor: descriptor({
-      name: "validate",
-      description: "Run a structured validation command and return typed exit evidence. Use project-native lint, test, build, or focused checks.",
+      name: "apply_patch",
+      description: "Atomically apply a unified multi-file patch inside the workspace. All hunks are preflighted; any failure leaves every file unchanged.",
       properties: {
-        executable: { type: "string" },
-        args: { type: "array", items: { type: "string" } },
-        cwd: { type: "string" },
-        timeoutMs: { type: "number", minimum: 1, maximum: 600000 }
+        patch: { type: "string" },
+        preimageHashes: { type: "object", additionalProperties: { type: "string" } }
       },
-      required: ["executable"],
-      possibleEffects: ["process.spawn", "filesystem.write", "validation"],
-      executionMode: "parallel",
-      resourceKeys: ["workspace:validation"],
-      contextPathArguments: ["cwd"],
+      required: ["patch"],
+      possibleEffects: ["filesystem.read", "filesystem.write"],
+      availableModes: ["change"],
+      maximumEffects: ["filesystem.read", "filesystem.write"],
+      executionMode: "exclusive",
+      resourceKeys: ["workspace:write"],
       approval: "prompt",
-      idempotent: true,
-      timeoutMs: 600_000,
-      idleTimeoutMs: 120_000
+      idempotent: false,
+      timeoutMs: 120_000,
+      prepare(argumentsValue) {
+        const input = args(argumentsValue);
+        const files = parseUnifiedPatch(stringArg(input, "patch"));
+        const paths = [...new Set(files.flatMap((item) => [item.oldPath, item.newPath]
+          .filter((value): value is string => Boolean(value))))];
+        return {
+          exactEffects: ["filesystem.read", "filesystem.write"],
+          readPaths: paths,
+          writePaths: paths,
+          network: "none",
+          processMode: "none",
+          checkpointScope: paths,
+          idempotence: "non_replayable"
+        };
+      }
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
-      const cwd = await resolveWorkspacePath(context.workspacePath, typeof input.cwd === "string" ? input.cwd : ".");
-      const argv = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === "string") : [];
-      const timeoutMs = typeof input.timeoutMs === "number" ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 600_000;
-      const result = await runProcess({ executable: stringArg(input, "executable"), args: argv, cwd, timeoutMs, idleTimeoutMs: Math.min(timeoutMs, 120_000), signal: context.signal });
-      return receipt(request, startedAt, {
-        ok: result.exitCode === 0 && !result.timedOut && !result.cancelled,
-        output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
-        observedEffects: ["process.spawn", "validation"],
-        diagnostics: [`exit_code=${result.exitCode}`, ...(result.timedOut ? ["validation timed out"] : []), ...(result.cancelled ? ["validation cancelled"] : [])]
-      });
+      const rawHashes = input.preimageHashes;
+      const preimageHashes = rawHashes && typeof rawHashes === "object" && !Array.isArray(rawHashes)
+        ? Object.fromEntries(Object.entries(rawHashes).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+        : undefined;
+      const result = await applyUnifiedPatch(context.workspacePath, stringArg(input, "patch"), { preimageHashes });
+      const completedAt = new Date().toISOString();
+      return {
+        callId: request.callId,
+        ok: true,
+        output: JSON.stringify(result),
+        observedEffects: ["filesystem.read", "filesystem.write"],
+        actualEffects: ["filesystem.read", "filesystem.write"],
+        workspaceDelta: result.delta,
+        artifacts: [],
+        diagnostics: [],
+        // The checkpoint manager emits the authoritative delta after sealing.
+        evidence: [],
+        startedAt,
+        completedAt
+      };
     }
   };
 }
 
-export function registerBuiltinTools(registry: EffectToolRegistry): EffectToolRegistry {
-  for (const tool of [readTool(), writeTool(), editTool(), execTool(), shellTool(), validateTool(), ...repositoryTools()]) registry.register(tool);
-  return registerCompletionTool(registry);
+export interface BuiltinToolOptions extends Partial<Omit<ExecutionToolOptions, "broker">> {
+  broker?: ExecutionBroker;
+  codeIntel?: Omit<CodeIntelToolOptions, "broker">;
+}
+
+export function registerBuiltinTools(registry: EffectToolRegistry, options: BuiltinToolOptions = {}): EffectToolRegistry {
+  const execution: ExecutionToolOptions = {
+    broker: options.broker ?? unavailableExecutionBroker(),
+    sandboxMode: options.sandboxMode ?? "required",
+    networkMode: options.networkMode ?? "none"
+  };
+  const codeIntel = options.codeIntel ? [codeIntelTool({ broker: execution.broker, ...options.codeIntel })] : [];
+  for (const tool of [
+    readTool(), writeTool(), editTool(), applyPatchTool(),
+    ...codeIntel, ...executionTools(execution), ...repositoryTools(options.broker)
+  ]) registry.register(tool);
+  return registerControlTools(registerCompletionTool(registry));
 }
