@@ -107,11 +107,71 @@ fn run_launcher(arguments: Vec<OsString>) -> i32 {
 }
 
 fn launch(spec: LauncherSpec) -> io::Result<i32> {
+    if unsafe { libc::getpid() } != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hardened launcher must be sandbox PID 1",
+        ));
+    }
     apply_landlock_and_seccomp(&spec.read_roots, &spec.write_roots)?;
-    let error = Command::new(&spec.command[0])
-        .args(&spec.command[1..])
-        .exec();
-    Err(error)
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        let error = Command::new(&spec.command[0])
+            .args(&spec.command[1..])
+            .exec();
+        eprintln!("sigma-exec command launch failed: {error}");
+        unsafe { libc::_exit(126) };
+    }
+    let status = wait_for_child(child)?;
+    unsafe {
+        libc::kill(-1, libc::SIGKILL);
+    }
+    reap_descendants()?;
+    Ok(exit_code(status))
+}
+
+fn wait_for_child(child: libc::pid_t) -> io::Result<libc::c_int> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(child, &mut status, 0) };
+        if result == child {
+            return Ok(status);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn reap_descendants() -> io::Result<()> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if result > 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(());
+        }
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        255
+    }
 }
 
 fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
@@ -541,6 +601,7 @@ fn self_test_arguments(
         OsString::from("--die-with-parent"),
         OsString::from("--new-session"),
         OsString::from("--unshare-all"),
+        OsString::from("--as-pid-1"),
         OsString::from("--ro-bind"),
         OsString::from("/"),
         OsString::from("/"),
@@ -596,8 +657,9 @@ mod tests {
             .iter()
             .map(|item| item.to_string_lossy())
             .collect::<Vec<_>>();
+        assert_eq!(values[3], "--as-pid-1");
         assert_eq!(
-            &values[6..12],
+            &values[7..13],
             [
                 "--bind",
                 "/tmp/allowed",
@@ -608,7 +670,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &values[26..],
+            &values[27..],
             [
                 "/tmp/allowed",
                 "/tmp/denied",

@@ -648,7 +648,12 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     const HELPER_MOUNT: &str = "/.sigma-exec";
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
-    command.args(["--die-with-parent", "--new-session", "--unshare-all"]);
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--as-pid-1",
+    ]);
     if params.policy.network == NetworkMode::Full {
         command.arg("--share-net");
     }
@@ -862,6 +867,7 @@ fn detect_sandbox() -> SandboxStatus {
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
+            "--as-pid-1",
             "--ro-bind",
             "/",
             "/",
@@ -926,6 +932,7 @@ fn linux_pty_self_test(bwrap: &Path) -> bool {
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
+            "--as-pid-1",
             "--ro-bind",
             "/",
             "/",
