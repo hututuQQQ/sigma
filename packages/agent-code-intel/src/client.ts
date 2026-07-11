@@ -179,7 +179,13 @@ export class LspClient {
     };
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      await this.send({ jsonrpc: "2.0", id, method, params }, signal);
+      await this.send({ jsonrpc: "2.0", id, method, params }, signal).catch((error: unknown) => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(error);
+      });
       return await response;
     } finally {
       signal?.removeEventListener("abort", onAbort);

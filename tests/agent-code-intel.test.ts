@@ -224,6 +224,25 @@ describe("agent-code-intel", () => {
     await client.close();
   });
 
+  it("settles the registered response when an LSP write fails", async () => {
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => { stop = resolve; });
+    const transport: LspTransport = {
+      async write() { throw new Error("fixture write failed"); },
+      chunks() {
+        return {
+          [Symbol.asyncIterator]() {
+            return { async next() { await stopped; return { done: true, value: undefined }; } };
+          }
+        };
+      },
+      async close() { stop(); }
+    };
+    const client = new LspClient({ rootPath: process.cwd(), transport });
+    await expect(client.start()).rejects.toThrow("fixture write failed");
+    await expect(client.close()).resolves.toBeUndefined();
+  });
+
   it("rejects language-server input that resolves outside the workspace through a link", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-contained-"));
     const outside = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-outside-"));
