@@ -191,6 +191,29 @@ mod tests {
         }
     }
 
+    struct FailingWriter {
+        write_calls: usize,
+        fail_on_write: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            if self.fail_on_write == Some(self.write_calls) {
+                return Err(io::Error::other("intentional write failure"));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::Error::other("intentional flush failure"));
+            }
+            Ok(())
+        }
+    }
+
     fn framed(value: &Value) -> Vec<u8> {
         let payload = serde_json::to_vec(value).unwrap();
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
@@ -306,6 +329,53 @@ mod tests {
         .join();
         send_result(&writer, 2, Value::Null);
         assert!(bounded_response_payload(serde_json::to_vec(&SerializationFailure)).is_none());
+    }
+
+    #[test]
+    fn reports_oversized_errors_and_each_writer_failure() {
+        let (writer, bytes) = capture_writer();
+        let mut error = RpcError::new("oversized", "too much data");
+        error.data = Some(Value::String("x".repeat(MAX_FRAME_BYTES + 1)));
+        send_error(&writer, 11, error);
+        assert_eq!(
+            decoded_response(&bytes),
+            json!({
+                "protocolVersion": 1, "requestId": 11, "ok": false,
+                "error": {
+                    "code": "broker_protocol_error",
+                    "message": "broker error response could not be encoded within the maximum frame size"
+                }
+            })
+        );
+
+        let result = json!({"ready": true});
+        let response = Response {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: 12,
+            ok: true,
+            result: Some(&result),
+            error: None,
+        };
+        for writer in [
+            FailingWriter {
+                write_calls: 0,
+                fail_on_write: Some(1),
+                fail_flush: false,
+            },
+            FailingWriter {
+                write_calls: 0,
+                fail_on_write: Some(2),
+                fail_flush: false,
+            },
+            FailingWriter {
+                write_calls: 0,
+                fail_on_write: None,
+                fail_flush: true,
+            },
+        ] {
+            let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
+            assert!(!send(&writer, &response));
+        }
     }
 
     #[test]
