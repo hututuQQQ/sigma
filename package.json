@@ -41,7 +41,7 @@
     "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
     "product:readiness": "node scripts/product-readiness-report.mjs",
     "smoke:harbor": "node scripts/run-bash.mjs scripts/smoke-harbor.sh",
-    "verify:containment": "node scripts/verify-containment.mjs",
+    "verify:containment": "cargo build --locked --manifest-path native/sigma-exec/Cargo.toml && node scripts/verify-containment.mjs",
     "perf:repo-100k": "pnpm build && node scripts/perf-repository-100k.mjs",
     "perf:migration-v2-100k": "pnpm build && node --expose-gc scripts/perf-v2-migration-100k.mjs",
     "bench:deepseek": "pnpm bench:tb:deepseek",

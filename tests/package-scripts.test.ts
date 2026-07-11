@@ -30,6 +30,7 @@ describe("package scripts", () => {
       "smoke:product": "pnpm build && node scripts/smoke-product.mjs",
       "smoke:tui-product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-tui-product.mjs",
       "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
+      "verify:containment": "cargo build --locked --manifest-path native/sigma-exec/Cargo.toml && node scripts/verify-containment.mjs",
       "product:readiness": "node scripts/product-readiness-report.mjs",
       "package:agent-cli:linux": "pnpm build && pnpm build:native:sigma-exec && node scripts/package-agent-cli.mjs --target-platform linux --target-arch x64",
       "package:agent-cli:windows": "pnpm build && pnpm build:native:sigma-exec && node scripts/package-agent-cli.mjs --target-platform win32 --target-arch x64",

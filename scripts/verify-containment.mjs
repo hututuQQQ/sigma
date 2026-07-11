@@ -15,7 +15,7 @@ async function main() {
   const helperPath = path.resolve(
     "native", "sigma-exec", "target", "debug", process.platform === "win32" ? "sigma-exec.exe" : "sigma-exec"
   );
-  if (!existsSync(helperPath)) throw new Error(`Native broker not found at ${helperPath}. Run cargo test first.`);
+  if (!existsSync(helperPath)) throw new Error(`Native broker not found at ${helperPath}. Run cargo build first.`);
   const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-platform-verify-"));
   const external = await mkdtemp(path.join(os.tmpdir(), "sigma-platform-external-"));
   const execution = new SigmaExecBrokerClient({
