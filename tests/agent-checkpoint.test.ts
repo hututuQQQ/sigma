@@ -1,5 +1,5 @@
 import {
-  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, truncate, writeFile
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, truncate, writeFile
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
@@ -284,6 +284,31 @@ describe("CheckpointManager", () => {
     await expect(beforeRecord.list(checkpoint.sessionId)).resolves.toContainEqual(expect.objectContaining({ status: "sealed" }));
   });
 
+  it("replays a write-ahead journal after a crash between rename and completion recording", async () => {
+    const { workspace, manager } = await fixture();
+    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-crash");
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    await rename(path.join(workspace, "existing.txt"), path.join(transaction, "backup", "0"));
+    await writeFile(path.join(workspace, "existing.txt"), "partially installed preimage", "utf8");
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 1,
+      phase: "applying",
+      operations: [{
+        path: "existing.txt", index: 0, hadCurrent: true, hasDesired: true,
+        backupIntent: true, backupMoved: false, installIntent: true, installed: false
+      }]
+    }));
+
+    await manager.create({
+      sessionId: "session-crash-recovery", runId: "run-crash-recovery",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
+    });
+
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
+    await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("surfaces a typed recovery error and never marks restored when rollback itself fails", async () => {
     const { root, workspace, manager } = await fixture();
     const checkpoint = await manager.create({
@@ -326,6 +351,12 @@ describe("CheckpointManager", () => {
       sessionId: "session-preimage-link", runId: "run-preimage-link",
       workspacePath: workspace, scopePaths: ["tree-preimage-link"], baseSeq: 1
     });
+    if (process.platform === "win32") {
+      const manifest = JSON.parse(await readFile(
+        path.join(root, "state", "checkpoints", "cas", checkpoint.preManifestDigest), "utf8"
+      )) as { entries: Array<{ path: string; linkType?: string }> };
+      expect(manifest.entries.find((entry) => entry.path === "tree-preimage-link")?.linkType).toBe("directory");
+    }
     await rm(tree);
     await mkdir(tree);
     await writeFile(path.join(tree, "local.txt"), "postimage", "utf8");
@@ -335,6 +366,26 @@ describe("CheckpointManager", () => {
     expect((await lstat(tree)).isSymbolicLink()).toBe(true);
     await expect(readFile(path.join(outside, "sentinel.txt"), "utf8")).resolves.toBe("outside");
     await expect(readFile(path.join(outside, "local.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.runIf(process.platform === "win32")("round-trips a directory link after its target becomes dangling", async () => {
+    const { root, workspace, manager } = await fixture();
+    const target = path.join(root, "removed-directory-target");
+    const link = path.join(workspace, "dangling-directory-link");
+    await mkdir(target);
+    await symlink(target, link, "junction");
+    const checkpoint = await manager.create({
+      sessionId: "session-dangling-directory-link", runId: "run-dangling-directory-link",
+      workspacePath: workspace, scopePaths: ["dangling-directory-link"], baseSeq: 1
+    });
+    await rm(link);
+    await rm(target, { recursive: true });
+    await mkdir(link);
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    await manager.undoLatest(checkpoint.sessionId);
+
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    await expect(readlink(link)).resolves.toBe(target);
   });
 
   it("fails closed on a real-directory to linked-parent race and leaves the external target unchanged", async () => {

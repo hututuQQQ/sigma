@@ -15,6 +15,7 @@ import { CheckpointConflictError } from "./types.js";
 import { checkpointDelta } from "./manifest.js";
 import { normalizeCheckpointScopes, safeCheckpointId as safeId } from "./path-safety.js";
 import { restoreCheckpointTransaction } from "./restore-transaction.js";
+import { recoverCheckpointTransactions } from "./restore-recovery.js";
 import { captureCheckpointManifest } from "./safe-capture.js";
 import { CheckpointCasStore } from "./cas-store.js";
 import { buildCheckpointReview } from "./checkpoint-review.js";
@@ -43,6 +44,7 @@ export class CheckpointManager {
       );
     }
     const { workspacePath, scopePaths } = await normalizeCheckpointScopes(input.workspacePath, input.scopePaths);
+    await recoverCheckpointTransactions(workspacePath);
     const pre = await this.capture(workspacePath, scopePaths);
     const preManifestDigest = await this.putManifest(pre);
     const record: CheckpointRecord = {
@@ -66,6 +68,7 @@ export class CheckpointManager {
     expectedCurrentManifestDigest?: string
   ): Promise<CheckpointRecord> {
     const record = await this.readRecord(sessionId, checkpointId);
+    await recoverCheckpointTransactions(record.workspacePath);
     if (record.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
     await this.assertLatestUnresolved(sessionId, checkpointId, "open");
     const before = await this.getManifest(record.preManifestDigest);
@@ -97,6 +100,7 @@ export class CheckpointManager {
   }
   async inspectOpen(sessionId: string, checkpointId: string): Promise<OpenCheckpointInspection> {
     const checkpoint = await this.readRecord(sessionId, checkpointId);
+    await recoverCheckpointTransactions(checkpoint.workspacePath);
     if (checkpoint.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
     const before = await this.getManifest(checkpoint.preManifestDigest);
     const current = await this.capture(checkpoint.workspacePath, checkpoint.scopePaths);
@@ -110,6 +114,7 @@ export class CheckpointManager {
   }
   async inspectSealed(sessionId: string, checkpointId: string): Promise<SealedCheckpointInspection> {
     const checkpoint = await this.readRecord(sessionId, checkpointId);
+    await recoverCheckpointTransactions(checkpoint.workspacePath);
     if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest) {
       throw new Error(`Checkpoint ${checkpointId} is not sealed.`);
     }
@@ -123,6 +128,7 @@ export class CheckpointManager {
   }
   async reviewDiff(sessionId: string, checkpointId: string, maxBytes = 256 * 1024): Promise<string> {
     const checkpoint = await this.readRecord(sessionId, checkpointId);
+    await recoverCheckpointTransactions(checkpoint.workspacePath);
     if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
       throw new Error(`Checkpoint ${checkpointId} is not sealed for review.`);
     }
@@ -140,6 +146,7 @@ export class CheckpointManager {
       );
     }
     if (!latest?.postManifestDigest) throw new Error(`Session ${sessionId} has no sealed checkpoint to undo.`);
+    await recoverCheckpointTransactions(latest.workspacePath);
     const current = await this.capture(latest.workspacePath, latest.scopePaths);
     const currentDigest = await this.putManifest(current);
     if (currentDigest !== latest.postManifestDigest) {
@@ -170,6 +177,7 @@ export class CheckpointManager {
     expectedCurrentManifestDigest: string
   ): Promise<CheckpointRecord> {
     const checkpoint = await this.readRecord(sessionId, checkpointId);
+    await recoverCheckpointTransactions(checkpoint.workspacePath);
     if (checkpoint.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
     await this.assertLatestUnresolved(sessionId, checkpointId, "open");
     const before = await this.getManifest(checkpoint.preManifestDigest);

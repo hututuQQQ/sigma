@@ -7,7 +7,9 @@ export function portable(relative: string): string {
 }
 
 function entryIdentity(entry: CheckpointEntry): string {
-  return JSON.stringify([entry.kind, entry.mode, entry.size, entry.digest ?? null, entry.linkTarget ?? null]);
+  return JSON.stringify([
+    entry.kind, entry.mode, entry.size, entry.digest ?? null, entry.linkTarget ?? null, entry.linkType ?? null
+  ]);
 }
 
 export function checkpointDelta(before: CheckpointManifest, after: CheckpointManifest): CheckpointDelta {

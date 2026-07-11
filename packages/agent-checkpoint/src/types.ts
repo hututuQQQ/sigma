@@ -19,6 +19,8 @@ export interface CheckpointEntry {
   digest?: string;
   casIdentity?: CheckpointCasIdentity;
   linkTarget?: string;
+  /** Required for newly captured Windows links so restore never guesses from the live postimage. */
+  linkType?: "file" | "directory";
 }
 
 export interface CheckpointManifest {

@@ -93,7 +93,13 @@ pub fn send_result(writer: &SharedWriter, request_id: u64, result: Value) {
         result: Some(&result),
         error: None,
     };
-    send(writer, &response);
+    if !send(writer, &response) {
+        send_fallback_error(
+            writer,
+            request_id,
+            "broker response exceeds the maximum frame size",
+        );
+    }
 }
 
 pub fn send_error(writer: &SharedWriter, request_id: u64, error: RpcError) {
@@ -104,20 +110,40 @@ pub fn send_error(writer: &SharedWriter, request_id: u64, error: RpcError) {
         result: None,
         error: Some(&error),
     };
-    send(writer, &response);
+    if !send(writer, &response) {
+        send_fallback_error(
+            writer,
+            request_id,
+            "broker error response could not be encoded within the maximum frame size",
+        );
+    }
 }
 
-fn send(writer: &SharedWriter, response: &Response<'_>) {
+fn send_fallback_error(writer: &SharedWriter, request_id: u64, message: &'static str) {
+    let error = RpcError::new("broker_protocol_error", message);
+    let response = Response {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        ok: false,
+        result: None,
+        error: Some(&error),
+    };
+    let _ = send(writer, &response);
+}
+
+fn send(writer: &SharedWriter, response: &Response<'_>) -> bool {
     let Some(payload) = response_payload(response) else {
-        return;
+        return false;
     };
     let mut stdout = match writer.lock() {
         Ok(value) => value,
-        Err(_) => return,
+        Err(_) => return false,
     };
-    let _ = stdout.write_all(&(payload.len() as u32).to_be_bytes());
-    let _ = stdout.write_all(&payload);
-    let _ = stdout.flush();
+    stdout
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .is_ok()
+        && stdout.write_all(&payload).is_ok()
+        && stdout.flush().is_ok()
 }
 
 fn response_payload(response: &Response<'_>) -> Option<Vec<u8>> {
@@ -258,10 +284,19 @@ mod tests {
     }
 
     #[test]
-    fn refuses_oversized_output_and_poisoned_writer_without_panicking() {
+    fn reports_oversized_output_and_handles_poisoned_writer_without_panicking() {
         let (writer, bytes) = capture_writer();
         send_result(&writer, 1, Value::String("x".repeat(MAX_FRAME_BYTES + 1)));
-        assert!(bytes.lock().unwrap().is_empty());
+        assert_eq!(
+            decoded_response(&bytes),
+            json!({
+                "protocolVersion": 1, "requestId": 1, "ok": false,
+                "error": {
+                    "code": "broker_protocol_error",
+                    "message": "broker response exceeds the maximum frame size"
+                }
+            })
+        );
 
         let poisoned = writer.clone();
         let _ = std::thread::spawn(move || {

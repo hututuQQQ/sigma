@@ -161,6 +161,29 @@ describe("applyUnifiedPatch", () => {
       .rejects.toBeInstanceOf(AtomicPatchError);
   });
 
+  it.runIf(process.platform === "linux")("pins the commit parent so a linked-parent swap cannot reach outside files", async () => {
+    const root = await workspace();
+    const outside = await workspace();
+    await mkdir(path.join(root, "tree"));
+    await writeFile(path.join(root, "tree", "victim.txt"), "before\n", "utf8");
+    await writeFile(path.join(outside, "victim.txt"), "before\n", "utf8");
+    await writeFile(path.join(outside, "sentinel.txt"), "outside", "utf8");
+    let swapped = false;
+    await expect(applyUnifiedPatch(root, [
+      "--- a/tree/victim.txt", "+++ b/tree/victim.txt", "@@ -1 +1 @@", "-before", "+after"
+    ].join("\n"), {
+      beforeMutation: async (operation) => {
+        if (swapped || operation.direction !== "commit" || operation.phase !== "backup_source") return;
+        swapped = true;
+        await rm(path.join(root, "tree"), { recursive: true });
+        await symlink(outside, path.join(root, "tree"), "dir");
+      }
+    })).rejects.toBeInstanceOf(AtomicPatchError);
+
+    await expect(readFile(path.join(outside, "victim.txt"), "utf8")).resolves.toBe("before\n");
+    await expect(readFile(path.join(outside, "sentinel.txt"), "utf8")).resolves.toBe("outside");
+  });
+
   it.runIf(process.platform !== "win32")("preserves Unicode paths and applies executable modes", async () => {
     const root = await workspace();
     await writeFile(path.join(root, "说明.txt"), "你好\n", { encoding: "utf8", mode: 0o644 });

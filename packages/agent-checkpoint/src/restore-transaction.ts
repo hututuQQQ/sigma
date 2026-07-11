@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { pinCheckpointParent } from "./path-safety.js";
 import {
@@ -20,6 +20,8 @@ interface RestoreOperation {
   backupPath: string;
   backupMoved: boolean;
   installed: boolean;
+  backupIntent: boolean;
+  installIntent: boolean;
 }
 
 export interface RestoreTransactionOptions {
@@ -38,7 +40,7 @@ function compareText(left: string, right: string): number {
 
 function entryEqual(left: CheckpointEntry | undefined, right: CheckpointEntry | undefined): boolean {
   if (!left || !right) return left === right;
-  const fields = ["path", "kind", "mode", "size", "digest", "linkTarget"] as const;
+  const fields = ["path", "kind", "mode", "size", "digest", "linkTarget", "linkType"] as const;
   return fields.every((field) => left[field] === right[field]);
 }
 
@@ -63,6 +65,13 @@ function validateEntry(entry: CheckpointEntry): void {
   }
   if (entry.kind === "symlink" && typeof entry.linkTarget !== "string") {
     throw new CheckpointConflictError(`Checkpoint symlink target is invalid: ${entry.path}`);
+  }
+  validateLinkType(entry);
+}
+
+function validateLinkType(entry: CheckpointEntry): void {
+  if (entry.linkType !== undefined && !["file", "directory"].includes(entry.linkType)) {
+    throw new CheckpointConflictError(`Checkpoint symlink type is invalid: ${entry.path}`);
   }
 }
 
@@ -107,6 +116,8 @@ async function windowsSymlinkType(
   entry: CheckpointEntry
 ): Promise<"file" | "junction" | undefined> {
   if (process.platform !== "win32" || entry.kind !== "symlink") return undefined;
+  if (entry.linkType) return entry.linkType === "directory" ? "junction" : "file";
+  // Compatibility for checkpoints captured before linkType was persisted.
   const originalTarget = path.resolve(options.workspacePath, path.dirname(entry.path), entry.linkTarget!);
   const info = await stat(originalTarget).catch(() => null);
   return info?.isDirectory() ? "junction" : "file";
@@ -147,7 +158,9 @@ async function createOperations(
     ...(desiredByPath.has(name) ? { stagePath: path.join(transactionPath, "stage", String(index)) } : {}),
     backupPath: path.join(transactionPath, "backup", String(index)),
     backupMoved: false,
-    installed: false
+    installed: false,
+    backupIntent: false,
+    installIntent: false
   }));
   await mkdir(path.join(transactionPath, "stage"), { recursive: true });
   await mkdir(path.join(transactionPath, "backup"), { recursive: true });
@@ -176,7 +189,9 @@ function journalValue(phase: string, operations: RestoreOperation[]): string {
       hadCurrent: Boolean(operation.current),
       hasDesired: Boolean(operation.desired),
       backupMoved: operation.backupMoved,
-      installed: operation.installed
+      installed: operation.installed,
+      backupIntent: operation.backupIntent,
+      installIntent: operation.installIntent
     }))
   }, null, 2);
 }
@@ -184,8 +199,28 @@ function journalValue(phase: string, operations: RestoreOperation[]): string {
 async function writeJournal(transactionPath: string, phase: string, operations: RestoreOperation[]): Promise<void> {
   const target = path.join(transactionPath, "journal.json");
   const temporary = `${target}.${randomUUID()}.tmp`;
-  await writeFile(temporary, journalValue(phase, operations), { flag: "wx" });
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(journalValue(phase, operations), "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(temporary, target);
+  await syncDirectory(transactionPath);
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, "r").catch((error: NodeJS.ErrnoException) => {
+    if (["EINVAL", "ENOTSUP", "EPERM", "EISDIR"].includes(error.code ?? "")) return null;
+    throw error;
+  });
+  if (!handle) return;
+  try {
+    await handle.sync().catch((error: NodeJS.ErrnoException) => {
+      if (!["EINVAL", "ENOTSUP", "EPERM"].includes(error.code ?? "")) throw error;
+    });
+  } finally { await handle.close(); }
 }
 
 async function ensureInternalDirectory(workspacePath: string, relative: string): Promise<void> {
@@ -228,14 +263,22 @@ async function commitOperation(
       throw new CheckpointConflictError(`Checkpoint target changed before commit: ${operation.path}`);
     }
     if (operation.current) {
+      operation.backupIntent = true;
+      await writeJournal(transactionPath, "applying", operations);
       await rename(pinned.targetPath, operation.backupPath);
       operation.backupMoved = true;
+      await syncDirectory(pinned.parentPath);
+      await syncDirectory(path.dirname(operation.backupPath));
       await writeJournal(transactionPath, "applying", operations);
       await fault(options, { point: "after_backup", path: operation.path, operationIndex: operation.index });
     }
     if (operation.stagePath) {
+      operation.installIntent = true;
+      await writeJournal(transactionPath, "applying", operations);
       await rename(operation.stagePath, pinned.targetPath);
       operation.installed = true;
+      await syncDirectory(pinned.parentPath);
+      await syncDirectory(path.dirname(operation.stagePath));
       await writeJournal(transactionPath, "applying", operations);
       await fault(options, { point: "after_install", path: operation.path, operationIndex: operation.index });
     }
@@ -279,6 +322,8 @@ async function rollback(
       }
       operation.installed = false;
       operation.backupMoved = false;
+      operation.installIntent = false;
+      operation.backupIntent = false;
       await writeJournal(transactionPath, "rolling_back", operations);
       await pinned.verify();
     } finally {
@@ -319,6 +364,7 @@ export async function restoreCheckpointTransaction(options: RestoreTransactionOp
     await fault(options, { point: "before_record" });
     await options.finalize?.();
     finalized = true;
+    await writeJournal(transactionPath, "finalized", operations);
     await rm(transactionPath, { recursive: true, force: true });
   } catch (error) {
     if (finalized) {

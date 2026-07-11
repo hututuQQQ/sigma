@@ -2,6 +2,7 @@ import { chmod, lstat, mkdir, rename, rm, rmdir, symlink, writeFile } from "node
 import path from "node:path";
 import { readPatchPath } from "./atomic-patch-file-state.js";
 import { AtomicPatchError } from "./atomic-patch-parser.js";
+import { pinPatchParent } from "./atomic-patch-path-safety.js";
 import type {
   AtomicPatchMutation, AtomicPatchTransactionHooks, AtomicPatchTransactionValidators, PreparedPatchChange
 } from "./atomic-patch-types.js";
@@ -106,17 +107,6 @@ async function existingDirectory(absolute: string, relative: string): Promise<bo
   return true;
 }
 
-async function assertExistingParents(workspace: string, relative: string): Promise<void> {
-  const parts = relative.split("/").slice(0, -1);
-  let current = workspace;
-  for (const part of parts) {
-    current = path.join(current, part);
-    if (!(await existingDirectory(current, relative))) {
-      throw new AtomicPatchError(`Patch parent disappeared during the transaction: ${relative}`);
-    }
-  }
-}
-
 async function ensureTargetParents(
   options: AtomicPatchTransactionOptions,
   relative: string,
@@ -133,7 +123,14 @@ async function ensureTargetParents(
       direction: "commit", phase: "create_parent", changeIndex, relativePath: relativeParent
     });
     try {
-      await mkdir(current, { mode: 0o700 });
+      const pinned = await pinPatchParent(options.workspace, relativeParent);
+      try {
+        await pinned.verify();
+        await mkdir(pinned.targetPath, { mode: 0o700 });
+        await pinned.verify();
+      } finally {
+        await pinned.close();
+      }
       created.push({ absolutePath: current, relativePath: relativeParent, changeIndex });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !(await existingDirectory(current, relative))) throw error;
@@ -154,7 +151,14 @@ async function moveSource(
   await options.validators.assertSourceUnchanged(change);
   const target = path.join(options.workspace, ...change.source!.split("/"));
   const saved = path.join(backup, String(changeIndex));
-  await rename(target, saved);
+  const pinned = await pinPatchParent(options.workspace, change.source!);
+  try {
+    await pinned.verify();
+    await rename(pinned.targetPath, saved);
+    await pinned.verify();
+  } finally {
+    await pinned.close();
+  }
   moved.push({ target, backup: saved, relativePath: change.source!, changeIndex });
 }
 
@@ -171,7 +175,14 @@ async function installTarget(
   });
   await options.validators.assertTargetAbsent(change);
   const target = path.join(options.workspace, ...change.target!.split("/"));
-  await rename(path.join(staged, String(changeIndex)), target);
+  const pinned = await pinPatchParent(options.workspace, change.target!);
+  try {
+    await pinned.verify();
+    await rename(path.join(staged, String(changeIndex)), pinned.targetPath);
+    await pinned.verify();
+  } finally {
+    await pinned.close();
+  }
   state.installed.push({ absolutePath: target, relativePath: change.target!, changeIndex });
 }
 
@@ -211,9 +222,15 @@ async function rollbackInstalled(
         direction: "rollback", phase: "remove_installed",
         changeIndex: item.changeIndex, relativePath: item.relativePath
       });
-      await assertExistingParents(options.workspace, item.relativePath);
-      await assertInstalledTarget(options.changes[item.changeIndex]!, item.absolutePath, item.relativePath);
-      await rm(item.absolutePath, { force: true, recursive: false });
+      const pinned = await pinPatchParent(options.workspace, item.relativePath);
+      try {
+        await pinned.verify();
+        await assertInstalledTarget(options.changes[item.changeIndex]!, pinned.targetPath, item.relativePath);
+        await rm(pinned.targetPath, { force: true, recursive: false });
+        await pinned.verify();
+      } finally {
+        await pinned.close();
+      }
     });
   }
 }
@@ -246,13 +263,19 @@ async function rollbackMoved(
         direction: "rollback", phase: "restore_source",
         changeIndex: item.changeIndex, relativePath: item.relativePath
       });
-      await assertExistingParents(options.workspace, item.relativePath);
-      const existing = await lstat(item.target).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      if (existing) throw new AtomicPatchError(`Restore destination is occupied: ${item.relativePath}`);
-      await rename(item.backup, item.target);
+      const pinned = await pinPatchParent(options.workspace, item.relativePath);
+      try {
+        await pinned.verify();
+        const existing = await lstat(pinned.targetPath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (existing) throw new AtomicPatchError(`Restore destination is occupied: ${item.relativePath}`);
+        await rename(item.backup, pinned.targetPath);
+        await pinned.verify();
+      } finally {
+        await pinned.close();
+      }
     });
   }
 }
@@ -269,11 +292,17 @@ async function rollbackCreatedParents(
         direction: "rollback", phase: "remove_created_parent",
         changeIndex: item.changeIndex, relativePath: item.relativePath
       });
-      await assertExistingParents(options.workspace, `${item.relativePath}/placeholder`);
-      if (!(await existingDirectory(item.absolutePath, item.relativePath))) {
-        throw new AtomicPatchError(`Created parent disappeared before rollback: ${item.relativePath}`);
+      const pinned = await pinPatchParent(options.workspace, item.relativePath);
+      try {
+        await pinned.verify();
+        if (!(await existingDirectory(pinned.targetPath, item.relativePath))) {
+          throw new AtomicPatchError(`Created parent disappeared before rollback: ${item.relativePath}`);
+        }
+        await rmdir(pinned.targetPath);
+        await pinned.verify();
+      } finally {
+        await pinned.close();
       }
-      await rmdir(item.absolutePath);
     });
   }
 }

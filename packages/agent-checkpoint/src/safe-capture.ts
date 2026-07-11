@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { lstat, open, readlink, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { portable } from "./manifest.js";
+import { windowsLinkType } from "./windows-link-type.js";
 import { pinCheckpointParent, type PinnedCheckpointParent } from "./path-safety.js";
 import {
   CheckpointConflictError,
@@ -156,12 +157,14 @@ class CheckpointCapture {
     portablePath: string
   ): Promise<void> {
     const linkTarget = await readlink(pinned.targetPath);
+    const linkType = process.platform === "win32" ? windowsLinkType(pinned.targetPath) : undefined;
     const after = await lstat(pinned.targetPath);
     if (!sameIdentity(identity(info), identity(after))) {
       throw new CheckpointConflictError(`Checkpoint symlink changed during capture: ${portablePath}`);
     }
     this.entries.set(portablePath, {
-      path: portablePath, kind: "symlink", mode: Number(info.mode), size: Number(info.size), linkTarget
+      path: portablePath, kind: "symlink", mode: Number(info.mode), size: Number(info.size), linkTarget,
+      ...(linkType ? { linkType } : {})
     });
   }
 

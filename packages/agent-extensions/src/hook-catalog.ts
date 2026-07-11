@@ -130,6 +130,7 @@ function validateWorkspaceCommandAssets(hookDirectory: string, hook: Extract<Hoo
     return resolved;
   });
   rejectInlineInterpreter(hook);
+  rejectImplicitWorkspaceLoader(hook);
   for (const value of [hook.command, ...hook.args]) {
     if (value.startsWith("-")) continue;
     const candidate = path.resolve(cwd, value);
@@ -137,6 +138,21 @@ function validateWorkspaceCommandAssets(hookDirectory: string, hook: Extract<Hoo
     if (!trusted.some((root) => candidate === root || candidate.startsWith(`${root}${path.sep}`))) {
       throw new Error(`Workspace hook '${hook.id}' executable asset '${value}' must be declared in trust_paths.`);
     }
+  }
+}
+
+function rejectImplicitWorkspaceLoader(hook: Extract<HookDefinition, { kind: "command" }>): void {
+  const executable = path.basename(hook.command).toLowerCase().replace(/\.(?:exe|cmd|bat)$/u, "");
+  const first = hook.args[0]?.toLowerCase();
+  const implicit = new Set([
+    "make", "nmake", "msbuild", "gradle", "gradlew", "mvn", "cargo",
+    "npm", "npx", "pnpm", "pnpx", "yarn", "bun", "deno", "pipenv", "poetry"
+  ]);
+  const moduleLoader = ["python", "python3", "py"].includes(executable) && first === "-m";
+  if (implicit.has(executable) || moduleLoader) {
+    throw new Error(
+      `Workspace hook '${hook.id}' cannot use '${executable}' because it implicitly loads executable code or configuration from cwd; invoke a declared trust_paths executable directly.`
+    );
   }
 }
 

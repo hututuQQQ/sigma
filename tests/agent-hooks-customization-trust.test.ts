@@ -109,6 +109,26 @@ required = true
     await expect(discoverHooks([hookRoot])).rejects.toThrow("cannot use inline interpreter code");
   });
 
+  it.each([
+    ["npm", '["run", "policy"]'],
+    ["make", '["policy"]'],
+    ["python", '["-m", "policy"]']
+  ])("forbids workspace loaders that implicitly execute mutable cwd assets (%s)", async (command, args) => {
+    const root = await tempRoot();
+    const workspace = path.join(root, "workspace");
+    const hookRoot = defaultHookRoots(path.join(root, "home"), workspace)[1]!;
+    await mkdir(hookRoot.directory, { recursive: true });
+    await writeFile(path.join(hookRoot.directory, "implicit.toml"), `
+id = "implicit"
+event = "pre_tool"
+kind = "command"
+command = "${command}"
+args = ${args}
+required = true
+`);
+    await expect(discoverHooks([hookRoot])).rejects.toThrow("implicitly loads executable code or configuration from cwd");
+  });
+
   it("binds a frozen workspace command hook to its trusted assets even after the live hook is deleted", async () => {
     const root = await tempRoot();
     const workspace = path.join(root, "workspace");
