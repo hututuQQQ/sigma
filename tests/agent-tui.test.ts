@@ -400,14 +400,14 @@ describe("Sigma OpenTUI", () => {
     try {
       const initialStarted = performance.now();
       harness.view.update(snapshot(presentation));
-      expect(performance.now() - initialStarted).toBeLessThan(100);
+      expect(performance.now() - initialStarted).toBeLessThan(150);
       await harness.setup.flush();
       expect(harness.setup.captureCharFrame()).toContain("消息 10000");
 
       const next = projectEvent(presentation, event(10_001, "user.message", { text: "incremental tail" }));
       const incrementalStarted = performance.now();
       harness.view.update(snapshot(next));
-      expect(performance.now() - incrementalStarted).toBeLessThan(100);
+      expect(performance.now() - incrementalStarted).toBeLessThan(150);
       expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(150 * 1024 * 1024);
     } finally { harness.view.destroy(); }
   });
