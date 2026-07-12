@@ -83,13 +83,17 @@ export function loadEvalSecrets(filePath = path.join(rootDir, ".env")) {
 const SECRET_ENV_KEY = /(?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|authorization|cookie)/iu;
 
 export function artifactSecretValues(subjectSecrets, base = process.env) {
-  const candidates = [
-    ...Object.values(subjectSecrets ?? {}),
-    ...Object.entries(base)
-      .filter(([key]) => SECRET_ENV_KEY.test(key))
-      .map(([, value]) => value)
-  ];
-  return [...new Set(candidates.filter((value) => typeof value === "string" && value.length >= 4))];
+  const explicit = Object.values(subjectSecrets ?? {})
+    .filter((value) => typeof value === "string" && value.length >= 4);
+  // The subject receives an allowlisted environment, so short host values are
+  // not part of its reachable secret surface. Ignoring them here avoids
+  // treating ordinary report words such as "pass" as leaked credentials while
+  // still scanning realistic host tokens and passwords.
+  const host = Object.entries(base)
+    .filter(([key]) => SECRET_ENV_KEY.test(key))
+    .map(([, value]) => value)
+    .filter((value) => typeof value === "string" && value.length >= 16);
+  return [...new Set([...explicit, ...host])];
 }
 
 const SAFE_ENV_KEYS = new Set([

@@ -305,6 +305,41 @@ describe("agent evaluation report", () => {
 });
 
 describe("agent evaluation baseline comparison", () => {
+  it("uses controlled environment identity, treats subject identity as the variant, and rejects self-comparison", () => {
+    const baseline = run([attempt({
+      subjectOverrides: { environmentDigest: "environment-1", subjectDigest: "subject-a" }
+    })], {
+      repeat: 1,
+      subject: subject({ environmentDigest: "environment-1", subjectDigest: "subject-a" })
+    });
+    const candidate = run([attempt({
+      subjectOverrides: { environmentDigest: "environment-1", subjectDigest: "subject-b" }
+    })], {
+      runId: "run-candidate",
+      repeat: 1,
+      subject: subject({ environmentDigest: "environment-1", subjectDigest: "subject-b" })
+    });
+
+    const comparison = compareEvalRuns(baseline, candidate);
+    expect(comparison.comparable).toBe(true);
+    expect(comparison.compatibility.requiredFields).toContain("environmentDigest");
+    expect(comparison.compatibility.requiredFields).not.toContain("subjectDigest");
+    expect(comparison.baseline.subjectDigest).toBe("subject-a");
+    expect(comparison.candidate.subjectDigest).toBe("subject-b");
+
+    const differentEnvironment = run([attempt({
+      subjectOverrides: { environmentDigest: "environment-2", subjectDigest: "subject-b" }
+    })], {
+      runId: "run-other-environment",
+      repeat: 1,
+      subject: subject({ environmentDigest: "environment-2", subjectDigest: "subject-b" })
+    });
+    expect(compareEvalRuns(baseline, differentEnvironment).compatibility.mismatches)
+      .toContainEqual(expect.objectContaining({ field: "environmentDigest" }));
+    expect(compareEvalRuns(baseline, baseline).compatibility.mismatches)
+      .toContainEqual(expect.objectContaining({ field: "runId" }));
+  });
+
   it("compares only compatible runs and reports candidate-minus-baseline metric changes", () => {
     const baseline = run([1, 2, 3].map((repetition) => attempt({ repetition, durationMs: 2000 })));
     const candidate = run([1, 2, 3].map((repetition) => attempt({ repetition, durationMs: 1000 })), {

@@ -15,11 +15,15 @@ export const EVAL_COMPATIBILITY_FIELDS = Object.freeze([
   "scenarioDigest",
   "evaluatorDigest",
   "verifierDigest",
-  "brokerDigest",
   "model",
   "platform",
   "surface",
-  "configDigest"
+  "environmentDigest"
+]);
+
+const LEGACY_COMPATIBILITY_FIELDS = Object.freeze([
+  "scenarioDigest", "evaluatorDigest", "verifierDigest", "brokerDigest",
+  "model", "platform", "surface", "configDigest"
 ]);
 
 const LOWER_IS_BETTER = new Set([
@@ -75,8 +79,25 @@ function infrastructureValidity(run) {
   return { valid: runErrors === 0 && attemptErrors === 0 && !sampleMismatch, runErrors, attemptErrors, expectedSamples, actualSamples };
 }
 
-function compatibilityMismatches(baseline, candidate) {
+function compatibilityFields(baseline, candidate) {
+  const scenarioIds = [...new Set([
+    ...baseline.scenarios.map((scenario) => scenario.scenarioId),
+    ...candidate.scenarios.map((scenario) => scenario.scenarioId)
+  ])];
+  const hasEnvironmentDigest = scenarioIds.every((scenarioId) =>
+    subjectValues(baseline, scenarioId, "environmentDigest").length > 0
+    && subjectValues(candidate, scenarioId, "environmentDigest").length > 0);
+  return hasEnvironmentDigest ? EVAL_COMPATIBILITY_FIELDS : LEGACY_COMPATIBILITY_FIELDS;
+}
+
+function compatibilityMismatches(baseline, candidate, requiredFields) {
   const mismatches = [];
+  if (baseline.runId === candidate.runId) {
+    mismatches.push({
+      scope: "run", field: "runId", baseline: baseline.runId, candidate: candidate.runId,
+      reason: "A run cannot be compared with itself."
+    });
+  }
   if (baseline.repeat !== candidate.repeat) {
     mismatches.push({
       scope: "run", field: "repeat", baseline: baseline.repeat, candidate: candidate.repeat,
@@ -103,7 +124,7 @@ function compatibilityMismatches(baseline, candidate) {
     });
   }
   for (const scenarioId of [...new Set([...baselineIds, ...candidateIds])].sort()) {
-    for (const field of EVAL_COMPATIBILITY_FIELDS) {
+    for (const field of requiredFields) {
       const baselineValues = subjectValues(baseline, scenarioId, field);
       const candidateValues = subjectValues(candidate, scenarioId, field);
       const equal = baselineValues.length === 1 && candidateValues.length === 1
@@ -213,6 +234,8 @@ function runIdentity(run) {
     model: run.subject?.model ?? null,
     platform: run.subject?.platform ?? null,
     surface: run.subject?.surface ?? null,
+    subjectDigest: run.subject?.subjectDigest ?? null,
+    environmentDigest: run.subject?.environmentDigest ?? null,
     configDigest: run.subject?.configDigest ?? null
   };
 }
@@ -220,7 +243,8 @@ function runIdentity(run) {
 export function compareEvalRuns(baselineInput, candidateInput) {
   const baseline = buildEvalRunReport(baselineInput);
   const candidate = buildEvalRunReport(candidateInput);
-  const mismatches = compatibilityMismatches(baseline, candidate);
+  const requiredFields = compatibilityFields(baseline, candidate);
+  const mismatches = compatibilityMismatches(baseline, candidate, requiredFields);
   const comparable = mismatches.length === 0;
   const sharedIds = baseline.scenarios.map((scenario) => scenario.scenarioId)
     .filter((scenarioId) => candidate.scenarios.some((scenario) => scenario.scenarioId === scenarioId))
@@ -230,7 +254,7 @@ export function compareEvalRuns(baselineInput, candidateInput) {
     kind: "eval_comparison",
     comparable,
     compatibility: {
-      requiredFields: EVAL_COMPATIBILITY_FIELDS,
+      requiredFields,
       mismatches
     },
     baseline: runIdentity(baseline),

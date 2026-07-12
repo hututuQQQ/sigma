@@ -50,17 +50,69 @@ async function gitSha() {
   return result.exitCode === 0 ? result.stdout.trim() : "unknown";
 }
 
-async function prepareSubject(suite, runDir, options = {}, redactor = String) {
-  if (options.subjectKind === "dev" || suite === "quick") {
+async function digestTrees(trees) {
+  const entries = {};
+  for (const tree of trees) {
+    const snapshot = await snapshotWorkspace(tree.directory);
+    for (const [name, value] of Object.entries(snapshot)) entries[`${tree.label}/${name}`] = value;
+  }
+  return directoryDigest(entries);
+}
+
+async function devRuntimeTrees() {
+  const trees = [];
+  for (const entry of await readdir(path.join(rootDir, "packages"), { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const directory = path.join(rootDir, "packages", entry.name, "dist");
+    try {
+      await access(directory);
+      trees.push({ label: `packages/${entry.name}/dist`, directory });
+    } catch {
+      // Packages without runtime output are not part of the executable subject.
+    }
+  }
+  const assets = path.join(rootDir, "assets");
+  await access(assets);
+  trees.push({ label: "assets", directory: assets });
+  return trees;
+}
+
+async function subjectIdentity({ subjectKind, cliTreeDigest, nodePath, brokerPath }) {
+  const [nodeDigest, brokerDigest] = await Promise.all([
+    readFile(nodePath).then(digest),
+    readFile(brokerPath).then(digest)
+  ]);
+  return {
+    nodeDigest,
+    brokerDigest,
+    cliTreeDigest,
+    subjectDigest: digest({ subjectKind, cliTreeDigest, nodeDigest, brokerDigest })
+  };
+}
+
+async function prepareSubject(runDir, options = {}, redactor = String) {
+  const subjectKind = options.subjectKind ?? "package";
+  if (!new Set(["dev", "package"]).has(subjectKind)) {
+    throw new Error("Evaluation subject must be 'package' or 'dev'.");
+  }
+  if (options.skipPackage && subjectKind !== "package") {
+    throw new Error("--skip-package is valid only with --subject package.");
+  }
+  if (subjectKind === "dev") {
     const brokerPath = path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecName());
     const result = await capture(packageManager(), ["build:native:sigma-exec"], { cwd: rootDir });
     await writeFile(path.join(runDir, "native-build.stdout.log"), redactor(result.stdout), "utf8");
     await writeFile(path.join(runDir, "native-build.stderr.log"), redactor(result.stderr), "utf8");
     if (result.exitCode !== 0) throw new Error("Building the target-native sigma-exec evaluator dependency failed.");
     await Promise.all([access(cliEntry), access(brokerPath)]);
+    const identity = await subjectIdentity({
+      subjectKind,
+      cliTreeDigest: await digestTrees(await devRuntimeTrees()),
+      nodePath: process.execPath,
+      brokerPath
+    });
     return {
-      subjectKind: "dev", cliEntry, nodePath: process.execPath, brokerPath,
-      brokerDigest: digest(await readFile(brokerPath)),
+      subjectKind, cliEntry, nodePath: process.execPath, brokerPath, ...identity,
       nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
       nativeTarget: `${process.platform}-${process.arch}`
     };
@@ -79,9 +131,14 @@ async function prepareSubject(suite, runDir, options = {}, redactor = String) {
   const entryPath = path.join(bundleRoot, "packages", "agent-cli", "dist", "index.js");
   const brokerPath = path.join(bundleRoot, "bin", sigmaExecName());
   await Promise.all([access(nodePath), access(entryPath), access(brokerPath)]);
+  const identity = await subjectIdentity({
+    subjectKind,
+    cliTreeDigest: directoryDigest(await snapshotWorkspace(bundleRoot)),
+    nodePath,
+    brokerPath
+  });
   return {
-    subjectKind: "package", cliEntry: entryPath, nodePath, brokerPath,
-    brokerDigest: digest(await readFile(brokerPath)),
+    subjectKind, cliEntry: entryPath, nodePath, brokerPath, ...identity,
     nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
     nativeTarget: `${process.platform}-${process.arch}`
   };
@@ -207,6 +264,24 @@ async function redactArtifactTree(directory, secretValues) {
   return exposures;
 }
 
+async function scanArtifactTree(directory, secretValues) {
+  const exposures = [];
+  async function visit(current) {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const target = path.join(current, entry.name);
+      if (entry.isDirectory()) { await visit(target); continue; }
+      if (!entry.isFile()) continue;
+      let content;
+      try { content = await readFile(target); } catch { continue; }
+      if (!secretValues.some((secret) => typeof secret === "string" && secret.length > 0
+        && content.includes(Buffer.from(secret)))) continue;
+      exposures.push(path.relative(directory, target).replace(/\\/gu, "/"));
+    }
+  }
+  await visit(directory);
+  return exposures;
+}
+
 async function durableEvents(workspace, stateHome, subjectResult) {
   const stateRoot = await resolveWorkspaceStateRoot(workspace, { env: { SIGMA_STATE_HOME: stateHome } });
   const sessions = await listV3Sessions(stateRoot);
@@ -265,12 +340,15 @@ function subjectConfiguration(context, fixtureSnapshot) {
     scenarioDigest: digest(scenario),
     evaluatorDigest,
     verifierDigest,
+    nodeDigest: subject.nodeDigest ?? null,
+    cliTreeDigest: subject.cliTreeDigest ?? null,
     brokerDigest: subject.brokerDigest ?? null,
+    subjectDigest: subject.subjectDigest ?? null,
     nativeSourceDigest: subject.nativeSourceDigest ?? null,
     nativeTarget: subject.nativeTarget ?? null,
     subjectKind: subject.subjectKind
   };
-  configuration.configDigest = digest({
+  configuration.environmentDigest = digest({
     provider: configuration.provider,
     model: configuration.model,
     surface: configuration.surface,
@@ -280,12 +358,11 @@ function subjectConfiguration(context, fixtureSnapshot) {
     fixtureDigest: configuration.fixtureDigest,
     evaluatorDigest: configuration.evaluatorDigest,
     verifierDigest: configuration.verifierDigest,
-    brokerDigest: configuration.brokerDigest,
-    nativeSourceDigest: configuration.nativeSourceDigest,
-    nativeTarget: configuration.nativeTarget,
-    budget,
-    subjectKind: configuration.subjectKind
+    budget
   });
+  // configDigest remains as a compatibility alias for schema-v1 readers. It
+  // now describes controlled evaluation conditions rather than subject bytes.
+  configuration.configDigest = configuration.environmentDigest;
   return configuration;
 }
 
@@ -713,6 +790,13 @@ async function runAttempt(context, deps = {}) {
 export async function runEvaluation(options = {}, deps = {}) {
   const suite = options.suite ?? "quick";
   if (!new Set(["quick", "experience"]).has(suite)) throw new Error(`Unknown evaluation suite '${suite}'.`);
+  const subjectKind = options.subjectKind ?? "package";
+  if (!new Set(["dev", "package"]).has(subjectKind)) {
+    throw new Error("Evaluation subject must be 'package' or 'dev'.");
+  }
+  if (options.skipPackage && subjectKind !== "package") {
+    throw new Error("--skip-package is valid only with --subject package.");
+  }
   const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
   const manifestDir = path.dirname(manifestPath);
   const manifest = await loadEvalManifestV1(manifestPath);
@@ -727,7 +811,15 @@ export async function runEvaluation(options = {}, deps = {}) {
   const repeat = options.repeat ?? (suite === "experience" ? 3 : 1);
   if (!Number.isSafeInteger(repeat) || repeat <= 0) throw new Error("repeat must be a positive integer.");
   const runId = options.runId ?? makeRunId();
-  const runDir = await prepareRunDirectory(options.runDir ?? path.join(evalRootDir, runId));
+  const requestedRunDir = options.runDir ? path.resolve(options.runDir) : undefined;
+  const effectiveEvalRoot = path.resolve(options.evalRootDir
+    ?? (requestedRunDir ? path.dirname(requestedRunDir) : evalRootDir));
+  const destination = requestedRunDir ?? path.join(effectiveEvalRoot, runId);
+  const relativeDestination = path.relative(effectiveEvalRoot, destination);
+  if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination)) {
+    throw new Error("Evaluation run directory must be inside its results root.");
+  }
+  const runDir = await prepareRunDirectory(destination);
   const secrets = deps.secrets ?? loadEvalSecrets(options.envPath);
   const artifactSecretValues = deps.artifactSecretValues ?? collectArtifactSecretValues(secrets);
   const redactor = createRedactor(artifactSecretValues);
@@ -751,8 +843,8 @@ export async function runEvaluation(options = {}, deps = {}) {
   let subject;
   try {
     subject = deps.prepareSubject
-      ? await deps.prepareSubject(suite, runDir, options)
-      : await prepareSubject(suite, runDir, options, redactor);
+      ? await deps.prepareSubject(runDir, options)
+      : await prepareSubject(runDir, options, redactor);
   } catch (error) {
     const detail = redactor(error instanceof Error ? error.stack ?? error.message : String(error));
     infrastructureErrors.push({ code: "subject_preparation_failed", phase: "subject_preparation", detail });
@@ -816,9 +908,14 @@ export async function runEvaluation(options = {}, deps = {}) {
       surface: "mixed",
       evaluatorDigest,
       verifierDigest,
+      nodeDigest: subject?.nodeDigest ?? null,
+      cliTreeDigest: subject?.cliTreeDigest ?? null,
       brokerDigest: subject?.brokerDigest ?? null,
+      subjectDigest: subject?.subjectDigest ?? null,
       nativeSourceDigest: subject?.nativeSourceDigest ?? null,
-      nativeTarget: subject?.nativeTarget ?? null
+      nativeTarget: subject?.nativeTarget ?? null,
+      environmentDigest: attempts[0]?.subject?.environmentDigest ?? null,
+      configDigest: attempts[0]?.subject?.environmentDigest ?? null
     },
     scenarios: scenarios.map((scenario) => ({ scenarioId: scenario.id, scenarioDigest: digest(scenario) })),
     attempts,
@@ -833,7 +930,7 @@ export async function runEvaluation(options = {}, deps = {}) {
     });
   }
   const safeRun = () => JSON.parse(redactor(JSON.stringify(rawRun)));
-  let written = await writeEvalReport({ run: safeRun(), runDir, evalRootDir });
+  let written = await writeEvalReport({ run: safeRun(), runDir, evalRootDir: effectiveEvalRoot });
   const finalExposures = await redactArtifactTree(runDir, artifactSecretValues);
   if (finalExposures.length > 0) {
     infrastructureErrors.push({
@@ -841,11 +938,12 @@ export async function runEvaluation(options = {}, deps = {}) {
       phase: "final_secret_scan",
       files: finalExposures
     });
-    written = await writeEvalReport({ run: safeRun(), runDir, evalRootDir });
-    const residualExposures = await redactArtifactTree(runDir, artifactSecretValues);
-    if (residualExposures.length > 0) {
-      throw new Error(`Secret material could not be removed from evaluation artifacts: ${residualExposures.join(", ")}`);
-    }
+    written = await writeEvalReport({ run: safeRun(), runDir, evalRootDir: effectiveEvalRoot });
+    await redactArtifactTree(runDir, artifactSecretValues);
+  }
+  const residualExposures = await scanArtifactTree(runDir, artifactSecretValues);
+  if (residualExposures.length > 0) {
+    throw new Error(`Secret material could not be removed from evaluation artifacts: ${residualExposures.join(", ")}`);
   }
   return { ...written, runDir, run: written.report };
 }

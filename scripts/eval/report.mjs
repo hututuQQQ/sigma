@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -660,6 +660,10 @@ export async function writeEvalReport({ run, runDir, outputDir, evalRootDir }) {
   const report = buildEvalRunReport(run);
   const destination = path.resolve(runDir ?? outputDir ?? path.join(".artifacts", "eval", String(report.runId)));
   const root = path.resolve(evalRootDir ?? path.dirname(destination));
+  const relativeDestination = path.relative(root, destination);
+  if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination)) {
+    throw new Error("Evaluation report destination must be inside its results root.");
+  }
   const runPath = path.join(destination, "run.json");
   const reportPath = path.join(destination, "report.md");
   const codexReviewPath = path.join(destination, "codex-review.md");
@@ -668,6 +672,7 @@ export async function writeEvalReport({ run, runDir, outputDir, evalRootDir }) {
   await writeJson(runPath, report);
   await atomicWrite(reportPath, `${renderEvalReportMarkdown(report).trimEnd()}\n`);
   await atomicWrite(codexReviewPath, `${renderCodexReviewMarkdown(report).trimEnd()}\n`);
+  await Promise.all([access(runPath), access(reportPath), access(codexReviewPath)]);
   await writeJson(latestPath, {
     schemaVersion: EVAL_REPORT_SCHEMA_VERSION,
     kind: "eval_latest",

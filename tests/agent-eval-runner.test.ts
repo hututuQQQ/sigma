@@ -2,7 +2,7 @@ import { access, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { artifactSecretValues, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
+import { artifactSecretValues, evalRootDir, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
 import { evaluatorDigestFromSnapshot, runEvaluation, verifierSourceDigest } from "../scripts/eval/runner.mjs";
 import { breachedBudget } from "../scripts/eval/subject-cli.mjs";
 
@@ -123,6 +123,88 @@ describe("agent experience evaluation runner", () => {
     expect(await readFile(result.runPath, "utf8")).not.toContain("test-secret-value-12345");
   });
 
+  it("keeps custom result roots and their latest pointers isolated from the repository", async () => {
+    const fixture = await manifest();
+    const repositoryLatest = path.join(evalRootDir, "latest.json");
+    const before = await readFile(repositoryLatest, "utf8").catch(() => null);
+    const runDir = path.join(fixture.root, "isolated-results", "run-one");
+    const result = await runEvaluation({
+      suite: "quick", repeat: 1, manifestPath: fixture.manifestPath, runDir
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+      prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+      runSubject: async (input: Record<string, unknown>) => {
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return { exitCode: 0, sessionId: "session", result: { status: "completed" }, events: successfulEvents() };
+      }
+    });
+    expect(result.latestPath).toBe(path.join(path.dirname(runDir), "latest.json"));
+    expect(JSON.parse(await readFile(result.latestPath, "utf8"))).toMatchObject({ runDir: "run-one" });
+    expect(await readFile(repositoryLatest, "utf8").catch(() => null)).toBe(before);
+  });
+
+  it("uses one explicit subject identity across suites and rejects invalid subject options", async () => {
+    const fixture = await manifest();
+    const run = async (suite: "quick" | "experience", name: string) => await runEvaluation({
+      suite, repeat: 1, manifestPath: fixture.manifestPath,
+      runDir: path.join(fixture.root, name), subjectKind: "package", skipPackage: true
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+      prepareSubject: async () => ({
+        subjectKind: "package", cliEntry: "fake", nodePath: "fake", subjectDigest: "subject-fixed"
+      }),
+      runSubject: async (input: Record<string, unknown>) => {
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return { exitCode: 0, sessionId: "session", result: { status: "completed" }, events: successfulEvents() };
+      }
+    });
+    const [quick, experience] = await Promise.all([run("quick", "quick-run"), run("experience", "experience-run")]);
+    expect(quick.run.subject.subjectDigest).toBe("subject-fixed");
+    expect(experience.run.subject.subjectDigest).toBe("subject-fixed");
+    await expect(runEvaluation({
+      suite: "quick", manifestPath: fixture.manifestPath,
+      evalRootDir: path.join(fixture.root, "declared-root"),
+      runDir: path.join(fixture.root, "outside-root")
+    }, { secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" } })).rejects.toThrow(/results root/);
+    await expect(runEvaluation({
+      suite: "quick", manifestPath: fixture.manifestPath, runDir: path.join(fixture.root, "bad-subject"),
+      subjectKind: "fixture"
+    }, { secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" } })).rejects.toThrow(/package.*dev/);
+    await expect(runEvaluation({
+      suite: "quick", manifestPath: fixture.manifestPath, runDir: path.join(fixture.root, "bad-skip"),
+      subjectKind: "dev", skipPackage: true
+    }, { secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" } })).rejects.toThrow(/skip-package/);
+  });
+
+  it("does not mistake a short host token value for report secret material", async () => {
+    const fixture = await manifest();
+    const previous = process.env.CI_TOKEN;
+    process.env.CI_TOKEN = "pass";
+    try {
+      const result = await runEvaluation({
+        suite: "quick", repeat: 1, manifestPath: fixture.manifestPath,
+        runDir: path.join(fixture.root, "short-host-token")
+      }, {
+        secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+        prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+        runSubject: async (input: Record<string, unknown>) => {
+          await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+          await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+          return { exitCode: 0, sessionId: "session", result: { status: "completed" }, events: successfulEvents() };
+        }
+      });
+      expect(result.run.status).toBe("stable");
+      for (const file of [result.runPath, result.reportPath, result.codexReviewPath]) {
+        expect(await readFile(file, "utf8")).not.toContain("test-secret-value-12345");
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CI_TOKEN;
+      else process.env.CI_TOKEN = previous;
+    }
+  });
+
   it("does not retry a failed post-run verifier", async () => {
     const fixture = await manifest({ verifierPass: false });
     let calls = 0;
@@ -177,6 +259,8 @@ describe("agent experience evaluation runner", () => {
     expect(Object.values(subject)).not.toContain("C:\\host-temp");
     expect(artifactSecretValues(secrets, { NPM_TOKEN: "host-package-token", PATH: "not-secret" }))
       .toEqual(expect.arrayContaining(["file-only-key", "host-package-token"]));
+    expect(artifactSecretValues(secrets, { CI_TOKEN: "pass" })).not.toContain("pass");
+    expect(artifactSecretValues({ DEEPSEEK_API_KEY: "pass" }, {})).toContain("pass");
   });
 
   it("hashes evaluator sources without machine-specific Python caches", () => {

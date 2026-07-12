@@ -17,8 +17,9 @@ export async function runAgentEvalCli(argv = process.argv.slice(2), deps = {}) {
     scenarios,
     manifestPath: typeof flags.manifest === "string" ? flags.manifest : undefined,
     runDir: typeof flags["run-dir"] === "string" ? flags["run-dir"] : undefined,
+    evalRootDir: typeof flags["eval-root"] === "string" ? flags["eval-root"] : undefined,
     envPath: typeof flags.env === "string" ? flags.env : undefined,
-    subjectKind: typeof flags.subject === "string" ? flags.subject : undefined,
+    subjectKind: typeof flags.subject === "string" ? flags.subject : "package",
     skipPackage: flags["skip-package"] === true
   }, {
     ...deps,

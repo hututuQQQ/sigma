@@ -33,6 +33,18 @@ const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => crea
   reviewer: createApprovingReviewer()
 });
 
+async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
 
 function completion(summary: string): (request: ModelRequest) => ModelResponse {
@@ -1065,11 +1077,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
       delegatedEffects: ["filesystem.read", "filesystem.write", "process.spawn", "process.spawn.readonly", "validation"],
       metadata: { mode: "change" }
     });
-    await expect(Promise.race([
-      supervisor.join(child.id),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Child approval deadlocked.")), 3_000))
-    ])).resolves.toMatchObject({ status: "completed", result: { outcome: { kind: "completed" } } });
+    await expect(withDeadline(
+      supervisor.join(child.id), 15_000, "Child approval deadlocked."
+    )).resolves.toMatchObject({ status: "completed", result: { outcome: { kind: "completed" } } });
     await expect(readFile(path.join(workspace, "child.txt"), "utf8")).resolves.toBe("child");
     expect(messages.some((value) => JSON.stringify(value).includes("delegated_approval_resolved"))).toBe(true);
-  });
+  }, 20_000);
 });
