@@ -104,6 +104,9 @@ function requireRelativePath(value, label, { allowGlob = false } = {}) {
     throw new TypeError(`${label} must not escape or ambiguously address its root`);
   }
   if (!allowGlob && /[*?[\]{}]/.test(candidate)) throw new TypeError(`${label} must not contain glob syntax`);
+  if (allowGlob && /[[\]{}]/u.test(candidate)) {
+    throw new TypeError(`${label} only supports *, **, and ? glob syntax`);
+  }
   return candidate;
 }
 
@@ -256,6 +259,9 @@ export function assertEvalScenarioV1(value, label = "scenario") {
   requireEnum(scenario.budget, Object.keys(EVAL_BUDGETS_V1), `${label}.budget`);
   requireStringArray(scenario.allowedChanges, `${label}.allowedChanges`, { path: true, allowGlob: true });
   validateInteractions(scenario.interactions, `${label}.interactions`);
+  if (scenario.surface === "cli" && (scenario.permissionPolicy !== "auto" || scenario.interactions.length > 0)) {
+    throw new TypeError(`${label} CLI scenarios require permissionPolicy "auto" and no interactions`);
+  }
   validateVerifier(scenario.verifier, `${label}.verifier`);
   return scenario;
 }

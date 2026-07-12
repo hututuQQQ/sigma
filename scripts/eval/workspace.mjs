@@ -104,6 +104,32 @@ export async function snapshotWorkspace(workspace) {
   return entries;
 }
 
+export async function copyWorkspaceEvidence(source, destination) {
+  const links = [];
+  async function copyDirectory(currentSource, currentDestination) {
+    await mkdir(currentDestination, { recursive: true });
+    const entries = await readdir(currentSource, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      const from = path.join(currentSource, entry.name);
+      const to = path.join(currentDestination, entry.name);
+      const info = await lstat(from);
+      const relative = path.relative(source, from).replace(/\\/gu, "/");
+      if (info.isSymbolicLink()) {
+        links.push({ path: relative, target: await readlink(from) });
+      } else if (info.isDirectory()) {
+        await copyDirectory(from, to);
+      } else if (info.isFile()) {
+        await cp(from, to, { force: false, errorOnExist: true });
+      }
+    }
+  }
+  await copyDirectory(source, destination);
+  if (links.length > 0) {
+    await writeFile(path.join(destination, ".symlinks.json"), `${JSON.stringify({ schemaVersion: 1, links }, null, 2)}\n`, "utf8");
+  }
+  return links;
+}
+
 export function diffWorkspaceSnapshots(before, after) {
   const added = [];
   const modified = [];

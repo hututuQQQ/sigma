@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -15,7 +15,7 @@ import { runCliSubject } from "./subject-cli.mjs";
 import { runTuiSubject } from "./subject-tui.mjs";
 import { runPostVerifier } from "./verifier.mjs";
 import {
-  diffWorkspaceSnapshots, gitDiff, seedWorkspace, snapshotWorkspace, unauthorizedChanges
+  copyWorkspaceEvidence, diffWorkspaceSnapshots, gitDiff, seedWorkspace, snapshotWorkspace, unauthorizedChanges
 } from "./workspace.mjs";
 
 const DEFAULT_MANIFEST = path.join(fixtureRootDir, "manifest.json");
@@ -53,16 +53,17 @@ async function gitSha() {
 async function prepareSubject(suite, runDir, options = {}, redactor = String) {
   if (options.subjectKind === "dev" || suite === "quick") {
     const brokerPath = path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecName());
-    try {
-      await access(brokerPath);
-    } catch {
-      const result = await capture(packageManager(), ["build:native:sigma-exec"], { cwd: rootDir });
-      await writeFile(path.join(runDir, "native-build.stdout.log"), redactor(result.stdout), "utf8");
-      await writeFile(path.join(runDir, "native-build.stderr.log"), redactor(result.stderr), "utf8");
-      if (result.exitCode !== 0) throw new Error("Building the target-native sigma-exec evaluator dependency failed.");
-    }
+    const result = await capture(packageManager(), ["build:native:sigma-exec"], { cwd: rootDir });
+    await writeFile(path.join(runDir, "native-build.stdout.log"), redactor(result.stdout), "utf8");
+    await writeFile(path.join(runDir, "native-build.stderr.log"), redactor(result.stderr), "utf8");
+    if (result.exitCode !== 0) throw new Error("Building the target-native sigma-exec evaluator dependency failed.");
     await Promise.all([access(cliEntry), access(brokerPath)]);
-    return { subjectKind: "dev", cliEntry, nodePath: process.execPath, brokerPath };
+    return {
+      subjectKind: "dev", cliEntry, nodePath: process.execPath, brokerPath,
+      brokerDigest: digest(await readFile(brokerPath)),
+      nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
+      nativeTarget: `${process.platform}-${process.arch}`
+    };
   }
   const target = process.platform === "win32" ? "windows" : "linux";
   const arch = process.arch === "arm64" ? "arm64" : "x64";
@@ -78,7 +79,12 @@ async function prepareSubject(suite, runDir, options = {}, redactor = String) {
   const entryPath = path.join(bundleRoot, "packages", "agent-cli", "dist", "index.js");
   const brokerPath = path.join(bundleRoot, "bin", sigmaExecName());
   await Promise.all([access(nodePath), access(entryPath), access(brokerPath)]);
-  return { subjectKind: "package", cliEntry: entryPath, nodePath, brokerPath };
+  return {
+    subjectKind: "package", cliEntry: entryPath, nodePath, brokerPath,
+    brokerDigest: digest(await readFile(brokerPath)),
+    nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
+    nativeTarget: `${process.platform}-${process.arch}`
+  };
 }
 
 function directoryDigest(snapshot) {
@@ -92,6 +98,32 @@ export function evaluatorDigestFromSnapshot(snapshot) {
 
 export async function evaluatorSourceDigest() {
   return evaluatorDigestFromSnapshot(await snapshotWorkspace(path.join(rootDir, "scripts", "eval")));
+}
+
+export async function verifierSourceDigest(manifestDir, scenarios) {
+  const snapshot = await snapshotWorkspace(manifestDir);
+  const fixturePrefixes = scenarios.map((scenario) => `${scenario.fixture.workspace.replace(/\\/gu, "/").replace(/\/$/u, "")}/`);
+  return directoryDigest(Object.fromEntries(Object.entries(snapshot).filter(([name, entry]) =>
+    entry?.kind === "file" && !fixturePrefixes.some((prefix) => name.startsWith(prefix)))));
+}
+
+async function prepareRunDirectory(runDir) {
+  const resolved = path.resolve(runDir);
+  const dangerous = new Set([
+    path.parse(resolved).root.toLowerCase(), path.resolve(rootDir).toLowerCase(), path.resolve(os.homedir()).toLowerCase()
+  ]);
+  if (dangerous.has(resolved.toLowerCase())) throw new Error(`Refusing unsafe evaluation run directory: ${resolved}`);
+  const existing = await lstat(resolved).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error("Evaluation run directory must be a real directory.");
+    const canonical = await realpath(resolved);
+    if (dangerous.has(path.resolve(canonical).toLowerCase())) throw new Error(`Refusing unsafe evaluation run directory: ${resolved}`);
+    if ((await readdir(resolved)).length > 0) throw new Error("Evaluation run directory must be new or empty.");
+    return resolved;
+  }
+  await mkdir(path.dirname(resolved), { recursive: true });
+  await mkdir(resolved, { recursive: false });
+  return resolved;
 }
 
 function normalizeMetrics(raw, subjectDurationMs) {
@@ -219,7 +251,7 @@ async function appendExternalReport(stateRoot, attempt) {
 }
 
 function subjectConfiguration(context, fixtureSnapshot) {
-  const { scenario, subject, sourceGitSha, evaluatorDigest } = context;
+  const { scenario, subject, sourceGitSha, evaluatorDigest, verifierDigest } = context;
   const budget = EVAL_BUDGETS_V1[scenario.budget];
   const configuration = {
     provider: "deepseek",
@@ -232,6 +264,10 @@ function subjectConfiguration(context, fixtureSnapshot) {
     fixtureDigest: directoryDigest(fixtureSnapshot),
     scenarioDigest: digest(scenario),
     evaluatorDigest,
+    verifierDigest,
+    brokerDigest: subject.brokerDigest ?? null,
+    nativeSourceDigest: subject.nativeSourceDigest ?? null,
+    nativeTarget: subject.nativeTarget ?? null,
     subjectKind: subject.subjectKind
   };
   configuration.configDigest = digest({
@@ -243,6 +279,10 @@ function subjectConfiguration(context, fixtureSnapshot) {
     arch: configuration.arch,
     fixtureDigest: configuration.fixtureDigest,
     evaluatorDigest: configuration.evaluatorDigest,
+    verifierDigest: configuration.verifierDigest,
+    brokerDigest: configuration.brokerDigest,
+    nativeSourceDigest: configuration.nativeSourceDigest,
+    nativeTarget: configuration.nativeTarget,
     budget,
     subjectKind: configuration.subjectKind
   });
@@ -504,7 +544,7 @@ async function runAttemptCore(context, deps, lifecycle) {
   lifecycle.phase = "verifier";
   await mkdir(verifierHome, { recursive: true });
   await Promise.all([
-    cp(workspace, verifierWorkspace, { recursive: true, force: false, errorOnExist: true }),
+    copyWorkspaceEvidence(workspace, verifierWorkspace),
     cp(manifestDir, verifierManifestDir, { recursive: true, force: false, errorOnExist: true })
   ]);
   const verifierBefore = await snapshotWorkspace(verifierWorkspace);
@@ -533,7 +573,8 @@ async function runAttemptCore(context, deps, lifecycle) {
   const safetyViolations = safetyViolationsFromEvidence(scenario, delta, rawMetrics, events);
   const finalWorkspaceArtifact = path.join(attemptArtifactDir, "workspace-final");
   lifecycle.phase = "evidence_copy";
-  await cp(workspace, finalWorkspaceArtifact, { recursive: true, force: false, errorOnExist: true });
+  const evidenceLinks = await copyWorkspaceEvidence(workspace, finalWorkspaceArtifact);
+  for (const link of evidenceLinks) safetyViolations.push({ code: "workspace_symbolic_link", ...link });
   const experienceViolations = experienceViolationsFromEvidence(scenario, subjectResult, metrics);
   const expectedActual = actualTerminal(metrics, subjectResult);
   const reliabilitySignals = rawMetrics.hardFailures.map((failure) => ({ severity: "blocker", ...failure }));
@@ -686,13 +727,13 @@ export async function runEvaluation(options = {}, deps = {}) {
   const repeat = options.repeat ?? (suite === "experience" ? 3 : 1);
   if (!Number.isSafeInteger(repeat) || repeat <= 0) throw new Error("repeat must be a positive integer.");
   const runId = options.runId ?? makeRunId();
-  const runDir = path.resolve(options.runDir ?? path.join(evalRootDir, runId));
-  await mkdir(runDir, { recursive: true });
+  const runDir = await prepareRunDirectory(options.runDir ?? path.join(evalRootDir, runId));
   const secrets = deps.secrets ?? loadEvalSecrets(options.envPath);
   const artifactSecretValues = deps.artifactSecretValues ?? collectArtifactSecretValues(secrets);
   const redactor = createRedactor(artifactSecretValues);
   const sourceGitSha = await gitSha();
   const evaluatorDigest = await evaluatorSourceDigest();
+  const verifierDigest = await verifierSourceDigest(manifestDir, scenarios);
   const schedule = scenarios.flatMap((scenario) => Array.from({ length: repeat }, (_, index) => ({
     scenario,
     repetition: index + 1,
@@ -732,7 +773,8 @@ export async function runEvaluation(options = {}, deps = {}) {
           artifactSecretValues,
           redactor,
           sourceGitSha,
-          evaluatorDigest
+          evaluatorDigest,
+          verifierDigest
         }, deps);
         attempts.push(attempt);
         for (const signal of attempt.dimensions.reliability.signals ?? []) {
@@ -772,7 +814,11 @@ export async function runEvaluation(options = {}, deps = {}) {
       gitSha: sourceGitSha,
       subjectKind: subject?.subjectKind ?? "unavailable",
       surface: "mixed",
-      evaluatorDigest
+      evaluatorDigest,
+      verifierDigest,
+      brokerDigest: subject?.brokerDigest ?? null,
+      nativeSourceDigest: subject?.nativeSourceDigest ?? null,
+      nativeTarget: subject?.nativeTarget ?? null
     },
     scenarios: scenarios.map((scenario) => ({ scenarioId: scenario.id, scenarioDigest: digest(scenario) })),
     attempts,

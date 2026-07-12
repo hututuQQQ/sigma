@@ -39,6 +39,8 @@ const subject = (overrides: Record<string, unknown> = {}) => ({
   fixtureDigest: "fixture-1",
   scenarioDigest: "scenario-1",
   evaluatorDigest: "evaluator-1",
+  verifierDigest: "verifier-1",
+  brokerDigest: "broker-1",
   subjectKind: "built-cli",
   ...overrides
 });
@@ -375,7 +377,7 @@ describe("agent evaluation baseline comparison", () => {
     expect(comparison.compatibility.mismatches.map((item: { field: string }) => item.field)).toEqual(expect.arrayContaining([
       "scenarioDigest", "configDigest"
     ]));
-    expect(comparison.metrics).toEqual({});
+    expect(comparison.metrics.durationMs).toMatchObject({ change: "invalid", delta: null });
     expect(comparison.scenarios).toEqual([]);
     expect(() => assertComparableEvalRuns(baseline, candidate)).toThrow("not comparable");
     expect(renderEvalComparisonMarkdown(comparison)).toContain("Compatibility Gate Failed");
@@ -394,8 +396,37 @@ describe("agent evaluation baseline comparison", () => {
     expect(comparison.compatibility.mismatches.map((item: { field: string }) => item.field)).toEqual(expect.arrayContaining([
       "repeat", "infrastructureValidity"
     ]));
-    expect(comparison.metrics).toEqual({});
+    expect(comparison.metrics.durationMs).toMatchObject({ change: "invalid", delta: null });
     expect(comparison.scenarios).toEqual([]);
+  });
+
+  it("marks every metric invalid when durable event evidence is missing", () => {
+    const brokenAttempt = attempt();
+    brokenAttempt.dimensions.reliability = {
+      status: "fail",
+      signals: [{ severity: "blocker", code: "missing_durable_events" }]
+    };
+    const baseline = run([brokenAttempt], { repeat: 1 });
+    const candidate = run([attempt()], { runId: "run-candidate", repeat: 1 });
+
+    const comparison = compareEvalRuns(baseline, candidate);
+    expect(comparison.comparable).toBe(false);
+    expect(comparison.compatibility.mismatches).toContainEqual(expect.objectContaining({ field: "infrastructureValidity" }));
+    expect(Object.values(comparison.metrics).every((metric: any) => metric.change === "invalid")).toBe(true);
+  });
+
+  it("rejects a metric delta when valid sample counts differ", () => {
+    const candidateAttempt = attempt();
+    delete candidateAttempt.metrics.counts.toolCalls;
+    const comparison = compareEvalRuns(
+      run([attempt()], { repeat: 1 }),
+      run([candidateAttempt], { runId: "run-candidate", repeat: 1 })
+    );
+    expect(comparison.comparable).toBe(false);
+    expect(comparison.compatibility.mismatches).toContainEqual(expect.objectContaining({
+      field: "metricSamples.toolCalls", baseline: 1, candidate: 0
+    }));
+    expect(comparison.metrics.toolCalls.change).toBe("invalid");
   });
 
   it("writes comparison artifacts and supports directory inputs in the CLI", async () => {

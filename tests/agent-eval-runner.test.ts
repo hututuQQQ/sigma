@@ -1,9 +1,9 @@
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { artifactSecretValues, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
-import { evaluatorDigestFromSnapshot, runEvaluation } from "../scripts/eval/runner.mjs";
+import { evaluatorDigestFromSnapshot, runEvaluation, verifierSourceDigest } from "../scripts/eval/runner.mjs";
 import { breachedBudget } from "../scripts/eval/subject-cli.mjs";
 
 const temporary: string[] = [];
@@ -75,6 +75,30 @@ async function manifest(options: { verifierPass?: boolean; initialDirty?: boolea
 }
 
 describe("agent experience evaluation runner", () => {
+  it("refuses a non-empty run directory without modifying its files", async () => {
+    const fixture = await manifest();
+    const runDir = path.join(fixture.root, "existing-output");
+    await mkdir(runDir);
+    const sentinel = path.join(runDir, "secret-looking.txt");
+    await writeFile(sentinel, "test-secret-value-12345", "utf8");
+
+    await expect(runEvaluation({ suite: "quick", manifestPath: fixture.manifestPath, runDir }, {
+      secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" }
+    })).rejects.toThrow(/new or empty/);
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("test-secret-value-12345");
+  });
+
+  it("includes hidden verifier contents in the compatibility digest", async () => {
+    const fixture = await manifest();
+    const manifestValue = JSON.parse(await readFile(fixture.manifestPath, "utf8"));
+    const verifierPath = path.join(fixture.root, "scenario", "verifier.json");
+    await writeFile(verifierPath, "{\"expected\":1}\n", "utf8");
+    const before = await verifierSourceDigest(fixture.root, manifestValue.scenarios);
+    await writeFile(verifierPath, "{\"expected\":2}\n", "utf8");
+    const after = await verifierSourceDigest(fixture.root, manifestValue.scenarios);
+    expect(after).not.toBe(before);
+  });
+
   it("runs a precommitted attempt in an opaque workspace and writes a Codex review pack", async () => {
     const fixture = await manifest();
     const runDir = path.join(fixture.root, "artifacts");
@@ -301,6 +325,34 @@ describe("agent experience evaluation runner", () => {
       status: "fail", violations: expect.arrayContaining([expect.objectContaining({ code: "secret_in_artifact" })])
     });
     expect(await readFile(path.join(fixture.root, "artifacts", attempt.artifacts.stdout), "utf8")).toBe("[REDACTED]");
+  });
+
+  it("records workspace links as inert metadata instead of active artifact links", async () => {
+    const fixture = await manifest();
+    const host = path.join(fixture.root, "host-secret");
+    await mkdir(host);
+    await writeFile(path.join(host, "secret.txt"), "host-only-secret", "utf8");
+    const result = await runEvaluation({
+      suite: "quick", repeat: 1, manifestPath: fixture.manifestPath, runDir: path.join(fixture.root, "artifacts")
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+      prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+      runSubject: async (input: Record<string, unknown>) => {
+        await symlink(host, path.join(String(input.workspace), "host-link"), "junction");
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return { exitCode: 0, sessionId: "session", result: { status: "completed" }, events: successfulEvents() };
+      }
+    });
+    const attempt = result.run.attempts[0];
+    const evidence = path.join(fixture.root, "artifacts", attempt.artifacts.workspaceFinal);
+    await expect(lstat(path.join(evidence, "host-link"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await readFile(path.join(evidence, ".symlinks.json"), "utf8"))).toMatchObject({
+      links: [{ path: "host-link" }]
+    });
+    expect(attempt.dimensions.safety.violations).toContainEqual(expect.objectContaining({
+      code: "workspace_symbolic_link", path: "host-link"
+    }));
   });
 
   it("detects each external experience budget dimension", () => {

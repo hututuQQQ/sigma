@@ -14,6 +14,8 @@ export const EVAL_COMPARISON_SCHEMA_VERSION = 1;
 export const EVAL_COMPATIBILITY_FIELDS = Object.freeze([
   "scenarioDigest",
   "evaluatorDigest",
+  "verifierDigest",
+  "brokerDigest",
   "model",
   "platform",
   "surface",
@@ -61,9 +63,16 @@ function comparisonValue(values) {
 
 function infrastructureValidity(run) {
   const runErrors = Array.isArray(run.infrastructureErrors) ? run.infrastructureErrors.length : 0;
+  const invalidCodes = new Set([
+    "evaluator_infrastructure_error", "sandbox_cleanup_failed", "missing_durable_events",
+    "event_store_read_failed", "incomplete_event_data", "invalid_run_boundary"
+  ]);
   const attemptErrors = run.attempts.reduce((count, attempt) => count + (attempt.dimensions?.reliability?.signals ?? [])
-    .filter((signal) => new Set(["evaluator_infrastructure_error", "sandbox_cleanup_failed"]).has(signal?.code)).length, 0);
-  return { valid: runErrors === 0 && attemptErrors === 0, runErrors, attemptErrors };
+    .filter((signal) => invalidCodes.has(signal?.code)).length, 0);
+  const expectedSamples = run.scenarios.reduce((total, scenario) => total + Number(scenario.expectedAttempts ?? run.repeat ?? 0), 0);
+  const actualSamples = run.attempts.length;
+  const sampleMismatch = expectedSamples !== actualSamples;
+  return { valid: runErrors === 0 && attemptErrors === 0 && !sampleMismatch, runErrors, attemptErrors, expectedSamples, actualSamples };
 }
 
 function compatibilityMismatches(baseline, candidate) {
@@ -112,6 +121,20 @@ function compatibilityMismatches(baseline, candidate) {
               : "Compatibility values differ."
         });
       }
+    }
+    const baselineMetrics = summarizeEvalMetrics(scenarioAttempts(baseline, scenarioId));
+    const candidateMetrics = summarizeEvalMetrics(scenarioAttempts(candidate, scenarioId));
+    for (const name of Object.keys(EVAL_METRIC_PATHS)) {
+      const baselineSamples = baselineMetrics[name]?.samples ?? 0;
+      const candidateSamples = candidateMetrics[name]?.samples ?? 0;
+      if (baselineSamples === candidateSamples) continue;
+      mismatches.push({
+        scope: scenarioId,
+        field: `metricSamples.${name}`,
+        baseline: baselineSamples,
+        candidate: candidateSamples,
+        reason: "Both runs must contain the same number of valid samples for each metric."
+      });
     }
   }
   return mismatches;
@@ -227,7 +250,9 @@ export function compareEvalRuns(baselineInput, candidateInput) {
     }])),
     metrics: comparable
       ? metricDeltas(summarizeEvalMetrics(baseline.attempts), summarizeEvalMetrics(candidate.attempts))
-      : {},
+      : Object.fromEntries(Object.keys(EVAL_METRIC_PATHS).map((name) => [name, {
+        baseline: null, candidate: null, delta: null, deltaPercent: null, change: "invalid"
+      }])),
     scenarios: comparable ? sharedIds.map((scenarioId) => compareScenario(baseline, candidate, scenarioId)) : []
   };
 }

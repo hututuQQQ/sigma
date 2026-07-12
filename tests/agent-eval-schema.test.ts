@@ -142,6 +142,12 @@ describe("agent evaluation scenario schema", () => {
       ...base,
       verifier: { checks: [{ type: "command", argv: ["node", "$SCENARIO_ID/verify.mjs"] }] }
     })).toThrow(/unsupported variable/);
+    expect(() => assertEvalScenarioV1({ ...base, surface: "cli", permissionPolicy: "allow_once" })).toThrow(/CLI scenarios/);
+    expect(() => assertEvalScenarioV1({ ...base, surface: "cli", interactions: [{
+      triggers: [{ kind: "elapsed_ms", value: 1 }], action: "follow_up", text: "more"
+    }] })).toThrow(/CLI scenarios/);
+    expect(() => assertEvalScenarioV1({ ...base, allowedChanges: ["src/[ab].ts"] })).toThrow(/only supports/);
+    expect(() => assertEvalScenarioV1({ ...base, allowedChanges: ["src/{client,server}.ts"] })).toThrow(/only supports/);
   });
 
   it("rejects duplicate ids and invalid answer regular expressions", async () => {

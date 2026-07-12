@@ -310,7 +310,10 @@ function stagnationWindows(events, minimumWorkUnits) {
 }
 
 function postAnswerChurn(events) {
-  const answerIndex = events.findIndex(isAnswer);
+  const lastFollowUp = events.reduce((latest, event, index) =>
+    event.type === "user.follow_up" ? index : latest, -1);
+  const relativeAnswerIndex = events.slice(lastFollowUp + 1).findIndex(isAnswer);
+  const answerIndex = relativeAnswerIndex < 0 ? -1 : lastFollowUp + 1 + relativeAnswerIndex;
   if (answerIndex < 0) {
     return { answerSeq: null, answeredAt: null, events: 0, modelTurns: 0, toolCalls: 0, durationMs: 0 };
   }
@@ -532,7 +535,11 @@ function hardFailures(events, mode, workspace) {
  * Tool arguments and outputs are represented only by SHA-256 fingerprints.
  */
 export function reduceAgentEvents(input, options = {}) {
-  const events = sortedEvents(input);
+  const allEvents = sortedEvents(input);
+  const latestRunStart = allEvents.findLastIndex((event) => event.type === "run.started");
+  const latestRunId = latestRunStart >= 0 ? allEvents[latestRunStart].runId : null;
+  const events = latestRunStart < 0 ? allEvents : allEvents.slice(latestRunStart)
+    .filter((event) => !latestRunId || event.runId === latestRunId);
   const first = events[0] ?? null;
   const last = events.at(-1) ?? null;
   const runStarted = events.find((event) => event.type === "run.started");

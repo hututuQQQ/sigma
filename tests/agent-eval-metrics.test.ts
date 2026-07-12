@@ -226,6 +226,21 @@ describe("agent experience event metrics", () => {
       durationMs: 0
     });
   });
+
+  it("uses only the latest run boundary and resets answer churn after a follow-up", () => {
+    const first = eventFactory("multi-run", "run-1");
+    const second = eventFactory("multi-run", "run-2");
+    const events = [
+      first("run.started"), first("model.completed", { text: "first answer", toolCalls: [] }), first("run.completed"),
+      second("run.started"), second("model.completed", { text: "draft answer", toolCalls: [] }),
+      second("user.follow_up", { text: "continue" }), second("model.started", { turnId: 2 })
+    ].map((item, index) => ({ ...item, seq: index + 1, eventId: `multi-${index + 1}` }));
+
+    const metrics = reduceAgentEvents(events);
+    expect(metrics.terminal.status).toBe("incomplete");
+    expect(metrics.counts.modelTurns).toBe(1);
+    expect(metrics.postAnswerChurn).toMatchObject({ answerSeq: null, events: 0, toolCalls: 0 });
+  });
 });
 
 describe("V3 historical session audit", () => {
