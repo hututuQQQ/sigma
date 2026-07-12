@@ -1,7 +1,7 @@
 {
   "files": [
     { "path": "AGENTS.md", "contains": "Preserve UTF-8" },
-    { "path": "功能/AGENTS.md", "contains": "Keep `locale=zh-CN` unchanged" },
-    { "path": "功能/资料/greeting.txt", "equals": "message=你好，Sigma！\nlocale=zh-CN\n" }
+    { "path": "feature/AGENTS.md", "contains": "Keep `locale=zh-CN` unchanged" },
+    { "path": "feature/resources/greeting.txt", "equals": "message=你好，Sigma！\nlocale=zh-CN\n" }
   ]
 }

@@ -269,13 +269,13 @@
       "suites": ["experience"],
       "fixture": { "workspace": "scenarios/nested-instructions-unicode/workspace" },
       "userMessages": [
-        "请按照仓库说明，把 `功能/资料/greeting.txt` 的 message 更新为 `你好，Sigma！`。不要改变 locale 或其他文件。"
+        "请按照仓库说明，把 `feature/resources/greeting.txt` 的 message 更新为 `你好，Sigma！`。不要改变 locale 或其他文件。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
       "budget": "small",
-      "allowedChanges": ["功能/资料/greeting.txt"],
+      "allowedChanges": ["feature/resources/greeting.txt"],
       "interactions": [],
       "verifier": {
         "checks": [
@@ -284,7 +284,7 @@
             "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/nested-instructions-unicode/verifier.json"],
             "expectedExitCode": 0
           },
-          { "type": "git_diff", "allowedPaths": ["功能/资料/greeting.txt"] }
+          { "type": "git_diff", "allowedPaths": ["feature/resources/greeting.txt"] }
         ]
       }
     },
