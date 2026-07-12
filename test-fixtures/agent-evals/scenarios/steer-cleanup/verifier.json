@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "README.md", "equals": "# Draft workspace\n\nKeep this repository clean when an author abandons a draft.\n" },
+    { "path": "draft.md", "exists": false }
+  ]
+}

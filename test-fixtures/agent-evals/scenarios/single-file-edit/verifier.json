@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "config.json", "equals": "{\n  \"theme\": \"dark\",\n  \"telemetry\": false\n}\n" },
+    { "path": "README.md", "equals": "# Sample app\n\nConfiguration lives in `config.json`.\n" }
+  ]
+}

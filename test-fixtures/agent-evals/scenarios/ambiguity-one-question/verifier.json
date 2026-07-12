@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "settings.json", "equals": "{\n  \"requestTimeoutMs\": 3000,\n  \"idleTimeoutMs\": 30000\n}\n" },
+    { "path": "README.md", "contains": "independently configurable" }
+  ]
+}

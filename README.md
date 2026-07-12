@@ -220,6 +220,26 @@ pnpm verify:package:agent-cli
 
 Development and release use Node `26.4.0`. TUI entry points add `--experimental-ffi` automatically; direct `runTuiApp` callers must start Node with that flag. Portable Linux and Windows packages recursively deploy the complete production dependency graph, preserve nested version conflicts, select optional dependencies for the target OS/CPU/libc, assert the matching OpenTUI native runtime, and bundle Node `26.4.0`. Linux remains glibc-targeted. The structural package check is cross-platform; executing a target wrapper requires a supported native or WSL environment for that target.
 
+## Agent experience evaluation
+
+The external experience evaluator runs Sigma with `deepseek-v4-pro` in fresh, opaque workspaces and reduces the durable V3 event stream into separate correctness, safety, experience, and reliability results. It never sends scenario identity, verifier details, scores, or reviewer conclusions to the solving session.
+
+```powershell
+# Audit existing sessions without calling a model.
+pnpm eval:session -- --workspace . --latest 2
+
+# Fast live suite: five scenarios, one precommitted attempt each.
+pnpm eval:agent -- --suite quick
+
+# Full live suite: twelve scenarios, three fresh attempts each.
+pnpm eval:agent -- --suite experience --repeat 3
+
+# Compare compatible saved runs.
+pnpm eval:compare -- --baseline <run-dir> --candidate <run-dir>
+```
+
+Live runs load only `DEEPSEEK_API_KEY` from `.env`; the endpoint is not overridable and secret values are not written to artifacts. Results are stored under `.artifacts/eval/<run-id>/`, with `run.json`, `report.md`, and `codex-review.md`. When asked to "run the evaluation system", Codex should run the quick suite by default, read the generated review pack and cited traces, and return a `通过`, `需修`, or `阻断` verdict with general root causes and likely owning subsystems. The evaluator itself does not call a reviewer model.
+
 ## Evaluation fairness boundary
 
 Evaluation adapters may select a task, launch the packaged CLI, and collect results after the run. They remain outside production packages. Evaluation identity, hidden checks, scores, evaluator logs, and post-run failures are not solver context and cannot trigger another solver attempt.

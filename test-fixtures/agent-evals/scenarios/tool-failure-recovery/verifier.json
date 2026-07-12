@@ -1,0 +1,7 @@
+{
+  "files": [
+    { "path": "primary.txt", "exists": false },
+    { "path": "fallback.txt", "equals": "fallback-value-42\n" },
+    { "path": "README.md", "contains": "documented fallback" }
+  ]
+}
