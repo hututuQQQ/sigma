@@ -202,6 +202,11 @@ fn verified_shells(status: &SandboxStatus) -> Value {
                     "kind": "cmd",
                     "executable": path,
                     "verified": true,
+                    // AppContainer cmd can execute built-ins, but Windows can
+                    // still deny its descendant CreateProcess call. Do not
+                    // advertise it as a general-purpose shell until that
+                    // boundary has its own passing self-test.
+                    "supportsChildProcesses": false,
                 }])
             },
         )
@@ -215,6 +220,7 @@ fn verified_shells(status: &SandboxStatus) -> Value {
                     "kind": "bash",
                     "executable": path,
                     "verified": true,
+                    "supportsChildProcesses": true,
                 }])
             },
         )

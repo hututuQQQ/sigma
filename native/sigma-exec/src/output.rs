@@ -21,6 +21,8 @@ impl fmt::Display for OutputDecodingError {
 enum OutputEncoding {
     Utf8,
     Utf16Le,
+    #[cfg(windows)]
+    WindowsOem,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +68,8 @@ impl OutputDecoder {
         match self.encoding.expect("encoding selected") {
             OutputEncoding::Utf8 => self.decode_utf8(final_input),
             OutputEncoding::Utf16Le => self.decode_utf16le(final_input),
+            #[cfg(windows)]
+            OutputEncoding::WindowsOem => self.decode_windows_oem(final_input),
         }
     }
 
@@ -76,9 +80,19 @@ impl OutputDecoder {
                 let valid = error.valid_up_to();
                 Ok(self.pending.drain(..valid).collect())
             }
-            Err(_) => Err(invalid_encoding(
-                "process output is neither valid UTF-8 nor supported UTF-16LE",
-            )),
+            Err(_) => {
+                #[cfg(windows)]
+                {
+                    self.encoding = Some(OutputEncoding::WindowsOem);
+                    self.decode_windows_oem(final_input)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(invalid_encoding(
+                        "process output is neither valid UTF-8 nor supported UTF-16LE",
+                    ))
+                }
+            }
         }
     }
 
@@ -108,6 +122,68 @@ impl OutputDecoder {
         self.pending.drain(..complete);
         Ok(decoded.into_bytes())
     }
+
+    #[cfg(windows)]
+    fn decode_windows_oem(&mut self, final_input: bool) -> Result<Vec<u8>, OutputDecodingError> {
+        let maximum_suffix = if final_input {
+            0
+        } else {
+            self.pending.len().min(4)
+        };
+        for suffix in 0..=maximum_suffix {
+            let complete = self.pending.len() - suffix;
+            match windows_oem_to_string(&self.pending[..complete]) {
+                Ok(decoded) => {
+                    self.pending.drain(..complete);
+                    return Ok(decoded.into_bytes());
+                }
+                Err(_) if suffix < maximum_suffix => continue,
+                Err(_) => break,
+            }
+        }
+        Err(invalid_encoding(
+            "process output is neither valid UTF-8, UTF-16LE, nor strict Windows OEM text",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_oem_to_string(input: &[u8]) -> Result<String, ()> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS, MultiByteToWideChar};
+
+    if input.is_empty() {
+        return Ok(String::new());
+    }
+    let length = i32::try_from(input.len()).map_err(|_| ())?;
+    let required = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            MB_ERR_INVALID_CHARS,
+            input.as_ptr(),
+            length,
+            null_mut(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return Err(());
+    }
+    let mut output = vec![0_u16; required as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            MB_ERR_INVALID_CHARS,
+            input.as_ptr(),
+            length,
+            output.as_mut_ptr(),
+            required,
+        )
+    };
+    if written != required {
+        return Err(());
+    }
+    String::from_utf16(&output).map_err(|_| ())
 }
 
 fn detect_encoding(
@@ -133,9 +209,22 @@ fn detect_encoding(
         Ok(_) => Ok(Some((OutputEncoding::Utf8, 0))),
         Err(error) if error.error_len().is_none() && !final_input => Ok(None),
         Err(_) if !final_input && input.len() < 4 => Ok(None),
-        Err(_) => Err(invalid_encoding(
-            "process output is neither valid UTF-8 nor supported UTF-16LE",
-        )),
+        Err(_) => {
+            #[cfg(windows)]
+            {
+                windows_oem_to_string(input)
+                    .map(|_| Some((OutputEncoding::WindowsOem, 0)))
+                    .map_err(|_| invalid_encoding(
+                        "process output is neither valid UTF-8, UTF-16LE, nor strict Windows OEM text",
+                    ))
+            }
+            #[cfg(not(windows))]
+            {
+                Err(invalid_encoding(
+                    "process output is neither valid UTF-8 nor supported UTF-16LE",
+                ))
+            }
+        }
     }
 }
 
@@ -324,8 +413,26 @@ mod tests {
         // UTF-16 code units. Accepting printable pairs as BOM-less UTF-16 would
         // silently reinterpret unknown legacy encodings before redaction.
         let mut cp936 = OutputDecoder::default();
-        let error = cp936.push(&[0xd6, 0xd0, 0xce, 0xc4], true).unwrap_err();
-        assert_eq!(error.code, "invalid_output_encoding");
+        let decoded = cp936.push(&[0xd6, 0xd0, 0xce, 0xc4], true);
+        #[cfg(windows)]
+        match decoded {
+            Ok(value) => {
+                let text = String::from_utf8(value).unwrap();
+                assert!(!text.contains('\u{fffd}'));
+            }
+            Err(error) => assert_eq!(error.code, "invalid_output_encoding"),
+        }
+        #[cfg(not(windows))]
+        assert_eq!(decoded.unwrap_err().code, "invalid_output_encoding");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strictly_normalizes_the_active_windows_oem_code_page() {
+        assert_eq!(
+            windows_oem_to_string(b"plain diagnostic").unwrap(),
+            "plain diagnostic"
+        );
     }
 
     #[test]
