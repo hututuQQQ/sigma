@@ -51,6 +51,7 @@ export interface ModelResponseUsage {
 export interface ModelRequest {
   messages: ModelMessage[];
   tools?: ModelToolDefinition[];
+  toolChoice?: "auto" | "required" | "none";
   maxOutputTokens?: number;
   temperature?: number;
   signal: AbortSignal;

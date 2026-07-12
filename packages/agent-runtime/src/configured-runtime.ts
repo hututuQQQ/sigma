@@ -378,6 +378,6 @@ function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnvironmen
 
 function verifiedShellKinds(report: BrokerDoctorReport): ShellKind[] {
   return [...new Set((report.capabilities.shells ?? [])
-    .filter((shell) => shell.verified)
+    .filter((shell) => shell.verified && shell.supportsChildProcesses === true)
     .map((shell) => shell.kind))];
 }

@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-NODE_LPAC_OPTIONS = "--preserve-symlinks-main"
+NODE_LPAC_OPTIONS = "--preserve-symlinks --preserve-symlinks-main"
 
 
 def sha256_file(file_path: Path) -> str:
@@ -222,11 +222,17 @@ def main() -> int:
                 f"bundled Node was not resolvable through the authorized sandbox PATH: {shell_node_version}"
             )
 
+        module_file = workspace / "runtime-smoke.mjs"
+        module_file.write_text(
+            "export const add = (left, right) => left + right;\n",
+            encoding="utf-8",
+        )
         test_file = workspace / "runtime-smoke.test.mjs"
         test_file.write_text(
             'import test from "node:test";\n'
             'import assert from "node:assert/strict";\n'
-            'test("bundled runtime", () => assert.equal(2 + 2, 4));\n',
+            'import { add } from "./runtime-smoke.mjs";\n'
+            'test("bundled runtime", () => assert.equal(add(2, 2), 4));\n',
             encoding="utf-8",
         )
         node_test = require_ok(
@@ -603,7 +609,7 @@ setTimeout(() => process.exit(4), 3000);
                 "cjsEntry": True,
                 "esmEntry": True,
                 "symlinkMainPreserved": True,
-                "runtimeEnvironment": {"NODE_OPTIONS": NODE_LPAC_OPTIONS},
+                "sandboxRuntimeEnvironment": {"NODE_OPTIONS": NODE_LPAC_OPTIONS},
                 "crashRecovery": {
                     "journalDurable": True,
                     "exactAceRemoved": True,

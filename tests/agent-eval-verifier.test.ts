@@ -20,7 +20,9 @@ describe("agent evaluation verifier isolation", () => {
       return compatibility;
     };
     expect(verifierNodeToolchain(nodePath, {
-      WINDOWS_APPCONTAINER_NODE_COMPATIBILITY: { requiredNodeOptions: "--preserve-symlinks-main" },
+      WINDOWS_APPCONTAINER_NODE_COMPATIBILITY: {
+        requiredNodeOptions: "--preserve-symlinks --preserve-symlinks-main"
+      },
       createWindowsAppContainerNodeCompatibilityProof: createProof
     }, "win32")).toEqual({
       id: "eval-verifier-node",
@@ -29,7 +31,7 @@ describe("agent evaluation verifier isolation", () => {
       aliases: ["node", "node.exe"],
       executionRoots: [nodePath],
       pathEntries: [],
-      environment: { NODE_OPTIONS: "--preserve-symlinks-main" },
+      environment: { NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" },
       compatibility
     });
   });

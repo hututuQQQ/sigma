@@ -155,10 +155,10 @@ export function portableNodeToolchain(api, layout, metadata, integrityManifest, 
       throw new Error(`Windows Node compatibility field ${field} does not match packaged agent-execution.`);
     }
   }
-  if (!isDeepStrictEqual(metadataCompatibility.runtimeEnvironment, {
+  if (!isDeepStrictEqual(metadataCompatibility.sandboxRuntimeEnvironment, {
     NODE_OPTIONS: contract.requiredNodeOptions
   })) {
-    throw new Error("Windows Node compatibility environment is not the required exact environment.");
+    throw new Error("Windows Node sandbox compatibility environment is not the required exact environment.");
   }
   const compatibility = api.createWindowsAppContainerNodeCompatibilityProof(layout.node, toolchain.id);
   if (compatibility.executableSha256 !== nodeDigest) {
@@ -166,7 +166,7 @@ export function portableNodeToolchain(api, layout, metadata, integrityManifest, 
   }
   return {
     ...toolchain,
-    environment: { ...metadataCompatibility.runtimeEnvironment },
+    environment: { ...metadataCompatibility.sandboxRuntimeEnvironment },
     compatibility
   };
 }

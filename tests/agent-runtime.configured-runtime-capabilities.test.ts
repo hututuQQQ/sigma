@@ -215,9 +215,20 @@ describe("configured runtime execution capabilities", () => {
   it.each([
     {
       name: "one verified shell",
-      shells: [{ kind: "bash", executable: "/bin/bash", verified: true }] as BrokerVerifiedShell[],
+      shells: [{
+        kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true
+      }] as BrokerVerifiedShell[],
       expectedShells: ["bash"],
       expectedDefault: "bash"
+    },
+    {
+      name: "shell without child process capability",
+      shells: [{
+        kind: "cmd", executable: "C:\\Windows\\System32\\cmd.exe", verified: true,
+        supportsChildProcesses: false
+      }] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none"
     },
     {
       name: "no verified shells",

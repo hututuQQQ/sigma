@@ -191,7 +191,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     messages,
     pendingTools,
     toolCallIds: [...state.toolCallIds, ...identifiers],
-    completionRepairAttempts: 0,
+    completionRepairAttempts: state.completionRepairAttempts,
     continuationAttempts: 0,
     lastToolBatchSignature: signature,
     repeatedToolBatchCount,
@@ -247,6 +247,7 @@ const toolFinished: EventReducer = (state, event) => {
   const pending = pendingForEvent(state, objectPayload(event.payload));
   if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
   const pendingTools = state.pendingTools.filter((item) => item !== pending);
+  const terminalRepair = state.completionRepairAttempts > 0;
   const next: KernelState = {
     ...state,
     messages: [...state.messages, {
@@ -270,7 +271,17 @@ const toolFinished: EventReducer = (state, event) => {
     return propose(progressed, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
   }
   const summary = completionSummary(receipt);
-  if (summary) return propose(progressed, { kind: "completed", message: summary, evidence: progressed.evidence });
+  if (summary) {
+    const repairedAnswer = terminalRepair
+      ? [...state.messages].reverse().find((message) =>
+        message.role === "assistant" && message.content.trim())?.content.trim()
+      : undefined;
+    return propose(progressed, {
+      kind: "completed",
+      message: repairedAnswer || summary,
+      evidence: progressed.evidence
+    });
+  }
   if (semantic.limitReached && pendingTools.length === 0 && progressed.semanticFailureCluster) {
     const cluster = progressed.semanticFailureCluster;
     return propose(progressed, {

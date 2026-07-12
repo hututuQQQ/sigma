@@ -32,7 +32,11 @@ export const windowsAppContainerNodeCompatibility = Object.freeze({
   unsignedPatchedSha256: "b30b9546e4c9fddffbd4054ef4a78cdd76b42a8496bfb6308a7966bae37fea8f",
   normalizedContentSha256: "6345a8101a378aea8f004210fe3924b6bcc77029abd35d9a86fa88e65a65bf35",
   runtimeEnvironment: Object.freeze({ NODE_OPTIONS: "--preserve-symlinks-main" }),
-  runtimeEnvironmentReason: "Preserve the declared main path so LPAC Node does not probe inaccessible volume-root metadata."
+  runtimeEnvironmentReason: "Preserve the declared CLI main path so startup does not probe inaccessible volume-root metadata.",
+  sandboxRuntimeEnvironment: Object.freeze({
+    NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main"
+  }),
+  sandboxRuntimeEnvironmentReason: "Preserve sandboxed workspace module paths so relative ESM resolution does not probe inaccessible volume-root metadata."
 });
 export const windowsNodeGlobalPipeMarker = Buffer.from("\\\\?\\pipe\\uv\\%llu-%lu\0", "ascii");
 export const windowsNodeLocalPipeMarker = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u\0", "ascii");
@@ -868,6 +872,14 @@ async function writePortableSbom(
           {
             name: "sigma:runtime-environment-reason",
             value: nodeRuntime.compatibility.runtimeEnvironmentReason
+          },
+          {
+            name: "sigma:sandbox-runtime-environment",
+            value: JSON.stringify(nodeRuntime.compatibility.sandboxRuntimeEnvironment)
+          },
+          {
+            name: "sigma:sandbox-runtime-environment-reason",
+            value: nodeRuntime.compatibility.sandboxRuntimeEnvironmentReason
           }
         ] : [])
       ]

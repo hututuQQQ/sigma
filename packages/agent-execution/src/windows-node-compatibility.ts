@@ -16,7 +16,7 @@ export const WINDOWS_APPCONTAINER_NODE_COMPATIBILITY = Object.freeze({
   sourceSha256: "3193d7f751b8a07bd4acc70e81946ae9c6efdee83e07ad1c8d0e4089df7c5cef",
   unsignedPatchedSha256: "b30b9546e4c9fddffbd4054ef4a78cdd76b42a8496bfb6308a7966bae37fea8f",
   normalizedContentSha256: "6345a8101a378aea8f004210fe3924b6bcc77029abd35d9a86fa88e65a65bf35",
-  requiredNodeOptions: "--preserve-symlinks-main",
+  requiredNodeOptions: "--preserve-symlinks --preserve-symlinks-main",
   reason: "Use AppContainer-local libuv pipe names for captured stdio and Node IPC."
 });
 

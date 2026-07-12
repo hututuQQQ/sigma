@@ -115,7 +115,7 @@ const handle = request => {
   } else if (request.method === "process.spawn") {
     if (mode === "toolchain-check" && (
       !request.params.policy.executionRoots.some(root => path.resolve(root) === path.resolve(process.execPath))
-      || request.params.command.env.NODE_OPTIONS !== "--preserve-symlinks-main"
+      || request.params.command.env.NODE_OPTIONS !== "--preserve-symlinks --preserve-symlinks-main"
     )) {
       fail(request, "policy_denied", "trusted toolchain policy was not forwarded");
     } else if (mode === "toolchain-alias-check" && (
@@ -618,7 +618,7 @@ describe("SigmaExecBrokerClient", () => {
         id: "bundled-runtime",
         executable: process.execPath,
         aliases: ["node"],
-        environment: { NODE_OPTIONS: "--preserve-symlinks-main" }
+        environment: { NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" }
       }]
     }));
     await client.connect();
@@ -643,7 +643,7 @@ describe("SigmaExecBrokerClient", () => {
       ...request,
       command: {
         ...request.command,
-        environment: { overrides: { NODE_OPTIONS: "--preserve-symlinks-main" } }
+        environment: { overrides: { NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" } }
       }
     })).resolves.toMatchObject({ id: "fixture-process" });
     await client.close();

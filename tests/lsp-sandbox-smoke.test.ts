@@ -48,7 +48,7 @@ describe("bundled LSP sandbox smoke", () => {
       sourceSha256: "a".repeat(64),
       unsignedPatchedSha256: "d".repeat(64),
       normalizedContentSha256: "b".repeat(64),
-      requiredNodeOptions: "--preserve-symlinks-main"
+      requiredNodeOptions: "--preserve-symlinks --preserve-symlinks-main"
     };
     const nodeDigest = "c".repeat(64);
     const proof = {
@@ -76,7 +76,8 @@ describe("bundled LSP sandbox smoke", () => {
       sourceSha256: contract.sourceSha256,
       unsignedPatchedSha256: contract.unsignedPatchedSha256,
       normalizedContentSha256: contract.normalizedContentSha256,
-      runtimeEnvironment: { NODE_OPTIONS: contract.requiredNodeOptions }
+      runtimeEnvironment: { NODE_OPTIONS: "--preserve-symlinks-main" },
+      sandboxRuntimeEnvironment: { NODE_OPTIONS: contract.requiredNodeOptions }
     };
     const metadata = {
       targetPlatform: "win32",
@@ -97,7 +98,7 @@ describe("bundled LSP sandbox smoke", () => {
       ...metadata,
       node: { compatibility: {
         ...compatibility,
-        runtimeEnvironment: { NODE_OPTIONS: "--inspect" }
+        sandboxRuntimeEnvironment: { NODE_OPTIONS: "--inspect" }
       }, sha256: nodeDigest }
     }, integrity, nodeDigest)).toThrow("does not match the integrity manifest");
   });

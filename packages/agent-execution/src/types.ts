@@ -130,6 +130,8 @@ export interface BrokerVerifiedShell {
   kind: "powershell" | "cmd" | "bash";
   executable: string;
   verified: true;
+  /** The sandbox has proved that the shell can launch separately trusted executables. */
+  supportsChildProcesses?: boolean;
 }
 
 export interface BrokerDoctorReport {

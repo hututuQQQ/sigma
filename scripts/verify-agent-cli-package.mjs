@@ -702,7 +702,9 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
       ["sigma:source-sha256", metadata.node.compatibility.sourceSha256],
       ["sigma:normalized-content-sha256", metadata.node.compatibility.normalizedContentSha256],
       ["sigma:runtime-environment", JSON.stringify(metadata.node.compatibility.runtimeEnvironment)],
-      ["sigma:runtime-environment-reason", metadata.node.compatibility.runtimeEnvironmentReason]
+      ["sigma:runtime-environment-reason", metadata.node.compatibility.runtimeEnvironmentReason],
+      ["sigma:sandbox-runtime-environment", JSON.stringify(metadata.node.compatibility.sandboxRuntimeEnvironment)],
+      ["sigma:sandbox-runtime-environment-reason", metadata.node.compatibility.sandboxRuntimeEnvironmentReason]
     ]);
     for (const [name, expected] of compatibilityProperties) {
       if (node.properties.get(name) !== expected) {

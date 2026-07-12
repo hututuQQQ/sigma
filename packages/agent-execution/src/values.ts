@@ -156,7 +156,16 @@ function verifiedShells(
       throw new BrokerProtocolError("Broker verified shell entry is invalid or duplicated.");
     }
     seen.add(shell.kind);
-    return { kind: shell.kind, executable, verified: true as const };
+    const supportsChildProcesses = shell.supportsChildProcesses;
+    if (supportsChildProcesses !== undefined && typeof supportsChildProcesses !== "boolean") {
+      throw new BrokerProtocolError("Broker verified shell child-process capability is invalid.");
+    }
+    return {
+      kind: shell.kind,
+      executable,
+      verified: true as const,
+      ...(supportsChildProcesses === undefined ? {} : { supportsChildProcesses })
+    };
   });
 }
 

@@ -179,7 +179,8 @@ function budgetOverrunPayload(payload: unknown): boolean {
 
 function reviewStartedPayload(payload: unknown): boolean {
   const item = record(payload);
-  return Boolean(item && text(item.reviewerId) && textArray(item.workspaceDeltaEvidenceIds));
+  return Boolean(item && text(item.reviewerId) && textArray(item.workspaceDeltaEvidenceIds)
+    && (item.validationEvidenceIds === undefined || textArray(item.validationEvidenceIds)));
 }
 
 const VALIDATORS: Partial<Record<string, PayloadValidator>> = {
