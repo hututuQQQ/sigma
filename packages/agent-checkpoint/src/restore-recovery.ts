@@ -1,131 +1,245 @@
-import { lstat, readFile, readdir, rename, rm } from "node:fs/promises";
+import { chmod, lstat, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import { durableReplaceFile } from "agent-platform";
+import {
+  cleanupWorkspaceTransactionRoot,
+  durableReplaceFile,
+  pinWorkspaceTransactionDirectories,
+  syncDirectory,
+  type WorkspaceTransactionDirectoryLease
+} from "agent-platform";
 import { pinCheckpointParent } from "./path-safety.js";
-import type { RestoreFinalization } from "./restore-transaction.js";
+import {
+  readRecoveryJournal,
+  type RecoveryJournal,
+  type RecoveryOperation
+} from "./restore-recovery-schema.js";
+import {
+  acquireCheckpointMutationLease,
+  assertRestoreImage,
+  inspectRestoreImage,
+  restoreImagesEqual,
+  type RestoreFinalization,
+  type RestoreImageIdentity
+} from "./restore-transaction.js";
 import { CheckpointRecoveryError } from "./types.js";
-
-interface RecoveryOperation {
-  path: string;
-  index: number;
-  backupMoved: boolean;
-  installed: boolean;
-  backupIntent?: boolean;
-  installIntent?: boolean;
-}
-
-interface RecoveryJournal {
-  schemaVersion: 1 | 2;
-  phase: string;
-  operations: RecoveryOperation[];
-  finalization?: RestoreFinalization;
-}
 
 export interface CheckpointTransactionRecoveryOptions {
   workspacePath: string;
+  transactionRootDir: string;
   finalize(finalization: RestoreFinalization): Promise<void>;
 }
 
-function safePath(value: string): boolean {
-  const normalized = path.posix.normalize(value);
-  return Boolean(value) && !path.posix.isAbsolute(value) && normalized === value
-    && value !== "." && value !== ".." && !value.startsWith("../") && !value.includes("\\");
+async function recoveryDirectories(transactionPath: string): Promise<string[]> {
+  const candidates = [
+    transactionPath, path.join(transactionPath, "stage"), path.join(transactionPath, "backup")
+  ];
+  const directories: string[] = [];
+  for (const candidate of candidates) {
+    const info = await lstat(candidate).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!info) continue;
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new CheckpointRecoveryError("Checkpoint transaction directory is unsafe.", transactionPath);
+    }
+    directories.push(candidate);
+  }
+  return directories;
 }
 
-function recoveryOperation(value: unknown): value is RecoveryOperation {
-  if (!value || typeof value !== "object") return false;
-  const operation = value as Partial<RecoveryOperation>;
-  return [
-    Number.isSafeInteger(operation.index),
-    typeof operation.path === "string" && safePath(operation.path),
-    typeof operation.backupMoved === "boolean",
-    typeof operation.installed === "boolean",
-    operation.backupIntent === undefined || typeof operation.backupIntent === "boolean",
-    operation.installIntent === undefined || typeof operation.installIntent === "boolean"
-  ].every(Boolean);
+async function writeRecoveryJournal(transactionPath: string, value: unknown): Promise<void> {
+  await durableReplaceFile(
+    path.join(transactionPath, "journal.json"), JSON.stringify(value, null, 2), { mode: 0o600 }
+  );
 }
 
-function recoveryFinalization(value: unknown): value is RestoreFinalization {
-  if (!value || typeof value !== "object") return false;
-  const finalization = value as Partial<RestoreFinalization>;
-  return typeof finalization.desiredManifestDigest === "string"
-    && /^[a-f0-9]{64}$/u.test(finalization.desiredManifestDigest)
-    && Boolean(finalization.record && typeof finalization.record === "object");
+type RecoveryFlag = "installed" | "installIntent" | "backupMoved" | "backupIntent";
+
+async function clearRecoveryFlag(
+  transactionPath: string,
+  parsed: RecoveryJournal,
+  operation: RecoveryOperation,
+  flag: RecoveryFlag
+): Promise<void> {
+  if (operation[flag] === false) return;
+  operation[flag] = false;
+  await writeRecoveryJournal(transactionPath, parsed);
 }
 
-function journal(value: unknown, transactionPath: string): RecoveryJournal {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new CheckpointRecoveryError("Checkpoint recovery journal is invalid.", transactionPath);
+function validateRecoveryImages(
+  transactionPath: string,
+  operation: RecoveryOperation,
+  stageImage: RestoreImageIdentity | undefined,
+  backupImage: RestoreImageIdentity | undefined
+): void {
+  if (stageImage && !restoreImagesEqual(stageImage, operation.installedImage)) {
+    throw new CheckpointRecoveryError("Checkpoint recovery stage image is invalid.", transactionPath);
   }
-  const candidate = value as Partial<RecoveryJournal>;
-  if (![1, 2].includes(Number(candidate.schemaVersion))
-    || typeof candidate.phase !== "string" || !Array.isArray(candidate.operations)) {
-    throw new CheckpointRecoveryError("Checkpoint recovery journal has an unsupported schema.", transactionPath);
+  if (backupImage && !restoreImagesEqual(backupImage, operation.currentImage)) {
+    throw new CheckpointRecoveryError("Checkpoint recovery backup image is invalid.", transactionPath);
   }
-  if (!candidate.operations.every(recoveryOperation)) {
-    throw new CheckpointRecoveryError("Checkpoint recovery journal contains an invalid operation.", transactionPath);
-  }
-  if (candidate.schemaVersion === 2 && !recoveryFinalization(candidate.finalization)) {
-    throw new CheckpointRecoveryError("Checkpoint recovery journal finalization is invalid.", transactionPath);
-  }
-  return candidate as RecoveryJournal;
 }
 
-async function exists(target: string): Promise<boolean> {
-  return await lstat(target).then(() => true, (error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return false;
-    throw error;
-  });
+async function recoverOperation(
+  options: CheckpointTransactionRecoveryOptions,
+  transactionPath: string,
+  parsed: RecoveryJournal,
+  operation: RecoveryOperation,
+  lease: WorkspaceTransactionDirectoryLease
+): Promise<void> {
+  const pinned = await pinCheckpointParent(options.workspacePath, operation.path);
+  try {
+    await pinned.verify();
+    await lease.verify();
+    const stagePath = path.join(transactionPath, "stage", String(operation.index));
+    const backupPath = path.join(transactionPath, "backup", String(operation.index));
+    const [targetImage, stageImage, backupImage] = await Promise.all([
+      inspectRestoreImage(pinned.targetPath),
+      inspectRestoreImage(stagePath),
+      inspectRestoreImage(backupPath)
+    ]);
+    validateRecoveryImages(transactionPath, operation, stageImage, backupImage);
+    if (targetImage && restoreImagesEqual(targetImage, operation.installedImage)) {
+      await lease.verify();
+      await pinned.verify();
+      await rm(pinned.targetPath, { recursive: true, force: true });
+      await syncDirectory(pinned.parentPath);
+    } else if (targetImage && !restoreImagesEqual(targetImage, operation.currentImage)) {
+      throw new CheckpointRecoveryError("Checkpoint recovery target image is invalid.", transactionPath);
+    }
+    await clearRecoveryFlag(transactionPath, parsed, operation, "installed");
+    await clearRecoveryFlag(transactionPath, parsed, operation, "installIntent");
+
+    const currentTarget = await inspectRestoreImage(pinned.targetPath);
+    const currentBackup = await inspectRestoreImage(backupPath);
+    if (operation.currentImage) {
+      if (!restoreImagesEqual(currentTarget, operation.currentImage)) {
+        if (currentTarget || !restoreImagesEqual(currentBackup, operation.currentImage)) {
+          throw new CheckpointRecoveryError("Checkpoint backup is missing during crash recovery.", transactionPath);
+        }
+        await lease.verify();
+        await pinned.verify();
+        await rename(backupPath, pinned.targetPath);
+        await syncDirectory(pinned.parentPath);
+        await syncDirectory(path.dirname(backupPath));
+        await assertRestoreImage(
+          pinned.targetPath,
+          operation.currentImage,
+          `Checkpoint current image was not restored during crash recovery: ${operation.path}`
+        );
+      } else if (currentBackup) {
+        throw new CheckpointRecoveryError("Checkpoint recovery found duplicate current images.", transactionPath);
+      }
+    } else if (currentTarget || currentBackup) {
+      throw new CheckpointRecoveryError("Checkpoint recovery found an unexpected current image.", transactionPath);
+    }
+    await clearRecoveryFlag(transactionPath, parsed, operation, "backupMoved");
+    await clearRecoveryFlag(transactionPath, parsed, operation, "backupIntent");
+    await pinned.verify();
+  } finally {
+    await pinned.close();
+  }
+}
+
+async function recoverUnfinishedTransaction(
+  options: CheckpointTransactionRecoveryOptions,
+  transactionPath: string,
+  parsed: RecoveryJournal,
+  lease: WorkspaceTransactionDirectoryLease
+): Promise<void> {
+  if (parsed.schemaVersion !== 3) {
+    throw new CheckpointRecoveryError(
+      "Checkpoint recovery journal predates postimage identity checks and cannot be replayed safely.",
+      transactionPath
+    );
+  }
+  parsed.phase = "rolling_back";
+  await writeRecoveryJournal(transactionPath, parsed);
+  for (const operation of [...parsed.operations].reverse()) {
+    await recoverOperation(options, transactionPath, parsed, operation, lease);
+  }
+  for (const directory of [...(parsed.directoryModes ?? [])]
+    .sort((left, right) => right.path.split("/").length - left.path.split("/").length)) {
+    if (directory.currentMode === undefined) continue;
+    const pinned = await pinCheckpointParent(options.workspacePath, directory.path);
+    try {
+      await lease.verify();
+      await pinned.verify();
+      const info = await lstat(pinned.targetPath);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new CheckpointRecoveryError("Checkpoint recovery directory mode target is invalid.", transactionPath);
+      }
+      await chmod(pinned.targetPath, directory.currentMode);
+      await syncDirectory(pinned.parentPath);
+      await pinned.verify();
+    } finally {
+      await pinned.close();
+    }
+  }
+}
+
+async function finalizeVerifiedTransaction(
+  options: CheckpointTransactionRecoveryOptions,
+  transactionPath: string,
+  parsed: RecoveryJournal,
+  lease: WorkspaceTransactionDirectoryLease
+): Promise<void> {
+  if (parsed.schemaVersion === 1 || !parsed.finalization) {
+    throw new CheckpointRecoveryError(
+      "Checkpoint restore is verified but its legacy journal cannot finalize the checkpoint record automatically.",
+      transactionPath
+    );
+  }
+  await lease.verify();
+  await options.finalize(parsed.finalization);
+  await writeRecoveryJournal(transactionPath, { ...parsed, phase: "finalized" });
+  await lease.verify();
+}
+
+async function replayRecoveryJournal(
+  options: CheckpointTransactionRecoveryOptions,
+  transactionPath: string,
+  parsed: RecoveryJournal,
+  lease: WorkspaceTransactionDirectoryLease
+): Promise<void> {
+  if (parsed.phase === "finalized") {
+    await lease.verify();
+    return;
+  }
+  if (parsed.phase === "verified") {
+    await finalizeVerifiedTransaction(options, transactionPath, parsed, lease);
+    return;
+  }
+  await recoverUnfinishedTransaction(options, transactionPath, parsed, lease);
 }
 
 async function recoverTransaction(
   options: CheckpointTransactionRecoveryOptions,
   transactionPath: string
 ): Promise<void> {
-  const parsed = journal(JSON.parse(await readFile(path.join(transactionPath, "journal.json"), "utf8")), transactionPath);
-  if (parsed.phase === "finalized") {
-    await rm(transactionPath, { recursive: true, force: true });
-    return;
-  }
-  if (parsed.phase === "verified") {
-    if (parsed.schemaVersion !== 2 || !parsed.finalization) {
-      throw new CheckpointRecoveryError(
-        "Checkpoint restore is verified but its legacy journal cannot finalize the checkpoint record automatically.",
-        transactionPath
+  const parsed = await readRecoveryJournal(transactionPath);
+  const directories = await recoveryDirectories(transactionPath);
+  const lease = await pinWorkspaceTransactionDirectories(directories);
+  let primary: unknown;
+  try {
+    await replayRecoveryJournal(options, transactionPath, parsed, lease);
+  } catch (error) {
+    primary = error;
+  } finally {
+    if (primary === undefined) {
+      await lease.verify().catch((error: unknown) => { primary = error; });
+    }
+    const closeError = await lease.close().then(() => undefined, (error: unknown) => error);
+    if (closeError) {
+      primary = new CheckpointRecoveryError(
+        "Checkpoint crash recovery resource cleanup failed.",
+        transactionPath,
+        new AggregateError(primary === undefined ? [closeError] : [primary, closeError])
       );
     }
-    await options.finalize(parsed.finalization);
-    await durableReplaceFile(
-      path.join(transactionPath, "journal.json"),
-      JSON.stringify({ ...parsed, phase: "finalized" }, null, 2),
-      { mode: 0o600 }
-    );
-    await rm(transactionPath, { recursive: true, force: true });
-    return;
   }
-  for (const operation of [...parsed.operations].reverse()) {
-    const pinned = await pinCheckpointParent(options.workspacePath, operation.path);
-    try {
-      await pinned.verify();
-      const stagePath = path.join(transactionPath, "stage", String(operation.index));
-      const backupPath = path.join(transactionPath, "backup", String(operation.index));
-      const backupExists = await exists(backupPath);
-      const installOccurred = operation.installed
-        || (operation.installIntent === true && !await exists(stagePath) && await exists(pinned.targetPath));
-      const backupOccurred = operation.backupMoved || (operation.backupIntent === true && backupExists);
-      if (installOccurred) await rm(pinned.targetPath, { recursive: true, force: true });
-      if (backupOccurred) {
-        if (!backupExists) throw new CheckpointRecoveryError("Checkpoint backup is missing during crash recovery.", transactionPath);
-        if (await exists(pinned.targetPath)) {
-          throw new CheckpointRecoveryError("Checkpoint target is occupied during crash recovery.", transactionPath);
-        }
-        await rename(backupPath, pinned.targetPath);
-      }
-      await pinned.verify();
-    } finally {
-      await pinned.close();
-    }
-  }
+  if (primary !== undefined) throw primary;
   await rm(transactionPath, { recursive: true, force: true });
 }
 
@@ -133,19 +247,73 @@ async function recoverTransaction(
 export async function recoverCheckpointTransactions(
   options: CheckpointTransactionRecoveryOptions
 ): Promise<void> {
-  const root = path.join(options.workspacePath, ".agent", "checkpoint-transactions");
-  const entries = await readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return [];
-    throw error;
-  });
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith("restore-")) continue;
-    const transactionPath = path.join(root, entry.name);
-    try {
-      await recoverTransaction(options, transactionPath);
-    } catch (error) {
-      if (error instanceof CheckpointRecoveryError) throw error;
-      throw new CheckpointRecoveryError("Checkpoint crash recovery failed.", transactionPath, error);
+  let mutationLease: Awaited<ReturnType<typeof acquireCheckpointMutationLease>> | undefined;
+  let primary: unknown;
+  try {
+    mutationLease = await acquireCheckpointMutationLease(options.transactionRootDir);
+    await recoverTransactionRoot(options, options.transactionRootDir);
+  } catch (error) {
+    primary = error;
+  }
+  const cleanupErrors: unknown[] = [];
+  if (mutationLease) {
+    await cleanupWorkspaceTransactionRoot(options.transactionRootDir).then(
+      (warnings) => { cleanupErrors.push(...warnings); },
+      (error: unknown) => { cleanupErrors.push(error); }
+    );
+    await mutationLease.release().catch((error: unknown) => { cleanupErrors.push(error); });
+  }
+  if (cleanupErrors.length > 0) {
+    const recoveryPath = primary instanceof CheckpointRecoveryError
+      ? primary.transactionPath
+      : options.transactionRootDir;
+    throw new CheckpointRecoveryError(
+      "Checkpoint crash recovery cleanup failed; recovery data was preserved.",
+      recoveryPath,
+      new AggregateError(primary === undefined ? cleanupErrors : [primary, ...cleanupErrors])
+    );
+  }
+  if (primary !== undefined) throw primary;
+}
+
+async function recoverTransactionRoot(
+  options: CheckpointTransactionRecoveryOptions,
+  root: string
+): Promise<void> {
+  const rootLease = await pinWorkspaceTransactionDirectories([root]);
+  let primary: unknown;
+  try {
+    const entries = await readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.name.startsWith("restore-")) continue;
+      const transactionPath = path.join(root, entry.name);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new CheckpointRecoveryError("Checkpoint transaction entry is unsafe.", transactionPath);
+      }
+      try {
+        await rootLease.verify();
+        await recoverTransaction(options, transactionPath);
+        await rootLease.verify();
+      } catch (error) {
+        if (error instanceof CheckpointRecoveryError) throw error;
+        throw new CheckpointRecoveryError("Checkpoint crash recovery failed.", transactionPath, error);
+      }
+    }
+  } catch (error) {
+    primary = error;
+  } finally {
+    const closeError = await rootLease.close().then(() => undefined, (error: unknown) => error);
+    if (closeError) {
+      const recoveryPath = primary instanceof CheckpointRecoveryError ? primary.transactionPath : root;
+      primary = new CheckpointRecoveryError(
+        "Checkpoint recovery root lease cleanup failed.",
+        recoveryPath,
+        new AggregateError(primary === undefined ? [closeError] : [primary, closeError])
+      );
     }
   }
+  if (primary !== undefined) throw primary;
 }

@@ -1,6 +1,7 @@
 import type {
   ModelToolCall,
   ToolCallApproval,
+  ToolCallPlan,
   ToolDescriptor,
   ToolReceipt
 } from "agent-protocol";
@@ -25,6 +26,26 @@ export interface ToolExecutionMonitorOptions {
   control: RuntimeControlService;
 }
 
+/** Resolve the runtime watchdog independently from the tool/broker idle
+ * deadline. The default grace prevents two equal timers racing to classify
+ * the same foreground process. */
+export function resolveToolIdleWatchdogMs(runtime: RuntimeOptions, descriptor: ToolDescriptor): number | undefined {
+  if (runtime.toolIdleWatchdogMs === false) return undefined;
+  if (runtime.toolIdleWatchdogMs !== undefined) {
+    if (!Number.isSafeInteger(runtime.toolIdleWatchdogMs) || runtime.toolIdleWatchdogMs <= 0) {
+      throw new RangeError("toolIdleWatchdogMs must be a positive integer or false.");
+    }
+    return runtime.toolIdleWatchdogMs;
+  }
+  if (descriptor.idleTimeoutMs === undefined) return undefined;
+  const graceMs = Math.max(1_000, Math.ceil(descriptor.idleTimeoutMs * 0.25));
+  return descriptor.idleTimeoutMs + graceMs;
+}
+
+function processTimeout(message: string, code: "process_deadline" | "process_idle_timeout"): Error {
+  return Object.assign(new Error(message), { name: "TimeoutError", code });
+}
+
 export class ToolExecutionMonitor {
   private readonly unsettled = new Map<string, Promise<void>>();
   private readonly sessionUnsettled = new Map<string, Set<Promise<void>>>();
@@ -47,7 +68,7 @@ export class ToolExecutionMonitor {
     session: RuntimeSession,
     call: ModelToolCall,
     modelTurn: ActiveModelTurn,
-    descriptor: ToolDescriptor, signal: AbortSignal, resourceKeys: string[],
+    descriptor: ToolDescriptor, plan: ToolCallPlan, signal: AbortSignal, resourceKeys: string[],
     approval?: ToolCallApproval
   ): Promise<ToolReceipt> {
     await this.options.emit(session, "tool.started", "runtime", {
@@ -56,25 +77,27 @@ export class ToolExecutionMonitor {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(Object.assign(
-      new Error(`Tool '${call.name}' exceeded ${descriptor.timeoutMs}ms.`),
-      { name: "TimeoutError" }
+    const timer = setTimeout(() => controller.abort(processTimeout(
+      `Tool '${call.name}' exceeded ${descriptor.timeoutMs}ms.`, "process_deadline"
     )), descriptor.timeoutMs);
-    const idleTimeoutMs = descriptor.idleTimeoutMs ?? descriptor.timeoutMs;
+    const idleTimeoutMs = resolveToolIdleWatchdogMs(this.options.runtime, descriptor);
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const heartbeat = (): void => {
       if (!idleTimeoutMs) return;
       if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => controller.abort(Object.assign(
-        new Error(`Tool '${call.name}' was idle for ${idleTimeoutMs}ms.`), { name: "TimeoutError" }
+      idleTimer = setTimeout(() => controller.abort(processTimeout(
+        `Tool '${call.name}' was idle for ${idleTimeoutMs}ms.`, "process_idle_timeout"
       )), idleTimeoutMs);
       idleTimer.unref();
     };
     heartbeat();
     try {
-      const observes = descriptor.possibleEffects.some((effect) =>
-        ["filesystem.write", "process.spawn", "destructive", "validation"].includes(effect));
-      const before = observes ? await this.gitState(session, controller.signal) : null;
+      const requiresSettlement = plan.exactEffects.some((effect) =>
+        ["filesystem.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
+          .includes(effect));
+      const observesWorkspace = plan.exactEffects.some((effect) =>
+        ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));
+      const before = observesWorkspace ? await this.gitState(session, controller.signal) : null;
       const execution = this.options.runtime.tools.execute({
         callId: call.id, name: call.name, arguments: call.arguments
       }, {
@@ -82,6 +105,7 @@ export class ToolExecutionMonitor {
         runId: session.runId,
         workspacePath: session.workspacePath,
         runMode: session.mode,
+        callPlan: plan,
         ...(approval ? { approval } : {}),
         signal: controller.signal,
         heartbeat,
@@ -95,13 +119,9 @@ export class ToolExecutionMonitor {
           await this.options.createArtifact(session.sessionId, artifact.content),
         runtimeControl: this.options.control.forSession(session)
       });
-      let receipt: ToolReceipt;
-      try {
-        receipt = await abortable(execution, controller.signal);
-      } catch (error) {
-        if (controller.signal.aborted) this.quarantine(session.sessionId, resourceKeys, execution);
-        throw error;
-      }
+      const receipt = await this.settledReceipt(
+        execution, requiresSettlement, controller, session.sessionId, resourceKeys
+      );
       if (!before) return receipt;
       const after = await this.gitState(session, controller.signal);
       if (!after) return receipt;
@@ -121,6 +141,25 @@ export class ToolExecutionMonitor {
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private async settledReceipt(
+    execution: Promise<ToolReceipt>,
+    requiresSettlement: boolean,
+    controller: AbortController,
+    sessionId: string,
+    resourceKeys: string[]
+  ): Promise<ToolReceipt> {
+    try {
+      // Mutation/process executors must confirm termination before checkpoint
+      // recovery. Read-only plugins may be quarantined if they ignore abort.
+      return requiresSettlement ? await execution : await abortable(execution, controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted && !requiresSettlement) {
+        this.quarantine(sessionId, resourceKeys, execution);
+      }
+      throw error;
     }
   }
 

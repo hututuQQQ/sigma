@@ -180,6 +180,8 @@ describe("context, platform, and repository tool capabilities", () => {
     await mkdir(path.join(workspace, ".agent"), { recursive: true });
     const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: execution });
     expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["complete_task", "request_user_input"]));
+    expect(tools.descriptor("exec")).toMatchObject({ timeoutMs: 750_000 });
+    expect(tools.descriptor("exec")?.idleTimeoutMs).toBeUndefined();
     const supervisor: SupervisorPort = {
       spawnDurable: async () => ({ id: "child" }), followUp: () => undefined,
       join: async () => null, list: () => [], integrate: async () => null
@@ -265,6 +267,12 @@ describe("context, platform, and repository tool capabilities", () => {
     await expect(tools.execute(request("write-agent", "write", {
       path: ".agent/config.toml", content: "forbidden"
     }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
+    await expect(tools.execute(request("write-nested-git", "write", {
+      path: "src/.git/model-owned", content: "forbidden"
+    }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
+    await expect(tools.execute(request("write-nested-agent", "write", {
+      path: "src/.agent/config.toml", content: "forbidden"
+    }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
   });
 
   it("rejects nested instruction links that escape the workspace", async () => {
@@ -303,7 +311,7 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(shellInvocation("powershell", "Get-Date").executable).toContain("powershell");
     expect(shellInvocation("cmd", "echo ok").args).toContain("/c");
     expect(shellInvocation("bash", "true")).toEqual({ executable: "bash", args: ["-lc", "true"] });
-    expect(runtimeEnvironment().defaultShell).toBe(process.platform === "win32" ? "powershell" : "bash");
+    expect(runtimeEnvironment().defaultShell).toBe(process.platform === "win32" ? "cmd" : "bash");
 
     const locks = new ResourceLockManager();
     const order: string[] = [];

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { loadNestedInstructions } from "agent-context";
 import { createKernelState } from "agent-kernel";
+import type { RuntimeEnvironment } from "agent-platform";
 import { createBudgetLedger, type BudgetLimits, type StartSession } from "agent-protocol";
 import { baseContext } from "./runtime-context.js";
 import type { RuntimeSession } from "./types.js";
@@ -13,7 +14,8 @@ export async function newRuntimeSession(
   identity: Pick<RuntimeSession, "gateway" | "modelRole" | "profile" | "profileSource"> & {
     parentSessionId?: string;
     workspaceLeaseInherited?: boolean;
-  }
+  },
+  environment?: RuntimeEnvironment
 ): Promise<RuntimeSession> {
   const sessionId = randomUUID();
   const runId = randomUUID();
@@ -26,7 +28,7 @@ export async function newRuntimeSession(
     deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
   });
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
-  const base = baseContext();
+  const base = baseContext(environment);
   const project = await loadNestedInstructions({ workspacePath: input.workspacePath });
   return {
     sessionId,

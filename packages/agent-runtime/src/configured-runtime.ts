@@ -1,5 +1,5 @@
 import path from "node:path";
-import { chmod, mkdir, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import type {
   McpConfigSource,
   McpServerConfigValue,
@@ -9,11 +9,18 @@ import type {
   WorkspaceMcpTrustAttestation
 } from "agent-config";
 import type { JsonValue, ModelGateway, RunStore } from "agent-protocol";
-import type { ExecutionBroker } from "agent-execution";
+import type { BrokerDoctorReport, ExecutionBroker } from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
+import {
+  ensurePrivateStateDirectory,
+  isInside,
+  runtimeEnvironment,
+  type RuntimeEnvironment,
+  type ShellKind
+} from "agent-platform";
 import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
@@ -85,6 +92,7 @@ interface PreparedComposition {
   storeRootDir: string;
   customization: RuntimeCustomization;
   execution: ExecutionBroker;
+  executionReport: BrokerDoctorReport;
   hookRunner: HookRunnerPort;
 }
 
@@ -115,56 +123,101 @@ export async function createConfiguredRuntime(
   options: RuntimeFactoryOptions = {}
 ): Promise<ConfiguredRuntime> {
   const prepared = await prepareComposition(config, deps, options);
-  const { workspace, storeRootDir, customization, execution, hookRunner } = prepared;
-  const gateways = createRoleGateways(config, deps, customization);
-  const runtimeReference: { current?: InProcessRuntimeClient } = {};
-  const supervisor = createSupervisor(config, execution, runtimeReference);
-  const tools = createTools(config, execution, supervisor);
-  const mcpClients = options.connectMcp === false
-    ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
-  const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-  const runtime = createRuntime({
-    gateway: gateways.orchestrator,
-    store,
-    storeRootDir,
-    tools,
-    permissionMode: customization.permissionMode,
-    runDeadlineMs: config.runDeadlineSec * 1_000,
-    maxParallelTools: config.maxParallelTools,
-    budgetLimits: customization.budgetLimits,
-    checkpointMaxFiles: config.checkpoint?.maxFiles,
-    checkpointMaxBytes: config.checkpoint?.maxBytes,
-    profile: customization.profile,
-    profileSource: customization.profileSource,
-    availableProfiles: customization.availableProfiles,
-    gatewayForRole: gateways.forRole,
-    execution,
-    skills: customization.skills,
-    hooks: customization.hookDefinitions,
-    hookArtifacts: customization.hookArtifacts,
-    hookRunner,
-    agentProfileHookRunner: deps.agentProfileHookRunner,
-    reviewer: new ModelReviewer(gateways.reviewer, reviewerRouteId(customization.profile)),
-    reviewerForSession: (session) => new ModelReviewer(
-      gateways.forRole("reviewer", session.profile),
-      reviewerRouteId(session.profile)
-    ),
-    joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
-    cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason),
-    hasActiveChildren: (parentId) => supervisor.list(parentId)
-      .some((child) => child.status === "queued" || child.status === "running")
-  });
-  runtimeReference.current = runtime;
-  return {
-    workspace,
-    storeRootDir,
-    runtime,
-    execution,
-    close: async () => {
-      await closeMcpClients(mcpClients);
-      await execution.close();
+  const { workspace, storeRootDir, customization, execution, executionReport, hookRunner } = prepared;
+  let mcpClients: Awaited<ReturnType<typeof connectMcpServers>> = [];
+  try {
+    const gateways = createRoleGateways(config, deps, customization);
+    const runtimeReference: { current?: InProcessRuntimeClient } = {};
+    const supervisor = createSupervisor(config, execution, runtimeReference);
+    const tools = createTools(config, execution, supervisor, executionReport, storeRootDir);
+    mcpClients = options.connectMcp === false
+      ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway: gateways.orchestrator,
+      store,
+      storeRootDir,
+      tools,
+      permissionMode: customization.permissionMode,
+      runDeadlineMs: config.runDeadlineSec * 1_000,
+      maxParallelTools: config.maxParallelTools,
+      budgetLimits: customization.budgetLimits,
+      checkpointMaxFiles: config.checkpoint?.maxFiles,
+      checkpointMaxBytes: config.checkpoint?.maxBytes,
+      profile: customization.profile,
+      profileSource: customization.profileSource,
+      availableProfiles: customization.availableProfiles,
+      gatewayForRole: gateways.forRole,
+      execution,
+      runtimeEnvironment: brokerRuntimeEnvironment(executionReport),
+      skills: customization.skills,
+      hooks: customization.hookDefinitions,
+      hookArtifacts: customization.hookArtifacts,
+      hookRunner,
+      agentProfileHookRunner: deps.agentProfileHookRunner,
+      reviewer: new ModelReviewer(gateways.reviewer, reviewerRouteId(customization.profile)),
+      reviewerForSession: (session) => new ModelReviewer(
+        gateways.forRole("reviewer", session.profile),
+        reviewerRouteId(session.profile)
+      ),
+      joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
+      cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason),
+      hasActiveChildren: (parentId) => supervisor.list(parentId)
+        .some((child) => child.status === "queued" || child.status === "running")
+    });
+    runtimeReference.current = runtime;
+    return {
+      workspace,
+      storeRootDir,
+      runtime,
+      execution,
+      close: async () => await closeComposition(mcpClients, execution)
+    };
+  } catch (error) {
+    return await rethrowAfterCompositionClose(mcpClients, execution, error);
+  }
+}
+
+async function closeComposition(
+  mcpClients: Parameters<typeof closeMcpClients>[0],
+  execution: ExecutionBroker
+): Promise<void> {
+  let mcpFailure: unknown;
+  try {
+    await closeMcpClients(mcpClients);
+  } catch (error) {
+    mcpFailure = error;
+  }
+  try {
+    await execution.close();
+  } catch (error) {
+    if (mcpFailure) {
+      throw new AggregateError(
+        [mcpFailure, error],
+        "Runtime resources could not be closed cleanly.",
+        { cause: error }
+      );
     }
-  };
+    throw error;
+  }
+  if (mcpFailure) throw mcpFailure;
+}
+
+async function rethrowAfterCompositionClose(
+  mcpClients: Parameters<typeof closeMcpClients>[0],
+  execution: ExecutionBroker,
+  failure: unknown
+): Promise<never> {
+  try {
+    await closeComposition(mcpClients, execution);
+  } catch (cleanupFailure) {
+    throw new AggregateError(
+      [failure, cleanupFailure],
+      "Runtime composition failed and its resources could not be closed.",
+      { cause: cleanupFailure }
+    );
+  }
+  throw failure;
 }
 
 async function prepareComposition(
@@ -174,20 +227,30 @@ async function prepareComposition(
 ): Promise<PreparedComposition> {
   const workspace = await realpath(path.resolve(config.workspace));
   await verifyMcpTrust(config, options, workspace);
-  const storeRootDir = await prepareStoreRoot(deps.stateRootDir ?? runtimeStateRoot(workspace));
+  const storeRootDir = await prepareStoreRoot(
+    deps.stateRootDir ?? runtimeStateRoot(workspace),
+    workspace
+  );
   const customization = await resolveRuntimeCustomization(config, workspace, undefined, deps.hookDefinitions);
   verifyCustomization(config, workspace, customization);
   const execution = deps.executionBroker ?? new LazyExecutionBroker({
     sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
     allowUnsafeHostExec: config.allowUnsafeHostExec === true
   });
-  return {
-    workspace,
-    storeRootDir,
-    customization,
-    execution,
-    hookRunner: createHookRunner(config, deps, workspace, storeRootDir, customization, execution)
-  };
+  try {
+    const hookRunner = createHookRunner(config, deps, workspace, storeRootDir, customization, execution);
+    const executionReport = await execution.connect();
+    return {
+      workspace,
+      storeRootDir,
+      customization,
+      execution,
+      executionReport,
+      hookRunner
+    };
+  } catch (error) {
+    return await rethrowAfterCompositionClose([], execution, error);
+  }
 }
 
 async function verifyMcpTrust(
@@ -199,11 +262,32 @@ async function verifyMcpTrust(
   await verifyWorkspaceMcpTrust(workspace, config.mcpSource, config.workspaceMcpTrust);
 }
 
-async function prepareStoreRoot(configuredRoot: string): Promise<string> {
+async function canonicalPathAllowMissing(target: string): Promise<string> {
+  let ancestor = path.resolve(target);
+  while (true) {
+    try {
+      const canonical = await realpath(ancestor);
+      return path.resolve(canonical, path.relative(ancestor, target));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      ancestor = parent;
+    }
+  }
+}
+
+async function prepareStoreRoot(configuredRoot: string, workspace: string): Promise<string> {
   const storeRootDir = path.resolve(configuredRoot);
-  await mkdir(storeRootDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await chmod(storeRootDir, 0o700);
-  return storeRootDir;
+  if (isInside(workspace, await canonicalPathAllowMissing(storeRootDir))) {
+    throw new Error("Runtime state root must be outside the workspace.");
+  }
+  await ensurePrivateStateDirectory(storeRootDir);
+  const canonicalStoreRoot = await realpath(storeRootDir);
+  if (isInside(workspace, canonicalStoreRoot)) {
+    throw new Error("Runtime state root must remain outside the workspace after creation.");
+  }
+  return canonicalStoreRoot;
 }
 
 function verifyCustomization(
@@ -260,16 +344,40 @@ function createSupervisor(
 function createTools(
   config: RuntimeCompositionConfig,
   execution: ExecutionBroker,
-  supervisor: AgentSupervisor
+  supervisor: AgentSupervisor,
+  executionReport: BrokerDoctorReport,
+  storeRootDir: string
 ): EffectToolRegistry {
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
+    atomicPatchStateRootDir: storeRootDir,
     sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
     networkMode: config.networkMode ?? "none",
+    shells: verifiedShellKinds(executionReport),
     codeIntel: {
       presets: discoverLanguageServers(),
       additionalReadRoots: [defaultBundledLanguageServerRoot()].filter((value): value is string => Boolean(value))
     }
   });
   return registerSupervisorTools(builtins, supervisor);
+}
+
+function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnvironment {
+  const reported = report.platform === "windows" ? "win32"
+    : report.platform === "macos" ? "darwin" : report.platform;
+  const platform = ["aix", "darwin", "freebsd", "linux", "openbsd", "sunos", "win32"]
+    .includes(reported) ? reported as NodeJS.Platform : process.platform;
+  const availableShells = verifiedShellKinds(report);
+  return {
+    ...runtimeEnvironment(platform),
+    arch: report.architecture,
+    defaultShell: availableShells[0] ?? "none",
+    availableShells
+  };
+}
+
+function verifiedShellKinds(report: BrokerDoctorReport): ShellKind[] {
+  return [...new Set((report.capabilities.shells ?? [])
+    .filter((shell) => shell.verified)
+    .map((shell) => shell.kind))];
 }

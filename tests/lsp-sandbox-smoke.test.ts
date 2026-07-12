@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { parseArguments, portableLayout } from "../scripts/ci/lsp-sandbox-smoke.mjs";
+import {
+  parseArguments,
+  portableLayout,
+  portableNodeToolchain
+} from "../scripts/ci/lsp-sandbox-smoke.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +34,72 @@ describe("bundled LSP sandbox smoke", () => {
     expect(() => parseArguments([
       "--bundle", "release", "--broker", "broker", "--target-platform", "darwin", "--output", "out"
     ])).toThrow("--target-platform must be 'linux' or 'win32'");
+  });
+
+  it("binds the exact bundled Node runtime to its Windows compatibility proof", () => {
+    const layout = portableLayout("release", "win32");
+    const contract = {
+      kind: "windows_appcontainer_node",
+      patchId: "patch-v1",
+      reason: "fixture",
+      nodeVersion: "v1.2.3",
+      targetPlatform: "win32",
+      targetArch: "x64",
+      sourceSha256: "a".repeat(64),
+      unsignedPatchedSha256: "d".repeat(64),
+      normalizedContentSha256: "b".repeat(64),
+      requiredNodeOptions: "--preserve-symlinks-main"
+    };
+    const nodeDigest = "c".repeat(64);
+    const proof = {
+      kind: contract.kind,
+      patchId: contract.patchId,
+      sourceSha256: contract.sourceSha256,
+      normalizedContentSha256: contract.normalizedContentSha256,
+      executableSha256: nodeDigest
+    };
+    const api = {
+      WINDOWS_APPCONTAINER_NODE_COMPATIBILITY: contract,
+      createWindowsAppContainerNodeCompatibilityProof: (executable: string, id: string) => {
+        expect(executable).toBe(layout.node);
+        expect(id).toBe("bundled-runtime");
+        return proof;
+      }
+    };
+    const compatibility = {
+      kind: contract.kind,
+      patchId: contract.patchId,
+      reason: contract.reason,
+      nodeVersion: contract.nodeVersion,
+      targetPlatform: contract.targetPlatform,
+      targetArch: contract.targetArch,
+      sourceSha256: contract.sourceSha256,
+      unsignedPatchedSha256: contract.unsignedPatchedSha256,
+      normalizedContentSha256: contract.normalizedContentSha256,
+      runtimeEnvironment: { NODE_OPTIONS: contract.requiredNodeOptions }
+    };
+    const metadata = {
+      targetPlatform: "win32",
+      node: { sha256: nodeDigest, compatibility }
+    };
+    const integrity = { nodeCompatibility: structuredClone(compatibility) };
+    expect(portableNodeToolchain(api, layout, metadata, integrity, nodeDigest)).toEqual({
+      id: "bundled-runtime",
+      runtime: "node",
+      executable: layout.node,
+      aliases: ["node", "node.exe"],
+      executionRoots: [layout.node],
+      pathEntries: [],
+      environment: { NODE_OPTIONS: contract.requiredNodeOptions },
+      compatibility: proof
+    });
+    expect(() => portableNodeToolchain(api, layout, {
+      ...metadata,
+      node: { compatibility: {
+        ...compatibility,
+        runtimeEnvironment: { NODE_OPTIONS: "--inspect" }
+      }, sha256: nodeDigest }
+    }, integrity, nodeDigest)).toThrow("does not match the integrity manifest");
   });
 
   it("removes stale evidence before reporting a failed smoke", async () => {

@@ -35,6 +35,28 @@ interface FileIdentity {
   ctimeMs: number;
 }
 
+/**
+ * Validate a prospective file-size reservation without reading or allocating
+ * the file. Kept as a pure numeric seam so very large boundaries can be tested
+ * on filesystems that do not support sparse files.
+ */
+export function preflightCheckpointByteReservation(input: {
+  maxBytes: number;
+  totalBytes: number;
+  expectedSize: number;
+}): void {
+  const { maxBytes, totalBytes, expectedSize } = input;
+  const validMaximum = maxBytes === Number.POSITIVE_INFINITY
+    || (Number.isSafeInteger(maxBytes) && maxBytes >= 0);
+  if (!validMaximum
+    || !Number.isSafeInteger(totalBytes) || totalBytes < 0
+    || !Number.isSafeInteger(expectedSize) || expectedSize < 0
+    || (maxBytes !== Number.POSITIVE_INFINITY
+      && (totalBytes > maxBytes || expectedSize > maxBytes - totalBytes))) {
+    throw new CheckpointLimitError(`Checkpoint exceeds ${maxBytes} preimage bytes.`);
+  }
+}
+
 function identity(info: Awaited<ReturnType<typeof lstat>>): FileIdentity {
   return {
     dev: Number(info.dev), ino: Number(info.ino), mode: Number(info.mode),
@@ -174,10 +196,11 @@ class CheckpointCapture {
     portablePath: string
   ): Promise<void> {
     const expectedSize = Number(info.size);
-    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0
-      || expectedSize > this.options.maxBytes - this.totalBytes) {
-      throw new CheckpointLimitError(`Checkpoint exceeds ${this.options.maxBytes} preimage bytes.`);
-    }
+    preflightCheckpointByteReservation({
+      maxBytes: this.options.maxBytes,
+      totalBytes: this.totalBytes,
+      expectedSize
+    });
     const stored = await captureStableFile(pinned, info, portablePath, this.options.putCas);
     this.totalBytes += stored.size;
     this.entries.set(portablePath, {

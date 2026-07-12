@@ -1,27 +1,90 @@
 import {
-  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, truncate, writeFile
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   CheckpointConflictError,
   CheckpointLimitError,
   CheckpointManager,
   CheckpointRecoveryError
 } from "../packages/agent-checkpoint/src/index.js";
-import { captureCheckpointManifest } from "../packages/agent-checkpoint/src/safe-capture.js";
+import {
+  captureCheckpointManifest,
+  preflightCheckpointByteReservation
+} from "../packages/agent-checkpoint/src/safe-capture.js";
+import { workspaceTransactionRoot } from "../packages/agent-platform/src/workspace-transaction-root.js";
+
+const checkpointTemporaryRoots = new Set<string>();
+
+async function checkpointTemporaryRoot(prefix: string): Promise<string> {
+  const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+  checkpointTemporaryRoots.add(root);
+  return root;
+}
+
+afterEach(async () => {
+  const roots = [...checkpointTemporaryRoots];
+  checkpointTemporaryRoots.clear();
+  await Promise.all(roots.map(async (root) => {
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+  }));
+});
 
 async function fixture(): Promise<{ root: string; workspace: string; manager: CheckpointManager }> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checkpoint-"));
+  const root = await checkpointTemporaryRoot("sigma-checkpoint-");
   const workspace = path.join(root, "workspace");
   await mkdir(path.join(workspace, ".git"), { recursive: true });
   await writeFile(path.join(workspace, "existing.txt"), "before", "utf8");
   await writeFile(path.join(workspace, "deleted.txt"), "keep me", "utf8");
   await writeFile(path.join(workspace, ".git", "protected"), "user state", "utf8");
   return { root, workspace, manager: new CheckpointManager({ rootDir: path.join(root, "state") }) };
+}
+
+async function checkpointTransactionRoot(root: string, workspacePath: string): Promise<string> {
+  return await workspaceTransactionRoot({
+    workspacePath,
+    stateRootDir: path.join(root, "state"),
+    namespace: "checkpoint-restore"
+  });
+}
+
+async function checkpointFileImage(target: string): Promise<{
+  kind: "file";
+  mode: number;
+  size: number;
+  digest: string;
+}> {
+  const [info, content] = await Promise.all([lstat(target), readFile(target)]);
+  return {
+    kind: "file",
+    mode: info.mode,
+    size: content.byteLength,
+    digest: createHash("sha256").update(content).digest("hex")
+  };
+}
+
+function validRecoveryFinalization(workspacePath: string, digest = "0".repeat(64)) {
+  const now = new Date().toISOString();
+  return {
+    desiredManifestDigest: digest,
+    record: {
+      schemaVersion: 1 as const,
+      checkpointId: "recovery-checkpoint",
+      sessionId: "recovery-session",
+      runId: "recovery-run",
+      status: "restored" as const,
+      workspacePath,
+      scopePaths: ["existing.txt"],
+      baseSeq: 0,
+      createdAt: now,
+      restoredAt: now,
+      preManifestDigest: digest
+    }
+  };
 }
 
 describe("CheckpointManager", () => {
@@ -54,6 +117,7 @@ describe("CheckpointManager", () => {
     await expect(readFile(path.join(workspace, "deleted.txt"), "utf8")).resolves.toBe("keep me");
     await expect(readFile(path.join(workspace, "added.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(workspace, ".git", "protected"), "utf8")).resolves.toBe("changed outside checkpoint");
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects a conflicting undo before changing files", async () => {
@@ -173,7 +237,7 @@ describe("CheckpointManager", () => {
   });
 
   it("round-trips non-Git binary content, file modes, and safe symlinks", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checkpoint-nongit-"));
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-nongit-");
     const workspace = path.join(root, "workspace");
     await mkdir(workspace, { recursive: true });
     const binary = path.join(workspace, "data.bin");
@@ -271,7 +335,7 @@ describe("CheckpointManager", () => {
       checkpointId: checkpoint.checkpointId,
       status: "sealed"
     }));
-    await expect(readdir(path.join(workspace, ".agent", "checkpoint-transactions"))).resolves.toEqual([]);
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
 
     const beforeRecord = new CheckpointManager({
       rootDir: path.join(root, "state"),
@@ -285,19 +349,89 @@ describe("CheckpointManager", () => {
     await expect(beforeRecord.list(checkpoint.sessionId)).resolves.toContainEqual(expect.objectContaining({ status: "sealed" }));
   });
 
+  it("rechecks the complete current file image immediately before its backup rename", async () => {
+    const { root, workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-current-cas-race", runId: "run-current-cas-race",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 1
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const transactional = new CheckpointManager({
+      rootDir: path.join(root, "state"),
+      restoreFaultInjector: async ({ point }) => {
+        if (point === "before_backup_move") {
+          await writeFile(path.join(workspace, "existing.txt"), "concurrent current image", "utf8");
+        }
+      }
+    });
+
+    await expect(transactional.undoLatest(checkpoint.sessionId)).rejects.toBeInstanceOf(CheckpointConflictError);
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("concurrent current image");
+  });
+
+  it("does not clobber a current-absent target that appears at the install boundary", async () => {
+    const { root, workspace, manager } = await fixture();
+    const restoredPath = path.join(workspace, "restore-me.txt");
+    await writeFile(restoredPath, "checkpoint preimage", "utf8");
+    const checkpoint = await manager.create({
+      sessionId: "session-absent-install-race", runId: "run-absent-install-race",
+      workspacePath: workspace, scopePaths: ["restore-me.txt"], baseSeq: 1
+    });
+    await rm(restoredPath);
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const transactional = new CheckpointManager({
+      rootDir: path.join(root, "state"),
+      restoreFaultInjector: async ({ point }) => {
+        if (point === "before_install_move") await writeFile(restoredPath, "concurrent owner", "utf8");
+      }
+    });
+
+    await expect(transactional.undoLatest(checkpoint.sessionId)).rejects.toBeInstanceOf(CheckpointConflictError);
+    await expect(readFile(restoredPath, "utf8")).resolves.toBe("concurrent owner");
+  });
+
+  it("never removes a concurrently replaced installed postimage during rollback", async () => {
+    const { root, workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-installed-race", runId: "run-installed-race",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 1
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const transactional = new CheckpointManager({
+      rootDir: path.join(root, "state"),
+      restoreFaultInjector: async ({ point }) => {
+        if (point === "after_install") {
+          await writeFile(path.join(workspace, "existing.txt"), "concurrent postimage", "utf8");
+          throw new Error("fail after concurrent replacement");
+        }
+      }
+    });
+
+    await expect(transactional.undoLatest(checkpoint.sessionId)).rejects.toBeInstanceOf(CheckpointRecoveryError);
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("concurrent postimage");
+  });
+
   it("replays a write-ahead journal after a crash between rename and completion recording", async () => {
-    const { workspace, manager } = await fixture();
-    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-crash");
+    const { root, workspace, manager } = await fixture();
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, "restore-crash");
     await mkdir(path.join(transaction, "backup"), { recursive: true });
     await mkdir(path.join(transaction, "stage"), { recursive: true });
     await rename(path.join(workspace, "existing.txt"), path.join(transaction, "backup", "0"));
     await writeFile(path.join(workspace, "existing.txt"), "partially installed preimage", "utf8");
+    const currentImage = await checkpointFileImage(path.join(transaction, "backup", "0"));
+    const installedImage = await checkpointFileImage(path.join(workspace, "existing.txt"));
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 3,
       phase: "applying",
+      finalization: validRecoveryFinalization(workspace),
+      directoryModes: [],
       operations: [{
         path: "existing.txt", index: 0, hadCurrent: true, hasDesired: true,
-        backupIntent: true, backupMoved: false, installIntent: true, installed: false
+        backupIntent: true, backupMoved: false, installIntent: true, installed: false,
+        currentImage, installedImage
       }]
     }));
 
@@ -308,10 +442,105 @@ describe("CheckpointManager", () => {
 
     await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
     await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    ["after installed removal", true, false, true, true],
+    ["after backup restoration", false, true, true, true],
+    ["while clearing recorded flags", false, true, false, false]
+  ])("re-enters rollback idempotently %s", async (
+    _label, keepBackup, keepTarget, installed, installIntent
+  ) => {
+    const { root, workspace, manager } = await fixture();
+    const target = path.join(workspace, "existing.txt");
+    const currentImage = await checkpointFileImage(target);
+    const installedSource = path.join(root, "installed-image.txt");
+    await writeFile(installedSource, "partially installed preimage", "utf8");
+    const installedImage = await checkpointFileImage(installedSource);
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, `restore-second-crash-${keepBackup}-${keepTarget}`);
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    if (keepBackup) await rename(target, path.join(transaction, "backup", "0"));
+    if (!keepTarget && !keepBackup) await rm(target);
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 3,
+      phase: "rolling_back",
+      finalization: validRecoveryFinalization(workspace),
+      directoryModes: [],
+      operations: [{
+        path: "existing.txt", index: 0, hadCurrent: true, hasDesired: true,
+        backupIntent: true, backupMoved: true, installIntent, installed,
+        currentImage, installedImage
+      }]
+    }));
+
+    await manager.create({
+      sessionId: `session-second-crash-${keepBackup}-${keepTarget}`,
+      runId: "run-second-crash", workspacePath: workspace,
+      scopePaths: ["existing.txt"], baseSeq: 0
+    });
+    await expect(readFile(target, "utf8")).resolves.toBe("before");
+    await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("restores a pure directory mode change from a v3 recovery journal", async () => {
+    const { root, workspace, manager } = await fixture();
+    const directory = path.join(workspace, "mode-only");
+    await mkdir(directory);
+    await chmod(directory, 0o700);
+    const currentMode = (await lstat(directory)).mode;
+    await chmod(directory, 0o755);
+    const desiredMode = (await lstat(directory)).mode;
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, "restore-mode-only");
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 3,
+      phase: "applying",
+      finalization: validRecoveryFinalization(workspace),
+      directoryModes: [{ path: "mode-only", currentMode, desiredMode }],
+      operations: []
+    }));
+
+    await manager.create({
+      sessionId: "session-mode-recovery", runId: "run-mode-recovery",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
+    });
+    expect((await lstat(directory)).mode).toBe(currentMode);
+  });
+
+  it.each([
+    ["coerced phase", ["applying"], validRecoveryFinalization],
+    ["malformed finalization record", "applying", () => ({
+      desiredManifestDigest: "0".repeat(64), record: []
+    })]
+  ])("rejects a v3 journal with %s", async (_label, phase, finalizationFactory) => {
+    const { root, workspace, manager } = await fixture();
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, `restore-invalid-${String(_label).replaceAll(" ", "-")}`);
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 3,
+      phase,
+      finalization: finalizationFactory(workspace),
+      directoryModes: [],
+      operations: []
+    }));
+
+    await expect(manager.create({
+      sessionId: "session-invalid-recovery", runId: "run-invalid-recovery",
+      workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
+    })).rejects.toBeInstanceOf(CheckpointRecoveryError);
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
+    await expect(lstat(transaction)).resolves.toBeDefined();
   });
 
   it("finalizes a schema v2 verified restore journal before the next checkpoint operation", async () => {
-    const { workspace, manager } = await fixture();
+    const { root, workspace, manager } = await fixture();
     const checkpoint = await manager.create({
       sessionId: "session-verified-finalize", runId: "run-verified-finalize",
       workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 1
@@ -320,7 +549,8 @@ describe("CheckpointManager", () => {
     const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
     await writeFile(path.join(workspace, "existing.txt"), "before", "utf8");
     const restored = { ...sealed, status: "restored" as const, restoredAt: new Date().toISOString() };
-    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-verified");
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, "restore-verified");
     await mkdir(transaction, { recursive: true });
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
       schemaVersion: 2,
@@ -338,10 +568,11 @@ describe("CheckpointManager", () => {
       status: "restored"
     }));
     await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("recovers finalization after a subprocess is killed at the verified boundary", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checkpoint-hard-crash-"));
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-hard-crash-");
     const stateRoot = path.join(root, "state");
     const workspace = path.join(root, "workspace");
     const marker = path.join(root, "verified.marker");
@@ -360,6 +591,11 @@ describe("CheckpointManager", () => {
     expect(result.code === 0).toBe(false);
     expect(stderr).not.toContain("Error:");
 
+    const transactions = await workspaceTransactionRoot({
+      workspacePath: workspace,
+      stateRootDir: stateRoot,
+      namespace: "checkpoint-restore"
+    });
     const manager = new CheckpointManager({ rootDir: stateRoot });
     await manager.create({
       sessionId: "session-verified-crash",
@@ -371,23 +607,37 @@ describe("CheckpointManager", () => {
     const records = await manager.list("session-verified-crash");
     expect(records[0]).toMatchObject({ status: "restored" });
     await expect(readFile(path.join(workspace, "target.txt"), "utf8")).resolves.toBe("before");
-    await expect(readdir(path.join(workspace, ".agent", "checkpoint-transactions"))).resolves.toEqual([]);
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("preserves a legacy verified journal that lacks finalization data", async () => {
+  it("never scans or applies a forged legacy journal from workspace .agent state", async () => {
     const { workspace, manager } = await fixture();
-    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-legacy-verified");
-    await mkdir(transaction, { recursive: true });
+    const transaction = path.join(workspace, ".agent", "checkpoint-transactions", "restore-forged");
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    await writeFile(path.join(transaction, "backup", "0"), "forged replacement", "utf8");
+    const currentImage = await checkpointFileImage(path.join(transaction, "backup", "0"));
+    const installedImage = await checkpointFileImage(path.join(workspace, "existing.txt"));
     await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
-      schemaVersion: 1,
-      phase: "verified",
-      operations: []
+      schemaVersion: 3,
+      phase: "applying",
+      finalization: {
+        desiredManifestDigest: "0".repeat(64),
+        record: { schemaVersion: 1, status: "restored" }
+      },
+      operations: [{
+        path: "existing.txt", index: 0,
+        backupIntent: true, backupMoved: true, installIntent: true, installed: true,
+        currentImage, installedImage
+      }]
     }), "utf8");
 
     await expect(manager.create({
       sessionId: "session-legacy-verified", runId: "run-legacy-verified",
       workspacePath: workspace, scopePaths: ["existing.txt"], baseSeq: 0
-    })).rejects.toMatchObject({ code: "checkpoint_recovery_failed", transactionPath: transaction });
+    })).resolves.toMatchObject({ status: "open" });
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
     await expect(lstat(transaction)).resolves.toBeDefined();
   });
 
@@ -406,6 +656,7 @@ describe("CheckpointManager", () => {
         if (point === "before_rollback_restore") throw new Error("injected rollback failure");
       }
     });
+    const transactions = await checkpointTransactionRoot(root, workspace);
 
     const failure = await transactional.undoLatest(checkpoint.sessionId).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(CheckpointRecoveryError);
@@ -414,10 +665,10 @@ describe("CheckpointManager", () => {
       checkpointId: checkpoint.checkpointId,
       status: "sealed"
     }));
-    const transactions = path.join(workspace, ".agent", "checkpoint-transactions");
     const retained = (await readdir(transactions)).find((name) => name.startsWith("restore-"));
     expect(retained).toBeTruthy();
     await expect(readFile(path.join(transactions, retained!, "journal.json"), "utf8")).resolves.toContain("rolling_back");
+    await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("restores a preimage symlink over a real directory without mutating its external target", async () => {
@@ -538,7 +789,7 @@ describe("CheckpointManager", () => {
     }
   );
 
-  it("never follows a linked .agent directory while creating its restore journal", async () => {
+  it("keeps restore state external when the legacy .agent directory is linked", async () => {
     const { root, workspace, manager } = await fixture();
     const outside = path.join(root, "agent-link-outside");
     await mkdir(outside);
@@ -551,14 +802,16 @@ describe("CheckpointManager", () => {
     });
     await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const transactions = await checkpointTransactionRoot(root, workspace);
 
-    await expect(manager.undoLatest(checkpoint.sessionId)).rejects.toBeInstanceOf(CheckpointConflictError);
-    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("after");
+    await expect(manager.undoLatest(checkpoint.sessionId)).resolves.toMatchObject({ status: "restored" });
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(lstat(path.join(outside, "checkpoint-transactions"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("streams pinned file capture in bounded chunks and preflights a near-2-GiB limit failure", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-checkpoint-stream-"));
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-stream-");
     const workspace = path.join(root, "workspace");
     await mkdir(workspace);
     const streamed = path.join(workspace, "streamed.txt");
@@ -589,7 +842,19 @@ describe("CheckpointManager", () => {
     expect(chunkSizes.length).toBeGreaterThan(1);
     expect(Math.max(...chunkSizes)).toBeLessThanOrEqual(64 * 1024);
 
-    await truncate(streamed, 2 * 1024 * 1024 * 1024 - 1);
+    const twoGiB = 2 * 1024 * 1024 * 1024;
+    const nearTwoGiB = twoGiB - 1;
+    expect(() => preflightCheckpointByteReservation({
+      maxBytes: twoGiB,
+      totalBytes: 0,
+      expectedSize: nearTwoGiB
+    })).not.toThrow();
+    expect(() => preflightCheckpointByteReservation({
+      maxBytes: twoGiB,
+      totalBytes: nearTwoGiB,
+      expectedSize: 2
+    })).toThrow(CheckpointLimitError);
+
     const limitedRoot = path.join(root, "limited-state");
     const limited = new CheckpointManager({ rootDir: limitedRoot, maxBytes: 1024 });
     await expect(limited.create({

@@ -52,7 +52,7 @@ export async function pinPatchParent(workspace: string, relative: string): Promi
       handles.push(handle);
       anchored = `/proc/self/fd/${handle.fd}`;
     }
-    if (process.platform === "win32") windowsLock = lockWindowsDirectories(paths);
+    if (process.platform === "win32") windowsLock = await lockWindowsDirectories(paths);
     return {
       targetPath: path.join(process.platform === "linux" ? anchored : paths.at(-1)!, name),
       verify: async () => {
@@ -63,12 +63,12 @@ export async function pinPatchParent(workspace: string, relative: string): Promi
         }
       },
       close: async () => {
-        windowsLock?.close();
+        await windowsLock?.close();
         for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
       }
     };
   } catch (error) {
-    windowsLock?.close();
+    await windowsLock?.close();
     for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
     throw error;
   }

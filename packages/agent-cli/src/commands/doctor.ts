@@ -8,6 +8,7 @@ interface DoctorDeps {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   executionBroker?: ExecutionBroker;
+  createExecutionBroker?: () => ExecutionBroker;
   languageServers?: LanguageServerPreset[];
 }
 
@@ -99,20 +100,18 @@ function writeReport(stdout: NodeJS.WritableStream, report: object, checks: Doct
   for (const check of checks) stdout.write(`${check.name}=${check.status} ${check.message}\n`);
 }
 
-export async function runDoctorCommand(argv: string[], deps: DoctorDeps = {}): Promise<number> {
-  const stdout = deps.stdout ?? process.stdout;
-  const stderr = deps.stderr ?? process.stderr;
-  if (argv.includes("--help") || argv.includes("-h")) {
-    stdout.write("agent doctor [--workspace <path>] [--check-api] [--strict] [--json]\n");
-    return 0;
-  }
+async function executeDoctor(
+  argv: string[],
+  deps: DoctorDeps,
+  stdout: NodeJS.WritableStream
+): Promise<number> {
+  const { flags } = parseArgs(argv);
+  const config = loadCliConfig(flags);
+  const ownedBroker = deps.executionBroker ? undefined : (deps.createExecutionBroker?.() ?? new LazyExecutionBroker({
+    sandboxMode: "unsafe",
+    allowUnsafeHostExec: false
+  }));
   try {
-    const { flags } = parseArgs(argv);
-    const config = loadCliConfig(flags);
-    const ownedBroker = deps.executionBroker ? undefined : new LazyExecutionBroker({
-      sandboxMode: "unsafe",
-      allowUnsafeHostExec: false
-    });
     const broker = deps.executionBroker ?? ownedBroker!;
     const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
     checks.push(await sandboxCheck(broker));
@@ -122,8 +121,21 @@ export async function runDoctorCommand(argv: string[], deps: DoctorDeps = {}): P
     const outcome = reportStatus(checks, strict);
     const report = { status: outcome.status, strict, checks };
     writeReport(stdout, report, checks, flags.json === true);
-    await ownedBroker?.close();
     return outcome.failed ? 1 : 0;
+  } finally {
+    await ownedBroker?.close();
+  }
+}
+
+export async function runDoctorCommand(argv: string[], deps: DoctorDeps = {}): Promise<number> {
+  const stdout = deps.stdout ?? process.stdout;
+  const stderr = deps.stderr ?? process.stderr;
+  if (argv.includes("--help") || argv.includes("-h")) {
+    stdout.write("agent doctor [--workspace <path>] [--check-api] [--strict] [--json]\n");
+    return 0;
+  }
+  try {
+    return await executeDoctor(argv, deps, stdout);
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

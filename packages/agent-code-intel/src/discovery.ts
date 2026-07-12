@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolvePortableNodeExecutable } from "agent-execution";
 import type { DiscoverLanguageServersOptions, LanguageServerPreset } from "./types.js";
 import { nodeLanguageServerArguments } from "./node-launch.js";
 
@@ -45,12 +46,17 @@ function bundledTypeScriptServerEntry(): string {
   ].find((candidate) => existsSync(candidate)) ?? path.join(directory, "typescript-server.mjs");
 }
 
+function bundledNodeExecutable(configured: string | undefined, platform: NodeJS.Platform): string {
+  if (configured) return path.resolve(configured);
+  return resolvePortableNodeExecutable(import.meta.url, platform) ?? process.execPath;
+}
+
 export function discoverLanguageServers(options: DiscoverLanguageServersOptions = {}): LanguageServerPreset[] {
   const platform = options.platform ?? process.platform;
   const pathValue = options.pathValue ?? process.env.PATH ?? "";
   const bundledRoot = options.bundledRoot ?? defaultBundledLanguageServerRoot();
   const root = bundledRoot ? path.resolve(bundledRoot) : undefined;
-  const node = options.nodeExecutable ? path.resolve(options.nodeExecutable) : process.execPath;
+  const node = bundledNodeExecutable(options.nodeExecutable, platform);
   const tsEntry = bundledTypeScriptServerEntry();
   const pyrightEntry = root ? path.join(root, "pyright", "langserver.index.js") : "";
   const presets: LanguageServerPreset[] = [

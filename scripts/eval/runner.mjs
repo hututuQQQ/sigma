@@ -12,6 +12,9 @@ import { reduceAgentEvents } from "./metrics.mjs";
 import { writeEvalReport } from "./report.mjs";
 import { EVAL_BUDGETS_V1, loadEvalManifestV1 } from "./schema.mjs";
 import { runCliSubject } from "./subject-cli.mjs";
+import {
+  applySubjectLaunchEnvironment, createDevNodeLaunch, loadPackagedSubjectLaunch
+} from "./subject-launch.mjs";
 import { runTuiSubject } from "./subject-tui.mjs";
 import { runPostVerifier } from "./verifier.mjs";
 import {
@@ -20,8 +23,16 @@ import {
 
 const DEFAULT_MANIFEST = path.join(fixtureRootDir, "manifest.json");
 
-function packageManager() {
-  return process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+export function packageManagerInvocation(args, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  if (platform === "win32") {
+    return {
+      command: env.ComSpec ?? env.COMSPEC ?? "cmd.exe",
+      args: ["/d", "/s", "/c", "pnpm.cmd", ...args]
+    };
+  }
+  return { command: "pnpm", args: [...args] };
 }
 
 function sigmaExecName() {
@@ -100,7 +111,8 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
   }
   if (subjectKind === "dev") {
     const brokerPath = path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecName());
-    const result = await capture(packageManager(), ["build:native:sigma-exec"], { cwd: rootDir });
+    const invocation = packageManagerInvocation(["build:native:sigma-exec"]);
+    const result = await capture(invocation.command, invocation.args, { cwd: rootDir });
     await writeFile(path.join(runDir, "native-build.stdout.log"), redactor(result.stdout), "utf8");
     await writeFile(path.join(runDir, "native-build.stderr.log"), redactor(result.stderr), "utf8");
     if (result.exitCode !== 0) throw new Error("Building the target-native sigma-exec evaluator dependency failed.");
@@ -112,7 +124,9 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
       brokerPath
     });
     return {
-      subjectKind, cliEntry, nodePath: process.execPath, brokerPath, ...identity,
+      subjectKind, cliEntry, nodePath: process.execPath, brokerPath,
+      launch: createDevNodeLaunch(process.execPath, cliEntry),
+      ...identity,
       nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
       nativeTarget: `${process.platform}-${process.arch}`
     };
@@ -122,15 +136,17 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
   const bundleName = `agent-cli-${process.platform === "win32" ? "win32" : "linux"}-${arch}`;
   const bundleRoot = path.join(rootDir, ".artifacts", bundleName);
   if (!options.skipPackage) {
-    const result = await capture(packageManager(), [`package:agent-cli:${target}`], { cwd: rootDir });
+    const invocation = packageManagerInvocation([`package:agent-cli:${target}`]);
+    const result = await capture(invocation.command, invocation.args, { cwd: rootDir });
     await writeFile(path.join(runDir, "package.stdout.log"), redactor(result.stdout), "utf8");
     await writeFile(path.join(runDir, "package.stderr.log"), redactor(result.stderr), "utf8");
     if (result.exitCode !== 0) throw new Error(`Packaging the ${target} evaluation subject failed; inspect package.stderr.log.`);
   }
-  const nodePath = path.join(bundleRoot, "bin", process.platform === "win32" ? "node.exe" : "node");
-  const entryPath = path.join(bundleRoot, "packages", "agent-cli", "dist", "index.js");
-  const brokerPath = path.join(bundleRoot, "bin", sigmaExecName());
-  await Promise.all([access(nodePath), access(entryPath), access(brokerPath)]);
+  const packaged = await loadPackagedSubjectLaunch(bundleRoot, {
+    targetPlatform: process.platform === "win32" ? "win32" : "linux",
+    targetArch: arch
+  });
+  const { nodePath, brokerPath } = packaged;
   const identity = await subjectIdentity({
     subjectKind,
     cliTreeDigest: directoryDigest(await snapshotWorkspace(bundleRoot)),
@@ -138,7 +154,7 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
     brokerPath
   });
   return {
-    subjectKind, cliEntry: entryPath, nodePath, brokerPath, ...identity,
+    subjectKind, ...packaged, ...identity,
     nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
     nativeTarget: `${process.platform}-${process.arch}`
   };
@@ -556,7 +572,13 @@ async function runAttemptCore(context, deps, lifecycle) {
   const initialGit = await gitDiff(workspace);
   const promptPath = path.join(controllerDir, "instruction.md");
   await writeFile(promptPath, `${scenario.userMessages[0].trim()}\n`, "utf8");
-  const env = subjectEnvironment({ stateHome, homeDir, tempDir, secrets });
+  const baseSubjectEnv = subjectEnvironment({ stateHome, homeDir, tempDir, secrets });
+  // An injected runSubject owns process creation and may use a synthetic
+  // subject in unit tests. The built-in launchers always require the prepared
+  // descriptor and apply its package-bound environment here.
+  const env = deps.runSubject && !subject.launch
+    ? baseSubjectEnv
+    : applySubjectLaunchEnvironment(baseSubjectEnv, subject.launch);
   const budget = EVAL_BUDGETS_V1[scenario.budget];
   const runSubject = deps.runSubject ?? (scenario.surface === "tui" ? runTuiSubject : runCliSubject);
   let subjectResult;

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { access, mkdtemp, writeFile } from "node:fs/promises";
+import { access, cp, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -8,10 +8,13 @@ import {
   BrokerCancelledError,
   BrokerConnectionError,
   BrokerFrameDecoder,
+  BrokerOutputDecodingError,
   BrokerPolicyError,
   BrokerProcessLostError,
   BrokerProtocolError,
+  BrokerToolchainEnvironmentConflictError,
   BrokerTimeoutError,
+  BrokerToolchainUnavailableError,
   SandboxUnavailableError,
   SecretRedactor,
   SigmaExecBrokerClient,
@@ -47,6 +50,7 @@ const artifactRoot = artifactRootArgument ? path.resolve(artifactRootArgument) :
 if (artifactRoot) fs.mkdirSync(artifactRoot, { recursive: true });
 let input = Buffer.alloc(0);
 let pollCount = 0;
+let pendingExec;
 const send = value => {
   const body = Buffer.from(JSON.stringify(value));
   const header = Buffer.alloc(4);
@@ -82,6 +86,8 @@ const handle = request => {
     });
   } else if (request.method === "exec" && mode === "hang") {
     // cancellation request remains readable while this logical request is pending
+  } else if (request.method === "exec" && mode === "cancel-ack") {
+    pendingExec = request;
   } else if (request.method === "exec" && mode === "overflow") {
     const content = Buffer.from("prefix [REDACTED:provider] suffix\n", "utf8");
     const artifactPath = path.join(artifactRoot, "stdout-output.log");
@@ -96,10 +102,28 @@ const handle = request => {
       }],
       timedOut: false, idleTimedOut: false, cancelled: false
     });
+  } else if (request.method === "exec" && mode === "decoding-error") {
+    ok(request, {
+      ...terminal(),
+      stdout: { ...output("", 0), decodingError: {
+        code: "invalid_output_encoding", message: "unsupported process output bytes"
+      } },
+      timedOut: false, idleTimedOut: false, cancelled: false
+    });
   } else if (request.method === "exec") {
     ok(request, { ...terminal("secret-value"), timedOut: false, idleTimedOut: false, cancelled: false });
   } else if (request.method === "process.spawn") {
-    if (mode === "pty-check" && (request.params.pty !== true || request.params.ptyColumns !== 90 || request.params.ptyRows !== 20)) {
+    if (mode === "toolchain-check" && (
+      !request.params.policy.executionRoots.some(root => path.resolve(root) === path.resolve(process.execPath))
+      || request.params.command.env.NODE_OPTIONS !== "--preserve-symlinks-main"
+    )) {
+      fail(request, "policy_denied", "trusted toolchain policy was not forwarded");
+    } else if (mode === "toolchain-alias-check" && (
+      path.resolve(request.params.command.executable) !== path.resolve(process.execPath)
+      || !request.params.policy.executionRoots.some(root => path.resolve(root) === path.resolve(process.execPath))
+    )) {
+      fail(request, "policy_denied", "trusted toolchain alias was not resolved exactly");
+    } else if (mode === "pty-check" && (request.params.pty !== true || request.params.ptyColumns !== 90 || request.params.ptyRows !== 20)) {
       fail(request, "broker_protocol_error", "PTY request was not forwarded");
     } else if (mode === "slow-spawn") {
       setTimeout(() => ok(request, { handleId: "fixture-process" }), 50);
@@ -125,6 +149,13 @@ const handle = request => {
       state: "exited", exitCode: 0, signal: null, durationMs: 4,
       stdout: output("def", 6), stderr: output("", 0)
     });
+  } else if (request.method === "cancel" && mode === "cancel-ack") {
+    ok(request, { cancelled: true });
+    setTimeout(() => {
+      if (artifactRoot) fs.writeFileSync(path.join(artifactRoot, "cancel-settled"), "yes");
+      ok(pendingExec, { ...terminal(), timedOut: false, idleTimedOut: false, cancelled: true });
+      pendingExec = undefined;
+    }, 50);
   } else if (request.method === "process.write" || request.method === "process.release" || request.method === "cancel") {
     ok(request, {});
   } else if (request.method === "artifact.release") {
@@ -159,7 +190,8 @@ const requiredPolicy = (): ExecutionPolicy => ({
   sandbox: "required",
   network: "none",
   readRoots: [process.cwd()],
-  writeRoots: []
+  writeRoots: [],
+  executionRoots: [process.execPath]
 });
 
 const spawnRequest = (): ProcessSpawnRequest => ({
@@ -177,6 +209,8 @@ function fixtureOptions(
     helperArgs: ["-e", BROKER_FIXTURE, mode, ...(artifactRoot ? [artifactRoot] : [])],
     requestTimeoutMs: 1_000,
     shutdownGraceMs: 250,
+    cancellationGraceMs: 250,
+    trustedToolchains: [],
     ...extra
   };
 }
@@ -353,7 +387,11 @@ describe("agent-execution protocol validation", () => {
           networkNamespace: true
         }
       },
-      capabilities: { foreground: true, background: true, stdin: true, pty: false, networkModes: ["none"] }
+      capabilities: {
+        foreground: true, background: true, stdin: true, pty: false, networkModes: ["none"],
+        executionRoots: true,
+        shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
+      }
     };
     const parsedDoctor = parseDoctor(doctor);
     expect(parsedDoctor.sandbox.reason).toBeUndefined();
@@ -366,12 +404,53 @@ describe("agent-execution protocol validation", () => {
       pidNamespace: true,
       networkNamespace: true
     });
+    expect(parsedDoctor.capabilities).toMatchObject({
+      executionRoots: true,
+      shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
+    });
+    expect(parseDoctor({
+      ...doctor,
+      platform: "windows",
+      capabilities: {
+        ...doctor.capabilities,
+        shells: [{ kind: "cmd", executable: "C:\\Windows\\System32\\cmd.exe", verified: true }]
+      }
+    }).capabilities.shells).toEqual([
+      { kind: "cmd", executable: "C:\\Windows\\System32\\cmd.exe", verified: true }
+    ]);
     expect(parseDoctor({
       ...doctor,
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }
     }).sandbox.hardening).not.toHaveProperty("landlockAbi");
     expect(() => parseDoctor({ ...doctor, protocolVersion: 2 })).toThrow(BrokerProtocolError);
     expect(() => parseDoctor({ ...doctor, capabilities: { ...doctor.capabilities, networkModes: ["domain"] } })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, shells: [{ kind: "powershell", executable: "powershell.exe", verified: false }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, shells: [{ kind: "bash", executable: "bin/bash", verified: true }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      platform: "windows",
+      capabilities: { ...doctor.capabilities, shells: [{ kind: "cmd", executable: "cmd.exe", verified: true }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, shells: [{ kind: "bash", executable: "/bin/bash\0", verified: true }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: {
+        ...doctor.capabilities,
+        shells: [
+          { kind: "bash", executable: "/bin/bash", verified: true },
+          { kind: "bash", executable: "/usr/bin/bash", verified: true }
+        ]
+      }
+    })).toThrow(BrokerProtocolError);
     expect(() => parseDoctor({
       ...doctor, sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: 0 } }
     })).toThrow(BrokerProtocolError);
@@ -434,6 +513,12 @@ describe("agent-execution protocol validation", () => {
 });
 
 describe("SigmaExecBrokerClient", () => {
+  it("rejects an invalid acknowledged-cancellation grace period", () => {
+    expect(() => new SigmaExecBrokerClient(fixtureOptions("normal", {
+      cancellationGraceMs: 0
+    }))).toThrow("cancellationGraceMs must be a positive integer");
+  });
+
   it("handshakes, redacts foreground output, and manages background handles", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions("normal", {
       secrets: { provider: "secret-value", stream: "abcdef" }
@@ -526,6 +611,181 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
+  it("enforces manifest toolchain roots, PATH, and descendant environment on every command", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("toolchain-check", {
+      sandboxMode: "unsafe",
+      trustedToolchains: [{
+        id: "bundled-runtime",
+        executable: process.execPath,
+        aliases: ["node"],
+        environment: { NODE_OPTIONS: "--preserve-symlinks-main" }
+      }]
+    }));
+    await client.connect();
+    const request = spawnRequest();
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: process.platform === "win32" ? "cmd" : "bash" }
+    })).resolves.toMatchObject({ id: "fixture-process" });
+    const conflict = await client.spawn({
+      ...request,
+      command: {
+        ...request.command,
+        environment: { overrides: { NODE_OPTIONS: "--test-isolation=none" } }
+      }
+    }).catch((error: unknown) => error);
+    expect(conflict).toBeInstanceOf(BrokerToolchainEnvironmentConflictError);
+    expect(conflict).toMatchObject({
+      code: "toolchain_environment_conflict",
+      data: { name: "NODE_OPTIONS", toolchainId: "bundled-runtime" }
+    });
+    await expect(client.spawn({
+      ...request,
+      command: {
+        ...request.command,
+        environment: { overrides: { NODE_OPTIONS: "--preserve-symlinks-main" } }
+      }
+    })).resolves.toMatchObject({ id: "fixture-process" });
+    await client.close();
+  });
+
+  it("resolves manifest aliases to one exact executable without trusting sibling binaries", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("toolchain-alias-check", {
+      sandboxMode: "unsafe",
+      trustedToolchains: [{
+        id: "bundled-runtime",
+        runtime: "node",
+        executable: process.execPath,
+        aliases: process.platform === "win32" ? ["node", "node.exe"] : ["node"],
+        executionRoots: [process.execPath],
+        pathEntries: []
+      }]
+    }));
+    await client.connect();
+    const request = spawnRequest();
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: "node" }
+    })).resolves.toMatchObject({ id: "fixture-process" });
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: path.join(path.dirname(process.execPath), "sibling.exe") }
+    })).rejects.toBeInstanceOf(BrokerPolicyError);
+    expect(() => new SigmaExecBrokerClient(fixtureOptions("normal", {
+      trustedToolchains: [
+        { id: "one", executable: process.execPath, aliases: ["node"] },
+        { id: "two", executable: process.execPath, aliases: [process.platform === "win32" ? "NODE" : "node"] }
+      ]
+    }))).toThrow(/alias.*duplicated/iu);
+    expect(() => new SigmaExecBrokerClient(fixtureOptions("normal", {
+      trustedToolchains: [{
+        id: "broad-node",
+        runtime: "node",
+        executable: process.execPath,
+        executionRoots: [path.dirname(process.execPath)],
+        pathEntries: []
+      }]
+    }))).toThrow(/trust only its exact executable/iu);
+    expect(() => new SigmaExecBrokerClient(fixtureOptions("normal", {
+      trustedToolchains: [{
+        id: "path-node",
+        runtime: "node",
+        executable: process.execPath,
+        executionRoots: [process.execPath],
+        pathEntries: [path.dirname(process.execPath)]
+      }]
+    }))).toThrow(/cannot add a directory to PATH/iu);
+    await client.close();
+  });
+
+  it("does not create an implicit current-runtime toolchain when the manifest is omitted", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("toolchain-alias-check", {
+      sandboxMode: "unsafe",
+      trustedToolchains: undefined
+    }));
+    await client.connect();
+    const request = spawnRequest();
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: "node" }
+    })).rejects.toBeInstanceOf(BrokerPolicyError);
+    await client.close();
+  });
+
+  it.runIf(process.platform === "win32")(
+    "fails closed before broker startup when an explicit required Node toolchain lacks compatibility proof",
+    async () => {
+      const client = new SigmaExecBrokerClient(fixtureOptions("normal", {
+        trustedToolchains: [{
+          id: "unpatched-node",
+          runtime: "generic",
+          executable: process.execPath,
+          aliases: [],
+          executionRoots: [process.execPath],
+          pathEntries: []
+        }]
+      }));
+      const error = await client.connect().catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(BrokerToolchainUnavailableError);
+      expect(error).toMatchObject({ code: "toolchain_unavailable" });
+    }
+  );
+
+  it.runIf(process.platform === "win32")(
+    "detects a renamed Node executable instead of accepting it as a generic required toolchain",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "sigma-renamed-node-"));
+      const renamed = path.join(root, "runtime.bin");
+      await cp(process.execPath, renamed);
+      const client = new SigmaExecBrokerClient(fixtureOptions("normal", {
+        trustedToolchains: [{
+          id: "renamed-node",
+          runtime: "generic",
+          executable: renamed,
+          aliases: [],
+          executionRoots: [renamed],
+          pathEntries: []
+        }]
+      }));
+      const error = await client.connect().catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(BrokerToolchainUnavailableError);
+      expect(error).toMatchObject({ code: "toolchain_unavailable" });
+    }
+  );
+
+  it("allows relative verified primaries with child roots and rejects untrusted absolute primaries", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("normal"));
+    await client.connect();
+    const request = spawnRequest();
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: "node" },
+      policy: { ...request.policy, executionRoots: [path.dirname(process.execPath)] }
+    })).resolves.toMatchObject({ id: "fixture-process" });
+    const outside = path.join(request.command.cwd, "untrusted-primary.exe");
+    await expect(client.spawn({
+      ...request,
+      command: { ...request.command, executable: outside }
+    })).rejects.toBeInstanceOf(BrokerPolicyError);
+    await expect(client.spawn({
+      ...request,
+      policy: { ...request.policy, executionRoots: [request.command.cwd], writeRoots: [request.command.cwd] }
+    })).rejects.toBeInstanceOf(BrokerPolicyError);
+    await client.close();
+  });
+
+  it("fails closed with a typed error when the broker cannot normalize process output", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("decoding-error"));
+    await client.connect();
+    const error = await client.execute({ ...spawnRequest(), timeoutMs: 500 }).catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(BrokerOutputDecodingError);
+    expect(error).toMatchObject({
+      code: "invalid_output_encoding",
+      data: { stream: "stdout", diagnosticCode: "invalid_output_encoding" }
+    });
+    await expect(client.doctor()).rejects.toThrow(/closed/u);
+  });
+
   it("fails closed when the required sandbox self-test fails", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions("unavailable"));
     await expect(client.connect()).rejects.toBeInstanceOf(SandboxUnavailableError);
@@ -581,6 +841,30 @@ describe("SigmaExecBrokerClient", () => {
     const result = client.execute({ ...spawnRequest(), timeoutMs: 5_000 }, { signal: controller.signal });
     controller.abort(new Error("stop now"));
     await expect(result).rejects.toBeInstanceOf(BrokerCancelledError);
+    await client.close();
+  });
+
+  it("preserves a stable runtime deadline code through acknowledged broker cancellation", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("hang"));
+    await client.connect();
+    const controller = new AbortController();
+    const deadline = Object.assign(new Error("run deadline reached"), { code: "run_deadline" });
+    const result = client.execute({ ...spawnRequest(), timeoutMs: 5_000 }, { signal: controller.signal });
+    controller.abort(deadline);
+    await expect(result).rejects.toMatchObject({ code: "run_deadline", cause: deadline });
+    await client.close();
+  });
+
+  it("does not release an exec cancellation until the broker confirms terminal settlement", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-cancel-ack-"));
+    const client = new SigmaExecBrokerClient(fixtureOptions("cancel-ack", {}, artifactRoot));
+    await client.connect();
+    const controller = new AbortController();
+    const result = client.execute({ ...spawnRequest(), timeoutMs: 5_000 }, { signal: controller.signal });
+    controller.abort(new Error("stop safely"));
+    await expect(result).rejects.toBeInstanceOf(BrokerCancelledError);
+    await expect(access(path.join(artifactRoot, "cancel-settled"))).resolves.toBeUndefined();
+    await expect(client.doctor()).resolves.toMatchObject({ sandbox: { available: true } });
     await client.close();
   });
 

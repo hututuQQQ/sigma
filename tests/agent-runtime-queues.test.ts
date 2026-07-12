@@ -967,14 +967,18 @@ describe("runtime queues and non-blocking instruction steering", () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error("Approvals were not exposed.")), 2_000))
     ])).resolves.toBeUndefined();
     expect(approvalIds.sort()).toEqual(["write-a-replanned", "write-b-replanned"]);
-    for (const requestId of approvalIds) {
+    await Promise.all(approvalIds.map(async (requestId) => {
       await runtime.command({ type: "approve", sessionId: session.sessionId, requestId, decision: "allow" });
-    }
+    }));
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await expect(readFile(path.join(workspace, "nested", "a.txt"), "utf8")).resolves.toBe("a");
     await expect(readFile(path.join(workspace, "nested", "b.txt"), "utf8")).resolves.toBe("b");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.approval_requested")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "tool.approval_resolved")
+      .some((event) => typeof (event.payload as { deadlineAt?: unknown }).deadlineAt === "string")).toBe(true);
+    expect((await restoreStoredSession(store, session.sessionId, 10_000)).state.deadlineRemainingMs)
+      .toBeUndefined();
     expect(events.some((event) => event.type === "diagnostic"
       && (event.payload as { kind?: string }).kind === "nested_instructions_loaded")).toBe(true);
     expect(events.filter((event) => event.type === "tool.failed"

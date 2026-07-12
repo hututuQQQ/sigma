@@ -27,6 +27,8 @@ export interface ExecutionPolicy {
   networkApproved?: boolean;
   readRoots: string[];
   writeRoots: string[];
+  /** Read/execute-only roots for explicitly trusted absolute executables. */
+  executionRoots?: string[];
   protectedPaths?: string[];
   unsafeHostExecApproved?: boolean;
 }
@@ -118,6 +120,16 @@ export interface BrokerCapabilities {
   stdin: boolean;
   pty: boolean;
   networkModes: NetworkPolicy[];
+  /** The broker enforces read/execute-only roots independently from workspace roots. */
+  executionRoots?: boolean;
+  /** Shells listed here have passed the native sandbox self-test. */
+  shells?: BrokerVerifiedShell[];
+}
+
+export interface BrokerVerifiedShell {
+  kind: "powershell" | "cmd" | "bash";
+  executable: string;
+  verified: true;
 }
 
 export interface BrokerDoctorReport {
@@ -127,6 +139,39 @@ export interface BrokerDoctorReport {
   architecture: string;
   sandbox: BrokerSandboxReport;
   capabilities: BrokerCapabilities;
+}
+
+/**
+ * A package-verified runtime/toolchain that may execute inside the sandbox.
+ * The broker treats every entry as trusted configuration, never as model- or
+ * command-provided input.
+ */
+export interface TrustedToolchainManifestEntry {
+  /** Stable manifest identifier, for example "bundled-node". */
+  id: string;
+  /** Runtime family. Node aliases are also detected independently. */
+  runtime?: "node" | "generic";
+  /** Verified absolute entry-point executable. */
+  executable: string;
+  /** Command aliases that higher layers may resolve to executable. */
+  aliases?: string[];
+  /** Read/execute roots; defaults to the exact executable. */
+  executionRoots?: string[];
+  /** Directories prepended to PATH; defaults to none. */
+  pathEntries?: string[];
+  /** Immutable environment required by this runtime and inherited by descendants. */
+  environment?: Record<string, string>;
+  /** Supply-chain proof required for Node in a required Windows sandbox. */
+  compatibility?: WindowsAppContainerNodeCompatibilityProof;
+}
+
+export interface WindowsAppContainerNodeCompatibilityProof {
+  kind: "windows_appcontainer_node";
+  patchId: string;
+  sourceSha256: string;
+  normalizedContentSha256: string;
+  /** Full-file digest captured for this exact signed or unsigned executable. */
+  executableSha256: string;
 }
 
 export interface BrokerRequestOptions {
@@ -157,7 +202,17 @@ export interface SigmaExecBrokerClientOptions {
   allowUnsafeHostExec?: boolean;
   requestTimeoutMs?: number;
   shutdownGraceMs?: number;
+  /** Time allowed for an exec cancellation to return its terminal response.
+   * On expiry the broker is closed and its process tree must exit before the
+   * request rejects. */
+  cancellationGraceMs?: number;
   maximumFrameBytes?: number;
   maximumStderrBytes?: number;
   secrets?: Record<string, string | undefined>;
+  /**
+   * Package-verified toolchains made available read/execute-only to sandboxed
+   * commands. Omission trusts no runtime implicitly; product composition roots
+   * must bind their verified bundled executable explicitly.
+   */
+  trustedToolchains?: TrustedToolchainManifestEntry[];
 }

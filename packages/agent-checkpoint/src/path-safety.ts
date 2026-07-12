@@ -134,14 +134,14 @@ export async function pinCheckpointParent(workspacePath: string, relative: strin
   const paths = [workspacePath, ...parentParts.map((_part, index) =>
     path.join(workspacePath, ...parentParts.slice(0, index + 1)))];
   const identities = await Promise.all(paths.map(stableDirectory));
-  const windowsLock = process.platform === "win32" ? lockWindowsDirectories(paths) : undefined;
+  const windowsLock = process.platform === "win32" ? await lockWindowsDirectories(paths) : undefined;
   const name = parts.at(-1);
   if (!name) throw new CheckpointConflictError("Checkpoint restore cannot replace the workspace root.");
   return {
     parentPath: paths.at(-1)!,
     targetPath: path.join(paths.at(-1)!, name),
     verify: async () => await verifyIdentities(paths, identities),
-    close: async () => windowsLock?.close()
+    close: async () => { await windowsLock?.close(); }
   };
 }
 

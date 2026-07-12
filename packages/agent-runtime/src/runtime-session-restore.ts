@@ -1,5 +1,6 @@
 import { loadNestedInstructions } from "agent-context";
 import type { FrozenAgentProfile } from "agent-extensions";
+import type { RuntimeEnvironment } from "agent-platform";
 import type { ModelGateway, RunStore } from "agent-protocol";
 import { baseContext } from "./runtime-context.js";
 import { restoreStoredSession } from "./restore-session.js";
@@ -13,15 +14,16 @@ export async function hydrateRuntimeSession(
     gateway: ModelGateway;
     profile?: FrozenAgentProfile;
     profileSource?: "home" | "workspace" | "builtin";
-  }
+  },
+  environment?: RuntimeEnvironment
 ): Promise<RuntimeSession> {
   const restored = await restoreStoredSession(store, sessionId, runDeadlineMs);
   const {
     workspacePath, state, modelTurn, lastSeq, followUps,
-    writeScope, strictWriteScope, contextItems, parentSessionId
+    writeScope, strictWriteScope, contextItems, parentSessionId, pendingApprovals
   } = restored;
   const project = await loadNestedInstructions({ workspacePath });
-  const base = baseContext();
+  const base = baseContext(environment);
   const allContext = [...base, ...project, ...contextItems];
   return {
     sessionId,
@@ -43,7 +45,12 @@ export async function hydrateRuntimeSession(
     deadlineTimer: null,
     running: null,
     subscribers: new Set(),
-    approvals: new Map(),
+    approvals: new Map(pendingApprovals.map((approval) => [approval.callId, {
+      effects: approval.effects,
+      ...(approval.binding ? { binding: approval.binding } : {}),
+      recovered: true,
+      resolve: () => undefined
+    }])),
     callApprovals: new Map(),
     alwaysAllowedEffects: new Set(),
     processHandles: new Map(),

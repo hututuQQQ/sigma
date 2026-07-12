@@ -50,6 +50,8 @@ pub struct ExecutionPolicy {
     #[serde(default)]
     pub write_roots: Vec<PathBuf>,
     #[serde(default)]
+    pub execution_roots: Vec<PathBuf>,
+    #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
     #[serde(default)]
     pub unsafe_host_exec_approved: bool,
@@ -101,6 +103,8 @@ struct SandboxStatus {
 }
 
 static STATUS: OnceLock<Mutex<Option<SandboxStatus>>> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static VERIFIED_BASH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PROTECTED_GUARD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROTECTED_GUARD_MARKER: &str = ".sigma-exec-protected";
 
@@ -150,6 +154,7 @@ pub fn doctor_report() -> Value {
     } else {
         json!([])
     };
+    let shells = verified_shells(&status);
     json!({
         "protocolVersion": crate::protocol::PROTOCOL_VERSION,
         "brokerVersion": env!("CARGO_PKG_VERSION"),
@@ -177,8 +182,97 @@ pub fn doctor_report() -> Value {
             "stdin": true,
             "pty": cfg!(any(target_os = "linux", target_os = "windows")) && status.available,
             "networkModes": network_modes,
+            "executionRoots": true,
+            "shells": shells,
         }
     })
+}
+
+fn verified_shells(status: &SandboxStatus) -> Value {
+    if !status.available || !status.self_test_passed {
+        return json!([]);
+    }
+    #[cfg(windows)]
+    {
+        let executable = crate::windows_sandbox::verified_cmd_executable();
+        executable.map_or_else(
+            || json!([]),
+            |path| {
+                json!([{
+                    "kind": "cmd",
+                    "executable": path,
+                    "verified": true,
+                }])
+            },
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_verified_bash().map_or_else(
+            || json!([]),
+            |path| {
+                json!([{
+                    "kind": "bash",
+                    "executable": path,
+                    "verified": true,
+                }])
+            },
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    json!([])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_verified_bash() -> Option<PathBuf> {
+    VERIFIED_BASH
+        .get_or_init(|| {
+            let bash = PathBuf::from("/bin/bash").canonicalize().ok()?;
+            let sequence = PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "sigma-bash-self-test-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).ok()?;
+            let marker = "sigma-bash-sandbox-ok";
+            let params = ProcessParams {
+                command: CommandSpec {
+                    executable: bash.to_string_lossy().into_owned(),
+                    args: vec![
+                        "--noprofile".into(),
+                        "--norc".into(),
+                        "-c".into(),
+                        format!("printf {marker}"),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::new(),
+                    stdin: None,
+                },
+                policy: ExecutionPolicy {
+                    sandbox: SandboxMode::Required,
+                    network: NetworkMode::None,
+                    network_approved: false,
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    execution_roots: Vec::new(),
+                    protected_paths: Vec::new(),
+                    unsafe_host_exec_approved: false,
+                },
+                max_output_bytes: 4 * 1024,
+                timeout_ms: Some(5_000),
+                idle_timeout_ms: None,
+                pty: false,
+                pty_columns: 80,
+                pty_rows: 24,
+            };
+            let result = build_sandboxed_command(&params)
+                .and_then(|mut prepared| prepared.command.output().map_err(RpcError::from))
+                .ok();
+            let _ = std::fs::remove_dir_all(&root);
+            let output = result?;
+            (output.status.success() && output.stdout == marker.as_bytes()).then_some(bash)
+        })
+        .clone()
 }
 
 pub struct PreparedCommand {
@@ -362,6 +456,7 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
     }
     let read_roots = canonical_roots(&params.policy.read_roots)?;
     let write_roots = canonical_roots(&params.policy.write_roots)?;
+    let execution_roots = canonical_roots(&params.policy.execution_roots)?;
     for write_root in &write_roots {
         if !read_roots.iter().any(|root| write_root.starts_with(root)) {
             return Err(RpcError::new(
@@ -377,6 +472,16 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
             return Err(RpcError::new(
                 "policy_denied",
                 "metadata directories cannot be writable roots",
+            ));
+        }
+    }
+    for execution_root in &execution_roots {
+        if write_roots.iter().any(|write_root| {
+            write_root.starts_with(execution_root) || execution_root.starts_with(write_root)
+        }) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "execution roots must not overlap writable roots",
             ));
         }
     }
@@ -660,6 +765,8 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     let system_roots = linux_system_roots();
     let read_roots = canonical_roots(&params.policy.read_roots)?;
     let write_roots = canonical_roots(&params.policy.write_roots)?;
+    let execution_roots = canonical_roots(&params.policy.execution_roots)?;
+    authorize_linux_executable(params, &system_roots, &execution_roots)?;
     for root in &system_roots {
         let value = root.to_string_lossy();
         command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
@@ -667,6 +774,12 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
     bind_roots(&mut command, &params.policy.read_roots, true)?;
     bind_roots(&mut command, &params.policy.write_roots, false)?;
+    bind_roots_excluding(
+        &mut command,
+        &params.policy.execution_roots,
+        true,
+        &system_roots,
+    )?;
     bind_protected(&mut command, params)?;
     command.arg("--clearenv");
     for (key, value) in &params.command.env {
@@ -692,6 +805,7 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         .iter()
         .map(PathBuf::as_path)
         .chain(read_roots.iter().map(PathBuf::as_path))
+        .chain(execution_roots.iter().map(PathBuf::as_path))
         .chain([
             Path::new("/tmp"),
             Path::new("/proc"),
@@ -745,10 +859,26 @@ fn build_sandboxed_command(_params: &ProcessParams) -> Result<PreparedCommand, R
 
 #[cfg(target_os = "linux")]
 fn bind_roots(command: &mut Command, roots: &[PathBuf], read_only: bool) -> Result<(), RpcError> {
+    bind_roots_excluding(command, roots, read_only, &[])
+}
+
+#[cfg(target_os = "linux")]
+fn bind_roots_excluding(
+    command: &mut Command,
+    roots: &[PathBuf],
+    read_only: bool,
+    covered_roots: &[PathBuf],
+) -> Result<(), RpcError> {
     for root in roots {
         let canonical = root.canonicalize().map_err(|error| {
             RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
         })?;
+        if covered_roots
+            .iter()
+            .any(|covered| canonical.starts_with(covered))
+        {
+            continue;
+        }
         let value = canonical.to_string_lossy().into_owned();
         command.args([
             if read_only { "--ro-bind" } else { "--bind" },
@@ -757,6 +887,52 @@ fn bind_roots(command: &mut Command, roots: &[PathBuf], read_only: bool) -> Resu
         ]);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn authorize_linux_executable(
+    params: &ProcessParams,
+    system_roots: &[PathBuf],
+    execution_roots: &[PathBuf],
+) -> Result<(), RpcError> {
+    let requested = PathBuf::from(&params.command.executable);
+    let mut candidates = Vec::new();
+    if requested.is_absolute() {
+        candidates.push(requested);
+    } else if requested.components().count() > 1 {
+        candidates.push(params.command.cwd.join(requested));
+    } else if let Some(search) = params.command.env.get("PATH") {
+        candidates
+            .extend(std::env::split_paths(search).map(|directory| directory.join(&requested)));
+    }
+    let executable = candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+        .ok_or_else(|| {
+            RpcError::new(
+                "executable_not_found",
+                format!("cannot resolve executable '{}'", params.command.executable),
+            )
+        })?;
+    let system_roots = system_roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect::<Vec<_>>();
+    if system_roots
+        .iter()
+        .chain(execution_roots.iter())
+        .any(|root| executable.starts_with(root))
+    {
+        return Ok(());
+    }
+    Err(RpcError::new(
+        "policy_denied",
+        format!(
+            "resolved executable '{}' is outside trusted system and declared execution roots",
+            executable.display()
+        ),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1035,6 +1211,7 @@ mod tests {
                 network_approved: false,
                 read_roots: vec![root.to_owned()],
                 write_roots: vec![root.to_owned()],
+                execution_roots: Vec::new(),
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
                 unsafe_host_exec_approved: false,
             },
@@ -1089,6 +1266,27 @@ mod tests {
         guards.clear();
         assert!(!root.join(".git").exists());
         assert!(!root.join(".agent").exists());
+        std::fs::remove_dir_all(&root).expect("remove test workspace");
+    }
+
+    #[test]
+    fn execution_roots_are_read_only_and_do_not_force_a_relative_primary_to_be_absolute() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-execution-root-test-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create test workspace");
+        let mut params = non_git_params(&root);
+        params.policy.write_roots.clear();
+        params.command.executable = "cmd".into();
+        params.policy.execution_roots = vec![root.clone()];
+        validate_roots(&params).expect("relative primary remains valid with child execution roots");
+
+        params.policy.write_roots = vec![root.clone()];
+        let overlap = validate_roots(&params).unwrap_err();
+        assert_eq!(overlap.code, "policy_denied");
+        assert!(overlap.message.contains("must not overlap"));
         std::fs::remove_dir_all(&root).expect("remove test workspace");
     }
 

@@ -3,7 +3,7 @@ import {
   mkdir, readFile, readdir
 } from "node:fs/promises";
 import path from "node:path";
-import { durableReplaceFile } from "agent-platform";
+import { durableReplaceFile, workspaceTransactionRoot } from "agent-platform";
 import type {
   CheckpointManagerOptions,
   CheckpointManifest,
@@ -12,7 +12,7 @@ import type {
   OpenCheckpointInspection,
   SealedCheckpointInspection
 } from "./types.js";
-import { CheckpointConflictError } from "./types.js";
+import { CheckpointConflictError, isCheckpointRecord } from "./types.js";
 import { checkpointDelta } from "./manifest.js";
 import { normalizeCheckpointScopes, safeCheckpointId as safeId } from "./path-safety.js";
 import { restoreCheckpointTransaction } from "./restore-transaction.js";
@@ -253,6 +253,7 @@ export class CheckpointManager {
   ): Promise<void> {
     await restoreCheckpointTransaction({
       workspacePath,
+      transactionRootDir: await this.transactionRoot(workspacePath),
       desired,
       current,
       readCas: (digest) => this.cas.stream(digest),
@@ -278,7 +279,11 @@ export class CheckpointManager {
   }
 
   private async readRecord(sessionId: string, checkpointId: string): Promise<CheckpointRecord> {
-    return JSON.parse(await readFile(this.recordPath(sessionId, checkpointId), "utf8")) as CheckpointRecord;
+    const value: unknown = JSON.parse(await readFile(this.recordPath(sessionId, checkpointId), "utf8"));
+    if (!isCheckpointRecord(value) || value.sessionId !== sessionId || value.checkpointId !== checkpointId) {
+      throw new CheckpointConflictError("Persisted checkpoint record is invalid.");
+    }
+    return value;
   }
 
   private async putManifest(manifest: CheckpointManifest): Promise<string> {
@@ -293,6 +298,7 @@ export class CheckpointManager {
     const canonical = path.resolve(workspacePath);
     await recoverCheckpointTransactions({
       workspacePath: canonical,
+      transactionRootDir: await this.transactionRoot(canonical),
       finalize: async ({ record, desiredManifestDigest }) => {
         if (record.schemaVersion !== 1 || record.status !== "restored"
           || path.resolve(record.workspacePath) !== canonical
@@ -308,6 +314,14 @@ export class CheckpointManager {
         }
         await this.writeRecord(record);
       }
+    });
+  }
+
+  private async transactionRoot(workspacePath: string): Promise<string> {
+    return await workspaceTransactionRoot({
+      workspacePath,
+      stateRootDir: this.rootDir,
+      namespace: "checkpoint-restore"
     });
   }
 }
