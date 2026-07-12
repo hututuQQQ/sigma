@@ -129,7 +129,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     const value = parseExecutionValue(await this.transport.request("exec", params, {
       ...options, timeoutMs: options.timeoutMs ?? timeoutMs + 5_000
     }));
-    await this.assertDecoded(value);
+    await this.assertDecoded(value, false);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
     return {
       state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
@@ -260,13 +260,20 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     }
   }
 
-  private async assertDecoded(value: ReturnType<typeof parseProcessValue>): Promise<void> {
+  private async assertDecoded(
+    value: ReturnType<typeof parseProcessValue>,
+    closeClient = true
+  ): Promise<void> {
     const failure = (["stdout", "stderr"] as const).flatMap((stream) => {
       const decodingError = value[stream].decodingError;
       return decodingError ? [{ stream, ...decodingError }] : [];
     })[0];
     if (!failure) return;
-    await this.close().catch(() => undefined);
+    // Foreground exec responses are already terminal, so an undecodable child
+    // stream can be rejected without discarding the healthy broker. Streaming
+    // processes still close the client because their unread output and process
+    // lifetime can no longer be managed safely.
+    if (closeClient) await this.close().catch(() => undefined);
     throw new BrokerOutputDecodingError(failure.stream, failure.code, failure.message);
   }
 

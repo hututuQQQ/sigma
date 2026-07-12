@@ -185,6 +185,25 @@ describe("semantic execution failure convergence", () => {
     });
   });
 
+  it("converges repeated workspace transaction infrastructure failures across mutation tools", () => {
+    let state = failAlternative(initial(), "edit-attempt", "edit", "workspace_transaction_root_unavailable");
+    state = failAlternative(state, "write-attempt", "write", "workspace_transaction_root_unavailable");
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      semanticFailureCluster: { family: "workspace_transaction", attempts: 2 }
+    });
+
+    state = failAlternative(state, "patch-attempt", "apply_patch", "checkpoint_recovery_failed");
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { family: "workspace_transaction", attempts: 3 },
+      proposedOutcome: {
+        kind: "recoverable_failure",
+        code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
+      }
+    });
+  });
+
   it("latches a reached cluster across another failure family and same-call evidence", () => {
     let state = queueTools(initial(), [
       { id: "infra-one", name: "shell" },

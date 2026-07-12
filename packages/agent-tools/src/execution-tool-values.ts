@@ -1,5 +1,10 @@
 import type { JsonValue, ToolDescriptor } from "agent-protocol";
-import { runtimeEnvironment, type ShellKind } from "agent-platform";
+import {
+  normalizeWindowsShellInvocation,
+  runtimeEnvironment,
+  shellInvocation as platformShellInvocation,
+  type ShellKind
+} from "agent-platform";
 import type { ExecutionToolOptions } from "./execution-tool-types.js";
 
 export function executionArgs(value: JsonValue): Record<string, JsonValue> {
@@ -74,12 +79,10 @@ export function executionToolSchema(
 }
 
 export function shellInvocation(shell: string, command: string): { executable: string; args: string[] } {
-  if (shell === "powershell") {
-    return { executable: "powershell.exe", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command] };
+  if (shell === "powershell" || shell === "cmd" || shell === "bash") {
+    return platformShellInvocation(shell, command);
   }
-  if (shell === "cmd") {
-    return { executable: "cmd.exe", args: ["/d", "/s", "/c", `chcp 65001>nul & ${command}`] };
-  }
-  if (shell === "bash") return { executable: "bash", args: ["-lc", command] };
   throw new Error(`Unsupported shell '${shell}'.`);
 }
+
+export { normalizeWindowsShellInvocation };

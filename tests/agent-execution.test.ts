@@ -774,7 +774,7 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
-  it("fails closed with a typed error when the broker cannot normalize process output", async () => {
+  it("rejects undecodable foreground output without closing the healthy broker", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions("decoding-error"));
     await client.connect();
     const error = await client.execute({ ...spawnRequest(), timeoutMs: 500 }).catch((cause: unknown) => cause);
@@ -783,7 +783,8 @@ describe("SigmaExecBrokerClient", () => {
       code: "invalid_output_encoding",
       data: { stream: "stdout", diagnosticCode: "invalid_output_encoding" }
     });
-    await expect(client.doctor()).rejects.toThrow(/closed/u);
+    await expect(client.doctor()).resolves.toMatchObject({ brokerVersion: "fixture" });
+    await client.close();
   });
 
   it("fails closed when the required sandbox self-test fails", async () => {

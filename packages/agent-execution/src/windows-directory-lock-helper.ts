@@ -7,6 +7,7 @@ export interface WindowsDirectoryLockHelperHandle {
 const LOCK_HELPER = String.raw`
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
+import path from "node:path";
 
 const INVALID_HANDLE = (1n << 64n) - 1n;
 const ffi = createRequire(import.meta.url)("node:ffi");
@@ -32,7 +33,7 @@ try {
   }
   for (const target of paths) {
     const handle = library.functions.CreateFileW(
-      Buffer.from(target + "\0", "utf16le"),
+      Buffer.from(path.toNamespacedPath(target) + "\0", "utf16le"),
       0x0001,
       0x0001 | 0x0002,
       null,

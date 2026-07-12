@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import path from "node:path";
 import { acquireWindowsDirectoryLockHelper } from "agent-execution";
 
 type Handle = bigint;
@@ -60,7 +61,7 @@ function directLock(paths: readonly string[]): WindowsDirectoryLock {
   try {
     for (const target of paths) {
       const handle = library.functions.CreateFileW(
-        Buffer.from(`${target}\0`, "utf16le"),
+        Buffer.from(`${path.toNamespacedPath(target)}\0`, "utf16le"),
         FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         null,

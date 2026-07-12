@@ -22,6 +22,7 @@ import {
   executionStrings,
   executionText,
   executionToolSchema,
+  normalizeWindowsShellInvocation,
   shellInvocation
 } from "./execution-tool-values.js";
 import type { PlannedToolExecutionContext, RegisteredEffectTool } from "./registry.js";
@@ -47,10 +48,10 @@ async function executeForegroundCommand(
   );
   const invocation = kind === "shell"
     ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
-    : {
-        executable: executionText(input, "executable"),
-        args: [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")]
-      };
+    : normalizeWindowsShellInvocation(
+      executionText(input, "executable"),
+      [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")]
+    );
   const timeoutMs = typeof input.timeoutMs === "number"
     ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 600_000;
   const mutationLock = await lockWindowsMutationRoots(context, approvedPlan);

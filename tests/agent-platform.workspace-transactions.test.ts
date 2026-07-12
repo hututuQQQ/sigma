@@ -90,4 +90,21 @@ describe("workspace transaction roots", () => {
       await lease.close();
     }
   });
+
+  it("pins long Unicode Windows paths through namespaced directory handles", async () => {
+    if (process.platform !== "win32") return;
+    const container = await temporaryRoot();
+    let root = path.join(container, "\u4e2d\u6587\u76ee\u5f55");
+    for (let index = 0; root.length < 280; index += 1) {
+      root = path.join(root, `segment-${index.toString().padStart(3, "0")}`);
+    }
+    await mkdir(path.toNamespacedPath(root), { recursive: true });
+    expect(root.length).toBeGreaterThan(260);
+    const lease = await pinWorkspaceTransactionDirectories([root]);
+    try {
+      await expect(lease.verify()).resolves.toBeUndefined();
+    } finally {
+      await lease.close();
+    }
+  });
 });

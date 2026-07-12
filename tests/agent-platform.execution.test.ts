@@ -12,6 +12,7 @@ import {
 import {
   ProcessExecutionUnavailableError,
   lockWindowsDirectories,
+  normalizeWindowsShellInvocation,
   runProcess,
   shellInvocation,
   type ProcessExecutionPort,
@@ -81,9 +82,15 @@ describe("agent-platform execution boundary", () => {
   });
 
   it("constructs shell invocations without enabling a shell on the broker", () => {
-    expect(shellInvocation("cmd", "echo ok")).toEqual({
-      executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"]
-    });
+    expect(normalizeWindowsShellInvocation("cmd.exe", ["/d", "/s", "/c", "cd"], "win32"))
+      .toEqual({ executable: "cmd.exe", args: ["/d", "/s", "/c", "chcp 65001>nul & cd"] });
+    expect(normalizeWindowsShellInvocation("powershell.exe", ["-Command", "Get-Date"], "win32").args[1])
+      .toContain("[Console]::OutputEncoding");
+    expect(normalizeWindowsShellInvocation("cmd.exe", ["/c", "cd"], "linux"))
+      .toEqual({ executable: "cmd.exe", args: ["/c", "cd"] });
+    expect(shellInvocation("cmd", "echo ok")).toEqual(process.platform === "win32"
+      ? { executable: "cmd.exe", args: ["/d", "/s", "/c", "chcp 65001>nul & echo ok"] }
+      : { executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"] });
     expect(shellInvocation("bash", "echo ok")).toEqual({ executable: "bash", args: ["-lc", "echo ok"] });
   });
 

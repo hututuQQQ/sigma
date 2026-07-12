@@ -19,6 +19,8 @@ export interface SemanticFailureUpdate {
 }
 
 const CODE_FAMILIES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^(?:workspace_transaction_root_unavailable|workspace_transaction_cleanup_failed|checkpoint_recovery_failed)$/u,
+    "workspace_transaction"],
   [/^(?:broker_connection_error|broker_protocol_error|process_lost)$/u, "execution_broker"],
   [/^(?:sandbox_unavailable|sandbox_denied|sandbox_setup_failed|sandbox_self_test_failed)$/u, "execution_sandbox"],
   [/^(?:process_spawn_failed|spawn_failed|executable_not_found|executable_unavailable|shell_unavailable|runtime_unavailable|toolchain_unavailable)$/u,
