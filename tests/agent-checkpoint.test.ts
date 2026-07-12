@@ -16,7 +16,14 @@ import {
   captureCheckpointManifest,
   preflightCheckpointByteReservation
 } from "../packages/agent-checkpoint/src/safe-capture.js";
-import { workspaceTransactionRoot } from "../packages/agent-platform/src/workspace-transaction-root.js";
+import {
+  acquireCheckpointMutationLease
+} from "../packages/agent-checkpoint/src/restore-transaction.js";
+import { recoverCheckpointTransactions } from "../packages/agent-checkpoint/src/restore-recovery.js";
+import {
+  cleanupWorkspaceTransactionRoot,
+  workspaceTransactionRoot
+} from "../packages/agent-platform/src/workspace-transaction-root.js";
 
 const checkpointTemporaryRoots = new Set<string>();
 
@@ -88,6 +95,23 @@ function validRecoveryFinalization(workspacePath: string, digest = "0".repeat(64
 }
 
 describe("CheckpointManager", () => {
+  it("recreates a transaction root removed while waiting for the mutation lease", async () => {
+    const { root, workspace } = await fixture();
+    const transactionRoot = await checkpointTransactionRoot(root, workspace);
+    const blocker = await acquireCheckpointMutationLease(transactionRoot);
+    const recovery = recoverCheckpointTransactions({
+      workspacePath: workspace,
+      transactionRootDir: transactionRoot,
+      finalize: async () => undefined
+    });
+
+    await cleanupWorkspaceTransactionRoot(transactionRoot);
+    await blocker.release();
+
+    await expect(recovery).resolves.toBeUndefined();
+    await expect(lstat(transactionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("seals a delta and restores the exact preimage", async () => {
     const { workspace, manager } = await fixture();
     const checkpoint = await manager.create({

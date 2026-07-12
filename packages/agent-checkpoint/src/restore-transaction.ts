@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   acquireProcessOwnerLease,
   cleanupWorkspaceTransactionRoot,
+  ensurePrivateStateDirectory,
   pinWorkspaceTransactionDirectories,
   syncDirectory,
   type ProcessOwnerLease,
@@ -69,6 +70,16 @@ export async function acquireCheckpointMutationLease(
     activeOwner: "wait",
     timeoutMs: 30_000
   });
+}
+
+/**
+ * A caller can resolve a transaction root before waiting for the per-workspace
+ * mutation lease. The previous lease holder is allowed to remove its empty
+ * root during cleanup, so validate and recreate the private directory only
+ * after this operation owns the lease.
+ */
+export async function ensureCheckpointTransactionRoot(transactionRootDir: string): Promise<void> {
+  await ensurePrivateStateDirectory(transactionRootDir);
 }
 
 async function createLeasedTransaction(
@@ -266,6 +277,7 @@ export async function restoreCheckpointTransaction(options: RestoreTransactionOp
   let primary: unknown;
   try {
     mutationLease = await acquireCheckpointMutationLease(options.transactionRootDir);
+    await ensureCheckpointTransactionRoot(options.transactionRootDir);
     await performRestore(options);
   } catch (error) {
     primary = error;

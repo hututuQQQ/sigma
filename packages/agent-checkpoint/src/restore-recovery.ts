@@ -15,6 +15,7 @@ import {
 } from "./restore-recovery-schema.js";
 import {
   acquireCheckpointMutationLease,
+  ensureCheckpointTransactionRoot,
   assertRestoreImage,
   inspectRestoreImage,
   restoreImagesEqual,
@@ -251,6 +252,7 @@ export async function recoverCheckpointTransactions(
   let primary: unknown;
   try {
     mutationLease = await acquireCheckpointMutationLease(options.transactionRootDir);
+    await ensureCheckpointTransactionRoot(options.transactionRootDir);
     await recoverTransactionRoot(options, options.transactionRootDir);
   } catch (error) {
     primary = error;
