@@ -79,7 +79,10 @@ async function main() {
 
   const version = await captureProcessWrites(() => runAgentCommand(["version", "--json"]));
   const doctor = await captureProcessWrites(() => runAgentCommand(["doctor", "--workspace", workspace, "--json"]));
-  const sessions = await captureProcessWrites(() => runAgentCommand(["sessions", "--workspace", workspace, "--json"]));
+  const sessions = await captureProcessWrites(() => runAgentCommand(
+    ["sessions", "--workspace", workspace, "--json"],
+    { runtime }
+  ));
   for (const [name, result] of Object.entries({ version, doctor, sessions })) {
     if (result.code !== 0) throw new Error(`${name} failed: ${result.stderr}`);
   }

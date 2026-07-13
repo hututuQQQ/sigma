@@ -494,4 +494,12 @@ describe("CLI command registry dispatch", () => {
     })).resolves.toBe(0);
     expect(selected).toBe("chosen");
   });
+
+  it("passes an injected runtime through registry session dispatch", async () => {
+    const runtime = new FakeRuntime();
+    runtime.sessions = [overview()];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await expect(runAgentCommand(["sessions", "--json"], { runtime })).resolves.toBe(0);
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining("session-one"));
+  });
 });
