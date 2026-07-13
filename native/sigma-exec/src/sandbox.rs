@@ -451,9 +451,7 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
                 "sandbox roots must be absolute",
             ));
         }
-        let canonical = root.canonicalize().map_err(|error| {
-            RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
-        })?;
+        let canonical = canonicalize_sandbox_root(root)?;
         contained |= cwd.starts_with(canonical);
     }
     if !contained {
@@ -498,11 +496,8 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
         .read_roots
         .iter()
         .chain(params.policy.write_roots.iter())
-        .map(|root| root.canonicalize())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
-        })?;
+        .map(|root| canonicalize_sandbox_root(root))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut protected_paths = params.policy.protected_paths.clone();
     protected_paths.extend(
         minimal_roots(&read_roots)
@@ -670,12 +665,21 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, RpcError> {
 fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
     roots
         .iter()
-        .map(|root| {
-            root.canonicalize().map_err(|error| {
-                RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
-            })
-        })
+        .map(|root| canonicalize_sandbox_root(root))
         .collect()
+}
+
+fn canonicalize_sandbox_root(root: &Path) -> Result<PathBuf, RpcError> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_sandbox::canonicalize_policy_root(root)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        root.canonicalize().map_err(|error| {
+            RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
+        })
+    }
 }
 
 pub(crate) fn minimal_roots(roots: &[PathBuf]) -> Vec<&PathBuf> {

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -18,6 +19,28 @@ def sha256_file(file_path: Path) -> str:
     with file_path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_tree_fingerprint(root: Path) -> str:
+    """Hash a workspace tree without following symbolic links."""
+    digest = hashlib.sha256()
+
+    def visit(path: Path) -> None:
+        info = path.lstat()
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(struct.pack(">I", len(relative)))
+        digest.update(relative)
+        digest.update(struct.pack(">I", info.st_mode))
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(os.readlink(path).encode("utf-8"))
+        elif stat.S_ISREG(info.st_mode):
+            digest.update(path.read_bytes())
+        elif stat.S_ISDIR(info.st_mode):
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                visit(child)
+
+    visit(root)
     return digest.hexdigest()
 
 
@@ -105,6 +128,80 @@ def poll_until_settled(broker: Broker, handle_id: str) -> dict:
     raise RuntimeError(f"process did not settle: {result}")
 
 
+def verify_dangling_read_only_conformance(
+    broker: Broker, workspace: Path, external: Path
+) -> dict:
+    root = workspace / "dangling-read-conformance"
+    target_parent = external / "removed-targets"
+    outside = external / "read-only-outside"
+    outside_link = root / "outside-link"
+    dangling: list[Path] = []
+    root.mkdir()
+    target_parent.mkdir()
+    outside.mkdir()
+    (root / "ordinary.txt").write_text("ordinary read-only content\n", encoding="utf-8")
+    (outside / "secret.txt").write_text("outside\n", encoding="utf-8")
+    outside_link.symlink_to(outside, target_is_directory=True)
+    try:
+        for seed in range(100):
+            branch = root / f"case-{seed:03d}"
+            depth = (seed * 37 % 5) + 1
+            for level in range(depth):
+                branch /= f"level-{(seed * 17 + level) % 23:02d}"
+            branch.mkdir(parents=True)
+            (branch / f"visible-{seed:03d}.txt").write_text(
+                f"seed={seed}\n", encoding="utf-8"
+            )
+            target = target_parent / f"target-{seed:03d}"
+            link = branch / f"unavailable-{seed:03d}"
+            target.mkdir()
+            link.symlink_to(target, target_is_directory=True)
+            target.rmdir()
+            dangling.append(link)
+
+        before = read_tree_fingerprint(root)
+        request = params(
+            root,
+            "test \"$(cat ordinary.txt)\" = \"ordinary read-only content\" "
+            "&& ! cat outside-link/secret.txt >/dev/null 2>&1",
+        )
+        request["policy"]["writeRoots"] = []
+        spawned = require_ok(broker.request("process.spawn", request))
+        settled = poll_until_settled(broker, spawned["handleId"])
+        if settled.get("exitCode") != 0:
+            raise RuntimeError(
+                "dangling symlink descendants blocked an unrelated read-only process or "
+                f"exposed an outside target: {settled}"
+            )
+
+        direct = params(root, "true")
+        direct["policy"]["writeRoots"] = []
+        direct["policy"]["readRoots"].append(str(dangling[37]))
+        direct_result = broker.request("exec", {**direct, "timeoutMs": 10000})
+        if direct_result.get("ok"):
+            raise RuntimeError(
+                "a dangling symlink declared as a read root was not rejected: "
+                f"{direct_result}"
+            )
+        if read_tree_fingerprint(root) != before:
+            raise RuntimeError("read-only symlink conformance mutated workspace content")
+        if (outside / "secret.txt").read_text(encoding="utf-8") != "outside\n":
+            raise RuntimeError("read-only symlink conformance mutated the outside target")
+        return {
+            "deterministicSeeds": 100,
+            "unrelatedSpawn": True,
+            "outsideReadDenied": True,
+            "directDanglingRootRejected": True,
+            "workspaceUnchanged": True,
+            "processSettled": True,
+        }
+    finally:
+        for link in dangling:
+            link.unlink(missing_ok=True)
+        outside_link.unlink(missing_ok=True)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--broker", type=Path, required=True)
@@ -129,6 +226,10 @@ def main() -> int:
             or not hardening.get("seccompFilter")
         ):
             raise RuntimeError(f"required Linux hardening self-test failed: {setup}")
+
+        dangling_read_conformance = verify_dangling_read_only_conformance(
+            broker, workspace, external
+        )
 
         scoped = require_ok(broker.request("exec", {
             **params(workspace, "printf allowed > out/allowed.txt; printf escaped > escape.txt || true"),
@@ -213,6 +314,7 @@ def main() -> int:
             "brokerSha256": sha256_file(args.broker.resolve()),
             "backend": setup["sandbox"]["backend"],
             "hardening": hardening,
+            "danglingReadConformance": dangling_read_conformance,
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

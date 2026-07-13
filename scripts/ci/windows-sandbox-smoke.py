@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -22,6 +23,36 @@ def sha256_file(file_path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_tree_fingerprint(root: Path) -> str:
+    """Hash names, types, attributes, and file bytes without following reparse points."""
+    digest = hashlib.sha256()
+
+    def visit(path: Path) -> None:
+        info = path.stat(follow_symlinks=False)
+        attributes = getattr(info, "st_file_attributes", 0)
+        is_reparse = bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(struct.pack(">I", len(relative)))
+        digest.update(relative)
+        digest.update(struct.pack(">II", stat.S_IFMT(info.st_mode), attributes))
+        if stat.S_ISREG(info.st_mode) and not is_reparse:
+            digest.update(path.read_bytes())
+        if stat.S_ISDIR(info.st_mode) and not is_reparse:
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                visit(child)
+
+    visit(root)
+    return digest.hexdigest()
+
+
+def create_junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        [os.environ["COMSPEC"], "/d", "/c", "mklink", "/J", str(link), str(target)],
+        check=True,
+        capture_output=True,
+    )
 
 
 def appcontainer_sid_string(profile_name: str) -> str:
@@ -176,6 +207,129 @@ def require_ok(response: dict) -> dict:
     return response["result"]
 
 
+def poll_until_settled(broker: Broker, handle_id: str) -> dict:
+    result: dict = {}
+    for _ in range(300):
+        result = require_ok(
+            broker.request(
+                "process.poll",
+                {"handleId": handle_id, "stdoutOffset": 0, "stderrOffset": 0},
+            )
+        )
+        if result["state"] != "running":
+            return result
+        time.sleep(0.05)
+    raise RuntimeError(f"process did not settle: {result}")
+
+
+def verify_dangling_read_only_conformance(
+    broker: Broker,
+    workspace: Path,
+    external: Path,
+    packages_directory: Path,
+    preexisting_profiles: set[str],
+) -> dict:
+    root = workspace / "dangling-read-conformance"
+    target_parent = external / "removed-targets"
+    outside = external / "read-only-outside"
+    ordinary = root / "ordinary.txt"
+    outside_link = root / "outside-link"
+    dangling: list[Path] = []
+    root.mkdir()
+    target_parent.mkdir()
+    outside.mkdir()
+    ordinary.write_text("ordinary read-only content\n", encoding="utf-8")
+    (outside / "secret.txt").write_text("outside\n", encoding="utf-8")
+    create_junction(outside_link, outside)
+    try:
+        for seed in range(100):
+            branch = root / f"case-{seed:03d}"
+            depth = (seed * 37 % 5) + 1
+            for level in range(depth):
+                branch /= f"level-{(seed * 17 + level) % 23:02d}"
+            branch.mkdir(parents=True)
+            (branch / f"visible-{seed:03d}.txt").write_text(
+                f"seed={seed}\n", encoding="utf-8"
+            )
+            target = target_parent / f"target-{seed:03d}"
+            link = branch / f"unavailable-{seed:03d}"
+            target.mkdir()
+            create_junction(link, target)
+            target.rmdir()
+            dangling.append(link)
+
+        before = read_tree_fingerprint(root)
+        probe_request = params(root, "type ordinary.txt")
+        probe_request["policy"]["writeRoots"] = []
+        probe = require_ok(
+            broker.request("exec", {**probe_request, "timeoutMs": 10000})
+        )
+        if (
+            probe["exitCode"] != 0
+            or probe["stdout"]["data"].strip() != "ordinary read-only content"
+        ):
+            raise RuntimeError(
+                "dangling descendants blocked an unrelated read-only process: "
+                f"{probe}"
+            )
+
+        outside_request = params(root, "type outside-link\\secret.txt")
+        outside_request["policy"]["writeRoots"] = []
+        outside_probe = require_ok(
+            broker.request("exec", {**outside_request, "timeoutMs": 10000})
+        )
+        if outside_probe["exitCode"] == 0:
+            raise RuntimeError(
+                "an out-of-root junction exposed its target to the read-only process: "
+                f"{outside_probe}"
+            )
+
+        direct = params(root, "exit /b 0")
+        direct["policy"]["writeRoots"] = []
+        direct["policy"]["readRoots"].append(str(dangling[37]))
+        direct_result = broker.request("exec", {**direct, "timeoutMs": 10000})
+        direct_code = (direct_result.get("error") or {}).get("code")
+        if direct_result.get("ok") or direct_code != "sandbox_reparse_target_unresolvable":
+            raise RuntimeError(
+                "a dangling junction declared as a read root did not fail with the stable code: "
+                f"{direct_result}"
+            )
+        if read_tree_fingerprint(root) != before:
+            raise RuntimeError("read-only reparse conformance mutated workspace content")
+        if (outside / "secret.txt").read_text(encoding="utf-8") != "outside\n":
+            raise RuntimeError("read-only reparse conformance mutated the outside target")
+
+        leaked_profiles = [
+            profile
+            for profile in packages_directory.glob("sigmacode.exec.*")
+            if profile.name.lower() not in preexisting_profiles
+        ]
+        if leaked_profiles:
+            raise RuntimeError(
+                f"read-only reparse conformance left AppContainer profiles: {leaked_profiles}"
+            )
+        return {
+            "deterministicSeeds": 100,
+            "unrelatedExecution": True,
+            "outsideReadDenied": True,
+            "directDanglingRootStableCode": True,
+            "workspaceUnchanged": True,
+            "processSettled": True,
+            "profilesRemoved": True,
+        }
+    finally:
+        for link in dangling:
+            try:
+                os.rmdir(link)
+            except FileNotFoundError:
+                pass
+        try:
+            os.rmdir(outside_link)
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--broker", type=Path, required=True)
@@ -205,6 +359,14 @@ def main() -> int:
         hardening = setup["sandbox"].get("hardening") or {}
         if not hardening.get("lessPrivilegedAppContainer"):
             raise RuntimeError(f"LPAC token self-test failed: {setup}")
+
+        dangling_read_conformance = verify_dangling_read_only_conformance(
+            broker,
+            workspace,
+            external,
+            packages_directory,
+            preexisting_profiles,
+        )
 
         node_version = require_ok(
             broker.request("exec", {**node_params(workspace, node, ["--version"]), "timeoutMs": 10000})
@@ -714,6 +876,7 @@ setTimeout(() => process.exit(4), 3000);
                 "esmEntry": True,
                 "symlinkMainPreserved": True,
                 "sandboxRuntimeEnvironment": {"NODE_OPTIONS": NODE_LPAC_OPTIONS},
+                "danglingReadConformance": dangling_read_conformance,
                 "crashRecovery": {
                     "journalDurable": True,
                     "exactAceRemoved": True,
