@@ -1,10 +1,20 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmod, cp, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { packageAgentCli, pinnedNodeVersion } from "../scripts/package-agent-cli.mjs";
+import {
+  packageAgentCli,
+  patchWindowsAppContainerNode,
+  pinnedNodeVersion,
+  nodeRuntimeArchiveName,
+  windowsAppContainerNodeCompatibility,
+  windowsNodeGlobalPipeMarker
+} from "../scripts/package-agent-cli.mjs";
+import { inspectArchiveBytes, validateArchiveEntryNames } from "../scripts/archive-safety.mjs";
+import { inspectPeAuthenticodeIdentity } from "../scripts/pe-authenticode-identity.mjs";
 import {
   runTargetWrapperVersion,
   verifyAgentCliPackage,
@@ -70,6 +80,8 @@ exec "${process.execPath}" "$@"
     encoding: "utf8"
   });
   expect(result.status, result.stderr).toBe(0);
+  const digest = createHash("sha256").update(await readFile(tarball)).digest("hex");
+  await writeFile(`${tarball}.sha256`, `${digest}  ${path.basename(tarball)}\n`, "utf8");
   return tarball;
 }
 
@@ -108,7 +120,13 @@ function runZip(args: string[], cwd: string) {
   }
 }
 
-const windowsZipFixtureIt = windowsZipFixtureAvailable() ? it : it.skip;
+function approvedWindowsNodeFixtureAvailable() {
+  if (process.platform !== "win32" || process.arch !== "x64" || process.version !== pinnedNodeVersion) return false;
+  const digest = createHash("sha256").update(readFileSync(process.execPath)).digest("hex");
+  return digest === windowsAppContainerNodeCompatibility.sourceSha256;
+}
+
+const approvedWindowsPackageIt = windowsZipFixtureAvailable() && approvedWindowsNodeFixtureAvailable() ? it : it.skip;
 
 async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime-win");
@@ -124,6 +142,8 @@ async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   if (!powerShell) {
     runZip(["-qr", archive, runtimeDirName], runtimeRoot);
   }
+  const digest = createHash("sha256").update(await readFile(archive)).digest("hex");
+  await writeFile(`${archive}.sha256`, `${digest}  ${path.basename(archive)}\n`, "utf8");
   return archive;
 }
 
@@ -152,7 +172,7 @@ async function writeMinimalExecutable(
     await writeFile(filePath, header);
     return;
   }
-  const header = Buffer.alloc(0x9a);
+  const header = Buffer.alloc(0x400);
   header.write("MZ", 0, "ascii");
   header.writeUInt32LE(0x80, 0x3c);
   header.write("PE\0\0", 0x80, "binary");
@@ -161,6 +181,12 @@ async function writeMinimalExecutable(
   header.writeUInt16LE(0x00f0, 0x94);
   header.writeUInt16LE(0x0002, 0x96);
   header.writeUInt16LE(0x020b, 0x98);
+  header.writeUInt32LE(0x200, 0x98 + 60);
+  header.writeUInt32LE(16, 0x98 + 108);
+  const section = 0x98 + 0xf0;
+  header.write(".text\0\0\0", section, "binary");
+  header.writeUInt32LE(0x200, section + 16);
+  header.writeUInt32LE(0x200, section + 20);
   await writeFile(filePath, header);
 }
 
@@ -215,6 +241,107 @@ describe("package-agent-cli", () => {
     await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
   });
 
+  it("rejects an unknown future major instead of falling back to the legacy package schema", async () => {
+    const { rootDir } = await writeV3PackageFixture();
+    const manifestPath = path.join(rootDir, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.version = "4.0.0";
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
+
+    await expect(packageAgentCli({ rootDir })).rejects.toThrow("a new major requires an explicit schema review");
+  });
+
+  it("rejects unknown or unapproved Windows Node patch inputs", () => {
+    const descriptor = {
+      nodeVersion: pinnedNodeVersion,
+      targetPlatform: "win32",
+      targetArch: "x64",
+      archiveSha256: "a".repeat(64)
+    };
+    expect(() => patchWindowsAppContainerNode(Buffer.from("not-node"), descriptor))
+      .toThrow("unsupported libuv pipe marker layout");
+    expect(() => patchWindowsAppContainerNode(Buffer.concat([
+      Buffer.from("prefix"),
+      windowsNodeGlobalPipeMarker,
+      Buffer.from("suffix")
+    ]), descriptor)).toThrow(`source SHA-256 is not approved for ${pinnedNodeVersion}`);
+  });
+
+  it("rejects unsafe portable archive names and case-folding collisions", () => {
+    expect(() => validateArchiveEntryNames(["bundle/file", "bundle/../escape"], "bundle"))
+      .toThrow("unsafe path segment");
+    expect(() => validateArchiveEntryNames(["bundle/file", "bundle/FILE"], "bundle"))
+      .toThrow("duplicated under portable path rules");
+    expect(() => validateArchiveEntryNames(["other/file"], "bundle"))
+      .toThrow("outside the expected bundle/ directory");
+    for (const entry of ["a?.txt", "a*.txt", "a|b.txt", "a<b", "a>b", "a\"b", "COM\u00b9.txt", "LPT\u00b2"]) {
+      expect(() => validateArchiveEntryNames([`bundle/${entry}`], "bundle"))
+        .toThrow("unsafe path segment");
+    }
+  });
+
+  it("parses GNU tar and bsdtar expanded sizes and fails closed on unknown layouts", () => {
+    const inspect = (verbose: string) => inspectArchiveBytes(Buffer.from("archive"), {
+      root: "bundle",
+      spawn: (_command: string, args: string[]) => ({
+        status: 0,
+        stdout: args[0] === "-tf" ? "bundle/file\n" : `${verbose}\n`,
+        stderr: ""
+      })
+    });
+    expect(inspect("-rw-r--r-- 0/0 55200 2026-07-13 00:00 bundle/file").expandedBytes).toBe(55_200);
+    expect(inspect("-rw-r--r-- 0 0 0 55200 Jul 13 00:00 bundle/file").expandedBytes).toBe(55_200);
+    expect(() => inspect("-rw-r--r-- owner group 55200 date bundle/file"))
+      .toThrow("unreadable expanded size");
+  });
+
+  it("enforces expanded archive limits and rejects a non-directory ancestor", () => {
+    const inspect = (names: string[], verbose: string[]) => inspectArchiveBytes(Buffer.from("archive"), {
+      root: "bundle",
+      spawn: (_command: string, args: string[]) => ({
+        status: 0,
+        stdout: `${(args[0] === "-tf" ? names : verbose).join("\n")}\n`,
+        stderr: ""
+      })
+    });
+    expect(() => inspect(
+      ["bundle/file"],
+      ["-rw-r--r-- 0/0 536870913 2026-07-13 00:00 bundle/file"]
+    )).toThrow("exceeds the 536870912-byte limit");
+    const names = Array.from({ length: 5 }, (_, index) => `bundle/file-${index}`);
+    expect(() => inspect(names, names.map((name) =>
+      `-rw-r--r-- 0/0 536870912 2026-07-13 00:00 ${name}`
+    ))).toThrow("expanded members exceed the 2147483648-byte total limit");
+    expect(() => inspect(
+      ["bundle/parent", "bundle/parent/child"],
+      [
+        "-rw-r--r-- 0/0 1 2026-07-13 00:00 bundle/parent",
+        "-rw-r--r-- 0/0 1 2026-07-13 00:00 bundle/parent/child"
+      ]
+    )).toThrow("descends from non-directory");
+  });
+
+  it("verifies a trusted Node archive before extraction or version probing", async () => {
+    const rootDir = await writePackageFixture();
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    await rm(`${runtimeTarball}.sha256`);
+    let probes = 0;
+    const options = {
+      rootDir,
+      nodeVersionProbe: async () => {
+        probes += 1;
+        return pinnedNodeVersion;
+      },
+      env: { NODE_RUNTIME_TARBALL: runtimeTarball, AGENT_TARGET_ARCH: "x64" }
+    };
+    await expect(packageAgentCli(options)).rejects.toThrow("No trusted SHA-256 was provided");
+    await expect(packageAgentCli({
+      ...options,
+      env: { ...options.env, NODE_RUNTIME_SHA256: "0".repeat(64) }
+    })).rejects.toThrow("Node runtime archive SHA-256 mismatch");
+    expect(probes).toBe(0);
+  });
+
   it("creates the Linux x64 artifact with bin/agent and bundled node", async () => {
     const rootDir = await writePackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
@@ -234,6 +361,8 @@ describe("package-agent-cli", () => {
     const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent"), "utf8");
     expect(wrapper).toContain('if [ ! -x "$NODE" ]; then');
     expect(wrapper).toContain('NODE="$SCRIPT_DIR/node"');
+    expect(wrapper).toContain('export PATH="$SCRIPT_DIR${PATH:+:$PATH}"');
+    expect(wrapper).toContain("unset NODE_OPTIONS NODE_PATH");
     expect(wrapper).not.toContain("command -v node");
     expect(wrapper).toContain("Sigma Code cannot start: the bundled Node runtime is missing or not executable.");
     expect(wrapper).toContain('exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"');
@@ -313,19 +442,48 @@ describe("package-agent-cli", () => {
     const cacheDir = path.join(artifactsDir, "cache");
     await mkdir(cacheDir, { recursive: true });
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
-    await writeFile(path.join(cacheDir, `node-${pinnedNodeVersion}-linux-x64.tar.xz`), await readFile(runtimeTarball));
+    const cachedRuntime = path.join(cacheDir, `node-${pinnedNodeVersion}-linux-x64.tar.xz`);
+    const cachedBytes = await readFile(runtimeTarball);
+    await writeFile(cachedRuntime, cachedBytes);
+    const cachedDigest = createHash("sha256").update(cachedBytes).digest("hex");
+    await writeFile(
+      `${cachedRuntime}.sha256`,
+      `${"0".repeat(64)}  ${path.basename(cachedRuntime)}\n`,
+      "utf8"
+    );
+    const checksumUrls: string[] = [];
 
-    const result = await packageAgentCli({ rootDir, env: {}, artifactsDir });
+    const result = await packageAgentCli({
+      rootDir,
+      env: {},
+      artifactsDir,
+      nodeChecksumDownloader: async (url: string) => {
+        checksumUrls.push(url);
+        return `${cachedDigest}  ${nodeRuntimeArchiveName("linux", "x64")}\n`;
+      }
+    });
 
     expect(result.source).toBe("cache");
     expect(result.downloaded).toBe(false);
+    expect(checksumUrls).toEqual([`https://nodejs.org/dist/${pinnedNodeVersion}/SHASUMS256.txt`]);
     await expect(stat(path.join(result.bundleDir, "bin", "node"))).resolves.toBeTruthy();
+
+    await expect(packageAgentCli({
+      rootDir,
+      env: {},
+      artifactsDir,
+      nodeChecksumDownloader: async () => (
+        `${cachedDigest}  ${nodeRuntimeArchiveName("linux", "x64")}.backup\n`
+      )
+    })).rejects.toThrow("exactly one SHA-256 digest for the exact file");
   });
 
   it("auto-downloads the Node runtime tarball into cache when missing", async () => {
     const rootDir = await writePackageFixture();
     const sourceTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const sourceDigest = createHash("sha256").update(await readFile(sourceTarball)).digest("hex");
     const downloads: Array<{ url: string; destination: string }> = [];
+    const checksumUrls: string[] = [];
 
     const result = await packageAgentCli({
       rootDir,
@@ -334,6 +492,10 @@ describe("package-agent-cli", () => {
         downloads.push({ url, destination });
         await mkdir(path.dirname(destination), { recursive: true });
         await writeFile(destination, await readFile(sourceTarball));
+      },
+      nodeChecksumDownloader: async (url: string) => {
+        checksumUrls.push(url);
+        return `${sourceDigest}  ${nodeRuntimeArchiveName("linux", "x64")}\n`;
       }
     });
 
@@ -341,6 +503,7 @@ describe("package-agent-cli", () => {
     expect(result.downloaded).toBe(true);
     expect(downloads[0].url).toContain(`node-${pinnedNodeVersion}-linux-x64.tar.xz`);
     expect(downloads[0].destination).toContain(path.join(".artifacts", "cache"));
+    expect(checksumUrls).toEqual([`https://nodejs.org/dist/${pinnedNodeVersion}/SHASUMS256.txt`]);
     const metadata = JSON.parse(await readFile(path.join(result.bundleDir, "package-metadata.json"), "utf8"));
     expect(metadata.node).toMatchObject({
       downloaded: true,
@@ -505,19 +668,187 @@ describe("package-agent-cli", () => {
     tokenizer.hashes[0].content = "0".repeat(64);
     expect(() => verifyPortableSbomComponents(forgedTokenizer, integrity, metadata, "linux", "x64"))
       .toThrow("SHA-256 does not match integrity metadata");
+
+    const provenancePath = packaged.sidecars.provenancePath;
+    const provenanceEnvelope = JSON.parse(await readFile(provenancePath, "utf8"));
+    const provenance = JSON.parse(Buffer.from(provenanceEnvelope.payload, "base64").toString("utf8"));
+    provenance.predicate.runDetails.builder.id = "https://example.invalid/forged-builder";
+    provenanceEnvelope.payload = Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`, "utf8").toString("base64");
+    await writeFile(provenancePath, `${JSON.stringify(provenanceEnvelope, null, 2)}\n`, "utf8");
+    await expect(verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      env: {}
+    })).rejects.toThrow("unexpected builder identity");
   });
 
-  windowsZipFixtureIt("creates and verifies the Windows x64 artifact with agent.cmd and bundled node.exe", async () => {
-    const rootDir = await writePackageFixture();
+  it("rejects every unmanifested file in the portable bundle tree", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const artifactsDir = path.join(rootDir, ".artifacts");
+    const packaged = await packageAgentCli({
+      rootDir,
+      artifactsDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        SIGMA_EXEC_BINARY: broker
+      }
+    });
+    await writeFile(path.join(packaged.bundleDir, "extra.js"), "export {};\n", "utf8");
+    await mkdir(path.join(packaged.bundleDir, "assets", "other"), { recursive: true });
+    await writeFile(path.join(packaged.bundleDir, "assets", "other", "payload"), "extra\n", "utf8");
+    const rebuilt = spawnSync("tar", [
+      "-czf", packaged.outputPath, "-C", artifactsDir, packaged.bundleName
+    ], { encoding: "utf8" });
+    expect(rebuilt.status, rebuilt.stderr).toBe(0);
+
+    await expect(verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      env: {}
+    })).rejects.toThrow("Integrity manifest omits portable bundle file");
+  });
+
+  it("binds sidecar and provenance verification to the initially inspected archive bytes", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const artifactsDir = path.join(rootDir, ".artifacts");
+    const packaged = await packageAgentCli({
+      rootDir,
+      artifactsDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        SIGMA_EXEC_BINARY: broker
+      }
+    });
+    const replacement = Buffer.from("replacement archive bytes");
+    const replacementDigest = createHash("sha256").update(replacement).digest("hex");
+    const provenanceEnvelope = JSON.parse(await readFile(packaged.sidecars.provenancePath, "utf8"));
+    const provenance = JSON.parse(Buffer.from(provenanceEnvelope.payload, "base64").toString("utf8"));
+    provenance.subject = [{
+      name: path.basename(packaged.outputPath),
+      digest: { sha256: replacementDigest }
+    }];
+    provenanceEnvelope.payload = Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`, "utf8").toString("base64");
+    let replaced = false;
+    const replacingSpawn = (command: string, args: readonly string[], options: Record<string, unknown>) => {
+      const result = spawnSync(command, args, options);
+      if (!replaced && command === "tar" && args[0] === "-xf") {
+        replaced = true;
+        writeFileSync(packaged.outputPath, replacement);
+        writeFileSync(
+          packaged.sidecars.checksumPath,
+          `${replacementDigest}  ${path.basename(packaged.outputPath)}\n`,
+          "utf8"
+        );
+        writeFileSync(
+          packaged.sidecars.provenancePath,
+          `${JSON.stringify(provenanceEnvelope, null, 2)}\n`,
+          "utf8"
+        );
+      }
+      return result;
+    };
+
+    await expect(verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      spawnSync: replacingSpawn,
+      env: {}
+    })).rejects.toThrow("Portable archive SHA-256 sidecar does not match the archive");
+    expect(replaced).toBe(true);
+  });
+
+  it("verifies release provenance only against an externally trusted Ed25519 key", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+    const artifactsDir = path.join(rootDir, ".artifacts");
+    const releaseKey = generateKeyPairSync("ed25519");
+    const untrustedKey = generateKeyPairSync("ed25519");
+    const packaged = await packageAgentCli({
+      rootDir,
+      artifactsDir,
+      releaseSigningPrivateKey: releaseKey.privateKey,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        SIGMA_EXEC_BINARY: broker
+      }
+    });
+
+    const trusted = await verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      trustedReleasePublicKeys: [releaseKey.publicKey],
+      env: {}
+    });
+    expect(trusted.checks.provenanceSignature).toBe(true);
+    expect(trusted.sidecars.provenanceSignature).toMatchObject({
+      verified: true,
+      status: "verified"
+    });
+
+    const untrusted = await verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      trustedReleasePublicKeys: [untrustedKey.publicKey],
+      env: {}
+    });
+    expect(untrusted.checks.provenanceSignature).toBe(false);
+    expect(untrusted.sidecars.provenanceSignature.status).toBe("untrusted-signer");
+
+    const envelope = JSON.parse(await readFile(packaged.sidecars.provenancePath, "utf8"));
+    const signature = Buffer.from(envelope.signatures[0].sig, "base64");
+    signature[0] ^= 0x01;
+    envelope.signatures[0].sig = signature.toString("base64");
+    await writeFile(packaged.sidecars.provenancePath, `${JSON.stringify(envelope, null, 2)}\n`, "utf8");
+    await expect(verifyAgentCliPackage({
+      rootDir,
+      artifactsDir,
+      archive: packaged.outputPath,
+      targetPlatform: "linux",
+      targetArch: "x64",
+      targetWrapperSmoke: false,
+      trustedReleasePublicKeys: [releaseKey.publicKey],
+      env: {}
+    })).rejects.toThrow("DSSE signature is invalid for trusted key");
+  });
+
+  approvedWindowsPackageIt("creates and verifies the Windows V3 artifact and patched Node proof chain", async () => {
+    const { rootDir, broker, version } = await writeV3PackageFixture("win32");
     const runtimeArchive = await writeFakeWindowsNodeRuntimeZip(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
 
+    let signingFiles: readonly string[] = [];
     const result = await packageAgentCli({
       rootDir,
       artifactsDir,
       nodeVersionProbe: async () => pinnedNodeVersion,
+      windowsSigner: async ({ files }: { files: readonly string[] }) => {
+        signingFiles = files;
+      },
       env: {
         NODE_RUNTIME_ARCHIVE: runtimeArchive,
+        SIGMA_EXEC_BINARY: broker,
         AGENT_TARGET_PLATFORM: "win32",
         AGENT_TARGET_ARCH: "x64"
       }
@@ -525,11 +856,16 @@ describe("package-agent-cli", () => {
 
     expect(path.basename(result.outputPath)).toBe("agent-cli-win32-x64.zip");
     expect(result.targetPlatform).toBe("win32");
+    expect(result.windowsSigningStage).toEqual({ attempted: true, method: "callback" });
+    expect(signingFiles.map((file) => path.basename(file))).toEqual(["node.exe", "sigma-exec.exe"]);
     await expect(stat(path.join(result.bundleDir, "bin", "agent.cmd"))).resolves.toBeTruthy();
     await expect(stat(path.join(result.bundleDir, "bin", "node.exe"))).resolves.toBeTruthy();
 
     const wrapper = await readFile(path.join(result.bundleDir, "bin", "agent.cmd"), "utf8");
     expect(wrapper).toContain("set \"NODE_EXE=%SCRIPT_DIR%node.exe\"");
+    expect(wrapper).toContain("set \"PATH=%SCRIPT_DIR%;%PATH%\"");
+    expect(wrapper).toContain("set \"NODE_OPTIONS=--preserve-symlinks-main\"");
+    expect(wrapper).toContain("set \"NODE_PATH=\"");
     expect(wrapper).not.toContain("where node");
     expect(wrapper).toContain("\"%NODE_EXE%\" \"%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js\" %*");
 
@@ -560,9 +896,15 @@ describe("package-agent-cli", () => {
         wrapper: true,
         metadata: true,
         hostCli: true,
-        targetWrapper: false
+        targetWrapper: false,
+        integrity: true,
+        sbom: true,
+        provenance: true,
+        archiveChecksum: true
       },
       metadata: {
+        schemaVersion: 3,
+        productVersion: version,
         targetPlatform: "win32",
         targetArch: "x64",
         node: {
@@ -571,7 +913,27 @@ describe("package-agent-cli", () => {
         }
       }
     });
+    expect(report.integrity.nodeCompatibilityVerified).toBe(true);
+    expect(result.compatibilitySmokePassed).toBe(true);
     expect(report.entries).toBeGreaterThan(10);
+    const patchedNode = await readFile(path.join(result.bundleDir, "bin", "node.exe"));
+    expect(createHash("sha256").update(patchedNode).digest("hex"))
+      .toBe(windowsAppContainerNodeCompatibility.unsignedPatchedSha256);
+    expect(inspectPeAuthenticodeIdentity(patchedNode).normalizedContentSha256)
+      .toBe(windowsAppContainerNodeCompatibility.normalizedContentSha256);
+    expect(report.metadata.node.compatibilitySmokePassed).toBe(true);
+    const metadata = JSON.parse(await readFile(path.join(result.bundleDir, "package-metadata.json"), "utf8"));
+    expect(metadata.node.compatibility).toEqual(windowsAppContainerNodeCompatibility);
+    expect(report.signing).toMatchObject({ policyVerified: false });
+    expect(report.signing.signatures.node).toEqual(expect.objectContaining({
+      signatureType: expect.any(String),
+      certificateTablePresent: true
+    }));
+    expect(report.signing.signatures.sigmaExec).toEqual(expect.objectContaining({
+      signatureType: expect.any(String),
+      certificateTablePresent: false
+    }));
+    expect(report.metadata.signing.signatures).toEqual(report.signing.signatures);
   }, 30_000);
 
   it("can require the target wrapper smoke for release environments", async () => {

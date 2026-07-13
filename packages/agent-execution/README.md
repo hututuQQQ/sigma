@@ -27,6 +27,9 @@ Security invariants:
   `unsafeHostExecApproved: true` on that call.
 - The process environment is rebuilt from an allowlist. Secret-looking keys
   are rejected and configured secret values are redacted from responses.
+- The current Node process is never an implicit toolchain. Product composition
+  binds the canonical bundled Node executable explicitly; Node toolchains have
+  an exact-file execution root and cannot add their directory to `PATH`.
 - Write roots must be contained by a declared read root. `.git` and `.agent`
   remain read-only in both native backends; Windows refuses a containing write
   grant when a protected path does not yet exist.

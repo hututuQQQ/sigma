@@ -1,4 +1,6 @@
 import { createRequire } from "node:module";
+import path from "node:path";
+import { acquireWindowsDirectoryLockHelper } from "agent-execution";
 
 type Handle = bigint;
 
@@ -35,7 +37,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT = 0x0400;
 const FILE_ATTRIBUTE_TAG_INFO_CLASS = 9;
 
 export interface WindowsDirectoryLock {
-  close(): void;
+  close(): Promise<void>;
 }
 
 function openLibrary(): DynamicLibrary {
@@ -53,18 +55,13 @@ function openLibrary(): DynamicLibrary {
   });
 }
 
-/**
- * Holds every directory without FILE_SHARE_DELETE. Windows then rejects a
- * concurrent rename/delete/junction swap until the mutation transaction ends.
- */
-export function lockWindowsDirectories(paths: readonly string[]): WindowsDirectoryLock {
-  if (process.platform !== "win32") return { close: () => undefined };
+function directLock(paths: readonly string[]): WindowsDirectoryLock {
   const library = openLibrary();
   const handles: Handle[] = [];
   try {
     for (const target of paths) {
       const handle = library.functions.CreateFileW(
-        Buffer.from(`${target}\0`, "utf16le"),
+        Buffer.from(`${path.toNamespacedPath(target)}\0`, "utf16le"),
         FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         null,
@@ -95,11 +92,25 @@ export function lockWindowsDirectories(paths: readonly string[]): WindowsDirecto
   }
   let closed = false;
   return {
-    close: () => {
+    close: async () => {
       if (closed) return;
       closed = true;
       for (const handle of handles.reverse()) library.functions.CloseHandle(handle);
       library.lib.close();
     }
   };
+}
+
+/**
+ * Holds every directory without FILE_SHARE_DELETE. Windows then rejects a
+ * concurrent rename/delete/junction swap until the mutation transaction ends.
+ */
+export async function lockWindowsDirectories(paths: readonly string[]): Promise<WindowsDirectoryLock> {
+  if (process.platform !== "win32") return { close: async () => undefined };
+  try {
+    return directLock(paths);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ERR_UNKNOWN_BUILTIN_MODULE") throw error;
+    return await acquireWindowsDirectoryLockHelper(paths);
+  }
 }

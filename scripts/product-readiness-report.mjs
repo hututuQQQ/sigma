@@ -19,6 +19,13 @@ function check(name, ok, detail) {
   return { name, ok: Boolean(ok), detail };
 }
 
+function productMajor(version) {
+  const match = String(version ?? "").match(/^([1-9][0-9]*)\./u);
+  if (!match) return null;
+  const major = Number(match[1]);
+  return Number.isSafeInteger(major) ? major : null;
+}
+
 function assertEvidenceFile(filePath, label, checks) {
   checks.push(check(`${label}:exists`, existsSync(filePath), filePath));
 }
@@ -338,18 +345,48 @@ export async function buildProductReadinessReport(options = {}) {
   }
   checks.push(...productSmokeChecks(productSmoke));
   checks.push(...tuiSmokeChecks(tuiSmoke));
-  const expectedProductVersion = String(packageJson.version ?? packageVerify?.metadata?.productVersion ?? "");
-  const expectedV3 = /^3\./u.test(expectedProductVersion);
+  const expectedProductVersion = String(packageJson.version ?? "");
+  const expectedProductMajor = productMajor(expectedProductVersion);
+  // V3 introduced the portable trust contract. Every later major must retain
+  // those gates, while an unknown major remains unsupported until its package
+  // schema is reviewed explicitly.
+  const expectedV3 = expectedProductMajor !== null && expectedProductMajor >= 3;
+  const supportedProductMajor = expectedProductMajor === 2 || expectedProductMajor === 3;
+  checks.push(check(
+    "productVersion:supportedMajor",
+    supportedProductMajor,
+    expectedProductMajor === null
+      ? `invalid version=${expectedProductVersion || "missing"}`
+      : `major=${expectedProductMajor}`
+  ));
+  checks.push(check(
+    "package:productVersion",
+    packageVerify?.metadata?.productVersion === expectedProductVersion,
+    `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
+  ));
   checks.push(...packageChecks(packageVerify, expectedV3));
 
   const target = `${targetPlatform}-${targetArch}`;
   const v3IntegrityReady = !expectedV3 || packageVerify?.checks?.integrity === true;
-  const windowsSigned = targetPlatform !== "win32" || packageVerify?.metadata?.signing?.authenticodeVerified === true;
+  const provenanceTrusted = !expectedV3 || packageVerify?.checks?.provenanceSignature === true;
+  const windowsSigned = targetPlatform !== "win32"
+    || (expectedV3
+      ? packageVerify?.signing?.policyVerified === true
+      : packageVerify?.metadata?.signing?.authenticodeVerified === true);
   const releaseChecks = [
     check("package:tier1Target", supportedReleaseTargets.has(target), target),
     check("package:targetWrapper", packageVerify?.targetWrapper?.ok === true, packageVerify?.targetWrapper?.status ?? "missing"),
     check("package:integrity", v3IntegrityReady, v3IntegrityReady ? "verified" : "missing"),
-    check("package:windowsAuthenticode", windowsSigned, targetPlatform === "win32" ? (windowsSigned ? "verified" : "unsigned preview only") : "not applicable"),
+    check(
+      "package:provenanceSignature",
+      provenanceTrusted,
+      expectedV3 ? (provenanceTrusted ? "verified by an externally trusted key" : "unsigned or untrusted preview only") : "not applicable"
+    ),
+    check(
+      "package:windowsSignerPolicy",
+      windowsSigned,
+      targetPlatform === "win32" ? (windowsSigned ? "approved signer verified" : "unsigned or unapproved preview only") : "not applicable"
+    ),
     ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
     ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
     ...migrationPerformanceReleaseChecks(migrationPerformance, migrationPerformancePath),
@@ -364,9 +401,11 @@ export async function buildProductReadinessReport(options = {}) {
     ? `${packageLabel} is not proven in this environment: ${packageVerify?.targetWrapper?.status ?? "missing"}${packageVerify?.targetWrapper?.reason ? ` (${packageVerify.targetWrapper.reason})` : ""}`
     : !v3IntegrityReady
       ? `${packageLabel} ran successfully, but portable integrity evidence is missing.`
-      : !windowsSigned
-        ? `${packageLabel} and integrity evidence passed; the unsigned Windows build remains preview-only.`
-        : `${packageLabel} has been executed successfully with release integrity gates.`;
+      : !provenanceTrusted
+        ? `${packageLabel} and integrity evidence passed; external provenance trust is missing, so the build remains preview-only.`
+        : !windowsSigned
+          ? `${packageLabel}, integrity, and provenance passed; Windows signer policy is not satisfied, so the build remains preview-only.`
+          : `${packageLabel} has been executed successfully with release integrity and trust gates.`;
   const releaseNotes = [
     packageReleaseNote,
     sandboxSmoke?.ready === true

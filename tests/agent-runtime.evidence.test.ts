@@ -78,7 +78,12 @@ function review(id: string, deltaIds: string[], runId = "run"): EvidenceRecord {
   };
 }
 
-function failedReview(id: string, deltaIds: string[], runId = "run"): ReviewEvidence {
+function failedReview(
+  id: string,
+  deltaIds: string[],
+  runId = "run",
+  validationIds: string[] = []
+): ReviewEvidence {
   return {
     ...(review(id, deltaIds, runId) as ReviewEvidence),
     status: "failed",
@@ -87,7 +92,8 @@ function failedReview(id: string, deltaIds: string[], runId = "run"): ReviewEvid
       reviewerId: "reviewer",
       verdict: "changes_requested",
       findings: ["fix it"],
-      workspaceDeltaEvidenceIds: deltaIds
+      workspaceDeltaEvidenceIds: deltaIds,
+      validationEvidenceIds: validationIds
     }
   };
 }
@@ -368,5 +374,50 @@ describe("run-scoped completion evidence", () => {
       data: { workspaceDeltaEvidenceIds: ["delta"] }
     });
     expect(completed.evidenceId).not.toBe("forged-review");
+  });
+
+  it("re-enters review when stronger validation changes the review input", async () => {
+    const changed = delta("delta");
+    const initialValidation = validation("initial-validation", [changed.evidenceId]);
+    const active = session([changed, initialValidation]);
+    let reviewCalls = 0;
+    let seq = 1;
+    const coordinator = new ReviewCoordinator({
+      review: async (input) => {
+        reviewCalls += 1;
+        return reviewCalls === 1
+          ? failedReview("first-review", input.workspaceDeltas.map((item) => item.evidenceId))
+          : review("second-review", input.workspaceDeltas.map((item) => item.evidenceId)) as ReviewEvidence;
+      }
+    }, async (runtimeSession, type, authority, value) => {
+      if (type === "review.completed") active.state.evidence.push(value as ReviewEvidence);
+      return {
+        schemaVersion: 3,
+        seq: ++seq,
+        eventId: `event-${seq}`,
+        sessionId: runtimeSession.sessionId,
+        runId: runtimeSession.runId,
+        occurredAt: now,
+        type,
+        authority,
+        payload: value as JsonValue
+      } as AgentEventEnvelope;
+    });
+
+    await coordinator.maybeReview(active, new AbortController().signal);
+    await coordinator.maybeReview(active, new AbortController().signal);
+    expect(reviewCalls).toBe(1);
+    expect((active.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
+      .toEqual([initialValidation.evidenceId]);
+
+    const strongerValidation = validation("stronger-validation", [changed.evidenceId]);
+    active.state.evidence.push(strongerValidation);
+    await coordinator.maybeReview(active, new AbortController().signal);
+    await coordinator.maybeReview(active, new AbortController().signal);
+
+    expect(reviewCalls).toBe(2);
+    expect((active.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
+      .toEqual([initialValidation.evidenceId, strongerValidation.evidenceId]);
+    expect((active.state.evidence.at(-1) as ReviewEvidence).status).toBe("passed");
   });
 });

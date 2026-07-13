@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runPostVerifier } from "../scripts/eval/verifier.mjs";
+import { runPostVerifier, verifierNodeToolchain } from "../scripts/eval/verifier.mjs";
 
 const temporary: string[] = [];
 
@@ -11,6 +11,31 @@ afterEach(async () => {
 });
 
 describe("agent evaluation verifier isolation", () => {
+  it("binds command verification to one exact Node toolchain", () => {
+    const nodePath = path.resolve("portable", "bin", "node.exe");
+    const compatibility = { kind: "test-proof", executableSha256: "a".repeat(64) };
+    const createProof = (executable: string, id: string) => {
+      expect(executable).toBe(nodePath);
+      expect(id).toBe("eval-verifier-node");
+      return compatibility;
+    };
+    expect(verifierNodeToolchain(nodePath, {
+      WINDOWS_APPCONTAINER_NODE_COMPATIBILITY: {
+        requiredNodeOptions: "--preserve-symlinks --preserve-symlinks-main"
+      },
+      createWindowsAppContainerNodeCompatibilityProof: createProof
+    }, "win32")).toEqual({
+      id: "eval-verifier-node",
+      runtime: "node",
+      executable: nodePath,
+      aliases: ["node", "node.exe"],
+      executionRoots: [nodePath],
+      pathEntries: [],
+      environment: { NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" },
+      compatibility
+    });
+  });
+
   it("does not follow a subject-created symlink or junction outside the verifier workspace", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-verifier-"));
     temporary.push(root);

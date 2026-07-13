@@ -2,6 +2,7 @@
 """Real Windows AppContainer/ConPTY/Job Object release smoke test."""
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -12,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+NODE_LPAC_OPTIONS = "--preserve-symlinks --preserve-symlinks-main"
+
 
 def sha256_file(file_path: Path) -> str:
     digest = hashlib.sha256()
@@ -19,6 +22,52 @@ def sha256_file(file_path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def appcontainer_sid_string(profile_name: str) -> str:
+    userenv = ctypes.WinDLL("userenv", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    derive = userenv.DeriveAppContainerSidFromAppContainerName
+    derive.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    derive.restype = ctypes.c_long
+    convert = advapi32.ConvertSidToStringSidW
+    convert.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    convert.restype = ctypes.c_int
+    free_sid = advapi32.FreeSid
+    free_sid.argtypes = [ctypes.c_void_p]
+    free_sid.restype = ctypes.c_void_p
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+    sid = ctypes.c_void_p()
+    result = derive(profile_name, ctypes.byref(sid))
+    if result < 0 or not sid.value:
+        raise RuntimeError(
+            f"DeriveAppContainerSidFromAppContainerName failed for {profile_name}: 0x{result & 0xffffffff:08x}"
+        )
+    text = ctypes.c_wchar_p()
+    try:
+        if not convert(sid, ctypes.byref(text)) or not text.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return text.value
+    finally:
+        if text:
+            local_free(ctypes.cast(text, ctypes.c_void_p))
+        free_sid(sid)
+
+
+def acl_contains_sid(path: Path, sid: str) -> bool:
+    result = subprocess.run(
+        ["icacls", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"icacls failed for recovery target {path}: {result.stderr}")
+    return sid.lower() in result.stdout.lower()
 
 
 class Broker:
@@ -93,14 +142,31 @@ def params(root: Path, command: str, *, pty: bool = False) -> dict:
 
 def node_params(root: Path, node: Path, node_args: list[str]) -> dict:
     request = params(root, "")
+    command_env = environment()
+    command_env["NODE_OPTIONS"] = NODE_LPAC_OPTIONS
     request["command"] = {
         "executable": str(node),
         "args": node_args,
         "cwd": str(root),
-        "env": environment(),
+        "env": command_env,
     }
     request["policy"]["readRoots"] = [str(root), str(node.parent.parent)]
     request["policy"]["writeRoots"] = []
+    request["policy"]["executionRoots"] = [str(node.parent)]
+    return request
+
+
+def shell_node_params(root: Path, node: Path, node_args: str) -> dict:
+    request = params(root, f"node {node_args}")
+    command_env = environment()
+    command_env["NODE_OPTIONS"] = NODE_LPAC_OPTIONS
+    command_env["PATH"] = os.pathsep.join(
+        [str(node.parent), command_env.get("PATH", "")]
+    ).rstrip(os.pathsep)
+    request["command"]["env"] = command_env
+    request["policy"]["readRoots"] = [str(root), str(node.parent.parent)]
+    request["policy"]["writeRoots"] = []
+    request["policy"]["executionRoots"] = [str(node.parent)]
     return request
 
 
@@ -120,6 +186,12 @@ def main() -> int:
         args.output.unlink(missing_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix="sigma-windows-sandbox-ci-"))
     external = Path(tempfile.mkdtemp(prefix="sigma-windows-sandbox-external-"))
+    local_app_data = Path(os.environ["LOCALAPPDATA"])
+    packages_directory = local_app_data / "Packages"
+    preexisting_profiles = {
+        profile.name.lower()
+        for profile in packages_directory.glob("sigmacode.exec.*")
+    }
     node = args.node.resolve()
     if not node.is_file():
         raise RuntimeError(f"bundled Node executable is missing: {node}")
@@ -139,6 +211,164 @@ def main() -> int:
         )
         if node_version["exitCode"] != 0 or not node_version["stdout"]["data"].startswith("v"):
             raise RuntimeError(f"bundled Node failed to initialize inside LPAC: {node_version}")
+        shell_node_version = require_ok(
+            broker.request(
+                "exec",
+                {**shell_node_params(workspace, node, "--version"), "timeoutMs": 10000},
+            )
+        )
+        if shell_node_version["exitCode"] != 0 or not shell_node_version["stdout"]["data"].startswith("v"):
+            raise RuntimeError(
+                f"bundled Node was not resolvable through the authorized sandbox PATH: {shell_node_version}"
+            )
+
+        module_file = workspace / "runtime-smoke.mjs"
+        module_file.write_text(
+            "export const add = (left, right) => left + right;\n",
+            encoding="utf-8",
+        )
+        test_file = workspace / "runtime-smoke.test.mjs"
+        test_file.write_text(
+            'import test from "node:test";\n'
+            'import assert from "node:assert/strict";\n'
+            'import { add } from "./runtime-smoke.mjs";\n'
+            'test("bundled runtime", () => assert.equal(add(2, 2), 4));\n',
+            encoding="utf-8",
+        )
+        node_test = require_ok(
+            broker.request(
+                "exec",
+                {**node_params(workspace, node, ["--test", test_file.name]), "timeoutMs": 10000},
+            )
+        )
+        if node_test["exitCode"] != 0 or "bundled runtime" not in node_test["stdout"]["data"]:
+            raise RuntimeError(f"bundled Node test runner failed inside LPAC: {node_test}")
+
+        child_script = (
+            'const {spawnSync}=require("node:child_process");'
+            'const child=spawnSync(process.execPath,'
+            '["-e","process.stdout.write(\\"sigma-node-child-ok\\")"],{encoding:"utf8"});'
+            'process.stdout.write(JSON.stringify({status:child.status,stdout:child.stdout,error:child.error?.code}));'
+            'process.exit(child.status===0&&child.stdout==="sigma-node-child-ok"?0:2);'
+        )
+        node_child = require_ok(
+            broker.request(
+                "exec",
+                {**node_params(workspace, node, ["-e", child_script]), "timeoutMs": 10000},
+            )
+        )
+        if node_child["exitCode"] != 0 or "sigma-node-child-ok" not in node_child["stdout"]["data"]:
+            raise RuntimeError(f"bundled Node child process failed inside LPAC: {node_child}")
+
+        cjs_target = workspace / "runtime-entry-target"
+        cjs_target.mkdir()
+        cjs_entry = cjs_target / "runtime-entry.cjs"
+        cjs_entry.write_text(
+            'console.log(JSON.stringify({kind:"cjs",filename:__filename,main:require.main.filename}));\n',
+            encoding="utf-8",
+        )
+        esm_entry = workspace / "runtime-entry.mjs"
+        esm_entry.write_text(
+            'console.log(JSON.stringify({kind:"esm",url:import.meta.url}));\n',
+            encoding="utf-8",
+        )
+        linked_directory = workspace / "runtime-linked-main"
+        subprocess.run(
+            [os.environ["COMSPEC"], "/d", "/c", "mklink", "/J", str(linked_directory), str(cjs_target)],
+            check=True,
+            capture_output=True,
+        )
+        symlinked_entry = linked_directory / cjs_entry.name
+
+        entry_reports = {}
+        for kind, entry in (("cjs", cjs_entry), ("esm", esm_entry), ("symlink", symlinked_entry)):
+            result = require_ok(
+                broker.request(
+                    "exec",
+                    {
+                        **node_params(workspace, node, [str(entry.relative_to(workspace))]),
+                        "timeoutMs": 10000,
+                    },
+                )
+            )
+            if result["exitCode"] != 0:
+                raise RuntimeError(f"bundled Node {kind} entry failed inside LPAC: {result}")
+            try:
+                entry_reports[kind] = json.loads(result["stdout"]["data"].strip())
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"bundled Node {kind} entry returned invalid JSON: {result}") from error
+        if entry_reports["cjs"].get("kind") != "cjs" or entry_reports["esm"].get("kind") != "esm":
+            raise RuntimeError(f"bundled Node CJS/ESM entry compatibility failed: {entry_reports}")
+        linked_filename_parent = Path(entry_reports["symlink"].get("filename", "")).parent.name
+        linked_main_parent = Path(entry_reports["symlink"].get("main", "")).parent.name
+        if linked_filename_parent != linked_directory.name or linked_main_parent != linked_directory.name:
+            raise RuntimeError(
+                "trusted runtime constraint did not preserve the symlinked main path: "
+                f"{entry_reports['symlink']}"
+            )
+
+        ipc_child_file = workspace / "runtime-ipc-child.cjs"
+        ipc_child_file.write_text(
+            '"use strict";\n'
+            'const {execFileSync}=require("node:child_process");\n'
+            'const containment=()=>JSON.parse(execFileSync(process.env.SIGMA_CONTAINMENT_PROBE,'
+            '["--internal-appcontainer-containment-probe"],{encoding:"utf8"}));\n'
+            'process.on("message",message=>{if(message?.type!=="ping")return;'
+            'process.stdout.write("sigma-ipc-child-stdout");'
+            'process.send?.({type:"pong",nonce:message.nonce,containment:containment()});'
+            'process.disconnect();});\n',
+            encoding="utf-8",
+        )
+        ipc_parent_script = r'''
+const {execFileSync, fork} = require("node:child_process");
+const path = require("node:path");
+const containment = () => JSON.parse(execFileSync(
+  process.env.SIGMA_CONTAINMENT_PROBE,
+  ["--internal-appcontainer-containment-probe"],
+  {encoding: "utf8"}
+));
+const parentContainment = containment();
+const child = fork(path.join(process.cwd(), "runtime-ipc-child.cjs"), [], {
+  stdio: ["ignore", "pipe", "pipe", "ipc"]
+});
+let stdout = "";
+let stderr = "";
+let pong;
+child.stdout.on("data", chunk => stdout += chunk);
+child.stderr.on("data", chunk => stderr += chunk);
+child.on("message", message => { if (message?.type === "pong") pong = message; });
+child.on("error", error => { console.error(error); process.exit(3); });
+child.on("close", code => {
+  const contained = value => value?.isAppContainer && value?.tokenHasLpacAttribute && value?.inJob;
+  const ok = code === 0
+    && pong?.nonce === "sigma-ipc-nonce"
+    && stdout === "sigma-ipc-child-stdout"
+    && contained(parentContainment)
+    && contained(pong?.containment);
+  console.log(JSON.stringify({
+    ok, code, stdout, stderr, parentContainment,
+    childContainment: pong?.containment, pong: pong?.type
+  }));
+  process.exit(ok ? 0 : 2);
+});
+child.send({type: "ping", nonce: "sigma-ipc-nonce"});
+setTimeout(() => { console.error("ipc timeout"); child.kill(); process.exit(4); }, 5000).unref();
+'''.strip()
+        ipc_request = node_params(workspace, node, ["-e", ipc_parent_script])
+        broker_path = args.broker.resolve()
+        ipc_request["command"]["env"]["SIGMA_CONTAINMENT_PROBE"] = str(broker_path)
+        ipc_request["policy"]["readRoots"].append(str(broker_path))
+        ipc_request["policy"]["executionRoots"].append(str(broker_path))
+        ipc_result = require_ok(
+            broker.request("exec", {**ipc_request, "timeoutMs": 10000})
+        )
+        try:
+            ipc_report = json.loads(ipc_result["stdout"]["data"].strip())
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"bundled Node IPC returned invalid JSON: {ipc_result}") from error
+        if ipc_result["exitCode"] != 0 or not ipc_report.get("ok") or ipc_report.get("pong") != "pong":
+            raise RuntimeError(f"bundled Node IPC/containment failed inside LPAC: {ipc_result}")
+
         node_boundary_script = r"""
 const fs = require("fs");
 const net = require("net");
@@ -273,6 +503,14 @@ setTimeout(() => process.exit(4), 3000);
         if (workspace / "out" / "leak.txt").exists():
             raise RuntimeError("Job Object termination left a descendant process alive")
 
+        recovery_directory = local_app_data / "SigmaCode" / "sandbox-recovery"
+        preexisting_journals = (
+            list(recovery_directory.glob("sigmacode.exec.*.json"))
+            if recovery_directory.exists()
+            else []
+        )
+        if preexisting_journals:
+            raise RuntimeError(f"stale recovery journals existed before crash fixture: {preexisting_journals}")
         crashed_tree = require_ok(
             broker.request(
                 "process.spawn",
@@ -285,11 +523,69 @@ setTimeout(() => process.exit(4), 3000);
         )
         if not crashed_tree.get("handleId"):
             raise RuntimeError(f"broker-crash fixture did not start: {crashed_tree}")
+        for _ in range(100):
+            crash_journals = list(recovery_directory.glob("sigmacode.exec.*.json"))
+            if crash_journals:
+                break
+            time.sleep(0.05)
+        if len(crash_journals) != 1:
+            raise RuntimeError(
+                f"broker-crash fixture did not reach a durably journaled ACL state: {crash_journals}"
+            )
         broker.process.kill()
         broker.process.wait(timeout=5)
         time.sleep(4)
         if (workspace / "out" / "crash-leak.txt").exists():
             raise RuntimeError("broker crash left a descendant process alive")
+        crash_journals = list(recovery_directory.glob("sigmacode.exec.*.json"))
+        if len(crash_journals) != 1:
+            raise RuntimeError(f"broker crash did not leave exactly one recoverable journal: {crash_journals}")
+        crash_journal_path = crash_journals[0]
+        crash_journal = json.loads(crash_journal_path.read_text(encoding="utf-8"))
+        crash_profile_name = crash_journal.get("profileName")
+        crash_entries = crash_journal.get("entries")
+        if not isinstance(crash_profile_name, str) or not isinstance(crash_entries, list) or not crash_entries:
+            raise RuntimeError(f"broker crash recovery journal is incomplete: {crash_journal}")
+        crash_sid = appcontainer_sid_string(crash_profile_name)
+        crash_profile_directory = local_app_data / "Packages" / crash_profile_name.lower()
+        if not crash_profile_directory.exists():
+            raise RuntimeError(f"crashed AppContainer profile was not present for recovery: {crash_profile_name}")
+
+        recovery_broker = Broker(args.broker.resolve())
+        try:
+            recovered_setup = require_ok(recovery_broker.request("sandbox.setup"))
+            if not recovered_setup["sandbox"]["selfTestPassed"]:
+                raise RuntimeError(f"post-crash recovery broker self-test failed: {recovered_setup}")
+        finally:
+            recovery_broker.close()
+        if crash_journal_path.exists():
+            raise RuntimeError(f"post-crash recovery did not remove journal: {crash_journal_path}")
+        remaining_journal_files = (
+            [path for path in recovery_directory.iterdir() if path.is_file()]
+            if recovery_directory.exists()
+            else []
+        )
+        if remaining_journal_files:
+            raise RuntimeError(f"post-crash recovery left journal artifacts: {remaining_journal_files}")
+        if crash_profile_directory.exists():
+            raise RuntimeError(f"post-crash recovery did not delete profile: {crash_profile_name}")
+        remaining_profiles = [
+            profile
+            for profile in packages_directory.glob("sigmacode.exec.*")
+            if profile.name.lower() not in preexisting_profiles
+        ]
+        if remaining_profiles:
+            raise RuntimeError(
+                f"post-crash recovery left new Sigma ephemeral profiles: {remaining_profiles}"
+            )
+        recovered_paths = {
+            Path(entry["path"])
+            for entry in crash_entries
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
+        uncleared = [path for path in recovered_paths if path.exists() and acl_contains_sid(path, crash_sid)]
+        if uncleared:
+            raise RuntimeError(f"post-crash recovery left exact AppContainer ACEs: {uncleared}")
         report = {
             "schemaVersion": 1,
             "ready": True,
@@ -303,6 +599,23 @@ setTimeout(() => process.exit(4), 3000);
             "hardening": hardening,
             "nodeLpac": {
                 "version": node_version["stdout"]["data"].strip(),
+                "shellPathVersion": shell_node_version["stdout"]["data"].strip(),
+                "testRunner": True,
+                "childProcess": True,
+                "ipcPingPong": True,
+                "ipcCapturedStdout": ipc_report["stdout"] == "sigma-ipc-child-stdout",
+                "parentContainment": ipc_report["parentContainment"],
+                "childContainment": ipc_report["childContainment"],
+                "cjsEntry": True,
+                "esmEntry": True,
+                "symlinkMainPreserved": True,
+                "sandboxRuntimeEnvironment": {"NODE_OPTIONS": NODE_LPAC_OPTIONS},
+                "crashRecovery": {
+                    "journalDurable": True,
+                    "exactAceRemoved": True,
+                    "profileRemoved": True,
+                    "journalRemoved": True,
+                },
                 "tempWritable": True,
                 "workspaceReadOnly": True,
                 "networkDenied": True,

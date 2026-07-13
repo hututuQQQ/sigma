@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { BrokerDoctorReport, ExecutionBroker } from "../packages/agent-execution/src/index.js";
 
 const api = vi.hoisted(() => ({ mode: "success" as "success" | "empty" | "error" | "raw_error" }));
 
@@ -37,6 +38,39 @@ class Capture extends Writable {
 
 async function workspace(): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), "sigma-doctor-coverage-"));
+}
+
+function healthyBroker(close: () => Promise<void>): ExecutionBroker {
+  const report: BrokerDoctorReport = {
+    protocolVersion: 1,
+    brokerVersion: "fixture",
+    platform: process.platform,
+    architecture: process.arch,
+    sandbox: {
+      available: true,
+      backend: "fixture",
+      selfTestPassed: true,
+      setupRequired: false
+    },
+    capabilities: {
+      foreground: true,
+      background: true,
+      stdin: true,
+      pty: false,
+      networkModes: ["none"]
+    }
+  };
+  return {
+    lostProcessHandles: [],
+    connect: async () => report,
+    doctor: async () => report,
+    execute: async () => { throw new Error("not implemented"); },
+    spawn: async () => { throw new Error("not implemented"); },
+    poll: async () => { throw new Error("not implemented"); },
+    write: async () => { throw new Error("not implemented"); },
+    terminate: async () => { throw new Error("not implemented"); },
+    close
+  };
 }
 
 afterEach(() => {
@@ -132,5 +166,30 @@ describe("doctor command branch coverage", () => {
     const stderr = new Capture();
     await expect(runDoctorCommand(["--not-a-doctor-option"], { stderr })).resolves.toBe(1);
     expect(stderr.text()).toContain("Unknown option");
+  });
+
+  it("always closes an owned broker, including when report output fails", async () => {
+    const root = await workspace();
+    const successfulClose = vi.fn(async () => undefined);
+    await expect(runDoctorCommand(["--workspace", root, "--json"], {
+      stdout: new Capture(),
+      languageServers: [],
+      createExecutionBroker: () => healthyBroker(successfulClose)
+    })).resolves.toBe(0);
+    expect(successfulClose).toHaveBeenCalledOnce();
+
+    const failedClose = vi.fn(async () => undefined);
+    const stderr = new Capture();
+    const stdout = {
+      write: () => { throw new Error("fixture output failure"); }
+    } as unknown as NodeJS.WritableStream;
+    await expect(runDoctorCommand(["--workspace", root, "--json"], {
+      stdout,
+      stderr,
+      languageServers: [],
+      createExecutionBroker: () => healthyBroker(failedClose)
+    })).resolves.toBe(1);
+    expect(stderr.text()).toContain("fixture output failure");
+    expect(failedClose).toHaveBeenCalledOnce();
   });
 });

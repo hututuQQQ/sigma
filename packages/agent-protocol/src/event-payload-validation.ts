@@ -82,12 +82,19 @@ function processLostPayload(payload: unknown): boolean {
   return Boolean(item && text(item.processId) && text(item.reason));
 }
 
+function checkpointActionPayload(value: unknown): boolean {
+  if (value === undefined) return true;
+  const action = record(value);
+  return Boolean(action && action.kind === "restore" && text(action.checkpointId));
+}
+
 function executionPlanPayload(payload: unknown): boolean {
   const item = record(payload);
   const plan = record(item?.plan);
   return Boolean(item && text(item.executionId) && text(item.toolCallId) && plan
     && textArray(plan.exactEffects) && textArray(plan.readPaths) && textArray(plan.writePaths)
     && textArray(plan.checkpointScope) && (plan.network === "none" || plan.network === "full")
+    && checkpointActionPayload(plan.checkpointAction)
     && ["none", "pipe", "pty", "background"].includes(String(plan.processMode))
     && ["read_only", "replay_safe", "non_replayable"].includes(String(plan.idempotence)));
 }
@@ -172,7 +179,8 @@ function budgetOverrunPayload(payload: unknown): boolean {
 
 function reviewStartedPayload(payload: unknown): boolean {
   const item = record(payload);
-  return Boolean(item && text(item.reviewerId) && textArray(item.workspaceDeltaEvidenceIds));
+  return Boolean(item && text(item.reviewerId) && textArray(item.workspaceDeltaEvidenceIds)
+    && (item.validationEvidenceIds === undefined || textArray(item.validationEvidenceIds)));
 }
 
 const VALIDATORS: Partial<Record<string, PayloadValidator>> = {

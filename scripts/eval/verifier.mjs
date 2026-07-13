@@ -11,15 +11,44 @@ function substitute(value, variables) {
 
 async function connectVerifierBroker(context) {
   if (!context.brokerPath) throw new Error("A target-native sigma-exec broker is required for command verification.");
-  const { SigmaExecBrokerClient } = await import("../../packages/agent-execution/dist/index.js");
-  const broker = new SigmaExecBrokerClient({
+  if (!context.nodePath) throw new Error("A verified Node runtime is required for command verification.");
+  const api = await import("../../packages/agent-execution/dist/index.js");
+  const broker = new api.SigmaExecBrokerClient({
     helperPath: context.brokerPath,
     sandboxMode: "required",
     allowUnsafeHostExec: false,
+    trustedToolchains: [verifierNodeToolchain(context.nodePath, api)],
     secrets: context.secrets
   });
   await broker.connect();
   return broker;
+}
+
+export function verifierNodeToolchain(nodePath, api, platform = process.platform) {
+  if (!path.isAbsolute(nodePath)) throw new Error("Verifier Node runtime must be absolute.");
+  const toolchain = {
+    id: "eval-verifier-node",
+    runtime: "node",
+    executable: path.resolve(nodePath),
+    aliases: platform === "win32" ? ["node", "node.exe"] : ["node"],
+    executionRoots: [path.resolve(nodePath)],
+    pathEntries: []
+  };
+  if (platform !== "win32") return toolchain;
+  if (typeof api?.createWindowsAppContainerNodeCompatibilityProof !== "function"
+    || typeof api?.WINDOWS_APPCONTAINER_NODE_COMPATIBILITY?.requiredNodeOptions !== "string") {
+    throw new Error("Windows verifier Node compatibility support is unavailable.");
+  }
+  return {
+    ...toolchain,
+    environment: {
+      NODE_OPTIONS: api.WINDOWS_APPCONTAINER_NODE_COMPATIBILITY.requiredNodeOptions
+    },
+    compatibility: api.createWindowsAppContainerNodeCompatibilityProof(
+      toolchain.executable,
+      toolchain.id
+    )
+  };
 }
 
 async function execute(broker, executable, args, options) {

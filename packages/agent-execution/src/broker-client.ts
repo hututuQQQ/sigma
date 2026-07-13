@@ -1,20 +1,28 @@
-import path from "node:path";
 import { BrokerTransport } from "./broker-transport.js";
 import {
   BrokerCancelledError,
   BrokerConnectionError,
+  BrokerOutputDecodingError,
   BrokerPolicyError,
   BrokerProcessLostError,
   BrokerTimeoutError,
   SandboxUnavailableError
 } from "./errors.js";
-import { createMinimalEnvironment } from "./environment.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
+import {
+  positiveInteger,
+  redactionSecrets,
+  requestParams
+} from "./broker-request-policy.js";
 import { SecretRedactor, type SecretRedactionStream } from "./redaction.js";
+import {
+  assertTrustedToolchainsAvailable,
+  normalizeTrustedToolchains,
+  type NormalizedTrustedToolchain
+} from "./trusted-toolchains.js";
 import type {
   BrokerDoctorReport,
   BrokerRequestOptions,
-  CommandSpec,
   ExecutionBroker,
   ExecutionPolicy,
   ExecutionRequest,
@@ -24,7 +32,6 @@ import type {
   ProcessSpawnRequest,
   SigmaExecBrokerClientOptions
 } from "./types.js";
-import { DEFAULT_MAX_OUTPUT_BYTES } from "./types.js";
 import { parseDoctor, parseExecutionValue, parseHello, parseProcessValue, parseSpawnedProcess } from "./values.js";
 
 type ClientState = "new" | "connecting" | "ready" | "failed" | "closed";
@@ -34,117 +41,9 @@ interface RedactionStream {
 }
 interface ProcessRedaction { stdout: RedactionStream; stderr: SecretRedactionStream }
 
-function positiveInteger(value: number | undefined, fallback: number, label: string): number {
-  const result = value ?? fallback;
-  if (!Number.isSafeInteger(result) || result <= 0) throw new BrokerPolicyError(`${label} must be a positive integer.`);
-  return result;
-}
-
 function cancellationError(signal?: AbortSignal): BrokerCancelledError {
   const cause = signal?.reason instanceof Error ? signal.reason : undefined;
   return new BrokerCancelledError(cause?.message ?? "Execution request cancelled.", { cause });
-}
-
-function ptyDimension(value: number | undefined, fallback: number, label: string): number {
-  const result = positiveInteger(value, fallback, label);
-  if (result > 65_535) throw new BrokerPolicyError(`${label} must not exceed 65535.`);
-  return result;
-}
-
-function assertAbsoluteRoots(roots: string[], label: string): void {
-  if (!Array.isArray(roots) || roots.some((root) => typeof root !== "string" || !path.isAbsolute(root))) {
-    throw new BrokerPolicyError(`${label} must contain only absolute paths.`);
-  }
-}
-
-function pathWithin(candidate: string, root: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-function defaultProtectedPaths(policy: ExecutionPolicy): string[] {
-  const explicit = policy.protectedPaths ?? [];
-  const resolved = [...new Set(policy.readRoots.map((root) => path.resolve(root)))];
-  const roots = resolved.filter((root) => !resolved.some((candidate) =>
-    candidate !== root && pathWithin(root, candidate)
-  ));
-  return [...new Set([
-    ...explicit,
-    ...roots.flatMap((root) => [path.join(root, ".git"), path.join(root, ".agent")])
-  ])];
-}
-
-function wireCommand(command: CommandSpec): Record<string, unknown> {
-  if (!command.executable || typeof command.executable !== "string") throw new BrokerPolicyError("Command executable is required.");
-  if (!path.isAbsolute(command.cwd)) throw new BrokerPolicyError("Command cwd must be absolute.");
-  if (command.args?.some((argument) => typeof argument !== "string" || argument.includes("\0"))) {
-    throw new BrokerPolicyError("Command arguments must be NUL-free strings.");
-  }
-  if (command.executable.includes("\0") || command.cwd.includes("\0") || command.stdin?.includes("\0")) {
-    throw new BrokerPolicyError("Command values cannot contain NUL bytes.");
-  }
-  return {
-    executable: command.executable,
-    args: command.args ?? [],
-    cwd: path.resolve(command.cwd),
-    env: createMinimalEnvironment(command.environment),
-    ...(command.stdin === undefined ? {} : { stdin: command.stdin })
-  };
-}
-
-function wirePolicy(policy: ExecutionPolicy, options: SigmaExecBrokerClientOptions): Record<string, unknown> {
-  assertAbsoluteRoots(policy.readRoots, "readRoots");
-  assertAbsoluteRoots(policy.writeRoots, "writeRoots");
-  assertAbsoluteRoots(policy.protectedPaths ?? [], "protectedPaths");
-  if (policy.network === "full" && policy.networkApproved !== true) {
-    throw new BrokerPolicyError("Full network access requires an explicit per-call approval.");
-  }
-  if (policy.sandbox === "unsafe" && (!options.allowUnsafeHostExec || policy.unsafeHostExecApproved !== true)) {
-    throw new BrokerPolicyError("Unsafe host execution requires broker opt-in and explicit per-call approval.");
-  }
-  return {
-    sandbox: policy.sandbox,
-    network: policy.network,
-    networkApproved: policy.networkApproved === true,
-    readRoots: policy.readRoots.map((root) => path.resolve(root)),
-    writeRoots: policy.writeRoots.map((root) => path.resolve(root)),
-    protectedPaths: defaultProtectedPaths(policy).map((item) => path.resolve(item)),
-    unsafeHostExecApproved: policy.unsafeHostExecApproved === true
-  };
-}
-
-function requestParams(
-  request: ExecutionRequest | ProcessSpawnRequest,
-  options: SigmaExecBrokerClientOptions
-): Record<string, unknown> {
-  if (request.policy.sandbox === "required") {
-    const roots = [...request.policy.readRoots, ...request.policy.writeRoots];
-    if (!roots.some((root) => pathWithin(request.command.cwd, root))) {
-      throw new BrokerPolicyError("A sandboxed command cwd must be inside a declared read or write root.");
-    }
-  }
-  return {
-    command: wireCommand(request.command),
-    policy: wirePolicy(request.policy, options),
-    maxOutputBytes: positiveInteger(request.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES, "maxOutputBytes"),
-    ...("pty" in request && request.pty === true ? {
-      pty: true,
-      ptyColumns: ptyDimension(request.ptyColumns, 120, "ptyColumns"),
-      ptyRows: ptyDimension(request.ptyRows, 30, "ptyRows")
-    } : {})
-  };
-}
-
-function redactionSecrets(secrets: SigmaExecBrokerClientOptions["secrets"]): Array<{ name: string; value: string }> {
-  const result = Object.entries(secrets ?? {}).flatMap(([name, value]) => {
-    if (!value || value.length < 4) return [];
-    if (name.length > 128 || name.includes("\0") || value.length > 64 * 1024 || value.includes("\0")) {
-      throw new BrokerPolicyError("Artifact redaction secrets exceed native broker limits.");
-    }
-    return [{ name, value }];
-  });
-  if (result.length > 128) throw new BrokerPolicyError("At most 128 artifact redaction secrets are allowed.");
-  return result;
 }
 
 export class SigmaExecBrokerClient implements ExecutionBroker {
@@ -154,6 +53,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly processRedaction = new Map<string, ProcessRedaction>();
   private readonly lost = new Map<string, ProcessHandle>();
   private readonly outputArtifacts: BrokerOutputArtifactImporter;
+  private readonly trustedToolchains: NormalizedTrustedToolchain[];
   private state: ClientState = "new";
   private instanceId?: string;
   private artifactCleanup?: Promise<void>;
@@ -161,6 +61,8 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
 
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
     if (!options.helperPath) throw new BrokerPolicyError("sigma-exec helperPath is required.");
+    positiveInteger(options.cancellationGraceMs, 10_000, "cancellationGraceMs");
+    this.trustedToolchains = normalizeTrustedToolchains(options.trustedToolchains);
     this.redactor = new SecretRedactor(options.secrets);
     this.transport = new BrokerTransport(options, () => this.markProcessesLost());
     this.outputArtifacts = new BrokerOutputArtifactImporter(this.redactor, async (artifactIds) =>
@@ -175,6 +77,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot connect broker client in '${this.state}' state.`);
     this.state = "connecting";
     try {
+      assertTrustedToolchainsAvailable(this.trustedToolchains, this.options.sandboxMode);
       this.transport.start();
       const hello = parseHello(await this.transport.request("hello", {
         clientVersion: "3.0.0",
@@ -218,7 +121,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.assertRequestSandbox(request.policy);
     const timeoutMs = positiveInteger(request.timeoutMs, 120_000, "timeoutMs");
     const params = {
-      ...requestParams(request, this.options), timeoutMs,
+      ...requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()), timeoutMs,
       ...(request.idleTimeoutMs === undefined ? {} : {
         idleTimeoutMs: positiveInteger(request.idleTimeoutMs, 30_000, "idleTimeoutMs")
       })
@@ -226,6 +129,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     const value = parseExecutionValue(await this.transport.request("exec", params, {
       ...options, timeoutMs: options.timeoutMs ?? timeoutMs + 5_000
     }));
+    await this.assertDecoded(value, false);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
     return {
       state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
@@ -250,13 +154,12 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     const onAbort = (): void => { cancelled = true; };
     options.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      // A process handle must never be orphaned because the request response lost
-      // a race with cancellation. Receive it first, then terminate it durably.
+      // Receive a racing process handle first, then terminate it durably.
       let spawned: ReturnType<typeof parseSpawnedProcess>;
       try {
         spawned = parseSpawnedProcess(await this.transport.request(
           "process.spawn",
-          requestParams(request, this.options),
+          requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()),
           { ...options, signal: undefined }
         ));
       } catch (error) {
@@ -325,6 +228,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   }
 
   private async processResult(handle: ProcessHandle, value: ReturnType<typeof parseProcessValue>): Promise<ProcessPollResult> {
+    await this.assertDecoded(value);
     const streams = this.processRedaction.get(handle.id) ?? this.createProcessRedaction();
     this.processRedaction.set(handle.id, streams);
     const final = value.state !== "running";
@@ -354,6 +258,29 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     if ((this.options.sandboxMode ?? "required") === "required" && (!report.sandbox.available || !report.sandbox.selfTestPassed)) {
       throw new SandboxUnavailableError(report.sandbox.reason ?? "Required sandbox self-test failed.", report.sandbox);
     }
+  }
+
+  private async assertDecoded(
+    value: ReturnType<typeof parseProcessValue>,
+    closeClient = true
+  ): Promise<void> {
+    const failure = (["stdout", "stderr"] as const).flatMap((stream) => {
+      const decodingError = value[stream].decodingError;
+      return decodingError ? [{ stream, ...decodingError }] : [];
+    })[0];
+    if (!failure) return;
+    // Foreground exec responses are already terminal, so an undecodable child
+    // stream can be rejected without discarding the healthy broker. Streaming
+    // processes still close the client because their unread output and process
+    // lifetime can no longer be managed safely.
+    if (closeClient) await this.close().catch(() => undefined);
+    throw new BrokerOutputDecodingError(failure.stream, failure.code, failure.message);
+  }
+
+  private verifiedShellExecutables(): string[] {
+    return this.doctorValue?.capabilities.shells
+      ?.filter((shell) => shell.verified)
+      .map((shell) => shell.executable) ?? [];
   }
 
   private assertRequestSandbox(policy: ExecutionPolicy): void {

@@ -216,7 +216,11 @@ export interface AgentEventPayloadMap {
     sourceSessionId?: string;
     childId?: string;
   };
-  "review.started": JsonPayload & { reviewerId: string; workspaceDeltaEvidenceIds: string[] };
+  "review.started": JsonPayload & {
+    reviewerId: string;
+    workspaceDeltaEvidenceIds: string[];
+    validationEvidenceIds?: string[];
+  };
   "review.completed": ReviewEvidence;
   "review.waived": EvidenceRecord;
 }

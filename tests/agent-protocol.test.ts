@@ -285,7 +285,8 @@ describe("AgentEventEnvelope V3 runtime boundary", () => {
       { ...base, kind: "validation", data: { validator: "tests", workspaceDeltaEvidenceIds: ["delta"] } },
       { ...base, kind: "diagnostic", data: { source: "lsp", diagnostic: null } },
       { ...base, kind: "review", data: {
-        reviewerId: "reviewer", verdict: "changes_requested", findings: [], workspaceDeltaEvidenceIds: ["delta"]
+        reviewerId: "reviewer", verdict: "changes_requested", findings: [],
+        workspaceDeltaEvidenceIds: ["delta"], validationEvidenceIds: ["validation"]
       } },
       { ...base, kind: "checkpoint", data: {
         checkpointId: "checkpoint", checkpointStatus: "sealed", preManifestDigest: "digest"
@@ -310,6 +311,10 @@ describe("AgentEventEnvelope V3 runtime boundary", () => {
       { ...base, kind: "validation", data: { validator: "", workspaceDeltaEvidenceIds: [1] } },
       { ...base, kind: "review", data: {
         reviewerId: "reviewer", verdict: "unknown", findings: {}, workspaceDeltaEvidenceIds: []
+      } },
+      { ...base, kind: "review", data: {
+        reviewerId: "reviewer", verdict: "approved", findings: [],
+        workspaceDeltaEvidenceIds: ["delta"], validationEvidenceIds: [1]
       } },
       { ...base, kind: "checkpoint", data: {
         checkpointId: "checkpoint", checkpointStatus: "unknown", preManifestDigest: ""

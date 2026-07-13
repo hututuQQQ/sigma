@@ -4,7 +4,7 @@ import type {
   ToolDescriptor,
   UsageRecord
 } from "agent-protocol";
-import { recoveryResultLostPayload } from "./run-transitions.js";
+import { recoveryDenialPayload, recoveryResultLostPayload } from "./run-transitions.js";
 import type { RuntimeSession } from "./types.js";
 import type { BoundRuntimeEventEmitter } from "./runtime-event-emitter.js";
 
@@ -82,6 +82,28 @@ async function recoverInterruptedModel(session: RuntimeSession, options: Recover
   });
 }
 
+async function recoverUnstartedTool(
+  pending: RuntimeSession["state"]["pendingTools"][number],
+  descriptor: ToolDescriptor | undefined,
+  options: RecoveryOptions
+): Promise<void> {
+  await options.settleToolBudget(pending.request.callId, "release");
+  if (pending.approval === "denied") {
+    await options.emit(
+      "tool.failed",
+      "runtime",
+      recoveryDenialPayload(pending.request.callId, pending.modelTurn)
+    );
+    return;
+  }
+  if (pending.approval !== "allowed" || !mutating(descriptor)) return;
+  await options.emit("diagnostic", "runtime", {
+    kind: "recovery.reset_tool",
+    callId: pending.request.callId,
+    approval: "not_required"
+  });
+}
+
 export async function recoverInterruptedSession(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
   if (session.state.phase === "terminal") return;
   const lostProcessIds = [...session.state.activeProcessIds];
@@ -97,13 +119,15 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
   for (const pending of [...session.state.pendingTools]) {
     const descriptor = options.descriptors.find((item) => item.name === pending.request.name);
     if (pending.approval === "pending") {
-      session.approvals.set(pending.request.callId, {
-        effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined
-      });
+      if (!session.approvals.has(pending.request.callId)) {
+        session.approvals.set(pending.request.callId, {
+          effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined
+        });
+      }
       continue;
     }
     if (!pending.started) {
-      await options.settleToolBudget(pending.request.callId, "release");
+      await recoverUnstartedTool(pending, descriptor, options);
       continue;
     }
     if (!mustNotReplay(session, descriptor)) {

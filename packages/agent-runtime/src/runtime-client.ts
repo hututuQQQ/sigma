@@ -182,7 +182,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       profileSource: selection.profileSource,
       workspaceLeaseInherited,
       ...(parentSessionId ? { parentSessionId } : {})
-    });
+    }, this.options.runtimeEnvironment);
     this.sessions.set(session.sessionId, session);
     await this.commandBus.claim(session.sessionId);
     try {
@@ -345,7 +345,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       gateway: this.options.gateway,
       profile: this.options.profile,
       profileSource: this.options.profileSource
-    });
+    }, this.options.runtimeEnvironment);
     await restoreRuntimeCustomization(session, this.artifacts, this.options);
     this.sessions.set(sessionId, session);
     const recovery = await this.control.recoverOpen(session);

@@ -1,21 +1,10 @@
-import type {
-  AgentEventEnvelope,
-  AgentEventType,
-  JsonValue,
-  ModelMessage,
-  ModelToolCall,
-  RunOutcome
-} from "agent-protocol";
+import type { AgentEventEnvelope, AgentEventType, JsonValue, ModelMessage, ModelToolCall, RunOutcome } from "agent-protocol";
 import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
-import {
-  completionSummary,
-  incompleteModelCompletion,
-  requestedInput,
-  toolBatchSignature
-} from "./model-convergence.js";
+import { completionSummary, incompleteModelCompletion, requestedInput, toolBatchSignature } from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
+import { recordSemanticToolResult, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
 
 function objectPayload(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -86,6 +75,8 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
+  semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: state.revision },
+  semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
   outcome: undefined,
   proposedOutcome: undefined
@@ -101,6 +92,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
+  semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
   outcome: undefined,
   proposedOutcome: undefined
@@ -121,6 +113,7 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
+  semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
   proposedOutcome: undefined,
   outcome: undefined
@@ -198,7 +191,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     messages,
     pendingTools,
     toolCallIds: [...state.toolCallIds, ...identifiers],
-    completionRepairAttempts: 0,
+    completionRepairAttempts: state.completionRepairAttempts,
     continuationAttempts: 0,
     lastToolBatchSignature: signature,
     repeatedToolBatchCount,
@@ -254,6 +247,7 @@ const toolFinished: EventReducer = (state, event) => {
   const pending = pendingForEvent(state, objectPayload(event.payload));
   if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
   const pendingTools = state.pendingTools.filter((item) => item !== pending);
+  const terminalRepair = state.completionRepairAttempts > 0;
   const next: KernelState = {
     ...state,
     messages: [...state.messages, {
@@ -270,12 +264,33 @@ const toolFinished: EventReducer = (state, event) => {
     continuationAttempts: 0,
     phase: nextPhase(pendingTools)
   };
+  const semantic = recordSemanticToolResult(next, receipt);
+  const progressed = semantic.state;
   const inputMessage = requestedInput(receipt);
   if (inputMessage) {
-    return propose(next, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
+    return propose(progressed, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
   }
   const summary = completionSummary(receipt);
-  return summary ? propose(next, { kind: "completed", message: summary, evidence: next.evidence }) : next;
+  if (summary) {
+    const repairedAnswer = terminalRepair
+      ? [...state.messages].reverse().find((message) =>
+        message.role === "assistant" && message.content.trim())?.content.trim()
+      : undefined;
+    return propose(progressed, {
+      kind: "completed",
+      message: repairedAnswer || summary,
+      evidence: progressed.evidence
+    });
+  }
+  if (semantic.limitReached && pendingTools.length === 0 && progressed.semanticFailureCluster) {
+    const cluster = progressed.semanticFailureCluster;
+    return propose(progressed, {
+      kind: "recoverable_failure",
+      code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
+      message: `Execution infrastructure repeatedly failed without workspace or durable evidence progress (${cluster.family}, ${cluster.attempts} attempts; diagnostics: ${cluster.diagnosticCodes.join(", ")}).`
+    });
+  }
+  return progressed;
 };
 
 const runSuspended: EventReducer = (state, _event, payload) => {

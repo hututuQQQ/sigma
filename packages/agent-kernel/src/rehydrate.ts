@@ -8,7 +8,7 @@ import {
   type AgentEventEnvelope
 } from "agent-protocol";
 import { evolve } from "./reducer.js";
-import type { KernelState } from "./state.js";
+import { isSemanticFailureCluster, isSemanticProgressWatermark, type KernelState } from "./state.js";
 
 export function rehydrate(initial: KernelState, events: Iterable<AgentEventEnvelope>): KernelState {
   let state = initial;
@@ -31,6 +31,27 @@ function assertDurableLedgers(state: KernelState): void {
   }
   if (new Set(state.budget.reservations.map((item) => item.reservationId)).size !== state.budget.reservations.length) {
     throw new Error("Duplicate budget reservation IDs.");
+  }
+  assertSemanticFailureState(state);
+}
+
+function assertSemanticFailureState(state: KernelState): void {
+  if (!isSemanticProgressWatermark(state.semanticProgress)
+    || (state.semanticFailureCluster && !isSemanticFailureCluster(state.semanticFailureCluster))) {
+    throw new Error("Kernel semantic failure progress state is invalid.");
+  }
+  const clusterProgress = state.semanticFailureCluster?.progress;
+  if (clusterProgress && (clusterProgress.workspaceChanges !== state.semanticProgress.workspaceChanges
+    || clusterProgress.durableEvidence !== state.semanticProgress.durableEvidence
+    || clusterProgress.revision !== state.semanticProgress.revision)) {
+    throw new Error("Kernel semantic failure cluster does not match its progress watermark.");
+  }
+  if (state.semanticProgress.revision > state.revision) {
+    throw new Error("Kernel semantic progress revision exceeds the current revision.");
+  }
+  const cluster = state.semanticFailureCluster;
+  if (cluster && (cluster.firstRevision > cluster.lastRevision || cluster.lastRevision > state.revision)) {
+    throw new Error("Kernel semantic failure revisions are invalid.");
   }
 }
 

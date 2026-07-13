@@ -2,16 +2,17 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import { cliEntry } from "./common.mjs";
+import { subjectNodeLaunch } from "./subject-launch.mjs";
 
 const OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 const CANCEL_GRACE_MS = 15_000;
 
-function nodeCliArgs(commandArgs, subject = {}) {
+function nodeCliArgs(commandArgs, subject) {
+  const launch = subjectNodeLaunch(subject);
   return [
     "--experimental-ffi",
     "--disable-warning=ExperimentalWarning",
-    subject.cliEntry ?? cliEntry,
+    launch.entryPath,
     ...commandArgs
   ];
 }
@@ -126,7 +127,8 @@ function spawnCapture(command, args, options = {}) {
 
 async function cancelSession({ sessionId, workspace, env, reason, subject }) {
   if (!sessionId) return { exitCode: 1, stderr: "Session id was not observed before cancellation." };
-  const operation = spawnCapture(subject?.nodePath ?? process.execPath, nodeCliArgs([
+  const launch = subjectNodeLaunch(subject);
+  const operation = spawnCapture(launch.executablePath, nodeCliArgs([
     "session", "cancel", sessionId,
     "--workspace", workspace,
     "--provider", "deepseek",
@@ -153,8 +155,9 @@ export async function runCliSubject(options) {
     "--output-format", "stream-json",
     "--output-schema", "3"
   ], subject);
+  const launch = subjectNodeLaunch(subject);
   const startedAt = Date.now();
-  const child = spawn(subject.nodePath ?? process.execPath, args, {
+  const child = spawn(launch.executablePath, args, {
     cwd: workspace,
     env: { ...env, SIGMA_STATE_HOME: stateHome },
     detached: process.platform !== "win32",

@@ -3,7 +3,7 @@ import type {
   ToolEffect
 } from "agent-protocol";
 import { abortable } from "./effect-helpers.js";
-import type { RuntimeSession } from "./types.js";
+import type { ApprovalWaiter, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
 export interface DelegatedApprovalRequest {
@@ -27,7 +27,7 @@ export async function requestDelegatedApproval(
   if (session.approvals.has(request.requestId)) throw new Error(`Duplicate approval '${request.requestId}'.`);
   let resolve!: (value: "allow" | "deny" | "always_allow") => void;
   const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
-  session.approvals.set(request.requestId, {
+  const waiter: ApprovalWaiter = {
     effects: [...request.effects],
     external: {
       callId: request.callId,
@@ -35,29 +35,37 @@ export async function requestDelegatedApproval(
       childId: request.childId
     },
     resolve
-  });
-  await emit(session, "tool.approval_requested", "runtime", {
-    requestId: request.requestId,
-    callId: request.callId,
-    toolName: request.toolName,
-    ...(request.arguments === undefined ? {} : { arguments: request.arguments }),
-    childId: request.childId,
-    effects: request.effects,
-    reason: request.reason,
-    delegated: true
-  });
+  };
+  session.approvals.set(request.requestId, waiter);
+  let completed = false;
+  let requestWasDurable = false;
   try {
-    const decision = await abortable(pending, signal);
-    return decision === "deny" ? "deny" : "allow";
-  } catch (error) {
-    session.approvals.delete(request.requestId);
-    await emit(session, "tool.approval_resolved", "runtime", {
+    await emit(session, "tool.approval_requested", "runtime", {
       requestId: request.requestId,
       callId: request.callId,
+      toolName: request.toolName,
+      ...(request.arguments === undefined ? {} : { arguments: request.arguments }),
       childId: request.childId,
-      decision: "cancelled",
+      effects: request.effects,
+      reason: request.reason,
       delegated: true
     });
-    throw error;
+    requestWasDurable = true;
+    const decision = await abortable(pending, signal);
+    completed = true;
+    return decision === "deny" ? "deny" : "allow";
+  } finally {
+    if (!completed && session.approvals.get(request.requestId) === waiter) {
+      session.approvals.delete(request.requestId);
+      if (requestWasDurable) {
+        await emit(session, "tool.approval_resolved", "runtime", {
+          requestId: request.requestId,
+          callId: request.callId,
+          childId: request.childId,
+          decision: "cancelled",
+          delegated: true
+        });
+      }
+    }
   }
 }

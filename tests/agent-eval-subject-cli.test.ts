@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCliSubject, terminateProcessTree } from "../scripts/eval/subject-cli.mjs";
+import { createDevNodeLaunch } from "../scripts/eval/subject-launch.mjs";
 
 const temporary: string[] = [];
 
@@ -100,7 +101,12 @@ if (args[0] === "session" && args[1] === "cancel") {
       budget: { wallTimeSec: 0.05, modelTurns: 8, toolCalls: 12, costUsd: 0.1 },
       artifactDir,
       redactor: String,
-      subject: { nodePath: process.execPath, cliEntry: subjectPath }
+      subject: {
+        subjectKind: "dev",
+        nodePath: process.execPath,
+        cliEntry: subjectPath,
+        launch: createDevNodeLaunch(process.execPath, subjectPath)
+      }
     });
 
     expect(result.cancellation).toMatchObject({ reason: "experience_budget_exceeded", dimension: "wallTime", cancelExitCode: 0 });

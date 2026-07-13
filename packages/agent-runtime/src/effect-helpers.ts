@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import type {
-  EvidenceRecord, JsonValue, ModelGateway, ModelToolCall, ModelToolDefinition, ToolDescriptor, ToolReceipt,
+  EvidenceRecord, JsonValue, ModelGateway, ModelToolCall, ModelToolDefinition, ToolCallPlan, ToolDescriptor, ToolReceipt,
   ValidationEvidence, WorkspaceDelta, WorkspaceDeltaEvidence
 } from "agent-protocol";
 import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
@@ -188,17 +188,40 @@ export function completionPlanError(session: RuntimeSession, call: ModelToolCall
   );
 }
 
+const scopedMutationEffects = new Set(["filesystem.write", "process.spawn", "destructive", "open_world"]);
+
+function needsWriteScope(plan: ToolCallPlan | undefined, descriptor: ToolDescriptor): boolean {
+  return (plan?.exactEffects ?? descriptor.possibleEffects).some((effect) => scopedMutationEffects.has(effect));
+}
+
+function structuredArguments(call: ModelToolCall): Record<string, JsonValue> | null {
+  const value = call.arguments;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, JsonValue>
+    : null;
+}
+
+function scopedWriteTargets(
+  plan: ToolCallPlan | undefined,
+  descriptor: ToolDescriptor,
+  input: Record<string, JsonValue>
+): string[] {
+  if (plan) return [...new Set([...plan.writePaths, ...plan.checkpointScope])];
+  return (descriptor.writePathArguments ?? []).flatMap((key) =>
+    typeof input[key] === "string" ? [input[key] as string] : []);
+}
+
 export async function writeScopeFailure(
   session: RuntimeSession,
   call: ModelToolCall,
   descriptor: ToolDescriptor,
-  startedAt: string
+  startedAt: string,
+  plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
-  if (!session.strictWriteScope || !descriptor.possibleEffects.some((effect) => effect === "filesystem.write" || effect === "destructive")) return null;
-  const input = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
-    ? call.arguments as Record<string, JsonValue> : null;
+  if (!session.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
+  const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");
-  const targets = (descriptor.writePathArguments ?? []).flatMap((key) => typeof input[key] === "string" ? [input[key] as string] : []);
+  const targets = scopedWriteTargets(plan, descriptor, input);
   if (targets.length === 0) return failed(call, startedAt, `Tool '${call.name}' can write outside declared paths and is disabled in an exclusive shared workspace.`, "write_scope_denied");
   const scopes = await Promise.all(session.writeScope.map(async (scope) =>
     await canonicalWorkspacePath(session.workspacePath, scope)));
@@ -210,10 +233,12 @@ export async function writeScopeFailure(
   return outside.length > 0 ? failed(call, startedAt, `Write target is outside the delegated scope: ${outside.join(", ")}.`, "write_scope_denied") : null;
 }
 
-export function lockKeys(session: RuntimeSession, descriptor: ToolDescriptor): string[] {
+export function lockKeys(session: RuntimeSession, descriptor: ToolDescriptor, plan?: ToolCallPlan): string[] {
   const scope = workspaceLockScope(session);
   const declared = descriptor.resourceKeys.map((key) => `${scope}:${key}`);
-  const writer = descriptor.possibleEffects.some((effect) => effect === "filesystem.write" || effect === "destructive")
+  const effects = plan?.exactEffects ?? descriptor.possibleEffects;
+  const writer = effects.some((effect) => effect === "filesystem.write" || effect === "destructive"
+    || effect === "checkpoint.restore" || effect === "open_world")
     ? [`${scope}:workspace:write`] : [];
   const resources = [...new Set([...declared, ...writer])];
   return descriptor.executionMode === "parallel" ? resources : [...resources, `${scope}:runtime:serial`];
