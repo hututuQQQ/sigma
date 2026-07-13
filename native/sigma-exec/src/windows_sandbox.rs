@@ -2,7 +2,7 @@ use crate::platform::PlatformGuard;
 use crate::protocol::RpcError;
 use crate::sandbox::{NetworkMode, PreparedCommand, ProcessParams, SandboxMode, minimal_roots};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
@@ -97,6 +97,18 @@ const MAX_RECOVERY_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_SCAN_DEPTH: usize = 256;
 const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
 static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherBootstrap {
+    params: ProcessParams,
+    failure_nonce: String,
+}
+
+struct LauncherFailure {
+    nonce: Option<String>,
+    error: RpcError,
+}
 
 #[repr(C)]
 struct NativeUnicodeString {
@@ -200,11 +212,25 @@ pub(crate) fn try_run_internal_mode() -> Option<i32> {
     match std::env::args().nth(1).as_deref() {
         Some(INTERNAL_LAUNCHER) => Some(match run_launcher() {
             Ok(code) => code,
-            Err(error) => {
-                eprintln!(
-                    "sigma-exec sandbox launch failed [{}]: {}",
-                    error.code, error.message
-                );
+            Err(failure) => {
+                if let Some(nonce) = failure.nonce {
+                    let marker = json!({
+                        "phase": "sandbox_launch",
+                        "code": failure.error.code,
+                        "message": failure.error.message,
+                    });
+                    eprintln!(
+                        "{}{}:{}",
+                        crate::process::INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX,
+                        nonce,
+                        marker
+                    );
+                } else {
+                    eprintln!(
+                        "sigma-exec sandbox launch failed [{}]: {}",
+                        failure.error.code, failure.error.message
+                    );
+                }
                 125
             }
         }),
@@ -216,7 +242,12 @@ pub(crate) fn try_run_internal_mode() -> Option<i32> {
 
 pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
     validate_writable_acl_trees(params)?;
-    let payload = serde_json::to_vec(params).map_err(|error| {
+    let failure_nonce = secure_nonce("launch failure marker")?;
+    let payload = serde_json::to_vec(&LauncherBootstrap {
+        params: params.clone(),
+        failure_nonce: failure_nonce.clone(),
+    })
+    .map_err(|error| {
         RpcError::new(
             "broker_protocol_error",
             format!("failed to encode Windows sandbox request: {error}"),
@@ -250,6 +281,7 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
         command,
         bootstrap_stdin: bootstrap,
         protected_path_guards: Vec::new(),
+        launch_failure_nonce: Some(failure_nonce),
     })
 }
 
@@ -351,13 +383,24 @@ pub(crate) fn recover_after_process_quiesced() -> Result<(), RpcError> {
     recover_stale_profiles(&recovery)
 }
 
-fn run_launcher() -> Result<i32, RpcError> {
-    let params: ProcessParams = serde_json::from_slice(&read_bootstrap()?).map_err(|error| {
-        RpcError::new(
-            "broker_protocol_error",
-            format!("invalid Windows sandbox bootstrap: {error}"),
-        )
-    })?;
+fn run_launcher() -> Result<i32, LauncherFailure> {
+    let bytes = read_bootstrap().map_err(|error| LauncherFailure { nonce: None, error })?;
+    let bootstrap: LauncherBootstrap =
+        serde_json::from_slice(&bytes).map_err(|error| LauncherFailure {
+            nonce: None,
+            error: RpcError::new(
+                "broker_protocol_error",
+                format!("invalid Windows sandbox bootstrap: {error}"),
+            ),
+        })?;
+    let nonce = bootstrap.failure_nonce;
+    run_launcher_with_params(bootstrap.params).map_err(|error| LauncherFailure {
+        nonce: Some(nonce),
+        error,
+    })
+}
+
+fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     validate_launcher_params(&params)?;
     let profile_name = ephemeral_profile_name()?;
     // Persist the profile intent before profile creation. A hard kill in the
@@ -531,6 +574,11 @@ fn derive_profile_sid(name: &str) -> Result<PSID, RpcError> {
 }
 
 fn ephemeral_profile_name() -> Result<String, RpcError> {
+    let nonce = secure_nonce("profile nonce")?;
+    Ok(format!("SigmaCode.Exec.{}.{}", std::process::id(), nonce))
+}
+
+fn secure_nonce(label: &str) -> Result<String, RpcError> {
     let mut nonce = [0_u8; 16];
     let status = unsafe {
         BCryptGenRandom(
@@ -543,14 +591,14 @@ fn ephemeral_profile_name() -> Result<String, RpcError> {
     if status != 0 {
         return Err(RpcError::new(
             "sandbox_recovery_failed",
-            format!("BCryptGenRandom(profile nonce) failed with NTSTATUS 0x{status:08x}"),
+            format!("BCryptGenRandom({label}) failed with NTSTATUS 0x{status:08x}"),
         ));
     }
     let nonce = nonce
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok(format!("SigmaCode.Exec.{}.{}", std::process::id(), nonce))
+    Ok(nonce)
 }
 
 fn grant_policy_access(
@@ -1717,7 +1765,7 @@ fn inspect_read_acl_target_path(
 
     let resolved = path.canonicalize().map_err(|error| {
         RpcError::new(
-            "policy_denied",
+            "sandbox_reparse_target_unresolvable",
             format!(
                 "cannot resolve read-only sandbox reparse target '{}': {error}",
                 path.display()
@@ -4805,11 +4853,17 @@ mod tests {
         std::fs::write(&target_file, b"content").expect("create in-root junction file");
         create_test_junction(&junction, &target);
 
+        // Production canonicalizes declared policy roots before planning. Mirror
+        // that contract here so Windows short-path aliases (for example
+        // RUNNER~1 in hosted CI) cannot make an in-root target appear external.
+        let canonical_root = root.canonicalize().expect("canonical read junction root");
+        let planned_junction = canonical_root.join("linked-target");
+
         let mut plan = Vec::new();
         let mut planned_objects = 0;
         plan_read_tree(
-            &root,
-            std::slice::from_ref(&root),
+            &canonical_root,
+            std::slice::from_ref(&canonical_root),
             &[],
             &mut plan,
             &mut planned_objects,
@@ -4818,7 +4872,7 @@ mod tests {
         .expect("plan read tree containing an in-root junction");
         let junction_plan = plan
             .iter()
-            .find(|entry| entry.path == junction)
+            .find(|entry| entry.path == planned_junction)
             .expect("journal the junction object itself");
         assert_eq!(
             junction_plan
@@ -4836,7 +4890,7 @@ mod tests {
         assert!(
             !plan
                 .iter()
-                .any(|entry| entry.path == junction.join("file.txt"))
+                .any(|entry| entry.path == planned_junction.join("file.txt"))
         );
 
         let mut profile = test_profile();
@@ -4861,6 +4915,27 @@ mod tests {
     }
 
     #[test]
+    fn dangling_read_junction_reports_the_stable_sandbox_code() {
+        let unique = ephemeral_profile_name()
+            .expect("create dangling junction profile name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-dangling-junction-{unique}"));
+        let root = fixture.join("root");
+        let target = root.join("target");
+        let junction = root.join("dangling");
+        std::fs::create_dir_all(&target).expect("create dangling junction target");
+        create_test_junction(&junction, &target);
+        std::fs::remove_dir(&target).expect("remove junction target");
+
+        let error = inspect_read_acl_target_path(&junction, std::slice::from_ref(&root))
+            .expect_err("direct dangling junction inspection must fail closed");
+        assert_eq!(error.code, "sandbox_reparse_target_unresolvable");
+
+        std::fs::remove_dir(&junction).expect("remove dangling junction");
+        std::fs::remove_dir_all(&fixture).expect("remove dangling junction fixture");
+    }
+
+    #[test]
     fn read_tree_skips_an_out_of_root_junction_and_rejects_retargeting() {
         let unique = ephemeral_profile_name()
             .expect("create skipped junction profile name")
@@ -4878,28 +4953,36 @@ mod tests {
         create_test_junction(&in_root_link, &inside_a);
         create_test_junction(&outside_link, &outside);
 
+        // Match grant_policy_access: policy roots are canonical before the
+        // planner compares them with resolved reparse targets.
+        let canonical_root = root
+            .canonicalize()
+            .expect("canonical skipped junction root");
+        let planned_in_root_link = canonical_root.join("in-root-link");
+        let planned_outside_link = canonical_root.join("outside-link");
+
         let mut plan = Vec::new();
         let mut planned_objects = 0;
         plan_read_tree(
-            &root,
-            std::slice::from_ref(&root),
+            &canonical_root,
+            std::slice::from_ref(&canonical_root),
             &[],
             &mut plan,
             &mut planned_objects,
             0,
         )
         .expect("skip an out-of-root read junction without granting it");
-        assert!(plan.iter().all(|entry| entry.path != outside_link));
+        assert!(plan.iter().all(|entry| entry.path != planned_outside_link));
         let in_root_plan = plan
             .iter()
-            .find(|entry| entry.path == in_root_link)
+            .find(|entry| entry.path == planned_in_root_link)
             .expect("retain the in-root junction plan");
-        let handle = open_acl_target(&in_root_link).expect("open planned in-root junction");
+        let handle = open_acl_target(&planned_in_root_link).expect("open planned in-root junction");
         std::fs::remove_dir(&in_root_link).expect("remove original in-root junction");
         create_test_junction(&in_root_link, &inside_b);
         let error = assert_read_reparse_target(
             &handle,
-            &in_root_link,
+            &planned_in_root_link,
             in_root_plan
                 .read_reparse_target
                 .as_ref()

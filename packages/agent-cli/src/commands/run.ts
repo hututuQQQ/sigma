@@ -234,7 +234,7 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
       writeNeedsInput(config, stdout, stderr);
       return 2;
     }
-    const configured = await createConfiguredRuntime(config, deps);
+    const configured = await createConfiguredRuntime(config, deps, { surface: "cli" });
     try {
       return await executeRun(configured, config, instruction, mode, stdin, stdout, stderr);
     } finally {

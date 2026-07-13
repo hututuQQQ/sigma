@@ -449,6 +449,17 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             cancellation = cancellation or {"reason": "tui_driver_timeout"}
             terminal.terminate()
         exit_code = terminal.wait()
+        # Close can race the polling interval after the final durable event.
+        # Re-read once and enforce the frozen budget at the terminal boundary.
+        events.extend(tail.read())
+        finished_elapsed_ms = int((time.monotonic() - started) * 1000)
+        final_breach = budget_breach(events, finished_elapsed_ms, config["budget"])
+        if cancellation is None and final_breach:
+            cancellation = {
+                "reason": "experience_budget_exceeded",
+                **final_breach,
+                "observedAtTerminal": True,
+            }
     finally:
         if terminal.alive():
             terminal.terminate()

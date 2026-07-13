@@ -201,8 +201,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
         hookArtifacts: this.options.hookArtifacts,
         putArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
         emit: async (target, type, authority, value) => await this.emit(target, type, authority, value),
-        dispatchHook: async (target, event, value, signal) =>
-          await this.hooks.dispatch(target, event, value, signal)
+        dispatchHook: async (target, event, value, signal) => await this.hooks.dispatch(target, event, value, signal),
+        subjectAttestation: this.options.subjectAttestation
       });
     } catch (error) {
       this.sessions.delete(session.identity.sessionId);

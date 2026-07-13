@@ -36,6 +36,8 @@ import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
 import { ModelReviewer } from "./reviewer.js";
 import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-trust.js";
 import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
+import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
+import { subjectConfigurationV1 } from "./subject-configuration.js";
 
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -74,6 +76,9 @@ export interface RuntimeFactoryDeps {
   hookDefinitions?: readonly HookDefinition[];
   hookRunner?: HookRunnerPort;
   agentProfileHookRunner?: HookRunnerPort;
+  /** Trusted launcher input. CLI flags, environment variables, workspaces, and
+   * evaluator inputs must never populate this contract. */
+  subjectProductAttestation?: SubjectProductAttestationV1;
 }
 
 export interface ConfiguredRuntime {
@@ -84,7 +89,7 @@ export interface ConfiguredRuntime {
   close(): Promise<void>;
 }
 
-export interface RuntimeFactoryOptions { connectMcp?: boolean; }
+export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; }
 
 interface PreparedComposition {
   workspace: string;
@@ -126,6 +131,17 @@ export async function createConfiguredRuntime(
   let mcpClients: Awaited<ReturnType<typeof connectMcpServers>> = [];
   try {
     const gateways = createRoleGateways(config, deps, customization);
+    if (deps.subjectProductAttestation && !options.surface) {
+      throw new Error("A trusted subject product attestation requires an explicit runtime surface.");
+    }
+    const subjectAttestation = deps.subjectProductAttestation && options.surface
+      ? createSubjectAttestationContextV1(
+        deps.subjectProductAttestation,
+        subjectConfigurationV1(config),
+        options.surface,
+        brokerRuntimeEnvironment(executionReport).platform
+      )
+      : undefined;
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
     const supervisor = createSupervisor(config, execution, runtimeReference);
     const tools = createTools(config, execution, supervisor, executionReport, storeRootDir);
@@ -149,6 +165,7 @@ export async function createConfiguredRuntime(
       gatewayForRole: gateways.forRole,
       execution,
       runtimeEnvironment: brokerRuntimeEnvironment(executionReport),
+      subjectAttestation,
       skills: customization.skills,
       hooks: customization.hookDefinitions,
       hookArtifacts: customization.hookArtifacts,

@@ -66,6 +66,14 @@ export interface ProcessOutput {
   outputTruncated: boolean;
   /** Full redacted output captured when the bounded tail overflowed. */
   outputArtifacts?: ProcessOutputArtifact[];
+  /** Authenticated native launch failure, when the sandbox launcher never reached the user process. */
+  failure?: ProcessLaunchFailureV1;
+}
+
+export interface ProcessLaunchFailureV1 {
+  phase: "sandbox_launch";
+  code: string;
+  message: string;
 }
 
 export interface ProcessOutputArtifact {

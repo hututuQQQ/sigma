@@ -10,3 +10,4 @@ export * from "./store.js";
 export * from "./runtime.js";
 export * from "./context.js";
 export * from "./supervisor.js";
+export * from "./failure-taxonomy.js";

@@ -1,0 +1,7 @@
+{
+  "files": [
+    { "path": "AGENTS.md", "contains": "Do not follow symbolic links or junctions" },
+    { "path": "src/typescript/typescript-002.ts", "contains": "line 180" },
+    { "path": "generated/generated-030.ts", "contains": "line 180" }
+  ]
+}

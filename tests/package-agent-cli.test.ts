@@ -934,7 +934,12 @@ describe("package-agent-cli", () => {
       certificateTablePresent: false
     }));
     expect(report.metadata.signing.signatures).toEqual(report.signing.signatures);
-  }, 30_000);
+  // The Windows proof-chain fixture performs a complete ZIP package, PE
+  // identity inspection, integrity/SBOM generation, and archive verification.
+  // It takes roughly 28 seconds under hosted-runner coverage, so a 30-second
+  // deadline does not leave enough scheduling margin to distinguish a slow
+  // runner from a stuck package operation.
+  }, 60_000);
 
   it("can require the target wrapper smoke for release environments", async () => {
     const rootDir = await writePackageFixture();

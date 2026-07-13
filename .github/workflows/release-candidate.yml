@@ -40,13 +40,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Enable pnpm (Linux)
+      - name: Install pinned pnpm (Linux)
         shell: bash
         if: runner.os != 'Windows'
-        run: corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
-      - name: Enable pnpm (Windows)
+        run: npm install --global "pnpm@${PNPM_VERSION}" && test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install pinned pnpm (Windows)
         if: runner.os == 'Windows'
-        run: corepack enable; corepack prepare pnpm@$env:PNPM_VERSION --activate
+        run: |
+          npm install --global "pnpm@$env:PNPM_VERSION"
+          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version: $(pnpm --version)" }
       - name: Install pinned Rust and coverage toolchain
         shell: bash
         if: runner.os != 'Windows'

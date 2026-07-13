@@ -199,4 +199,41 @@ describe("execution output artifact receipts", () => {
     }), context)).rejects.toThrow("injected CAS failure");
     expect(released).toEqual([]);
   });
+
+  it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-launch-failure-receipt-"));
+    const failure = {
+      phase: "sandbox_launch" as const,
+      code: "sandbox_reparse_target_unresolvable",
+      message: "cannot resolve a declared read root"
+    };
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 125, signal: null, durationMs: 5,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: failure.message,
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0, outputTruncated: false,
+      failure
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      state: "exited",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({ broker: broker(execution, poll), sandboxMode: "required", networkMode: "none" });
+    const { context } = await fixtureContext(workspace);
+
+    const foreground = await tools.find((tool) => tool.descriptor.name === "exec")!.execute(
+      request("failed-exec", "exec", { executable: process.execPath }),
+      context
+    );
+    expect(foreground).toMatchObject({ ok: false });
+    expect(foreground.diagnostics).toContain(failure.code);
+
+    const background = await tools.find((tool) => tool.descriptor.name === "process_poll")!.execute(
+      request("failed-poll", "process_poll", { handleId: "process", brokerInstanceId: "broker" }),
+      context
+    );
+    expect(background).toMatchObject({ ok: false });
+    expect(background.diagnostics).toContain(failure.code);
+  });
 });

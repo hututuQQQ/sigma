@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sigma Evaluation Improver"
+  short_description: "Turn sanitized failure clusters into fair product fixes"
+  default_prompt: "Use $sigma-eval-improver to implement one general Sigma reliability invariant from a sanitized cluster card."

@@ -19,6 +19,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 static ARTIFACT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+pub(crate) const INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX: &str =
+    "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE_V1@@";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InternalLaunchFailure {
+    phase: String,
+    code: String,
+    message: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +75,7 @@ struct ManagedProcess {
     stdout_artifact: Arc<Mutex<ArtifactCapture>>,
     stderr_artifact: Arc<Mutex<ArtifactCapture>>,
     output_artifacts: Vec<OutputArtifactMetadata>,
+    launch_failure_nonce: Option<String>,
     protected_path_guards: Vec<ProtectedPathGuard>,
     _guard: PlatformGuard,
 }
@@ -355,6 +366,7 @@ impl BrokerState {
         let initial_input = params.command.stdin.clone();
         let recover_sandbox = params.policy.sandbox == SandboxMode::Required;
         let mut prepared = build_command(&params, self.allow_unsafe)?;
+        let launch_failure_nonce = prepared.launch_failure_nonce.take();
         let handle = format!(
             "{}-{}",
             self.instance_id,
@@ -428,6 +440,7 @@ impl BrokerState {
             stdout_artifact,
             stderr_artifact,
             output_artifacts: Vec::new(),
+            launch_failure_nonce,
             protected_path_guards: prepared.protected_path_guards,
             _guard: guard,
         }));
@@ -642,6 +655,16 @@ fn process_json(
     } else {
         "exited"
     };
+    let complete_stderr = process
+        .stderr_artifact
+        .lock()
+        .ok()
+        .and_then(|capture| capture.completed_text(64 * 1024));
+    let failure = authenticated_launch_failure(
+        process.exit_code,
+        process.launch_failure_nonce.as_deref(),
+        complete_stderr.as_deref().unwrap_or(&stderr.data),
+    );
     let mut value = json!({
         "state": state,
         "exitCode": process.exit_code,
@@ -651,12 +674,49 @@ fn process_json(
         "stderr": snapshot_json(stderr)?,
         "outputArtifacts": process.output_artifacts,
     });
+    if let Some(failure) = failure {
+        value["failure"] = failure;
+    }
     if let Some((timed_out, idle_timed_out)) = execution {
         value["timedOut"] = json!(timed_out);
         value["idleTimedOut"] = json!(idle_timed_out);
         value["cancelled"] = json!(process.cancelled);
     }
     Ok(value)
+}
+
+fn authenticated_launch_failure(
+    exit_code: Option<i32>,
+    expected_nonce: Option<&str>,
+    stderr: &str,
+) -> Option<Value> {
+    if exit_code != Some(125) {
+        return None;
+    }
+    let nonce = expected_nonce?;
+    let prefix = format!("{INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX}{nonce}:");
+    let marker = stderr.lines().find_map(|line| line.strip_prefix(&prefix))?;
+    let failure: InternalLaunchFailure = serde_json::from_str(marker).ok()?;
+    let stable_code = !failure.code.is_empty()
+        && failure.code.len() <= 128
+        && failure.code.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || (index > 0 && byte.is_ascii_digit())
+                || (index > 0 && byte == b'_')
+        });
+    if failure.phase != "sandbox_launch"
+        || !stable_code
+        || failure.message.is_empty()
+        || failure.message.len() > 16_384
+        || failure.message.contains('\0')
+    {
+        return None;
+    }
+    Some(json!({
+        "phase": "sandbox_launch",
+        "code": failure.code,
+        "message": failure.message,
+    }))
 }
 
 fn snapshot_json(snapshot: OutputSnapshot) -> Result<Value, RpcError> {
@@ -749,6 +809,43 @@ mod tests {
                 .contains("sigma-native-ok")
         );
         state.shutdown();
+    }
+
+    #[test]
+    fn accepts_only_nonce_authenticated_internal_launch_failures() {
+        let nonce = "2a7d2b1724a54430a9b2f37a3e3a2d6f";
+        let marker = format!(
+            "{INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX}{nonce}:{}",
+            json!({
+                "phase": "sandbox_launch",
+                "code": "sandbox_reparse_target_unresolvable",
+                "message": "cannot resolve a declared read root",
+            })
+        );
+        assert_eq!(
+            authenticated_launch_failure(Some(125), Some(nonce), &marker)
+                .expect("authenticate internal marker")["code"],
+            "sandbox_reparse_target_unresolvable"
+        );
+        assert!(authenticated_launch_failure(Some(125), Some("wrong"), &marker).is_none());
+        assert!(authenticated_launch_failure(Some(1), Some(nonce), &marker).is_none());
+        assert!(authenticated_launch_failure(Some(125), None, &marker).is_none());
+        assert!(
+            authenticated_launch_failure(
+                Some(125),
+                Some(nonce),
+                &format!(
+                    "{INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX}{nonce}:{}",
+                    json!({
+                        "phase": "sandbox_launch",
+                        "code": "sandbox_unavailable",
+                        "message": "bad",
+                        "forged": true,
+                    })
+                )
+            )
+            .is_none()
+        );
     }
 
     #[test]

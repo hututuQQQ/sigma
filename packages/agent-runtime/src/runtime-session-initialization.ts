@@ -15,6 +15,7 @@ import type {
 import type { RuntimeAgentProfile, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { persistFrozenWorkspaceHookAssets } from "./frozen-hook-assets.js";
+import { emitSubjectAttestationV1, type SubjectAttestationContextV1 } from "./subject-attestation.js";
 
 type DispatchHook = (
   session: RuntimeSession,
@@ -33,6 +34,7 @@ export interface RuntimeSessionInitializationOptions {
   putArtifact(sessionId: string, content: string | Uint8Array): Promise<string>;
   emit: RuntimeEventEmitter;
   dispatchHook: DispatchHook;
+  subjectAttestation?: SubjectAttestationContextV1;
 }
 
 function initialPlan(input: StartSession): PlanGraph {
@@ -154,6 +156,7 @@ export async function initializeRuntimeSession(
     modelRole: session.services.modelRole,
     ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {})
   });
+  await emitSubjectAttestationV1(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);
   await emitFrozenCustomization(session, options);
   await options.dispatchHook(session, "session_start", {

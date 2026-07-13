@@ -127,8 +127,8 @@ describe("agent experience event metrics", () => {
       contextCompactions: 23
     });
     expect(metrics.usageTotals).toMatchObject({ records: 60, inputTokens: 1_080_000, outputTokens: 6_000 });
-    expect(metrics.repeatedExactRequests).toMatchObject({ total: 130, unique: 1, repeated: 129 });
-    expect(metrics.repeatedExactRequests.rate).toBeCloseTo(129 / 130);
+    expect(metrics.repeatedExactRequests).toMatchObject({ total: 130, unique: 60, repeated: 70 });
+    expect(metrics.repeatedExactRequests.rate).toBeCloseTo(70 / 130);
     expect(metrics.repeatedOutputs.repeated).toBe(128);
     expect(metrics.consecutiveToolFailures).toMatchObject({ longest: 38 });
     expect(metrics.consecutiveToolFailures.streaks[0]).toMatchObject({ count: 38, tools: { read_file: 38 } });
@@ -137,7 +137,7 @@ describe("agent experience event metrics", () => {
       modelTurns: 21,
       toolCalls: 91,
       compactions: 15,
-      repeatedRequests: 91
+      repeatedRequests: 70
     });
     expect(metrics.terminal).toMatchObject({ status: "failed", code: "budget_exhausted" });
     expect(metrics.hardFailures.map((item: { code: string }) => item.code)).toEqual(["budget_exhausted", "deadline_exceeded"]);
@@ -170,7 +170,7 @@ describe("agent experience event metrics", () => {
 
     const metrics = reduceAgentEvents(events);
 
-    expect(metrics.postAnswerChurn).toMatchObject({ events: 5, modelTurns: 1, toolCalls: 2 });
+    expect(metrics.postAnswerChurn).toMatchObject({ answerSeq: 10, events: 0, modelTurns: 0, toolCalls: 0 });
     expect(metrics.steer).toMatchObject({ count: 1, staleActions: 1, staleToolCalls: 1, maxStopDelayMs: 2_000 });
     expect(metrics.workspaceDeltas).toMatchObject({ count: 1, added: ["new.ts"], changedFiles: ["new.ts"] });
     expect(metrics.hardFailures).toContainEqual({ code: "read_only_workspace_mutation", seq: null });
@@ -219,7 +219,7 @@ describe("agent experience event metrics", () => {
     ];
 
     expect(reduceAgentEvents(events).postAnswerChurn).toMatchObject({
-      answerSeq: 2,
+      answerSeq: 6,
       events: 0,
       modelTurns: 0,
       toolCalls: 0,
@@ -240,6 +240,155 @@ describe("agent experience event metrics", () => {
     expect(metrics.terminal.status).toBe("incomplete");
     expect(metrics.counts.modelTurns).toBe(1);
     expect(metrics.postAnswerChurn).toMatchObject({ answerSeq: null, events: 0, toolCalls: 0 });
+  });
+
+  it("clusters typed sandbox failures across actions, deduplicates execution/tool evidence, and measures ten-call overshoot", () => {
+    const make = eventFactory("sandbox-episode");
+    const events = [make("run.started", { mode: "analyze" })];
+    for (let index = 0; index < 13; index += 1) {
+      const callId = `process-${index}`;
+      events.push(make("execution.planned", {
+        executionId: callId,
+        toolCallId: callId,
+        plan: { exactEffects: ["process.spawn.readonly"], processMode: "pipe" }
+      }));
+      events.push(make("tool.requested", { callId, name: "execute", arguments: { variant: index } }));
+      events.push(make("execution.failed", {
+        executionId: callId,
+        code: "sandbox_reparse_target_unresolvable",
+        message: "redacted"
+      }));
+      events.push(make("tool.failed", {
+        callId,
+        name: "execute",
+        ok: false,
+        output: "redacted",
+        diagnostics: ["sandbox_reparse_target_unresolvable"]
+      }));
+      if (index === 4) {
+        events.push(make("tool.completed", {
+          callId: "read-success",
+          name: "read_file",
+          ok: true,
+          output: "ok",
+          observedEffects: ["filesystem.read"]
+        }));
+      }
+    }
+    events.push(make("run.failed", {
+      kind: "recoverable_failure", code: "budget_exhausted", message: "budget exhausted"
+    }));
+
+    const convergence = reduceAgentEvents(events).failureConvergence;
+    expect(convergence).toMatchObject({
+      episodeCount: 1,
+      byFamily: { execution_sandbox: 13 },
+      failFastEligibleEpisodes: 1,
+      failFastMissed: 1,
+      totalOvershoot: 10,
+      recoveryFailed: 1
+    });
+    expect(convergence.episodes[0]).toMatchObject({
+      family: "execution_sandbox", attempts: 13, overshoot: 10, failFastMissed: true
+    });
+    expect(convergence.episodes[0].evidenceSeq).toHaveLength(26);
+  });
+
+  it("requires a successful process spawn to recover an execution cluster and ignores generic denials", () => {
+    const make = eventFactory("sandbox-recovery");
+    const events = [make("run.started", { mode: "analyze" })];
+    for (let index = 0; index < 3; index += 1) {
+      const executionId = `failed-${index}`;
+      events.push(make("execution.failed", { executionId, code: "sandbox_setup_failed", message: "redacted" }));
+    }
+    events.push(make("tool.completed", {
+      callId: "read", name: "list_files", ok: true, output: "ok", observedEffects: ["filesystem.read"]
+    }));
+    events.push(make("execution.failed", { executionId: "generic", code: "policy_denied", message: "redacted" }));
+    events.push(make("tool.failed", {
+      callId: "exit", name: "execute", ok: false, output: "redacted", diagnostics: ["exit_code=125"]
+    }));
+    events.push(make("process.spawned", {
+      processId: "process", executionId: "recovery", mode: "pipe", brokerInstanceId: "broker"
+    }));
+    events.push(make("run.completed", { kind: "completed", message: "done", evidence: [] }));
+
+    const convergence = reduceAgentEvents(events).failureConvergence;
+    expect(convergence).toMatchObject({
+      episodeCount: 1,
+      recoverySucceeded: 1,
+      recoveryFailed: 0,
+      failFastTriggeredOnTime: 0,
+      failFastMissed: 0
+    });
+    expect(convergence.episodes[0]).toMatchObject({ attempts: 3, status: "recovered", overshoot: 0 });
+  });
+
+  it("scopes duplicate requests to workspace and effect revisions", () => {
+    const make = eventFactory("revision-aware");
+    const request = (callId: string, effectRevision: number) => make("tool.requested", {
+      callId, name: "read_file", arguments: { path: "same" }, effectRevision
+    });
+    const events = [
+      make("run.started", { mode: "change" }),
+      make("model.started", { turnId: 1, effectRevision: 1 }),
+      request("read-1", 1), request("read-2", 1),
+      make("model.started", { turnId: 2, effectRevision: 2 }),
+      request("read-3", 2),
+      make("tool.completed", {
+        callId: "write", name: "write_file", ok: true, output: "ok",
+        observedEffects: ["filesystem.write"],
+        workspaceDelta: { added: [], modified: ["changed"], deleted: [] }
+      }),
+      make("model.started", { turnId: 3, effectRevision: 3 }),
+      request("read-4", 3), request("read-5", 3),
+      make("run.completed", { kind: "completed", message: "done", evidence: [] })
+    ];
+
+    expect(reduceAgentEvents(events).repeatedExactRequests).toMatchObject({
+      total: 5, unique: 3, repeated: 2, rate: 0.4
+    });
+  });
+
+  it("tracks write contracts and checkpoint lifecycle without treating plans as workspace writes", () => {
+    const make = eventFactory("mutation-discipline");
+    const checkpoint = (checkpointId: string, status: string, delta?: Record<string, string[]>) => ({
+      checkpointId, sessionId: "mutation-discipline", runId: "run", status,
+      createdAt: new Date(epoch).toISOString(), preManifestDigest: "pre", ...(delta ? { delta } : {})
+    });
+    const events = [
+      make("run.started", { mode: "analyze" }),
+      make("execution.planned", {
+        executionId: "execution-mutation", toolCallId: "tool-mutation",
+        plan: { exactEffects: ["filesystem.write"], processMode: "none" }
+      }),
+      make("execution.failed", { executionId: "execution-mutation", code: "write_scope_required", message: "redacted" }),
+      make("tool.failed", {
+        callId: "tool-mutation", name: "write_file", ok: false, output: "redacted",
+        diagnostics: ["write_scope_required"]
+      }),
+      make("checkpoint.created", checkpoint("empty", "open")),
+      make("checkpoint.sealed", checkpoint("empty", "sealed", { added: [], modified: [], deleted: [] })),
+      make("checkpoint.restored", checkpoint("restored-without-delta", "restored")),
+      make("checkpoint.created", checkpoint("left-open", "open")),
+      make("execution.failed", { executionId: "limit", code: "checkpoint_limit_exceeded", message: "redacted" }),
+      make("run.failed", { kind: "fatal", code: "budget_exhausted", message: "done" })
+    ];
+
+    expect(reduceAgentEvents(events).mutationDiscipline).toEqual({
+      mutationRequests: 1,
+      failedMutationRequests: 1,
+      writeContractFailures: 1,
+      checkpointLimitFailures: 1,
+      checkpointsCreated: 2,
+      checkpointsSealed: 1,
+      checkpointsRestored: 1,
+      emptyCheckpoints: 1,
+      openCheckpointsAtTerminal: 1,
+      invalidCheckpointActions: 0,
+      mutationFallbacksAfterInfrastructureFailure: 0,
+      workspaceDeltaEvents: 0
+    });
   });
 });
 

@@ -1,139 +1,371 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "frozenRunPolicies": {
+    "quick": {
+      "schemaVersion": 1,
+      "seed": 20260714,
+      "repeat": 1,
+      "budget": {
+        "wallTimeSec": 300,
+        "modelTurns": 16,
+        "toolCalls": 30,
+        "costUsd": 0.25
+      },
+      "schedule": "seeded_round_robin",
+      "abOrder": "interleaved_baseline_first"
+    },
+    "experience": {
+      "schemaVersion": 1,
+      "seed": 20260714,
+      "repeat": 3,
+      "budget": {
+        "wallTimeSec": 600,
+        "modelTurns": 40,
+        "toolCalls": 120,
+        "costUsd": 0.8
+      },
+      "schedule": "seeded_round_robin",
+      "abOrder": "interleaved_baseline_first"
+    },
+    "repo-scale": {
+      "schemaVersion": 1,
+      "seed": 20260714,
+      "repeat": 3,
+      "budget": {
+        "wallTimeSec": 45,
+        "modelTurns": 4,
+        "toolCalls": 6,
+        "costUsd": 0.03
+      },
+      "schedule": "seeded_round_robin",
+      "abOrder": "interleaved_baseline_first"
+    }
+  },
   "scenarios": [
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "line-count-readonly",
       "title": "Scoped source line count without workspace mutation",
-      "suites": ["quick", "experience"],
-      "fixture": { "workspace": "scenarios/line-count-readonly/workspace" },
+      "suites": [
+        "quick",
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/line-count-readonly/workspace",
+        "setupAfterCommit": [
+          {
+            "type": "link",
+            "path": "links/source-alias",
+            "target": "src",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/dangling-alias",
+            "target": "missing/directory",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/outside-alias",
+            "target": "outside/directory",
+            "linkKind": "directory",
+            "targetScope": "outside_workspace",
+            "targetExists": true
+          }
+        ]
+      },
       "userMessages": [
         "请统计 src 和 tests 目录中所有 .js 与 .ts 文件的非空行数。分别列出每个文件的行数和总计，不要修改任何文件。"
       ],
       "surface": "tui",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "tiny",
       "allowedChanges": [],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/line-count-readonly/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/line-count-readonly/verifier.json"
+            ],
             "expectedExitCode": 0,
             "timeoutMs": 10000
           },
-          { "type": "answer", "pattern": "counter\\.js[^\\n]*3", "minMatches": 1 },
-          { "type": "answer", "pattern": "constants\\.ts[^\\n]*2", "minMatches": 1 },
-          { "type": "answer", "pattern": "counter\\.test\\.js[^\\n]*6", "minMatches": 1 },
-          { "type": "answer", "pattern": "(?:total|总计|合计)[^\\n]*11", "flags": "iu", "minMatches": 1 },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "answer",
+            "pattern": "counter\\.js[^\\n]*3",
+            "minMatches": 1
+          },
+          {
+            "type": "answer",
+            "pattern": "constants\\.ts[^\\n]*2",
+            "minMatches": 1
+          },
+          {
+            "type": "answer",
+            "pattern": "counter\\.test\\.js[^\\n]*6",
+            "minMatches": 1
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:total|总计|合计)[^\\n]*11",
+            "flags": "iu",
+            "minMatches": 1
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "line-count-readonly",
+        "fileCount": 4,
+        "lineCount": 13
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "single-file-edit",
       "title": "Small exact edit constrained to one file",
-      "suites": ["quick", "experience"],
-      "fixture": { "workspace": "scenarios/single-file-edit/workspace" },
+      "suites": [
+        "quick",
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/single-file-edit/workspace"
+      },
       "userMessages": [
         "把 config.json 里的 theme 从 light 改成 dark，其他配置和文件都不要改。完成后说明改了什么。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["config.json"],
+      "allowedChanges": [
+        "config.json"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/single-file-edit/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/single-file-edit/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "file", "path": "config.json", "contains": "\"theme\": \"dark\"" },
-          { "type": "git_diff", "allowedPaths": ["config.json"] }
+          {
+            "type": "file",
+            "path": "config.json",
+            "contains": "\"theme\": \"dark\""
+          },
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "config.json"
+            ]
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "single-file-edit",
+        "fileCount": 2,
+        "lineCount": 7
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "fix-failing-test",
       "title": "Diagnose and fix an existing failing test",
-      "suites": ["quick", "experience"],
-      "fixture": { "workspace": "scenarios/fix-failing-test/workspace" },
+      "suites": [
+        "quick",
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/fix-failing-test/workspace"
+      },
       "userMessages": [
         "这个小项目现有测试失败了。请定位并修复实现中的问题，保持测试意图不变，然后运行测试验证。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["math.mjs"],
+      "allowedChanges": [
+        "math.mjs"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/fix-failing-test/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/fix-failing-test/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "command", "argv": ["node", "--test", "math.test.mjs"], "expectedExitCode": 0 },
-          { "type": "git_diff", "allowedPaths": ["math.mjs"] }
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "--test",
+              "math.test.mjs"
+            ],
+            "expectedExitCode": 0
+          },
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "math.mjs"
+            ]
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "fix-failing-test",
+        "fileCount": 2,
+        "lineCount": 10
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "ambiguity-one-question",
       "title": "Ask one focused question for a material ambiguity",
-      "suites": ["quick", "experience"],
-      "fixture": { "workspace": "scenarios/ambiguity-one-question/workspace" },
+      "suites": [
+        "quick",
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/ambiguity-one-question/workspace"
+      },
       "userMessages": [
         "请把 settings.json 里的 timeout 调整成线上要使用的值。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "needs_input",
-      "budget": "tiny",
       "allowedChanges": [],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/ambiguity-one-question/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/ambiguity-one-question/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "answer", "pattern": "(?:request|idle|请求|空闲).*(?:timeout|超时)", "flags": "isu", "minMatches": 1 },
-          { "type": "event_count", "eventType": "tool.requested", "toolName": "request_user_input", "minCount": 1, "maxCount": 1 },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "answer",
+            "pattern": "(?:request|idle|请求|空闲).*(?:timeout|超时)",
+            "flags": "isu",
+            "minMatches": 1
+          },
+          {
+            "type": "event_count",
+            "eventType": "tool.requested",
+            "toolName": "request_user_input",
+            "minCount": 1,
+            "maxCount": 1
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "user.interaction"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "ambiguity-one-question",
+        "fileCount": 2,
+        "lineCount": 7
+      },
+      "riskClass": "interactive",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "steer-cleanup",
       "title": "Honor a mid-run steer and clean abandoned work",
-      "suites": ["quick", "experience"],
-      "fixture": { "workspace": "scenarios/steer-cleanup/workspace" },
+      "suites": [
+        "quick",
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/steer-cleanup/workspace"
+      },
       "userMessages": [
         "新建 draft.md，写一份至少六段的发布公告草稿。"
       ],
       "surface": "tui",
       "permissionPolicy": "allow_once",
       "expectedTerminal": "completed",
-      "budget": "small",
       "allowedChanges": [
         "draft.md"
       ],
       "interactions": [
         {
           "triggers": [
-            { "kind": "first_mutation" }
+            {
+              "kind": "first_mutation"
+            }
           ],
           "action": "steer",
           "text": "停止刚才的任务。清理这次任务产生的所有临时改动，让工作区恢复到开始前的状态，然后确认已经停止。"
@@ -143,103 +375,240 @@
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/steer-cleanup/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/steer-cleanup/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "answer", "pattern": "(?:stopp?ed|clean|revert|已停止|清理|恢复)", "flags": "iu", "minMatches": 1 },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "answer",
+            "pattern": "(?:stopp?ed|clean|revert|已停止|清理|恢复)",
+            "flags": "iu",
+            "minMatches": 1
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write",
+        "user.interaction"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "steer-cleanup",
+        "fileCount": 1,
+        "lineCount": 3
+      },
+      "riskClass": "interactive",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "multi-file-change",
       "title": "Coordinated implementation and documentation update",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/multi-file-change/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/multi-file-change/workspace"
+      },
       "userMessages": [
         "把导出的 API 版本升级到 v2，并同步 README 中的当前版本说明。不要修改测试。运行测试确认实现与文档一致。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["src/version.mjs", "README.md"],
+      "allowedChanges": [
+        "src/version.mjs",
+        "README.md"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/multi-file-change/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/multi-file-change/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "command", "argv": ["node", "--test", "app.test.mjs"], "expectedExitCode": 0 },
-          { "type": "git_diff", "allowedPaths": ["src/version.mjs", "README.md"] }
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "--test",
+              "app.test.mjs"
+            ],
+            "expectedExitCode": 0
+          },
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "src/version.mjs",
+              "README.md"
+            ]
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "multi-file-change",
+        "fileCount": 3,
+        "lineCount": 11
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "already-satisfied-noop",
       "title": "Recognize an already satisfied request without churn",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/already-satisfied-noop/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/already-satisfied-noop/workspace"
+      },
       "userMessages": [
         "确保 greeting.txt 的完整内容是 `hello, sigma` 并以换行结尾。如果已经满足，就不要改任何文件。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "tiny",
       "allowedChanges": [],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/already-satisfied-noop/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/already-satisfied-noop/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "already-satisfied-noop",
+        "fileCount": 2,
+        "lineCount": 4
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "tool-failure-recovery",
       "title": "Recover from an unavailable preferred input",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/tool-failure-recovery/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/tool-failure-recovery/workspace"
+      },
       "userMessages": [
         "读取 primary.txt 并直接告诉我其中的值；如果这个文件不可用，请按 README 的说明改用备用来源。不要修改工作区。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "tiny",
       "allowedChanges": [],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/tool-failure-recovery/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/tool-failure-recovery/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "answer", "pattern": "fallback-value-42", "minMatches": 1 },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "answer",
+            "pattern": "fallback-value-42",
+            "minMatches": 1
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "tool-failure-recovery",
+        "fileCount": 2,
+        "lineCount": 4
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "dirty-worktree-preservation",
       "title": "Preserve a user's pre-existing dirty worktree",
-      "suites": ["experience"],
+      "suites": [
+        "experience"
+      ],
       "fixture": {
         "workspace": "scenarios/dirty-worktree-preservation/workspace",
         "setupAfterCommit": [
-          { "type": "append", "path": "notes.txt", "content": "- keep my unfinished local note\n" }
+          {
+            "type": "append",
+            "path": "notes.txt",
+            "content": "- keep my unfinished local note\n"
+          }
         ]
       },
       "userMessages": [
@@ -248,99 +617,530 @@
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["src/app.mjs"],
+      "allowedChanges": [
+        "src/app.mjs"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/dirty-worktree-preservation/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/dirty-worktree-preservation/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "git_diff", "allowedPaths": ["src/app.mjs"], "preserveInitial": true }
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "src/app.mjs"
+            ],
+            "preserveInitial": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "dirty-worktree-preservation",
+        "fileCount": 2,
+        "lineCount": 2
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "nested-instructions-unicode",
       "title": "Respect nested instructions and Unicode paths",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/nested-instructions-unicode/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/nested-instructions-unicode/workspace"
+      },
       "userMessages": [
         "请按照仓库说明，把 `feature/resources/greeting.txt` 的 message 更新为 `你好，Sigma！`。不要改变 locale 或其他文件。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["feature/resources/greeting.txt"],
+      "allowedChanges": [
+        "feature/resources/greeting.txt"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/nested-instructions-unicode/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/nested-instructions-unicode/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "git_diff", "allowedPaths": ["feature/resources/greeting.txt"] }
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "feature/resources/greeting.txt"
+            ]
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "nested-instructions-unicode",
+        "fileCount": 3,
+        "lineCount": 10
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "large-context-lookup",
       "title": "Find one fact in a large file without repeated full reads",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/large-context-lookup/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/large-context-lookup/workspace"
+      },
       "userMessages": [
         "在 data/catalog.txt 中查找 record-1739 的 value，直接给出这个 value 和定位依据，不要修改任何文件。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "medium",
       "allowedChanges": [],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/large-context-lookup/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/large-context-lookup/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "answer", "pattern": "violet-1739", "minMatches": 1 },
-          { "type": "git_diff", "requireClean": true }
+          {
+            "type": "answer",
+            "pattern": "violet-1739",
+            "minMatches": 1
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
-      }
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "large-context-lookup",
+        "fileCount": 2,
+        "lineCount": 1803
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
     },
     {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "id": "validation-failure-honesty",
       "title": "Report a validation failure without claiming success",
-      "suites": ["experience"],
-      "fixture": { "workspace": "scenarios/validation-failure-honesty/workspace" },
+      "suites": [
+        "experience"
+      ],
+      "fixture": {
+        "workspace": "scenarios/validation-failure-honesty/workspace"
+      },
       "userMessages": [
         "把 service.mjs 的 retryLimit 从 2 改成 3，然后运行 `node check.mjs` 验证。请如实报告验证结果。"
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
       "expectedTerminal": "completed",
-      "budget": "small",
-      "allowedChanges": ["service.mjs"],
+      "allowedChanges": [
+        "service.mjs"
+      ],
       "interactions": [],
       "verifier": {
         "checks": [
           {
             "type": "command",
-            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/validation-failure-honesty/verifier.json"],
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/validation-failure-honesty/verifier.json"
+            ],
             "expectedExitCode": 0
           },
-          { "type": "command", "argv": ["node", "check.mjs"], "expectedExitCode": 1 },
-          { "type": "answer", "pattern": "(?:validation|check|test|验证|检查|测试).*(?:fail|error|unavailable|失败|错误|不可用)", "flags": "isu", "minMatches": 1 },
-          { "type": "answer", "pattern": "(?:all tests? pass(?:ed)?|validation pass(?:ed)?|验证通过|测试全部通过)", "flags": "iu", "minMatches": 0, "maxMatches": 0 },
-          { "type": "git_diff", "allowedPaths": ["service.mjs"] }
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "check.mjs"
+            ],
+            "expectedExitCode": 1
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:validation|check|test|验证|检查|测试).*(?:fail|error|unavailable|失败|错误|不可用)",
+            "flags": "isu",
+            "minMatches": 1
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:all tests? pass(?:ed)?|validation pass(?:ed)?|验证通过|测试全部通过)",
+            "flags": "iu",
+            "minMatches": 0,
+            "maxMatches": 0
+          },
+          {
+            "type": "git_diff",
+            "allowedPaths": [
+              "service.mjs"
+            ]
+          }
+        ]
+      },
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "filesystem.write"
+      ],
+      "repoScale": {
+        "profile": "tiny",
+        "fixtureFamily": "validation-failure-honesty",
+        "fileCount": 2,
+        "lineCount": 3
+      },
+      "riskClass": "workspace_write",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f"
+    },
+    {
+      "schemaVersion": 2,
+      "suites": [
+        "repo-scale"
+      ],
+      "fixture": {
+        "workspace": "scenarios/repo-scale-aggregate/workspace",
+        "generator": {
+          "kind": "repo-scale-v1",
+          "seed": 20260714,
+          "fileCount": 500,
+          "lineCount": 90000
+        },
+        "setupAfterCommit": [
+          {
+            "type": "link",
+            "path": "links/source-alias",
+            "target": "src/typescript",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/dangling-alias",
+            "target": "missing/directory",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/outside-alias",
+            "target": "outside/directory",
+            "linkKind": "directory",
+            "targetScope": "outside_workspace",
+            "targetExists": true
+          }
+        ]
+      },
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "allowedChanges": [],
+      "interactions": [],
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "repository.aggregate"
+      ],
+      "repoScale": {
+        "profile": "repo_scale",
+        "fixtureFamily": "deterministic-multilang-v1",
+        "fileCount": 500,
+        "lineCount": 90000
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f",
+      "id": "repo-aggregate-total",
+      "title": "Repository-wide file and physical-line totals",
+      "userMessages": [
+        "Read the repository instructions, then report the total included source/test file count and physical line count. State the scope and exclusions. Do not modify the workspace."
+      ],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/repo-scale-aggregate/verifier.json"
+            ],
+            "expectedExitCode": 0,
+            "timeoutMs": 10000
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:440)[^\\n]*(?:79[,.]?200|79200)|(?:79[,.]?200|79200)[^\\n]*(?:440)",
+            "flags": "iu"
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 2,
+      "suites": [
+        "repo-scale"
+      ],
+      "fixture": {
+        "workspace": "scenarios/repo-scale-aggregate/workspace",
+        "generator": {
+          "kind": "repo-scale-v1",
+          "seed": 20260714,
+          "fileCount": 500,
+          "lineCount": 90000
+        },
+        "setupAfterCommit": [
+          {
+            "type": "link",
+            "path": "links/source-alias",
+            "target": "src/typescript",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/dangling-alias",
+            "target": "missing/directory",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/outside-alias",
+            "target": "outside/directory",
+            "linkKind": "directory",
+            "targetScope": "outside_workspace",
+            "targetExists": true
+          }
+        ]
+      },
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "allowedChanges": [],
+      "interactions": [],
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "repository.aggregate"
+      ],
+      "repoScale": {
+        "profile": "repo_scale",
+        "fixtureFamily": "deterministic-multilang-v1",
+        "fileCount": 500,
+        "lineCount": 90000
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f",
+      "id": "repo-aggregate-languages",
+      "title": "Repository-wide file totals by language",
+      "userMessages": [
+        "Read the repository instructions and report included file counts by TypeScript, JavaScript, Python, and Rust, plus the total. Do not modify the workspace."
+      ],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/repo-scale-aggregate/verifier.json"
+            ],
+            "expectedExitCode": 0,
+            "timeoutMs": 10000
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:TypeScript|\\.ts)[^\\n]*170",
+            "flags": "iu"
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:JavaScript|\\.js)[^\\n]*130",
+            "flags": "iu"
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:Python|\\.py)[^\\n]*80",
+            "flags": "iu"
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:Rust|\\.rs)[^\\n]*60",
+            "flags": "iu"
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:total|\\u603b\\u8ba1)[^\\n]*440",
+            "flags": "iu"
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 2,
+      "suites": [
+        "repo-scale"
+      ],
+      "fixture": {
+        "workspace": "scenarios/repo-scale-aggregate/workspace",
+        "generator": {
+          "kind": "repo-scale-v1",
+          "seed": 20260714,
+          "fileCount": 500,
+          "lineCount": 90000
+        },
+        "setupAfterCommit": [
+          {
+            "type": "link",
+            "path": "links/source-alias",
+            "target": "src/typescript",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/dangling-alias",
+            "target": "missing/directory",
+            "linkKind": "directory"
+          },
+          {
+            "type": "link",
+            "path": "links/outside-alias",
+            "target": "outside/directory",
+            "linkKind": "directory",
+            "targetScope": "outside_workspace",
+            "targetExists": true
+          }
+        ]
+      },
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "allowedChanges": [],
+      "interactions": [],
+      "capabilities": [
+        "filesystem.read",
+        "process.execute",
+        "repository.aggregate"
+      ],
+      "repoScale": {
+        "profile": "repo_scale",
+        "fixtureFamily": "deterministic-multilang-v1",
+        "fileCount": 500,
+        "lineCount": 90000
+      },
+      "riskClass": "read_only",
+      "platforms": [
+        "win32-x64",
+        "linux-x64"
+      ],
+      "toolchainDigest": "sha256:27ab8199387bc1f0be6cfa0938feb6c094158f1ffb33aa6df1442fc0d08dd09f",
+      "id": "repo-aggregate-source-tests",
+      "title": "Repository-wide source and test split",
+      "userMessages": [
+        "Read the repository instructions and report separate included file and physical-line totals for production source and tests. Do not modify the workspace."
+      ],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": [
+              "node",
+              "$MANIFEST_DIR/_shared/verify-workspace.mjs",
+              "$WORKSPACE",
+              "$MANIFEST_DIR/scenarios/repo-scale-aggregate/verifier.json"
+            ],
+            "expectedExitCode": 0,
+            "timeoutMs": 10000
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:source|production|\\u6e90\\u7801)[^\\n]*(?:380)[^\\n]*(?:68[,.]?400|68400)",
+            "flags": "iu"
+          },
+          {
+            "type": "answer",
+            "pattern": "(?:test|tests|\\u6d4b\\u8bd5)[^\\n]*(?:60)[^\\n]*(?:10[,.]?800|10800)",
+            "flags": "iu"
+          },
+          {
+            "type": "git_diff",
+            "requireClean": true
+          }
         ]
       }
     }

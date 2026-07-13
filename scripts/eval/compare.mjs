@@ -7,10 +7,13 @@ import {
   EVAL_DIMENSIONS,
   EVAL_METRIC_PATHS,
   buildEvalRunReport,
+  evalAttemptPassed,
+  evalDimensionPassed,
+  evalMetricValue,
   summarizeEvalMetrics
 } from "./report.mjs";
 
-export const EVAL_COMPARISON_SCHEMA_VERSION = 1;
+export const EVAL_COMPARISON_SCHEMA_VERSION = 2;
 export const EVAL_COMPATIBILITY_FIELDS = Object.freeze([
   "scenarioDigest",
   "evaluatorDigest",
@@ -33,7 +36,9 @@ const LOWER_IS_BETTER = new Set([
   "reviewerCostMicroUsd", "reviewerCostUsd", "reviewerLatencyMs", "approvals", "userInteractions",
   "extraUserInteractions", "contextCompactions", "duplicateRequestRate",
   "duplicateRequests", "duplicateOutputBytes", "stagnationWindows", "longestStagnationMs",
-  "postAnswerDurationMs", "postAnswerToolCalls", "steerStopLatencyMs", "staleActionsAfterSteer"
+  "postAnswerDurationMs", "postAnswerToolCalls", "steerStopLatencyMs", "staleActionsAfterSteer",
+  "failureOvershoot", "failFastMissed", "infrastructureEpisodes", "writeContractFailures",
+  "checkpointLimitFailures", "emptyCheckpoints", "openCheckpointsAtTerminal"
 ]);
 
 function uniqueStrings(values) {
@@ -42,6 +47,11 @@ function uniqueStrings(values) {
 
 function scenarioAttempts(run, scenarioId) {
   return run.attempts.filter((attempt) => attempt.scenarioId === scenarioId);
+}
+
+function metricAttempts(run, scenarioId) {
+  const attempts = scenarioAttempts(run, scenarioId);
+  return run.sourceSchemaVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
 }
 
 function subjectValues(run, scenarioId, field) {
@@ -73,10 +83,15 @@ function infrastructureValidity(run) {
   ]);
   const attemptErrors = run.attempts.reduce((count, attempt) => count + (attempt.dimensions?.reliability?.signals ?? [])
     .filter((signal) => invalidCodes.has(signal?.code)).length, 0);
+  const invalidAttempts = run.sourceSchemaVersion === 1 ? 0
+    : run.attempts.filter((attempt) => attempt.validity !== "valid").length;
   const expectedSamples = run.scenarios.reduce((total, scenario) => total + Number(scenario.expectedAttempts ?? run.repeat ?? 0), 0);
   const actualSamples = run.attempts.length;
   const sampleMismatch = expectedSamples !== actualSamples;
-  return { valid: runErrors === 0 && attemptErrors === 0 && !sampleMismatch, runErrors, attemptErrors, expectedSamples, actualSamples };
+  return {
+    valid: runErrors === 0 && attemptErrors === 0 && invalidAttempts === 0 && !sampleMismatch,
+    runErrors, attemptErrors, invalidAttempts, expectedSamples, actualSamples
+  };
 }
 
 function compatibilityFields(baseline, candidate) {
@@ -92,6 +107,13 @@ function compatibilityFields(baseline, candidate) {
 
 function runCompatibilityMismatches(baseline, candidate) {
   const mismatches = [];
+  if (baseline.sourceSchemaVersion !== candidate.sourceSchemaVersion) {
+    mismatches.push({
+      scope: "run", field: "schemaVersion", baseline: baseline.sourceSchemaVersion,
+      candidate: candidate.sourceSchemaVersion,
+      reason: "V1 and V2 evaluation reports cannot be statistically compared."
+    });
+  }
   if (baseline.runId === candidate.runId) {
     mismatches.push({
       scope: "run", field: "runId", baseline: baseline.runId, candidate: candidate.runId,
@@ -150,8 +172,8 @@ function scenarioFieldMismatches(baseline, candidate, scenarioId, requiredFields
 
 function metricSampleMismatches(baseline, candidate, scenarioId) {
   const mismatches = [];
-  const baselineMetrics = summarizeEvalMetrics(scenarioAttempts(baseline, scenarioId));
-  const candidateMetrics = summarizeEvalMetrics(scenarioAttempts(candidate, scenarioId));
+  const baselineMetrics = summarizeEvalMetrics(metricAttempts(baseline, scenarioId));
+  const candidateMetrics = summarizeEvalMetrics(metricAttempts(candidate, scenarioId));
   for (const name of Object.keys(EVAL_METRIC_PATHS)) {
     const baselineSamples = baselineMetrics[name]?.samples ?? 0;
     const candidateSamples = candidateMetrics[name]?.samples ?? 0;
@@ -199,18 +221,176 @@ function metricDeltas(baselineMetrics, candidateMetrics) {
   }));
 }
 
+function median(values) {
+  if (values.length === 0) return null;
+  const ordered = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2 === 0 ? (ordered[middle - 1] + ordered[middle]) / 2 : ordered[middle];
+}
+
+function attemptPairKey(attempt) {
+  return `${attempt.scenarioId}\0${attempt.repetition}`;
+}
+
+function pairedAttempts(baseline, candidate) {
+  const baselineByKey = new Map(baseline.attempts.map((attempt) => [attemptPairKey(attempt), attempt]));
+  const candidateByKey = new Map(candidate.attempts.map((attempt) => [attemptPairKey(attempt), attempt]));
+  const keys = [...new Set([...baselineByKey.keys(), ...candidateByKey.keys()])].sort();
+  return keys.map((key) => ({ key, baseline: baselineByKey.get(key), candidate: candidateByKey.get(key) }));
+}
+
+function validPair(run, attempt) {
+  return Boolean(attempt) && (run.sourceSchemaVersion === 1 || attempt.validity === "valid");
+}
+
+function pairedMetricDifferences(baseline, candidate) {
+  if (baseline.sourceSchemaVersion === 1 || candidate.sourceSchemaVersion === 1) return "unavailable";
+  const pairs = pairedAttempts(baseline, candidate)
+    .filter((pair) => validPair(baseline, pair.baseline) && validPair(candidate, pair.candidate));
+  return Object.fromEntries(Object.keys(EVAL_METRIC_PATHS).flatMap((name) => {
+    const differences = pairs.flatMap((pair) => {
+      const baselineValue = evalMetricValue(pair.baseline, name);
+      const candidateValue = evalMetricValue(pair.candidate, name);
+      return baselineValue === undefined || candidateValue === undefined ? [] : [candidateValue - baselineValue];
+    });
+    if (differences.length === 0) return [];
+    return [[name, {
+      pairs: differences.length,
+      median: median(differences),
+      min: Math.min(...differences),
+      max: Math.max(...differences)
+    }]];
+  }));
+}
+
+function guardrailRegressions(baseline, candidate, pairs) {
+  const dimensions = ["correctness", "delivery", "safety"];
+  return pairs.flatMap((pair) => dimensions.flatMap((dimension) => {
+    if (!pair.baseline || !pair.candidate) return [];
+    return evalDimensionPassed(pair.baseline, dimension) && !evalDimensionPassed(pair.candidate, dimension)
+      ? [{ pair: pair.key, dimension }] : [];
+  }));
+}
+
+function relativeImprovement(baseline, candidate, lowerIsBetter) {
+  if (baseline === candidate) return 0;
+  if (baseline === 0) return lowerIsBetter ? (candidate < baseline ? 1 : -1) : (candidate > baseline ? 1 : -1);
+  return lowerIsBetter ? (baseline - candidate) / Math.abs(baseline)
+    : (candidate - baseline) / Math.abs(baseline);
+}
+
+function gateBaseReasons(comparison, pairs, invalidPairs, guardrails, primary) {
+  const reasons = [];
+  if (!comparison.comparable) reasons.push("incompatible_runs");
+  if (invalidPairs.length > 0) reasons.push("invalid_pair");
+  if (guardrails.length > 0) reasons.push("guardrail_regression");
+  const minimumPairs = Number.isSafeInteger(primary?.minimumPairs) ? primary.minimumPairs : 3;
+  if (pairs.length < minimumPairs) reasons.push("insufficient_pairs");
+  return reasons;
+}
+
+function binaryGateResult(pairs, primary) {
+  let wins = 0;
+  let losses = 0;
+  let ties = 0;
+  for (const pair of pairs) {
+    if (!pair.baseline || !pair.candidate) continue;
+    const baselinePassed = evalAttemptPassed(pair.baseline);
+    const candidatePassed = evalAttemptPassed(pair.candidate);
+    if (candidatePassed && !baselinePassed) wins += 1;
+    else if (!candidatePassed && baselinePassed) losses += 1;
+    else ties += 1;
+  }
+  const requiredWins = Number.isSafeInteger(primary.requiredWins) ? primary.requiredWins : 2;
+  const reasons = [];
+  if (wins < requiredWins) reasons.push("insufficient_candidate_wins");
+  if (losses > 0) reasons.push("candidate_loss");
+  return { reasons, result: { kind: "binary", wins, losses, ties, requiredWins } };
+}
+
+function continuousPairSample(pair, primary, lowerIsBetter) {
+  const baseline = pair.baseline ? evalMetricValue(pair.baseline, primary.metric) : undefined;
+  const candidate = pair.candidate ? evalMetricValue(pair.candidate, primary.metric) : undefined;
+  if (baseline === undefined || candidate === undefined) return null;
+  return {
+    pair: pair.key,
+    baseline,
+    candidate,
+    nonInferior: lowerIsBetter ? candidate <= baseline : candidate >= baseline,
+    improvement: relativeImprovement(baseline, candidate, lowerIsBetter)
+  };
+}
+
+function continuousGateResult(pairs, primary) {
+  const lowerIsBetter = primary.direction ? primary.direction === "lower" : LOWER_IS_BETTER.has(primary.metric);
+  const samples = pairs.map((pair) => continuousPairSample(pair, primary, lowerIsBetter)).filter(Boolean);
+  const medianImprovement = median(samples.map((sample) => sample.improvement));
+  const requiredImprovement = Number.isFinite(primary.requiredImprovement) ? primary.requiredImprovement : 0.2;
+  const reasons = [];
+  if (samples.length !== pairs.length) reasons.push("missing_primary_metric");
+  if (samples.some((sample) => !sample.nonInferior)) reasons.push("primary_metric_regression");
+  if (medianImprovement === null || medianImprovement < requiredImprovement) {
+    reasons.push("insufficient_median_improvement");
+  }
+  return {
+    reasons,
+    result: {
+      kind: "continuous", metric: primary.metric, direction: lowerIsBetter ? "lower" : "higher",
+      pairs: samples.length, medianImprovement, requiredImprovement, samples
+    }
+  };
+}
+
+function primaryGateResult(pairs, primary) {
+  if (primary?.kind === "binary") return binaryGateResult(pairs, primary);
+  if (primary?.kind === "continuous" && typeof primary.metric === "string") {
+    return continuousGateResult(pairs, primary);
+  }
+  return { reasons: ["invalid_primary_metric"], result: { kind: "invalid" } };
+}
+
+/** Apply the pre-registered frozen A/B acceptance rule without retrying or mutating either run. */
+export function evaluateFrozenABGate(baselineInput, candidateInput, primary) {
+  const baseline = buildEvalRunReport(baselineInput);
+  const candidate = buildEvalRunReport(candidateInput);
+  const comparison = compareEvalRuns(baseline, candidate);
+  const pairs = pairedAttempts(baseline, candidate);
+  const invalidPairs = pairs.filter((pair) => !validPair(baseline, pair.baseline)
+    || !validPair(candidate, pair.candidate)).map((pair) => pair.key);
+  const guardrails = guardrailRegressions(baseline, candidate, pairs);
+  const primaryResult = primaryGateResult(pairs, primary);
+  const uniqueReasons = [...new Set([
+    ...gateBaseReasons(comparison, pairs, invalidPairs, guardrails, primary),
+    ...primaryResult.reasons
+  ])];
+  return {
+    schemaVersion: EVAL_COMPARISON_SCHEMA_VERSION,
+    kind: "frozen_ab_gate",
+    passed: uniqueReasons.length === 0,
+    status: uniqueReasons.length === 0 ? "pass" : "reject",
+    reasons: uniqueReasons,
+    invalidPairs,
+    guardrailRegressions: guardrails,
+    primary: primaryResult.result
+  };
+}
+
 function statusChange(baseline, candidate) {
+  if ([baseline, candidate].some((status) => ["inconclusive", "unavailable"].includes(status))) return "inconclusive";
   const rank = { fail: 0, flaky: 1, stable: 2 };
   const delta = (rank[candidate] ?? -1) - (rank[baseline] ?? -1);
   return delta > 0 ? "improved" : delta < 0 ? "regressed" : "unchanged";
 }
 
 function scenarioPassRate(scenario) {
+  const valid = Number(scenario?.validity?.valid);
+  if (Number.isFinite(valid)) return valid > 0 ? Number(scenario?.passedAttempts ?? 0) / valid : null;
   const expected = Number(scenario?.expectedAttempts ?? 0);
   return expected > 0 ? Number(scenario?.passedAttempts ?? 0) / expected : null;
 }
 
 function runPassRate(run) {
+  if (typeof run.statistics?.passRate === "object") return run.statistics.passRate.rate;
   const expected = run.scenarios.reduce((total, scenario) => total + Number(scenario.expectedAttempts ?? 0), 0);
   const passed = run.scenarios.reduce((total, scenario) => total + Number(scenario.passedAttempts ?? 0), 0);
   return expected > 0 ? passed / expected : null;
@@ -245,6 +425,7 @@ function compareScenario(baselineRun, candidateRun, scenarioId) {
 function runIdentity(run) {
   return {
     runId: run.runId,
+    sourceSchemaVersion: run.sourceSchemaVersion,
     suite: run.suite ?? null,
     repeat: run.repeat,
     status: run.status,
@@ -290,10 +471,16 @@ export function compareEvalRuns(baselineInput, candidateInput) {
       change: comparable ? statusChange(baseline.dimensions[dimension], candidate.dimensions[dimension]) : "invalid"
     }])),
     metrics: comparable
-      ? metricDeltas(summarizeEvalMetrics(baseline.attempts), summarizeEvalMetrics(candidate.attempts))
+      ? metricDeltas(
+        summarizeEvalMetrics(baseline.sourceSchemaVersion === 1
+          ? baseline.attempts : baseline.attempts.filter((attempt) => attempt.validity === "valid")),
+        summarizeEvalMetrics(candidate.sourceSchemaVersion === 1
+          ? candidate.attempts : candidate.attempts.filter((attempt) => attempt.validity === "valid"))
+      )
       : Object.fromEntries(Object.keys(EVAL_METRIC_PATHS).map((name) => [name, {
         baseline: null, candidate: null, delta: null, deltaPercent: null, change: "invalid"
       }])),
+    pairedMedianDifferences: comparable ? pairedMetricDifferences(baseline, candidate) : "unavailable",
     scenarios: comparable ? sharedIds.map((scenarioId) => compareScenario(baseline, candidate, scenarioId)) : []
   };
 }
@@ -328,6 +515,12 @@ function incompatibilityRows(mismatches) {
   return mismatches.map((mismatch) => `| ${mismatch.scope} | ${mismatch.field} | \`${JSON.stringify(mismatch.baseline)}\` | \`${JSON.stringify(mismatch.candidate)}\` | ${mismatch.reason} |`);
 }
 
+function pairedRows(metrics) {
+  if (!metrics || metrics === "unavailable") return ["| unavailable | - | - | - | - |"];
+  return Object.entries(metrics).map(([name, metric]) =>
+    `| ${name} | ${metric.pairs} | ${formatNumber(metric.median)} | ${formatNumber(metric.min)} | ${formatNumber(metric.max)} |`);
+}
+
 export function renderEvalComparisonMarkdown(input) {
   const comparison = input?.kind === "eval_comparison"
     ? input
@@ -341,7 +534,7 @@ export function renderEvalComparisonMarkdown(input) {
     `- Stability: ${comparison.stability.baseline} -> ${comparison.stability.candidate} (${comparison.stability.change})`,
     `- Attempt pass rate: ${formatPercent(comparison.passRate.baseline)} -> ${formatPercent(comparison.passRate.candidate)} (delta ${formatPercent(comparison.passRate.delta)})`,
     "",
-    "The comparison keeps the four evaluation dimensions separate and does not calculate a composite score.",
+    "The comparison keeps the five evaluation dimensions separate and does not calculate a composite score.",
     "",
     ...(comparison.comparable ? [
       "## Dimensions",
@@ -360,6 +553,14 @@ export function renderEvalComparisonMarkdown(input) {
       "| Metric | Baseline median | Candidate median | Delta | Delta % | Interpretation |",
       "| --- | ---: | ---: | ---: | ---: | --- |",
       ...(metricTableRows.length > 0 ? metricTableRows : ["| - | - | - | - | - | unavailable |"]),
+      "",
+      "## Paired Median Differences",
+      "",
+      "Differences are candidate minus baseline for matched scenario/repetition pairs.",
+      "",
+      "| Metric | Pairs | Median difference | Min | Max |",
+      "| --- | ---: | ---: | ---: | ---: |",
+      ...pairedRows(comparison.pairedMedianDifferences),
       "",
       "## Scenarios",
       "",

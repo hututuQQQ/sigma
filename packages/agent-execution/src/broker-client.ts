@@ -131,17 +131,24 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     }));
     await this.assertDecoded(value, false);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
+    const failure = value.failure ? {
+      ...value.failure,
+      message: this.redactor.redactText(value.failure.message)
+    } : undefined;
     return {
       state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
       timedOut: value.timedOut, idleTimedOut: value.idleTimedOut, cancelled: value.cancelled,
       stdout: value.stdout.droppedBytes > 0
         ? "[REDACTED:truncated-output]"
         : this.redactor.redactText(value.stdout.data),
-      stderr: value.stderr.droppedBytes > 0
+      stderr: failure
+        ? `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`
+        : value.stderr.droppedBytes > 0
         ? "[REDACTED:truncated-output]"
         : this.redactor.redactText(value.stderr.data),
       stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
       outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
+      ...(failure ? { failure } : {}),
       ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
     };
   }
@@ -235,9 +242,16 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     const stdout = streams.stdout.push(value.stdout.data, {
       final, discontinuity: value.stdout.droppedBytes > 0
     });
-    const stderr = streams.stderr.push(value.stderr.data, {
+    let stderr = streams.stderr.push(value.stderr.data, {
       final, discontinuity: value.stderr.droppedBytes > 0
     });
+    const failure = value.failure ? {
+      ...value.failure,
+      message: this.redactor.redactText(value.failure.message)
+    } : undefined;
+    if (failure) {
+      stderr = `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`;
+    }
     if (final) this.processRedaction.delete(handle.id);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
     const result: ProcessPollResult = {
@@ -245,6 +259,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       stdout, stderr,
       stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
       outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
+      ...(failure ? { failure } : {}),
       ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
     };
     if (final) {

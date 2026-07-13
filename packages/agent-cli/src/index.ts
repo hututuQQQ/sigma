@@ -53,7 +53,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
     (options.stderr ?? process.stderr).write(`${trustMessage}\n`);
     return 2;
   }
-  const configured = await createConfiguredRuntime(cliConfig, options.runtimeFactoryDeps);
+  const configured = await createConfiguredRuntime(cliConfig, options.runtimeFactoryDeps, { surface: "tui" });
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,
     workspace: configured.workspace,

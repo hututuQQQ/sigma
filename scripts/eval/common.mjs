@@ -66,7 +66,7 @@ function parseEnvValue(raw) {
   return quoted ? quoted[1] ?? quoted[2] ?? "" : value;
 }
 
-export function loadEvalSecrets(filePath = path.join(rootDir, ".env")) {
+export function loadEvalSecrets(filePath = path.join(rootDir, ".env"), base = process.env) {
   const allowed = new Set(["DEEPSEEK_API_KEY"]);
   const values = {};
   if (existsSync(filePath)) {
@@ -76,7 +76,12 @@ export function loadEvalSecrets(filePath = path.join(rootDir, ".env")) {
       values[match[1]] = parseEnvValue(match[2]);
     }
   }
-  if (!values.DEEPSEEK_API_KEY?.trim()) throw new Error(`Missing DEEPSEEK_API_KEY in ${filePath}.`);
+  for (const key of allowed) {
+    if (typeof base?.[key] === "string" && base[key].trim()) values[key] = base[key];
+  }
+  if (!values.DEEPSEEK_API_KEY?.trim()) {
+    throw new Error(`Missing DEEPSEEK_API_KEY in the process environment or ${filePath}.`);
+  }
   return values;
 }
 

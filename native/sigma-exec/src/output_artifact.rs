@@ -161,6 +161,14 @@ impl ArtifactCapture {
         })
     }
 
+    /** Read a small completed capture for broker-internal protocol recovery. */
+    pub(crate) fn completed_text(&self, maximum_bytes: usize) -> Option<String> {
+        if !self.finished || !self.complete || self.size_bytes > maximum_bytes as u64 {
+            return None;
+        }
+        String::from_utf8(fs::read(&self.path).ok()?).ok()
+    }
+
     fn write_redacted(&mut self, value: &[u8]) {
         if value.is_empty() || self.file.is_none() {
             return;
