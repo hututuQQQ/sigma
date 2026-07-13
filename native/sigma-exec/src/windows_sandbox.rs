@@ -1509,12 +1509,17 @@ fn rebuild_acl_without_one_exact_entry(
     Ok(removed.then_some(storage))
 }
 
-/// Remove inherited allow ACEs for the ephemeral run SID from an object that
-/// did not exist when the recovery journal was prepared. Explicit same-SID
-/// entries are left untouched so recovery never destroys a host-owned grant.
+/// Remove allow ACEs attributable to an inheritable journal grant from an
+/// object that did not exist when the recovery journal was prepared.
+///
+/// Windows can normalize an inherited ACE into an explicit-looking ACE while
+/// an ancestor DACL is being recovered. A matching journal permission mask is
+/// therefore also required for that fallback; unrelated explicit same-SID
+/// permissions remain untouched.
 fn rebuild_acl_without_inherited_sid_entries(
     old_acl: *mut ACL,
     sid: PSID,
+    inherited_permissions: &[u32],
 ) -> Result<Option<Vec<usize>>, RpcError> {
     if old_acl.is_null() {
         return Ok(None);
@@ -1559,18 +1564,18 @@ fn rebuild_acl_without_inherited_sid_entries(
             ));
         }
         let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
-        let inherited_for_sid = if header.AceType == ACCESS_ALLOWED_ACE_TYPE_VALUE
-            && header.AceFlags & INHERITED_ACE as u8 != 0
-        {
+        let journal_grant_for_sid = if header.AceType == ACCESS_ALLOWED_ACE_TYPE_VALUE {
             let allowed = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
             let ace_sid = (&allowed.SidStart as *const u32)
                 .cast_mut()
                 .cast::<c_void>();
             (unsafe { EqualSid(ace_sid, sid) }) != 0
+                && (header.AceFlags & INHERITED_ACE as u8 != 0
+                    || inherited_permissions.contains(&allowed.Mask))
         } else {
             false
         };
-        if inherited_for_sid {
+        if journal_grant_for_sid {
             removed = true;
             continue;
         }
@@ -1590,7 +1595,11 @@ fn rebuild_acl_without_inherited_sid_entries(
     Ok(removed.then_some(storage))
 }
 
-fn remove_inherited_sid_acl_entries(handle: &OwnedHandle, sid: PSID) -> Result<(), RpcError> {
+fn remove_inherited_sid_acl_entries(
+    handle: &OwnedHandle,
+    sid: PSID,
+    inherited_permissions: &[u32],
+) -> Result<(), RpcError> {
     let mut old_acl = null_mut();
     let mut security_descriptor = null_mut();
     let get = unsafe {
@@ -1621,7 +1630,9 @@ fn remove_inherited_sid_acl_entries(handle: &OwnedHandle, sid: PSID) -> Result<(
                 "GetSecurityDescriptorControl(inherited ACL recovery target)",
             ));
         }
-        let Some(mut storage) = rebuild_acl_without_inherited_sid_entries(old_acl, sid)? else {
+        let Some(mut storage) =
+            rebuild_acl_without_inherited_sid_entries(old_acl, sid, inherited_permissions)?
+        else {
             return Ok(());
         };
         let acl = storage.as_mut_ptr().cast::<ACL>();
@@ -2961,6 +2972,12 @@ fn verify_recovery_scopes(
     }
 
     let mut roots = writable_roots.to_vec();
+    let inheritable_grants = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.inherit)
+        .map(|entry| (entry.path.clone(), entry.permissions))
+        .collect::<Vec<_>>();
     roots.extend(
         snapshot
             .entries
@@ -2991,7 +3008,7 @@ fn verify_recovery_scopes(
 
     let mut scanned = 0;
     for root in &minimal_roots {
-        verify_recovery_scope(root, &baselines, sid, &mut scanned)?;
+        verify_recovery_scope(root, &baselines, &inheritable_grants, sid, &mut scanned)?;
     }
     Ok(())
 }
@@ -2999,6 +3016,7 @@ fn verify_recovery_scopes(
 fn verify_recovery_scope(
     root: &RecoveryRootIdentity,
     baselines: &HashMap<RecoveryFileIdentity, u32>,
+    inheritable_grants: &[(PathBuf, u32)],
     sid: PSID,
     scanned: &mut usize,
 ) -> Result<(), RpcError> {
@@ -3021,7 +3039,15 @@ fn verify_recovery_scope(
             ),
         ));
     }
-    verify_recovery_tree(&root.path, &root.path, baselines, sid, scanned, 0)?;
+    verify_recovery_tree(
+        &root.path,
+        &root.path,
+        baselines,
+        inheritable_grants,
+        sid,
+        scanned,
+        0,
+    )?;
     if acl_target_identity(root_handle.0)? != root.identity {
         return Err(RpcError::new(
             "sandbox_recovery_failed",
@@ -3035,6 +3061,7 @@ fn verify_recovery_tree(
     path: &Path,
     root: &Path,
     baselines: &HashMap<RecoveryFileIdentity, u32>,
+    inheritable_grants: &[(PathBuf, u32)],
     sid: PSID,
     scanned: &mut usize,
     depth: usize,
@@ -3057,10 +3084,15 @@ fn verify_recovery_tree(
     let information = acl_target_information(handle.0)?;
     let identity = acl_target_identity(handle.0)?;
     if !baselines.contains_key(&identity) {
-        // Descendants created after the grant inherit the run SID but have no
-        // journal entry. The parent grants are already gone at this point, so
-        // removing only inherited same-SID entries is stable and retryable.
-        remove_inherited_sid_acl_entries(&handle, sid)?;
+        // Descendants created after the grant have no journal entry. Derive
+        // their possible product-owned permissions only from inheritable
+        // ancestor entries in the durable journal.
+        let inherited_permissions = inheritable_grants
+            .iter()
+            .filter(|(grant_root, _)| recovery_path_within(path, grant_root))
+            .map(|(_, permissions)| *permissions)
+            .collect::<Vec<_>>();
+        remove_inherited_sid_acl_entries(&handle, sid, &inherited_permissions)?;
     }
     let expected = baselines.get(&identity).copied().unwrap_or(0);
     let actual = count_allowed_acl_entries_for_handle(&handle, sid)?;
@@ -3091,6 +3123,7 @@ fn verify_recovery_tree(
             &child.map_err(RpcError::from)?.path(),
             root,
             baselines,
+            inheritable_grants,
             sid,
             scanned,
             depth + 1,
@@ -5104,9 +5137,22 @@ mod tests {
             0
         );
 
-        let rebuilt = rebuild_acl_without_inherited_sid_entries(original_acl, sid)
-            .expect("rebuild inherited ACL")
-            .expect("one inherited SID ACE should be removed");
+        let product_mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        // Windows may normalize the inherited product grant into an explicit
+        // ACE during ancestor recovery. It is still distinguishable from the
+        // unrelated explicit read-only grant by the journal permission mask.
+        assert_ne!(
+            unsafe { AddAccessAllowedAceEx(original_acl, ACL_REVISION, 0, product_mask, sid) },
+            0
+        );
+
+        let rebuilt = rebuild_acl_without_inherited_sid_entries(
+            original_acl,
+            sid,
+            std::slice::from_ref(&product_mask),
+        )
+        .expect("rebuild inherited ACL")
+        .expect("inherited and normalized product SID ACEs should be removed");
         let rebuilt_acl = rebuilt.as_ptr().cast::<ACL>();
         let mut information = ACL_SIZE_INFORMATION::default();
         assert_ne!(
