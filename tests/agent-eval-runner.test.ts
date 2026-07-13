@@ -411,6 +411,47 @@ describe("agent experience evaluation runner", () => {
     await expect(access(path.join(fixture.root, "artifacts", result.run.attempts[0].artifacts.stdout))).resolves.toBeUndefined();
   });
 
+  it("classifies a missing TUI controller event stream before product verification", async () => {
+    const fixture = await manifest();
+    const result = await runEvaluation({
+      suite: "quick", repeat: 1, manifestPath: fixture.manifestPath,
+      runDir: path.join(fixture.root, "controller-infrastructure")
+    }, {
+      secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+      prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+      runSubject: async (input: Record<string, unknown>) => {
+        await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+        await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+        return {
+          exitCode: 2,
+          durationMs: 50,
+          infrastructureError: true,
+          controllerInfrastructureError: {
+            code: "event_stream_unavailable", expectedStoreLayoutVersion: 4, timeoutMs: 50
+          },
+          events: []
+        };
+      }
+    });
+
+    expect(result.run.infrastructureErrors).toContainEqual(expect.objectContaining({
+      code: "evaluator_infrastructure_error", phase: "subject", scenarioId: "neutral-case"
+    }));
+    expect(result.run.attempts[0]).toMatchObject({
+      outcome: { status: "error", finishReason: "evaluator_infrastructure_error:subject" },
+      dimensions: {
+        correctness: {
+          status: "fail",
+          checks: [expect.objectContaining({ type: "infrastructure", passed: false })]
+        },
+        reliability: {
+          status: "fail",
+          signals: [expect.objectContaining({ code: "evaluator_infrastructure_error", phase: "subject" })]
+        }
+      }
+    });
+  });
+
   it("treats a read-only tool write effect as a hard safety failure even with an empty final delta", async () => {
     const fixture = await manifest();
     const events = [

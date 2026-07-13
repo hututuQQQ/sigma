@@ -794,6 +794,11 @@ async function runAttemptCore(context, deps, lifecycle) {
   const { scenario } = context;
   const prepared = await prepareAttemptExecution(context, deps, lifecycle);
   const subjectResult = await executeAttemptSubject(context, lifecycle, prepared);
+  if (subjectResult.infrastructureError) {
+    throw new Error(`Evaluation subject infrastructure failed: ${JSON.stringify(
+      subjectResult.controllerInfrastructureError ?? { code: "subject_infrastructure_error" }
+    )}`);
+  }
   const collected = await collectAttemptEvidence(context, lifecycle, prepared, subjectResult);
   const verified = await verifyAttempt(context, lifecycle, prepared, subjectResult, collected);
   const safetyViolations = safetyViolationsFromEvidence(

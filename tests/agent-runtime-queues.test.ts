@@ -168,12 +168,21 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
-  it("suspends a conversational natural stop without inventing execution evidence", async () => {
+  it("repairs a conversational natural stop through an explicit typed input request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
-    const gateway = new ScriptedGateway([{
-      message: { role: "assistant", content: "Hello. What would you like me to work on?" },
-      finishReason: "stop"
-    }]);
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "Hello. What would you like me to work on?" },
+        finishReason: "stop"
+      },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "need-task", name: "request_user_input", arguments: { message: "What should I work on?" } }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
@@ -184,14 +193,49 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input",
-      requestId: "model-response-1",
-      message: "Hello. What would you like me to work on?"
+      requestId: "need-task",
+      message: "What should I work on?"
     });
-    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].toolChoice).toBe("required");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
     const events = await storedEvents(store, session.sessionId);
-    expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.started")).toHaveLength(2);
     expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
   });
+
+  it("requires current-run evidence after a natural stop before allowing completion", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidence-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "read-evidence", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("evidence-backed read completed")
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "evidence-backed read completed"
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[1].toolChoice).toBe("required");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("complete_task");
+  }, 30_000);
 
   it("supports an explicit typed request for user input", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-request-input-"));

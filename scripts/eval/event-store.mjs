@@ -3,7 +3,7 @@ import { readFile, readdir, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const STORE_LAYOUT_VERSION = 4;
+export const STORE_LAYOUT_VERSION = 4;
 const EVENT_SCHEMA_VERSION = 4;
 const SNAPSHOT_SCHEMA_VERSION = 4;
 const EVENT_TYPES = new Set([

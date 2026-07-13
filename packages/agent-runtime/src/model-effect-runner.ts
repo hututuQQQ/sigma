@@ -146,9 +146,14 @@ export class ModelEffectRunner {
   ): Promise<void> {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
-    const terminalRepair = session.durable.state.completionRepairAttempts > 0
-      && session.durable.state.receipts.length > session.durable.state.receiptCountAtLastUserInput;
-    const descriptors = terminalRepair
+    const repairPending = session.durable.state.completionRepairAttempts > 0;
+    const hasCurrentRunReceipt = session.durable.state.receipts.length
+      > session.durable.state.receiptCountAtLastUserInput;
+    const evidenceRepair = repairPending && !hasCurrentRunReceipt;
+    const terminalRepair = repairPending && hasCurrentRunReceipt;
+    const descriptors = evidenceRepair
+      ? availableDescriptors.filter((item) => !item.possibleEffects.includes("outcome.propose"))
+      : terminalRepair
       ? availableDescriptors.filter((item) => item.possibleEffects.includes("outcome.propose")
         || item.possibleEffects.includes("outcome.request_input"))
       : availableDescriptors;
@@ -183,7 +188,7 @@ export class ModelEffectRunner {
     const turn: PreparedModelTurn = {
       messages: plan.messages,
       tools,
-      ...(terminalRepair ? { toolChoice: "required" } : {}),
+      ...(repairPending ? { toolChoice: "required" } : {}),
       budget
     };
     const requestId = `${session.durable.runId}:${turnId}`;

@@ -204,8 +204,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
     expect(conversational).toMatchObject({
-      phase: "outcome_pending",
-      proposedOutcome: { kind: "needs_input", message: "answer" }
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      proposedOutcome: undefined
+    });
+    expect(conversational.messages.at(-1)).toMatchObject({ role: "developer" });
+    const conversationalFailure = settleModel(startModel(conversational, 2), "model.completed", {
+      message: { role: "assistant", content: "still just an answer" }, toolCalls: [], finishReason: "stop"
+    });
+    expect(conversationalFailure.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_protocol_missing"
     });
     const receipt = {
       callId: "progress", ok: true, output: "inspected", observedEffects: ["filesystem.read" as const],
