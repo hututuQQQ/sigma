@@ -1772,6 +1772,16 @@ fn inspect_read_acl_target_path(
     path: &Path,
     read_roots: &[PathBuf],
 ) -> Result<Option<(bool, Option<RecoveryRootIdentity>)>, RpcError> {
+    // Some Windows filesystems reject a WRITE_DAC handle to a dangling
+    // junction before FILE_FLAG_OPEN_REPARSE_POINT can expose the link object.
+    // Classify the target failure through a metadata-only preflight first;
+    // the durable handle and identity checks below still guard every valid
+    // reparse target against retargeting races.
+    let preflight_resolved = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .map(|_| resolve_read_reparse_target(path))
+        .transpose()?;
     let handle = open_acl_target(path)?;
     let information = acl_target_information(handle.0)?;
     let tag = acl_target_tag(handle.0)?;
@@ -1792,15 +1802,10 @@ fn inspect_read_acl_target_path(
         )));
     }
 
-    let resolved = path.canonicalize().map_err(|error| {
-        RpcError::new(
-            SANDBOX_REPARSE_TARGET_UNRESOLVABLE,
-            format!(
-                "cannot resolve read-only sandbox reparse target '{}': {error}",
-                path.display()
-            ),
-        )
-    })?;
+    let resolved = match preflight_resolved {
+        Some(resolved) => resolved,
+        None => resolve_read_reparse_target(path)?,
+    };
     if !read_roots
         .iter()
         .any(|root| windows_path_within(root, &resolved))
@@ -1817,6 +1822,18 @@ fn inspect_read_acl_target_path(
     // Never inherit through or enumerate a reparse point. The resolved target
     // is covered independently through its real path under a declared root.
     Ok(Some((false, Some(target))))
+}
+
+fn resolve_read_reparse_target(path: &Path) -> Result<PathBuf, RpcError> {
+    path.canonicalize().map_err(|error| {
+        RpcError::new(
+            SANDBOX_REPARSE_TARGET_UNRESOLVABLE,
+            format!(
+                "cannot resolve read-only sandbox reparse target '{}': {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn assert_read_reparse_target(
