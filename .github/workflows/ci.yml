@@ -175,6 +175,7 @@ jobs:
           cargo fmt --manifest-path native/sigma-exec/Cargo.toml -- --check
           cargo test --locked --manifest-path native/sigma-exec/Cargo.toml
           cargo clippy --locked --manifest-path native/sigma-exec/Cargo.toml --all-targets -- -D warnings
+          cargo build --locked --manifest-path native/sigma-exec/Cargo.toml
           New-Item -ItemType Directory -Path .artifacts -Force | Out-Null
           pnpm test:coverage:native-protocol
       - name: Install pinned ConPTY smoke dependency

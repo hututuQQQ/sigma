@@ -107,14 +107,20 @@ function secretValues(env: NodeJS.ProcessEnv): Record<string, string | undefined
   return Object.fromEntries(Object.entries(env).filter(([key, value]) => value && isSecretEnvironmentKey(key)));
 }
 
-export function defaultSigmaExecPath(env: NodeJS.ProcessEnv = process.env): string {
+export function defaultSigmaExecPath(
+  env: NodeJS.ProcessEnv = process.env,
+  packageModuleUrl: string | URL = import.meta.url
+): string {
   if (env.SIGMA_EXEC_PATH) return path.resolve(env.SIGMA_EXEC_PATH);
-  const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const sourceDirectory = path.dirname(fileURLToPath(packageModuleUrl));
   const packaged = resolveSigmaExecBinary(path.resolve(sourceDirectory, "..", "..", "..", "bin"));
-  const development = resolveSigmaExecBinary(path.resolve(
+  const release = resolveSigmaExecBinary(path.resolve(
     sourceDirectory, "..", "..", "..", "native", "sigma-exec", "target", "release"
   ));
-  return [packaged, development].find(existsSync) ?? packaged;
+  const debug = resolveSigmaExecBinary(path.resolve(
+    sourceDirectory, "..", "..", "..", "native", "sigma-exec", "target", "debug"
+  ));
+  return [packaged, release, debug].find(existsSync) ?? packaged;
 }
 
 export class LazyExecutionBroker implements ExecutionBroker {

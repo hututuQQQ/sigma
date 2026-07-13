@@ -345,7 +345,9 @@ describe("typed workspace mutation contracts", () => {
     }
   );
 
-  it("starts cmd shells in UTF-8 mode without weakening the existing invocation flags", async () => {
+  it.runIf(process.platform === "win32")(
+    "starts cmd shells in UTF-8 mode without weakening the existing invocation flags",
+    async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cmd-utf8-"));
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
@@ -361,5 +363,6 @@ describe("typed workspace mutation contracts", () => {
       executable: "cmd.exe",
       args: ["/d", "/s", "/c", "chcp 65001>nul & echo 中文"]
     });
-  });
+    }
+  );
 });

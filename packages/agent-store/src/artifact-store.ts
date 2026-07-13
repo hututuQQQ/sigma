@@ -10,7 +10,7 @@ export class ContentAddressedArtifactStore {
     const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
     const digest = createHash("sha256").update(bytes).digest("hex");
     const directory = path.join(sessionDirectory(this.rootDir, sessionId), "artifacts");
-    await mkdir(directory, { recursive: true });
+    await mkdir(directory, { recursive: true, mode: 0o700 });
     const target = path.join(directory, digest);
     await writeFile(target, bytes, { flag: "wx" }).catch(async (error: NodeJS.ErrnoException) => {
       if (error.code !== "EEXIST") throw error;

@@ -135,7 +135,7 @@ export class SegmentedJsonlStore implements RunStore {
 
   private async appendLocked(event: AnyTypedAgentEvent, expectedSeq: number): Promise<StoreAppendResult> {
     const directory = sessionDirectory(this.rootDir, event.sessionId);
-    await mkdir(path.join(directory, "events"), { recursive: true });
+    await mkdir(path.join(directory, "events"), { recursive: true, mode: 0o700 });
     const release = await acquireSessionLock(directory);
     try {
     let meta = await this.readMeta(event.sessionId, event.occurredAt);
@@ -367,7 +367,7 @@ export class JsonlEvaluationSink implements EvaluationSink {
 
   async append(report: ExternalEvaluationReport): Promise<void> {
     const directory = path.join(path.resolve(this.rootDir), "evaluation-reports");
-    await mkdir(directory, { recursive: true });
+    await mkdir(directory, { recursive: true, mode: 0o700 });
     const handle = await open(path.join(directory, "reports.jsonl"), "a");
     try {
       await handle.write(`${JSON.stringify(report)}\n`, undefined, "utf8");

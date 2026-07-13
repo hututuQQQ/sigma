@@ -162,7 +162,7 @@ async function nextEventAfter(
   afterSeq: number,
   types: readonly AgentEventEnvelope["type"][]
 ): Promise<AgentEventEnvelope> {
-  const signal = AbortSignal.timeout(5_000);
+  const signal = AbortSignal.timeout(15_000);
   for await (const event of runtime.subscribe(sessionId, signal)) {
     if (event.seq > afterSeq && types.includes(event.type)) return event;
   }

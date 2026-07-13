@@ -2,10 +2,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type {
-  BrokerDoctorReport,
-  BrokerVerifiedShell,
-  ExecutionBroker
+import {
+  resolveSigmaExecBinary,
+  type BrokerDoctorReport,
+  type BrokerVerifiedShell,
+  type ExecutionBroker
 } from "../packages/agent-execution/src/index.js";
 import type {
   ModelGateway,
@@ -15,6 +16,7 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import {
   createConfiguredRuntime,
+  defaultSigmaExecPath,
   runtimeNodeBinding,
   runtimeTrustedToolchains,
   runtimeTrustedToolchainsForBinding,
@@ -23,6 +25,20 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fixtures: string[] = [];
+
+it("finds the debug broker produced by a development build", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-debug-broker-path-"));
+  fixtures.push(root);
+  const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
+  const debugDirectory = path.join(root, "native", "sigma-exec", "target", "debug");
+  const debugBroker = resolveSigmaExecBinary(debugDirectory);
+  await mkdir(path.dirname(modulePath), { recursive: true });
+  await mkdir(debugDirectory, { recursive: true });
+  await writeFile(modulePath, "export {};\n", "utf8");
+  await writeFile(debugBroker, "debug broker", "utf8");
+
+  expect(defaultSigmaExecPath({}, pathToFileURL(modulePath))).toBe(debugBroker);
+});
 
 it("omits an unproved automatic Windows Node capability without weakening explicit manifests", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-node-proof-"));

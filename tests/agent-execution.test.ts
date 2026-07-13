@@ -467,6 +467,13 @@ describe("agent-execution protocol validation", () => {
     expect(() => parseProcessValue({ ...processValue, state: "lost" })).toThrow(BrokerProtocolError);
     expect(() => parseProcessValue({ ...processValue, exitCode: 1.5 })).toThrow(BrokerProtocolError);
     expect(() => parseProcessValue({ ...processValue, durationMs: -1 })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessValue({
+      ...processValue,
+      stdout: {
+        ...processValue.stdout,
+        decodingError: { code: "unknown_encoding_error", message: "invalid" }
+      }
+    })).toThrow(BrokerProtocolError);
     const outputArtifact = {
       artifactId: "stdout-1", name: "stdout.log", stream: "stdout", path: "/tmp/stdout.log",
       sha256: "a".repeat(64), sizeBytes: 12, complete: true, redacted: true, redactionLossy: false

@@ -275,7 +275,7 @@ async function publishStagedTarget(
   source: LegacySessionInspectionV2,
   staged: StagedTarget
 ): Promise<PromoteV2SessionResult> {
-  await mkdir(sessionsDirectory(context.rootDir), { recursive: true });
+  await mkdir(sessionsDirectory(context.rootDir), { recursive: true, mode: 0o700 });
   try {
     await rename(staged.temporarySessionPath, context.targetPath);
     return promotedResult(source, context.targetPath, staged);
@@ -344,7 +344,7 @@ export async function promoteV2Session(options: PromoteV2SessionOptions): Promis
   const targetPath = sessionDirectory(rootDir, sessionId);
   if (!await exists(path.join(sourcePath, "meta.json"))) throw new Error(`V2 session '${sessionId}' does not exist.`);
   const lockDirectory = path.join(storeVersionDirectory(rootDir), "migration-locks");
-  await mkdir(lockDirectory, { recursive: true });
+  await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
   const owner = await acquireProcessOwnerLease(path.join(lockDirectory, `${sessionId}.lock`), {
     pid: process.pid,
     instanceId: randomUUID(),

@@ -1,5 +1,6 @@
 import { type AgentEventEnvelope, type AgentEventOf, type AgentEventPayloadMap, type AgentEventType, type BudgetLedgerState, type ContextAuthority, type JsonValue, type RunCommand, type RunOutcome, type RuntimeClient, type SessionOverview, type SessionRef, type StartSession } from "agent-protocol";
 import { ContentAddressedArtifactStore } from "agent-store";
+import { ensurePrivateStateDirectory } from "agent-platform";
 import { EffectRunner } from "./effect-runner.js";
 import { newRuntimeSession } from "./new-runtime-session.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
@@ -173,6 +174,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     workspaceLeaseInherited = false,
     parentSessionId?: string
   ): Promise<SessionRef> {
+    await ensurePrivateStateDirectory(this.options.storeRootDir);
     assertProfileResources(this.options, selection.profile);
     const gateway = this.options.gatewayForRole?.(modelRole, selection.profile) ?? this.options.gateway;
     const session = await newRuntimeSession(input, this.runDeadlineMs, allocatedBudget, {

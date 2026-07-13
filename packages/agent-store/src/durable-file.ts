@@ -45,7 +45,7 @@ export async function atomicJson(
   replaceFile: AtomicReplace = rename
 ): Promise<void> {
   const directory = path.dirname(filePath);
-  await mkdir(directory, { recursive: true });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(temporary, "wx");
   try {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -75,6 +75,19 @@ async function writeLegacySession(root: string, sessionId: string, count: number
 }
 
 describe("agent-store crash and validation coverage", () => {
+  it.skipIf(process.platform === "win32")(
+    "creates a new durable state tree with owner-only permissions",
+    async () => {
+      const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-private-store-"));
+      const root = path.join(parent, "state");
+      const store = new SegmentedJsonlStore({ rootDir: root });
+      await store.append(event("private", 1, "session.created"), 0);
+
+      expect((await stat(root)).mode & 0o777).toBe(0o700);
+      expect((await stat(sessionDirectory(root, "private"))).mode & 0o777).toBe(0o700);
+    }
+  );
+
   it("stores content-addressed artifacts idempotently and validates identifiers", async () => {
     const actualRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-artifacts-"));
     const artifacts = new ContentAddressedArtifactStore(actualRoot);

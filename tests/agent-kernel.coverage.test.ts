@@ -609,6 +609,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       consumed: { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 },
       createdAt: "2026-01-01T00:00:00.000Z"
     };
+    const semanticCluster: NonNullable<KernelState["semanticFailureCluster"]> = {
+      family: "infrastructure",
+      attempts: 1,
+      firstRevision: 0,
+      lastRevision: 0,
+      diagnosticCodes: ["fixture_failure"],
+      progress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
+    };
     const invalidStates: Array<[KernelState, string]> = [
       [{ ...base, schemaVersion: 2 } as unknown as KernelState, "schema version"],
       [{ ...base, plan: { revision: 0, goal: "", activeNodeId: "missing", nodes: [] } }, "plan graph"],
@@ -632,6 +640,24 @@ describe("agent-kernel exhaustive protocol behavior", () => {
         ...base.budget,
         reserved: { ...base.budget.reserved, inputTokens: 1 }
       } }, "does not match its active reservations"],
+      [{ ...base, semanticProgress: null } as unknown as KernelState, "semantic failure progress"],
+      [{ ...base, semanticFailureCluster: {} } as unknown as KernelState, "semantic failure progress"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, workspaceChanges: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, durableEvidence: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, revision: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } }, "exceeds the current revision"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, firstRevision: 1
+      } }, "semantic failure revisions"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, lastRevision: 1
+      } }, "semantic failure revisions"],
       [{ ...base, toolCallIds: ["same", "same"] }, "Duplicate run tool"],
       [{ ...base, phase: "tool_pending", pendingTools: [{
         request: { callId: "missing", name: "read", arguments: null },
@@ -640,7 +666,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       [{ ...base, phase: "tool_pending", toolCallIds: ["invalid-revision"], pendingTools: [{
         request: { callId: "invalid-revision", name: "read", arguments: null },
         modelTurn: { turnId: 1, effectRevision: Number.NaN }, approval: "allowed", started: false
-      }] }, "valid originating model turn"]
+      }] }, "valid originating model turn"],
+      [{ ...base, activeModelSemanticDelta: true }, "durable model semantic delta"]
     ];
     for (const [state, message] of invalidStates) {
       expect(() => assertKernelInvariants(state), message).toThrow(message);
