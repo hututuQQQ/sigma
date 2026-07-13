@@ -23,14 +23,14 @@ export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.met
 export const pinnedNodeVersion = "v26.4.0";
 export const windowsAppContainerNodeCompatibility = Object.freeze({
   kind: "windows_appcontainer_node",
-  patchId: "node-v26.4.0-win-x64-libuv-local-pipe-v2",
+  patchId: "node-v26.4.0-win-x64-libuv-local-pipe-v3",
   reason: "Use AppContainer-local libuv pipe names for captured stdio and Node IPC.",
   nodeVersion: pinnedNodeVersion,
   targetPlatform: "win32",
   targetArch: "x64",
   sourceSha256: "3193d7f751b8a07bd4acc70e81946ae9c6efdee83e07ad1c8d0e4089df7c5cef",
-  unsignedPatchedSha256: "b30b9546e4c9fddffbd4054ef4a78cdd76b42a8496bfb6308a7966bae37fea8f",
-  normalizedContentSha256: "6345a8101a378aea8f004210fe3924b6bcc77029abd35d9a86fa88e65a65bf35",
+  unsignedPatchedSha256: "386f067d5908eb9b94cf265ce03baaf7d12af3c82753ac48d0f2ede0cb28eb62",
+  normalizedContentSha256: "bed97c4bf6fc3aef84874a00a9cb3fd4e62f684395d140b757b84cc0f1c9e162",
   runtimeEnvironment: Object.freeze({ NODE_OPTIONS: "--preserve-symlinks-main" }),
   runtimeEnvironmentReason: "Preserve the declared CLI main path so startup does not probe inaccessible volume-root metadata.",
   sandboxRuntimeEnvironment: Object.freeze({
@@ -39,7 +39,7 @@ export const windowsAppContainerNodeCompatibility = Object.freeze({
   sandboxRuntimeEnvironmentReason: "Preserve sandboxed workspace module paths so relative ESM resolution does not probe inaccessible volume-root metadata."
 });
 export const windowsNodeGlobalPipeMarker = Buffer.from("\\\\?\\pipe\\uv\\%llu-%lu\0", "ascii");
-export const windowsNodeLocalPipeMarker = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u\0", "ascii");
+export const windowsNodeLocalPipeMarker = Buffer.from("\\\\.\\pipe\\LOCAL\\%u-%u\0", "ascii");
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
 export const supportedTargetArchitectures = new Set(["x64"]);
 export const supportedReleaseTargets = new Set(["linux-x64", "win32-x64"]);

@@ -9,19 +9,19 @@ import type { WindowsAppContainerNodeCompatibilityProof } from "./types.js";
 
 export const WINDOWS_APPCONTAINER_NODE_COMPATIBILITY = Object.freeze({
   kind: "windows_appcontainer_node" as const,
-  patchId: "node-v26.4.0-win-x64-libuv-local-pipe-v2",
+  patchId: "node-v26.4.0-win-x64-libuv-local-pipe-v3",
   nodeVersion: "v26.4.0",
   targetPlatform: "win32" as const,
   targetArch: "x64" as const,
   sourceSha256: "3193d7f751b8a07bd4acc70e81946ae9c6efdee83e07ad1c8d0e4089df7c5cef",
-  unsignedPatchedSha256: "b30b9546e4c9fddffbd4054ef4a78cdd76b42a8496bfb6308a7966bae37fea8f",
-  normalizedContentSha256: "6345a8101a378aea8f004210fe3924b6bcc77029abd35d9a86fa88e65a65bf35",
+  unsignedPatchedSha256: "386f067d5908eb9b94cf265ce03baaf7d12af3c82753ac48d0f2ede0cb28eb62",
+  normalizedContentSha256: "bed97c4bf6fc3aef84874a00a9cb3fd4e62f684395d140b757b84cc0f1c9e162",
   requiredNodeOptions: "--preserve-symlinks --preserve-symlinks-main",
   reason: "Use AppContainer-local libuv pipe names for captured stdio and Node IPC."
 });
 
 export const WINDOWS_NODE_GLOBAL_PIPE_MARKER = Buffer.from("\\\\?\\pipe\\uv\\%llu-%lu\0", "ascii");
-export const WINDOWS_NODE_LOCAL_PIPE_MARKER = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u\0", "ascii");
+export const WINDOWS_NODE_LOCAL_PIPE_MARKER = Buffer.from("\\\\.\\pipe\\LOCAL\\%u-%u\0", "ascii");
 
 export interface WindowsNodeExecutableInspection {
   sha256: string;
