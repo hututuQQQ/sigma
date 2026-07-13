@@ -35,10 +35,12 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
     AddAccessAllowedAceEx, AddAce, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
     DACL_SECURITY_INFORMATION, DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetLengthSid, INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor,
-    OBJECT_INHERIT_ACE, PSID, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
-    SetSecurityDescriptorDacl, WinBuiltinAnyPackageSid, WinCapabilityInternetClientServerSid,
-    WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, INHERITED_ACE, InitializeAcl,
+    InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    SE_DACL_PROTECTED, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
+    SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAnyPackageSid,
+    WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+    WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
@@ -1610,10 +1612,62 @@ fn remove_inherited_sid_acl_entries(handle: &OwnedHandle, sid: PSID) -> Result<(
         ));
     }
     let result = (|| {
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(security_descriptor, &mut control, &mut revision) }
+            == 0
+        {
+            return Err(last_error(
+                "GetSecurityDescriptorControl(inherited ACL recovery target)",
+            ));
+        }
         let Some(mut storage) = rebuild_acl_without_inherited_sid_entries(old_acl, sid)? else {
             return Ok(());
         };
-        apply_acl_handle(handle, storage.as_mut_ptr().cast::<ACL>(), false)
+        let acl = storage.as_mut_ptr().cast::<ACL>();
+        // Applying an unprotected DACL without an explicit protection flag can
+        // cause Windows to immediately materialize the stale inherited ACE
+        // again. First pin the filtered ACL as protected, then restore the
+        // object's original inheritance mode. The parent has already been
+        // cleaned, so unprotecting deterministically recomputes inheritance
+        // without the ephemeral run SID.
+        let protect = unsafe {
+            SetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        if protect != 0 {
+            return Err(win32_code_error(
+                "SetSecurityInfo(protected inherited ACL recovery target)",
+                protect,
+            ));
+        }
+        if control & SE_DACL_PROTECTED == 0 {
+            let unprotect = unsafe {
+                SetSecurityInfo(
+                    handle.0,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    acl,
+                    null_mut(),
+                )
+            };
+            if unprotect != 0 {
+                return Err(win32_code_error(
+                    "SetSecurityInfo(unprotected inherited ACL recovery target)",
+                    unprotect,
+                ));
+            }
+        }
+        Ok(())
     })();
     unsafe { LocalFree(security_descriptor) };
     result
