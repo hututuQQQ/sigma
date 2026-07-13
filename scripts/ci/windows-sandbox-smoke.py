@@ -261,8 +261,9 @@ def verify_dangling_read_only_conformance(
         before = read_tree_fingerprint(root)
         probe_request = params(root, "type ordinary.txt")
         probe_request["policy"]["writeRoots"] = []
-        spawned = require_ok(broker.request("process.spawn", probe_request))
-        probe = poll_until_settled(broker, spawned["handleId"])
+        probe = require_ok(
+            broker.request("exec", {**probe_request, "timeoutMs": 10000})
+        )
         if (
             probe["exitCode"] != 0
             or probe["stdout"]["data"].strip() != "ordinary read-only content"
@@ -309,7 +310,7 @@ def verify_dangling_read_only_conformance(
             )
         return {
             "deterministicSeeds": 100,
-            "unrelatedSpawn": True,
+            "unrelatedExecution": True,
             "outsideReadDenied": True,
             "directDanglingRootStableCode": True,
             "workspaceUnchanged": True,
