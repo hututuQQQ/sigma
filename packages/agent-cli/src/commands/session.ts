@@ -19,6 +19,7 @@ interface SessionCommandDeps {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   runtime?: RuntimeClient;
+  createConfiguredRuntime?: typeof createConfiguredRuntime;
   activeSessionOwner?: typeof activeSessionOwner;
   sendSessionCommand?: typeof sendSessionCommand;
 }
@@ -33,6 +34,7 @@ interface ConfiguredSessionCommand {
   flags: Record<string, unknown>;
   positionals: string[];
   storeRootDir: string;
+  close?: () => Promise<void>;
 }
 
 function streams(deps: SessionCommandDeps): SessionIo {
@@ -46,10 +48,17 @@ function presentation(session: SessionOverview): string {
 async function configured(argv: string[], deps: SessionCommandDeps): Promise<ConfiguredSessionCommand> {
   const parsed = parseArgs(argv);
   const config = loadCliConfig(parsed.flags);
-  const configuredRuntime = deps.runtime ? undefined : await createConfiguredRuntime(config, {}, { connectMcp: false });
+  const configuredRuntime = deps.runtime ? undefined : await (deps.createConfiguredRuntime ?? createConfiguredRuntime)(
+    config, {}, { connectMcp: false }
+  );
   const runtime = deps.runtime ?? configuredRuntime!.runtime;
-  const workspace = await realpath(config.workspace);
-  return { runtime, storeRootDir: configuredRuntime?.storeRootDir ?? runtimeStateRoot(workspace), ...parsed };
+  const workspace = configuredRuntime?.workspace ?? await realpath(config.workspace);
+  return {
+    runtime,
+    storeRootDir: configuredRuntime?.storeRootDir ?? runtimeStateRoot(workspace),
+    ...(configuredRuntime ? { close: async () => await configuredRuntime.close() } : {}),
+    ...parsed
+  };
 }
 
 function approvalDecision(flags: Record<string, unknown>): "allow" | "deny" | "always_allow" {
@@ -243,10 +252,12 @@ async function handleStoredSession(
   throw new Error(`Unknown session command '${subcommand}'.`);
 }
 
-async function executeSessionCommand(argv: string[], deps: SessionCommandDeps, io: SessionIo): Promise<number> {
-  const [subcommand = "list", ...rest] = argv;
-  if (subcommand === "list") return await runSessionsCommand(rest, deps);
-  const parsed = await configured(rest, deps);
+async function executeConfiguredSessionCommand(
+  subcommand: string,
+  parsed: ConfiguredSessionCommand,
+  deps: SessionCommandDeps,
+  io: SessionIo
+): Promise<number> {
   if (subcommand === "migrate") {
     const requested = parsed.positionals[0];
     const legacy = new V2ReadOnlySessionStore(parsed.storeRootDir);
@@ -279,16 +290,36 @@ async function executeSessionCommand(argv: string[], deps: SessionCommandDeps, i
   return await handleStoredSession(subcommand, parsed, sessionId, io);
 }
 
-export async function runSessionsCommand(argv: string[], deps: SessionCommandDeps = {}): Promise<number> {
-  const io = streams(deps);
+async function executeSessionCommand(argv: string[], deps: SessionCommandDeps, io: SessionIo): Promise<number> {
+  const [subcommand = "list", ...rest] = argv;
+  if (subcommand === "list") return await executeSessionsCommand(rest, deps, io);
+  const parsed = await configured(rest, deps);
   try {
-    const { runtime, flags } = await configured(argv, deps);
+    return await executeConfiguredSessionCommand(subcommand, parsed, deps, io);
+  } finally {
+    await parsed.close?.();
+  }
+}
+
+async function executeSessionsCommand(argv: string[], deps: SessionCommandDeps, io: SessionIo): Promise<number> {
+  const parsed = await configured(argv, deps);
+  try {
+    const { runtime, flags } = parsed;
     const limit = typeof flags.limit === "string" ? Number(flags.limit) : 20;
     const sessions = await runtime.listSessions(limit);
     if (flags.json === true) io.stdout.write(`${JSON.stringify({ sessions })}\n`);
     else if (sessions.length === 0) io.stdout.write("No sessions.\n");
     else io.stdout.write(`${sessions.map(presentation).join("\n")}\n`);
     return 0;
+  } finally {
+    await parsed.close?.();
+  }
+}
+
+export async function runSessionsCommand(argv: string[], deps: SessionCommandDeps = {}): Promise<number> {
+  const io = streams(deps);
+  try {
+    return await executeSessionsCommand(argv, deps, io);
   } catch (error) {
     io.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

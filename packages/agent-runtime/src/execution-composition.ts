@@ -3,10 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BrokerConnectionError,
+  BrokerToolchainUnavailableError,
+  createWindowsAppContainerNodeCompatibilityProof,
   isSecretEnvironmentKey,
+  resolvePortableNodeExecutable,
   resolveSigmaExecBinary,
   SandboxUnavailableError,
   SigmaExecBrokerClient,
+  WINDOWS_APPCONTAINER_NODE_COMPATIBILITY,
   type BrokerDoctorReport,
   type BrokerRequestOptions,
   type ExecutionBroker,
@@ -14,7 +18,8 @@ import {
   type ExecutionResult,
   type ProcessHandle,
   type ProcessPollResult,
-  type ProcessSpawnRequest
+  type ProcessSpawnRequest,
+  type TrustedToolchainManifestEntry
 } from "agent-execution";
 
 export interface ExecutionCompositionOptions {
@@ -22,20 +27,100 @@ export interface ExecutionCompositionOptions {
   allowUnsafeHostExec: boolean;
   helperPath?: string;
   env?: NodeJS.ProcessEnv;
+  trustedToolchains?: TrustedToolchainManifestEntry[];
+}
+
+export interface RuntimeNodeBinding {
+  executable: string;
+  source: "portable" | "current-runtime";
+}
+
+/** Prefer the canonical regular Node file in the portable bundle even when a
+ * caller loaded the CLI entry with a different host Node executable. */
+export function runtimeNodeBinding(
+  packageModuleUrl: string | URL = import.meta.url,
+  platform: NodeJS.Platform = process.platform,
+  currentExecutable = process.execPath
+): RuntimeNodeBinding {
+  const portable = resolvePortableNodeExecutable(packageModuleUrl, platform);
+  return portable
+    ? { executable: portable, source: "portable" }
+    : { executable: path.resolve(currentExecutable), source: "current-runtime" };
+}
+
+export function runtimeTrustedToolchains(
+  executable = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+  sandboxMode: "required" | "unsafe" = "required"
+): TrustedToolchainManifestEntry[] {
+  const resolved = path.resolve(executable);
+  let windowsCompatibility: ReturnType<typeof createWindowsAppContainerNodeCompatibilityProof> | undefined;
+  if (platform === "win32" && sandboxMode === "required") {
+    try {
+      windowsCompatibility = createWindowsAppContainerNodeCompatibilityProof(resolved, "runtime-node");
+    } catch (error) {
+      // The host CLI can still use verified shells and non-Node toolchains. Do
+      // not claim an unpatched development Node as an LPAC capability; explicit
+      // manifests remain strict in SigmaExecBrokerClient.
+      if (error instanceof BrokerToolchainUnavailableError) return [];
+      throw error;
+    }
+  }
+  return [{
+    id: "runtime-node",
+    runtime: "node",
+    executable: resolved,
+    aliases: platform === "win32" ? ["node", "node.exe"] : ["node"],
+    executionRoots: [resolved],
+    pathEntries: [],
+    ...(windowsCompatibility ? {
+      environment: { NODE_OPTIONS: WINDOWS_APPCONTAINER_NODE_COMPATIBILITY.requiredNodeOptions },
+      compatibility: windowsCompatibility
+    } : {})
+  }];
+}
+
+export function runtimeTrustedToolchainsForBinding(
+  binding: RuntimeNodeBinding,
+  platform: NodeJS.Platform,
+  sandboxMode: "required" | "unsafe"
+): TrustedToolchainManifestEntry[] {
+  if (binding.source !== "portable" || platform !== "win32" || sandboxMode !== "required") {
+    return runtimeTrustedToolchains(binding.executable, platform, sandboxMode);
+  }
+  // A present portable Windows executable is part of the product contract. Do
+  // not silently downgrade to "no Node" when its dynamic proof is invalid.
+  const compatibility = createWindowsAppContainerNodeCompatibilityProof(binding.executable, "runtime-node");
+  return [{
+    id: "runtime-node",
+    runtime: "node",
+    executable: binding.executable,
+    aliases: ["node", "node.exe"],
+    executionRoots: [binding.executable],
+    pathEntries: [],
+    environment: { NODE_OPTIONS: WINDOWS_APPCONTAINER_NODE_COMPATIBILITY.requiredNodeOptions },
+    compatibility
+  }];
 }
 
 function secretValues(env: NodeJS.ProcessEnv): Record<string, string | undefined> {
   return Object.fromEntries(Object.entries(env).filter(([key, value]) => value && isSecretEnvironmentKey(key)));
 }
 
-export function defaultSigmaExecPath(env: NodeJS.ProcessEnv = process.env): string {
+export function defaultSigmaExecPath(
+  env: NodeJS.ProcessEnv = process.env,
+  packageModuleUrl: string | URL = import.meta.url
+): string {
   if (env.SIGMA_EXEC_PATH) return path.resolve(env.SIGMA_EXEC_PATH);
-  const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const sourceDirectory = path.dirname(fileURLToPath(packageModuleUrl));
   const packaged = resolveSigmaExecBinary(path.resolve(sourceDirectory, "..", "..", "..", "bin"));
-  const development = resolveSigmaExecBinary(path.resolve(
+  const release = resolveSigmaExecBinary(path.resolve(
     sourceDirectory, "..", "..", "..", "native", "sigma-exec", "target", "release"
   ));
-  return [packaged, development].find(existsSync) ?? packaged;
+  const debug = resolveSigmaExecBinary(path.resolve(
+    sourceDirectory, "..", "..", "..", "native", "sigma-exec", "target", "debug"
+  ));
+  return [packaged, release, debug].find(existsSync) ?? packaged;
 }
 
 export class LazyExecutionBroker implements ExecutionBroker {
@@ -45,10 +130,13 @@ export class LazyExecutionBroker implements ExecutionBroker {
 
   constructor(options: ExecutionCompositionOptions) {
     const env = options.env ?? process.env;
+    const runtime = runtimeNodeBinding();
     this.client = new SigmaExecBrokerClient({
       helperPath: path.resolve(options.helperPath ?? defaultSigmaExecPath(env)),
       sandboxMode: options.sandboxMode,
       allowUnsafeHostExec: options.allowUnsafeHostExec,
+      trustedToolchains: options.trustedToolchains
+        ?? runtimeTrustedToolchainsForBinding(runtime, process.platform, options.sandboxMode),
       secrets: secretValues(env)
     });
   }
@@ -58,7 +146,9 @@ export class LazyExecutionBroker implements ExecutionBroker {
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     if (this.failure) throw this.failure;
     this.connecting ??= this.client.connect(signal).catch((error: unknown) => {
-      this.failure = error instanceof SandboxUnavailableError ? error : new SandboxUnavailableError(
+      this.failure = error instanceof SandboxUnavailableError || error instanceof BrokerToolchainUnavailableError
+        ? error
+        : new SandboxUnavailableError(
         error instanceof Error ? error.message : "sigma-exec could not be started."
       );
       throw this.failure;

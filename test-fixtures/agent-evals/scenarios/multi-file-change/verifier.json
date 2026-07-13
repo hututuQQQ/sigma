@@ -1,0 +1,7 @@
+{
+  "files": [
+    { "path": "src/version.mjs", "equals": "export const apiVersion = \"v2\";\n" },
+    { "path": "README.md", "equals": "# Example API\n\nCurrent API version: `v2`.\n" },
+    { "path": "app.test.mjs", "contains": "assert.equal(apiVersion, \"v2\")" }
+  ]
+}

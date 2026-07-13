@@ -1,0 +1,4 @@
+{
+  "requestTimeoutMs": 3000,
+  "idleTimeoutMs": 30000
+}

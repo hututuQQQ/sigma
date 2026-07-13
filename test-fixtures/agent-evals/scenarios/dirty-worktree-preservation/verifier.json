@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "src/app.mjs", "equals": "export const greeting = \"hello\";\n" },
+    { "path": "notes.txt", "equals": "# Personal notes\n- keep my unfinished local note\n" }
+  ]
+}

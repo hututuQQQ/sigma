@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "greeting.txt", "equals": "hello, sigma\n" },
+    { "path": "README.md", "contains": "canonical greeting" }
+  ]
+}

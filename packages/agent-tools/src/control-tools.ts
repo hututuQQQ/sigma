@@ -1,6 +1,7 @@
 import type {
   JsonValue,
   PlanGraph,
+  ToolCallPlan,
   ToolDescriptor,
   ToolReceipt,
   ToolRequest
@@ -49,9 +50,13 @@ function receipt(request: ToolRequest, startedAt: string, value: unknown, effect
   };
 }
 
-function requiredControl(context: Parameters<RegisteredEffectTool["execute"]>[1]) {
+function requiredControl(context: { runtimeControl?: Parameters<RegisteredEffectTool["execute"]>[1]["runtimeControl"] }) {
   if (!context.runtimeControl) throw new Error("Runtime control port is unavailable.");
   return context.runtimeControl;
+}
+
+function controlError(message: string, code: string): Error {
+  return Object.assign(new Error(message), { code });
 }
 
 function readPlanTool(): RegisteredEffectTool {
@@ -108,6 +113,74 @@ function checkpointTool(): RegisteredEffectTool {
   };
 }
 
+function restoreRunChangesTool(): RegisteredEffectTool {
+  const effects: ToolDescriptor["possibleEffects"] = [
+    "runtime.control", "filesystem.write", "destructive", "checkpoint.restore"
+  ];
+  return {
+    descriptor: {
+      ...descriptor(
+        "restore_run_changes",
+        "Restore the latest sealed mutation checkpoint created by this run. The runtime freezes the target, checks LIFO safety, and does not create a nested checkpoint.",
+        {},
+        [],
+        effects
+      ),
+      availableModes: ["change"],
+      prepare: async (_argumentsValue, context): Promise<ToolCallPlan> => {
+        const checkpoints = await requiredControl(context).listCheckpoints();
+        const latest = [...checkpoints].reverse().find((item) => item.status !== "restored");
+        if (!latest) throw controlError("The current session has no checkpoint to restore.", "checkpoint_missing");
+        if (latest.status !== "sealed") {
+          throw controlError("Resolve the open checkpoint before restoring run changes.", "checkpoint_recovery_required");
+        }
+        if (latest.runId !== context.runId) {
+          throw controlError("The latest checkpoint was not created by the current run.", "checkpoint_run_mismatch");
+        }
+        const delta = latest.delta;
+        const paths = delta
+          ? [...new Set([...delta.added, ...delta.modified, ...delta.deleted])]
+          : [];
+        if (paths.length === 0) {
+          throw controlError("The latest checkpoint contains no workspace changes.", "checkpoint_delta_empty");
+        }
+        return {
+          exactEffects: effects,
+          readPaths: paths,
+          writePaths: paths,
+          network: "none",
+          processMode: "none",
+          checkpointScope: paths,
+          checkpointAction: { kind: "restore", checkpointId: latest.checkpointId },
+          idempotence: "non_replayable"
+        };
+      }
+    },
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const action = context.callPlan?.checkpointAction;
+      if (!action || action.kind !== "restore") {
+        throw controlError("A frozen checkpoint restore plan is required.", "checkpoint_action_invalid");
+      }
+      const restored = await requiredControl(context).restoreRunCheckpoint(action.checkpointId);
+      if (!restored.delta) {
+        throw controlError("The restored checkpoint has no workspace delta.", "checkpoint_delta_empty");
+      }
+      return {
+        ...receipt(request, startedAt, {
+          checkpointId: restored.checkpointId,
+          status: restored.status
+        }, effects),
+        workspaceDelta: {
+          added: [...restored.delta.deleted],
+          modified: [...restored.delta.modified],
+          deleted: [...restored.delta.added]
+        }
+      };
+    }
+  };
+}
+
 function loadSkillTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor("load_skill", "Load a discovered skill's frozen instructions by qualified name.", {
@@ -126,7 +199,9 @@ function loadSkillTool(): RegisteredEffectTool {
 }
 
 export function registerControlTools(registry: EffectToolRegistry): EffectToolRegistry {
-  for (const tool of [readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), loadSkillTool()]) {
+  for (const tool of [
+    readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), restoreRunChangesTool(), loadSkillTool()
+  ]) {
     registry.register(tool);
   }
   return registry;

@@ -46,6 +46,26 @@ export interface PendingTool {
   started: boolean;
 }
 
+export interface SemanticProgressWatermark {
+  /** Number of concrete changed paths (plus explicit checkpoint restores) observed in this run. */
+  workspaceChanges: number;
+  /** Number of accepted, non-failed durable evidence records observed in this run. */
+  durableEvidence: number;
+  /** Kernel revision at which either progress dimension last advanced. */
+  revision: number;
+}
+
+export interface SemanticFailureCluster {
+  /** Stable execution diagnostic family; deliberately independent of command text and tool arguments. */
+  family: string;
+  attempts: number;
+  firstRevision: number;
+  lastRevision: number;
+  diagnosticCodes: string[];
+  /** Progress watermark shared by every attempt in this no-progress cluster. */
+  progress: SemanticProgressWatermark;
+}
+
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
   sessionId: string;
@@ -82,6 +102,8 @@ export interface KernelState {
   continuationAttempts: number;
   repeatedToolBatchCount: number;
   receiptCountAtLastUserInput: number;
+  semanticProgress: SemanticProgressWatermark;
+  semanticFailureCluster?: SemanticFailureCluster;
   lastToolBatchSignature?: string;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
@@ -148,7 +170,8 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     completionRepairAttempts: 0,
     continuationAttempts: 0,
     repeatedToolBatchCount: 0,
-    receiptCountAtLastUserInput: 0
+    receiptCountAtLastUserInput: 0,
+    semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
   };
 }
 
@@ -159,6 +182,37 @@ function record(value: unknown): Record<string, unknown> | null {
 function validDeadlineState(state: Record<string, unknown>): boolean {
   return typeof state.deadlineAt === "string" && (state.deadlineRemainingMs === undefined
     || (Number.isSafeInteger(state.deadlineRemainingMs) && Number(state.deadlineRemainingMs) >= 1));
+}
+
+function nonNegativeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+export function isSemanticProgressWatermark(value: unknown): value is SemanticProgressWatermark {
+  const progress = record(value);
+  return Boolean(progress && [progress.workspaceChanges, progress.durableEvidence, progress.revision]
+    .every(nonNegativeInteger));
+}
+
+export function isSemanticFailureCluster(value: unknown): value is SemanticFailureCluster {
+  const cluster = record(value);
+  return Boolean(cluster
+    && typeof cluster.family === "string" && cluster.family.length > 0
+    && Number.isSafeInteger(cluster.attempts) && Number(cluster.attempts) >= 1
+    && [cluster.firstRevision, cluster.lastRevision].every(nonNegativeInteger)
+    && Array.isArray(cluster.diagnosticCodes)
+    && cluster.diagnosticCodes.every((item) => typeof item === "string" && item.length > 0)
+    && isSemanticProgressWatermark(cluster.progress));
+}
+
+function validSemanticState(state: Record<string, unknown>): boolean {
+  if (!isSemanticProgressWatermark(state.semanticProgress)) return false;
+  const revision = Number(state.revision);
+  if (state.semanticProgress.revision > revision) return false;
+  if (state.semanticFailureCluster === undefined) return true;
+  if (!isSemanticFailureCluster(state.semanticFailureCluster)) return false;
+  return state.semanticFailureCluster.firstRevision <= state.semanticFailureCluster.lastRevision
+    && state.semanticFailureCluster.lastRevision <= revision;
 }
 
 export function isKernelStateV2(value: unknown): value is KernelStateV2 {
@@ -217,6 +271,7 @@ export function isKernelState(value: unknown): value is KernelState {
     validFrozenState(state),
     Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
     Array.isArray(state.childIds),
+    validSemanticState(state),
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
       state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
   ].every(Boolean);
@@ -291,7 +346,8 @@ export function upcastKernelStateV2(state: KernelStateV2): KernelState {
     plan: createEmptyPlan(),
     budget: createBudgetLedger(),
     frozenSkills: [],
-    activeProcessIds: []
+    activeProcessIds: [],
+    semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
   };
 }
 

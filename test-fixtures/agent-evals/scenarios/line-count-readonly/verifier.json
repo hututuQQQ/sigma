@@ -1,0 +1,8 @@
+{
+  "files": [
+    { "path": "src/counter.js", "equals": "export function add(a, b) {\n  return a + b;\n}\n" },
+    { "path": "src/constants.ts", "equals": "export const product = \"sigma\";\nexport const enabled = true;\n" },
+    { "path": "tests/counter.test.js", "equals": "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { add } from \"../src/counter.js\";\ntest(\"adds\", () => {\n  assert.equal(add(2, 3), 5);\n});\n" },
+    { "path": "vendor/generated.js", "contains": "outside the requested" }
+  ]
+}

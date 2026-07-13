@@ -1,3 +1,4 @@
+import path from "node:path";
 import { BrokerProtocolError } from "./errors.js";
 import { protocolRecord } from "./protocol.js";
 import { BROKER_PROTOCOL_VERSION, type BrokerDoctorReport, type ProcessState } from "./types.js";
@@ -6,6 +7,10 @@ export interface OutputChunkValue {
   data: string;
   nextOffset: number;
   droppedBytes: number;
+  decodingError?: {
+    code: "invalid_output_encoding" | "encoding_lossy";
+    message: string;
+  };
 }
 
 export interface OutputArtifactValue {
@@ -66,10 +71,23 @@ function nullableExitCode(value: unknown): number | null {
 
 function outputChunk(input: unknown, label: string): OutputChunkValue {
   const value = protocolRecord(input, label);
+  const rawDecodingError = value.decodingError;
+  let decodingError: OutputChunkValue["decodingError"];
+  if (rawDecodingError !== undefined && rawDecodingError !== null) {
+    const error = protocolRecord(rawDecodingError, `${label}.decodingError`);
+    if (error.code !== "invalid_output_encoding" && error.code !== "encoding_lossy") {
+      throw new BrokerProtocolError(`${label}.decodingError.code is invalid.`);
+    }
+    decodingError = {
+      code: error.code,
+      message: stringValue(error.message, `${label}.decodingError.message`)
+    };
+  }
   return {
     data: stringValue(value.data, `${label}.data`),
     nextOffset: integerValue(value.nextOffset, `${label}.nextOffset`),
-    droppedBytes: integerValue(value.droppedBytes, `${label}.droppedBytes`)
+    droppedBytes: integerValue(value.droppedBytes, `${label}.droppedBytes`),
+    ...(decodingError ? { decodingError } : {})
   };
 }
 
@@ -117,6 +135,40 @@ function processState(input: unknown): Exclude<ProcessState, "lost"> {
   throw new BrokerProtocolError(`Invalid process state '${String(input)}'.`);
 }
 
+function verifiedShells(
+  input: unknown,
+  platform: string
+): NonNullable<BrokerDoctorReport["capabilities"]["shells"]> | undefined {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input) || input.length > 8) {
+    throw new BrokerProtocolError("Broker verified shells are invalid.");
+  }
+  const seen = new Set<string>();
+  return input.map((raw, index) => {
+    const shell = protocolRecord(raw, `Broker verified shell[${index}]`);
+    if (shell.kind !== "powershell" && shell.kind !== "cmd" && shell.kind !== "bash") {
+      throw new BrokerProtocolError("Broker verified shell kind is invalid.");
+    }
+    const executable = stringValue(shell.executable, "Broker verified shell executable");
+    const absolute = platform === "windows" || platform === "win32"
+      ? path.win32.isAbsolute(executable) : path.posix.isAbsolute(executable);
+    if (!executable || executable.includes("\0") || !absolute || seen.has(shell.kind) || shell.verified !== true) {
+      throw new BrokerProtocolError("Broker verified shell entry is invalid or duplicated.");
+    }
+    seen.add(shell.kind);
+    const supportsChildProcesses = shell.supportsChildProcesses;
+    if (supportsChildProcesses !== undefined && typeof supportsChildProcesses !== "boolean") {
+      throw new BrokerProtocolError("Broker verified shell child-process capability is invalid.");
+    }
+    return {
+      kind: shell.kind,
+      executable,
+      verified: true as const,
+      ...(supportsChildProcesses === undefined ? {} : { supportsChildProcesses })
+    };
+  });
+}
+
 export function parseHello(input: unknown): { instanceId: string; artifactRoot?: string } {
   const value = protocolRecord(input, "Broker hello result");
   if (value.protocolVersion !== BROKER_PROTOCOL_VERSION) throw new BrokerProtocolError("Broker hello version mismatch.");
@@ -147,10 +199,12 @@ export function parseDoctor(input: unknown): BrokerDoctorReport {
   if (!Array.isArray(networkModes) || networkModes.some((mode) => mode !== "none" && mode !== "full")) {
     throw new BrokerProtocolError("Broker networkModes are invalid.");
   }
+  const platform = stringValue(value.platform, "Broker platform");
+  const shells = verifiedShells(capabilities.shells, platform);
   return {
     protocolVersion: BROKER_PROTOCOL_VERSION,
     brokerVersion: stringValue(value.brokerVersion, "Broker version"),
-    platform: stringValue(value.platform, "Broker platform"),
+    platform,
     architecture: stringValue(value.architecture, "Broker architecture"),
     sandbox: {
       available: booleanValue(sandbox.available, "sandbox.available"),
@@ -176,7 +230,11 @@ export function parseDoctor(input: unknown): BrokerDoctorReport {
       background: booleanValue(capabilities.background, "capabilities.background"),
       stdin: booleanValue(capabilities.stdin, "capabilities.stdin"),
       pty: booleanValue(capabilities.pty, "capabilities.pty"),
-      networkModes: networkModes as Array<"none" | "full">
+      networkModes: networkModes as Array<"none" | "full">,
+      ...(capabilities.executionRoots === undefined ? {} : {
+        executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
+      }),
+      ...(shells ? { shells } : {})
     }
   };
 }

@@ -79,7 +79,7 @@ export async function copyLegacyEvents(
   }
   const directory = sessionDirectory(temporaryRoot, context.sessionId);
   const eventsDirectory = path.join(directory, "events");
-  await mkdir(eventsDirectory, { recursive: true });
+  await mkdir(eventsDirectory, { recursive: true, mode: 0o700 });
   let expectedSeq = 0;
   let segment = 1;
   let segmentEvents = 0;

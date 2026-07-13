@@ -2,6 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CommandRegistry, SIGMA_CONFIG_SCHEMA, configHelp, type CommandDefinition } from "agent-config";
+import type { RuntimeClient } from "agent-protocol";
 import type { TuiAppOptions } from "agent-tui";
 import { runDoctorCommand } from "./commands/doctor.js";
 import { runSandboxCommand } from "./commands/sandbox.js";
@@ -14,11 +15,13 @@ import { runVersionCommand } from "./commands/version.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
-import { createConfiguredRuntime } from "agent-runtime";
+import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
   stderr?: NodeJS.WritableStream;
+  runtimeFactoryDeps?: RuntimeFactoryDeps;
+  runtime?: RuntimeClient;
 }
 
 function printHelp(): void {
@@ -50,7 +53,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
     (options.stderr ?? process.stderr).write(`${trustMessage}\n`);
     return 2;
   }
-  const configured = await createConfiguredRuntime(cliConfig);
+  const configured = await createConfiguredRuntime(cliConfig, options.runtimeFactoryDeps);
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,
     workspace: configured.workspace,
@@ -79,9 +82,11 @@ async function dispatchCommand(
     case "run": return await runCommand(argv, { mode: definition.mode });
     case "tui": return await runTuiCommand(argv, options);
     case "session": return definition.sessionAction === "list"
-      ? await runSessionsCommand(argv)
-      : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv);
-    case "replay": return await runReplayCommand(argv);
+      ? await runSessionsCommand(argv, { runtime: options.runtime })
+      : await runSessionCommand(definition.sessionAction ? [definition.sessionAction, ...argv] : argv, {
+        runtime: options.runtime
+      });
+    case "replay": return await runReplayCommand(argv, { runtime: options.runtime });
     case "doctor": return await runDoctorCommand(argv);
     case "sandbox": return await runSandboxCommand(argv);
     case "version": return await runVersionCommand(argv);

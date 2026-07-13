@@ -8,10 +8,28 @@ import {
   type ModelExecutionRole,
   type RunMode,
   type RunStore,
-  type SnapshotEnvelope
+  type SnapshotEnvelope,
+  type ToolCallPlan,
+  type ToolEffect
 } from "agent-protocol";
-import { assertKernelInvariants, createKernelState, evolve, isKernelState, type KernelState } from "agent-kernel";
+import {
+  assertKernelInvariants,
+  createKernelState,
+  evolve,
+  isKernelState,
+  isSemanticFailureCluster,
+  isSemanticProgressWatermark,
+  type KernelState
+} from "agent-kernel";
 import { jsonValue } from "./json.js";
+import {
+  approvalEffectsForPlan,
+  createApprovalBinding,
+  parseToolCallPlan,
+  parseToolEffects,
+  type ApprovalBinding,
+  type RecoveredApprovalMetadata
+} from "./approval-binding.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
@@ -25,6 +43,7 @@ export interface RestoredSessionData {
   strictWriteScope: boolean;
   modelRole: ModelExecutionRole;
   contextItems: ContextItem[];
+  pendingApprovals: Array<RecoveredApprovalMetadata & { callId: string }>;
 }
 
 function createdData(event: AgentEventEnvelope | undefined): {
@@ -94,6 +113,76 @@ interface RestoreAccumulator {
   lastSeq: number;
   followUps: Map<string, string>;
   contextItems: Map<string, ContextItem>;
+  executionPlans: Map<string, ToolCallPlan>;
+  pendingApprovals: Map<string, RecoveredApprovalMetadata>;
+}
+
+function approvalKey(runId: string, callId: string): string {
+  return `${runId}\0${callId}`;
+}
+
+function payloadRecord(event: AgentEventEnvelope): Record<string, unknown> | null {
+  return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : null;
+}
+
+function recoveredBinding(
+  event: AgentEventEnvelope,
+  callId: string,
+  toolName: string,
+  argumentsValue: JsonValue,
+  plan: ToolCallPlan,
+  effects: ToolEffect[]
+): ApprovalBinding | undefined {
+  try {
+    return createApprovalBinding(event.sessionId, event.runId, {
+      id: callId,
+      name: toolName,
+      arguments: argumentsValue
+    }, plan, effects);
+  } catch {
+    return undefined;
+  }
+}
+
+function recoveredBindingFromPayload(
+  event: AgentEventEnvelope,
+  payload: Record<string, unknown>,
+  callId: string,
+  plan: ToolCallPlan | undefined,
+  effects: ToolEffect[]
+): ApprovalBinding | undefined {
+  if (!plan || typeof payload.toolName !== "string"
+    || !Object.prototype.hasOwnProperty.call(payload, "arguments")) return undefined;
+  return recoveredBinding(
+    event, callId, payload.toolName, payload.arguments as JsonValue, plan, effects
+  );
+}
+
+function trackApprovalAuthority(accumulator: RestoreAccumulator, event: AgentEventEnvelope): void {
+  if (event.authority !== "runtime") return;
+  const payload = payloadRecord(event);
+  if (!payload) return;
+  if (event.type === "execution.planned") {
+    if (typeof payload.toolCallId !== "string") return;
+    const plan = parseToolCallPlan(payload.plan);
+    if (plan) accumulator.executionPlans.set(approvalKey(event.runId, payload.toolCallId), plan);
+    return;
+  }
+  if (event.type !== "tool.approval_requested" || payload.delegated === true) return;
+  const callId = typeof payload.callId === "string"
+    ? payload.callId
+    : typeof payload.requestId === "string" ? payload.requestId : undefined;
+  if (!callId) return;
+  const key = approvalKey(event.runId, callId);
+  const plan = parseToolCallPlan(payload.plan) ?? accumulator.executionPlans.get(key);
+  const effects = parseToolEffects(payload.effects) ?? (plan ? approvalEffectsForPlan(plan) : []);
+  const binding = recoveredBindingFromPayload(event, payload, callId, plan, effects);
+  accumulator.pendingApprovals.set(key, {
+    effects,
+    ...(binding ? { binding } : {})
+  });
 }
 
 function contextItem(value: JsonValue): ContextItem | null {
@@ -136,6 +225,19 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
   return isKernelState(state) && state.sessionId === sessionId;
 }
 
+function restoredSemanticState(stored: Partial<KernelState>): Pick<
+  KernelState,
+  "semanticProgress" | "semanticFailureCluster"
+> {
+  return {
+    semanticProgress: isSemanticProgressWatermark(stored.semanticProgress)
+      ? stored.semanticProgress
+      : { workspaceChanges: 0, durableEvidence: 0, revision: 0 },
+    semanticFailureCluster: isSemanticFailureCluster(stored.semanticFailureCluster)
+      ? stored.semanticFailureCluster : undefined
+  };
+}
+
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
   const stored = snapshot.state as unknown as Partial<KernelState>;
@@ -146,6 +248,7 @@ function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>
       : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
         ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
     activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
+    ...restoredSemanticState(stored),
     completionRepairAttempts: Number.isInteger(stored.completionRepairAttempts) ? stored.completionRepairAttempts : 0,
     continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
     repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
@@ -187,6 +290,7 @@ function replayEvent(
   accumulator.lastSeq = event.seq;
   trackFollowUp(accumulator, event);
   trackContext(accumulator, event);
+  trackApprovalAuthority(accumulator, event);
   initializeFromCreated(accumulator, event, event.sessionId, runDeadlineMs);
   if (!accumulator.state || !accumulator.metadata || event.seq <= snapshotSeq) {
     countModelTurn(accumulator, event);
@@ -206,7 +310,9 @@ function emptyAccumulator(state?: KernelState): RestoreAccumulator {
     modelTurn: 0,
     lastSeq: 0,
     followUps: new Map(),
-    contextItems: new Map()
+    contextItems: new Map(),
+    executionPlans: new Map(),
+    pendingApprovals: new Map()
   };
 }
 
@@ -245,6 +351,18 @@ export async function restoreStoredSession(store: RunStore, sessionId: string, r
     replayEvent(accumulator, event, restoredSnapshot ? snapshot?.seq ?? 0 : 0, runDeadlineMs);
   }
   if (!accumulator.metadata || !accumulator.state) throw new Error(`Session '${sessionId}' was not found.`);
+  const pendingApprovals = accumulator.state.pendingTools
+    .filter((item) => item.approval === "pending")
+    .map((item) => {
+      const recovered = accumulator.pendingApprovals.get(
+        approvalKey(accumulator.state!.runId, item.request.callId)
+      );
+      return {
+        callId: item.request.callId,
+        effects: recovered?.effects ?? [],
+        ...(recovered?.binding ? { binding: recovered.binding } : {})
+      };
+    });
   return {
     ...accumulator.metadata,
     mode: accumulator.state.mode,
@@ -252,6 +370,7 @@ export async function restoreStoredSession(store: RunStore, sessionId: string, r
     modelTurn: accumulator.modelTurn,
     lastSeq: accumulator.lastSeq,
     followUps: [...accumulator.followUps].map(([id, text]) => ({ id, text })),
-    contextItems: [...accumulator.contextItems.values()]
+    contextItems: [...accumulator.contextItems.values()],
+    pendingApprovals
   };
 }

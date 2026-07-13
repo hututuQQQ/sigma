@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "service.mjs", "equals": "export const retryLimit = 3;\n" },
+    { "path": "check.mjs", "contains": "upstream fixture is offline" }
+  ]
+}

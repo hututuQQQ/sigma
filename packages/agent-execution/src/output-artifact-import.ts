@@ -84,7 +84,13 @@ export class BrokerOutputArtifactImporter {
       const nativeBytes = await readPinnedFile(sourcePath, artifact.sizeBytes);
       const checksum = createHash("sha256").update(nativeBytes).digest("hex");
       if (checksum !== artifact.sha256) throw new BrokerProtocolError("Output artifact checksum mismatch.");
-      const content = Buffer.from(this.redactor.redactText(nativeBytes.toString("utf8")), "utf8");
+      let decoded: string;
+      try {
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(nativeBytes);
+      } catch (error) {
+        throw new BrokerProtocolError("Broker output artifact is not valid normalized UTF-8.", { cause: error });
+      }
+      const content = Buffer.from(this.redactor.redactText(decoded), "utf8");
       prepared.push({ sourcePath, imported: {
         brokerArtifactId: artifact.artifactId, name: artifact.name, stream: artifact.stream,
         brokerSha256: artifact.sha256, sizeBytes: content.byteLength,

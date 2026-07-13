@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "math.mjs", "equals": "export function add(left, right) {\n  return left + right;\n}\n" },
+    { "path": "math.test.mjs", "contains": "assert.equal(add(7, 5), 12)" }
+  ]
+}

@@ -14,6 +14,7 @@ import type {
 import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 class Capture extends Writable {
   readonly chunks: Buffer[] = [];
@@ -138,6 +139,10 @@ function gatewayFactory(script: ScriptedResponse[]): () => ModelGateway {
   return () => new ScriptedGateway(script);
 }
 
+function runDeps(script: ScriptedResponse[]) {
+  return { gatewayFactory: gatewayFactory(script), executionBroker: createHostExecutionBroker() };
+}
+
 describe("run command branch coverage", () => {
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
@@ -165,7 +170,7 @@ describe("run command branch coverage", () => {
       "--prompt-file", prompt,
       "--workspace", root,
       "--permission-mode", "auto"
-    ], { stdin, stdout, stderr, mode: "analyze", gatewayFactory: gatewayFactory([
+    ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
       evidenceRequest("file-evidence"), complete("file complete")
     ]) });
     expect(code).toBe(0);
@@ -183,7 +188,7 @@ describe("run command branch coverage", () => {
       "--workspace", root,
       "--permission-mode", "auto",
       "--output-format", "stream-json"
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([
+    ], { stdin, stdout, stderr, ...runDeps([
       evidenceRequest("stream-evidence"), complete("stream complete")
     ]) });
     expect(code).toBe(0);
@@ -209,7 +214,7 @@ describe("run command branch coverage", () => {
       stdout,
       stderr,
       mode: "analyze",
-      gatewayFactory: gatewayFactory([
+      ...runDeps([
         evidenceRequest("stdin-evidence"), complete("stdin complete")
       ])
     });
@@ -240,7 +245,7 @@ describe("run command branch coverage", () => {
     const stderr = new Capture();
     const running = runCommand([
       "choose a target", "--workspace", root, "--permission-mode", "auto", "--output-format", "json"
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([userInputRequest()]) });
+    ], { stdin, stdout, stderr, ...runDeps([userInputRequest()]) });
     const code = await Promise.race([
       running,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("run command hung after NeedsInput")), 2_000))
@@ -271,7 +276,7 @@ describe("run command branch coverage", () => {
       "--workspace", root,
       "--permission-mode", "ask",
       ...(allowed ? ["--waive-reviewer"] : [])
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory(script) });
+    ], { stdin, stdout, stderr, ...runDeps(script) });
     expect(code).toBe(0);
     expect(stderr.text()).toContain(eventType);
     if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.md"), "utf8"))).toBe("approved");
@@ -288,7 +293,7 @@ describe("run command branch coverage", () => {
       "--workspace", root,
       "--permission-mode", "auto",
       "--output-format", "json"
-    ], { stdin, stdout, stderr, gatewayFactory: gatewayFactory([new Error("provider unavailable")]) });
+    ], { stdin, stdout, stderr, ...runDeps([new Error("provider unavailable")]) });
     expect(code).toBe(1);
     expect(JSON.parse(stdout.text())).toMatchObject({
       status: "error",

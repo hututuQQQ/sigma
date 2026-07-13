@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,7 +19,9 @@ import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runInitCommand } from "../packages/agent-cli/src/commands/init.js";
 import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
+import type { ConfiguredRuntime } from "../packages/agent-runtime/src/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 class Capture extends Writable {
   readonly chunks: Buffer[] = [];
@@ -98,6 +102,20 @@ async function workspace(prefix: string): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
+function configuredComposition(
+  runtime: RuntimeClient,
+  root: string,
+  close: () => Promise<void>
+): ConfiguredRuntime {
+  return {
+    runtime: runtime as ConfiguredRuntime["runtime"],
+    workspace: root,
+    storeRootDir: root,
+    execution: {} as ConfiguredRuntime["execution"],
+    close
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -164,12 +182,73 @@ describe("CLI init and replay branches", () => {
   it("constructs the configured replay runtime when one is not injected", async () => {
     const root = await workspace("sigma-replay-runtime-");
     const stderr = new Capture();
-    await expect(runReplayCommand(["--latest", "--workspace", root], { stderr })).resolves.toBe(1);
+    await expect(runReplayCommand(["--latest", "--workspace", root], {
+      stderr,
+      runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() }
+    })).resolves.toBe(1);
     expect(stderr.text()).toContain("replay requires a session id");
+  });
+
+  it("closes an owned replay composition when replay fails", async () => {
+    const root = await workspace("sigma-replay-owned-runtime-");
+    const runtime = new FakeRuntime();
+    const close = vi.fn(async () => undefined);
+    const stderr = new Capture();
+    await expect(runReplayCommand(["--latest", "--workspace", root], {
+      stderr,
+      createConfiguredRuntime: async () => configuredComposition(runtime, root, close)
+    })).resolves.toBe(1);
+    expect(stderr.text()).toContain("replay requires a session id");
+    expect(close).toHaveBeenCalledOnce();
   });
 });
 
 describe("CLI session branches", () => {
+  it("closes and awaits the child process owned by a configured list runtime", async () => {
+    const root = await workspace("sigma-session-owned-runtime-");
+    const runtime = new FakeRuntime();
+    runtime.sessions = [overview()];
+    const child = spawn(process.execPath, [
+      "-e",
+      "process.stdin.resume(); process.stdin.on('end', () => setTimeout(() => process.exit(0), 25));"
+    ], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+    await once(child, "spawn");
+    const childClosed = once(child, "close");
+    const close = vi.fn(async () => {
+      child.stdin.end();
+      await childClosed;
+    });
+    try {
+      const stdout = new Capture();
+      await expect(runSessionsCommand(["--workspace", root, "--json"], {
+        stdout,
+        createConfiguredRuntime: async () => configuredComposition(runtime, root, close)
+      })).resolves.toBe(0);
+      expect(close).toHaveBeenCalledOnce();
+      expect(child.exitCode).toBe(0);
+      expect(JSON.parse(stdout.text()).sessions).toHaveLength(1);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const closed = once(child, "close");
+        child.kill();
+        await closed;
+      }
+    }
+  });
+
+  it("closes an owned session composition when a subcommand fails", async () => {
+    const root = await workspace("sigma-session-owned-failure-");
+    const runtime = new FakeRuntime();
+    const close = vi.fn(async () => undefined);
+    const stderr = new Capture();
+    await expect(runSessionCommand(["show", "missing", "--workspace", root], {
+      stderr,
+      createConfiguredRuntime: async () => configuredComposition(runtime, root, close)
+    })).resolves.toBe(1);
+    expect(stderr.text()).toContain("was not found");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("lists empty, text, JSON, limited, and failed session results", async () => {
     const runtime = new FakeRuntime();
     const empty = new Capture();
@@ -410,8 +489,17 @@ describe("CLI command registry dispatch", () => {
     const root = await workspace("sigma-index-tui-");
     let selected: string | undefined;
     await expect(runAgentCommand(["tui", "--workspace", root, "--session", "chosen"], {
+      runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() },
       tuiRunner: async (options) => { selected = options.sessionId; }
     })).resolves.toBe(0);
     expect(selected).toBe("chosen");
+  });
+
+  it("passes an injected runtime through registry session dispatch", async () => {
+    const runtime = new FakeRuntime();
+    runtime.sessions = [overview()];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await expect(runAgentCommand(["sessions", "--json"], { runtime })).resolves.toBe(0);
+    expect(stdout).toHaveBeenCalledWith(expect.stringContaining("session-one"));
   });
 });

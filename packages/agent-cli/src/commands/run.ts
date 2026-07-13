@@ -2,13 +2,18 @@ import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
 import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agent-protocol";
-import { createConfiguredRuntime, type ConfiguredRuntime, type InProcessRuntimeClient } from "agent-runtime";
+import {
+  createConfiguredRuntime,
+  type ConfiguredRuntime,
+  type InProcessRuntimeClient,
+  type RuntimeFactoryDeps
+} from "agent-runtime";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage, type CliConfig
 } from "../config.js";
 import { outputError, outputEvent, outputResult } from "../output-schema.js";
 
-export interface RunCommandDeps {
+export interface RunCommandDeps extends RuntimeFactoryDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
   stdout?: NodeJS.WritableStream & { isTTY?: boolean };
   stderr?: NodeJS.WritableStream;

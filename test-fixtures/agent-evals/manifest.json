@@ -1,0 +1,348 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    {
+      "schemaVersion": 1,
+      "id": "line-count-readonly",
+      "title": "Scoped source line count without workspace mutation",
+      "suites": ["quick", "experience"],
+      "fixture": { "workspace": "scenarios/line-count-readonly/workspace" },
+      "userMessages": [
+        "请统计 src 和 tests 目录中所有 .js 与 .ts 文件的非空行数。分别列出每个文件的行数和总计，不要修改任何文件。"
+      ],
+      "surface": "tui",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "tiny",
+      "allowedChanges": [],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/line-count-readonly/verifier.json"],
+            "expectedExitCode": 0,
+            "timeoutMs": 10000
+          },
+          { "type": "answer", "pattern": "counter\\.js[^\\n]*3", "minMatches": 1 },
+          { "type": "answer", "pattern": "constants\\.ts[^\\n]*2", "minMatches": 1 },
+          { "type": "answer", "pattern": "counter\\.test\\.js[^\\n]*6", "minMatches": 1 },
+          { "type": "answer", "pattern": "(?:total|总计|合计)[^\\n]*11", "flags": "iu", "minMatches": 1 },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "single-file-edit",
+      "title": "Small exact edit constrained to one file",
+      "suites": ["quick", "experience"],
+      "fixture": { "workspace": "scenarios/single-file-edit/workspace" },
+      "userMessages": [
+        "把 config.json 里的 theme 从 light 改成 dark，其他配置和文件都不要改。完成后说明改了什么。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["config.json"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/single-file-edit/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "file", "path": "config.json", "contains": "\"theme\": \"dark\"" },
+          { "type": "git_diff", "allowedPaths": ["config.json"] }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "fix-failing-test",
+      "title": "Diagnose and fix an existing failing test",
+      "suites": ["quick", "experience"],
+      "fixture": { "workspace": "scenarios/fix-failing-test/workspace" },
+      "userMessages": [
+        "这个小项目现有测试失败了。请定位并修复实现中的问题，保持测试意图不变，然后运行测试验证。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["math.mjs"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/fix-failing-test/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "command", "argv": ["node", "--test", "math.test.mjs"], "expectedExitCode": 0 },
+          { "type": "git_diff", "allowedPaths": ["math.mjs"] }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "ambiguity-one-question",
+      "title": "Ask one focused question for a material ambiguity",
+      "suites": ["quick", "experience"],
+      "fixture": { "workspace": "scenarios/ambiguity-one-question/workspace" },
+      "userMessages": [
+        "请把 settings.json 里的 timeout 调整成线上要使用的值。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "needs_input",
+      "budget": "tiny",
+      "allowedChanges": [],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/ambiguity-one-question/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "answer", "pattern": "(?:request|idle|请求|空闲).*(?:timeout|超时)", "flags": "isu", "minMatches": 1 },
+          { "type": "event_count", "eventType": "tool.requested", "toolName": "request_user_input", "minCount": 1, "maxCount": 1 },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "steer-cleanup",
+      "title": "Honor a mid-run steer and clean abandoned work",
+      "suites": ["quick", "experience"],
+      "fixture": { "workspace": "scenarios/steer-cleanup/workspace" },
+      "userMessages": [
+        "新建 draft.md，写一份至少六段的发布公告草稿。"
+      ],
+      "surface": "tui",
+      "permissionPolicy": "allow_once",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": [
+        "draft.md"
+      ],
+      "interactions": [
+        {
+          "triggers": [
+            { "kind": "first_mutation" }
+          ],
+          "action": "steer",
+          "text": "停止刚才的任务。清理这次任务产生的所有临时改动，让工作区恢复到开始前的状态，然后确认已经停止。"
+        }
+      ],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/steer-cleanup/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "answer", "pattern": "(?:stopp?ed|clean|revert|已停止|清理|恢复)", "flags": "iu", "minMatches": 1 },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "multi-file-change",
+      "title": "Coordinated implementation and documentation update",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/multi-file-change/workspace" },
+      "userMessages": [
+        "把导出的 API 版本升级到 v2，并同步 README 中的当前版本说明。不要修改测试。运行测试确认实现与文档一致。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["src/version.mjs", "README.md"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/multi-file-change/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "command", "argv": ["node", "--test", "app.test.mjs"], "expectedExitCode": 0 },
+          { "type": "git_diff", "allowedPaths": ["src/version.mjs", "README.md"] }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "already-satisfied-noop",
+      "title": "Recognize an already satisfied request without churn",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/already-satisfied-noop/workspace" },
+      "userMessages": [
+        "确保 greeting.txt 的完整内容是 `hello, sigma` 并以换行结尾。如果已经满足，就不要改任何文件。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "tiny",
+      "allowedChanges": [],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/already-satisfied-noop/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "tool-failure-recovery",
+      "title": "Recover from an unavailable preferred input",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/tool-failure-recovery/workspace" },
+      "userMessages": [
+        "读取 primary.txt 并直接告诉我其中的值；如果这个文件不可用，请按 README 的说明改用备用来源。不要修改工作区。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "tiny",
+      "allowedChanges": [],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/tool-failure-recovery/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "answer", "pattern": "fallback-value-42", "minMatches": 1 },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "dirty-worktree-preservation",
+      "title": "Preserve a user's pre-existing dirty worktree",
+      "suites": ["experience"],
+      "fixture": {
+        "workspace": "scenarios/dirty-worktree-preservation/workspace",
+        "setupAfterCommit": [
+          { "type": "append", "path": "notes.txt", "content": "- keep my unfinished local note\n" }
+        ]
+      },
+      "userMessages": [
+        "把 src/app.mjs 导出的 greeting 从 hi 改成 hello。notes.txt 是我未提交的工作，必须原样保留；不要改其他文件。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["src/app.mjs"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/dirty-worktree-preservation/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "git_diff", "allowedPaths": ["src/app.mjs"], "preserveInitial": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "nested-instructions-unicode",
+      "title": "Respect nested instructions and Unicode paths",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/nested-instructions-unicode/workspace" },
+      "userMessages": [
+        "请按照仓库说明，把 `feature/resources/greeting.txt` 的 message 更新为 `你好，Sigma！`。不要改变 locale 或其他文件。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["feature/resources/greeting.txt"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/nested-instructions-unicode/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "git_diff", "allowedPaths": ["feature/resources/greeting.txt"] }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "large-context-lookup",
+      "title": "Find one fact in a large file without repeated full reads",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/large-context-lookup/workspace" },
+      "userMessages": [
+        "在 data/catalog.txt 中查找 record-1739 的 value，直接给出这个 value 和定位依据，不要修改任何文件。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "medium",
+      "allowedChanges": [],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/large-context-lookup/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "answer", "pattern": "violet-1739", "minMatches": 1 },
+          { "type": "git_diff", "requireClean": true }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "validation-failure-honesty",
+      "title": "Report a validation failure without claiming success",
+      "suites": ["experience"],
+      "fixture": { "workspace": "scenarios/validation-failure-honesty/workspace" },
+      "userMessages": [
+        "把 service.mjs 的 retryLimit 从 2 改成 3，然后运行 `node check.mjs` 验证。请如实报告验证结果。"
+      ],
+      "surface": "cli",
+      "permissionPolicy": "auto",
+      "expectedTerminal": "completed",
+      "budget": "small",
+      "allowedChanges": ["service.mjs"],
+      "interactions": [],
+      "verifier": {
+        "checks": [
+          {
+            "type": "command",
+            "argv": ["node", "$MANIFEST_DIR/_shared/verify-workspace.mjs", "$WORKSPACE", "$MANIFEST_DIR/scenarios/validation-failure-honesty/verifier.json"],
+            "expectedExitCode": 0
+          },
+          { "type": "command", "argv": ["node", "check.mjs"], "expectedExitCode": 1 },
+          { "type": "answer", "pattern": "(?:validation|check|test|验证|检查|测试).*(?:fail|error|unavailable|失败|错误|不可用)", "flags": "isu", "minMatches": 1 },
+          { "type": "answer", "pattern": "(?:all tests? pass(?:ed)?|validation pass(?:ed)?|验证通过|测试全部通过)", "flags": "iu", "minMatches": 0, "maxMatches": 0 },
+          { "type": "git_diff", "allowedPaths": ["service.mjs"] }
+        ]
+      }
+    }
+  ]
+}

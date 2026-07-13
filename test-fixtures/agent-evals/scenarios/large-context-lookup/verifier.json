@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "data/catalog.txt", "contains": "record-1739 value=violet-1739" },
+    { "path": "README.md", "contains": "lookup exercise" }
+  ]
+}

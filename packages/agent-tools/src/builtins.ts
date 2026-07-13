@@ -1,12 +1,16 @@
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
-import { resolveWorkspacePath } from "agent-platform";
+import { resolveWorkspacePath, runtimeEnvironment } from "agent-platform";
 import type { ExecutionBroker } from "agent-execution";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 import { repositoryTools } from "./repository-tools.js";
 import { registerCompletionTool } from "./completion-tool.js";
-import { applyUnifiedPatch, parseUnifiedPatch } from "./atomic-patch.js";
+import {
+  applyUnifiedPatch,
+  parseUnifiedPatch,
+  replaceWorkspaceTextFile
+} from "./atomic-patch.js";
 import { registerControlTools } from "./control-tools.js";
 import {
   executionTools,
@@ -14,6 +18,7 @@ import {
   type ExecutionToolOptions
 } from "./execution-tools.js";
 import { codeIntelTool, type CodeIntelToolOptions } from "./lsp-tools.js";
+import { deleteWorkspaceFile } from "./delete-file.js";
 
 function args(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -28,15 +33,19 @@ function stringArg(input: Record<string, JsonValue>, key: string): string {
 async function writableTarget(workspacePath: string, requestedPath: string): Promise<string> {
   const workspace = await realpath(workspacePath);
   const target = await resolveWorkspacePath(workspacePath, requestedPath);
-  const relative = path.relative(workspace, target).split(path.sep);
-  const root = relative[0]?.toLowerCase();
-  if (root === ".git" || root === ".agent") {
+  const segments = path.relative(workspace, target).split(path.sep).filter(Boolean);
+  if (segments.some((segment) => {
+    const normalized = segment.toLowerCase();
+    return normalized === ".git" || normalized === ".agent";
+  })) {
     throw Object.assign(new Error(`Protected workspace metadata is read-only: ${requestedPath}`), {
       code: "protected_path"
     });
   }
   return target;
 }
+
+class EditPreconditionError extends Error {}
 
 function descriptor(input: Omit<ToolDescriptor, "inputSchema"> & { properties: Record<string, JsonValue>; required?: string[] }): ToolDescriptor {
   return {
@@ -98,7 +107,7 @@ function readTool(): RegisteredEffectTool {
   };
 }
 
-function writeTool(): RegisteredEffectTool {
+function writeTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
   return {
     descriptor: descriptor({
       name: "write",
@@ -118,20 +127,22 @@ function writeTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
       const relative = stringArg(input, "path");
-      const target = await writableTarget(context.workspacePath, relative);
-      const existed = await stat(target).then(() => true, () => false);
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, stringArg(input, "content"), "utf8");
+      await writableTarget(context.workspacePath, relative);
+      const result = await replaceWorkspaceTextFile(context.workspacePath, relative, {
+        ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {}),
+        transform: () => stringArg(input, "content")
+      });
       return receipt(request, startedAt, {
         output: `Wrote ${relative}`,
         observedEffects: ["filesystem.write"],
-        workspaceDelta: { added: existed ? [] : [relative], modified: existed ? [relative] : [], deleted: [] }
+        workspaceDelta: result.delta,
+        diagnostics: result.cleanupWarning ? ["atomic_cleanup_pending"] : []
       });
     }
   };
 }
 
-function editTool(): RegisteredEffectTool {
+function editTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
   return {
     descriptor: descriptor({
       name: "edit",
@@ -151,23 +162,75 @@ function editTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
       const relative = stringArg(input, "path");
-      const target = await writableTarget(context.workspacePath, relative);
-      const content = await readFile(target, "utf8");
+      await writableTarget(context.workspacePath, relative);
       const oldText = stringArg(input, "oldText");
-      const first = content.indexOf(oldText);
-      if (first < 0) return receipt(request, startedAt, { ok: false, output: "oldText was not found", observedEffects: ["filesystem.read"] });
-      if (content.indexOf(oldText, first + oldText.length) >= 0) return receipt(request, startedAt, { ok: false, output: "oldText is not unique", observedEffects: ["filesystem.read"] });
-      await writeFile(target, `${content.slice(0, first)}${stringArg(input, "newText")}${content.slice(first + oldText.length)}`, "utf8");
+      let result: Awaited<ReturnType<typeof replaceWorkspaceTextFile>>;
+      try {
+        result = await replaceWorkspaceTextFile(context.workspacePath, relative, {
+          ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {}),
+          requireExisting: true,
+          transform: (content) => {
+            const first = content.indexOf(oldText);
+            if (first < 0) throw new EditPreconditionError("oldText was not found");
+            if (content.indexOf(oldText, first + oldText.length) >= 0) {
+              throw new EditPreconditionError("oldText is not unique");
+            }
+            return `${content.slice(0, first)}${stringArg(input, "newText")}${content.slice(first + oldText.length)}`;
+          }
+        });
+      } catch (error) {
+        if (error instanceof EditPreconditionError) {
+          return receipt(request, startedAt, {
+            ok: false,
+            output: error.message,
+            observedEffects: ["filesystem.read"]
+          });
+        }
+        throw error;
+      }
       return receipt(request, startedAt, {
         output: `Edited ${relative}`,
         observedEffects: ["filesystem.read", "filesystem.write"],
-        workspaceDelta: { added: [], modified: [relative], deleted: [] }
+        workspaceDelta: result.delta,
+        diagnostics: result.cleanupWarning ? ["atomic_cleanup_pending"] : []
       });
     }
   };
 }
 
-function applyPatchTool(): RegisteredEffectTool {
+function deleteFileTool(): RegisteredEffectTool {
+  return {
+    descriptor: descriptor({
+      name: "delete_file",
+      description: "Delete exactly one regular file inside the workspace. Directories, recursive deletion, links, junctions, and .git/.agent metadata are rejected.",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      possibleEffects: ["filesystem.read", "filesystem.write", "destructive"],
+      availableModes: ["change"],
+      maximumEffects: ["filesystem.read", "filesystem.write", "destructive"],
+      executionMode: "exclusive",
+      resourceKeys: ["workspace:write"],
+      contextPathArguments: ["path"],
+      writePathArguments: ["path"],
+      approval: "prompt",
+      idempotent: false,
+      timeoutMs: 30_000
+    }),
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const input = args(request.arguments);
+      const requestedPath = stringArg(input, "path");
+      const relativePath = await deleteWorkspaceFile(context.workspacePath, requestedPath, context.signal);
+      return receipt(request, startedAt, {
+        output: `Deleted ${relativePath}`,
+        observedEffects: ["filesystem.read", "filesystem.write", "destructive"],
+        workspaceDelta: { added: [], modified: [], deleted: [relativePath] }
+      });
+    }
+  };
+}
+
+function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
   return {
     descriptor: descriptor({
       name: "apply_patch",
@@ -208,7 +271,10 @@ function applyPatchTool(): RegisteredEffectTool {
       const preimageHashes = rawHashes && typeof rawHashes === "object" && !Array.isArray(rawHashes)
         ? Object.fromEntries(Object.entries(rawHashes).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
         : undefined;
-      const result = await applyUnifiedPatch(context.workspacePath, stringArg(input, "patch"), { preimageHashes });
+      const result = await applyUnifiedPatch(context.workspacePath, stringArg(input, "patch"), {
+        ...(preimageHashes ? { preimageHashes } : {}),
+        ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {})
+      });
       const completedAt = new Date().toISOString();
       return {
         callId: request.callId,
@@ -231,17 +297,22 @@ function applyPatchTool(): RegisteredEffectTool {
 export interface BuiltinToolOptions extends Partial<Omit<ExecutionToolOptions, "broker">> {
   broker?: ExecutionBroker;
   codeIntel?: Omit<CodeIntelToolOptions, "broker">;
+  /** Durable external root used for atomic write/edit/apply_patch recovery. */
+  atomicPatchStateRootDir?: string;
 }
 
 export function registerBuiltinTools(registry: EffectToolRegistry, options: BuiltinToolOptions = {}): EffectToolRegistry {
+  const defaultShell = runtimeEnvironment().defaultShell;
   const execution: ExecutionToolOptions = {
     broker: options.broker ?? unavailableExecutionBroker(),
     sandboxMode: options.sandboxMode ?? "required",
-    networkMode: options.networkMode ?? "none"
+    networkMode: options.networkMode ?? "none",
+    shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell])
   };
   const codeIntel = options.codeIntel ? [codeIntelTool({ broker: execution.broker, ...options.codeIntel })] : [];
   for (const tool of [
-    readTool(), writeTool(), editTool(), applyPatchTool(),
+    readTool(), writeTool(options.atomicPatchStateRootDir), editTool(options.atomicPatchStateRootDir),
+    deleteFileTool(), applyPatchTool(options.atomicPatchStateRootDir),
     ...codeIntel, ...executionTools(execution), ...repositoryTools(options.broker)
   ]) registry.register(tool);
   return registerControlTools(registerCompletionTool(registry));

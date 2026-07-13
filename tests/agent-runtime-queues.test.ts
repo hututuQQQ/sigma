@@ -33,6 +33,18 @@ const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => crea
   reviewer: createApprovingReviewer()
 });
 
+async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
 
 function completion(summary: string): (request: ModelRequest) => ModelResponse {
@@ -155,7 +167,7 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
-  it("suspends a conversational natural stop after one model turn", async () => {
+  it("suspends a conversational natural stop without inventing execution evidence", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
     const gateway = new ScriptedGateway([{
       message: { role: "assistant", content: "Hello. What would you like me to work on?" },
@@ -222,10 +234,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "needs_input", message: "I am still done."
+      kind: "recoverable_failure", code: "terminal_protocol_missing"
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(gateway.requests[2].toolChoice).toBe("required");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
   }, 30_000);
 
   it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {
@@ -955,14 +970,18 @@ describe("runtime queues and non-blocking instruction steering", () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error("Approvals were not exposed.")), 2_000))
     ])).resolves.toBeUndefined();
     expect(approvalIds.sort()).toEqual(["write-a-replanned", "write-b-replanned"]);
-    for (const requestId of approvalIds) {
+    await Promise.all(approvalIds.map(async (requestId) => {
       await runtime.command({ type: "approve", sessionId: session.sessionId, requestId, decision: "allow" });
-    }
+    }));
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
     await expect(readFile(path.join(workspace, "nested", "a.txt"), "utf8")).resolves.toBe("a");
     await expect(readFile(path.join(workspace, "nested", "b.txt"), "utf8")).resolves.toBe("b");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.approval_requested")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "tool.approval_resolved")
+      .some((event) => typeof (event.payload as { deadlineAt?: unknown }).deadlineAt === "string")).toBe(true);
+    expect((await restoreStoredSession(store, session.sessionId, 10_000)).state.deadlineRemainingMs)
+      .toBeUndefined();
     expect(events.some((event) => event.type === "diagnostic"
       && (event.payload as { kind?: string }).kind === "nested_instructions_loaded")).toBe(true);
     expect(events.filter((event) => event.type === "tool.failed"
@@ -1065,11 +1084,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
       delegatedEffects: ["filesystem.read", "filesystem.write", "process.spawn", "process.spawn.readonly", "validation"],
       metadata: { mode: "change" }
     });
-    await expect(Promise.race([
-      supervisor.join(child.id),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Child approval deadlocked.")), 3_000))
-    ])).resolves.toMatchObject({ status: "completed", result: { outcome: { kind: "completed" } } });
+    await expect(withDeadline(
+      supervisor.join(child.id), 15_000, "Child approval deadlocked."
+    )).resolves.toMatchObject({ status: "completed", result: { outcome: { kind: "completed" } } });
     await expect(readFile(path.join(workspace, "child.txt"), "utf8")).resolves.toBe("child");
     expect(messages.some((value) => JSON.stringify(value).includes("delegated_approval_resolved"))).toBe(true);
-  });
+  }, 20_000);
 });

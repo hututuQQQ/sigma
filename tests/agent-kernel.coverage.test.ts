@@ -221,7 +221,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
       message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
     });
-    expect(incomplete.proposedOutcome).toMatchObject({ kind: "needs_input", message: "still no action" });
+    expect(incomplete.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_protocol_missing"
+    });
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
@@ -346,6 +348,21 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       observedEffects: ["outcome.propose"], artifacts: ["artifact"], diagnostics: ["checked"], startedAt: "start", completedAt: "end"
     });
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
+
+    let repairedCompletion = withPendingTool("repair-complete", "complete_task");
+    repairedCompletion = {
+      ...repairedCompletion,
+      completionRepairAttempts: 1,
+      messages: [...repairedCompletion.messages, { role: "assistant", content: "Detailed final answer." }]
+    };
+    repairedCompletion = toolEvent(repairedCompletion, "tool.completed", "repair-complete", {
+      ok: true, output: JSON.stringify({ summary: "short summary" }),
+      observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [],
+      startedAt: "start", completedAt: "end"
+    });
+    expect(repairedCompletion).toMatchObject({
+      proposedOutcome: { kind: "completed", message: "Detailed final answer." }
+    });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
       message: "committed", outcomeRevision: committedRevision, evidence: [diagnosticEvidence("durable-child")]
@@ -592,6 +609,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       consumed: { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0 },
       createdAt: "2026-01-01T00:00:00.000Z"
     };
+    const semanticCluster: NonNullable<KernelState["semanticFailureCluster"]> = {
+      family: "infrastructure",
+      attempts: 1,
+      firstRevision: 0,
+      lastRevision: 0,
+      diagnosticCodes: ["fixture_failure"],
+      progress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
+    };
     const invalidStates: Array<[KernelState, string]> = [
       [{ ...base, schemaVersion: 2 } as unknown as KernelState, "schema version"],
       [{ ...base, plan: { revision: 0, goal: "", activeNodeId: "missing", nodes: [] } }, "plan graph"],
@@ -615,6 +640,24 @@ describe("agent-kernel exhaustive protocol behavior", () => {
         ...base.budget,
         reserved: { ...base.budget.reserved, inputTokens: 1 }
       } }, "does not match its active reservations"],
+      [{ ...base, semanticProgress: null } as unknown as KernelState, "semantic failure progress"],
+      [{ ...base, semanticFailureCluster: {} } as unknown as KernelState, "semantic failure progress"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, workspaceChanges: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, durableEvidence: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, progress: { ...semanticCluster.progress, revision: 1 }
+      } }, "does not match its progress watermark"],
+      [{ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } }, "exceeds the current revision"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, firstRevision: 1
+      } }, "semantic failure revisions"],
+      [{ ...base, semanticFailureCluster: {
+        ...semanticCluster, lastRevision: 1
+      } }, "semantic failure revisions"],
       [{ ...base, toolCallIds: ["same", "same"] }, "Duplicate run tool"],
       [{ ...base, phase: "tool_pending", pendingTools: [{
         request: { callId: "missing", name: "read", arguments: null },
@@ -623,7 +666,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       [{ ...base, phase: "tool_pending", toolCallIds: ["invalid-revision"], pendingTools: [{
         request: { callId: "invalid-revision", name: "read", arguments: null },
         modelTurn: { turnId: 1, effectRevision: Number.NaN }, approval: "allowed", started: false
-      }] }, "valid originating model turn"]
+      }] }, "valid originating model turn"],
+      [{ ...base, activeModelSemanticDelta: true }, "durable model semantic delta"]
     ];
     for (const [state, message] of invalidStates) {
       expect(() => assertKernelInvariants(state), message).toThrow(message);

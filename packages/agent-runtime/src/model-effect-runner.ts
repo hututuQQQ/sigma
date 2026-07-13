@@ -1,4 +1,4 @@
-import type { ContextItem, ModelMessage, ModelResponse, ModelToolDefinition } from "agent-protocol";
+import type { ContextItem, ModelMessage, ModelRequest, ModelResponse, ModelToolDefinition } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
 import { approximateTokens, RepositoryContextProvider } from "agent-context";
 import type { ModelRouteConstraints } from "agent-model";
@@ -20,6 +20,7 @@ type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 interface PreparedModelTurn {
   messages: ModelMessage[];
   tools: ModelToolDefinition[];
+  toolChoice?: ModelRequest["toolChoice"];
   budget: PreparedModelBudget;
 }
 
@@ -136,8 +137,14 @@ export class ModelEffectRunner {
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
   ): Promise<void> {
-    const descriptors = this.options.runtime.tools.descriptors().filter((item) =>
+    const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.mode) && profileAllowsTool(session, item));
+    const terminalRepair = session.state.completionRepairAttempts > 0
+      && session.state.receipts.length > session.state.receiptCountAtLastUserInput;
+    const descriptors = terminalRepair
+      ? availableDescriptors.filter((item) => item.possibleEffects.includes("outcome.propose")
+        || item.possibleEffects.includes("outcome.request_input"))
+      : availableDescriptors;
     const tools = modelTools(descriptors);
     const query = [...session.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.workspacePath, query, signal);
@@ -166,7 +173,12 @@ export class ModelEffectRunner {
         - session.state.budget.consumed.costMicroUsd
         - session.state.budget.reserved.costMicroUsd)
     );
-    const turn = { messages: plan.messages, tools, budget };
+    const turn: PreparedModelTurn = {
+      messages: plan.messages,
+      tools,
+      ...(terminalRepair ? { toolChoice: "required" } : {}),
+      budget
+    };
     const requestId = `${session.runId}:${turnId}`;
     const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, budget.reserved);
     await this.runReserved(session, turnId, effectRevision, signal, turn, requestId, reservationId);
@@ -185,7 +197,7 @@ export class ModelEffectRunner {
     const state: ModelReservationState = { settled: false };
     try {
       const response = await this.stream(
-        session, turnId, turn.messages, turn.tools, signal, turn.budget.routeConstraints, state
+        session, turnId, turn.messages, turn.tools, turn.toolChoice, signal, turn.budget.routeConstraints, state
       );
       await this.completeReservation(
         session, turnId, effectRevision, signal, turn, requestId, reservationId, response, startedAt, state
@@ -285,6 +297,7 @@ export class ModelEffectRunner {
     turnId: number,
     messages: ModelMessage[],
     tools: ModelToolDefinition[],
+    toolChoice: ModelRequest["toolChoice"],
     signal: AbortSignal,
     routeConstraints: ModelRouteConstraints | undefined,
     state: ModelReservationState
@@ -307,13 +320,15 @@ export class ModelEffectRunner {
       lastFlush = Date.now();
     };
     const gateway = session.gateway as typeof session.gateway & {
-      streamWithConstraints?(request: {
-        messages: ModelMessage[]; tools: ModelToolDefinition[]; signal: AbortSignal; maxOutputTokens: number;
-      }, constraints: ModelRouteConstraints): AsyncIterable<import("agent-protocol").ModelStreamEvent>;
+      streamWithConstraints?(
+        request: ModelRequest,
+        constraints: ModelRouteConstraints
+      ): AsyncIterable<import("agent-protocol").ModelStreamEvent>;
     };
     const request = {
       messages,
       tools,
+      ...(toolChoice ? { toolChoice } : {}),
       signal,
       maxOutputTokens: Math.min(this.options.outputReserveTokens, session.gateway.capabilities.maxOutputTokens)
     };

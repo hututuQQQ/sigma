@@ -3,14 +3,56 @@ import { spawn } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { workspaceTransactionRoot } from "../packages/agent-platform/src/workspace-transaction-root.js";
 import {
-  applyUnifiedPatch, AtomicPatchError, AtomicPatchRecoveryError, AtomicPatchRollbackError
+  applyUnifiedPatch as applyUnifiedPatchWithState,
+  AtomicPatchError,
+  AtomicPatchRecoveryError,
+  AtomicPatchRollbackError,
+  type AtomicPatchOptions
 } from "../packages/agent-tools/src/atomic-patch.js";
 
+const temporaryRoots = new Set<string>();
+
 async function workspace(): Promise<string> {
-  return await mkdtemp(path.join(os.tmpdir(), "sigma-patch-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-patch-"));
+  temporaryRoots.add(root);
+  return root;
 }
+
+function patchStateRoot(workspacePath: string): string {
+  return `${workspacePath}-state`;
+}
+
+async function applyUnifiedPatch(
+  workspacePath: string,
+  patch: string,
+  options: AtomicPatchOptions = {}
+) {
+  return await applyUnifiedPatchWithState(workspacePath, patch, {
+    ...options,
+    stateRootDir: options.stateRootDir ?? patchStateRoot(workspacePath)
+  });
+}
+
+async function patchTransactionRoot(workspacePath: string): Promise<string> {
+  return await workspaceTransactionRoot({
+    workspacePath,
+    stateRootDir: patchStateRoot(workspacePath),
+    namespace: "atomic-patch"
+  });
+}
+
+async function expectNoWorkspaceTransactionState(workspacePath: string): Promise<void> {
+  await expect(lstat(path.join(workspacePath, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+afterEach(async () => {
+  await Promise.all([...temporaryRoots].flatMap((root) => [root, patchStateRoot(root)])
+    .map(async (root) => await rm(root, { recursive: true, force: true })));
+  temporaryRoots.clear();
+});
 
 describe("applyUnifiedPatch", () => {
   it("applies a CRLF modification atomically and reports hashes", async () => {
@@ -31,25 +73,28 @@ describe("applyUnifiedPatch", () => {
       createHash("sha256").update("alpha\r\ngamma\r\n").digest("hex")
     );
     await expect(readFile(path.join(root, "one.txt"), "utf8")).resolves.toBe("alpha\r\ngamma\r\n");
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it("rejects staged content replacement and restores the original", async () => {
     const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
     await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
     await expect(applyUnifiedPatch(root, [
       "--- a/target.txt", "+++ b/target.txt", "@@ -1 +1 @@", "-before", "+expected"
     ].join("\n"), {
       beforeCommit: async () => {
-        const transactions = path.join(root, ".agent", "patch-transactions");
         const transaction = (await readdir(transactions)).find((entry) => entry.startsWith("patch-"));
         await writeFile(path.join(transactions, transaction!, "staged", "0"), "attacker\n", "utf8");
       }
     })).rejects.toThrow(/installed path changed|postimage|prepared content/iu);
     await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("before\n");
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it.runIf(process.platform !== "win32")("rejects a staged file replaced by a symlink", async () => {
     const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
     const outside = path.join(await workspace(), "outside.txt");
     await writeFile(outside, "attacker\n", "utf8");
     await expect(applyUnifiedPatch(root, [
@@ -57,7 +102,6 @@ describe("applyUnifiedPatch", () => {
       "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+expected"
     ].join("\n"), {
       beforeCommit: async () => {
-        const transactions = path.join(root, ".agent", "patch-transactions");
         const transaction = (await readdir(transactions)).find((entry) => entry.startsWith("patch-"));
         const staged = path.join(transactions, transaction!, "staged", "0");
         await rm(staged);
@@ -66,6 +110,7 @@ describe("applyUnifiedPatch", () => {
     })).rejects.toThrow(/installed path changed/iu);
     await expect(lstat(path.join(root, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(outside, "utf8")).resolves.toBe("attacker\n");
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it("preflights every hunk before making any filesystem change", async () => {
@@ -164,6 +209,7 @@ describe("applyUnifiedPatch", () => {
     ["install_target_moved", "remove_installed"]
   ] as const)("recovers a durable %s intent before the next patch", async (commitPhase, rollbackPhase) => {
     const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
     await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
     const patch = [
       "--- a/target.txt", "+++ b/target.txt", "@@ -1 +1 @@", "-before", "+after"
@@ -182,11 +228,13 @@ describe("applyUnifiedPatch", () => {
 
     await applyUnifiedPatch(root, patch);
     await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("after\n");
-    await expect(readdir(path.join(root, ".agent", "patch-transactions"))).resolves.toEqual([]);
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it("recovers a created-parent intent before applying the next patch", async () => {
     const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
     const patch = [
       "diff --git a/nested/new.txt b/nested/new.txt", "new file mode 100644",
       "--- /dev/null", "+++ b/nested/new.txt", "@@ -0,0 +1 @@", "+created"
@@ -205,11 +253,14 @@ describe("applyUnifiedPatch", () => {
 
     await applyUnifiedPatch(root, patch);
     await expect(readFile(path.join(root, "nested", "new.txt"), "utf8")).resolves.toBe("created\n");
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it("fails closed and preserves corrupt or ambiguous recovery state", async () => {
     const root = await workspace();
-    const transaction = path.join(root, ".agent", "patch-transactions", "patch-corrupt");
+    const transactions = await patchTransactionRoot(root);
+    const transaction = path.join(transactions, "patch-corrupt");
     await mkdir(transaction, { recursive: true });
     await writeFile(path.join(transaction, "journal.json"), "{not-json", "utf8");
     const patch = [
@@ -219,6 +270,40 @@ describe("applyUnifiedPatch", () => {
     await expect(applyUnifiedPatch(root, patch)).rejects.toBeInstanceOf(AtomicPatchRecoveryError);
     await expect(lstat(transaction)).resolves.toBeDefined();
     await expect(lstat(path.join(root, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expectNoWorkspaceTransactionState(root);
+  });
+
+  it("does not treat workspace-controlled legacy journals as recovery authority", async () => {
+    const root = await workspace();
+    const victim = path.join(root, "victim.txt");
+    const contents = "keep me\n";
+    await writeFile(victim, contents, "utf8");
+    const forged = path.join(root, ".agent", "patch-transactions", "patch-forged");
+    await mkdir(forged, { recursive: true });
+    await writeFile(path.join(forged, "journal.json"), JSON.stringify({
+      schemaVersion: 1,
+      phase: "applying",
+      parents: [],
+      operations: [{
+        changeIndex: 0,
+        target: "victim.txt",
+        targetKind: "file",
+        targetMode: 0o644,
+        targetDigest: createHash("sha256").update(contents).digest("hex"),
+        backupIntent: false,
+        backupMoved: false,
+        installIntent: true,
+        installed: true
+      }]
+    }), "utf8");
+
+    await applyUnifiedPatch(root, [
+      "diff --git a/new.txt b/new.txt", "new file mode 100644",
+      "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+new"
+    ].join("\n"));
+
+    await expect(readFile(victim, "utf8")).resolves.toBe(contents);
+    await expect(lstat(forged)).resolves.toBeDefined();
   });
 
   it.each([
@@ -227,6 +312,7 @@ describe("applyUnifiedPatch", () => {
     "install_target_moved"
   ] as const)("recovers after a subprocess is killed at %s", async (phase) => {
     const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
     const marker = path.join(root, `${phase}.marker`);
     const nested = phase === "create_parent_created";
     if (!nested) await writeFile(path.join(root, "target.txt"), "before\n", "utf8");
@@ -239,7 +325,12 @@ describe("applyUnifiedPatch", () => {
     const fixturePath = path.resolve("tests", "fixtures", "atomic-patch-crash.mjs");
     const child = spawn(process.execPath, [
       fixturePath, root, marker, phase, Buffer.from(patch, "utf8").toString("base64url")
-    ], { cwd: path.resolve("."), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    ], {
+      cwd: path.resolve("."),
+      env: { ...process.env, SIGMA_STATE_HOME: patchStateRoot(root) },
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true
+    });
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
     const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
@@ -253,7 +344,8 @@ describe("applyUnifiedPatch", () => {
     } else {
       await expect(readFile(path.join(root, "target.txt"), "utf8")).resolves.toBe("after\n");
     }
-    await expect(readdir(path.join(root, ".agent", "patch-transactions"))).resolves.toEqual([]);
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
+    await expectNoWorkspaceTransactionState(root);
   });
 
   it("creates, deletes and renames files in one transaction", async () => {

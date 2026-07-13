@@ -1,9 +1,11 @@
 import { createPresentationState, projectEvent } from "agent-presentation";
 import { loadCliConfig, parseArgs } from "../config.js";
-import { createConfiguredRuntime } from "agent-runtime";
+import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
 
 interface ReplayDeps {
   runtime?: import("agent-protocol").RuntimeClient;
+  createConfiguredRuntime?: typeof createConfiguredRuntime;
+  runtimeFactoryDeps?: RuntimeFactoryDeps;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
 }
@@ -56,11 +58,18 @@ function writeTextReport(report: ReplayReport, stdout: NodeJS.WritableStream): v
 
 async function executeReplay(argv: string[], deps: ReplayDeps, stdout: NodeJS.WritableStream): Promise<void> {
   const { flags, positionals } = parseArgs(argv);
-  const runtime = deps.runtime ?? (await createConfiguredRuntime(loadCliConfig(flags), {}, { connectMcp: false })).runtime;
-  const sessionId = await resolveSessionId(runtime, positionals[0], flags.latest === true);
-  const report = await buildReplay(runtime, sessionId, flags.timeline === true);
-  if (flags.json === true) stdout.write(`${JSON.stringify(report)}\n`);
-  else writeTextReport(report, stdout);
+  const configured = deps.runtime ? undefined : await (deps.createConfiguredRuntime ?? createConfiguredRuntime)(
+    loadCliConfig(flags), deps.runtimeFactoryDeps ?? {}, { connectMcp: false }
+  );
+  const runtime = deps.runtime ?? configured!.runtime;
+  try {
+    const sessionId = await resolveSessionId(runtime, positionals[0], flags.latest === true);
+    const report = await buildReplay(runtime, sessionId, flags.timeline === true);
+    if (flags.json === true) stdout.write(`${JSON.stringify(report)}\n`);
+    else writeTextReport(report, stdout);
+  } finally {
+    await configured?.close();
+  }
 }
 
 export async function runReplayCommand(argv: string[], deps: ReplayDeps = {}): Promise<number> {

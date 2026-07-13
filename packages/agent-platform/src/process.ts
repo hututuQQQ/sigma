@@ -133,11 +133,42 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
   };
 }
 
+const POWERSHELL_UTF8_PREFIX = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;";
+
+export function normalizeWindowsShellInvocation(
+  executable: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform
+): { executable: string; args: string[] } {
+  const normalized = [...args];
+  if (platform !== "win32") return { executable, args: normalized };
+  const name = path.win32.basename(executable).toLowerCase();
+  if (name === "cmd" || name === "cmd.exe") {
+    const commandIndex = normalized.findIndex((item) => /^\/(?:c|k)$/iu.test(item));
+    const valueIndex = commandIndex + 1;
+    if (commandIndex >= 0 && normalized[valueIndex]
+      && !/^\s*chcp\s+65001(?:\s*>\s*nul)?\s*&/iu.test(normalized[valueIndex]!)) {
+      normalized[valueIndex] = `chcp 65001>nul & ${normalized[valueIndex]}`;
+    }
+  } else if (["powershell", "powershell.exe", "pwsh", "pwsh.exe"].includes(name)) {
+    const commandIndex = normalized.findIndex((item) => /^-(?:command|c)$/iu.test(item));
+    const valueIndex = commandIndex + 1;
+    if (commandIndex >= 0 && normalized[valueIndex]
+      && !normalized[valueIndex]!.startsWith(POWERSHELL_UTF8_PREFIX)) {
+      normalized[valueIndex] = `${POWERSHELL_UTF8_PREFIX}${normalized[valueIndex]}`;
+    }
+  }
+  return { executable, args: normalized };
+}
+
 export function shellInvocation(shell: ShellKind, command: string): { executable: string; args: string[] } {
   if (shell === "powershell") {
-    return { executable: "powershell.exe", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command] };
+    return normalizeWindowsShellInvocation(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+    );
   }
-  if (shell === "cmd") return { executable: "cmd.exe", args: ["/d", "/s", "/c", command] };
+  if (shell === "cmd") return normalizeWindowsShellInvocation("cmd.exe", ["/d", "/s", "/c", command]);
   return { executable: "bash", args: ["-lc", command] };
 }
 

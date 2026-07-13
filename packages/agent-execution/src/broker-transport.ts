@@ -26,6 +26,7 @@ interface PendingRequest {
   signal?: AbortSignal;
   onAbort?: () => void;
   timer?: ReturnType<typeof setTimeout>;
+  deferredError?: Error;
 }
 
 function rpcError(code: string, message: string, data?: unknown): BrokerError {
@@ -47,6 +48,7 @@ export class BrokerTransport {
   private closePromise?: Promise<void>;
   private closingRequested = false;
   private childClosed = false;
+  private terminalFailure?: Error;
 
   constructor(
     private readonly options: SigmaExecBrokerClientOptions,
@@ -112,8 +114,8 @@ export class BrokerTransport {
       try { await this.request("shutdown", {}, { timeoutMs: grace }); } catch { /* terminate below */ }
     }
     this.state = "closing";
-    this.rejectPending(new BrokerConnectionError("Broker transport closed."));
     if (!child || this.childClosed) {
+      this.rejectPending(new BrokerConnectionError("Broker transport closed."));
       this.state = "closed";
       return;
     }
@@ -121,6 +123,7 @@ export class BrokerTransport {
     if (!await this.waitForChildClose(child, 5_000)) {
       throw new BrokerConnectionError("sigma-exec did not release its process handle during shutdown.");
     }
+    this.rejectPending(new BrokerConnectionError("Broker transport closed."));
     this.state = "closed";
   }
 
@@ -153,6 +156,23 @@ export class BrokerTransport {
 
   private cancel(pending: PendingRequest, error: Error): void {
     if (!this.pending.has(pending.id)) return;
+    if (pending.method === "exec") {
+      if (pending.deferredError) return;
+      pending.deferredError = error;
+      clearTimeout(pending.timer);
+      if (pending.signal && pending.onAbort) {
+        pending.signal.removeEventListener("abort", pending.onAbort);
+      }
+      this.sendCancellation(pending.id);
+      const grace = this.options.cancellationGraceMs ?? 10_000;
+      pending.timer = setTimeout(() => {
+        // close() waits for the broker process to exit. On Windows that closes
+        // the kill-on-close Job handle before rejectPending releases callers.
+        void this.close().catch(() => undefined);
+      }, grace);
+      pending.timer.unref();
+      return;
+    }
     this.sendCancellation(pending.id);
     this.settle(pending, undefined, error);
   }
@@ -169,6 +189,10 @@ export class BrokerTransport {
     const response = parseBrokerResponse(input);
     const pending = this.pending.get(response.requestId);
     if (!pending) return;
+    if (pending.deferredError) {
+      this.settle(pending, undefined, pending.deferredError);
+      return;
+    }
     if (response.ok) {
       const result = rawOutputMethods.has(pending.method)
         ? response.result
@@ -193,19 +217,30 @@ export class BrokerTransport {
   }
 
   private rejectPending(error: Error): void {
-    for (const pending of [...this.pending.values()]) this.settle(pending, undefined, error);
+    for (const pending of [...this.pending.values()]) {
+      this.settle(pending, undefined, pending.deferredError ?? error);
+    }
   }
 
   private fail(error: Error): void {
     if (this.state === "closing" || this.state === "closed" || this.state === "failed") return;
     this.state = "failed";
-    this.rejectPending(error);
-    if (this.child?.exitCode === null) this.child.kill();
+    this.terminalFailure = error;
+    const child = this.child;
+    const mustConfirmExit = Boolean(child && !this.childClosed && child.pid !== undefined
+      && child.exitCode === null);
+    if (mustConfirmExit && child) child.kill();
+    else this.rejectPending(error);
     this.onUnexpectedFailure(error);
   }
 
   private onClose(code: number | null, signal: NodeJS.Signals | null): void {
     this.childClosed = true;
+    if (this.terminalFailure) {
+      this.rejectPending(this.terminalFailure);
+      if (this.closingRequested || this.state === "closing") this.state = "closed";
+      return;
+    }
     if (this.closingRequested || this.state === "closing" || this.state === "closed") {
       this.rejectPending(new BrokerConnectionError("Broker transport closed."));
       this.state = "closed";

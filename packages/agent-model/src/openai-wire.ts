@@ -62,7 +62,9 @@ export function bodyFor(
     model,
     messages: openAiMessages(request.messages, profile),
     ...(tools?.length ? { tools } : {}),
-    ...(profile.supportsToolChoice ? { tool_choice: tools?.length ? "auto" : "none" } : {}),
+    ...(profile.supportsToolChoice ? {
+      tool_choice: tools?.length ? (request.toolChoice ?? "auto") : "none"
+    } : {}),
     ...(profile.thinking ? { thinking: { type: profile.thinking } } : {}),
     ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
