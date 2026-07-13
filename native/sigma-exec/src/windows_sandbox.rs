@@ -96,6 +96,7 @@ const MAX_RECOVERY_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_SCAN_DEPTH: usize = 256;
 const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+const SANDBOX_REPARSE_TARGET_UNRESOLVABLE: &str = "sandbox_reparse_target_unresolvable";
 static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize, Serialize)]
@@ -465,12 +466,13 @@ fn validate_launcher_params(params: &ProcessParams) -> Result<(), RpcError> {
         .chain(params.policy.write_roots.iter())
         .chain(params.policy.execution_roots.iter())
     {
-        if !root.is_absolute() || !root.exists() {
+        if !root.is_absolute() {
             return Err(RpcError::new(
                 "policy_denied",
-                "all AppContainer roots must be existing absolute paths",
+                "all AppContainer roots must be absolute paths",
             ));
         }
+        canonicalize_policy_root(root)?;
     }
     Ok(())
 }
@@ -870,8 +872,18 @@ fn plan_read_tree(
         return Ok(());
     }
     check_acl_plan_limits(plan, planned_objects, depth)?;
-    let Some((is_directory, read_reparse_target)) = inspect_read_acl_target_path(path, read_roots)?
-    else {
+    let inspected = inspect_read_acl_target_path(path, read_roots);
+    let Some((is_directory, read_reparse_target)) = (match inspected {
+        // A descendant discovered while enumerating a declared read tree is
+        // not itself an authorization request. If its reparse target no
+        // longer resolves, leave the link object and target ungranted and
+        // continue planning the unrelated tree. An explicitly declared root
+        // (depth zero) still fails closed with the stable sandbox code.
+        Err(error) if depth > 0 && error.code == SANDBOX_REPARSE_TARGET_UNRESOLVABLE => {
+            return Ok(());
+        }
+        result => result?,
+    }) else {
         // An existing read-only link outside every declared read root gets no
         // ACE and is never traversed. Parent grants are path-local, so the
         // AppContainer cannot acquire access through it.
@@ -1000,7 +1012,29 @@ fn canonical_unique(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for path in paths {
-        let canonical = path.canonicalize().map_err(|error| {
+        let canonical = canonicalize_policy_root(path)?;
+        let key = canonical.to_string_lossy().to_lowercase();
+        if seen.insert(key) {
+            result.push(canonical);
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn canonicalize_policy_root(path: &Path) -> Result<PathBuf, RpcError> {
+    path.canonicalize().map_err(|error| {
+        let is_reparse_point = std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false);
+        if is_reparse_point {
+            RpcError::new(
+                SANDBOX_REPARSE_TARGET_UNRESOLVABLE,
+                format!(
+                    "cannot resolve sandbox reparse root '{}': {error}",
+                    path.display()
+                ),
+            )
+        } else {
             RpcError::new(
                 "policy_denied",
                 format!(
@@ -1008,13 +1042,8 @@ fn canonical_unique(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
                     path.display()
                 ),
             )
-        })?;
-        let key = canonical.to_string_lossy().to_lowercase();
-        if seen.insert(key) {
-            result.push(canonical);
         }
-    }
-    Ok(result)
+    })
 }
 
 fn minimal_windows_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -1765,7 +1794,7 @@ fn inspect_read_acl_target_path(
 
     let resolved = path.canonicalize().map_err(|error| {
         RpcError::new(
-            "sandbox_reparse_target_unresolvable",
+            SANDBOX_REPARSE_TARGET_UNRESOLVABLE,
             format!(
                 "cannot resolve read-only sandbox reparse target '{}': {error}",
                 path.display()
@@ -4672,6 +4701,39 @@ mod tests {
         );
     }
 
+    fn read_tree_content_fingerprint(root: &Path) -> Vec<(String, u32, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(String, u32, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).expect("inspect read fixture entry");
+            let attributes = metadata.file_attributes();
+            let relative = path
+                .strip_prefix(root)
+                .expect("fixture entry remains below root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            let bytes = if metadata.is_file() && !is_reparse {
+                std::fs::read(path).expect("read fixture file")
+            } else {
+                Vec::new()
+            };
+            entries.push((relative, attributes, bytes));
+            if metadata.is_dir() && !is_reparse {
+                let mut children = std::fs::read_dir(path)
+                    .expect("enumerate read fixture")
+                    .map(|entry| entry.expect("read fixture entry").path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
     #[test]
     fn quotes_windows_arguments_without_losing_backslashes() {
         assert_eq!(quote_windows_argument("plain"), "plain");
@@ -4929,10 +4991,153 @@ mod tests {
 
         let error = inspect_read_acl_target_path(&junction, std::slice::from_ref(&root))
             .expect_err("direct dangling junction inspection must fail closed");
-        assert_eq!(error.code, "sandbox_reparse_target_unresolvable");
+        assert_eq!(error.code, SANDBOX_REPARSE_TARGET_UNRESOLVABLE);
+
+        let mut plan = Vec::new();
+        let mut planned_objects = 0;
+        let error = plan_read_tree(
+            &junction,
+            std::slice::from_ref(&junction),
+            &[],
+            &mut plan,
+            &mut planned_objects,
+            0,
+        )
+        .expect_err("a dangling junction declared as the read root must fail closed");
+        assert_eq!(error.code, SANDBOX_REPARSE_TARGET_UNRESOLVABLE);
+
+        let error = canonicalize_policy_root(&junction)
+            .expect_err("a dangling junction policy root must retain its stable failure code");
+        assert_eq!(error.code, SANDBOX_REPARSE_TARGET_UNRESOLVABLE);
 
         std::fs::remove_dir(&junction).expect("remove dangling junction");
         std::fs::remove_dir_all(&fixture).expect("remove dangling junction fixture");
+    }
+
+    #[test]
+    fn read_tree_skips_100_deterministic_dangling_descendants_without_residue() {
+        let unique = ephemeral_profile_name()
+            .expect("create deterministic reparse profile name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-dangling-descendants-{unique}"));
+        let recovery = fixture
+            .join("host")
+            .join("SigmaCode")
+            .join(RECOVERY_DIRECTORY);
+        let root = fixture.join("workspace");
+        let removed_targets = fixture.join("removed-targets");
+        let outside = fixture.join("outside");
+        let outside_link = root.join("outside-link");
+        let ordinary = root.join("ordinary.txt");
+        std::fs::create_dir_all(&root).expect("create deterministic read root");
+        std::fs::create_dir_all(&removed_targets).expect("create removed target parent");
+        std::fs::create_dir_all(&outside).expect("create outside target");
+        std::fs::write(&ordinary, b"ordinary read-only content")
+            .expect("create ordinary read target");
+        std::fs::write(outside.join("secret.txt"), b"outside").expect("create outside sentinel");
+        create_test_junction(&outside_link, &outside);
+
+        let mut dangling = Vec::with_capacity(100);
+        let mut ordinary_descendants = Vec::with_capacity(100);
+        for seed in 0_usize..100 {
+            let mut branch = root.join(format!("case-{seed:03}"));
+            let depth = (seed.wrapping_mul(37) % 5) + 1;
+            for level in 0..depth {
+                branch = branch.join(format!(
+                    "level-{:02}",
+                    seed.wrapping_mul(17).wrapping_add(level) % 23
+                ));
+            }
+            std::fs::create_dir_all(&branch).expect("create deterministic nested branch");
+            let ordinary_descendant = branch.join(format!("visible-{seed:03}.txt"));
+            std::fs::write(&ordinary_descendant, format!("seed={seed}\n"))
+                .expect("create deterministic ordinary descendant");
+            ordinary_descendants.push(ordinary_descendant);
+
+            let target = removed_targets.join(format!("target-{seed:03}"));
+            let link = branch.join(format!("unavailable-{seed:03}"));
+            std::fs::create_dir(&target).expect("create temporary junction target");
+            create_test_junction(&link, &target);
+            std::fs::remove_dir(&target).expect("make deterministic junction dangling");
+            dangling.push(link);
+        }
+
+        let before = read_tree_content_fingerprint(&root);
+        let mut plan = Vec::new();
+        let mut planned_objects = 0;
+        plan_read_tree(
+            &root,
+            std::slice::from_ref(&root),
+            &[],
+            &mut plan,
+            &mut planned_objects,
+            0,
+        )
+        .expect("unresolvable descendants must not reject the unrelated read tree");
+        for link in &dangling {
+            assert!(
+                plan.iter().all(|entry| entry.path != *link),
+                "a dangling descendant must receive no ACL grant: '{}'",
+                link.display()
+            );
+        }
+        assert!(plan.iter().all(|entry| entry.path != outside_link));
+        assert!(plan.iter().any(|entry| entry.path == ordinary));
+        for path in &ordinary_descendants {
+            assert!(plan.iter().any(|entry| entry.path == *path));
+        }
+
+        let mut profile = test_profile();
+        let mut journal = RecoveryJournal::create(&recovery, &profile.name)
+            .expect("create deterministic dangling-link recovery journal");
+        journal
+            .prepare(&plan, profile.sid)
+            .expect("journal only authorized read-tree entries");
+        journal
+            .apply(&plan, profile.sid)
+            .expect("grant the unrelated read tree");
+        assert!(count_allowed_aces(&root, profile.sid) > 0);
+        assert!(count_allowed_aces(&ordinary, profile.sid) > 0);
+        for link in &dangling {
+            assert_eq!(
+                count_allowed_aces(link, profile.sid),
+                0,
+                "a skipped dangling descendant must receive no run-SID ACE"
+            );
+        }
+        for path in [&outside_link, &outside, &outside.join("secret.txt")] {
+            assert_eq!(
+                count_allowed_aces(path, profile.sid),
+                0,
+                "an out-of-root link and target must receive no run-SID ACE"
+            );
+        }
+
+        cleanup_recovery_snapshot(&journal.snapshot, profile.sid)
+            .expect("recover deterministic dangling-link ACL grants");
+        assert_tree_has_no_allowed_ace(&root, profile.sid);
+        assert_eq!(count_allowed_aces(&outside, profile.sid), 0);
+        assert_eq!(
+            count_allowed_aces(&outside.join("secret.txt"), profile.sid),
+            0
+        );
+        journal
+            .remove()
+            .expect("remove deterministic dangling-link journal");
+        profile
+            .delete()
+            .expect("delete deterministic dangling-link profile");
+        assert_eq!(
+            read_tree_content_fingerprint(&root),
+            before,
+            "ACL grant and recovery must preserve workspace content and structure"
+        );
+
+        for link in dangling {
+            std::fs::remove_dir(&link).expect("remove deterministic dangling junction");
+        }
+        std::fs::remove_dir(&outside_link).expect("remove outside junction");
+        std::fs::remove_dir_all(&fixture).expect("remove deterministic dangling fixture");
     }
 
     #[test]
