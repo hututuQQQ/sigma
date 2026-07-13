@@ -237,6 +237,39 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("complete_task");
   }, 30_000);
 
+  it("repairs an evidence-backed natural stop through strict typed completion", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "read-before-answer", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      completion("typed terminal repair completed")
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "The file contains seed."
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(gateway.requests[2].toolChoice).toBe("required");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
+  }, 30_000);
+
   it("supports an explicit typed request for user input", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-request-input-"));
     const gateway = new ScriptedGateway([{

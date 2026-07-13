@@ -139,12 +139,31 @@ describe("OpenAI-compatible model gateway", () => {
     });
   });
 
-  it("omits tool_choice for adapters that explicitly do not support it", async () => {
+  it("maps the legacy unsupported-tool-choice flag and rejects strict choices before fetch", async () => {
+    let fetchCalls = 0;
+    const gateway = createGateway((async () => {
+      fetchCalls += 1;
+      return jsonResponse("ok");
+    }) as typeof fetch, { wireProfile: { supportsToolChoice: false } });
+
+    await expect(gateway.complete({
+      messages: [{ role: "user", content: "use a tool" }],
+      tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
+      toolChoice: "required",
+      signal: new AbortController().signal
+    })).rejects.toMatchObject({
+      category: "configuration",
+      message: "OpenAI wire profile cannot honor toolChoice='required'."
+    });
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("keeps the legacy supported-tool-choice flag equivalent to the always policy", async () => {
     let body: Record<string, unknown> | undefined;
     const gateway = createGateway((async (_url, init) => {
       body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       return jsonResponse("ok");
-    }) as typeof fetch, { wireProfile: { supportsToolChoice: false } });
+    }) as typeof fetch, { wireProfile: { supportsToolChoice: true } });
 
     await gateway.complete({
       messages: [{ role: "user", content: "use a tool" }],
@@ -153,10 +172,53 @@ describe("OpenAI-compatible model gateway", () => {
       signal: new AbortController().signal
     });
 
-    expect(body).toMatchObject({
-      tools: [{ type: "function", function: { name: "read_file" } }]
+    expect(body).toMatchObject({ tool_choice: "required" });
+  });
+
+  it("rejects strict choices under the canonical never policy before fetch", async () => {
+    let fetchCalls = 0;
+    const gateway = createGateway((async () => {
+      fetchCalls += 1;
+      return jsonResponse("ok");
+    }) as typeof fetch, { wireProfile: { toolChoicePolicy: "never" } });
+
+    await expect(gateway.complete({
+      messages: [{ role: "user", content: "do not use a tool" }],
+      tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
+      toolChoice: "none",
+      signal: new AbortController().signal
+    })).rejects.toMatchObject({ category: "configuration" });
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("rejects conflicting legacy and canonical tool-choice settings", () => {
+    expect(() => createGateway((async () => jsonResponse("ok")) as typeof fetch, {
+      wireProfile: { supportsToolChoice: true, toolChoicePolicy: "never" }
+    })).toThrow(/conflicting tool choice settings/u);
+  });
+
+  it("requires a thinking mode for the non-thinking-only policy", () => {
+    expect(() => createGateway((async () => jsonResponse("ok")) as typeof fetch, {
+      wireProfile: { toolChoicePolicy: "non_thinking_only" }
+    })).toThrow(/requires a thinking mode/u);
+  });
+
+  it("rejects required tool choice without a tool definition before fetch", async () => {
+    let fetchCalls = 0;
+    const gateway = createGateway((async () => {
+      fetchCalls += 1;
+      return jsonResponse("ok");
+    }) as typeof fetch);
+
+    await expect(gateway.complete({
+      messages: [{ role: "user", content: "use a tool" }],
+      toolChoice: "required",
+      signal: new AbortController().signal
+    })).rejects.toMatchObject({
+      category: "configuration",
+      message: "toolChoice='required' requires at least one tool definition."
     });
-    expect(body).not.toHaveProperty("tool_choice");
+    expect(fetchCalls).toBe(0);
   });
 
   it("adapts DeepSeek developer messages and replays reasoning across tool turns", async () => {
@@ -232,8 +294,11 @@ describe("OpenAI-compatible model gateway", () => {
         { role: "user", content: "read a.ts" }
       ]
     });
-    expect(bodies[0]).toMatchObject({ tool_choice: "auto" });
-    expect(bodies[1]).toMatchObject({ tool_choice: "required" });
+    expect(bodies[0]).not.toHaveProperty("tool_choice");
+    expect(bodies[1]).toMatchObject({
+      thinking: { type: "disabled" },
+      tool_choice: "required"
+    });
     expect(bodies[1]).toMatchObject({
       messages: expect.arrayContaining([expect.objectContaining({
         role: "assistant",
@@ -265,6 +330,7 @@ describe("OpenAI-compatible model gateway", () => {
     });
 
     expect(body).toMatchObject({
+      tool_choice: "none",
       messages: [
         { role: "system", content: "system contract" },
         { role: "system", content: "runtime context" },
