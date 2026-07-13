@@ -4853,11 +4853,17 @@ mod tests {
         std::fs::write(&target_file, b"content").expect("create in-root junction file");
         create_test_junction(&junction, &target);
 
+        // Production canonicalizes declared policy roots before planning. Mirror
+        // that contract here so Windows short-path aliases (for example
+        // RUNNER~1 in hosted CI) cannot make an in-root target appear external.
+        let canonical_root = root.canonicalize().expect("canonical read junction root");
+        let planned_junction = canonical_root.join("linked-target");
+
         let mut plan = Vec::new();
         let mut planned_objects = 0;
         plan_read_tree(
-            &root,
-            std::slice::from_ref(&root),
+            &canonical_root,
+            std::slice::from_ref(&canonical_root),
             &[],
             &mut plan,
             &mut planned_objects,
@@ -4866,7 +4872,7 @@ mod tests {
         .expect("plan read tree containing an in-root junction");
         let junction_plan = plan
             .iter()
-            .find(|entry| entry.path == junction)
+            .find(|entry| entry.path == planned_junction)
             .expect("journal the junction object itself");
         assert_eq!(
             junction_plan
@@ -4884,7 +4890,7 @@ mod tests {
         assert!(
             !plan
                 .iter()
-                .any(|entry| entry.path == junction.join("file.txt"))
+                .any(|entry| entry.path == planned_junction.join("file.txt"))
         );
 
         let mut profile = test_profile();
@@ -4947,28 +4953,36 @@ mod tests {
         create_test_junction(&in_root_link, &inside_a);
         create_test_junction(&outside_link, &outside);
 
+        // Match grant_policy_access: policy roots are canonical before the
+        // planner compares them with resolved reparse targets.
+        let canonical_root = root
+            .canonicalize()
+            .expect("canonical skipped junction root");
+        let planned_in_root_link = canonical_root.join("in-root-link");
+        let planned_outside_link = canonical_root.join("outside-link");
+
         let mut plan = Vec::new();
         let mut planned_objects = 0;
         plan_read_tree(
-            &root,
-            std::slice::from_ref(&root),
+            &canonical_root,
+            std::slice::from_ref(&canonical_root),
             &[],
             &mut plan,
             &mut planned_objects,
             0,
         )
         .expect("skip an out-of-root read junction without granting it");
-        assert!(plan.iter().all(|entry| entry.path != outside_link));
+        assert!(plan.iter().all(|entry| entry.path != planned_outside_link));
         let in_root_plan = plan
             .iter()
-            .find(|entry| entry.path == in_root_link)
+            .find(|entry| entry.path == planned_in_root_link)
             .expect("retain the in-root junction plan");
-        let handle = open_acl_target(&in_root_link).expect("open planned in-root junction");
+        let handle = open_acl_target(&planned_in_root_link).expect("open planned in-root junction");
         std::fs::remove_dir(&in_root_link).expect("remove original in-root junction");
         create_test_junction(&in_root_link, &inside_b);
         let error = assert_read_reparse_target(
             &handle,
-            &in_root_link,
+            &planned_in_root_link,
             in_root_plan
                 .read_reparse_target
                 .as_ref()
