@@ -4,10 +4,14 @@ import {
   type AgentEventEnvelope,
   type AgentEventType,
   type EvidenceRecord,
-  type JsonValue
+  type JsonValue,
+  type ToolEffect,
+  type WorkspaceDelta
 } from "../packages/agent-protocol/src/index.js";
 import {
+  assertKernelInvariants,
   createKernelState,
+  decide,
   evolve,
   rehydrate,
   SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
@@ -77,19 +81,61 @@ function queueTool(
 
 function queueTools(
   state: KernelState,
-  calls: Array<{ id: string; name: string }>
+  calls: Array<{ id: string; name: string }>,
+  events?: AgentEventEnvelope[]
 ): KernelState {
   let next = state;
-  if (next.phase === "idle") next = apply(next, "user.message", { text: "diagnose" }, undefined, "user");
+  if (next.phase === "idle") next = apply(next, "user.message", { text: "diagnose" }, events, "user");
   const turnId = next.toolCallIds.length + 1;
-  next = apply(next, "model.started", { turnId, effectRevision: next.revision });
+  next = apply(next, "model.started", { turnId, effectRevision: next.revision }, events);
   const turn = next.activeModelTurn!;
   return apply(next, "model.completed", {
     ...turn,
     message: { role: "assistant", content: "" },
     toolCalls: calls.map((call) => ({ id: call.id, name: call.name, arguments: {} })),
     finishReason: "tool_calls"
-  });
+  }, events);
+}
+
+interface SuccessfulReceiptOptions {
+  observedEffects?: ToolEffect[];
+  actualEffects?: ToolEffect[];
+  workspaceDelta?: WorkspaceDelta;
+}
+
+function completePendingTool(
+  state: KernelState,
+  callId: string,
+  options: SuccessfulReceiptOptions = {},
+  events?: AgentEventEnvelope[]
+): KernelState {
+  const pending = state.pendingTools.find((item) => item.request.callId === callId)!;
+  const observedEffects = options.observedEffects ?? ["filesystem.read"];
+  return apply(state, "tool.completed", {
+    callId,
+    ...pending.modelTurn,
+    ok: true,
+    output: "completed",
+    outcome: { status: "succeeded", output: "completed", diagnosticCodes: [] },
+    observedEffects,
+    ...(options.actualEffects === undefined ? {} : { actualEffects: options.actualEffects }),
+    ...(options.workspaceDelta ? { workspaceDelta: options.workspaceDelta } : {}),
+    artifacts: [],
+    diagnostics: [],
+    evidence: [],
+    startedAt: "start",
+    completedAt: "end"
+  }, events, "tool");
+}
+
+function successfulReceipt(
+  state: KernelState,
+  callId: string,
+  toolName: string,
+  options: SuccessfulReceiptOptions = {},
+  events?: AgentEventEnvelope[]
+): KernelState {
+  return completePendingTool(queueTool(state, callId, toolName, events), callId, options, events);
 }
 
 function failedReceipt(
@@ -180,7 +226,8 @@ describe("semantic execution failure convergence", () => {
       semanticFailureCluster: { family: "execution_capability", attempts: 3 },
       proposedOutcome: {
         kind: "recoverable_failure",
-        code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
+        code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
+        message: expect.stringContaining("successful process launch")
       }
     });
   });
@@ -278,33 +325,180 @@ describe("semantic execution failure convergence", () => {
     })).toMatchObject({ actualEffects: [] });
   });
 
-  it("resets a failure cluster on durable evidence progress, workspace progress, and steer", () => {
+  it("keeps an execution cluster across read/list work and informational evidence", () => {
     let state = failAlternative(initial(), "first", "exec", "process_spawn_failed");
     state = failAlternative(state, "second", "shell", "executable_not_found");
+    state = successfulReceipt(state, "read-progress", "read_file", {
+      observedEffects: ["filesystem.read"], actualEffects: ["filesystem.read"]
+    });
+    state = successfulReceipt(state, "list-progress", "list_files", {
+      observedEffects: ["filesystem.read"], actualEffects: ["filesystem.read"]
+    });
     const evidence: EvidenceRecord = {
       evidenceId: "real-progress",
       sessionId: state.sessionId,
       runId: state.runId,
       kind: "diagnostic",
-      status: "passed",
+      status: "informational",
       createdAt: "2026-07-12T00:00:00.000Z",
       producer: { authority: "runtime" },
       summary: "A capability was independently verified.",
       data: { source: "probe", diagnostic: { available: true } }
     };
     state = apply(state, "evidence.recorded", evidence);
-    expect(state.semanticFailureCluster).toBeUndefined();
+    expect(state.semanticFailureCluster).toMatchObject({ family: "execution_capability", attempts: 2 });
     expect(state.semanticProgress.durableEvidence).toBe(1);
+    expect(state.semanticFailureCluster?.progress).toEqual(state.semanticProgress);
 
-    state = failAlternative(state, "after-evidence", "exec", "process_spawn_failed");
+    state = failAlternative(state, "third", "validate", "shell_unavailable");
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { family: "execution_capability", attempts: 3 },
+      proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
+    });
+
+    state = apply(state, "evidence.recorded", {
+      ...evidence,
+      evidenceId: "post-threshold-information",
+      summary: "A read-only inventory completed after the execution failures."
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { attempts: 3 },
+      proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
+    });
+    expect(decide(state)).toEqual([expect.objectContaining({
+      type: "finish_run",
+      outcome: expect.objectContaining({ code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE })
+    })]);
+  });
+
+  it("only treats a verified launch-tool receipt as execution recovery", () => {
+    let state = failAlternative(initial(), "first", "exec", "process_spawn_failed");
+    state = failAlternative(state, "second", "shell", "executable_not_found");
+    for (const toolName of ["process_poll", "process_write", "process_terminate"]) {
+      state = successfulReceipt(state, `successful-${toolName}`, toolName, {
+        observedEffects: ["process.spawn.readonly"], actualEffects: ["process.spawn.readonly"]
+      });
+      expect(state.semanticFailureCluster?.attempts).toBe(2);
+    }
+
+    state = successfulReceipt(state, "real-launch", "exec", {
+      observedEffects: ["process.spawn.readonly"], actualEffects: ["process.spawn.readonly"]
+    });
+    expect(state.semanticFailureCluster).toBeUndefined();
+    state = failAlternative(state, "after-recovery", "exec", "process_spawn_failed");
     expect(state.semanticFailureCluster?.attempts).toBe(1);
-    state = failedReceipt(
-      queueTool(state, "workspace-progress", "shell"),
-      "workspace-progress",
-      "shell_unavailable",
-      undefined,
-      { added: [], modified: ["src/recovered.ts"], deleted: [] }
-    );
+
+    state = successfulReceipt(state, "legacy-launch", "shell", {
+      observedEffects: ["process.spawn.readonly"]
+    });
+    expect(state.semanticFailureCluster).toBeUndefined();
+  });
+
+  it("does not fall back to observed effects when actualEffects is explicitly empty", () => {
+    let state = failAlternative(initial(), "first", "exec", "process_spawn_failed");
+    state = failAlternative(state, "second", "shell", "executable_not_found");
+    state = successfulReceipt(state, "empty-actual-launch", "exec", {
+      observedEffects: ["process.spawn.readonly"], actualEffects: []
+    });
+    expect(state.semanticFailureCluster?.attempts).toBe(2);
+    state = failAlternative(state, "third", "validate", "shell_unavailable");
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { attempts: 3 },
+      proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
+    });
+  });
+
+  it("preserves the reached execution cluster through a fourth receipt and failed workspace delta", () => {
+    const events: AgentEventEnvelope[] = [];
+    let state = queueTools(initial(), [
+      { id: "first", name: "exec" },
+      { id: "second", name: "shell" },
+      { id: "third", name: "validate" },
+      { id: "fourth", name: "exec" }
+    ], events);
+    state = failedReceipt(state, "first", "process_spawn_failed", events);
+    state = failedReceipt(state, "second", "executable_not_found", events);
+    state = failedReceipt(state, "third", "shell_unavailable", events, {
+      added: [], modified: ["src/transient-third.ts"], deleted: []
+    });
+    expect(state).toMatchObject({
+      phase: "tool_pending",
+      semanticProgress: { workspaceChanges: 1 },
+      semanticFailureCluster: { family: "execution_capability", attempts: 3 }
+    });
+
+    state = failedReceipt(state, "fourth", "process_spawn_failed", events, {
+      added: [], modified: ["src/transient-fourth.ts"], deleted: []
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticProgress: { workspaceChanges: 2 },
+      semanticFailureCluster: { family: "execution_capability", attempts: 3 },
+      proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
+    });
+    expect(state.semanticFailureCluster?.progress).toEqual(state.semanticProgress);
+
+    const replayed = rehydrate(initial(), events);
+    assertKernelInvariants(replayed);
+    expect(replayed).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { family: "execution_capability", attempts: 3 }
+    });
+    expect(decide(replayed)).toEqual(decide(state));
+  });
+
+  it("allows an already-started successful launch to recover a threshold cluster", () => {
+    let state = queueTools(initial(), [
+      { id: "first", name: "exec" },
+      { id: "second", name: "shell" },
+      { id: "third", name: "validate" },
+      { id: "recovery", name: "process_spawn" }
+    ]);
+    state = failedReceipt(state, "first", "process_spawn_failed");
+    state = failedReceipt(state, "second", "executable_not_found");
+    state = failedReceipt(state, "third", "shell_unavailable");
+    expect(state.semanticFailureCluster?.attempts).toBe(3);
+    state = completePendingTool(state, "recovery", {
+      observedEffects: ["process.spawn.readonly"], actualEffects: ["process.spawn.readonly"]
+    });
+    expect(state).toMatchObject({ phase: "ready_model" });
+    expect(state.semanticFailureCluster).toBeUndefined();
+    expect(state.proposedOutcome).toBeUndefined();
+  });
+
+  it("retains legacy reset behavior for non-execution infrastructure clusters", () => {
+    let state = failAlternative(initial(), "first", "edit", "workspace_transaction_root_unavailable");
+    state = failAlternative(state, "second", "write", "workspace_transaction_cleanup_failed");
+    state = failAlternative(state, "third", "apply_patch", "workspace_transaction_root_unavailable");
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { family: "workspace_transaction", attempts: 3 }
+    });
+    const evidence: EvidenceRecord = {
+      evidenceId: "non-execution-progress",
+      sessionId: state.sessionId,
+      runId: state.runId,
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: "2026-07-12T00:00:00.000Z",
+      producer: { authority: "runtime" },
+      summary: "The workspace transaction service recovered.",
+      data: { source: "transaction-probe", diagnostic: { available: true } }
+    };
+    state = apply(state, "evidence.recorded", evidence);
+    expect(state).toMatchObject({ phase: "ready_model" });
+    expect(state.semanticFailureCluster).toBeUndefined();
+    expect(state.proposedOutcome).toBeUndefined();
+
+    state = failAlternative(state, "after-evidence", "edit", "workspace_transaction_root_unavailable");
+    state = successfulReceipt(state, "workspace-progress", "write_file", {
+      observedEffects: ["filesystem.write"],
+      actualEffects: ["filesystem.write"],
+      workspaceDelta: { added: [], modified: ["src/recovered.ts"], deleted: [] }
+    });
     expect(state.semanticFailureCluster).toBeUndefined();
     expect(state.semanticProgress.workspaceChanges).toBe(1);
 

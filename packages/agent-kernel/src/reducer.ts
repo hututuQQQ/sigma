@@ -4,7 +4,7 @@ import { completionSummary, incompleteModelCompletion, requestedInput, toolBatch
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
-import { recordSemanticToolResult, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
+import { recordSemanticToolResult, semanticInfrastructureFailureMessage, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
 function objectPayload(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, JsonValue>
@@ -259,7 +259,7 @@ const toolFinished: EventReducer = (state, event) => {
     continuationAttempts: 0,
     phase: nextPhase(pendingTools)
   };
-  const semantic = recordSemanticToolResult(next, receipt);
+  const semantic = recordSemanticToolResult(next, receipt, pending.request.name);
   const progressed = semantic.state;
   const inputMessage = requestedInput(receipt);
   if (inputMessage) {
@@ -282,7 +282,7 @@ const toolFinished: EventReducer = (state, event) => {
     return propose(progressed, {
       kind: "recoverable_failure",
       code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
-      message: `Execution infrastructure repeatedly failed without workspace or durable evidence progress (${cluster.family}, ${cluster.attempts} attempts; diagnostics: ${cluster.diagnosticCodes.join(", ")}).`
+      message: semanticInfrastructureFailureMessage(cluster)
     });
   }
   return progressed;

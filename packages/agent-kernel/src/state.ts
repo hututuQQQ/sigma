@@ -59,7 +59,8 @@ export interface SemanticFailureCluster {
   firstRevision: number;
   lastRevision: number;
   diagnosticCodes: string[];
-  /** Progress watermark shared by every attempt in this no-progress cluster. */
+  /** Latest global progress watermark. Execution clusters are rebased across
+   * unrelated evidence or workspace progress until a process launch succeeds. */
   progress: SemanticProgressWatermark;
 }
 
