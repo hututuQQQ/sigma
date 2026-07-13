@@ -47,10 +47,18 @@ jobs:
             sudo sysctl -w kernel.unprivileged_userns_clone=1
           fi
           bwrap --die-with-parent --new-session --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true
-      - name: Enable pnpm
+      - name: Install pinned pnpm (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          corepack enable
-          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+          npm install --global "pnpm@${PNPM_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install pinned pnpm (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm install --global "pnpm@$env:PNPM_VERSION"
+          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw "Unexpected pnpm version: $(pnpm --version)" }
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Build
