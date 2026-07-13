@@ -21,6 +21,7 @@ import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import type { ConfiguredRuntime } from "../packages/agent-runtime/src/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 class Capture extends Writable {
   readonly chunks: Buffer[] = [];
@@ -181,7 +182,10 @@ describe("CLI init and replay branches", () => {
   it("constructs the configured replay runtime when one is not injected", async () => {
     const root = await workspace("sigma-replay-runtime-");
     const stderr = new Capture();
-    await expect(runReplayCommand(["--latest", "--workspace", root], { stderr })).resolves.toBe(1);
+    await expect(runReplayCommand(["--latest", "--workspace", root], {
+      stderr,
+      runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() }
+    })).resolves.toBe(1);
     expect(stderr.text()).toContain("replay requires a session id");
   });
 
@@ -485,6 +489,7 @@ describe("CLI command registry dispatch", () => {
     const root = await workspace("sigma-index-tui-");
     let selected: string | undefined;
     await expect(runAgentCommand(["tui", "--workspace", root, "--session", "chosen"], {
+      runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() },
       tuiRunner: async (options) => { selected = options.sessionId; }
     })).resolves.toBe(0);
     expect(selected).toBe("chosen");

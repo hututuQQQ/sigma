@@ -195,7 +195,7 @@ function createClient(
     command: process.execPath,
     args: ["-e", SERVER, mode],
     cwd: process.cwd(),
-    timeouts: { idleTimeoutMs: 250, hardDeadlineMs: 2_000, shutdownGraceMs: 50, ...timeouts }
+    timeouts: { idleTimeoutMs: 1_000, hardDeadlineMs: 5_000, shutdownGraceMs: 50, ...timeouts }
   }, hooks, mcpExecution());
 }
 

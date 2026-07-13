@@ -15,6 +15,7 @@ import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
 import { createRuntime } from "../packages/agent-runtime/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 class Capture extends Writable {
   readonly chunks: Buffer[] = [];
@@ -149,7 +150,8 @@ describe("Sigma CLI", () => {
       stdin,
       stdout,
       stderr,
-      gatewayFactory: () => new FakeGateway([{ message: { role: "assistant", content: "analysis" }, finishReason: "stop" }])
+      gatewayFactory: () => new FakeGateway([{ message: { role: "assistant", content: "analysis" }, finishReason: "stop" }]),
+      executionBroker: createHostExecutionBroker()
     });
     expect(code).toBe(0);
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "completed", finalMessage: "analysis" });
@@ -183,6 +185,7 @@ describe("Sigma CLI", () => {
     const canonicalWorkspace = await realpath(workspace);
     let received = false;
     await expect(runAgentCommand(["tui", "--workspace", workspace], {
+      runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() },
       tuiRunner: async (options) => {
         received = typeof options.runtime.command === "function" && options.workspace === canonicalWorkspace;
       }

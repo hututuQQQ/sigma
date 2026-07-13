@@ -14,11 +14,12 @@ import { runVersionCommand } from "./commands/version.js";
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage
 } from "./config.js";
-import { createConfiguredRuntime } from "agent-runtime";
+import { createConfiguredRuntime, type RuntimeFactoryDeps } from "agent-runtime";
 
 export interface AgentCliMainOptions {
   tuiRunner?: (options: TuiAppOptions) => Promise<void>;
   stderr?: NodeJS.WritableStream;
+  runtimeFactoryDeps?: RuntimeFactoryDeps;
 }
 
 function printHelp(): void {
@@ -50,7 +51,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
     (options.stderr ?? process.stderr).write(`${trustMessage}\n`);
     return 2;
   }
-  const configured = await createConfiguredRuntime(cliConfig);
+  const configured = await createConfiguredRuntime(cliConfig, options.runtimeFactoryDeps);
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,
     workspace: configured.workspace,
