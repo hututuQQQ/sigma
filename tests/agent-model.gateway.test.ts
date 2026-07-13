@@ -139,6 +139,26 @@ describe("OpenAI-compatible model gateway", () => {
     });
   });
 
+  it("omits tool_choice for adapters that explicitly do not support it", async () => {
+    let body: Record<string, unknown> | undefined;
+    const gateway = createGateway((async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return jsonResponse("ok");
+    }) as typeof fetch, { wireProfile: { supportsToolChoice: false } });
+
+    await gateway.complete({
+      messages: [{ role: "user", content: "use a tool" }],
+      tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
+      toolChoice: "required",
+      signal: new AbortController().signal
+    });
+
+    expect(body).toMatchObject({
+      tools: [{ type: "function", function: { name: "read_file" } }]
+    });
+    expect(body).not.toHaveProperty("tool_choice");
+  });
+
   it("adapts DeepSeek developer messages and replays reasoning across tool turns", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     let attempt = 0;
@@ -199,6 +219,7 @@ describe("OpenAI-compatible model gateway", () => {
         { role: "tool", content: "file contents", toolCallId: "call_1" }
       ],
       tools,
+      toolChoice: "required",
       signal: new AbortController().signal
     });
 
@@ -211,8 +232,8 @@ describe("OpenAI-compatible model gateway", () => {
         { role: "user", content: "read a.ts" }
       ]
     });
-    expect(bodies[0]).not.toHaveProperty("tool_choice");
-    expect(bodies[1]).not.toHaveProperty("tool_choice");
+    expect(bodies[0]).toMatchObject({ tool_choice: "auto" });
+    expect(bodies[1]).toMatchObject({ tool_choice: "required" });
     expect(bodies[1]).toMatchObject({
       messages: expect.arrayContaining([expect.objectContaining({
         role: "assistant",
