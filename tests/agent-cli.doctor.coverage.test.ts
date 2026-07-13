@@ -11,13 +11,11 @@ vi.mock("../packages/agent-model/dist/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("agent-model")>();
   return {
     ...actual,
-    createModelGateway: () => ({
-      complete: async () => {
-        if (api.mode === "error") throw new Error("mock API failure");
-        if (api.mode === "raw_error") throw "raw API failure";
-        return { message: { role: "assistant", content: api.mode === "empty" ? "" : "ok" }, finishReason: "stop" };
-      }
-    })
+    checkProviderHealth: async () => {
+      if (api.mode === "error") throw new Error("mock API failure");
+      if (api.mode === "raw_error") throw "raw API failure";
+      return api.mode === "empty" ? "Provider returned an empty response." : "ok";
+    }
   };
 });
 

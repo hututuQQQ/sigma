@@ -3,6 +3,7 @@ dist/
 coverage/
 .agent/
 .artifacts/
+.stryker-tmp/
 .env
 trace.jsonl
 summary.json

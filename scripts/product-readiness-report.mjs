@@ -202,24 +202,19 @@ function lspSandboxSmokeReleaseChecks(lspSmoke, lspSmokePath, targetPlatform, ta
   ];
 }
 
-function migrationPerformanceReleaseChecks(performance, performancePath) {
+function replayPerformanceReleaseChecks(performance, performancePath) {
   return [
-    check("migrationPerformance:present", Boolean(performance), performancePath),
+    check("replayPerformance:present", Boolean(performance), performancePath),
     check(
-      "migrationPerformance:100k",
-      performance?.schemaVersion === 1 && performance?.kind === "v2Migration100k"
+      "replayPerformance:100k",
+      performance?.schemaVersion === 1 && performance?.kind === "v4Replay100k"
         && performance?.ok === true && performance?.events === 100_000,
       `events=${String(performance?.events ?? "missing")}, ok=${String(performance?.ok ?? false)}`
     ),
     check(
-      "migrationPerformance:memory",
+      "replayPerformance:memory",
       Number(performance?.peakRssMiB) < 256,
       `peakRssMiB=${String(performance?.peakRssMiB ?? "missing")}`
-    ),
-    check(
-      "migrationPerformance:sourceUnchanged",
-      performance?.sourceUnchanged === true,
-      `sourceUnchanged=${String(performance?.sourceUnchanged ?? false)}`
     )
   ];
 }
@@ -270,7 +265,7 @@ function markdownReport(report) {
     `- package target: ${report.evidence.packageVerify.targetPlatform ?? "unknown"}`,
     `- sandbox smoke: ${report.evidence.sandboxSmoke.path}`,
     `- LSP sandbox smoke: ${report.evidence.lspSandboxSmoke.path}`,
-    `- V2 migration performance: ${report.evidence.migrationPerformance.path}`,
+    `- V4 replay performance: ${report.evidence.replayPerformance.path}`,
     `- native protocol coverage: ${report.evidence.nativeProtocolCoverage.path}`,
     "",
     "## Checks",
@@ -295,6 +290,7 @@ export async function buildProductReadinessReport(options = {}) {
   const packageJsonPath = path.join(rootDir, "package.json");
   const productSmokePath = path.join(artifactsDir, "smoke-product", "product-smoke.json");
   const tuiSmokePath = path.join(artifactsDir, "smoke-tui-product", "tui-smoke.json");
+  const internalOnly = bool(options.internalOnly ?? process.env.AGENT_INTERNAL_READINESS_ONLY);
   const requestedPlatform = options.targetPlatform ?? process.env.AGENT_TARGET_PLATFORM;
   const requestedArch = options.targetArch ?? process.env.AGENT_TARGET_ARCH ?? "x64";
   const targetedPackageVerifyPath = requestedPlatform
@@ -304,24 +300,24 @@ export async function buildProductReadinessReport(options = {}) {
     ? targetedPackageVerifyPath
     : path.join(artifactsDir, "agent-cli-package-verify.json");
   const providerSmokePath = path.join(artifactsDir, "smoke-provider", "provider-smoke.json");
-  const migrationPerformancePath = path.join(artifactsDir, "migration-v2-100k.json");
+  const replayPerformancePath = path.join(artifactsDir, "replay-v4-100k.json");
   const nativeProtocolCoveragePath = path.join(artifactsDir, "sigma-exec-branch-coverage.json");
   const checks = [];
 
   assertEvidenceFile(productSmokePath, "productSmoke", checks);
   assertEvidenceFile(tuiSmokePath, "tuiSmoke", checks);
-  assertEvidenceFile(packageVerifyPath, "packageVerify", checks);
+  if (!internalOnly) assertEvidenceFile(packageVerifyPath, "packageVerify", checks);
 
   const [
     packageJson, productSmoke, tuiSmoke, packageVerify, providerSmoke,
-    migrationPerformance, nativeProtocolCoverage
+    replayPerformance, nativeProtocolCoverage
   ] = await Promise.all([
     readJson(packageJsonPath),
     existsSync(productSmokePath) ? readJson(productSmokePath) : Promise.resolve(null),
     existsSync(tuiSmokePath) ? readJson(tuiSmokePath) : Promise.resolve(null),
     existsSync(packageVerifyPath) ? readJson(packageVerifyPath) : Promise.resolve(null),
     existsSync(providerSmokePath) ? readJson(providerSmokePath) : Promise.resolve(null),
-    existsSync(migrationPerformancePath) ? readJson(migrationPerformancePath) : Promise.resolve(null),
+    existsSync(replayPerformancePath) ? readJson(replayPerformancePath) : Promise.resolve(null),
     existsSync(nativeProtocolCoveragePath) ? readJson(nativeProtocolCoveragePath) : Promise.resolve(null)
   ]);
 
@@ -336,7 +332,7 @@ export async function buildProductReadinessReport(options = {}) {
   checks.push(check("productGate:benchmarkNeutral", benchmarkNeutralScripts(packageJson), "verify:product excludes bench/Harbor adapters"));
   checks.push(check("productGate:noLiveProviderSmoke", !verifyProductScript.includes("smoke:provider"), "verify:product excludes live provider smoke"));
   checks.push(check("productGate:noRequiredTargetWrapper", !verifyProductScript.includes("--require-target-wrapper"), "verify:product does not require target wrapper smoke"));
-  if (requestedPlatform) {
+  if (requestedPlatform && !internalOnly) {
     checks.push(check(
       "package:requestedTarget",
       packageVerify?.targetPlatform === requestedPlatform && packageVerify?.targetArch === requestedArch,
@@ -359,12 +355,14 @@ export async function buildProductReadinessReport(options = {}) {
       ? `invalid version=${expectedProductVersion || "missing"}`
       : `major=${expectedProductMajor}`
   ));
-  checks.push(check(
-    "package:productVersion",
-    packageVerify?.metadata?.productVersion === expectedProductVersion,
-    `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
-  ));
-  checks.push(...packageChecks(packageVerify, expectedV3));
+  if (!internalOnly) {
+    checks.push(check(
+      "package:productVersion",
+      packageVerify?.metadata?.productVersion === expectedProductVersion,
+      `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
+    ));
+    checks.push(...packageChecks(packageVerify, expectedV3));
+  }
 
   const target = `${targetPlatform}-${targetArch}`;
   const v3IntegrityReady = !expectedV3 || packageVerify?.checks?.integrity === true;
@@ -389,7 +387,7 @@ export async function buildProductReadinessReport(options = {}) {
     ),
     ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
     ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
-    ...migrationPerformanceReleaseChecks(migrationPerformance, migrationPerformancePath),
+    ...replayPerformanceReleaseChecks(replayPerformance, replayPerformancePath),
     ...nativeProtocolCoverageReleaseChecks(nativeProtocolCoverage, nativeProtocolCoveragePath),
     ...providerSmokeReleaseChecks(providerSmoke, providerSmokePath)
   ];
@@ -451,12 +449,12 @@ export async function buildProductReadinessReport(options = {}) {
         brokerSha256: lspSandboxSmoke?.brokerSha256 ?? null,
         bundledNodeSha256: lspSandboxSmoke?.bundledNodeSha256 ?? null
       },
-      migrationPerformance: {
-        path: migrationPerformancePath,
-        ok: migrationPerformance?.ok ?? false,
-        events: migrationPerformance?.events ?? null,
-        peakRssMiB: migrationPerformance?.peakRssMiB ?? null,
-        sourceUnchanged: migrationPerformance?.sourceUnchanged ?? false
+      replayPerformance: {
+        path: replayPerformancePath,
+        ok: replayPerformance?.ok ?? false,
+        events: replayPerformance?.events ?? null,
+        peakRssMiB: replayPerformance?.peakRssMiB ?? null,
+        snapshotRebuilt: replayPerformance?.snapshotRebuilt ?? false
       },
       nativeProtocolCoverage: {
         path: nativeProtocolCoveragePath,
@@ -482,7 +480,8 @@ export async function writeProductReadinessReport(options = {}) {
   const artifactsDir = options.artifactsDir ? path.resolve(options.artifactsDir) : path.join(rootDir, ".artifacts");
   await mkdir(artifactsDir, { recursive: true });
   const report = await buildProductReadinessReport({ ...options, rootDir, artifactsDir });
-  const targetPlatform = report.evidence.packageVerify.targetPlatform ?? options.targetPlatform ?? "unknown";
+  const targetPlatform = options.internalOnly
+    ? "internal" : report.evidence.packageVerify.targetPlatform ?? options.targetPlatform ?? "unknown";
   const targetArch = report.evidence.packageVerify.targetArch ?? options.targetArch ?? "unknown";
   const jsonPath = path.join(artifactsDir, `product-readiness-${targetPlatform}-${targetArch}.json`);
   const markdownPath = path.join(artifactsDir, `product-readiness-${targetPlatform}-${targetArch}.md`);
@@ -513,6 +512,7 @@ function parseArgs(argv) {
     const next = argv[index + 1];
     if (arg === "--require-release-ready") options.requireReleaseReady = true;
     if (arg === "--require-provider-smoke") options.requireProviderSmoke = true;
+    if (arg === "--internal-only") options.internalOnly = true;
     if (arg === "--target-platform" && next) {
       options.targetPlatform = next;
       index += 1;

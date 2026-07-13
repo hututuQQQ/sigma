@@ -20,6 +20,7 @@ import { recoverCheckpointTransactions } from "./restore-recovery.js";
 import { captureCheckpointManifest } from "./safe-capture.js";
 import { CheckpointCasStore } from "./cas-store.js";
 import { buildCheckpointReview } from "./checkpoint-review.js";
+import type { CheckpointRestoreFaultInjector } from "./fault-injection.js";
 
 export { checkpointDelta } from "./manifest.js";
 export class CheckpointManager {
@@ -27,14 +28,14 @@ export class CheckpointManager {
   private readonly maxFiles: number;
   private readonly maxBytes: number;
   private readonly excludedNames: ReadonlySet<string>;
-  private readonly restoreFaultInjector: CheckpointManagerOptions["restoreFaultInjector"];
+  private readonly restoreFaultInjector: CheckpointRestoreFaultInjector | undefined;
   private readonly cas: CheckpointCasStore;
-  constructor(options: CheckpointManagerOptions) {
+  constructor(options: CheckpointManagerOptions, restoreFaultInjector?: CheckpointRestoreFaultInjector) {
     this.rootDir = path.resolve(options.rootDir);
     this.maxFiles = options.maxFiles ?? 250_000;
     this.maxBytes = options.maxBytes ?? 2 * 1024 * 1024 * 1024;
     this.excludedNames = new Set(options.excludedNames ?? [".git", ".agent"]);
-    this.restoreFaultInjector = options.restoreFaultInjector;
+    this.restoreFaultInjector = restoreFaultInjector;
     this.cas = new CheckpointCasStore(this.rootDir);
   }
   async create(input: CreateCheckpointInput): Promise<CheckpointRecord> {

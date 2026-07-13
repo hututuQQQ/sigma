@@ -23,7 +23,7 @@ import { segmentName, sessionDirectory, sessionsDirectory, snapshotName } from "
 
 const DEFAULT_SEGMENT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SEGMENT_EVENTS = 10_000;
-export interface SessionMetaV3 {
+export interface SessionMetaV4 {
   schemaVersion: typeof STORE_LAYOUT_VERSION;
   eventSchemaVersion: typeof EVENT_SCHEMA_VERSION;
   snapshotSchemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
@@ -56,7 +56,7 @@ export interface SegmentedJsonlStoreOptions {
   replaceFile?: AtomicReplace;
 }
 
-export function isSessionMetaV3(value: unknown, sessionId?: string): value is SessionMetaV3 {
+export function isSessionMetaV4(value: unknown, sessionId?: string): value is SessionMetaV4 {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const meta = value as Record<string, unknown>;
   return [
@@ -171,7 +171,7 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: event.seq,
       segment,
       segmentEvents: segmentEvents + 1
-    } satisfies SessionMetaV3, this.replaceFile);
+    } satisfies SessionMetaV4, this.replaceFile);
     return { rotated };
     } finally {
       await release();
@@ -250,7 +250,7 @@ export class SegmentedJsonlStore implements RunStore {
     }
   }
 
-  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMetaV3> {
+  private async reconcileMeta(sessionId: string, now: string): Promise<SessionMetaV4> {
     let lastSeq = 0;
     for await (const event of this.events(sessionId, 0, true)) lastSeq = event.seq;
     const eventsDir = path.join(sessionDirectory(this.rootDir, sessionId), "events");
@@ -260,7 +260,7 @@ export class SegmentedJsonlStore implements RunStore {
       ? (await readFile(path.join(eventsDir, files.at(-1)!), "utf8")).split("\n").filter((line) => line.trim()).length
       : 0;
     const meta = await this.readMeta(sessionId, now);
-    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMetaV3;
+    const reconciled = { ...meta, updatedAt: now, lastSeq, segment, segmentEvents } satisfies SessionMetaV4;
     await atomicJson(path.join(sessionDirectory(this.rootDir, sessionId), "meta.json"), reconciled, this.replaceFile);
     return reconciled;
   }
@@ -289,7 +289,7 @@ export class SegmentedJsonlStore implements RunStore {
       lastSeq: lastValidSeq,
       segment,
       segmentEvents: validEvents
-    } satisfies SessionMetaV3, this.replaceFile);
+    } satisfies SessionMetaV4, this.replaceFile);
   }
 
   async writeSnapshot(snapshot: SnapshotEnvelope): Promise<void> {
@@ -327,7 +327,7 @@ export class SegmentedJsonlStore implements RunStore {
     const sessions = await Promise.all(entries.filter((item) => item.isDirectory()).map(async (item) => {
       try {
         const meta = JSON.parse(await readFile(path.join(root, item.name, "meta.json"), "utf8")) as unknown;
-        if (!isSessionMetaV3(meta, item.name)) return null;
+        if (!isSessionMetaV4(meta, item.name)) return null;
         return { sessionId: meta.sessionId, updatedAt: meta.updatedAt, lastSeq: meta.lastSeq };
       } catch {
         return null;
@@ -337,11 +337,11 @@ export class SegmentedJsonlStore implements RunStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  private async readMeta(sessionId: string, now: string): Promise<SessionMetaV3> {
+  private async readMeta(sessionId: string, now: string): Promise<SessionMetaV4> {
     const metaPath = path.join(sessionDirectory(this.rootDir, sessionId), "meta.json");
     try {
       const parsed = JSON.parse(await readFile(metaPath, "utf8")) as unknown;
-      if (!isSessionMetaV3(parsed, sessionId)) throw new Error("invalid V3 metadata shape");
+      if (!isSessionMetaV4(parsed, sessionId)) throw new Error("invalid V4 metadata shape");
       return parsed;
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") {

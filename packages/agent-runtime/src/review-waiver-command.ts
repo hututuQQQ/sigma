@@ -43,7 +43,7 @@ export async function recordReviewerWaiver(
   command: ReviewerWaiverCommand,
   emit: RuntimeEventEmitter
 ): Promise<string> {
-  if (session.running || (session.state.phase !== "needs_input" && session.state.phase !== "terminal")) {
+  if (session.execution.running || (session.durable.state.phase !== "needs_input" && session.durable.state.phase !== "terminal")) {
     throw commandError(
       "reviewer_waiver_invalid_state",
       "Reviewer waiver is allowed only while a session is waiting for input or awaiting a follow-up."
@@ -53,14 +53,14 @@ export async function recordReviewerWaiver(
   if (!reason || reason.length > 2_000) {
     throw commandError("reviewer_waiver_invalid_reason", "Reviewer waiver reason must contain 1 to 2,000 characters.");
   }
-  if (session.state.evidence.some((item) => item.kind === "user_waiver")) {
+  if (session.durable.state.evidence.some((item) => item.kind === "user_waiver")) {
     throw commandError("reviewer_waiver_already_used", "This run has already used its one reviewer waiver.");
   }
   const target = targetDelta(session, command);
   await emit(session, "review.waived", "user", {
     evidenceId: randomUUID(),
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     kind: "user_waiver",
     status: "informational",
     createdAt: new Date().toISOString(),

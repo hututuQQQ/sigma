@@ -12,3 +12,4 @@ export * from "./ring-buffer.js";
 export * from "./types.js";
 export * from "./windows-node-compatibility.js";
 export * from "./windows-directory-lock-helper.js";
+export * from "./lazy-execution-broker.js";

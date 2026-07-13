@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { subjectNodeLaunch } from "./subject-launch.mjs";
+import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 const CANCEL_GRACE_MS = 15_000;
@@ -132,10 +133,36 @@ async function cancelSession({ sessionId, workspace, env, reason, subject }) {
     "session", "cancel", sessionId,
     "--workspace", workspace,
     "--provider", "deepseek",
-    "--model", "deepseek-v4-pro",
+    "--model", sigmaManifest.evaluation.model,
     "--reason", reason
   ], subject), { cwd: workspace, env, timeoutMs: CANCEL_GRACE_MS });
   return await operation.exited;
+}
+
+function startCliSubject({ workspace, stateHome, promptPath, runMode, env, subject }) {
+  const command = runMode === "analyze" ? "inspect" : "run";
+  const args = nodeCliArgs([
+    command,
+    "--workspace", workspace,
+    "--prompt-file", promptPath,
+    "--provider", "deepseek",
+    "--model", sigmaManifest.evaluation.model,
+    "--permission-mode", "auto",
+    "--output-format", "stream-json",
+    "--output-schema", "3"
+  ], subject);
+  const launch = subjectNodeLaunch(subject);
+  return {
+    startedAt: Date.now(),
+    child: spawn(launch.executablePath, args, {
+      cwd: workspace,
+      env: { ...env, SIGMA_STATE_HOME: stateHome },
+      detached: process.platform !== "win32",
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    })
+  };
 }
 
 export async function runCliSubject(options) {
@@ -144,27 +171,7 @@ export async function runCliSubject(options) {
     onEvent = () => undefined, subject = {}
   } = options;
   await mkdir(artifactDir, { recursive: true });
-  const command = runMode === "analyze" ? "inspect" : "run";
-  const args = nodeCliArgs([
-    command,
-    "--workspace", workspace,
-    "--prompt-file", promptPath,
-    "--provider", "deepseek",
-    "--model", "deepseek-v4-pro",
-    "--permission-mode", "auto",
-    "--output-format", "stream-json",
-    "--output-schema", "3"
-  ], subject);
-  const launch = subjectNodeLaunch(subject);
-  const startedAt = Date.now();
-  const child = spawn(launch.executablePath, args, {
-    cwd: workspace,
-    env: { ...env, SIGMA_STATE_HOME: stateHome },
-    detached: process.platform !== "win32",
-    shell: false,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+  const { child, startedAt } = startCliSubject({ workspace, stateHome, promptPath, runMode, env, subject });
   const events = [];
   let result;
   let stdout = "";

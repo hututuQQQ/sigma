@@ -27,13 +27,13 @@ export class RuntimeEventLog {
     outcome: RunOutcome,
     outcomeRevision: number
   ): Promise<AgentEventEnvelope | undefined> {
-    const previous = this.queues.get(session.sessionId) ?? Promise.resolve();
+    const previous = this.queues.get(session.identity.sessionId) ?? Promise.resolve();
     let emitted: AgentEventEnvelope | undefined;
     const current = previous.then(async () => {
-      if (session.state.phase !== "outcome_pending" || session.state.revision !== outcomeRevision) return;
+      if (session.durable.state.phase !== "outcome_pending" || session.durable.state.revision !== outcomeRevision) return;
       emitted = await this.emitLocked(session, type, "runtime", { ...outcome, outcomeRevision });
     });
-    this.queues.set(session.sessionId, current.catch(() => undefined));
+    this.queues.set(session.identity.sessionId, current.catch(() => undefined));
     await current;
     return emitted;
   }
@@ -44,12 +44,12 @@ export class RuntimeEventLog {
     authority: Exclude<ContextAuthority, "external_verifier">,
     value: AgentEventPayloadMap[NoInfer<TType>]
   ): Promise<AgentEventOf<TType>> {
-    const previous = this.queues.get(session.sessionId) ?? Promise.resolve();
+    const previous = this.queues.get(session.identity.sessionId) ?? Promise.resolve();
     let emitted!: AgentEventOf<TType>;
     const current = previous.then(async () => {
       emitted = await this.emitLocked(session, type, authority, value);
     });
-    this.queues.set(session.sessionId, current.catch(() => undefined));
+    this.queues.set(session.identity.sessionId, current.catch(() => undefined));
     await current;
     return emitted;
   }
@@ -68,13 +68,13 @@ export class RuntimeEventLog {
     authority: Exclude<ContextAuthority, "external_verifier">,
     value: AgentEventPayloadMap[NoInfer<TType>]
   ): Promise<AgentEventOf<TType>> {
-    const expectedSeq = session.seq;
+    const expectedSeq = session.durable.seq;
     const event = {
       schemaVersion: EVENT_SCHEMA_VERSION,
       seq: expectedSeq + 1,
       eventId: randomUUID(),
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       occurredAt: new Date().toISOString(),
       type,
       authority,
@@ -83,9 +83,9 @@ export class RuntimeEventLog {
     // TypeScript cannot distribute a generic indexed access over the mapped
     // event union, but `emit` has already bound TType to its payload above.
     const append = await this.store.append(event as import("agent-protocol").AnyTypedAgentEvent, expectedSeq);
-    session.seq = event.seq;
-    session.state = evolve(session.state, event);
-    for (const subscriber of session.subscribers) subscriber.push(event);
+    session.durable.seq = event.seq;
+    session.durable.state = evolve(session.durable.state, event);
+    for (const subscriber of session.interaction.subscribers) subscriber.push(event);
     if (append.rotated || event.seq % 250 === 0) await this.writeSnapshot(session);
     return event;
   }

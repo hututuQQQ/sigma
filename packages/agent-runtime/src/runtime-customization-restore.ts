@@ -11,22 +11,22 @@ export async function restoreRuntimeCustomization(
   artifacts: ContentAddressedArtifactStore,
   options: RuntimeOptions
 ): Promise<void> {
-  const profileReference = session.state.frozenProfile;
+  const profileReference = session.durable.state.frozenProfile;
   if (profileReference) {
-    const artifact = await artifacts.get(session.sessionId, profileReference.artifactId);
-    session.profile = restoreFrozenAgentProfile(artifact.toString("utf8"), profileReference.digest);
-    session.profileSource = profileReference.source;
+    const artifact = await artifacts.get(session.identity.sessionId, profileReference.artifactId);
+    session.services.profile = restoreFrozenAgentProfile(artifact.toString("utf8"), profileReference.digest);
+    session.services.profileSource = profileReference.source;
   }
-  const customizationReference = session.state.frozenCustomization;
+  const customizationReference = session.durable.state.frozenCustomization;
   if (customizationReference) {
-    const artifact = await artifacts.get(session.sessionId, customizationReference.artifactId);
-    session.frozenCustomization = restoreSessionCustomization(
+    const artifact = await artifacts.get(session.identity.sessionId, customizationReference.artifactId);
+    session.durable.frozenCustomization = restoreSessionCustomization(
       artifact.toString("utf8"), customizationReference.digest
     );
-    assertFrozenProfileResources(session.profile, session.frozenCustomization);
-    addFrozenSkillMetadata(session, session.frozenCustomization);
+    assertFrozenProfileResources(session.services.profile, session.durable.frozenCustomization);
+    addFrozenSkillMetadata(session, session.durable.frozenCustomization);
   } else {
-    assertProfileResources(options, session.profile);
+    assertProfileResources(options, session.services.profile);
   }
-  session.gateway = options.gatewayForRole?.(session.modelRole, session.profile) ?? options.gateway;
+  session.services.gateway = options.gatewayForRole?.(session.services.modelRole, session.services.profile) ?? options.gateway;
 }

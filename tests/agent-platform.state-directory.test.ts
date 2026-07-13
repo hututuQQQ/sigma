@@ -12,7 +12,7 @@ import {
 import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 
 const temporaryRoots: string[] = [];
 

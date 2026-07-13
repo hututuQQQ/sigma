@@ -11,7 +11,7 @@ export async function* streamSessionEvents(
   const queue = new AsyncQueue<AgentEventEnvelope>();
   const onAbort = (): void => queue.close();
   if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
-  session?.subscribers.add(queue);
+  session?.interaction.subscribers.add(queue);
   let lastSeq = 0;
   try {
     for await (const event of store.events(sessionId)) {
@@ -26,7 +26,7 @@ export async function* streamSessionEvents(
     }
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    session?.subscribers.delete(queue);
+    session?.interaction.subscribers.delete(queue);
     queue.close();
   }
 }

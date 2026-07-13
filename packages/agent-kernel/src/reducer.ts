@@ -5,17 +5,14 @@ import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
 import { recordSemanticToolResult, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
-
 function objectPayload(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, JsonValue>
     : {};
 }
-
 function text(value: JsonValue | undefined): string {
   return typeof value === "string" ? value : "";
 }
-
 function supersededToolMessages(state: KernelState): ModelMessage[] {
   return state.pendingTools.map((pending) => ({
     role: "tool",
@@ -23,7 +20,6 @@ function supersededToolMessages(state: KernelState): ModelMessage[] {
     content: `Failed tool receipt ID: ${pending.request.callId}\nSuperseded by a newer user instruction; no successful receipt or side effect may be inferred.`
   }));
 }
-
 function terminal(state: KernelState, outcome: RunOutcome): KernelState {
   return {
     ...state,
@@ -35,7 +31,6 @@ function terminal(state: KernelState, outcome: RunOutcome): KernelState {
     outcome
   };
 }
-
 function propose(state: KernelState, outcome: RunOutcome): KernelState {
   return {
     ...state,

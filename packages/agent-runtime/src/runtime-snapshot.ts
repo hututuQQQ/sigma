@@ -6,10 +6,10 @@ export async function persistRuntimeSnapshot(store: RunStore, session: RuntimeSe
   const snapshot: SnapshotEnvelope = {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
     storeLayoutVersion: STORE_LAYOUT_VERSION,
-    sessionId: session.sessionId,
-    seq: session.seq,
+    sessionId: session.identity.sessionId,
+    seq: session.durable.seq,
     createdAt: new Date().toISOString(),
-    state: jsonValue({ ...session.state, lastSeq: session.seq })
+    state: jsonValue({ ...session.durable.state, lastSeq: session.durable.seq })
   };
   await store.writeSnapshot(snapshot);
 }

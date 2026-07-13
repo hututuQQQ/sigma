@@ -20,12 +20,12 @@ export interface RuntimeCommandHandlerOptions {
 }
 
 async function waitForTerminalRunSettlement(session: RuntimeSession): Promise<void> {
-  const running = session.running;
-  if (!running || session.state.phase !== "terminal") return;
+  const running = session.execution.running;
+  if (!running || session.durable.state.phase !== "terminal") return;
   await running;
-  if (session.running !== running) return;
+  if (session.execution.running !== running) return;
   await new Promise<void>((resolve, reject) => {
-    session.idleWaiters.push({ resolve, reject });
+    session.interaction.idleWaiters.push({ resolve, reject });
   });
 }
 
@@ -45,8 +45,8 @@ function installCallGrant(
   hasPendingTool: boolean
 ): void {
   const binding = approval.binding ?? (approval.recovered ? {
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     callId: requestId,
     // Legacy approval events without a durable plan deliberately create a
     // non-matching sentinel so the resumed runner must present its fresh plan.
@@ -55,9 +55,9 @@ function installCallGrant(
   // Every explicit local approval receives a one-shot, plan-bound grant. The
   // execution gate consumes it before starting a sensitive or mutating call.
   if (decision === "deny" || !hasPendingTool || !binding
-    || binding.sessionId !== session.sessionId || binding.runId !== session.runId
+    || binding.sessionId !== session.identity.sessionId || binding.runId !== session.durable.runId
     || binding.callId !== requestId) return;
-  session.callApprovals.set(requestId, {
+  session.interaction.callApprovals.set(requestId, {
     ...binding,
     callId: requestId,
     authority: "user",
@@ -74,12 +74,12 @@ async function persistApprovalResolution(
   session: RuntimeSession,
   requestId: string,
   approval: ApprovalWaiter,
-  pendingTool: RuntimeSession["state"]["pendingTools"][number] | undefined,
+  pendingTool: RuntimeSession["durable"]["state"]["pendingTools"][number] | undefined,
   decision: "allow" | "deny" | "always_allow"
 ): Promise<void> {
   approval.resolving = true;
   try {
-    const deadlineAt = session.approvals.size === 1 ? resumedDeadlineAt(session) : undefined;
+    const deadlineAt = session.interaction.approvals.size === 1 ? resumedDeadlineAt(session) : undefined;
     await emit(session, "tool.approval_resolved", "user", {
       requestId,
       callId: approval.external?.callId ?? requestId,
@@ -103,27 +103,27 @@ export class RuntimeCommandHandler {
 
   async cancel(session: RuntimeSession, command: Extract<RunCommand, { type: "cancel" }>): Promise<void> {
     const reason = command.reason ?? "Cancelled by user.";
-    session.controller?.abort(new Error(reason));
-    for (const approval of session.approvals.values()) approval.resolve("deny");
-    session.approvals.clear();
-    session.callApprovals.clear();
-    await this.options.cancelChildren?.(session.sessionId, reason);
-    if (!session.running && session.state.phase !== "terminal") {
+    session.execution.controller?.abort(new Error(reason));
+    for (const approval of session.interaction.approvals.values()) approval.resolve("deny");
+    session.interaction.approvals.clear();
+    session.interaction.callApprovals.clear();
+    await this.options.cancelChildren?.(session.identity.sessionId, reason);
+    if (!session.execution.running && session.durable.state.phase !== "terminal") {
       await this.options.finish(session, { kind: "cancelled", reason });
     }
   }
 
   async approval(session: RuntimeSession, command: Extract<RunCommand, { type: "approve" }>): Promise<void> {
-    const previous = this.approvalResolutions.get(session.sessionId) ?? Promise.resolve();
+    const previous = this.approvalResolutions.get(session.identity.sessionId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
       await this.resolveApproval(session, command);
     });
-    this.approvalResolutions.set(session.sessionId, current);
+    this.approvalResolutions.set(session.identity.sessionId, current);
     try {
       await current;
     } finally {
-      if (this.approvalResolutions.get(session.sessionId) === current) {
-        this.approvalResolutions.delete(session.sessionId);
+      if (this.approvalResolutions.get(session.identity.sessionId) === current) {
+        this.approvalResolutions.delete(session.identity.sessionId);
       }
     }
   }
@@ -132,8 +132,8 @@ export class RuntimeCommandHandler {
     session: RuntimeSession,
     command: Extract<RunCommand, { type: "approve" }>
   ): Promise<void> {
-    const approval = session.approvals.get(command.requestId);
-    const pendingTool = session.state.pendingTools.find((item) => item.request.callId === command.requestId);
+    const approval = session.interaction.approvals.get(command.requestId);
+    const pendingTool = session.durable.state.pendingTools.find((item) => item.request.callId === command.requestId);
     if (!approval || approval.resolving || (!pendingTool && !approval.external)) {
       throw new Error(`Unknown approval '${command.requestId}'.`);
     }
@@ -141,8 +141,8 @@ export class RuntimeCommandHandler {
     await persistApprovalResolution(
       this.options.emit, session, command.requestId, approval, pendingTool, decision
     );
-    session.approvals.delete(command.requestId);
-    if (session.approvals.size === 0) armRunDeadline(session);
+    session.interaction.approvals.delete(command.requestId);
+    if (session.interaction.approvals.size === 0) armRunDeadline(session);
     installCallGrant(session, command.requestId, approval, decision, Boolean(pendingTool));
     approval.resolve(decision);
     if (approval.recovered && decision === "deny" && pendingTool) {
@@ -153,8 +153,8 @@ export class RuntimeCommandHandler {
         recoveryDenialPayload(command.requestId, pendingTool.modelTurn)
       );
     }
-    if (!approval.external && !session.running && session.state.phase !== "terminal") {
-      session.lastOutcome = undefined;
+    if (!approval.external && !session.execution.running && session.durable.state.phase !== "terminal") {
+      session.recovery.lastOutcome = undefined;
       this.options.start(session);
     }
   }
@@ -167,40 +167,40 @@ export class RuntimeCommandHandler {
   }
 
   async steer(session: RuntimeSession, text: string): Promise<void> {
-    if (session.steeringPending >= 256) throw new Error("Steering queue is full (256 messages).");
-    session.steeringPending += 1;
+    if (session.interaction.steeringPending >= 256) throw new Error("Steering queue is full (256 messages).");
+    session.interaction.steeringPending += 1;
     try {
       await this.options.emit(session, "user.steer", "user", { text });
       const reason = Object.assign(new Error("Active model/tool turn was superseded by user steering."), {
         code: "steering_restart"
       });
-      session.turnController?.abort(reason);
-      session.callApprovals.clear();
+      session.execution.turnController?.abort(reason);
+      session.interaction.callApprovals.clear();
     } finally {
-      session.steeringPending -= 1;
+      session.interaction.steeringPending -= 1;
     }
   }
 
   async followUp(session: RuntimeSession, text: string): Promise<void> {
-    if (session.followUps.length >= 256) throw new Error("Follow-up queue is full (256 messages).");
+    if (session.interaction.followUps.length >= 256) throw new Error("Follow-up queue is full (256 messages).");
     await waitForTerminalRunSettlement(session);
-    if (session.running) {
+    if (session.execution.running) {
       const followUp = { id: randomUUID(), text };
       await this.options.emit(session, "user.follow_up", "user", {
         text, queueId: followUp.id, status: "queued"
       });
-      session.followUps.push(followUp);
+      session.interaction.followUps.push(followUp);
       return;
     }
-    if (session.state.phase === "terminal") {
-      await this.options.commandBus.claim(session.sessionId);
-      beginNextRun(session, session.mode, this.options.runDeadlineMs);
-    } else if (session.state.phase === "needs_input") {
-      await this.options.commandBus.claim(session.sessionId);
-      session.lastOutcome = undefined;
+    if (session.durable.state.phase === "terminal") {
+      await this.options.commandBus.claim(session.identity.sessionId);
+      beginNextRun(session, session.durable.mode, this.options.runDeadlineMs);
+    } else if (session.durable.state.phase === "needs_input") {
+      await this.options.commandBus.claim(session.identity.sessionId);
+      session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.mode, deadlineAt: session.state.deadlineAt
+      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
     });
     await this.options.emit(session, "user.follow_up", "user", {
       text, queueId: randomUUID(), status: "delivered"
@@ -210,19 +210,19 @@ export class RuntimeCommandHandler {
 
   async submit(session: RuntimeSession, command: Extract<RunCommand, { type: "submit" }>): Promise<void> {
     await waitForTerminalRunSettlement(session);
-    if (session.running) {
+    if (session.execution.running) {
       await this.steer(session, command.text);
       return;
     }
-    if (session.state.phase === "terminal") {
-      await this.options.commandBus.claim(session.sessionId);
-      beginNextRun(session, command.mode ?? session.mode, this.options.runDeadlineMs);
-    } else if (session.state.phase === "needs_input") {
-      await this.options.commandBus.claim(session.sessionId);
-      session.lastOutcome = undefined;
+    if (session.durable.state.phase === "terminal") {
+      await this.options.commandBus.claim(session.identity.sessionId);
+      beginNextRun(session, command.mode ?? session.durable.mode, this.options.runDeadlineMs);
+    } else if (session.durable.state.phase === "needs_input") {
+      await this.options.commandBus.claim(session.identity.sessionId);
+      session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.mode, deadlineAt: session.state.deadlineAt
+      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
     });
     await this.options.emit(session, "user.message", "user", { text: command.text });
     this.options.start(session);

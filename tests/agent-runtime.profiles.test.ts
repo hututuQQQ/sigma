@@ -14,9 +14,10 @@ import {
   type ModelResponse,
   type ModelStreamEvent
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
+import { createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry } from "../packages/agent-tools/src/index.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 class IdleGateway implements ModelGateway {
   readonly provider = "test";
@@ -189,7 +190,9 @@ describe("runtime Agent Profile binding", () => {
         occurredAt: startedAt,
         type: "session.created",
         authority: "runtime",
-        payload: { workspacePath: root, mode: "analyze", modelRole: "child_analyze" }
+        payload: completeAgentEventPayload("session.created", {
+          workspacePath: root, mode: "analyze", modelRole: "child_analyze"
+        })
       }, 0);
       const state = createKernelState({
         sessionId, runId: firstRunId, mode: "analyze", startedAt, deadlineAt

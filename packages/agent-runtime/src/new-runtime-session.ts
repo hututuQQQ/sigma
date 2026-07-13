@@ -5,13 +5,14 @@ import { createKernelState } from "agent-kernel";
 import type { RuntimeEnvironment } from "agent-platform";
 import { createBudgetLedger, type BudgetLimits, type StartSession } from "agent-protocol";
 import { baseContext } from "./runtime-context.js";
-import type { RuntimeSession } from "./types.js";
+import type { RuntimeSession, RuntimeSessionServices } from "./types.js";
+import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
 
 export async function newRuntimeSession(
   input: StartSession,
   runDeadlineMs: number,
   budgetLimits: BudgetLimits | undefined,
-  identity: Pick<RuntimeSession, "gateway" | "modelRole" | "profile" | "profileSource"> & {
+  identity: RuntimeSessionServices & {
     parentSessionId?: string;
     workspaceLeaseInherited?: boolean;
   },
@@ -30,7 +31,7 @@ export async function newRuntimeSession(
   if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
   const base = baseContext(environment);
   const project = await loadNestedInstructions({ workspacePath: input.workspacePath });
-  return {
+  return createRuntimeSessionAggregate({
     sessionId,
     ...(identity.parentSessionId ? { parentSessionId: identity.parentSessionId } : {}),
     runId,
@@ -61,5 +62,5 @@ export async function newRuntimeSession(
     loadedContextIds: new Set([...base.map((item) => item.id), ...project.map((item) => item.id)]),
     outcomeWaiters: [],
     idleWaiters: []
-  };
+  });
 }

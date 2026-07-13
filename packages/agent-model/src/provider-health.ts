@@ -1,4 +1,4 @@
-import { createModelGateway } from "agent-model";
+import { createModelGateway } from "./registry.js";
 
 export async function checkProviderHealth(input: {
   provider: "deepseek" | "glm";

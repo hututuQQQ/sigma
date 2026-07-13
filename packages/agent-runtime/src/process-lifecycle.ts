@@ -64,8 +64,8 @@ async function recordSpawnedProcess(
   emit: RuntimeEventEmitter
 ): Promise<void> {
   const brokerInstanceId = typeof value.brokerInstanceId === "string" ? value.brokerInstanceId : "unknown";
-  session.processHandles ??= new Map();
-  session.processHandles.set(id, {
+  session.execution.processHandles ??= new Map();
+  session.execution.processHandles.set(id, {
     id,
     brokerInstanceId,
     ...(typeof value.systemProcessId === "number" ? { systemProcessId: value.systemProcessId } : {})
@@ -86,7 +86,7 @@ async function recordPolledProcess(
 ): Promise<void> {
   await outputEvents(session, id, value, emit);
   if (value.state === "running") return;
-  session.processHandles?.delete(id);
+  session.execution.processHandles?.delete(id);
   await emit(session, "process.exited", "runtime", {
     processId: id,
     exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
@@ -126,7 +126,7 @@ export async function recordLostProcess(
     ? call.arguments as Record<string, JsonValue> : {};
   const id = typeof errorId === "string" ? errorId : args.handleId;
   if (typeof id !== "string" || id.length === 0) return;
-  session.processHandles?.delete(id);
+  session.execution.processHandles?.delete(id);
   await emit(session, "process.lost", "runtime", {
     processId: id,
     reason: error instanceof Error ? error.message : "The process broker connection was lost."

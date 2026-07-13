@@ -15,9 +15,9 @@ import {
   recordLostProcess,
   recordProcessReceipt
 } from "../packages/agent-runtime/src/process-lifecycle.js";
-import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
-const session = { sessionId: "session", runId: "run" } as RuntimeSession;
+const session = runtimeSessionFixture();
 
 function call(name: string, argumentsValue: ModelToolCall["arguments"] = {}): ModelToolCall {
   return { id: `call-${name}`, name, arguments: argumentsValue };
@@ -149,7 +149,7 @@ describe("durable process lifecycle events", () => {
     });
     state.activeProcessIds.push("process-active");
     const failure = completionFailure(
-      { ...session, state } as RuntimeSession,
+      runtimeSessionFixture({ state }),
       call("complete_task"),
       { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
       "2026-01-01T00:00:00.000Z"
@@ -159,10 +159,11 @@ describe("durable process lifecycle events", () => {
   });
 
   it("terminates runtime-local process trees before a terminal outcome", async () => {
-    const target = {
-      ...session,
-      processHandles: new Map([["process-4", { id: "process-4", brokerInstanceId: "broker-1" }]])
-    } as RuntimeSession;
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([["process-4", { id: "process-4", brokerInstanceId: "broker-1" }]])
+      }
+    });
     const recorded = recorder();
     const execution = {
       execute: async () => { throw new Error("not used"); },
@@ -180,7 +181,7 @@ describe("durable process lifecycle events", () => {
       })
     } satisfies ProcessExecutionPort;
     await terminateRunProcesses(target, { kind: "cancelled", reason: "user" }, execution, recorded.emit);
-    expect(target.processHandles?.size).toBe(0);
+    expect(target.execution.processHandles.size).toBe(0);
     expect(recorded.events).toEqual([
       { type: "process.output", payload: { processId: "process-4", stream: "stdout", chunk: "stopped\n" } },
       {
@@ -207,19 +208,18 @@ describe("durable process lifecycle events", () => {
     state.phase = "outcome_pending";
     state.revision = 7;
     const beforeOutcome = vi.fn(async () => 0);
-    const target = {
-      ...session,
-      sessionId: state.sessionId,
-      runId: state.runId,
+    const target = runtimeSessionFixture({
       state,
-      processHandles: new Map([["still-running", { id: "still-running", brokerInstanceId: "broker-1" }]])
-    } as RuntimeSession;
+      execution: {
+        processHandles: new Map([["still-running", { id: "still-running", brokerInstanceId: "broker-1" }]])
+      }
+    });
     await expect(finishRuntimeSession({
       beforeOutcome
     } as unknown as Parameters<typeof finishRuntimeSession>[0], target, {
       kind: "completed", message: "stale", evidence: []
     }, 6)).resolves.toBe(false);
     expect(beforeOutcome).not.toHaveBeenCalled();
-    expect(target.processHandles?.has("still-running")).toBe(true);
+    expect(target.execution.processHandles.has("still-running")).toBe(true);
   });
 });

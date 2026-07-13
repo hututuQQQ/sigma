@@ -57,7 +57,7 @@ export async function assertCheckpointActionAllowed(
       code: "checkpoint_action_invalid"
     });
   }
-  if (session.state.activeProcessIds.length > 0) {
+  if (session.durable.state.activeProcessIds.length > 0) {
     throw Object.assign(new Error("Run changes cannot be restored while background processes are active."), {
       code: "checkpoint_processes_active"
     });
@@ -101,15 +101,15 @@ export async function assertReceiptWithinPlan(
     ? plan.writePaths
     : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
   const allowedResults = await Promise.all(plannedWritePaths.map(async (item) =>
-    await canonicalWorkspacePath(session.workspacePath, item).catch(() => null)));
+    await canonicalWorkspacePath(session.identity.workspacePath, item).catch(() => null)));
   const invalidAllowed = plannedWritePaths.filter((_item, index) => !allowedResults[index]);
   const allowed = allowedResults.filter((item): item is string => Boolean(item));
   const outsidePaths: string[] = [];
   for (const item of changedPaths) {
-    const canonical = await canonicalWorkspacePath(session.workspacePath, item.path).catch(() => null);
+    const canonical = await canonicalWorkspacePath(session.identity.workspacePath, item.path).catch(() => null);
     if (canonical && allowed.some((root) => isInside(root, canonical))) continue;
     const addedParentDirectory = await implicitAddedParentDirectory(
-      session.workspacePath, item, canonical, allowed
+      session.identity.workspacePath, item, canonical, allowed
     );
     if (!addedParentDirectory) outsidePaths.push(item.path);
   }

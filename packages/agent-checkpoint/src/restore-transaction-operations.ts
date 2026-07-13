@@ -13,9 +13,9 @@ import type {
 import {
   CheckpointConflictError,
   type CheckpointEntry,
-  type CheckpointManifest,
-  type CheckpointRestoreFaultEvent
+  type CheckpointManifest
 } from "./types.js";
+import type { CheckpointRestoreFaultEvent } from "./fault-injection.js";
 
 function structuralChange(current: CheckpointEntry | undefined, desired: CheckpointEntry | undefined): boolean {
   if (!current || !desired || current.kind !== desired.kind) return true;

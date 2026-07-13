@@ -11,7 +11,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/index.js";
+import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 

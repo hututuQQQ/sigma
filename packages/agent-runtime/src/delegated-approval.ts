@@ -23,8 +23,8 @@ export async function requestDelegatedApproval(
   signal: AbortSignal,
   emit: RuntimeEventEmitter
 ): Promise<"allow" | "deny"> {
-  if (session.state.phase === "terminal") return "deny";
-  if (session.approvals.has(request.requestId)) throw new Error(`Duplicate approval '${request.requestId}'.`);
+  if (session.durable.state.phase === "terminal") return "deny";
+  if (session.interaction.approvals.has(request.requestId)) throw new Error(`Duplicate approval '${request.requestId}'.`);
   let resolve!: (value: "allow" | "deny" | "always_allow") => void;
   const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
   const waiter: ApprovalWaiter = {
@@ -36,7 +36,7 @@ export async function requestDelegatedApproval(
     },
     resolve
   };
-  session.approvals.set(request.requestId, waiter);
+  session.interaction.approvals.set(request.requestId, waiter);
   let completed = false;
   let requestWasDurable = false;
   try {
@@ -55,8 +55,8 @@ export async function requestDelegatedApproval(
     completed = true;
     return decision === "deny" ? "deny" : "allow";
   } finally {
-    if (!completed && session.approvals.get(request.requestId) === waiter) {
-      session.approvals.delete(request.requestId);
+    if (!completed && session.interaction.approvals.get(request.requestId) === waiter) {
+      session.interaction.approvals.delete(request.requestId);
       if (requestWasDurable) {
         await emit(session, "tool.approval_resolved", "runtime", {
           requestId: request.requestId,

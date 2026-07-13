@@ -18,19 +18,12 @@ import {
   normalizeAllowedWindowsSignerCertificateSha256,
   runWindowsSigningStage
 } from "./windows-release-signing.mjs";
+import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const pinnedNodeVersion = "v26.4.0";
+export const pinnedNodeVersion = `v${sigmaManifest.toolchains.node}`;
 export const windowsAppContainerNodeCompatibility = Object.freeze({
-  kind: "windows_appcontainer_node",
-  patchId: "node-v26.4.0-win-x64-libuv-local-pipe-v2",
-  reason: "Use AppContainer-local libuv pipe names for captured stdio and Node IPC.",
-  nodeVersion: pinnedNodeVersion,
-  targetPlatform: "win32",
-  targetArch: "x64",
-  sourceSha256: "3193d7f751b8a07bd4acc70e81946ae9c6efdee83e07ad1c8d0e4089df7c5cef",
-  unsignedPatchedSha256: "b30b9546e4c9fddffbd4054ef4a78cdd76b42a8496bfb6308a7966bae37fea8f",
-  normalizedContentSha256: "6345a8101a378aea8f004210fe3924b6bcc77029abd35d9a86fa88e65a65bf35",
+  ...sigmaManifest.release.windowsNodePatch,
   runtimeEnvironment: Object.freeze({ NODE_OPTIONS: "--preserve-symlinks-main" }),
   runtimeEnvironmentReason: "Preserve the declared CLI main path so startup does not probe inaccessible volume-root metadata.",
   sandboxRuntimeEnvironment: Object.freeze({
@@ -42,7 +35,7 @@ export const windowsNodeGlobalPipeMarker = Buffer.from("\\\\?\\pipe\\uv\\%llu-%l
 export const windowsNodeLocalPipeMarker = Buffer.from("\\\\?\\pipe\\LOCAL\\%u-%u\0", "ascii");
 export const supportedTargetPlatforms = new Set(["linux", "win32"]);
 export const supportedTargetArchitectures = new Set(["x64"]);
-export const supportedReleaseTargets = new Set(["linux-x64", "win32-x64"]);
+export const supportedReleaseTargets = new Set(sigmaManifest.release.targets);
 export const v3PortablePackages = Object.freeze([
   "agent-execution",
   "agent-code-intel",
@@ -68,14 +61,17 @@ function bufferOccurrenceCount(buffer, marker) {
   return count;
 }
 
-export function patchWindowsAppContainerNode(sourceBytes, verifiedSource) {
+function assertWindowsNodePatchSource(sourceBytes, verifiedSource) {
   if (!Buffer.isBuffer(sourceBytes)) throw new Error("Windows Node patch source must be a Buffer.");
   if (verifiedSource?.nodeVersion !== pinnedNodeVersion
     || verifiedSource?.targetPlatform !== "win32"
     || verifiedSource?.targetArch !== "x64"
     || !/^[a-f0-9]{64}$/u.test(String(verifiedSource?.archiveSha256 ?? ""))) {
-    throw new Error("Windows Node patch requires a verified v26.4.0 win32-x64 archive descriptor.");
+    throw new Error(`Windows Node patch requires a verified ${pinnedNodeVersion} win32-x64 archive descriptor.`);
   }
+}
+
+function assertWindowsPipeMarkerLayout(sourceBytes) {
   const globalCount = bufferOccurrenceCount(sourceBytes, windowsNodeGlobalPipeMarker);
   const localCount = bufferOccurrenceCount(sourceBytes, windowsNodeLocalPipeMarker);
   if (globalCount !== 1 || localCount !== 0) {
@@ -83,12 +79,18 @@ export function patchWindowsAppContainerNode(sourceBytes, verifiedSource) {
       `Windows Node source has an unsupported libuv pipe marker layout (global=${globalCount}, local=${localCount}).`
     );
   }
+}
+
+function assertApprovedWindowsNodeSource(sourceBytes) {
   const sourceSha256 = createHash("sha256").update(sourceBytes).digest("hex");
   if (sourceSha256 !== windowsAppContainerNodeCompatibility.sourceSha256) {
     throw new Error(
       `Windows Node source SHA-256 is not approved for ${pinnedNodeVersion}: ${sourceSha256}.`
     );
   }
+}
+
+function createPatchedWindowsNode(sourceBytes) {
   const markerOffset = sourceBytes.indexOf(windowsNodeGlobalPipeMarker);
   const patched = Buffer.from(sourceBytes);
   patched.fill(0, markerOffset, markerOffset + windowsNodeGlobalPipeMarker.length);
@@ -98,6 +100,10 @@ export function patchWindowsAppContainerNode(sourceBytes, verifiedSource) {
     || bufferOccurrenceCount(patched, windowsNodeLocalPipeMarker) !== 1) {
     throw new Error("Windows Node AppContainer patch did not produce the exact expected marker layout.");
   }
+  return patched;
+}
+
+function assertApprovedPatchedWindowsNode(patched) {
   const identity = inspectPeAuthenticodeIdentity(patched, "Patched Windows Node");
   if (identity.fullSha256 !== windowsAppContainerNodeCompatibility.unsignedPatchedSha256) {
     throw new Error(`Windows Node unsigned patched SHA-256 is not approved: ${identity.fullSha256}.`);
@@ -105,6 +111,14 @@ export function patchWindowsAppContainerNode(sourceBytes, verifiedSource) {
   if (identity.normalizedContentSha256 !== windowsAppContainerNodeCompatibility.normalizedContentSha256) {
     throw new Error(`Windows Node normalized content SHA-256 is not approved: ${identity.normalizedContentSha256}.`);
   }
+}
+
+export function patchWindowsAppContainerNode(sourceBytes, verifiedSource) {
+  assertWindowsNodePatchSource(sourceBytes, verifiedSource);
+  assertWindowsPipeMarkerLayout(sourceBytes);
+  assertApprovedWindowsNodeSource(sourceBytes);
+  const patched = createPatchedWindowsNode(sourceBytes);
+  assertApprovedPatchedWindowsNode(patched);
   return {
     bytes: patched,
     compatibility: { ...windowsAppContainerNodeCompatibility }
@@ -671,48 +685,58 @@ function executableArchitecture(machine, format) {
   return architectures.get(machine) ?? `unknown-0x${machine.toString(16).padStart(4, "0")}`;
 }
 
+function inspectElfPrefix(prefix, filePath) {
+  const elfClass = prefix[4];
+  const byteOrder = prefix[5];
+  if (elfClass !== 2) throw new Error(`sigma-exec ELF binary must be 64-bit: ${filePath}`);
+  if (byteOrder !== 1 && byteOrder !== 2) {
+    throw new Error(`sigma-exec ELF binary has an invalid byte order: ${filePath}`);
+  }
+  const elfType = byteOrder === 1 ? prefix.readUInt16LE(16) : prefix.readUInt16BE(16);
+  if (elfType !== 2 && elfType !== 3) {
+    throw new Error(`sigma-exec ELF binary is not an executable or shared-object image: ${filePath}`);
+  }
+  const machine = byteOrder === 1 ? prefix.readUInt16LE(18) : prefix.readUInt16BE(18);
+  return {
+    format: "ELF",
+    machine: `0x${machine.toString(16).padStart(4, "0")}`,
+    targetPlatform: "linux",
+    targetArch: executableArchitecture(machine, "ELF")
+  };
+}
+
+async function inspectPeExecutable(handle, filePath) {
+  const dosHeader = await readExecutableBytes(handle, 64, 0, filePath);
+  const peOffset = dosHeader.readUInt32LE(0x3c);
+  if (peOffset < 64) throw new Error(`sigma-exec has an invalid PE header offset: ${filePath}`);
+  const peHeader = await readExecutableBytes(handle, 26, peOffset, filePath);
+  if (!peHeader.subarray(0, 4).equals(Buffer.from([0x50, 0x45, 0x00, 0x00]))) {
+    throw new Error(`sigma-exec has an invalid PE signature: ${filePath}`);
+  }
+  const machine = peHeader.readUInt16LE(4);
+  const optionalHeaderSize = peHeader.readUInt16LE(20);
+  const characteristics = peHeader.readUInt16LE(22);
+  const optionalHeaderMagic = peHeader.readUInt16LE(24);
+  if (optionalHeaderSize < 2 || (characteristics & 0x0002) === 0 || optionalHeaderMagic !== 0x020b) {
+    throw new Error(`sigma-exec PE binary is not a 64-bit executable image: ${filePath}`);
+  }
+  return {
+    format: "PE",
+    machine: `0x${machine.toString(16).padStart(4, "0")}`,
+    targetPlatform: "win32",
+    targetArch: executableArchitecture(machine, "PE")
+  };
+}
+
 export async function inspectSigmaExecBinary(filePath) {
   const handle = await open(filePath, "r");
   try {
     const prefix = await readExecutableBytes(handle, 20, 0, filePath);
     if (prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
-      const elfClass = prefix[4];
-      const byteOrder = prefix[5];
-      if (elfClass !== 2) throw new Error(`sigma-exec ELF binary must be 64-bit: ${filePath}`);
-      if (byteOrder !== 1 && byteOrder !== 2) throw new Error(`sigma-exec ELF binary has an invalid byte order: ${filePath}`);
-      const elfType = byteOrder === 1 ? prefix.readUInt16LE(16) : prefix.readUInt16BE(16);
-      if (elfType !== 2 && elfType !== 3) {
-        throw new Error(`sigma-exec ELF binary is not an executable or shared-object image: ${filePath}`);
-      }
-      const machine = byteOrder === 1 ? prefix.readUInt16LE(18) : prefix.readUInt16BE(18);
-      return {
-        format: "ELF",
-        machine: `0x${machine.toString(16).padStart(4, "0")}`,
-        targetPlatform: "linux",
-        targetArch: executableArchitecture(machine, "ELF")
-      };
+      return inspectElfPrefix(prefix, filePath);
     }
     if (prefix[0] === 0x4d && prefix[1] === 0x5a) {
-      const dosHeader = await readExecutableBytes(handle, 64, 0, filePath);
-      const peOffset = dosHeader.readUInt32LE(0x3c);
-      if (peOffset < 64) throw new Error(`sigma-exec has an invalid PE header offset: ${filePath}`);
-      const peHeader = await readExecutableBytes(handle, 26, peOffset, filePath);
-      if (!peHeader.subarray(0, 4).equals(Buffer.from([0x50, 0x45, 0x00, 0x00]))) {
-        throw new Error(`sigma-exec has an invalid PE signature: ${filePath}`);
-      }
-      const machine = peHeader.readUInt16LE(4);
-      const optionalHeaderSize = peHeader.readUInt16LE(20);
-      const characteristics = peHeader.readUInt16LE(22);
-      const optionalHeaderMagic = peHeader.readUInt16LE(24);
-      if (optionalHeaderSize < 2 || (characteristics & 0x0002) === 0 || optionalHeaderMagic !== 0x020b) {
-        throw new Error(`sigma-exec PE binary is not a 64-bit executable image: ${filePath}`);
-      }
-      return {
-        format: "PE",
-        machine: `0x${machine.toString(16).padStart(4, "0")}`,
-        targetPlatform: "win32",
-        targetArch: executableArchitecture(machine, "PE")
-      };
+      return await inspectPeExecutable(handle, filePath);
     }
     throw new Error(`sigma-exec is not a recognized ELF or PE executable: ${filePath}`);
   } finally {
@@ -810,16 +834,7 @@ function portableAssetComponent(entry, targetPlatform, targetArch, options) {
   };
 }
 
-async function writePortableSbom(
-  rootDir,
-  bundleDir,
-  packageNames,
-  targetPlatform,
-  targetArch,
-  sigmaExec,
-  nodeArchiveIntegrity,
-  nodeRuntime
-) {
+async function addPackageComponents(rootDir, packageNames, targetPlatform, targetArch) {
   const components = new Map();
   for (const packageName of packageNames) {
     const manifest = JSON.parse(await readFile(path.join(rootDir, "packages", packageName, "package.json"), "utf8"));
@@ -839,106 +854,79 @@ async function writePortableSbom(
       scope: "required"
     });
   }
-  const releaseVersion = (JSON.parse(await readFile(path.join(rootDir, "package.json"), "utf8"))).version;
+  return components;
+}
+
+function addRuntimeComponents(components, context) {
+  const { assetsByPath, targetPlatform, targetArch, nodeArchiveIntegrity, nodeRuntime } = context;
   const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
-  const assetEntries = await integrityEntries(bundleDir, [
-    nodePath,
-    brokerPath,
-    ...Object.values(portableLanguageAssets),
-    "assets/tokenizers"
-  ]);
-  const assetsByPath = new Map(assetEntries.map((entry) => [entry.path, entry]));
-  components.set("sigma:bundled-node", portableAssetComponent(
-    assetsByPath.get(nodePath),
-    targetPlatform,
-    targetArch,
-    {
-      kind: "node-runtime",
-      name: "node-runtime",
-      version: pinnedNodeVersion,
-      properties: [
-        { name: "sigma:archive-sha256", value: nodeArchiveIntegrity.sha256 },
-        ...(nodeRuntime.compatibility ? [
-          { name: "sigma:compatibility-kind", value: nodeRuntime.compatibility.kind },
-          { name: "sigma:compatibility-patch-id", value: nodeRuntime.compatibility.patchId },
-          { name: "sigma:compatibility-reason", value: nodeRuntime.compatibility.reason },
-          { name: "sigma:source-sha256", value: nodeRuntime.compatibility.sourceSha256 },
-          { name: "sigma:normalized-content-sha256", value: nodeRuntime.compatibility.normalizedContentSha256 },
-          {
-            name: "sigma:runtime-environment",
-            value: JSON.stringify(nodeRuntime.compatibility.runtimeEnvironment)
-          },
-          {
-            name: "sigma:runtime-environment-reason",
-            value: nodeRuntime.compatibility.runtimeEnvironmentReason
-          },
-          {
-            name: "sigma:sandbox-runtime-environment",
-            value: JSON.stringify(nodeRuntime.compatibility.sandboxRuntimeEnvironment)
-          },
-          {
-            name: "sigma:sandbox-runtime-environment-reason",
-            value: nodeRuntime.compatibility.sandboxRuntimeEnvironmentReason
-          }
-        ] : [])
-      ]
-    }
-  ));
-  components.set("sigma:sigma-exec", portableAssetComponent(
-    assetsByPath.get(brokerPath),
-    targetPlatform,
-    targetArch,
-    {
-      kind: "native-broker",
-      name: "sigma-exec",
-      version: releaseVersion,
-      properties: [
-        { name: "sigma:binary-format", value: sigmaExec.binaryTarget.format },
-        { name: "sigma:machine", value: sigmaExec.binaryTarget.machine }
-      ]
-    }
-  ));
+  components.set("sigma:bundled-node", portableAssetComponent(assetsByPath.get(nodePath), targetPlatform, targetArch, {
+    kind: "node-runtime",
+    name: "node-runtime",
+    version: pinnedNodeVersion,
+    properties: [
+      { name: "sigma:archive-sha256", value: nodeArchiveIntegrity.sha256 },
+      ...nodeCompatibilityProperties(nodeRuntime.compatibility)
+    ]
+  }));
+  components.set("sigma:sigma-exec", portableAssetComponent(assetsByPath.get(brokerPath), targetPlatform, targetArch, {
+    kind: "native-broker",
+    name: "sigma-exec",
+    version: context.releaseVersion,
+    properties: [
+      { name: "sigma:binary-format", value: context.sigmaExec.binaryTarget.format },
+      { name: "sigma:machine", value: context.sigmaExec.binaryTarget.machine }
+    ]
+  }));
+}
+
+function nodeCompatibilityProperties(compatibility) {
+  if (!compatibility) return [];
+  return [
+    { name: "sigma:compatibility-kind", value: compatibility.kind },
+    { name: "sigma:compatibility-patch-id", value: compatibility.patchId },
+    { name: "sigma:compatibility-reason", value: compatibility.reason },
+    { name: "sigma:source-sha256", value: compatibility.sourceSha256 },
+    { name: "sigma:normalized-content-sha256", value: compatibility.normalizedContentSha256 },
+    { name: "sigma:runtime-environment", value: JSON.stringify(compatibility.runtimeEnvironment) },
+    { name: "sigma:runtime-environment-reason", value: compatibility.runtimeEnvironmentReason },
+    { name: "sigma:sandbox-runtime-environment", value: JSON.stringify(compatibility.sandboxRuntimeEnvironment) },
+    { name: "sigma:sandbox-runtime-environment-reason", value: compatibility.sandboxRuntimeEnvironmentReason }
+  ];
+}
+
+async function addLanguageComponents(components, context) {
+  const { rootDir, assetsByPath, targetPlatform, targetArch } = context;
   const codeIntelManifest = JSON.parse(await readFile(
     path.join(rootDir, "packages", "agent-code-intel", "package.json"),
     "utf8"
   ));
-  for (const asset of [
-    {
-      path: portableLanguageAssets.typescriptServer,
-      kind: "language-server",
-      name: "sigma-typescript-language-server",
-      version: String(codeIntelManifest.version)
-    },
-    {
-      path: portableLanguageAssets.typescriptEngine,
-      kind: "language-service-engine",
-      name: "typescript",
-      version: String(codeIntelManifest.dependencies?.typescript ?? "")
-    },
-    {
-      path: portableLanguageAssets.pyrightServer,
-      kind: "language-server",
-      name: "pyright",
-      version: String(codeIntelManifest.dependencies?.pyright ?? "")
-    }
-  ]) {
-    components.set(`sigma:language-asset:${asset.path}`, portableAssetComponent(
-      assetsByPath.get(asset.path),
-      targetPlatform,
-      targetArch,
-      { kind: asset.kind, name: asset.name, version: asset.version }
+  const assets = [
+    [portableLanguageAssets.typescriptServer, "language-server", "sigma-typescript-language-server", codeIntelManifest.version],
+    [portableLanguageAssets.typescriptEngine, "language-service-engine", "typescript", codeIntelManifest.dependencies?.typescript],
+    [portableLanguageAssets.pyrightServer, "language-server", "pyright", codeIntelManifest.dependencies?.pyright]
+  ];
+  for (const [assetPath, kind, name, version] of assets) {
+    components.set(`sigma:language-asset:${assetPath}`, portableAssetComponent(
+      assetsByPath.get(assetPath), targetPlatform, targetArch,
+      { kind, name, version: String(version ?? "") }
     ));
   }
+}
+
+function addTokenizerComponents(components, context) {
+  const { assetEntries, targetPlatform, targetArch } = context;
   for (const entry of assetEntries.filter((candidate) => candidate.path.startsWith("assets/tokenizers/"))) {
     components.set(`sigma:tokenizer:${entry.path}`, portableAssetComponent(
-      entry,
-      targetPlatform,
-      targetArch,
+      entry, targetPlatform, targetArch,
       { kind: "tokenizer", name: path.posix.basename(entry.path) }
     ));
   }
-  const sbom = {
+}
+
+function portableSbomDocument(components, releaseVersion, targetPlatform, targetArch) {
+  return {
     bomFormat: "CycloneDX",
     specVersion: "1.5",
     version: 1,
@@ -959,6 +947,33 @@ async function writePortableSbom(
       return leftId.localeCompare(rightId, "en");
     })
   };
+}
+
+async function writePortableSbom(
+  rootDir, bundleDir, packageNames, targetPlatform, targetArch,
+  sigmaExec, nodeArchiveIntegrity, nodeRuntime
+) {
+  const components = await addPackageComponents(
+    rootDir, packageNames, targetPlatform, targetArch
+  );
+  const releaseVersion = (JSON.parse(await readFile(path.join(rootDir, "package.json"), "utf8"))).version;
+  const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
+  const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
+  const assetEntries = await integrityEntries(bundleDir, [
+    nodePath,
+    brokerPath,
+    ...Object.values(portableLanguageAssets),
+    "assets/tokenizers"
+  ]);
+  const assetsByPath = new Map(assetEntries.map((entry) => [entry.path, entry]));
+  const context = {
+    rootDir, assetsByPath, assetEntries, targetPlatform, targetArch,
+    releaseVersion, sigmaExec, nodeArchiveIntegrity, nodeRuntime
+  };
+  addRuntimeComponents(components, context);
+  await addLanguageComponents(components, context);
+  addTokenizerComponents(components, context);
+  const sbom = portableSbomDocument(components, releaseVersion, targetPlatform, targetArch);
   const sbomPath = path.join(bundleDir, "sbom.cdx.json");
   await writeFile(sbomPath, `${JSON.stringify(sbom, null, 2)}\n`, "utf8");
   return sbomPath;
@@ -993,44 +1008,32 @@ async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nod
   };
 }
 
-export function inspectWindowsAuthenticode(
-  nodePath,
-  brokerPath,
-  targetPlatform,
-  nodeCompatibility,
-  allowedSignerCertificateSha256 = []
-) {
-  const allowed = normalizeAllowedWindowsSignerCertificateSha256(allowedSignerCertificateSha256);
-  if (targetPlatform !== "win32") {
-    return {
-      required: false,
-      authenticodeVerified: true,
-      policyConfigured: false,
-      policyVerified: true,
-      status: "not-applicable",
-      observedSignerIds: { node: null, sigmaExec: null },
-      unapprovedSignerIds: [],
-      signatures: null
-    };
-  }
-  if (process.platform !== "win32") {
-    return {
-      required: true,
-      authenticodeVerified: false,
-      policyConfigured: allowed.length > 0,
-      policyVerified: false,
-      status: "not-verified-cross-platform",
-      observedSignerIds: { node: null, sigmaExec: null },
-      unapprovedSignerIds: [],
-      signatures: null,
-      ...(nodeCompatibility ? {
-        sourceSignatureInvalidatedByPatch: true,
-        sourceSignatureStatus: "invalidated-by-deterministic-patch",
-        finalArtifactRequiresResigning: true
-      } : {})
-    };
-  }
-  const script = [
+function unsignedCompatibilityEvidence(nodeCompatibility, finalArtifactRequiresResigning) {
+  if (!nodeCompatibility) return {};
+  return {
+    sourceSignatureInvalidatedByPatch: true,
+    sourceSignatureStatus: "invalidated-by-deterministic-patch",
+    finalArtifactRequiresResigning
+  };
+}
+
+function emptySigningEvidence(required, status, policyConfigured, nodeCompatibility) {
+  const applicable = required;
+  return {
+    required,
+    authenticodeVerified: !applicable,
+    policyConfigured,
+    policyVerified: !applicable,
+    status,
+    observedSignerIds: { node: null, sigmaExec: null },
+    unapprovedSignerIds: [],
+    signatures: null,
+    ...unsignedCompatibilityEvidence(nodeCompatibility, applicable)
+  };
+}
+
+function authenticodeInspectionScript(nodePath, brokerPath) {
+  return [
     "$ErrorActionPreference = 'Stop'",
     "function Convert-SigmaSignature {",
     "  param($Signature)",
@@ -1048,49 +1051,53 @@ export function inspectWindowsAuthenticode(
     `$broker = Get-AuthenticodeSignature -LiteralPath ${psQuote(brokerPath)}`,
     "[pscustomobject]@{ node = (Convert-SigmaSignature $node); sigmaExec = (Convert-SigmaSignature $broker) } | ConvertTo-Json -Depth 4 -Compress"
   ].join("\n");
+}
+
+function inspectAuthenticodeEvidence(nodePath, brokerPath, allowed) {
+  const certificateTablePresent = {
+    node: inspectPeAuthenticodeIdentity(
+      readFileSync(nodePath), "Windows Node Authenticode evidence"
+    ).certificateTable !== null,
+    sigmaExec: inspectPeAuthenticodeIdentity(
+      readFileSync(brokerPath), "Windows sigma-exec Authenticode evidence"
+    ).certificateTable !== null
+  };
+  const result = runPowerShell(
+    authenticodeInspectionScript(nodePath, brokerPath),
+    "failed to inspect Authenticode signatures"
+  );
+  const observed = JSON.parse(result.stdout.trim());
+  observed.node = { ...observed.node, certificateTablePresent: certificateTablePresent.node };
+  observed.sigmaExec = {
+    ...observed.sigmaExec,
+    certificateTablePresent: certificateTablePresent.sigmaExec
+  };
+  return evaluateWindowsAuthenticodePolicy(observed, allowed);
+}
+
+export function inspectWindowsAuthenticode(
+  nodePath, brokerPath, targetPlatform, nodeCompatibility,
+  allowedSignerCertificateSha256 = []
+) {
+  const allowed = normalizeAllowedWindowsSignerCertificateSha256(allowedSignerCertificateSha256);
+  if (targetPlatform !== "win32") {
+    return emptySigningEvidence(false, "not-applicable", false, nodeCompatibility);
+  }
+  if (process.platform !== "win32") {
+    return emptySigningEvidence(
+      true, "not-verified-cross-platform", allowed.length > 0, nodeCompatibility
+    );
+  }
   try {
-    const certificateTablePresent = {
-      node: inspectPeAuthenticodeIdentity(
-        readFileSync(nodePath),
-        "Windows Node Authenticode evidence"
-      ).certificateTable !== null,
-      sigmaExec: inspectPeAuthenticodeIdentity(
-        readFileSync(brokerPath),
-        "Windows sigma-exec Authenticode evidence"
-      ).certificateTable !== null
-    };
-    const result = runPowerShell(script, "failed to inspect Authenticode signatures");
-    const observed = JSON.parse(result.stdout.trim());
-    observed.node = { ...observed.node, certificateTablePresent: certificateTablePresent.node };
-    observed.sigmaExec = {
-      ...observed.sigmaExec,
-      certificateTablePresent: certificateTablePresent.sigmaExec
-    };
-    const policy = evaluateWindowsAuthenticodePolicy(observed, allowed);
+    const policy = inspectAuthenticodeEvidence(nodePath, brokerPath, allowed);
     return {
       required: true,
       ...policy,
-      ...(nodeCompatibility ? {
-        sourceSignatureInvalidatedByPatch: true,
-        sourceSignatureStatus: "invalidated-by-deterministic-patch",
-        finalArtifactRequiresResigning: !policy.policyVerified
-      } : {})
+      ...unsignedCompatibilityEvidence(nodeCompatibility, !policy.policyVerified)
     };
   } catch (error) {
     return {
-      required: true,
-      authenticodeVerified: false,
-      policyConfigured: allowed.length > 0,
-      policyVerified: false,
-      status: "inspection-failed",
-      observedSignerIds: { node: null, sigmaExec: null },
-      unapprovedSignerIds: [],
-      signatures: null,
-      ...(nodeCompatibility ? {
-        sourceSignatureInvalidatedByPatch: true,
-        sourceSignatureStatus: "invalidated-by-deterministic-patch",
-        finalArtifactRequiresResigning: true
-      } : {}),
+      ...emptySigningEvidence(true, "inspection-failed", allowed.length > 0, nodeCompatibility),
       detail: error instanceof Error ? error.message : String(error)
     };
   }
@@ -1300,7 +1307,7 @@ function parsePackageArgs(argv) {
   return options;
 }
 
-export async function packageAgentCli(options = {}) {
+async function resolvePackageContext(options) {
   const rootDir = options.rootDir ? path.resolve(options.rootDir) : defaultRootDir;
   const env = options.env ?? process.env;
   const targetPlatform = normalizeTargetPlatform(env.AGENT_TARGET_PLATFORM ?? options.targetPlatform ?? "linux");
@@ -1315,11 +1322,15 @@ export async function packageAgentCli(options = {}) {
   const provenancePath = outputPath.replace(/\.(?:zip|tgz)$/i, ".provenance.json");
   const release = await workspaceRelease(rootDir);
   const packages = await v3RuntimePackages(rootDir, await workspaceRuntimePackages(rootDir), release.isV3);
+  for (const packageName of packages) assertBuiltPackage(rootDir, packageName);
+  return {
+    options, rootDir, env, targetPlatform, targetArch, artifactsDir, bundleName,
+    bundleDir, outputPath, checksumPath, sbomOutputPath, provenancePath, release, packages
+  };
+}
 
-  for (const packageName of packages) {
-    assertBuiltPackage(rootDir, packageName);
-  }
-
+async function prepareBundleDirectories(context) {
+  const { bundleDir, outputPath, checksumPath, sbomOutputPath, provenancePath } = context;
   await rm(bundleDir, { recursive: true, force: true });
   await rm(outputPath, { force: true });
   await rm(checksumPath, { force: true });
@@ -1328,7 +1339,10 @@ export async function packageAgentCli(options = {}) {
   await mkdir(path.join(bundleDir, "bin"), { recursive: true });
   await mkdir(path.join(bundleDir, "packages"), { recursive: true });
   await mkdir(path.join(bundleDir, "node_modules"), { recursive: true });
+}
 
+async function copyBundlePackages(context) {
+  const { rootDir, packages, bundleDir, targetPlatform, targetArch } = context;
   for (const packageName of packages) {
     await copyRuntimePackage(rootDir, packageName, path.join(bundleDir, "packages"));
   }
@@ -1339,6 +1353,37 @@ export async function packageAgentCli(options = {}) {
   await deployRuntimeDependencies(
     rootDir, packages, path.join(bundleDir, "node_modules"), targetPlatform, targetArch
   );
+}
+
+async function preSigningBrokerIdentity(targetPlatform, sigmaExec) {
+  if (targetPlatform !== "win32" || !sigmaExec) return null;
+  return inspectPeAuthenticodeIdentity(
+    await readFile(sigmaExec.destination),
+    "Staged Windows sigma-exec before signing"
+  ).normalizedContentSha256;
+}
+
+async function verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentIdentity, targetPlatform) {
+  if (targetPlatform !== "win32") return;
+  const finalNodeBytes = await readFile(nodeRuntime.bundledNodePath);
+  const finalIdentity = inspectPeAuthenticodeIdentity(finalNodeBytes, "Staged Windows Node");
+  const nodeContentChanged = finalIdentity.normalizedContentSha256
+    !== windowsAppContainerNodeCompatibility.normalizedContentSha256;
+  const globalMarkers = bufferOccurrenceCount(finalNodeBytes, windowsNodeGlobalPipeMarker);
+  const localMarkers = bufferOccurrenceCount(finalNodeBytes, windowsNodeLocalPipeMarker);
+  if (nodeContentChanged || globalMarkers !== 0 || localMarkers !== 1) {
+    throw new Error("Windows signing changed the approved AppContainer Node content identity.");
+  }
+  const finalBrokerIdentity = inspectPeAuthenticodeIdentity(
+    await readFile(sigmaExec.destination), "Staged Windows sigma-exec after signing"
+  );
+  if (finalBrokerIdentity.normalizedContentSha256 !== brokerContentIdentity) {
+    throw new Error("Windows signing changed the sigma-exec executable content identity.");
+  }
+}
+
+async function stagePortableRuntime(context) {
+  const { rootDir, artifactsDir, targetPlatform, targetArch, env, options, bundleDir, release } = context;
   const resolvedNodeRuntime = await resolveNodeRuntimeArchive(
     rootDir,
     artifactsDir,
@@ -1364,12 +1409,7 @@ export async function packageAgentCli(options = {}) {
   const sigmaExec = release.isV3
     ? await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env)
     : null;
-  const brokerContentIdentity = targetPlatform === "win32" && sigmaExec
-    ? inspectPeAuthenticodeIdentity(
-        await readFile(sigmaExec.destination),
-        "Staged Windows sigma-exec before signing"
-      ).normalizedContentSha256
-    : null;
+  const brokerContentIdentity = await preSigningBrokerIdentity(targetPlatform, sigmaExec);
   const windowsSigningStage = release.isV3
     ? await runWindowsSigningStage({
         targetPlatform,
@@ -1381,23 +1421,12 @@ export async function packageAgentCli(options = {}) {
         spawn: options.windowsSigningSpawnSync ?? spawnSync
       })
     : null;
-  if (targetPlatform === "win32") {
-    const finalNodeBytes = await readFile(nodeRuntime.bundledNodePath);
-    const finalIdentity = inspectPeAuthenticodeIdentity(finalNodeBytes, "Staged Windows Node");
-    if (finalIdentity.normalizedContentSha256 !== windowsAppContainerNodeCompatibility.normalizedContentSha256
-      || bufferOccurrenceCount(finalNodeBytes, windowsNodeGlobalPipeMarker) !== 0
-      || bufferOccurrenceCount(finalNodeBytes, windowsNodeLocalPipeMarker) !== 1) {
-      throw new Error("Windows signing changed the approved AppContainer Node content identity.");
-    }
-    const finalBrokerIdentity = inspectPeAuthenticodeIdentity(
-      await readFile(sigmaExec.destination),
-      "Staged Windows sigma-exec after signing"
-    );
-    if (finalBrokerIdentity.normalizedContentSha256 !== brokerContentIdentity) {
-      throw new Error("Windows signing changed the sigma-exec executable content identity.");
-    }
-  }
-  const tokenizerAssets = release.isV3 ? await copyTokenizerAssets(rootDir, bundleDir) : null;
+  await verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentIdentity, targetPlatform);
+  return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, windowsSigningStage };
+}
+
+async function writeBundleEntrypoints(context, nodeRuntime) {
+  const { bundleDir, targetPlatform, targetArch, release } = context;
   await writeFile(
     path.join(bundleDir, "package.json"),
     `${JSON.stringify(
@@ -1427,142 +1456,146 @@ export async function packageAgentCli(options = {}) {
     createBundleReadme(targetPlatform, targetArch, nodeRuntime),
     "utf8"
   );
-  const sbomPath = release.isV3
-    ? await writePortableSbom(
-        rootDir,
-        bundleDir,
-        packages,
-        targetPlatform,
-        targetArch,
-        sigmaExec,
-        nodeArchiveIntegrity,
-        nodeRuntime
-      )
-    : null;
-  const integrity = release.isV3
-    ? await writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime)
-    : null;
-  const signing = release.isV3
-    ? inspectWindowsAuthenticode(
-        nodeRuntime.bundledNodePath,
-        sigmaExec.destination,
-        targetPlatform,
-        nodeRuntime.compatibility,
-        options.allowedWindowsSignerCertificateSha256
-          ?? loadAllowedWindowsSignerCertificateSha256(env)
-      )
-    : null;
+}
 
-  await writeFile(
-    path.join(bundleDir, "package-metadata.json"),
-    `${JSON.stringify(
-      {
-        schemaVersion: release.isV3 ? 3 : 2,
-        productVersion: release.version,
-        releaseChannel: release.version.includes("-") ? release.version.split("-")[1].split(".")[0] : "stable",
-        tier: "tier1",
-        targetPlatform,
-        targetArch,
-        node: {
-          version: pinnedNodeVersion,
-          runtimeUrl: nodeRuntime.runtimeUrl,
-          archive: path.basename(nodeRuntime.runtimeArchive),
-          archiveSha256: nodeArchiveIntegrity?.sha256,
-          archiveVerificationSource: nodeArchiveIntegrity?.verificationSource,
-          downloaded: nodeRuntime.downloaded,
-          source: nodeRuntime.source,
-          versionOutput: nodeRuntime.nodeVersionOutput,
-          ...(nodeRuntime.compatibilitySmokePassed ? { compatibilitySmokePassed: true } : {}),
-          ...(nodeRuntime.compatibility ? { compatibility: nodeRuntime.compatibility } : {}),
-          ...(integrity?.node ? { sha256: integrity.node.sha256, size: integrity.node.size } : {})
-        },
-        ...(integrity ? {
-          sigmaExec: {
-            path: `bin/${sigmaExecFileName(targetPlatform)}`,
-            sha256: integrity.sigmaExec.sha256,
-            size: integrity.sigmaExec.size,
-            source: sigmaExec.sourceKind,
-            targetPlatform: sigmaExec.binaryTarget.targetPlatform,
-            targetArch: sigmaExec.binaryTarget.targetArch,
-            format: sigmaExec.binaryTarget.format,
-            machine: sigmaExec.binaryTarget.machine
-          },
-          assets: {
-            languageServers: [
-              {
-                id: "typescript",
-                implementation: "sigma-typescript-language-server",
-                ...integrity.languageServerAssets.typescriptServer
-              },
-              {
-                id: "python",
-                implementation: "pyright",
-                ...integrity.languageServerAssets.pyrightServer
-              }
-            ],
-            languageServiceEngines: [
-              {
-                id: "typescript",
-                implementation: "typescript",
-                ...integrity.languageServerAssets.typescriptEngine
-              }
-            ],
-            tokenizerAssets: tokenizerAssets !== null
-          },
-          integrity: {
-            algorithm: "sha256",
-            manifest: "integrity-manifest.json",
-            manifestSha256: integrity.manifestSha256,
-            entries: integrity.manifest.entries.length
-          },
-          sbom: {
-            format: "CycloneDX",
-            specVersion: "1.5",
-            path: "sbom.cdx.json"
-          },
-          signing,
-          sidecars: {
-            checksum: path.basename(checksumPath),
-            sbom: path.basename(sbomOutputPath),
-            provenance: path.basename(provenancePath)
-          }
-        } : {})
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
+async function writeV3BundleEvidence(context, runtime) {
+  if (!context.release.isV3) {
+    return { tokenizerAssets: null, sbomPath: null, integrity: null, signing: null };
+  }
+  const { rootDir, bundleDir, packages, targetPlatform, targetArch, options, env } = context;
+  const { sigmaExec, nodeArchiveIntegrity, nodeRuntime } = runtime;
+  const tokenizerAssets = await copyTokenizerAssets(rootDir, bundleDir);
+  const sbomPath = await writePortableSbom(
+    rootDir, bundleDir, packages, targetPlatform, targetArch,
+    sigmaExec, nodeArchiveIntegrity, nodeRuntime
   );
+  const integrity = await writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime);
+  const allowedSigners = options.allowedWindowsSignerCertificateSha256
+    ?? loadAllowedWindowsSignerCertificateSha256(env);
+  const signing = inspectWindowsAuthenticode(
+    nodeRuntime.bundledNodePath, sigmaExec.destination, targetPlatform,
+    nodeRuntime.compatibility, allowedSigners
+  );
+  return { tokenizerAssets, sbomPath, integrity, signing };
+}
 
-  createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir);
-  const sidecars = release.isV3
-    ? await writeReleaseSidecars(
-        outputPath,
-        sbomPath,
-        release,
-        targetPlatform,
-        targetArch,
-        integrity,
-        signing,
-        nodeArchiveIntegrity,
-        nodeRuntime,
-        options.releaseSigningPrivateKey ?? loadReleaseProvenancePrivateKey(env)
-      )
-    : null;
+function nodePackageMetadata(runtime, integrity) {
+  const { nodeRuntime, nodeArchiveIntegrity } = runtime;
   return {
-    artifactsDir,
-    bundleName,
-    bundleDir,
-    outputPath,
+    version: pinnedNodeVersion,
+    runtimeUrl: nodeRuntime.runtimeUrl,
+    archive: path.basename(nodeRuntime.runtimeArchive),
+    archiveSha256: nodeArchiveIntegrity?.sha256,
+    archiveVerificationSource: nodeArchiveIntegrity?.verificationSource,
+    downloaded: nodeRuntime.downloaded,
+    source: nodeRuntime.source,
+    versionOutput: nodeRuntime.nodeVersionOutput,
+    ...(nodeRuntime.compatibilitySmokePassed ? { compatibilitySmokePassed: true } : {}),
+    ...(nodeRuntime.compatibility ? { compatibility: nodeRuntime.compatibility } : {}),
+    ...(integrity?.node ? { sha256: integrity.node.sha256, size: integrity.node.size } : {})
+  };
+}
+
+function sigmaExecPackageMetadata(context, runtime, integrity) {
+  const { targetPlatform } = context;
+  const { sigmaExec } = runtime;
+  return {
+    path: `bin/${sigmaExecFileName(targetPlatform)}`,
+    sha256: integrity.sigmaExec.sha256,
+    size: integrity.sigmaExec.size,
+    source: sigmaExec.sourceKind,
+    targetPlatform: sigmaExec.binaryTarget.targetPlatform,
+    targetArch: sigmaExec.binaryTarget.targetArch,
+    format: sigmaExec.binaryTarget.format,
+    machine: sigmaExec.binaryTarget.machine
+  };
+}
+
+function bundleAssetMetadata(integrity, tokenizerAssets) {
+  return {
+    languageServers: [
+      { id: "typescript", implementation: "sigma-typescript-language-server", ...integrity.languageServerAssets.typescriptServer },
+      { id: "python", implementation: "pyright", ...integrity.languageServerAssets.pyrightServer }
+    ],
+    languageServiceEngines: [
+      { id: "typescript", implementation: "typescript", ...integrity.languageServerAssets.typescriptEngine }
+    ],
+    tokenizerAssets: tokenizerAssets !== null
+  };
+}
+
+function v3PackageMetadata(context, runtime, evidence) {
+  const { integrity, signing, tokenizerAssets } = evidence;
+  return {
+    sigmaExec: sigmaExecPackageMetadata(context, runtime, integrity),
+    assets: bundleAssetMetadata(integrity, tokenizerAssets),
+    integrity: {
+      algorithm: "sha256", manifest: "integrity-manifest.json",
+      manifestSha256: integrity.manifestSha256, entries: integrity.manifest.entries.length
+    },
+    sbom: { format: "CycloneDX", specVersion: "1.5", path: "sbom.cdx.json" },
+    signing,
+    sidecars: {
+      checksum: path.basename(context.checksumPath),
+      sbom: path.basename(context.sbomOutputPath),
+      provenance: path.basename(context.provenancePath)
+    }
+  };
+}
+
+async function writePackageMetadata(context, runtime, evidence) {
+  const { release, targetPlatform, targetArch, bundleDir } = context;
+  const metadata = {
+    schemaVersion: release.isV3 ? 3 : 2,
+    productVersion: release.version,
+    releaseChannel: release.version.includes("-") ? release.version.split("-")[1].split(".")[0] : "stable",
+    tier: "tier1",
     targetPlatform,
     targetArch,
-    version: release.version,
-    sigmaExec,
-    integrity,
-    signing,
-    windowsSigningStage,
+    node: nodePackageMetadata(runtime, evidence.integrity),
+    ...(evidence.integrity ? v3PackageMetadata(context, runtime, evidence) : {})
+  };
+  await writeFile(
+    path.join(bundleDir, "package-metadata.json"),
+    `${JSON.stringify(metadata, null, 2)}\n`,
+    "utf8"
+  );
+}
+
+async function finalizePackage(context, runtime, evidence) {
+  const { outputPath, artifactsDir, bundleName, targetPlatform, rootDir, release, options, env } = context;
+  createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir);
+  if (!release.isV3) return null;
+  return writeReleaseSidecars(
+    outputPath, evidence.sbomPath, release, targetPlatform, context.targetArch,
+    evidence.integrity, evidence.signing, runtime.nodeArchiveIntegrity, runtime.nodeRuntime,
+    options.releaseSigningPrivateKey ?? loadReleaseProvenancePrivateKey(env)
+  );
+}
+
+export async function packageAgentCli(options = {}) {
+  const context = await resolvePackageContext(options);
+  await prepareBundleDirectories(context);
+  await copyBundlePackages(context);
+  const runtime = await stagePortableRuntime(context);
+  await writeBundleEntrypoints(context, runtime.nodeRuntime);
+  const evidence = await writeV3BundleEvidence(context, runtime);
+  await writePackageMetadata(context, runtime, evidence);
+  const sidecars = await finalizePackage(context, runtime, evidence);
+  return {
+    artifactsDir: context.artifactsDir,
+    bundleName: context.bundleName,
+    bundleDir: context.bundleDir,
+    outputPath: context.outputPath,
+    targetPlatform: context.targetPlatform,
+    targetArch: context.targetArch,
+    version: context.release.version,
+    sigmaExec: runtime.sigmaExec,
+    integrity: evidence.integrity,
+    signing: evidence.signing,
+    windowsSigningStage: runtime.windowsSigningStage,
     sidecars,
-    ...nodeRuntime
+    ...runtime.nodeRuntime
   };
 }
 

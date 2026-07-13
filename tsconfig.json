@@ -18,6 +18,7 @@
     { "path": "./packages/agent-presentation" },
     { "path": "./packages/agent-runtime" },
     { "path": "./packages/agent-cli" },
-    { "path": "./packages/agent-tui" }
+    { "path": "./packages/agent-tui" },
+    { "path": "./scripts" }
   ]
 }

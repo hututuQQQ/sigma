@@ -1,0 +1,59 @@
+name: Nightly live evaluation
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 26.4.0
+  PNPM_VERSION: 11.7.0
+  RUST_VERSION: 1.96.0
+
+jobs:
+  quick-five:
+    name: ${{ matrix.label }} quick five trend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x64
+          - os: windows-2022
+            label: win32-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Enable pnpm
+        shell: bash
+        if: runner.os != 'Windows'
+        run: corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+      - name: Enable pnpm
+        if: runner.os == 'Windows'
+        run: corepack enable; corepack prepare pnpm@$env:PNPM_VERSION --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
+      - name: Run real-model quick five once
+        run: pnpm eval:agent -- --suite quick --repeat 1 --eval-root .artifacts/eval-nightly
+      - name: Upload trend report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-eval-${{ matrix.label }}-${{ github.run_id }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: .artifacts/eval-nightly/**

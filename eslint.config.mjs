@@ -42,4 +42,11 @@ export default tseslint.config(
       "max-lines-per-function": ["error", { max: 80, skipBlankLines: true, skipComments: true, IIFEs: true }],
     },
   },
+  {
+    files: ["scripts/eval/**/*.{js,mjs,ts}", "scripts/release/**/*.{js,mjs,ts}", "scripts/package-agent-cli.mjs"],
+    rules: {
+      complexity: ["error", 15],
+      "max-lines-per-function": ["error", { max: 80, skipBlankLines: true, skipComments: true, IIFEs: true }],
+    },
+  },
 );

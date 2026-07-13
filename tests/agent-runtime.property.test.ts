@@ -14,6 +14,7 @@ import {
 import { assertPlanTransition } from "../packages/agent-runtime/src/plan-policy.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 function random(seed = 0x51_6d_61): () => number {
   let state = seed >>> 0;
@@ -37,12 +38,10 @@ function limits(): BudgetLimits {
   };
 }
 
-function session(): RuntimeSession {
-  return {
-    sessionId: "property-session",
-    runId: "property-run",
-    state: { budget: createBudgetLedger(limits()) }
-  } as RuntimeSession;
+function session(sessionId = "property-session"): RuntimeSession {
+  const target = runtimeSessionFixture({ sessionId, runId: "property-run" });
+  target.durable.state.budget = createBudgetLedger(limits());
+  return target;
 }
 
 function graph(size: number, next: () => number): PlanGraph {
@@ -86,7 +85,7 @@ describe("V3 plan and budget invariant properties", () => {
     let committed = 0;
     const budgets = new BudgetController(async (_session, type, _authority, value) => {
       if (type !== "budget.exhausted") {
-        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+        target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
       }
       return {} as AgentEventEnvelope;
     });
@@ -111,19 +110,19 @@ describe("V3 plan and budget invariant properties", () => {
       }
 
       const activeTotal = [...active.values()].reduce((total, value) => total + value, 0);
-      expect(target.state.budget.reserved.inputTokens).toBe(activeTotal);
-      expect(target.state.budget.consumed.inputTokens).toBe(committed);
-      expect(target.state.budget.reserved.inputTokens).toBeGreaterThanOrEqual(0);
-      expect(committed + activeTotal).toBeLessThanOrEqual(target.state.budget.limits.inputTokens);
+      expect(target.durable.state.budget.reserved.inputTokens).toBe(activeTotal);
+      expect(target.durable.state.budget.consumed.inputTokens).toBe(committed);
+      expect(target.durable.state.budget.reserved.inputTokens).toBeGreaterThanOrEqual(0);
+      expect(committed + activeTotal).toBeLessThanOrEqual(target.durable.state.budget.limits.inputTokens);
     }
   });
 
   it("never over-allocates randomized concurrent sibling reservations", async () => {
     const target = session();
-    target.state.budget.limits.inputTokens = 100;
+    target.durable.state.budget.limits.inputTokens = 100;
     const budgets = new BudgetController(async (_session, type, _authority, value) => {
       if (type !== "budget.exhausted") {
-        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+        target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
       }
       return {} as AgentEventEnvelope;
     });
@@ -135,23 +134,22 @@ describe("V3 plan and budget invariant properties", () => {
     expect(accepted).toHaveLength(14);
     expect(rejected).toHaveLength(50);
     expect(rejected.every((item) => item.status === "rejected" && item.reason instanceof BudgetExceededError)).toBe(true);
-    expect(target.state.budget.reserved.inputTokens).toBe(98);
-    expect(target.state.budget.consumed.inputTokens).toBe(0);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(98);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(0);
     await Promise.all(accepted.map(async (id) => await budgets.release(target, id)));
-    expect(target.state.budget.reserved.inputTokens).toBe(0);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
   });
 
   it("admits exactly maxDepth recursive child reservations and durably rejects the next", async () => {
     for (let initialDepth = 0; initialDepth <= 12; initialDepth += 1) {
-      let target = session();
-      target.sessionId = `depth-${initialDepth}-0`;
-      target.state.budget = createBudgetLedger({ ...limits(), maxDepth: initialDepth });
+      let target = session(`depth-${initialDepth}-0`);
+      target.durable.state.budget = createBudgetLedger({ ...limits(), maxDepth: initialDepth });
       const exhausted: Array<{ dimension: string; requested: number; available: number }> = [];
       const budgets = new BudgetController(async (emittedSession, type, _authority, value) => {
         if (type === "budget.exhausted") {
           exhausted.push(value as { dimension: string; requested: number; available: number });
         } else if (typeof value === "object" && value !== null && "ledger" in value) {
-          emittedSession.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+          emittedSession.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
         }
         return {} as AgentEventEnvelope;
       });
@@ -165,13 +163,12 @@ describe("V3 plan and budget invariant properties", () => {
 
       for (let level = 0; level < initialDepth; level += 1) {
         const allocation = await control.reserveChildBudget(target, `child-${level}`, {
-          children: target.state.budget.limits.maxDepth - 1,
-          maxDepth: target.state.budget.limits.maxDepth - 1
+          children: target.durable.state.budget.limits.maxDepth - 1,
+          maxDepth: target.durable.state.budget.limits.maxDepth - 1
         });
         expect(allocation.maxDepth).toBe(initialDepth - level - 1);
-        target = session();
-        target.sessionId = `depth-${initialDepth}-${level + 1}`;
-        target.state.budget = createBudgetLedger(allocation);
+        target = session(`depth-${initialDepth}-${level + 1}`);
+        target.durable.state.budget = createBudgetLedger(allocation);
       }
 
       await expect(control.reserveChildBudget(target, "too-deep", { maxDepth: 1 })).rejects.toMatchObject({
@@ -181,8 +178,8 @@ describe("V3 plan and budget invariant properties", () => {
         available: 0
       });
       expect(exhausted).toEqual([{ dimension: "maxDepth", requested: 1, available: 0 }]);
-      expect(target.state.budget.reservations).toEqual([]);
-      expect(target.state.budget.reserved).toEqual({
+      expect(target.durable.state.budget.reservations).toEqual([]);
+      expect(target.durable.state.budget.reserved).toEqual({
         inputTokens: 0,
         outputTokens: 0,
         costMicroUsd: 0,

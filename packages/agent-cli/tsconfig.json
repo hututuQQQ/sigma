@@ -15,6 +15,7 @@
     { "path": "../agent-presentation" },
     { "path": "../agent-protocol" },
     { "path": "../agent-runtime" },
+    { "path": "../agent-model" },
     { "path": "../agent-store" },
     { "path": "../agent-tui" }
   ]

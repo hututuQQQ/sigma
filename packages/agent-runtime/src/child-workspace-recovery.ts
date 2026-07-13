@@ -40,9 +40,9 @@ async function exclusiveWriterSession(
     if (event.type !== "session.created") continue;
     const payload = object(event.payload);
     return payload.mode === "change" && payload.strictWriteScope === true
-      && payload.parentSessionId === parent.sessionId
+      && payload.parentSessionId === parent.identity.sessionId
       && typeof payload.workspacePath === "string"
-      && await sameWorkspace(payload.workspacePath, parent.workspacePath);
+      && await sameWorkspace(payload.workspacePath, parent.identity.workspacePath);
   }
   return false;
 }
@@ -67,7 +67,7 @@ async function recordedDecisions(
 }
 
 function alreadyImported(session: RuntimeSession, sourceSessionId: string, checkpointId: string): boolean {
-  return session.state.mutationEvidence.some((item) => item.kind === "workspace_delta"
+  return session.durable.state.mutationEvidence.some((item) => item.kind === "workspace_delta"
     && item.data.checkpointId === checkpointId && item.data.sourceSessionId === sourceSessionId);
 }
 
@@ -79,7 +79,7 @@ async function latestUnresolvedMutation(
   const records = [...await checkpoints.list(childSessionId)].reverse();
   for (const stored of records) {
     if (stored.status === "restored" || alreadyImported(session, childSessionId, stored.checkpointId)) continue;
-    if (!await sameWorkspace(stored.workspacePath, session.workspacePath)) {
+    if (!await sameWorkspace(stored.workspacePath, session.identity.workspacePath)) {
       throw Object.assign(new Error(
         `Child checkpoint ${stored.checkpointId} is outside its parent workspace.`
       ), { code: "child_checkpoint_workspace_mismatch" });
@@ -126,8 +126,8 @@ export async function findInterruptedChildCheckpoint(
   session: RuntimeSession
 ): Promise<ChildCheckpointRecovery | null> {
   const [children, decisions] = await Promise.all([
-    readDurableChildren(store, session.sessionId),
-    recordedDecisions(store, session.sessionId)
+    readDurableChildren(store, session.identity.sessionId),
+    recordedDecisions(store, session.identity.sessionId)
   ]);
   for (const child of children.values()) {
     if (!failedOrInterrupted(child) || !child.childSessionId
@@ -149,7 +149,7 @@ export async function findInterruptedChildCheckpoint(
 }
 
 export function isChildCheckpointRecovery(
-  value: RuntimeSession["openCheckpointRecovery"]
+  value: RuntimeSession["recovery"]["openCheckpointRecovery"]
 ): value is ChildCheckpointRecovery {
   return Boolean(value && "sourceSessionId" in value);
 }
@@ -173,14 +173,14 @@ export class ChildCheckpointRecoveryCoordinator {
         session
       );
       if (!recovery) return false;
-      session.openCheckpointRecovery = recovery;
+      session.recovery.openCheckpointRecovery = recovery;
       if (recovery.recordedDecision) {
         try {
           await this.options.coordinator.replayRecordedChildDecision(session);
           continue;
         } catch (error) {
           if ((error as { code?: unknown })?.code !== "checkpoint_conflict") throw error;
-          session.openCheckpointRecovery = await this.options.control.refreshChildCheckpointRecovery(recovery);
+          session.recovery.openCheckpointRecovery = await this.options.control.refreshChildCheckpointRecovery(recovery);
         }
       }
       await this.suspend(session, recovery);
@@ -192,7 +192,7 @@ export class ChildCheckpointRecoveryCoordinator {
     session: RuntimeSession,
     recovery: { checkpointId: string; currentManifestDigest: string }
   ): Promise<void> {
-    session.openCheckpointRecovery = recovery;
+    session.recovery.openCheckpointRecovery = recovery;
     const message = "An interrupted mutation left a partial workspace delta. Only the user may choose safe restore or keep before continuing.";
     const outcome: RunOutcome = {
       kind: "needs_input",
@@ -205,7 +205,7 @@ export class ChildCheckpointRecoveryCoordinator {
       choices: ["restore", "keep"],
       message
     });
-    session.lastOutcome = outcome;
+    session.recovery.lastOutcome = outcome;
     resolveOutcomeWaiters(session, event.runId, outcome);
   }
 
@@ -226,7 +226,7 @@ export class ChildCheckpointRecoveryCoordinator {
       choices: ["restore", "keep"],
       message
     });
-    session.lastOutcome = outcome;
+    session.recovery.lastOutcome = outcome;
     resolveOutcomeWaiters(session, event.runId, outcome);
   }
 }

@@ -82,43 +82,49 @@ function finiteNumber(value) {
 
 export function evalMetricValue(attempt, name) {
   const metrics = isRecord(attempt?.metrics) ? attempt.metrics : {};
-  if (name === "durationMs") {
-    const explicit = finiteNumber(metrics.durationMs);
-    if (explicit !== undefined) return explicit;
-    const start = Date.parse(String(attempt?.startedAt ?? ""));
-    const finish = Date.parse(String(attempt?.finishedAt ?? ""));
-    return Number.isFinite(start) && Number.isFinite(finish) ? Math.max(0, finish - start) : undefined;
-  }
+  if (name === "durationMs") return durationMetric(attempt, metrics);
   for (const metricPath of EVAL_METRIC_PATHS[name] ?? []) {
     const result = finiteNumber(getPath(metrics, metricPath));
     if (result !== undefined) return result;
   }
+  return derivedMetric(attempt, name, metrics);
+}
+
+function durationMetric(attempt, metrics) {
+  const explicit = finiteNumber(metrics.durationMs);
+  if (explicit !== undefined) return explicit;
+  const start = Date.parse(String(attempt?.startedAt ?? ""));
+  const finish = Date.parse(String(attempt?.finishedAt ?? ""));
+  return Number.isFinite(start) && Number.isFinite(finish) ? Math.max(0, finish - start) : undefined;
+}
+
+function ratioMetric(attempt, numeratorName, denominatorName) {
+  const numerator = evalMetricValue(attempt, numeratorName);
+  const denominator = evalMetricValue(attempt, denominatorName);
+  if (numerator === undefined || denominator === undefined) return undefined;
+  return denominator === 0 ? 0 : numerator / denominator;
+}
+
+function microUsdMetric(attempt, name) {
+  const value = evalMetricValue(attempt, name);
+  return value === undefined ? undefined : value / 1_000_000;
+}
+
+function derivedMetric(attempt, name, metrics) {
   if (name === "stagnationWindows" && Array.isArray(metrics.stagnationWindows)) {
     return metrics.stagnationWindows.length;
   }
   if (name === "longestStagnationMs" && Array.isArray(metrics.stagnationWindows)) {
-    return metrics.stagnationWindows.reduce((maximum, window) => {
-      const duration = finiteNumber(window?.durationMs) ?? 0;
-      return Math.max(maximum, duration);
-    }, 0);
+    return metrics.stagnationWindows.reduce((maximum, window) =>
+      Math.max(maximum, finiteNumber(window?.durationMs) ?? 0), 0);
   }
   if (name === "extraUserInteractions") {
     const interactions = evalMetricValue(attempt, "userInteractions");
-    if (interactions !== undefined) return Math.max(0, interactions - 1);
+    return interactions === undefined ? undefined : Math.max(0, interactions - 1);
   }
-  if (name === "toolFailureRate") {
-    const failures = evalMetricValue(attempt, "toolFailures");
-    const calls = evalMetricValue(attempt, "toolCalls");
-    if (failures !== undefined && calls !== undefined) return calls === 0 ? 0 : failures / calls;
-  }
-  if (name === "costUsd") {
-    const microUsd = evalMetricValue(attempt, "costMicroUsd");
-    if (microUsd !== undefined) return microUsd / 1_000_000;
-  }
-  if (name === "reviewerCostUsd") {
-    const microUsd = evalMetricValue(attempt, "reviewerCostMicroUsd");
-    if (microUsd !== undefined) return microUsd / 1_000_000;
-  }
+  if (name === "toolFailureRate") return ratioMetric(attempt, "toolFailures", "toolCalls");
+  if (name === "costUsd") return microUsdMetric(attempt, "costMicroUsd");
+  if (name === "reviewerCostUsd") return microUsdMetric(attempt, "reviewerCostMicroUsd");
   return undefined;
 }
 
@@ -167,12 +173,7 @@ function assertAttempt(attempt, label = "attempt") {
   if (!isRecord(attempt) || attempt.schemaVersion !== 1 || attempt.kind !== "eval_attempt") {
     throw new Error(`${label} must be a versioned EvalAttemptReportV1 (schemaVersion=1, kind=eval_attempt).`);
   }
-  if (typeof attempt.scenarioId !== "string" || attempt.scenarioId.length === 0) {
-    throw new Error(`${label}.scenarioId must be a non-empty string.`);
-  }
-  for (const key of ["runId", "attemptId"]) {
-    if (typeof attempt[key] !== "string" || attempt[key].length === 0) throw new Error(`${label}.${key} must be a non-empty string.`);
-  }
+  assertAttemptIdentifiers(attempt, label);
   if (!Number.isSafeInteger(attempt.repetition) || attempt.repetition < 1) {
     throw new Error(`${label}.repetition must be a positive integer.`);
   }
@@ -181,6 +182,14 @@ function assertAttempt(attempt, label = "attempt") {
   }
   for (const dimension of EVAL_DIMENSIONS) {
     if (!isRecord(attempt.dimensions[dimension])) throw new Error(`${label}.dimensions.${dimension} must be an object.`);
+  }
+}
+
+function assertAttemptIdentifiers(attempt, label) {
+  for (const key of ["scenarioId", "runId", "attemptId"]) {
+    if (typeof attempt[key] !== "string" || attempt[key].length === 0) {
+      throw new Error(`${label}.${key} must be a non-empty string.`);
+    }
   }
 }
 
@@ -346,21 +355,7 @@ export function buildEvalRunReport(input) {
   if (!isRecord(input) || input.schemaVersion !== 1 || input.kind !== "eval_run") {
     throw new Error("input must be a versioned EvalRunReportV1 or EvalAttemptReportV1.");
   }
-  const attempts = Array.isArray(input.attempts) ? input.attempts : [];
-  attempts.forEach((attempt, index) => assertAttempt(attempt, `attempts[${index}]`));
-  const expected = Math.max(1, Number.isInteger(input.repeat) ? input.repeat : 1);
-  if (typeof input.runId !== "string" || input.runId.length === 0) throw new Error("runId must be a non-empty string.");
-  if (!Number.isSafeInteger(input.repeat) || input.repeat < 1) throw new Error("repeat must be a positive integer.");
-  const attemptIds = attempts.map((attempt) => attempt.attemptId);
-  if (new Set(attemptIds).size !== attemptIds.length) throw new Error("attempts must have unique attemptId values.");
-  const repetitions = attempts.map((attempt) => `${attempt.scenarioId}:${attempt.repetition}`);
-  if (new Set(repetitions).size !== repetitions.length) throw new Error("attempts must have unique scenarioId/repetition pairs.");
-  if (attempts.some((attempt) => attempt.runId !== input.runId)) throw new Error("every attempt.runId must match runId.");
-  if (attempts.some((attempt) => attempt.repetition > expected)) throw new Error("attempt repetition exceeds run repeat.");
-  const declaredIds = [...declaredScenarios(input.scenarios).keys()];
-  if (declaredIds.length > 0 && attempts.some((attempt) => !declaredIds.includes(attempt.scenarioId))) {
-    throw new Error("attempt scenarioId is not declared by the run.");
-  }
+  const { attempts, expected } = validateRunAttempts(input);
   const grouped = Map.groupBy(attempts, (attempt) => attempt.scenarioId);
   const declared = declaredScenarios(input.scenarios);
   const scenarioIds = [...new Set([...grouped.keys(), ...declared.keys()])].sort();
@@ -383,14 +378,37 @@ export function buildEvalRunReport(input) {
     scenarios,
     counts: runCounts(attempts, scenarios),
     status: runStatus(scenarios, infrastructureErrors),
-    dimensions: Object.fromEntries(EVAL_DIMENSIONS.map((dimension) => {
-      const statuses = scenarios.map((scenario) => scenario.dimensions[dimension].status);
-      if (dimension === "reliability" && infrastructureErrors.length > 0) return [dimension, "fail"];
-      if (dimension === "safety" && infrastructureSafetyFailure) return [dimension, "fail"];
-      return [dimension, statuses.length === 0 || statuses.includes("fail") ? "fail" : statuses.every((status) => status === "stable")
-        ? "stable" : "flaky"];
-    }))
+    dimensions: runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure)
   };
+}
+
+function validateRunAttempts(input) {
+  const attempts = Array.isArray(input.attempts) ? input.attempts : [];
+  attempts.forEach((attempt, index) => assertAttempt(attempt, `attempts[${index}]`));
+  const expected = Math.max(1, Number.isInteger(input.repeat) ? input.repeat : 1);
+  if (typeof input.runId !== "string" || input.runId.length === 0) throw new Error("runId must be a non-empty string.");
+  if (!Number.isSafeInteger(input.repeat) || input.repeat < 1) throw new Error("repeat must be a positive integer.");
+  const attemptIds = attempts.map((attempt) => attempt.attemptId);
+  if (new Set(attemptIds).size !== attemptIds.length) throw new Error("attempts must have unique attemptId values.");
+  const repetitions = attempts.map((attempt) => `${attempt.scenarioId}:${attempt.repetition}`);
+  if (new Set(repetitions).size !== repetitions.length) throw new Error("attempts must have unique scenarioId/repetition pairs.");
+  if (attempts.some((attempt) => attempt.runId !== input.runId)) throw new Error("every attempt.runId must match runId.");
+  if (attempts.some((attempt) => attempt.repetition > expected)) throw new Error("attempt repetition exceeds run repeat.");
+  const declaredIds = [...declaredScenarios(input.scenarios).keys()];
+  if (declaredIds.length > 0 && attempts.some((attempt) => !declaredIds.includes(attempt.scenarioId))) {
+    throw new Error("attempt scenarioId is not declared by the run.");
+  }
+  return { attempts, expected };
+}
+
+function runDimensions(scenarios, infrastructureErrors, infrastructureSafetyFailure) {
+  return Object.fromEntries(EVAL_DIMENSIONS.map((dimension) => {
+    const statuses = scenarios.map((scenario) => scenario.dimensions[dimension].status);
+    if (dimension === "reliability" && infrastructureErrors.length > 0) return [dimension, "fail"];
+    if (dimension === "safety" && infrastructureSafetyFailure) return [dimension, "fail"];
+    if (statuses.length === 0 || statuses.includes("fail")) return [dimension, "fail"];
+    return [dimension, statuses.every((status) => status === "stable") ? "stable" : "flaky"];
+  }));
 }
 
 export const aggregateEvalRun = buildEvalRunReport;

@@ -5,7 +5,7 @@ import { EffectRunner } from "./effect-runner.js";
 import { newRuntimeSession } from "./new-runtime-session.js";
 import { recoverInterruptedSession } from "./session-recovery.js";
 import { SessionCommandBus } from "./session-command-bus.js";
-import { combinedSessionEvents, ensureSessionPromoted, listCombinedSessions } from "./session-catalog.js";
+import { assertSessionStorageSupported, currentSessionEvents, listCurrentSessions } from "./session-catalog.js";
 import { streamSessionEvents } from "./runtime-stream.js";
 import { waitForSessionIdleOutcome, waitForSessionOutcome } from "./runtime-waiters.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
@@ -28,15 +28,9 @@ import { initializeRuntimeSession } from "./runtime-session-initialization.js";
 import { restoreRuntimeCustomization } from "./runtime-customization-restore.js";
 import { finishRuntimeSession } from "./runtime-session-finish.js";
 import { RuntimeCheckpointCoordinator } from "./runtime-checkpoint-coordinator.js";
-import {
-  assertProfileResources,
-  constrainBudget,
-  resolveHookProfile,
-  resolveChildProfile,
-  roleForMode,
-  type SessionProfileSelection
-} from "./session-profile.js";
+import { assertProfileResources, constrainBudget, resolveHookProfile, resolveChildProfile, roleForMode, type SessionProfileSelection } from "./session-profile.js";
 import { createCheckpointManager } from "./runtime-checkpoint-manager.js";
+import type { CheckpointManager } from "agent-checkpoint";
 import { FrozenWorkspaceHookMaterializer } from "./frozen-hook-assets.js";
 import { FrozenSkillMaterializer } from "./frozen-skill-assets.js";
 import { ChildCheckpointRecoveryCoordinator } from "./child-workspace-recovery.js";
@@ -56,7 +50,9 @@ export class InProcessRuntimeClient implements RuntimeClient {
   private readonly checkpointManager: ReturnType<typeof createCheckpointManager>;
   private readonly childCheckpointRecovery: ChildCheckpointRecoveryCoordinator;
   private readonly profileHookRecovery?: ModelAgentProfileHookRunner;
-  constructor(private readonly options: RuntimeOptions & { storeRootDir: string }) {
+  constructor(private readonly options: RuntimeOptions & { storeRootDir: string }, testing: {
+    checkpointManager?: CheckpointManager
+  } = {}) {
     assertProfileResources(options, options.profile);
     this.artifacts = new ContentAddressedArtifactStore(options.storeRootDir);
     this.runDeadlineMs = options.runDeadlineMs ?? 900_000;
@@ -70,29 +66,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       finish: async (session, outcome) => await this.finish(session, outcome),
       start: (session) => this.startRun(session)
     });
-    if (options.hooks?.some((hook) => hook.kind === "command") && !options.hookRunner) {
-      throw new Error("A hookRunner is required when command hooks are configured.");
-    }
     this.budgets = new BudgetController(async (session, type, authority, value) =>
       await this.emit(session, type, authority, value));
-    const productionProfileRunner = options.agentProfileHookRunner ? undefined : new ModelAgentProfileHookRunner({
-      session: (sessionId) => this.required(sessionId),
-      resolveProfile: (session, profileId) => resolveHookProfile(options, session, profileId),
-      gateway: (session, profile) => options.gatewayForRole?.("planner", profile) ?? session.gateway,
-      budgets: this.budgets,
-      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
-    });
+    const productionProfileRunner = this.createProductionProfileRunner();
     this.profileHookRecovery = productionProfileRunner;
-    const agentProfileRunner = options.agentProfileHookRunner ?? productionProfileRunner;
-    const hookMaterializer = new FrozenWorkspaceHookMaterializer(options.storeRootDir, this.artifacts);
-    this.hooks = new RuntimeHookCoordinator({
-      definitions: options.hooks ?? [],
-      runner: options.hookRunner ?? { run: async () => ({ ok: false, error: "Hook runner is unavailable.", durationMs: 0 }) },
-      ...(agentProfileRunner ? { agentProfileRunner } : {}),
-      materializeWorkspaceHook: (session, hook) => hookMaterializer.materialize(session.workspacePath, session.sessionId, hook),
-      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
-    });
-    this.checkpointManager = createCheckpointManager(options);
+    this.hooks = this.createHooks(productionProfileRunner);
+    this.checkpointManager = testing.checkpointManager ?? createCheckpointManager(options);
     this.control = new RuntimeControlService({
       checkpoints: this.checkpointManager,
       skills: options.skills,
@@ -104,7 +83,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       planChanged: async (session, previousRevision, plan) => {
         await this.hooks.dispatch(session, "plan_changed", {
           previousRevision, plan, source: "tool"
-        }, session.controller?.signal ?? new AbortController().signal);
+        }, session.execution.controller?.signal ?? new AbortController().signal);
       }
     });
     this.effects = new EffectRunner({
@@ -129,12 +108,37 @@ export class InProcessRuntimeClient implements RuntimeClient {
       finish: async (session, outcome) => await this.finish(session, outcome),
       waitForQuiescence: async (sessionId) => await this.effects.waitForQuiescence(sessionId)
     });
-    this.checkpoints = new RuntimeCheckpointCoordinator(
-      this.effects,
-      this.control,
-      options.hasActiveChildren
-    );
+    this.checkpoints = new RuntimeCheckpointCoordinator(this.effects, this.control, options.hasActiveChildren);
     this.childCheckpointRecovery = new ChildCheckpointRecoveryCoordinator({ store: options.store, checkpoints: this.checkpointManager, coordinator: this.checkpoints, control: this.control, emit: async (session, type, authority, value) => await this.emit(session, type, authority, value) });
+  }
+  private createProductionProfileRunner(): ModelAgentProfileHookRunner | undefined {
+    if (this.options.agentProfileHookRunner) return undefined;
+    return new ModelAgentProfileHookRunner({
+      session: (sessionId) => this.required(sessionId),
+      resolveProfile: (session, profileId) => resolveHookProfile(this.options, session, profileId),
+      gateway: (session, profile) => this.options.gatewayForRole?.("planner", profile) ?? session.services.gateway,
+      budgets: this.budgets,
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    });
+  }
+
+  private createHooks(productionProfileRunner?: ModelAgentProfileHookRunner): RuntimeHookCoordinator {
+    if (this.options.hooks?.some((hook) => hook.kind === "command") && !this.options.hookRunner) {
+      throw new Error("A hookRunner is required when command hooks are configured.");
+    }
+    const agentProfileRunner = this.options.agentProfileHookRunner ?? productionProfileRunner;
+    const materializer = new FrozenWorkspaceHookMaterializer(this.options.storeRootDir, this.artifacts);
+    return new RuntimeHookCoordinator({
+      definitions: this.options.hooks ?? [],
+      runner: this.options.hookRunner ?? {
+        run: async () => ({ ok: false, error: "Hook runner is unavailable.", durationMs: 0 })
+      },
+      ...(agentProfileRunner ? { agentProfileRunner } : {}),
+      materializeWorkspaceHook: (session, hook) => materializer.materialize(
+        session.identity.workspacePath, session.identity.sessionId, hook
+      ),
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    });
   }
   async createSession(input: StartSession, allocatedBudget = this.options.budgetLimits): Promise<SessionRef> {
     return await this.createSessionWithProfile(input, constrainBudget(allocatedBudget, this.options.profile), {
@@ -185,12 +189,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       workspaceLeaseInherited,
       ...(parentSessionId ? { parentSessionId } : {})
     }, this.options.runtimeEnvironment);
-    this.sessions.set(session.sessionId, session);
-    await this.commandBus.claim(session.sessionId);
+    this.sessions.set(session.identity.sessionId, session);
+    await this.commandBus.claim(session.identity.sessionId);
     try {
       await initializeRuntimeSession(session, input, {
-        profile: session.profile,
-        profileSource: session.profileSource,
+        profile: session.services.profile,
+        profileSource: session.services.profileSource,
         availableProfiles: this.options.availableProfiles,
         skills: this.options.skills,
         hooks: this.options.hooks,
@@ -201,34 +205,34 @@ export class InProcessRuntimeClient implements RuntimeClient {
           await this.hooks.dispatch(target, event, value, signal)
       });
     } catch (error) {
-      this.sessions.delete(session.sessionId);
-      await this.commandBus.release(session.sessionId);
+      this.sessions.delete(session.identity.sessionId);
+      await this.commandBus.release(session.identity.sessionId);
       throw error;
     }
-    return { sessionId: session.sessionId, runId: session.runId };
+    return { sessionId: session.identity.sessionId, runId: session.durable.runId };
   }
   async command(command: RunCommand): Promise<void> {
     if (command.type === "resume") return await this.handleResume(command);
     const session = this.required(command.sessionId);
     if (command.type === "checkpoint_recovery") {
       await this.checkpoints.resolveOpen(session, command.checkpointId, command.decision);
-      session.lastOutcome = undefined;
+      session.recovery.lastOutcome = undefined;
       await this.recoverSession(session);
       return;
     }
     if (command.type === "budget_increase") {
-      if (session.parentSessionId || session.modelRole === "child_analyze" || session.modelRole === "child_write") {
-        const ancestry = session.parentSessionId ? ` of '${session.parentSessionId}'` : "";
+      if (session.identity.parentSessionId || session.services.modelRole === "child_analyze" || session.services.modelRole === "child_write") {
+        const ancestry = session.identity.parentSessionId ? ` of '${session.identity.parentSessionId}'` : "";
         throw Object.assign(new Error(
-          `Only a root session may increase budget limits; '${session.sessionId}' is a child${ancestry}.`
+          `Only a root session may increase budget limits; '${session.identity.sessionId}' is a child${ancestry}.`
         ), { code: "budget_increase_root_only" });
       }
       await this.budgets.increaseLimits(session, command.increase);
       return;
     }
-    if (session.openCheckpointRecovery) {
+    if (session.recovery.openCheckpointRecovery) {
       throw Object.assign(new Error(
-        `Checkpoint ${session.openCheckpointRecovery.checkpointId} requires an explicit user restore or keep decision.`
+        `Checkpoint ${session.recovery.openCheckpointRecovery.checkpointId} requires an explicit user restore or keep decision.`
       ), { code: "checkpoint_recovery_required" });
     }
     if (command.type === "reviewer_waiver") return await this.commands.reviewerWaiver(session, command);
@@ -239,11 +243,11 @@ export class InProcessRuntimeClient implements RuntimeClient {
     await this.commands.submit(session, command);
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
-    await ensureSessionPromoted(this.options.storeRootDir, command.sessionId);
+    await assertSessionStorageSupported(this.options.storeRootDir, command.sessionId);
     await this.commandBus.claim(command.sessionId);
     try {
       await this.resume(command.sessionId);
-      if (this.sessions.get(command.sessionId)?.state.phase === "terminal") await this.commandBus.release(command.sessionId);
+      if (this.sessions.get(command.sessionId)?.durable.state.phase === "terminal") await this.commandBus.release(command.sessionId);
     } catch (error) {
       await this.commandBus.release(command.sessionId);
       throw error;
@@ -267,10 +271,10 @@ export class InProcessRuntimeClient implements RuntimeClient {
 
   async waitForQuiescence(sessionId: string, signal?: AbortSignal): Promise<void> { this.required(sessionId); await this.effects.waitForQuiescence(sessionId, signal); }
   async listSessions(limit = 20): Promise<SessionOverview[]> {
-    return await listCombinedSessions(this.options.store, this.options.storeRootDir, limit);
+    return await listCurrentSessions(this.options.store, this.options.storeRootDir, limit);
   }
   sessionEvents(sessionId: string, afterSeq = 0): AsyncIterable<AgentEventEnvelope> {
-    return combinedSessionEvents(this.options.store, this.options.storeRootDir, sessionId, afterSeq);
+    return currentSessionEvents(this.options.store, this.options.storeRootDir, sessionId, afterSeq);
   }
   async releaseSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -281,7 +285,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     this.events.forget(sessionId);
   }
   sessionBudget(sessionId: string): BudgetLedgerState {
-    return structuredClone(this.required(sessionId).state.budget);
+    return structuredClone(this.required(sessionId).durable.state.budget);
   }
   async undoLatestCheckpoint(sessionId: string): Promise<import("agent-protocol").CheckpointRef> {
     return await this.checkpoints.undoLatest(this.required(sessionId));
@@ -363,7 +367,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
 
   private async recoverSession(session: RuntimeSession): Promise<void> {
     await this.profileHookRecovery?.recoverInterrupted(session);
-    const hasLiveChildren = await this.options.hasActiveChildren?.(session.sessionId) ?? false;
+    const hasLiveChildren = await this.options.hasActiveChildren?.(session.identity.sessionId) ?? false;
     if (!hasLiveChildren) {
       if (await this.childCheckpointRecovery.recover(session)) return;
       await reconcileInterruptedChildren(

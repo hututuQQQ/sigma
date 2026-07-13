@@ -23,6 +23,7 @@ import { BudgetController, BudgetExceededError } from "../packages/agent-runtime
 import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
 import { ModelReviewer, type ReviewerPort } from "../packages/agent-runtime/src/reviewer.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const now = "2026-07-11T00:00:00.000Z";
 
@@ -77,7 +78,7 @@ class ReviewerGateway implements ModelGateway {
 }
 
 class FallbackReviewerGateway extends ReviewerGateway {
-  reservedAtInvocation?: RuntimeSession["state"]["budget"]["reserved"];
+  reservedAtInvocation?: RuntimeSession["durable"]["state"]["budget"]["reserved"];
 
   constructor(private readonly target: RuntimeSession) {
     super();
@@ -116,7 +117,7 @@ class FallbackReviewerGateway extends ReviewerGateway {
   }
 
   async completeWithConstraints(request: ModelRequest, _constraints: ModelRouteConstraints): Promise<ModelResponse> {
-    this.reservedAtInvocation = { ...this.target.state.budget.reserved };
+    this.reservedAtInvocation = { ...this.target.durable.state.budget.reserved };
     const response = await super.complete(request);
     return {
       ...response,
@@ -193,32 +194,7 @@ function runtimeSession(budgetLimits = limits()): RuntimeSession {
   state.budget.limits = budgetLimits;
   state.evidence = [delta(), validation()];
   state.plan = { revision: 1, goal: "Review the change", nodes: [] };
-  return {
-    sessionId: "session",
-    runId: "run",
-    modelTurn: 0,
-    workspacePath: ".",
-    mode: "change",
-    writeScope: [],
-    strictWriteScope: false,
-    gateway: new ReviewerGateway(),
-    modelRole: "orchestrator",
-    state,
-    seq: 0,
-    controller: null,
-    turnController: null,
-    deadlineTimer: null,
-    running: null,
-    subscribers: new Set(),
-    approvals: new Map(),
-    alwaysAllowedEffects: new Set(),
-    steeringPending: 0,
-    followUps: [],
-    contextItems: [],
-    loadedContextIds: new Set(),
-    outcomeWaiters: [],
-    idleWaiters: []
-  };
+  return runtimeSessionFixture({ state, services: { gateway: new ReviewerGateway() } });
 }
 
 function harness(target: RuntimeSession, crashBeforeUsage = false): {
@@ -245,17 +221,17 @@ function harness(target: RuntimeSession, crashBeforeUsage = false): {
     }
     const event: AgentEventEnvelope = {
       schemaVersion: EVENT_SCHEMA_VERSION,
-      seq: ++session.seq,
-      eventId: `event-${session.seq}`,
-      sessionId: session.sessionId,
-      runId: session.runId,
+      seq: ++session.durable.seq,
+      eventId: `event-${session.durable.seq}`,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       occurredAt: now,
       type,
       authority,
       payload: value as JsonValue
     };
     events.push(type);
-    session.state = evolve(session.state, event);
+    session.durable.state = evolve(session.durable.state, event);
     return event;
   };
   return { budgets: new BudgetController(emit), emit, events };
@@ -284,18 +260,18 @@ describe("independent reviewer budget accounting", () => {
     await coordinator.maybeReview(target, new AbortController().signal);
 
     expect(gateway.calls).toBe(1);
-    expect(target.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, modelTurns: 0 });
-    expect(target.state.budget.consumed).toMatchObject({
+    expect(target.durable.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, modelTurns: 0 });
+    expect(target.durable.state.budget.consumed).toMatchObject({
       inputTokens: 80,
       outputTokens: 10,
       costMicroUsd: 7,
       modelTurns: 1
     });
-    expect(target.state.usage).toHaveLength(1);
-    expect(target.state.usage[0]).toMatchObject({
+    expect(target.durable.state.usage).toHaveLength(1);
+    expect(target.durable.state.usage[0]).toMatchObject({
       role: "reviewer", providerId: "deepseek", modelId: "deepseek-v4-pro"
     });
-    expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
   it("settles provider-reported reviewer usage above its reservation", async () => {
@@ -306,8 +282,8 @@ describe("independent reviewer budget accounting", () => {
     await new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets)
       .maybeReview(target, new AbortController().signal);
 
-    expect(target.state.budget.consumed.inputTokens).toBe(175);
-    expect(target.state.budget.reserved.inputTokens).toBe(0);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(175);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
   });
 
   it("settles a failed reviewer attempt conservatively without approving it", async () => {
@@ -319,10 +295,10 @@ describe("independent reviewer budget accounting", () => {
     await coordinator.maybeReview(target, new AbortController().signal);
 
     expect(gateway.calls).toBe(1);
-    expect(target.state.budget.reserved.inputTokens).toBe(0);
-    expect(target.state.budget.consumed).toMatchObject({ inputTokens: 150, outputTokens: 0, modelTurns: 1 });
-    expect(target.state.usage[0]).toMatchObject({ role: "reviewer", providerReported: false });
-    expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
+    expect(target.durable.state.budget.consumed).toMatchObject({ inputTokens: 150, outputTokens: 0, modelTurns: 1 });
+    expect(target.durable.state.usage[0]).toMatchObject({ role: "reviewer", providerReported: false });
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
       status: "failed",
       data: { verdict: "changes_requested" }
     });
@@ -342,9 +318,9 @@ describe("independent reviewer budget accounting", () => {
       costMicroUsd: 300,
       modelTurns: 2
     });
-    expect(target.state.budget.reserved.modelTurns).toBe(0);
-    expect(target.state.budget.consumed.modelTurns).toBe(2);
-    expect(target.state.usage[0]).toMatchObject({ role: "reviewer", attempt: 2 });
+    expect(target.durable.state.budget.reserved.modelTurns).toBe(0);
+    expect(target.durable.state.budget.consumed.modelTurns).toBe(2);
+    expect(target.durable.state.usage[0]).toMatchObject({ role: "reviewer", attempt: 2 });
   });
 
   it("recovers a committed reviewer reservation without replay or double charge", async () => {
@@ -355,18 +331,18 @@ describe("independent reviewer budget accounting", () => {
 
     await expect(coordinator.maybeReview(target, new AbortController().signal))
       .rejects.toThrow("injected crash");
-    const consumed = structuredClone(target.state.budget.consumed);
+    const consumed = structuredClone(target.durable.state.budget.consumed);
     expect(gateway.calls).toBe(1);
-    expect(target.state.usage).toHaveLength(0);
+    expect(target.durable.state.usage).toHaveLength(0);
 
     const recovered = harness(target);
     await new ReviewCoordinator(new ModelReviewer(gateway), recovered.emit, recovered.budgets)
       .maybeReview(target, new AbortController().signal);
 
     expect(gateway.calls).toBe(1);
-    expect(target.state.budget.consumed).toEqual(consumed);
-    expect(target.state.usage).toHaveLength(1);
-    expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "failed" });
+    expect(target.durable.state.budget.consumed).toEqual(consumed);
+    expect(target.durable.state.usage).toHaveLength(1);
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "failed" });
   });
 
   it("keeps non-model reviewer ports compatible without fabricating usage", async () => {
@@ -394,9 +370,9 @@ describe("independent reviewer budget accounting", () => {
 
     await new ReviewCoordinator(fake, emit, budgets).maybeReview(target, new AbortController().signal);
 
-    expect(target.state.usage).toHaveLength(0);
-    expect(target.state.budget.consumed.modelTurns).toBe(0);
-    expect(target.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+    expect(target.durable.state.usage).toHaveLength(0);
+    expect(target.durable.state.budget.consumed.modelTurns).toBe(0);
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
   it("fails closed for non-strict JSON and incomplete review material", async () => {

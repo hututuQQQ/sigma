@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { artifactSecretValues, evalRootDir, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
 import {
-  evaluatorDigestFromSnapshot, packageManagerInvocation, runEvaluation, verifierSourceDigest
+  evaluatorDigestFromSnapshot, packageManagerInvocation, resolveEvaluatorHost, runEvaluation, verifierSourceDigest
 } from "../scripts/eval/runner.mjs";
 import { breachedBudget } from "../scripts/eval/subject-cli.mjs";
 
@@ -78,6 +78,23 @@ async function manifest(options: { verifierPass?: boolean; initialDirty?: boolea
 }
 
 describe("agent experience evaluation runner", () => {
+  it("accepts only the explicit evaluator host matrix", () => {
+    expect(resolveEvaluatorHost("linux", "x64")).toMatchObject({
+      packageTarget: "linux", targetPlatform: "linux", targetArch: "x64"
+    });
+    expect(resolveEvaluatorHost("win32", "x64")).toMatchObject({
+      packageTarget: "windows", targetPlatform: "win32", targetArch: "x64"
+    });
+    for (const [platform, arch] of [
+      ["darwin", "x64"], ["darwin", "arm64"], ["linux", "arm64"], ["win32", "arm64"],
+      ["freebsd", "x64"], ["linux", "riscv64"]
+    ]) {
+      expect(() => resolveEvaluatorHost(platform, arch)).toThrowError(expect.objectContaining({
+        code: "unsupported_evaluator_host", platform, arch
+      }));
+    }
+  });
+
   it("routes Windows package-manager scripts through the command processor", () => {
     expect(packageManagerInvocation(["package:agent-cli:windows"], {
       platform: "win32", env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }

@@ -19,9 +19,10 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { EVENT_SCHEMA_VERSION } from "../packages/agent-protocol/src/index.js";
-import { createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
+import { createRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const roots: string[] = [];
 const occurredAt = "2026-07-11T00:00:00.000Z";
@@ -69,7 +70,7 @@ function event(
     occurredAt,
     type,
     authority,
-    payload
+    payload: completeAgentEventPayload(type, payload) as JsonValue
   };
 }
 
@@ -269,6 +270,7 @@ describe("reviewer waiver user control plane", () => {
     const fixture = await pendingFixture(true);
     const first = runtime(fixture.storeRootDir, fixture.store);
     await first.command({ type: "resume", sessionId: "session" });
+    await first.waitForIdleOutcome("session");
     await first.command({
       type: "reviewer_waiver",
       sessionId: "session",

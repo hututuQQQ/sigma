@@ -90,7 +90,7 @@ jobs:
       - name: Verify portable Linux agent CLI
         env:
           AGENT_REQUIRE_TARGET_WRAPPER: "1"
-        run: pnpm verify:package:agent-cli
+        run: pnpm verify:package:agent-cli:linux
       - name: Required Linux namespace, Landlock, seccomp, and PTY security test
         run: >-
           python3 scripts/ci/linux-sandbox-smoke.py
@@ -110,8 +110,8 @@ jobs:
           --cli .artifacts/agent-cli-linux-x64/packages/agent-cli/dist/index.js
       - name: 100k-file repository performance
         run: node scripts/perf-repository-100k.mjs
-      - name: 100k-event V2 promotion memory and source-integrity gate
-        run: pnpm perf:migration-v2-100k
+      - name: 100k-event V4 replay and snapshot gate
+        run: pnpm perf:replay-v4-100k
       - name: Package Harbor runtime
         run: pnpm package:harbor-runtime
       - name: Product readiness
@@ -131,7 +131,7 @@ jobs:
             .artifacts/sandbox-smoke-linux-x64.json
             .artifacts/lsp-sandbox-smoke-linux-x64.json
             .artifacts/sigma-exec-branch-coverage.json
-            .artifacts/migration-v2-100k.json
+            .artifacts/replay-v4-100k.json
             .artifacts/product-readiness-linux-x64.*
 
   windows-release:
@@ -237,8 +237,8 @@ jobs:
           python scripts/ci/tui-real-terminal-smoke.py
           --node .artifacts/agent-cli-win32-x64/bin/node.exe
           --cli .artifacts/agent-cli-win32-x64/packages/agent-cli/dist/index.js
-      - name: 100k-event V2 promotion memory and source-integrity gate
-        run: pnpm perf:migration-v2-100k
+      - name: 100k-event V4 replay and snapshot gate
+        run: pnpm perf:replay-v4-100k
       - name: Product readiness
         run: pnpm product:readiness -- --target-platform win32 --target-arch x64
       - name: Upload Windows x64 preview evidence
@@ -256,5 +256,5 @@ jobs:
             .artifacts/sandbox-smoke-win32-x64.json
             .artifacts/lsp-sandbox-smoke-win32-x64.json
             .artifacts/sigma-exec-branch-coverage.json
-            .artifacts/migration-v2-100k.json
+            .artifacts/replay-v4-100k.json
             .artifacts/product-readiness-win32-x64.*

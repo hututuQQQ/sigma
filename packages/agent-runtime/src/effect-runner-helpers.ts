@@ -24,9 +24,9 @@ export function childOutcomeEvidence(
     : {};
   const childId = typeof detail.childId === "string" ? detail.childId : `joined-child-${index + 1}`;
   return {
-    evidenceId: `child:${session.runId}:${childId}`,
-    sessionId: session.sessionId,
-    runId: session.runId,
+    evidenceId: `child:${session.durable.runId}:${childId}`,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     kind: "child_outcome",
     status: "passed",
     createdAt: new Date().toISOString(),
@@ -42,7 +42,7 @@ export function mutatingPlan(plan: ToolCallPlan): boolean {
 }
 
 export function planAllowsMutation(session: RuntimeSession): boolean {
-  const active = session.state.plan.nodes.find((node) => node.id === session.state.plan.activeNodeId);
+  const active = session.durable.state.plan.nodes.find((node) => node.id === session.durable.state.plan.activeNodeId);
   return Boolean(active && active.owner.kind === "root" && active.status === "in_progress");
 }
 

@@ -18,6 +18,7 @@ import {
 } from "../packages/agent-protocol/src/index.js";
 import { recoverInterruptedSession } from "../packages/agent-runtime/src/session-recovery.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 class RecoveryGateway implements ModelGateway {
   readonly provider = "test-provider";
@@ -54,10 +55,10 @@ function event(
 ): AgentEventEnvelope {
   return {
     schemaVersion: EVENT_SCHEMA_VERSION,
-    seq: session.seq + 1,
+    seq: session.durable.seq + 1,
     eventId: randomUUID(),
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     occurredAt: new Date().toISOString(),
     type,
     authority,
@@ -113,32 +114,12 @@ function interruptedSession(semanticDelta: boolean, activeProcess = false): Runt
       payload: { processId: "background-1", executionId: "spawn-call", mode: "background" }
     });
   }
-  return {
-    sessionId: state.sessionId,
-    runId: state.runId,
-    modelTurn: 1,
-    workspacePath: ".",
-    mode: "change",
-    writeScope: [],
-    strictWriteScope: false,
-    gateway: new RecoveryGateway(),
-    modelRole: "orchestrator",
+  return runtimeSessionFixture({
     state,
     seq: state.lastSeq,
-    controller: null,
-    turnController: null,
-    deadlineTimer: null,
-    running: null,
-    subscribers: new Set(),
-    approvals: new Map(),
-    alwaysAllowedEffects: new Set(),
-    steeringPending: 0,
-    followUps: [],
-    contextItems: [],
-    loadedContextIds: new Set(),
-    outcomeWaiters: [],
-    idleWaiters: []
-  };
+    durable: { modelTurn: 1 },
+    services: { gateway: new RecoveryGateway() }
+  });
 }
 
 async function recover(semanticDelta: boolean, activeProcess = false): Promise<{
@@ -159,8 +140,8 @@ async function recover(semanticDelta: boolean, activeProcess = false): Promise<{
     },
     emit: async (type, authority, payload) => {
       const envelope = event(session, type, authority, payload as JsonValue);
-      session.seq = envelope.seq;
-      session.state = evolve(session.state, envelope);
+      session.durable.seq = envelope.seq;
+      session.durable.state = evolve(session.durable.state, envelope);
       types.push(type);
       return envelope;
     },
@@ -173,9 +154,9 @@ describe("interrupted model recovery", () => {
   it("conservatively accounts and retries only when no semantic delta is durable", async () => {
     const result = await recover(false);
     expect(result.types).toEqual(["usage.recorded", "diagnostic"]);
-    expect(result.session.state.phase).toBe("ready_model");
-    expect(result.session.state.usage).toHaveLength(1);
-    expect(result.session.state.usage[0]).toMatchObject({
+    expect(result.session.durable.state.phase).toBe("ready_model");
+    expect(result.session.durable.state.usage).toHaveLength(1);
+    expect(result.session.durable.state.usage[0]).toMatchObject({
       requestId: "model-recovery-run:1",
       providerReported: false,
       inputTokens: 100,
@@ -188,7 +169,7 @@ describe("interrupted model recovery", () => {
   it("suspends instead of replaying after durable content or reasoning", async () => {
     const result = await recover(true);
     expect(result.types).toEqual(["usage.recorded", "run.suspended"]);
-    expect(result.session.state).toMatchObject({
+    expect(result.session.durable.state).toMatchObject({
       phase: "needs_input",
       outcome: {
         kind: "needs_input",
@@ -206,8 +187,8 @@ describe("interrupted model recovery", () => {
       "diagnostic",
       "run.suspended"
     ]);
-    expect(result.session.state.activeProcessIds).toEqual([]);
-    expect(result.session.state).toMatchObject({
+    expect(result.session.durable.state.activeProcessIds).toEqual([]);
+    expect(result.session.durable.state).toMatchObject({
       phase: "needs_input",
       outcome: {
         kind: "needs_input",

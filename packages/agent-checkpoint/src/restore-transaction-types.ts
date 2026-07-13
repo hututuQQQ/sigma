@@ -1,12 +1,8 @@
 import type { WorkspaceTransactionDirectoryLease } from "agent-platform";
 import type { RestoreImageIdentity } from "./restore-image-identity.js";
 import type { RestoreCasReader } from "./restore-cas.js";
-import type {
-  CheckpointEntry,
-  CheckpointManifest,
-  CheckpointRecord,
-  CheckpointRestoreFaultEvent
-} from "./types.js";
+import type { CheckpointEntry, CheckpointManifest, CheckpointRecord } from "./types.js";
+import type { CheckpointRestoreFaultEvent } from "./fault-injection.js";
 
 export interface RestoreOperation {
   path: string;

@@ -12,7 +12,7 @@ import {
   type AgentEventEnvelope,
   type ToolCallPlan
 } from "../packages/agent-protocol/src/index.js";
-import { createChildAgentFactory, createRuntime } from "../packages/agent-runtime/src/index.js";
+import { createChildAgentFactory, createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { createApprovalBinding } from "../packages/agent-runtime/src/approval-binding.js";
 import { profilePermissionMode } from "../packages/agent-runtime/src/profile-policy.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -25,6 +25,7 @@ import {
   fakeToolTurn,
   SmokeFakeGateway
 } from "../scripts/smoke-fake-model.mjs";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const fixtures: string[] = [];
 
@@ -191,11 +192,11 @@ describe("sensitive per-call approvals", () => {
   it("uses the strictest runtime and profile permission mode", () => {
     expect(profilePermissionMode(
       { permissionMode: "deny" },
-      { profile: { profile: { permissionMode: "auto" } } } as never
+      { services: { profile: { profile: { permissionMode: "auto" } } } } as never
     )).toBe("deny");
     expect(profilePermissionMode(
       { permissionMode: "auto" },
-      { profile: { profile: { permissionMode: "deny" } } } as never
+      { services: { profile: { profile: { permissionMode: "deny" } } } } as never
     )).toBe("deny");
   });
 
@@ -652,12 +653,7 @@ describe("sensitive per-call approvals", () => {
       runDeadlineMs: 10_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
-    const rePrompt = (async () => {
-      for await (const event of runtime.subscribe("sensitive-session")) {
-        if (event.seq > 10 && event.type === "tool.approval_requested") return event;
-      }
-      throw new Error("missing approval re-prompt for changed plan");
-    })();
+    const rePrompt = nextEventAfter(runtime, "sensitive-session", 10, ["tool.approval_requested", "tool.failed"]);
     await runtime.command({
       type: "approve", sessionId: "sensitive-session", requestId: call.id, decision: "allow"
     });
@@ -775,6 +771,6 @@ function fixtureEvent(
     occurredAt: new Date(1_700_000_000_000 + seq).toISOString(),
     type,
     authority: "runtime",
-    payload
+    payload: completeAgentEventPayload(type, payload)
   };
 }

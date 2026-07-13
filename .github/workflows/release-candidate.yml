@@ -1,0 +1,93 @@
+name: Release candidate verification
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*-rc*"]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 26.4.0
+  PNPM_VERSION: 11.7.0
+  RUST_VERSION: 1.96.0
+  RUST_COVERAGE_TOOLCHAIN: nightly-2026-07-01
+  CARGO_LLVM_COV_VERSION: 0.8.6
+
+jobs:
+  verify:
+    name: ${{ matrix.label }} release and quick five
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x64
+            release: linux
+          - os: windows-2022
+            label: win32-x64
+            release: windows
+    runs-on: ${{ matrix.os }}
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Enable pnpm (Linux)
+        shell: bash
+        if: runner.os != 'Windows'
+        run: corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+      - name: Enable pnpm (Windows)
+        if: runner.os == 'Windows'
+        run: corepack enable; corepack prepare pnpm@$env:PNPM_VERSION --activate
+      - name: Install pinned Rust and coverage toolchain
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component llvm-tools-preview
+          rustup default "${RUST_VERSION}"
+          rustup toolchain install "${RUST_COVERAGE_TOOLCHAIN}" --profile minimal --component llvm-tools-preview
+          cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
+      - name: Install pinned Rust and coverage toolchain
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --component llvm-tools-preview
+          rustup default $env:RUST_VERSION
+          rustup toolchain install $env:RUST_COVERAGE_TOOLCHAIN --profile minimal --component llvm-tools-preview
+          cargo install cargo-llvm-cov --version $env:CARGO_LLVM_COV_VERSION --locked
+      - name: Prepare Linux sandbox
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+      - name: Install Windows ConPTY dependency
+        if: runner.os == 'Windows'
+        run: "python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r scripts/ci/windows-pty-requirements.txt"
+      - name: Install workspace
+        run: pnpm install --frozen-lockfile
+      - name: Verify release target
+        run: pnpm verify:release:${{ matrix.release }}
+      - name: Require all five live scenarios and zero safety failures
+        run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
+      - name: Upload candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc-${{ matrix.label }}-${{ github.run_id }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: .artifacts/**

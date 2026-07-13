@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "fileLimits": {
+    "production": 400,
+    "tui": 250,
+    "releaseAndEval": 400
+  },
+  "packages": {
+    "agent-protocol": [],
+    "agent-execution": [],
+    "agent-code-intel": ["agent-execution"],
+    "agent-config": ["agent-protocol"],
+    "agent-platform": ["agent-execution"],
+    "agent-checkpoint": ["agent-platform"],
+    "agent-context": ["agent-platform", "agent-protocol"],
+    "agent-model": ["agent-protocol"],
+    "agent-extensions": ["agent-model"],
+    "agent-kernel": ["agent-protocol"],
+    "agent-mcp": ["agent-execution", "agent-protocol"],
+    "agent-presentation": ["agent-protocol"],
+    "agent-store": ["agent-platform", "agent-protocol"],
+    "agent-supervisor": ["agent-platform", "agent-protocol"],
+    "agent-tools": ["agent-code-intel", "agent-execution", "agent-platform", "agent-protocol"],
+    "agent-runtime": [
+      "agent-checkpoint", "agent-code-intel", "agent-config", "agent-context", "agent-execution",
+      "agent-extensions", "agent-kernel", "agent-mcp", "agent-model", "agent-platform",
+      "agent-protocol", "agent-store", "agent-supervisor", "agent-tools"
+    ],
+    "agent-tui": ["agent-presentation", "agent-protocol"],
+    "agent-cli": [
+      "agent-code-intel", "agent-config", "agent-execution", "agent-extensions", "agent-presentation",
+      "agent-model", "agent-protocol", "agent-runtime", "agent-store", "agent-tui"
+    ]
+  }
+}

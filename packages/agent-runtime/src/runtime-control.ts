@@ -29,10 +29,10 @@ export class RuntimeControlService {
 
   forSession(session: RuntimeSession): RuntimeControlPort {
     return {
-      readPlan: async () => structuredClone(session.state.plan),
+      readPlan: async () => structuredClone(session.durable.state.plan),
       updatePlan: async (input) => await this.updatePlan(session, input),
-      readBudget: async () => structuredClone(session.state.budget),
-      listCheckpoints: async () => (await this.options.checkpoints.list(session.sessionId)).map(checkpointRef),
+      readBudget: async () => structuredClone(session.durable.state.budget),
+      listCheckpoints: async () => (await this.options.checkpoints.list(session.identity.sessionId)).map(checkpointRef),
       createCheckpoint: async (scopePaths) => await this.createCheckpoint(session, scopePaths),
       restoreRunCheckpoint: async (checkpointId) => await this.restoreRunCheckpoint(session, checkpointId),
       loadSkill: async (qualifiedName) => await this.skillControl.loadSkill(session, qualifiedName),
@@ -50,7 +50,7 @@ export class RuntimeControlService {
     { expectedRevision, plan }: { expectedRevision: number; plan: PlanGraph },
     allowChildOwnedChanges = false
   ): Promise<PlanGraph> {
-    return await this.serialPlan(session.sessionId, async () =>
+    return await this.serialPlan(session.identity.sessionId, async () =>
       await this.updatePlanLocked(session, expectedRevision, plan, allowChildOwnedChanges));
   }
 
@@ -58,8 +58,8 @@ export class RuntimeControlService {
     session: RuntimeSession,
     input: ChildPlanOutcome
   ): Promise<PlanGraph> {
-    return await this.serialPlan(session.sessionId, async () => {
-      const current = session.state.plan;
+    return await this.serialPlan(session.identity.sessionId, async () => {
+      const current = session.durable.state.plan;
       const next = planAfterChildOutcome(current, input);
       if (!next) return structuredClone(current);
       return await this.updatePlanLocked(session, current.revision, next, true);
@@ -72,8 +72,8 @@ export class RuntimeControlService {
     nodeIds: string[],
     previousPlan: PlanGraph
   ): Promise<PlanGraph> {
-    return await this.serialPlan(session.sessionId, async () => {
-      const current = session.state.plan;
+    return await this.serialPlan(session.identity.sessionId, async () => {
+      const current = session.durable.state.plan;
       const next = planAfterChildRollback(current, childId, nodeIds, previousPlan);
       if (!next) return structuredClone(current);
       return await this.updatePlanLocked(session, current.revision, next, true);
@@ -86,18 +86,18 @@ export class RuntimeControlService {
     plan: PlanGraph,
     allowChildOwnedChanges: boolean
   ): Promise<PlanGraph> {
-    if (session.state.plan.revision !== expectedRevision) {
-      throw Object.assign(new Error(`Plan revision conflict: expected ${expectedRevision}, actual ${session.state.plan.revision}.`), {
+    if (session.durable.state.plan.revision !== expectedRevision) {
+      throw Object.assign(new Error(`Plan revision conflict: expected ${expectedRevision}, actual ${session.durable.state.plan.revision}.`), {
         code: "plan_revision_conflict"
       });
     }
-    const currentRunEvidence = new Map(session.state.evidence
-      .filter((item) => item.sessionId === session.sessionId && item.runId === session.runId)
+    const currentRunEvidence = new Map(session.durable.state.evidence
+      .filter((item) => item.sessionId === session.identity.sessionId && item.runId === session.durable.runId)
       .map((item) => [item.evidenceId, item] as const));
-    assertPlanTransition(session.state.plan, plan, currentRunEvidence, allowChildOwnedChanges);
+    assertPlanTransition(session.durable.state.plan, plan, currentRunEvidence, allowChildOwnedChanges);
     await this.options.emit(session, "plan.updated", "runtime", { previousRevision: expectedRevision, plan });
     await this.options.planChanged?.(session, expectedRevision, plan);
-    return structuredClone(session.state.plan);
+    return structuredClone(session.durable.state.plan);
   }
 
   private async serialPlan<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {

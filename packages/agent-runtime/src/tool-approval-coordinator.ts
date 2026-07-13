@@ -45,7 +45,7 @@ function immediateApprovalDecision(
   const perCall = effects.some((effect) => effect === "network" || effect === "open_world");
   const effectGrant = effects.slice().sort().join("\0");
   return !perCall && (descriptor.approval === "auto" || permissionMode === "auto"
-    || session.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
+    || session.interaction.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
 }
 
 function validApprovalGrant(
@@ -73,9 +73,9 @@ async function cleanUpFailedApprovalRequest(
   requestWasDurable: boolean,
   signal: AbortSignal
 ): Promise<void> {
-  if (session.approvals.get(requestId) !== waiter) return;
-  session.approvals.delete(requestId);
-  const restartDeadline = session.approvals.size === 0;
+  if (session.interaction.approvals.get(requestId) !== waiter) return;
+  session.interaction.approvals.delete(requestId);
+  const restartDeadline = session.interaction.approvals.size === 0;
   const deadlineAt = restartDeadline ? resumedDeadlineAt(session) : undefined;
   try {
     if (requestWasDurable) {
@@ -87,8 +87,8 @@ async function cleanUpFailedApprovalRequest(
       });
     }
   } catch (error) {
-    if (restartDeadline && session.state.deadlineRemainingMs !== undefined) {
-      session.controller?.abort(Object.assign(
+    if (restartDeadline && session.durable.state.deadlineRemainingMs !== undefined) {
+      session.execution.controller?.abort(Object.assign(
         new Error("Failed to durably resume the run deadline after approval cleanup.", { cause: error }),
         { code: "approval_cleanup_failed" }
       ));
@@ -110,15 +110,15 @@ export class ToolApprovalCoordinator {
     const { call, modelTurn, descriptor, plan } = prepared;
     const permissionMode = profilePermissionMode(this.options.runtime, session);
     if (descriptor.approval === "deny" || permissionMode === "deny") return "deny";
-    const restored = session.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
+    const restored = session.durable.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
     const effects = approvalEffectsForPlan(plan);
     const expectedBinding = createApprovalBinding(
-      session.sessionId, session.runId, call, plan, effects
+      session.identity.sessionId, session.durable.runId, call, plan, effects
     );
-    const existingGrant = session.callApprovals.get(call.id);
+    const existingGrant = session.interaction.callApprovals.get(call.id);
     const hadCallGrant = Boolean(existingGrant);
     const freshCallGrant = sameApprovalBinding(existingGrant, expectedBinding);
-    if (existingGrant && !freshCallGrant) session.callApprovals.delete(call.id);
+    if (existingGrant && !freshCallGrant) session.interaction.callApprovals.delete(call.id);
     const requiresMatchingGrant = hadCallGrant
       || requiresFreshRecoveredApproval(plan)
       || requiresPerCallApproval(plan);
@@ -132,15 +132,15 @@ export class ToolApprovalCoordinator {
   consume(session: RuntimeSession, prepared: ApprovalRequest): ToolCallApproval | undefined {
     const effects = approvalEffectsForPlan(prepared.plan);
     const expectedBinding = createApprovalBinding(
-      session.sessionId, session.runId, prepared.call, prepared.plan, effects
+      session.identity.sessionId, session.durable.runId, prepared.call, prepared.plan, effects
     );
-    const restored = session.state.pendingTools
+    const restored = session.durable.state.pendingTools
       .find((item) => item.request.callId === prepared.call.id)?.approval;
     const perCall = requiresPerCallApproval(prepared.plan);
-    const grant = session.callApprovals.get(prepared.call.id);
+    const grant = session.interaction.callApprovals.get(prepared.call.id);
     const requiresGrant = Boolean(grant) || perCall
       || (restored === "allowed" && requiresFreshRecoveredApproval(prepared.plan));
-    session.callApprovals.delete(prepared.call.id);
+    session.interaction.callApprovals.delete(prepared.call.id);
     if (!requiresGrant) return undefined;
     if (!validApprovalGrant(grant, expectedBinding, prepared.plan)) {
       throw Object.assign(new Error("Sensitive execution requires a fresh per-call human approval."), {
@@ -154,7 +154,7 @@ export class ToolApprovalCoordinator {
           code: "per_call_approval_required"
         });
       }
-      session.alwaysAllowedEffects.add(grant.alwaysAllowEffectGrant);
+      session.interaction.alwaysAllowedEffects.add(grant.alwaysAllowEffectGrant);
     }
     return perCall ? grant : undefined;
   }
@@ -177,13 +177,13 @@ export class ToolApprovalCoordinator {
     if (immediate) return immediate;
     let resolve!: (value: "allow" | "deny" | "always_allow") => void;
     const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
-    if (session.approvals.has(requestId)) throw new Error(`Duplicate approval '${requestId}'.`);
+    if (session.interaction.approvals.has(requestId)) throw new Error(`Duplicate approval '${requestId}'.`);
     const waiter: ApprovalWaiter = {
       effects,
-      binding: createApprovalBinding(session.sessionId, session.runId, request, plan, effects),
+      binding: createApprovalBinding(session.identity.sessionId, session.durable.runId, request, plan, effects),
       resolve
     };
-    session.approvals.set(requestId, waiter);
+    session.interaction.approvals.set(requestId, waiter);
     const remainingDeadlineMs = pauseRunDeadline(session);
     let completed = false;
     let requestWasDurable = false;

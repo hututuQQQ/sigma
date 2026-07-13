@@ -1,26 +1,39 @@
 import type { JsonValue } from "./json.js";
+import type { z } from "zod";
+import type {
+  budgetAmountsSchema,
+  budgetLedgerStateSchema,
+  budgetLimitsSchema,
+  budgetReservationSchema,
+  checkpointDeltaSchema,
+  checkpointEvidenceSchema,
+  checkpointRefSchema,
+  childOutcomeEvidenceSchema,
+  commandEvidenceSchema,
+  diagnosticEvidenceSchema,
+  evidenceAuthoritySchema,
+  evidenceKindSchema,
+  evidenceProducerSchema,
+  evidenceRecordSchema,
+  evidenceRefSchema,
+  evidenceStatusSchema,
+  modelExecutionRoleSchema,
+  planGraphSchema,
+  reviewEvidenceSchema,
+  usageRecordSchema,
+  userWaiverEvidenceSchema,
+  validationEvidenceSchema,
+  workspaceDeltaEvidenceSchema
+} from "./domain-schemas.js";
 
 export type JsonObject = { [key: string]: JsonValue };
 
-export type EvidenceKind =
-  | "workspace_delta"
-  | "command"
-  | "validation"
-  | "diagnostic"
-  | "review"
-  | "checkpoint"
-  | "child_outcome"
-  | "user_waiver";
+export type EvidenceKind = z.infer<typeof evidenceKindSchema>;
+export type EvidenceStatus = z.infer<typeof evidenceStatusSchema>;
+export type EvidenceAuthority = z.infer<typeof evidenceAuthoritySchema>;
+export type EvidenceProducer = z.infer<typeof evidenceProducerSchema>;
 
-export type EvidenceStatus = "passed" | "failed" | "warning" | "informational";
-export type EvidenceAuthority = "system" | "developer" | "user" | "project" | "runtime" | "tool";
-
-export type EvidenceProducer = JsonObject & {
-  authority: EvidenceAuthority;
-  id?: string;
-};
-
-export type EvidenceBase<TKind extends EvidenceKind, TData extends JsonObject> = JsonObject & {
+export interface EvidenceBase<TKind extends EvidenceKind, TData> {
   evidenceId: string;
   sessionId: string;
   runId: string;
@@ -30,83 +43,19 @@ export type EvidenceBase<TKind extends EvidenceKind, TData extends JsonObject> =
   producer: EvidenceProducer;
   summary: string;
   data: TData;
-};
-
-export type CheckpointDelta = JsonObject & {
-  added: string[];
-  modified: string[];
-  deleted: string[];
-};
-
-export type WorkspaceDeltaEvidence = EvidenceBase<"workspace_delta", JsonObject & {
-  delta: CheckpointDelta;
-  checkpointId: string;
-}>;
-
-export type CommandEvidence = EvidenceBase<"command", JsonObject & {
-  command: string;
-  exitCode: number | null;
-  signal?: string;
-  artifactIds?: string[];
-  stdoutArtifactId?: string;
-  stderrArtifactId?: string;
-}>;
-
-export type ValidationEvidence = EvidenceBase<"validation", JsonObject & {
-  validator: string;
-  command?: string;
-  exitCode?: number;
-  artifactIds?: string[];
-  workspaceDeltaEvidenceIds: string[];
-}>;
-
-export type DiagnosticEvidence = EvidenceBase<"diagnostic", JsonObject & {
-  source: string;
-  diagnostic: JsonValue;
-}>;
-
-export type ReviewEvidence = EvidenceBase<"review", JsonObject & {
-  reviewerId: string;
-  verdict: "approved" | "changes_requested";
-  findings: JsonValue[];
-  workspaceDeltaEvidenceIds: string[];
-  validationEvidenceIds?: string[];
-  checkpointId?: string;
-}>;
-
-export type CheckpointEvidence = EvidenceBase<"checkpoint", JsonObject & {
-  checkpointId: string;
-  checkpointStatus: CheckpointStatus;
-  preManifestDigest: string;
-  postManifestDigest?: string;
-}>;
-
-export type ChildOutcomeEvidence = EvidenceBase<"child_outcome", JsonObject & {
-  childId: string;
-  outcome: "completed" | "failed" | "cancelled" | "blocked";
-  planNodeIds: string[];
-}>;
-
-export type UserWaiverEvidence = EvidenceBase<"user_waiver", JsonObject & {
-  scope: "review" | "validation";
-  reason: string;
-  checkpointId?: string;
-}>;
-
-export type EvidenceRecord =
-  | WorkspaceDeltaEvidence
-  | CommandEvidence
-  | ValidationEvidence
-  | DiagnosticEvidence
-  | ReviewEvidence
-  | CheckpointEvidence
-  | ChildOutcomeEvidence
-  | UserWaiverEvidence;
-
-export interface EvidenceRef {
-  evidenceId: string;
-  kind: EvidenceKind;
 }
+
+export type CheckpointDelta = z.infer<typeof checkpointDeltaSchema>;
+export type WorkspaceDeltaEvidence = z.infer<typeof workspaceDeltaEvidenceSchema>;
+export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
+export type ValidationEvidence = z.infer<typeof validationEvidenceSchema>;
+export type DiagnosticEvidence = z.infer<typeof diagnosticEvidenceSchema>;
+export type ReviewEvidence = z.infer<typeof reviewEvidenceSchema>;
+export type CheckpointEvidence = z.infer<typeof checkpointEvidenceSchema>;
+export type ChildOutcomeEvidence = z.infer<typeof childOutcomeEvidenceSchema>;
+export type UserWaiverEvidence = z.infer<typeof userWaiverEvidenceSchema>;
+export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
+export type EvidenceRef = z.infer<typeof evidenceRefSchema>;
 
 export interface ArtifactRef {
   artifactId: string;
@@ -116,96 +65,17 @@ export interface ArtifactRef {
   sizeBytes?: number;
 }
 
-export type ModelExecutionRole =
-  | "orchestrator"
-  | "planner"
-  | "reviewer"
-  | "child_analyze"
-  | "child_write"
-  | "summarizer";
-
-export interface UsageRecord {
-  usageId: string;
-  requestId: string;
-  sessionId: string;
-  runId: string;
-  role: ModelExecutionRole;
-  routeId: string;
-  providerId: string;
-  modelId: string;
-  tokenizerId: string;
-  tokenizerAccuracy: "exact" | "approximate";
-  /** Digest of the pinned tokenizer asset used for deterministic accounting, when applicable. */
-  tokenizerAssetDigest?: string;
-  providerReported: boolean;
-  inputTokens: number;
-  outputTokens: number;
-  reasoningTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  costMicroUsd: number;
-  latencyMs: number;
-  /** One-based provider/model attempt number. */
-  attempt: number;
-  occurredAt: string;
-}
-
-export type PlanNodeStatus = "pending" | "in_progress" | "blocked" | "completed" | "cancelled";
-
-export type PlanNodeOwner =
-  | { kind: "root" }
-  | { kind: "child"; childId: string };
-
-export interface PlanNode {
-  id: string;
-  title: string;
-  dependencies: string[];
-  status: PlanNodeStatus;
-  owner: PlanNodeOwner;
-  acceptanceCriteria: string[];
-  evidence: EvidenceRef[];
-  blockedReason?: string;
-  reopenReason?: string;
-}
-
-export interface PlanGraph {
-  revision: number;
-  goal: string;
-  activeNodeId?: string;
-  nodes: PlanNode[];
-}
-
-export interface BudgetAmounts {
-  inputTokens: number;
-  outputTokens: number;
-  costMicroUsd: number;
-  modelTurns: number;
-  toolCalls: number;
-  children: number;
-}
-
-export interface BudgetLimits extends BudgetAmounts {
-  maxDepth: number;
-}
-
-export type BudgetReservationStatus = "reserved" | "committed" | "released";
-
-export interface BudgetReservation {
-  reservationId: string;
-  ownerId: string;
-  status: BudgetReservationStatus;
-  requested: BudgetAmounts;
-  consumed: BudgetAmounts;
-  createdAt: string;
-  settledAt?: string;
-}
-
-export interface BudgetLedgerState {
-  limits: BudgetLimits;
-  consumed: BudgetAmounts;
-  reserved: BudgetAmounts;
-  reservations: BudgetReservation[];
-}
+export type ModelExecutionRole = z.infer<typeof modelExecutionRoleSchema>;
+export type UsageRecord = z.infer<typeof usageRecordSchema>;
+export type PlanGraph = z.infer<typeof planGraphSchema>;
+export type PlanNode = PlanGraph["nodes"][number];
+export type PlanNodeStatus = PlanNode["status"];
+export type PlanNodeOwner = PlanNode["owner"];
+export type BudgetAmounts = z.infer<typeof budgetAmountsSchema>;
+export type BudgetLimits = z.infer<typeof budgetLimitsSchema>;
+export type BudgetReservation = z.infer<typeof budgetReservationSchema>;
+export type BudgetReservationStatus = BudgetReservation["status"];
+export type BudgetLedgerState = z.infer<typeof budgetLedgerStateSchema>;
 
 export const DEFAULT_ROOT_BUDGET_LIMITS: BudgetLimits = {
   inputTokens: 8_000_000,
@@ -227,7 +97,7 @@ export const DEFAULT_CHILD_BUDGET_LIMITS: BudgetLimits = {
   maxDepth: 4
 };
 
-export type CheckpointStatus = "open" | "sealed" | "restored";
+export type CheckpointStatus = z.infer<typeof checkpointRefSchema>["status"];
 
 export type CheckpointEntryKind = "file" | "directory" | "symlink" | "missing";
 
@@ -248,18 +118,7 @@ export interface CheckpointManifest {
   totalBytes: number;
 }
 
-export interface CheckpointRef {
-  checkpointId: string;
-  sessionId: string;
-  runId: string;
-  status: CheckpointStatus;
-  createdAt: string;
-  sealedAt?: string;
-  restoredAt?: string;
-  preManifestDigest: string;
-  postManifestDigest?: string;
-  delta?: CheckpointDelta;
-}
+export type CheckpointRef = z.infer<typeof checkpointRefSchema>;
 
 export interface FrozenArtifactRef {
   artifactId: string;

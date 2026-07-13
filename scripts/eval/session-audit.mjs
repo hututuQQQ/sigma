@@ -2,7 +2,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { listV3Sessions, readV3Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
+import { listV4Sessions, readV4Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
 import { reduceAgentEvents, renderSessionMetricsMarkdown } from "./metrics.mjs";
 
 function positiveInteger(value, label) {
@@ -59,13 +59,13 @@ function reportSummary(sessions) {
 export async function auditSessions(options = {}) {
   const workspace = path.resolve(options.workspace ?? ".");
   const stateRoot = path.resolve(options.stateRoot ?? await resolveWorkspaceStateRoot(workspace, options.stateOptions));
-  const available = await listV3Sessions(stateRoot);
+  const available = await listV4Sessions(stateRoot);
   const requested = options.sessionIds?.length > 0
     ? [...new Set(options.sessionIds)]
     : available.slice(0, options.latest ?? 2).map((item) => item.sessionId);
   const sessions = [];
   for (const sessionId of requested) {
-    const stored = await readV3Session(stateRoot, sessionId);
+    const stored = await readV4Session(stateRoot, sessionId);
     sessions.push(reduceAgentEvents(stored.events, { sessionId }));
   }
   return {
@@ -114,7 +114,7 @@ export async function writeSessionAudit(report, outputDirectory) {
 function help() {
   return [
     "Usage: node scripts/eval/session-audit.mjs [options]",
-    "  --workspace <path>       Workspace whose V3 state should be audited (default: .)",
+    "  --workspace <path>       Workspace whose V4 state should be audited (default: .)",
     "  --state-root <path>      Explicit workspace state root (primarily for isolated runs)",
     "  --latest <n>             Audit the latest N sessions (default: 2)",
     "  --session <id>           Audit an exact session; repeatable",

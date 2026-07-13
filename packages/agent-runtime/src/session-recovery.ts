@@ -24,7 +24,7 @@ function mutating(descriptor: ToolDescriptor | undefined): boolean {
 
 function mustNotReplay(session: RuntimeSession, descriptor: ToolDescriptor | undefined): boolean {
   if (!descriptor?.idempotent) return true;
-  const checkpointStatus = session.state.checkpointHead?.status;
+  const checkpointStatus = session.durable.state.checkpointHead?.status;
   return mutating(descriptor) && (checkpointStatus === "sealed" || checkpointStatus === "restored");
 }
 
@@ -33,19 +33,19 @@ function interruptedModelUsage(
   requestId: string,
   charged: BudgetAmounts
 ): UsageRecord {
-  const routed = session.gateway as typeof session.gateway & {
+  const routed = session.services.gateway as typeof session.services.gateway & {
     routingIdentity?(): { role: UsageRecord["role"]; routeId: string };
   };
   const identity = routed.routingIdentity?.();
   return {
     usageId: randomUUID(),
     requestId,
-    sessionId: session.sessionId,
-    runId: session.runId,
-    role: identity?.role ?? session.modelRole,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
+    role: identity?.role ?? session.services.modelRole,
     routeId: identity?.routeId ?? "recovery/default",
-    providerId: session.gateway.provider,
-    modelId: session.gateway.model,
+    providerId: session.services.gateway.provider,
+    modelId: session.services.gateway.model,
     tokenizerId: "recovery/conservative",
     tokenizerAccuracy: "approximate",
     providerReported: false,
@@ -62,14 +62,14 @@ function interruptedModelUsage(
 }
 
 async function recoverInterruptedModel(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
-  const active = session.state.activeModelTurn;
+  const active = session.durable.state.activeModelTurn;
   if (!active) throw new Error("Interrupted model state is missing its active turn.");
-  const requestId = `${session.runId}:${active.turnId}`;
+  const requestId = `${session.durable.runId}:${active.turnId}`;
   const charged = await options.settleModelBudget(requestId);
-  if (charged && !session.state.usage.some((item) => item.requestId === requestId)) {
+  if (charged && !session.durable.state.usage.some((item) => item.requestId === requestId)) {
     await options.emit("usage.recorded", "runtime", interruptedModelUsage(session, requestId, charged));
   }
-  if (session.state.activeModelSemanticDelta) {
+  if (session.durable.state.activeModelSemanticDelta) {
     await options.emit("run.suspended", "runtime", {
       requestId: `model-recovery:${requestId}`,
       message: "The interrupted model attempt produced durable content or reasoning. It will not be replayed automatically; send a follow-up to continue."
@@ -83,7 +83,7 @@ async function recoverInterruptedModel(session: RuntimeSession, options: Recover
 }
 
 async function recoverUnstartedTool(
-  pending: RuntimeSession["state"]["pendingTools"][number],
+  pending: RuntimeSession["durable"]["state"]["pendingTools"][number],
   descriptor: ToolDescriptor | undefined,
   options: RecoveryOptions
 ): Promise<void> {
@@ -105,22 +105,22 @@ async function recoverUnstartedTool(
 }
 
 export async function recoverInterruptedSession(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
-  if (session.state.phase === "terminal") return;
-  const lostProcessIds = [...session.state.activeProcessIds];
+  if (session.durable.state.phase === "terminal") return;
+  const lostProcessIds = [...session.durable.state.activeProcessIds];
   for (const processId of lostProcessIds) {
     await options.emit("process.lost", "runtime", {
       processId,
       reason: "The runtime restarted; background process handles are valid only for the runtime lifecycle that created them."
     });
   }
-  if (session.state.phase === "model_in_flight") {
+  if (session.durable.state.phase === "model_in_flight") {
     await recoverInterruptedModel(session, options);
   }
-  for (const pending of [...session.state.pendingTools]) {
+  for (const pending of [...session.durable.state.pendingTools]) {
     const descriptor = options.descriptors.find((item) => item.name === pending.request.name);
     if (pending.approval === "pending") {
-      if (!session.approvals.has(pending.request.callId)) {
-        session.approvals.set(pending.request.callId, {
+      if (!session.interaction.approvals.has(pending.request.callId)) {
+        session.interaction.approvals.set(pending.request.callId, {
           effects: descriptor?.possibleEffects ?? [], recovered: true, resolve: () => undefined
         });
       }
@@ -140,7 +140,7 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
     await options.settleToolBudget(
       pending.request.callId,
       "commit",
-      mutating(descriptor) ? session.state.checkpointHead?.checkpointId : undefined
+      mutating(descriptor) ? session.durable.state.checkpointHead?.checkpointId : undefined
     );
     await options.emit(
       "tool.failed",
@@ -157,5 +157,5 @@ export async function recoverInterruptedSession(session: RuntimeSession, options
     return;
   }
   await options.settleEligibleToolBudgets();
-  if (["ready_model", "tool_pending", "outcome_pending"].includes(session.state.phase)) options.start();
+  if (["ready_model", "tool_pending", "outcome_pending"].includes(session.durable.state.phase)) options.start();
 }

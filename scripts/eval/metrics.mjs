@@ -80,23 +80,24 @@ function terminalSummary(events) {
 function eventCounts(events) {
   const byType = {};
   for (const event of events) byType[event.type] = (byType[event.type] ?? 0) + 1;
-  const toolCalls = byType["tool.requested"] ?? 0;
-  const toolFailures = byType["tool.failed"] ?? 0;
+  const count = (type) => byType[type] ?? 0;
+  const toolCalls = count("tool.requested");
+  const toolFailures = count("tool.failed");
   return {
     totalEvents: events.length,
     byType,
-    modelTurns: byType["model.started"] ?? 0,
-    modelCompletions: byType["model.completed"] ?? 0,
-    modelFailures: byType["model.failed"] ?? 0,
+    modelTurns: count("model.started"),
+    modelCompletions: count("model.completed"),
+    modelFailures: count("model.failed"),
     toolCalls,
-    toolCompletions: byType["tool.completed"] ?? 0,
+    toolCompletions: count("tool.completed"),
     toolFailures,
     toolFailureRate: toolCalls === 0 ? 0 : toolFailures / toolCalls,
-    approvals: byType["tool.approval_requested"] ?? 0,
-    approvalResolutions: byType["tool.approval_resolved"] ?? 0,
-    contextCompactions: byType["context.compacted"] ?? 0,
-    userMessages: (byType["user.message"] ?? 0) + (byType["user.follow_up"] ?? 0),
-    steers: byType["user.steer"] ?? 0
+    approvals: count("tool.approval_requested"),
+    approvalResolutions: count("tool.approval_resolved"),
+    contextCompactions: count("context.compacted"),
+    userMessages: count("user.message") + count("user.follow_up"),
+    steers: count("user.steer")
   };
 }
 
@@ -266,6 +267,29 @@ function isSubstantiveProgress(event, seenSuccessfulOutputs) {
   return true;
 }
 
+function newStagnationWindow(event) {
+  return {
+      startSeq: event.seq, endSeq: event.seq, startedAt: event.occurredAt, endedAt: event.occurredAt,
+      startedMs: timestamp(event), durationMs: 0, workUnits: 0, modelTurns: 0,
+      toolCalls: 0, failures: 0, compactions: 0, repeatedRequests: 0
+  };
+}
+
+function updateStagnationWindow(active, event, seenRequests, isFailure) {
+    if (event.type === "model.started") active.modelTurns += 1;
+    if (event.type === "tool.requested") {
+      active.toolCalls += 1;
+      const identity = requestIdentity(event).hash;
+      if (seenRequests.has(identity)) active.repeatedRequests += 1;
+      seenRequests.add(identity);
+    }
+    if (event.type === "context.compacted") active.compactions += 1;
+    if (isFailure) active.failures += 1;
+    if (WORK_TYPES.has(event.type)) active.workUnits += 1;
+    active.endSeq = event.seq;
+    active.endedAt = event.occurredAt;
+}
+
 function stagnationWindows(events, minimumWorkUnits) {
   const windows = [];
   const seenRequests = new Set();
@@ -285,25 +309,10 @@ function stagnationWindows(events, minimumWorkUnits) {
       finish(event);
       continue;
     }
-    const isFailure = event.type === "tool.failed" || event.type === "model.failed" || event.type === "execution.failed";
+    const isFailure = ["tool.failed", "model.failed", "execution.failed"].includes(event.type);
     if (!WORK_TYPES.has(event.type) && !isFailure) continue;
-    active ??= {
-      startSeq: event.seq, endSeq: event.seq, startedAt: event.occurredAt, endedAt: event.occurredAt,
-      startedMs: timestamp(event), durationMs: 0, workUnits: 0, modelTurns: 0,
-      toolCalls: 0, failures: 0, compactions: 0, repeatedRequests: 0
-    };
-    if (event.type === "model.started") active.modelTurns += 1;
-    if (event.type === "tool.requested") {
-      active.toolCalls += 1;
-      const identity = requestIdentity(event).hash;
-      if (seenRequests.has(identity)) active.repeatedRequests += 1;
-      seenRequests.add(identity);
-    }
-    if (event.type === "context.compacted") active.compactions += 1;
-    if (isFailure) active.failures += 1;
-    if (WORK_TYPES.has(event.type)) active.workUnits += 1;
-    active.endSeq = event.seq;
-    active.endedAt = event.occurredAt;
+    active ??= newStagnationWindow(event);
+    updateStagnationWindow(active, event, seenRequests, isFailure);
   }
   if (active) finish(events.at(-1) ?? { seq: active.endSeq, occurredAt: active.endedAt });
   return windows.sort((left, right) => right.workUnits - left.workUnits || right.durationMs - left.durationMs).slice(0, 20);
@@ -531,15 +540,27 @@ function hardFailures(events, mode, workspace) {
 }
 
 /**
- * Reduce validated V3 durable events to JSON-safe, content-redacted experience metrics.
+ * Reduce validated V4 durable events to JSON-safe, content-redacted experience metrics.
  * Tool arguments and outputs are represented only by SHA-256 fingerprints.
  */
 export function reduceAgentEvents(input, options = {}) {
   const allEvents = sortedEvents(input);
   const latestRunStart = allEvents.findLastIndex((event) => event.type === "run.started");
-  const latestRunId = latestRunStart >= 0 ? allEvents[latestRunStart].runId : null;
-  const events = latestRunStart < 0 ? allEvents : allEvents.slice(latestRunStart)
-    .filter((event) => !latestRunId || event.runId === latestRunId);
+  const events = latestRunEvents(allEvents, latestRunStart);
+  const boundaries = runBoundaries(events);
+  const { runStarted } = boundaries;
+  const mode = options.mode ?? record(runStarted?.payload).mode ?? null;
+  const workspace = workspaceDeltas(events);
+  return sessionMetrics(events, options, boundaries, mode, workspace);
+}
+
+function latestRunEvents(allEvents, latestRunStart) {
+  if (latestRunStart < 0) return allEvents;
+  const latestRunId = allEvents[latestRunStart].runId;
+  return allEvents.slice(latestRunStart).filter((event) => event.runId === latestRunId);
+}
+
+function runBoundaries(events) {
   const first = events[0] ?? null;
   const last = events.at(-1) ?? null;
   const runStarted = events.find((event) => event.type === "run.started");
@@ -547,22 +568,20 @@ export function reduceAgentEvents(input, options = {}) {
   const startedMs = timestamp(runStarted ?? first ?? { occurredAt: "" });
   const endedMs = timestamp(runTerminal ?? last ?? { occurredAt: "" });
   const durationMs = startedMs > 0 && endedMs >= startedMs ? endedMs - startedMs : 0;
-  const mode = options.mode ?? record(runStarted?.payload).mode ?? null;
-  const workspace = workspaceDeltas(events);
+  return { first, last, runStarted, runTerminal, durationMs };
+}
+
+function sessionMetrics(events, options, boundaries, mode, workspace) {
+  const { durationMs } = boundaries;
   const repetitions = groupRepeatedRequests(events);
   const repeatedOutputs = groupRepeatedOutputs(events);
   return {
     schemaVersion: 1,
     kind: "sigma.agent-session-metrics",
-    sessionId: first?.sessionId ?? options.sessionId ?? null,
-    runId: last?.runId ?? null,
+    ...sessionIdentity(events, options, boundaries),
     runIds: [...new Set(events.map((event) => event.runId))],
     mode,
-    timestamps: {
-      firstEventAt: first?.occurredAt ?? null,
-      startedAt: runStarted?.occurredAt ?? first?.occurredAt ?? null,
-      endedAt: runTerminal?.occurredAt ?? last?.occurredAt ?? null
-    },
+    timestamps: sessionTimestamps(boundaries),
     durationMs,
     terminal: terminalSummary(events),
     counts: eventCounts(events),
@@ -577,6 +596,21 @@ export function reduceAgentEvents(input, options = {}) {
     postAnswerChurn: postAnswerChurn(events),
     steer: steerMetrics(events),
     hardFailures: hardFailures(events, mode, workspace)
+  };
+}
+
+function sessionIdentity(_events, options, boundaries) {
+  return {
+    sessionId: boundaries.first?.sessionId ?? options.sessionId ?? null,
+    runId: boundaries.last?.runId ?? null
+  };
+}
+
+function sessionTimestamps({ first, last, runStarted, runTerminal }) {
+  return {
+    firstEventAt: first?.occurredAt ?? null,
+    startedAt: runStarted?.occurredAt ?? first?.occurredAt ?? null,
+    endedAt: runTerminal?.occurredAt ?? last?.occurredAt ?? null
   };
 }
 

@@ -20,13 +20,14 @@ import {
   STORE_LAYOUT_VERSION
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
+import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 import { typedCompletion } from "./helpers/typed-evidence.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
@@ -307,8 +308,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const waiting = runtime.waitForOutcome(session.sessionId, controller.signal);
     controller.abort(new Error("stop waiting"));
     await expect(waiting).rejects.toThrow("stop waiting");
-    const sessions = (runtime as unknown as { sessions: Map<string, { outcomeWaiters: unknown[] }> }).sessions;
-    expect(sessions.get(session.sessionId)?.outcomeWaiters).toHaveLength(0);
+    const sessions = (runtime as unknown as {
+      sessions: Map<string, { interaction: { outcomeWaiters: unknown[] } }>;
+    }).sessions;
+    expect(sessions.get(session.sessionId)?.interaction.outcomeWaiters).toHaveLength(0);
     await runtime.command({ type: "cancel", sessionId: session.sessionId, reason: "test cleanup" });
   });
 
@@ -427,7 +430,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         occurredAt: new Date(Date.now() + seq).toISOString(),
         type,
         authority: type === "user.message" || type === "user.follow_up" ? "user" : "runtime",
-        payload
+        payload: completeAgentEventPayload(type, payload)
       };
       await store.append(event, seq);
       seq += 1;
@@ -474,7 +477,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       occurredAt: startedAt,
       type: "session.created",
       authority: "runtime",
-      payload: { workspacePath: workspace, mode: "change" }
+      payload: completeAgentEventPayload("session.created", { workspacePath: workspace, mode: "change" })
     }, 0);
     const snapshotState = {
       ...createKernelState({ sessionId, runId, mode: "change", startedAt, deadlineAt }),
@@ -525,7 +528,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         occurredAt: new Date(Date.now() + seq).toISOString(),
         type,
         authority: type === "user.message" ? "user" : "runtime",
-        payload
+        payload: completeAgentEventPayload(type, payload)
       };
       await store.append(stored, seq);
       seq += 1;
@@ -641,7 +644,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     let seq = 0;
     const append = async (type: "child.spawned" | "child.completed" | "child.message", detail: Record<string, unknown>): Promise<void> => {
       const event = {
-        schemaVersion: EVENT_SCHEMA_VERSION, seq: seq + 1, eventId: `child-event-${seq + 1}`, parentSessionId,
+        schemaVersion: EVENT_SCHEMA_VERSION, seq: seq + 1, eventId: `child-event-${seq + 1}`,
         sessionId: parentSessionId, runId: "parent-run", occurredAt: new Date(Date.now() + seq).toISOString(),
         type, authority: "runtime" as const, payload: { childId: "child-1", payload: detail }
       };

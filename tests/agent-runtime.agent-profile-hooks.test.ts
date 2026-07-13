@@ -22,7 +22,7 @@ import {
   createConfiguredRuntime,
   createRuntime,
   type RuntimeCompositionConfig
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry } from "../packages/agent-tools/src/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";

@@ -12,7 +12,7 @@ import { runReplayCommand } from "../packages/agent-cli/src/commands/replay.js";
 import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
-import { createRuntime } from "../packages/agent-runtime/src/index.js";
+import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";

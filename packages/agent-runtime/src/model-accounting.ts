@@ -27,6 +27,20 @@ export interface PreparedModelBudget {
   routeConstraints?: ModelRouteConstraints;
 }
 
+type ModelUsageSession = {
+  identity: { sessionId: string };
+  durable: { runId: string };
+} | {
+  sessionId: string;
+  runId: string;
+};
+
+function modelUsageScope(session: ModelUsageSession): { sessionId: string; runId: string } {
+  return "identity" in session
+    ? { sessionId: session.identity.sessionId, runId: session.durable.runId }
+    : session;
+}
+
 interface BudgetAwareGateway extends ModelGateway {
   budgetPlan(
     messages: ModelMessage[], tools: ModelToolDefinition[], maxOutputTokens: number, remainingBudgetMicroUsd: number
@@ -169,7 +183,7 @@ function usageIdentity(
 }
 
 function record(
-  session: { sessionId: string; runId: string },
+  session: ModelUsageSession,
   gateway: ModelGateway,
   requestId: string,
   prepared: PreparedModelBudget,
@@ -178,11 +192,12 @@ function record(
   role: ModelExecutionRole
 ): UsageRecord {
   const identity = usageIdentity(gateway, response, prepared, role);
+  const scope = modelUsageScope(session);
   return {
     usageId: randomUUID(),
     requestId,
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: scope.sessionId,
+    runId: scope.runId,
     role: identity.role,
     routeId: identity.routeId,
     providerId: identity.providerId,
@@ -204,7 +219,7 @@ function record(
 }
 
 export function successfulModelUsage(
-  session: { sessionId: string; runId: string },
+  session: ModelUsageSession,
   gateway: ModelGateway,
   requestId: string,
   request: { messages: ModelMessage[]; tools: ModelToolDefinition[] },
@@ -233,7 +248,7 @@ export function successfulModelUsage(
 }
 
 export function failedModelUsage(
-  session: { sessionId: string; runId: string },
+  session: ModelUsageSession,
   gateway: ModelGateway,
   requestId: string,
   prepared: PreparedModelBudget,

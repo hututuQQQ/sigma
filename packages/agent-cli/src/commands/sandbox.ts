@@ -1,5 +1,4 @@
-import type { ExecutionBroker } from "agent-execution";
-import { LazyExecutionBroker } from "agent-runtime";
+import { LazyExecutionBroker, type ExecutionBroker } from "agent-execution";
 
 interface SandboxCommandDeps {
   stdout?: NodeJS.WritableStream;

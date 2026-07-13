@@ -25,10 +25,10 @@
     "agent-config": "workspace:*",
     "agent-execution": "workspace:*",
     "agent-extensions": "workspace:*",
+    "agent-model": "workspace:*",
     "agent-presentation": "workspace:*",
     "agent-protocol": "workspace:*",
     "agent-runtime": "workspace:*",
-    "agent-store": "workspace:*",
     "agent-tui": "workspace:*",
     "smol-toml": "^1.7.0"
   },

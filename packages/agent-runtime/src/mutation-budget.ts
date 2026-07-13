@@ -34,7 +34,7 @@ export async function settleEligibleToolBudgets(
   session: RuntimeSession,
   budgets: BudgetController
 ): Promise<void> {
-  const active = session.state.budget.reservations.filter((item) => item.status === "reserved");
+  const active = session.durable.state.budget.reservations.filter((item) => item.status === "reserved");
   for (const reservation of active) {
     const mutation = parseMutationBudgetOwner(reservation.ownerId);
     if (mutation ? mutationReservationSatisfied(session, reservation, mutation) : toolReceiptExists(session, reservation)) {
@@ -59,8 +59,8 @@ function mutationReservationSatisfied(
 ): boolean {
   const deltas = mutationDeltas(session, mutation.checkpointId);
   if (deltas.length === 0) {
-    return session.openCheckpointRecovery?.checkpointId !== mutation.checkpointId
-      && session.state.receipts.some((item) => item.callId === mutation.callId);
+    return session.recovery.openCheckpointRecovery?.checkpointId !== mutation.checkpointId
+      && session.durable.state.receipts.some((item) => item.callId === mutation.callId);
   }
   const evidence = sessionMutationEvidence(session);
   const validations = evidence.filter((item): item is ValidationEvidence =>
@@ -79,5 +79,5 @@ function mutationDeltas(session: RuntimeSession, checkpointId: string): Workspac
 
 function toolReceiptExists(session: RuntimeSession, reservation: BudgetReservation): boolean {
   if (!reservation.ownerId.startsWith("tool:")) return false;
-  return session.state.receipts.some((item) => `tool:${item.callId}` === reservation.ownerId);
+  return session.durable.state.receipts.some((item) => `tool:${item.callId}` === reservation.ownerId);
 }

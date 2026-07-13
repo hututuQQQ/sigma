@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ModelToolCall, ToolCallPlan, ToolDescriptor } from "../packages/agent-protocol/src/index.js";
 import { writeScopeFailure } from "../packages/agent-runtime/src/effect-helpers.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const descriptor: ToolDescriptor = {
   name: "exec",
@@ -37,11 +38,10 @@ function plan(exactEffects: ToolCallPlan["exactEffects"], writePaths: string[]):
 }
 
 function session(workspacePath: string): RuntimeSession {
-  return {
-    strictWriteScope: true,
-    writeScope: ["delegated"],
-    workspacePath
-  } as RuntimeSession;
+  return runtimeSessionFixture({
+    workspacePath,
+    identity: { strictWriteScope: true, writeScope: ["delegated"] }
+  });
 }
 
 describe("plan-aware delegated write scope", () => {

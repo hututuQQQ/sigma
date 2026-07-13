@@ -89,14 +89,14 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       }
     }
   });
-  await writeJson(path.join(artifactsDir, "migration-v2-100k.json"), {
+  await writeJson(path.join(artifactsDir, "replay-v4-100k.json"), {
     schemaVersion: 1,
-    kind: "v2Migration100k",
+    kind: "v4Replay100k",
     ok: true,
     events: 100_000,
     elapsedMs: 5_000,
     peakRssMiB: 200,
-    sourceUnchanged: true
+    snapshotRebuilt: true
   });
   await writeJson(path.join(artifactsDir, "sigma-exec-branch-coverage.json"), {
     data: [{ files: [{

@@ -1,4 +1,11 @@
-import type { ContextItem, ModelMessage, ModelRequest, ModelResponse, ModelToolDefinition } from "agent-protocol";
+import type {
+  ContextItem,
+  ModelExecutionRole,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+  ModelToolDefinition
+} from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
 import { approximateTokens, RepositoryContextProvider } from "agent-context";
 import type { ModelRouteConstraints } from "agent-model";
@@ -30,8 +37,8 @@ interface ModelReservationState {
 }
 
 function evidenceLedger(session: RuntimeSession): ContextItem | undefined {
-  const available = session.state.evidence.filter((item) => item.sessionId === session.sessionId
-    && item.runId === session.runId && item.status !== "failed");
+  const available = session.durable.state.evidence.filter((item) => item.sessionId === session.identity.sessionId
+    && item.runId === session.durable.runId && item.status !== "failed");
   if (available.length === 0) return undefined;
   const recent = available.slice(-96);
   const content = [
@@ -40,7 +47,7 @@ function evidenceLedger(session: RuntimeSession): ContextItem | undefined {
     ...recent.map((item) => `- ${item.evidenceId.replace(/\s+/gu, " ")} (${item.kind}, ${item.status})`)
   ].join("\n");
   return {
-    id: `runtime:evidence-ledger:${session.runId}:${session.seq}`,
+    id: `runtime:evidence-ledger:${session.durable.runId}:${session.durable.seq}`,
     authority: "runtime",
     provenance: "current-run typed durable evidence ledger",
     content,
@@ -58,25 +65,25 @@ export class ModelEffectRunner {
 
   async request(session: RuntimeSession, signal: AbortSignal, effect: RequestModelEffect): Promise<void> {
     const turnController = new AbortController();
-    session.turnController = turnController;
+    session.execution.turnController = turnController;
     const turnSignal = AbortSignal.any([signal, turnController.signal]);
-    const turnId = ++session.modelTurn;
+    const turnId = ++session.durable.modelTurn;
     let effectRevision = effect.revision;
     try {
       const hookResult = await this.options.hooks.dispatch(session, "pre_model", {
-        sessionId: session.sessionId,
-        runId: session.runId,
-        mode: session.mode,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
+        mode: session.durable.mode,
         turnId,
         effectRevision: effect.revision,
-        provider: session.gateway.provider,
-        model: session.gateway.model,
-        messageCount: session.state.messages.length
+        provider: session.services.gateway.provider,
+        model: session.services.gateway.model,
+        messageCount: session.durable.state.messages.length
       }, turnSignal);
-      effectRevision = session.state.revision;
+      effectRevision = session.durable.state.revision;
       await this.options.emit(session, "model.started", "runtime", {
-        provider: session.gateway.provider,
-        model: session.gateway.model,
+        provider: session.services.gateway.provider,
+        model: session.services.gateway.model,
         turnId,
         effectRevision
       });
@@ -89,8 +96,8 @@ export class ModelEffectRunner {
   }
 
   private isCurrent(session: RuntimeSession, turnId: number, effectRevision: number): boolean {
-    return session.state.activeModelTurn?.turnId === turnId
-      && session.state.activeModelTurn.effectRevision === effectRevision;
+    return session.durable.state.activeModelTurn?.turnId === turnId
+      && session.durable.state.activeModelTurn.effectRevision === effectRevision;
   }
 
   private async handleFailure(
@@ -114,7 +121,7 @@ export class ModelEffectRunner {
     };
     if (typeof routeFailure.routeId === "string" && typeof routeFailure.modelSpecId === "string") {
       await this.options.emit(session, "model.route_failed", "runtime", {
-        role: session.modelRole,
+        role: session.services.modelRole,
         routeId: routeFailure.routeId,
         modelSpecId: routeFailure.modelSpecId,
         attempt: typeof routeFailure.attempts === "number" ? routeFailure.attempts : 1,
@@ -138,26 +145,26 @@ export class ModelEffectRunner {
     hookContext: readonly ContextItem[]
   ): Promise<void> {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
-      isToolAllowed(item, session.mode) && profileAllowsTool(session, item));
-    const terminalRepair = session.state.completionRepairAttempts > 0
-      && session.state.receipts.length > session.state.receiptCountAtLastUserInput;
+      isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
+    const terminalRepair = session.durable.state.completionRepairAttempts > 0
+      && session.durable.state.receipts.length > session.durable.state.receiptCountAtLastUserInput;
     const descriptors = terminalRepair
       ? availableDescriptors.filter((item) => item.possibleEffects.includes("outcome.propose")
         || item.possibleEffects.includes("outcome.request_input"))
       : availableDescriptors;
     const tools = modelTools(descriptors);
-    const query = [...session.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
-    const dynamic = await this.repositoryContext.collect(session.workspacePath, query, signal);
+    const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
+    const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
       const ledger = evidenceLedger(session);
-    const plan = await providerSizedPlan(session.gateway, {
-      system: ledger ? [...session.contextItems, ...hookContext, ledger] : [...session.contextItems, ...hookContext],
-      history: session.state.messages,
+    const plan = await providerSizedPlan(session.services.gateway, {
+      system: ledger ? [...session.interaction.contextItems, ...hookContext, ledger] : [...session.interaction.contextItems, ...hookContext],
+      history: session.durable.state.messages,
       dynamic,
       tools,
       outputReserveTokens: this.options.outputReserveTokens
     });
-    if (plan.summary && !session.loadedContextIds.has(plan.summary.id)) {
-      session.loadedContextIds.add(plan.summary.id);
+    if (plan.summary && !session.interaction.loadedContextIds.has(plan.summary.id)) {
+      session.interaction.loadedContextIds.add(plan.summary.id);
       await this.options.emit(session, "context.compacted", "runtime", {
         item: plan.summary,
         omittedHistoryTurns: plan.omittedHistoryTurns
@@ -165,13 +172,13 @@ export class ModelEffectRunner {
     }
     signal.throwIfAborted();
     const budget = await prepareModelBudget(
-      session.gateway,
+      session.services.gateway,
       plan.messages,
       tools,
       this.options.outputReserveTokens,
-      Math.max(0, session.state.budget.limits.costMicroUsd
-        - session.state.budget.consumed.costMicroUsd
-        - session.state.budget.reserved.costMicroUsd)
+      Math.max(0, session.durable.state.budget.limits.costMicroUsd
+        - session.durable.state.budget.consumed.costMicroUsd
+        - session.durable.state.budget.reserved.costMicroUsd)
     );
     const turn: PreparedModelTurn = {
       messages: plan.messages,
@@ -179,7 +186,7 @@ export class ModelEffectRunner {
       ...(terminalRepair ? { toolChoice: "required" } : {}),
       budget
     };
-    const requestId = `${session.runId}:${turnId}`;
+    const requestId = `${session.durable.runId}:${turnId}`;
     const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, budget.reserved);
     await this.runReserved(session, turnId, effectRevision, signal, turn, requestId, reservationId);
   }
@@ -224,13 +231,13 @@ export class ModelEffectRunner {
   ): Promise<void> {
     const usage = successfulModelUsage(
       session,
-      session.gateway,
+      session.services.gateway,
       requestId,
       { messages: turn.messages, tools: turn.tools },
       response,
       turn.budget,
       performance.now() - startedAt,
-      session.modelRole
+      session.services.modelRole
     );
     await this.options.budgets.commitMeasured(session, reservationId, consumedBudget(usage, turn.budget));
     state.settled = true;
@@ -247,8 +254,8 @@ export class ModelEffectRunner {
       usage
     });
     await this.options.hooks.dispatch(session, "post_model", {
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       turnId,
       effectRevision,
       provider: usage.providerId,
@@ -266,8 +273,13 @@ export class ModelEffectRunner {
       routeId?: string; role?: string; modelSpecId?: string; attempt?: number; tokenizerAssetDigest?: string
     };
     if (!routed.routeId || !routed.modelSpecId) return;
+    const roles: readonly ModelExecutionRole[] = [
+      "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"
+    ];
+    const role = roles.includes(routed.role as ModelExecutionRole)
+      ? routed.role as ModelExecutionRole : "orchestrator";
     await this.options.emit(session, "model.route_resolved", "runtime", {
-      role: routed.role ?? "orchestrator",
+      role,
       routeId: routed.routeId,
       modelSpecId: routed.modelSpecId,
       attempt: (routed.attempt ?? 0) + 1,
@@ -286,7 +298,7 @@ export class ModelEffectRunner {
     const attempts = typeof (error as { attempts?: unknown })?.attempts === "number"
       ? Math.max(1, Math.trunc((error as { attempts: number }).attempts)) : 1;
     const usage = failedModelUsage(
-      session, session.gateway, requestId, turn.budget, performance.now() - startedAt, session.modelRole, attempts
+      session, session.services.gateway, requestId, turn.budget, performance.now() - startedAt, session.services.modelRole, attempts
     );
     await this.options.budgets.commit(session, reservationId, consumedBudget(usage, turn.budget));
     await this.options.emit(session, "usage.recorded", "runtime", usage);
@@ -319,7 +331,7 @@ export class ModelEffectRunner {
       }
       lastFlush = Date.now();
     };
-    const gateway = session.gateway as typeof session.gateway & {
+    const gateway = session.services.gateway as typeof session.services.gateway & {
       streamWithConstraints?(
         request: ModelRequest,
         constraints: ModelRouteConstraints
@@ -330,7 +342,7 @@ export class ModelEffectRunner {
       tools,
       ...(toolChoice ? { toolChoice } : {}),
       signal,
-      maxOutputTokens: Math.min(this.options.outputReserveTokens, session.gateway.capabilities.maxOutputTokens)
+      maxOutputTokens: Math.min(this.options.outputReserveTokens, session.services.gateway.capabilities.maxOutputTokens)
     };
     const stream = routeConstraints && gateway.streamWithConstraints
       ? gateway.streamWithConstraints(request, routeConstraints)
@@ -352,8 +364,8 @@ export class ModelEffectRunner {
   }
 
   private addContinuationContext(session: RuntimeSession): void {
-    session.contextItems.push({
-      id: `runtime:continue:${session.seq}`,
+    session.interaction.contextItems.push({
+      id: `runtime:continue:${session.durable.seq}`,
       authority: "runtime",
       provenance: "model finish reason",
       content: "The previous response reached its output limit. Continue from the exact stopping point without repeating completed work.",

@@ -5,11 +5,11 @@ export async function releaseRuntimeSession(
   waitForQuiescence: () => Promise<void>,
   releaseOwner: () => Promise<void>
 ): Promise<boolean> {
-  const running = session.running;
+  const running = session.execution.running;
   await running?.catch(() => undefined);
   await waitForQuiescence().catch(() => undefined);
-  if (session.running && session.running !== running) return false;
-  for (const subscriber of session.subscribers) subscriber.close();
+  if (session.execution.running && session.execution.running !== running) return false;
+  for (const subscriber of session.interaction.subscribers) subscriber.close();
   await releaseOwner();
   return true;
 }

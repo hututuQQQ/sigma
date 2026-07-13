@@ -25,9 +25,9 @@ import type {
 import { validateRestoreCas } from "./restore-cas.js";
 import {
   CheckpointConflictError,
-  CheckpointRecoveryError,
-  type CheckpointRestoreFaultEvent
+  CheckpointRecoveryError
 } from "./types.js";
+import type { CheckpointRestoreFaultEvent } from "./fault-injection.js";
 
 export {
   assertRestoreImage,

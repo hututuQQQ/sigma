@@ -135,9 +135,9 @@ async function preflightMinimumBudget(
   for (const [dimension, requested] of Object.entries(minimums) as Array<
     [keyof typeof minimums, number]
   >) {
-    const available = session.state.budget.limits[dimension]
-      - session.state.budget.consumed[dimension]
-      - session.state.budget.reserved[dimension];
+    const available = session.durable.state.budget.limits[dimension]
+      - session.durable.state.budget.consumed[dimension]
+      - session.durable.state.budget.reserved[dimension];
     if (available >= requested) continue;
     await emit(session, "budget.exhausted", "runtime", { dimension, requested, available });
     return `Budget '${dimension}' requires ${requested}, but only ${available} remains.`;
@@ -170,16 +170,16 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
 
   async recoverInterrupted(session: RuntimeSession): Promise<number> {
     let recovered = 0;
-    for (const reservation of session.state.budget.reservations) {
+    for (const reservation of session.durable.state.budget.reservations) {
       const identity = hookReservation(reservation);
       if (!identity || reservation.status === "released"
-        || session.state.usage.some((item) => item.requestId === reservation.ownerId)) continue;
+        || session.durable.state.usage.some((item) => item.requestId === reservation.ownerId)) continue;
       const consumed = reservation.status === "reserved" ? reservation.requested : reservation.consumed;
       if (reservation.status === "reserved") {
         await this.options.budgets.commit(session, reservation.reservationId, reservation.requested);
       }
       const profile = this.options.resolveProfile(session, identity.profileId);
-      const gateway = profile ? this.options.gateway(session, profile) : session.gateway;
+      const gateway = profile ? this.options.gateway(session, profile) : session.services.gateway;
       const prepared = {
         estimatedInputTokens: Math.max(1, consumed.inputTokens),
         reserved: consumed,
@@ -265,17 +265,17 @@ export class ModelAgentProfileHookRunner implements HookRunnerPort {
     }
     const safeInput = this.redactor.redactUnknown(request.input) as Readonly<Record<string, unknown>>;
     const hookMessages = messages(request, safeInput);
-    const remainingOutputTokens = session.state.budget.limits.outputTokens
-      - session.state.budget.consumed.outputTokens
-      - session.state.budget.reserved.outputTokens;
+    const remainingOutputTokens = session.durable.state.budget.limits.outputTokens
+      - session.durable.state.budget.consumed.outputTokens
+      - session.durable.state.budget.reserved.outputTokens;
     const maxOutputTokens = Math.min(
       this.options.maxOutputTokens ?? 2_048,
       gateway.capabilities.maxOutputTokens,
       Math.max(1, Math.floor(remainingOutputTokens / APPROXIMATE_TOKEN_RESERVATION_MARGIN))
     );
-    const remainingCost = Math.max(0, session.state.budget.limits.costMicroUsd
-      - session.state.budget.consumed.costMicroUsd
-      - session.state.budget.reserved.costMicroUsd);
+    const remainingCost = Math.max(0, session.durable.state.budget.limits.costMicroUsd
+      - session.durable.state.budget.consumed.costMicroUsd
+      - session.durable.state.budget.reserved.costMicroUsd);
     let prepared;
     try {
       prepared = await prepareModelBudget(gateway, hookMessages, [], maxOutputTokens, remainingCost);

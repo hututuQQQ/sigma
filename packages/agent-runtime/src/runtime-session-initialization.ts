@@ -58,7 +58,7 @@ async function emitResolvedProfile(
   options: RuntimeSessionInitializationOptions
 ): Promise<void> {
   if (!options.profile) return;
-  const artifactId = await options.putArtifact(session.sessionId, options.profile.canonicalJson);
+  const artifactId = await options.putArtifact(session.identity.sessionId, options.profile.canonicalJson);
   await options.emit(session, "profile.resolved", "runtime", {
     profileId: options.profile.profile.id,
     digest: options.profile.digest,
@@ -74,8 +74,8 @@ export function addFrozenSkillMetadata(
   for (const skill of customization.skills) {
     const content = `Available skill ${skill.qualifiedName}: ${skill.description} (digest ${skill.digest}). Call load_skill to load its instructions.`;
     const id = `skill:${skill.qualifiedName}:${skill.digest}`;
-    if (session.loadedContextIds.has(id)) continue;
-    session.contextItems.push({
+    if (session.interaction.loadedContextIds.has(id)) continue;
+    session.interaction.contextItems.push({
       id,
       authority: skill.source === "workspace" ? "project" : "runtime",
       provenance: `${skill.source} skill metadata`,
@@ -83,7 +83,7 @@ export function addFrozenSkillMetadata(
       tokenCount: Math.ceil(content.length / 4),
       priority: 800
     });
-    session.loadedContextIds.add(id);
+    session.interaction.loadedContextIds.add(id);
   }
 }
 
@@ -100,16 +100,16 @@ async function emitFrozenCustomization(
     hookArtifacts: options.hookArtifacts
   });
   await persistFrozenWorkspaceHookAssets(
-    session.workspacePath,
-    session.sessionId,
+    session.identity.workspacePath,
+    session.identity.sessionId,
     customization,
     async (sessionId, content) => await options.putArtifact(sessionId, content)
   );
-  const artifactId = await options.putArtifact(session.sessionId, customization.canonicalJson);
+  const artifactId = await options.putArtifact(session.identity.sessionId, customization.canonicalJson);
   if (artifactId !== customization.digest) {
     throw new Error("Customization artifact store returned a non-content-addressed identifier.");
   }
-  session.frozenCustomization = customization;
+  session.durable.frozenCustomization = customization;
   await options.emit(session, "customization.frozen", "runtime", {
     digest: customization.digest,
     artifactId,
@@ -129,8 +129,8 @@ async function emitReviewerWaiver(
   if (!normalizedReason) return;
   await emit(session, "review.waived", "user", {
     evidenceId: randomUUID(),
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     kind: "user_waiver",
     status: "informational",
     createdAt: new Date().toISOString(),
@@ -146,21 +146,21 @@ export async function initializeRuntimeSession(
   options: RuntimeSessionInitializationOptions
 ): Promise<void> {
   await options.emit(session, "session.created", "runtime", {
-    workspacePath: session.workspacePath,
+    workspacePath: session.identity.workspacePath,
     mode: input.mode,
     title: input.title ?? "",
-    writeScope: session.writeScope,
-    strictWriteScope: session.strictWriteScope,
-    modelRole: session.modelRole,
-    ...(session.parentSessionId ? { parentSessionId: session.parentSessionId } : {})
+    writeScope: session.identity.writeScope,
+    strictWriteScope: session.identity.strictWriteScope,
+    modelRole: session.services.modelRole,
+    ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {})
   });
   await emitResolvedProfile(session, options);
   await emitFrozenCustomization(session, options);
   await options.dispatchHook(session, "session_start", {
-    sessionId: session.sessionId,
-    runId: session.runId,
-    workspacePath: session.workspacePath,
-    mode: session.mode,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
+    workspacePath: session.identity.workspacePath,
+    mode: session.durable.mode,
     profileId: options.profile?.profile.id ?? null
   }, new AbortController().signal);
   const plan = initialPlan(input);

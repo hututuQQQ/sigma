@@ -97,8 +97,8 @@ export function failed(call: ModelToolCall, startedAt: string, output: string, d
 }
 
 export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
-  return session.state.evidence.filter((item) =>
-    item.sessionId === session.sessionId && item.runId === session.runId);
+  return session.durable.state.evidence.filter((item) =>
+    item.sessionId === session.identity.sessionId && item.runId === session.durable.runId);
 }
 
 function completionChangeEvidenceError(session: RuntimeSession): string | null {
@@ -125,15 +125,15 @@ function completionChangeEvidenceError(session: RuntimeSession): string | null {
 
 export function completionFailure(session: RuntimeSession, call: ModelToolCall, descriptor: ToolDescriptor, startedAt: string): ToolReceipt | null {
   if (!descriptor.possibleEffects.includes("outcome.propose")) return null;
-  if (session.state.activeProcessIds.length > 0) {
+  if (session.durable.state.activeProcessIds.length > 0) {
     return failed(
       call,
       startedAt,
-      `Completion is blocked while background processes remain active: ${session.state.activeProcessIds.join(", ")}. Poll or terminate them first.`,
+      `Completion is blocked while background processes remain active: ${session.durable.state.activeProcessIds.join(", ")}. Poll or terminate them first.`,
       "active_processes"
     );
   }
-  if (session.state.checkpointHead?.status === "open" || session.openCheckpointRecovery) {
+  if (session.durable.state.checkpointHead?.status === "open" || session.recovery.openCheckpointRecovery) {
     return failed(
       call,
       startedAt,
@@ -161,25 +161,25 @@ export function completionFailure(session: RuntimeSession, call: ModelToolCall, 
 }
 
 export function completionPlan(session: RuntimeSession): import("agent-protocol").PlanGraph | null {
-  const pending = session.state.plan.nodes.filter((node) => node.status !== "completed" && node.status !== "cancelled");
+  const pending = session.durable.state.plan.nodes.filter((node) => node.status !== "completed" && node.status !== "cancelled");
   if (pending.length !== 1 || pending[0]?.id !== "root" || pending[0].status !== "in_progress") return null;
-  const evidence = session.state.evidence
-    .filter((item) => item.sessionId === session.sessionId && item.runId === session.runId)
+  const evidence = session.durable.state.evidence
+    .filter((item) => item.sessionId === session.identity.sessionId && item.runId === session.durable.runId)
     .filter((item) => item.status !== "failed")
     .map((item) => ({ evidenceId: item.evidenceId, kind: item.kind }));
   if (evidence.length === 0) return null;
   return {
-    ...session.state.plan,
-    revision: session.state.plan.revision + 1,
+    ...session.durable.state.plan,
+    revision: session.durable.state.plan.revision + 1,
     activeNodeId: undefined,
-    nodes: session.state.plan.nodes.map((node) => node.id === "root"
+    nodes: session.durable.state.plan.nodes.map((node) => node.id === "root"
       ? { ...node, status: "completed" as const, evidence }
       : node)
   };
 }
 
 export function completionPlanError(session: RuntimeSession, call: ModelToolCall, startedAt: string): ToolReceipt | null {
-  const incomplete = session.state.plan.nodes.filter((node) => node.status !== "completed" && node.status !== "cancelled");
+  const incomplete = session.durable.state.plan.nodes.filter((node) => node.status !== "completed" && node.status !== "cancelled");
   return incomplete.length === 0 ? null : failed(
     call,
     startedAt,
@@ -218,16 +218,16 @@ export async function writeScopeFailure(
   startedAt: string,
   plan?: ToolCallPlan
 ): Promise<ToolReceipt | null> {
-  if (!session.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
+  if (!session.identity.strictWriteScope || !needsWriteScope(plan, descriptor)) return null;
   const input = structuredArguments(call);
   if (!input) return failed(call, startedAt, "Scoped writer tools require structured path arguments.", "write_scope_denied");
   const targets = scopedWriteTargets(plan, descriptor, input);
   if (targets.length === 0) return failed(call, startedAt, `Tool '${call.name}' can write outside declared paths and is disabled in an exclusive shared workspace.`, "write_scope_denied");
-  const scopes = await Promise.all(session.writeScope.map(async (scope) =>
-    await canonicalWorkspacePath(session.workspacePath, scope)));
+  const scopes = await Promise.all(session.identity.writeScope.map(async (scope) =>
+    await canonicalWorkspacePath(session.identity.workspacePath, scope)));
   const outside: string[] = [];
   for (const target of targets) {
-    const canonical = await canonicalWorkspacePath(session.workspacePath, target).catch(() => null);
+    const canonical = await canonicalWorkspacePath(session.identity.workspacePath, target).catch(() => null);
     if (!canonical || !scopes.some((scope) => isInside(scope, canonical))) outside.push(target);
   }
   return outside.length > 0 ? failed(call, startedAt, `Write target is outside the delegated scope: ${outside.join(", ")}.`, "write_scope_denied") : null;
@@ -249,7 +249,7 @@ export function workspaceWriteLockKey(session: RuntimeSession): string {
 }
 
 function workspaceLockScope(session: RuntimeSession): string {
-  return process.platform === "win32" ? session.workspacePath.toLowerCase() : session.workspacePath;
+  return process.platform === "win32" ? session.identity.workspacePath.toLowerCase() : session.identity.workspacePath;
 }
 
 export function requiresInstructionReplan(descriptor: ToolDescriptor): boolean {

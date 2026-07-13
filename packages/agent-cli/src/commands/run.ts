@@ -1,11 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { stdin as processStdin, stdout as processStdout, stderr as processStderr } from "node:process";
-import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome } from "agent-protocol";
+import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
 import {
   createConfiguredRuntime,
   type ConfiguredRuntime,
-  type InProcessRuntimeClient,
   type RuntimeFactoryDeps
 } from "agent-runtime";
 import {
@@ -60,7 +59,7 @@ function outcomeMessage(outcome: RunOutcome): string {
 
 async function promptApproval(
   event: AgentEventEnvelope,
-  runtime: InProcessRuntimeClient,
+  runtime: RuntimeClient,
   stdin: NodeJS.ReadableStream & { isTTY?: boolean },
   stderr: NodeJS.WritableStream
 ): Promise<void> {
@@ -96,7 +95,7 @@ function writeEvent(event: AgentEventEnvelope, config: CliConfig, stderr: NodeJS
 }
 
 async function streamSession(
-  runtime: InProcessRuntimeClient,
+  runtime: RuntimeClient,
   sessionId: string,
   config: CliConfig,
   stdin: NodeJS.ReadableStream & { isTTY?: boolean },

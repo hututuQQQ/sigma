@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJson } from "./common.mjs";
 import { subjectNodeLaunch } from "./subject-launch.mjs";
+import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const driverPath = fileURLToPath(new URL("./tui-driver.py", import.meta.url));
 const SUBJECT_ENVIRONMENT_BRIDGE = "SIGMA_TUI_SUBJECT_ENVIRONMENT_B64";
@@ -122,7 +123,7 @@ export async function runTuiSubject(options) {
       "tui",
       "--workspace", workspace,
       "--provider", "deepseek",
-      "--model", "deepseek-v4-pro",
+      "--model", sigmaManifest.evaluation.model,
       "--permission-mode", permissionPolicy === "auto" ? "auto" : "ask"
     ]),
     workspace,

@@ -22,12 +22,12 @@ import {
   frozenHookExecutionRoot,
   FrozenWorkspaceHookMaterializer,
   persistFrozenWorkspaceHookAssets,
-  RuntimeHookCoordinator,
-  type RuntimeSession
-} from "../packages/agent-runtime/src/index.js";
+  RuntimeHookCoordinator
+} from "../packages/agent-runtime/src/testing.js";
 import { ContentAddressedArtifactStore, SegmentedJsonlStore, sessionDirectory } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "../scripts/smoke-fake-model.mjs";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 function executionResult(overrides: Partial<ExecutionResult> = {}): ExecutionResult {
   return {
@@ -253,15 +253,12 @@ timeout_ms = 5000
         (await artifacts.get(sessionId, customizationId)).toString("utf8"), customization.digest
       );
       const materializer = new FrozenWorkspaceHookMaterializer(state, artifacts);
-      const session = {
+      const session = runtimeSessionFixture({
         sessionId,
         runId: "run",
         workspacePath: workspace,
-        frozenCustomization: resumed,
-        seq: 0,
-        contextItems: [],
-        loadedContextIds: new Set<string>()
-      } as unknown as RuntimeSession;
+        durable: { frozenCustomization: resumed }
+      });
       let executions = 0;
       const runner: HookRunnerPort = {
         run: async (request) => {
@@ -289,10 +286,10 @@ timeout_ms = 5000
         definitions: [],
         runner,
         materializeWorkspaceHook: async (current, hook) =>
-          await materializer.materialize(current.workspacePath, current.sessionId, hook),
+          await materializer.materialize(current.identity.workspacePath, current.identity.sessionId, hook),
         emit: async (current) => {
-          current.seq += 1;
-          return { seq: current.seq } as AgentEventEnvelope;
+          current.durable.seq += 1;
+          return { seq: current.durable.seq } as AgentEventEnvelope;
         }
       });
       await expect(coordinator.dispatch(session, "pre_model", {}, new AbortController().signal))
@@ -373,14 +370,7 @@ required = true
 
   it("persists lifecycle events and durable provenance for pre-model context", async () => {
     const events: Array<{ type: string; payload: unknown }> = [];
-    const session = {
-      sessionId: "session",
-      runId: "run",
-      workspacePath: process.cwd(),
-      seq: 0,
-      contextItems: [],
-      loadedContextIds: new Set<string>()
-    } as unknown as RuntimeSession;
+    const session = runtimeSessionFixture({ workspacePath: process.cwd() });
     const runner: HookRunnerPort = {
       run: vi.fn(async () => ({
         ok: true,
@@ -393,8 +383,8 @@ required = true
       runner,
       emit: async (current, type, _authority, payload) => {
         events.push({ type, payload });
-        current.seq += 1;
-        return { seq: current.seq } as AgentEventEnvelope;
+        current.durable.seq += 1;
+        return { seq: current.durable.seq } as AgentEventEnvelope;
       }
     });
     const dispatch = await coordinator.dispatch(session, "pre_model", { turnId: 1 }, new AbortController().signal);
@@ -403,19 +393,13 @@ required = true
       content: "policy supplied context",
       provenance: "hook:policy:pre_model"
     })]);
-    expect(session.contextItems).toEqual([]);
+    expect(session.interaction.contextItems).toEqual([]);
     expect(events[2]?.payload).toMatchObject({ kind: "hook_context_added", items: dispatch.contextItems });
   });
 
   it("persists failed gates and rejects recursive events", async () => {
     const eventTypes: string[] = [];
-    const session = {
-      sessionId: "session-recursive",
-      runId: "run",
-      seq: 0,
-      contextItems: [],
-      loadedContextIds: new Set<string>()
-    } as unknown as RuntimeSession;
+    const session = runtimeSessionFixture({ sessionId: "session-recursive" });
     const coordinatorRef: { current?: RuntimeHookCoordinator } = {};
     const runner: HookRunnerPort = {
       run: async () => {
@@ -428,8 +412,8 @@ required = true
       runner,
       emit: async (current, type) => {
         eventTypes.push(type);
-        current.seq += 1;
-        return { seq: current.seq } as AgentEventEnvelope;
+        current.durable.seq += 1;
+        return { seq: current.durable.seq } as AgentEventEnvelope;
       }
     });
     coordinatorRef.current = coordinator;

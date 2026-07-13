@@ -5,9 +5,9 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CheckpointManager,
-  type CheckpointRecord,
-  type CheckpointRestoreFaultEvent
+  type CheckpointRecord
 } from "../packages/agent-checkpoint/src/index.js";
+import type { CheckpointRestoreFaultEvent } from "../packages/agent-checkpoint/src/testing.js";
 import type {
   AgentEventEnvelope,
   AgentEventType,
@@ -23,9 +23,10 @@ import type {
 import { EVENT_SCHEMA_VERSION } from "../packages/agent-protocol/src/index.js";
 import {
   createRuntime,
+  createRuntimeForTesting,
   restoreStoredSession,
   type InProcessRuntimeClient
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 
@@ -114,7 +115,14 @@ async function recoveryFixture(
     baseSeq: 2
   });
   const events = [
-    event(sessionId, runId, 1, "session.created", { workspacePath: workspace, mode: "change" }),
+    event(sessionId, runId, 1, "session.created", {
+      workspacePath: workspace,
+      mode: "change",
+      title: "Checkpoint recovery fixture",
+      writeScope: [],
+      strictWriteScope: false,
+      modelRole: "orchestrator"
+    }),
     event(sessionId, runId, 2, "run.started", {
       mode: "change",
       deadlineAt: new Date(Date.now() + 60_000).toISOString()
@@ -123,16 +131,15 @@ async function recoveryFixture(
   ];
   for (const stored of events) await store.append(stored, stored.seq - 1);
   await writeFile(path.join(workspace, "target.txt"), "partial mutation", "utf8");
-  const runtime = createRuntime({
+  const runtime = createRuntimeForTesting({
     gateway: new UnusedGateway(),
     store,
     storeRootDir,
     tools: registerBuiltinTools(new EffectToolRegistry()),
     permissionMode: "auto",
     runDeadlineMs: 60_000,
-    ...(hasActiveChildren ? { hasActiveChildren: () => hasActiveChildren() } : {}),
-    ...(restoreFaultInjector ? { checkpointRestoreFaultInjector: restoreFaultInjector } : {})
-  });
+    ...(hasActiveChildren ? { hasActiveChildren: () => hasActiveChildren() } : {})
+  }, restoreFaultInjector);
   return { workspace, store, runtime, manager, checkpoint };
 }
 
