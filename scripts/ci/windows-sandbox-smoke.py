@@ -328,9 +328,19 @@ const containment = () => JSON.parse(execFileSync(
   {encoding: "utf8"}
 ));
 const parentContainment = containment();
-const child = fork(path.join(process.cwd(), "runtime-ipc-child.cjs"), [], {
-  stdio: ["ignore", "pipe", "pipe", "ipc"]
-});
+let child;
+try {
+  child = fork(path.join(process.cwd(), "runtime-ipc-child.cjs"), [], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"]
+  });
+} catch (error) {
+  console.log(JSON.stringify({
+    ok: false,
+    parentContainment,
+    error: {code: error?.code, message: error?.message}
+  }));
+  process.exit(2);
+}
 let stdout = "";
 let stderr = "";
 let pong;
@@ -366,8 +376,80 @@ setTimeout(() => { console.error("ipc timeout"); child.kill(); process.exit(4); 
             ipc_report = json.loads(ipc_result["stdout"]["data"].strip())
         except json.JSONDecodeError as error:
             raise RuntimeError(f"bundled Node IPC returned invalid JSON: {ipc_result}") from error
-        if ipc_result["exitCode"] != 0 or not ipc_report.get("ok") or ipc_report.get("pong") != "pong":
-            raise RuntimeError(f"bundled Node IPC/containment failed inside LPAC: {ipc_result}")
+        ipc_channel_available = ipc_result["exitCode"] == 0 and ipc_report.get("ok")
+        ipc_unavailable_reason = None
+        if not ipc_channel_available:
+            ipc_error = ipc_report.get("error", {})
+            if ipc_error.get("code") != "EPERM":
+                raise RuntimeError(f"bundled Node IPC/containment failed inside LPAC: {ipc_result}")
+            ipc_unavailable_reason = ipc_error.get("message", "spawn EPERM")
+            stdio_child_file = workspace / "runtime-stdio-child.cjs"
+            stdio_child_file.write_text(
+                '"use strict";\n'
+                'const {execFileSync}=require("node:child_process");\n'
+                'const containment=()=>JSON.parse(execFileSync(process.env.SIGMA_CONTAINMENT_PROBE,'
+                '["--internal-appcontainer-containment-probe"],{encoding:"utf8"}));\n'
+                'let input="";process.stdin.setEncoding("utf8");'
+                'process.stdin.on("data",chunk=>input+=chunk);'
+                'process.stdin.on("end",()=>{const message=JSON.parse(input);'
+                'process.stdout.write(JSON.stringify({type:"pong",nonce:message.nonce,'
+                'stdout:"sigma-ipc-child-stdout",containment:containment()}));});\n',
+                encoding="utf-8",
+            )
+            stdio_parent_script = r'''
+const {execFileSync, spawn} = require("node:child_process");
+const path = require("node:path");
+const containment = () => JSON.parse(execFileSync(
+  process.env.SIGMA_CONTAINMENT_PROBE,
+  ["--internal-appcontainer-containment-probe"],
+  {encoding: "utf8"}
+));
+const parentContainment = containment();
+const child = spawn(process.execPath, [path.join(process.cwd(), "runtime-stdio-child.cjs")], {
+  stdio: ["pipe", "pipe", "pipe"]
+});
+let stdout = "";
+let stderr = "";
+child.stdout.on("data", chunk => stdout += chunk);
+child.stderr.on("data", chunk => stderr += chunk);
+child.on("error", error => { console.error(error); process.exit(3); });
+child.on("close", code => {
+  let pong;
+  try { pong = JSON.parse(stdout); } catch {}
+  const contained = value => value?.isAppContainer && value?.tokenHasLpacAttribute && value?.inJob;
+  const ok = code === 0
+    && pong?.nonce === "sigma-ipc-nonce"
+    && pong?.stdout === "sigma-ipc-child-stdout"
+    && contained(parentContainment)
+    && contained(pong?.containment);
+  console.log(JSON.stringify({
+    ok, code, stdout: pong?.stdout, stderr, parentContainment,
+    childContainment: pong?.containment, pong: pong?.type
+  }));
+  process.exit(ok ? 0 : 2);
+});
+child.stdin.end(JSON.stringify({type: "ping", nonce: "sigma-ipc-nonce"}));
+setTimeout(() => { console.error("stdio timeout"); child.kill(); process.exit(4); }, 5000).unref();
+'''.strip()
+            stdio_request = node_params(workspace, node, ["-e", stdio_parent_script])
+            stdio_request["command"]["env"]["SIGMA_CONTAINMENT_PROBE"] = str(broker_path)
+            stdio_request["policy"]["readRoots"].append(str(broker_path))
+            stdio_request["policy"]["executionRoots"].append(str(broker_path))
+            stdio_result = require_ok(
+                broker.request("exec", {**stdio_request, "timeoutMs": 10000})
+            )
+            try:
+                ipc_report = json.loads(stdio_result["stdout"]["data"].strip())
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"bundled Node stdio fallback returned invalid JSON: {stdio_result}"
+                ) from error
+            if stdio_result["exitCode"] != 0 or not ipc_report.get("ok"):
+                raise RuntimeError(
+                    f"bundled Node stdio/containment fallback failed inside LPAC: {stdio_result}"
+                )
+        if ipc_report.get("pong") != "pong":
+            raise RuntimeError(f"bundled Node child ping-pong failed inside LPAC: {ipc_report}")
 
         node_boundary_script = r"""
 const fs = require("fs");
@@ -602,8 +684,14 @@ setTimeout(() => process.exit(4), 3000);
                 "shellPathVersion": shell_node_version["stdout"]["data"].strip(),
                 "testRunner": True,
                 "childProcess": True,
-                "ipcPingPong": True,
-                "ipcCapturedStdout": ipc_report["stdout"] == "sigma-ipc-child-stdout",
+                "ipcPingPong": ipc_channel_available,
+                "stdioPingPong": True,
+                "ipcUnavailableReason": ipc_unavailable_reason,
+                "ipcCapturedStdout": (
+                    ipc_channel_available
+                    and ipc_report["stdout"] == "sigma-ipc-child-stdout"
+                ),
+                "stdioCapturedStdout": ipc_report["stdout"] == "sigma-ipc-child-stdout",
                 "parentContainment": ipc_report["parentContainment"],
                 "childContainment": ipc_report["childContainment"],
                 "cjsEntry": True,
