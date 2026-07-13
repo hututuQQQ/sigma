@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { cp, lstat, mkdir, readFile, readdir, readlink, rm, writeFile, appendFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile, appendFile } from "node:fs/promises";
 import path from "node:path";
+import { generateRepoScaleFixtureV1 } from "./fixture-generator.mjs";
 
 function run(command, args, cwd, env = process.env) {
   return new Promise((resolve, reject) => {
@@ -32,11 +33,51 @@ function safeRelative(value, label = "workspace path") {
   return normalized;
 }
 
-async function applySetupOperation(workspace, operation) {
+export function evaluatorLinkTargetRoot(attemptRoot) {
+  return path.join(path.resolve(attemptRoot), "evaluator-link-targets");
+}
+
+async function setLinkTargetState(target, operation) {
+  if (operation.targetExists === undefined) return;
+  if (!operation.targetExists) {
+    await rm(target, { recursive: true, force: true });
+    return;
+  }
+  if (operation.linkKind === "directory") {
+    await mkdir(target, { recursive: true });
+    return;
+  }
+  await mkdir(path.dirname(target), { recursive: true });
+  const existing = await lstat(target).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+  if (!existing) await writeFile(target, "", "utf8");
+  else if (!existing.isFile()) throw new Error(`Evaluator link target is not a file: ${target}`);
+}
+
+async function applySetupOperation(workspace, externalTargetRoot, operation) {
   const relative = safeRelative(operation.path, "setup path");
   const target = path.join(workspace, ...relative.split("/"));
   if (operation.type === "delete") {
     await rm(target, { recursive: true, force: true });
+    return;
+  }
+  if (operation.type === "link") {
+    const targetRelative = safeRelative(operation.target, "setup link target");
+    if (operation.targetScope === "outside_workspace" && operation.targetExists === undefined) {
+      throw new Error("outside_workspace evaluator links must declare targetExists.");
+    }
+    const targetRoot = operation.targetScope === "outside_workspace" ? externalTargetRoot : workspace;
+    const linkTarget = path.join(targetRoot, ...targetRelative.split("/"));
+    await setLinkTargetState(linkTarget, operation);
+    await mkdir(path.dirname(target), { recursive: true });
+    if (process.platform === "win32") {
+      if (operation.linkKind !== "directory") {
+        throw new Error("Windows evaluator link fixtures use directory junctions only.");
+      }
+      await symlink(linkTarget, target, "junction");
+    } else {
+      const relativeTarget = path.relative(path.dirname(target), linkTarget);
+      await symlink(relativeTarget, target, operation.linkKind === "directory" ? "dir" : "file");
+    }
     return;
   }
   await mkdir(path.dirname(target), { recursive: true });
@@ -45,21 +86,44 @@ async function applySetupOperation(workspace, operation) {
   else throw new Error(`Unsupported setup operation '${String(operation.type)}'.`);
 }
 
-export async function seedWorkspace({ attemptRoot, fixtureDirectory, setupAfterCommit = [] }) {
+export async function seedWorkspace({ attemptRoot, fixtureDirectory, setupAfterCommit = [], generator }) {
   const workspaceParent = path.join(attemptRoot, "subject");
   const workspace = path.join(workspaceParent, `workspace-${randomUUID()}`);
   await mkdir(workspaceParent, { recursive: true });
   await cp(fixtureDirectory, workspace, { recursive: true, force: false, errorOnExist: true });
+  if (generator) await generateRepoScaleFixtureV1(workspace, generator);
   await mustRun("git", ["init", "--quiet"], workspace);
   await mustRun("git", ["config", "user.name", "Workspace User"], workspace);
   await mustRun("git", ["config", "user.email", "workspace-user@example.invalid"], workspace);
   await mustRun("git", ["add", "--all"], workspace);
   await mustRun("git", ["commit", "--quiet", "-m", "initial workspace"], workspace);
-  for (const operation of setupAfterCommit) await applySetupOperation(workspace, operation);
+  const externalTargetRoot = evaluatorLinkTargetRoot(attemptRoot);
+  for (const operation of setupAfterCommit) await applySetupOperation(workspace, externalTargetRoot, operation);
   return workspace;
 }
 
-async function visit(root, current, result) {
+function normalizedAbsolute(value) {
+  if (process.platform !== "win32") return path.resolve(value);
+  return path.resolve(value.replace(/^\\\\\?\\/u, "")).toLowerCase();
+}
+
+function pathWithin(root, candidate) {
+  const relative = path.relative(normalizedAbsolute(root), normalizedAbsolute(candidate));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function normalizedLinkTarget(linkPath, rawTarget, roots) {
+  const rawAbsolute = path.isAbsolute(rawTarget) ? rawTarget : path.resolve(path.dirname(linkPath), rawTarget);
+  const candidate = normalizedAbsolute(rawAbsolute);
+  for (const item of roots) {
+    if (!pathWithin(item.root, candidate)) continue;
+    const relative = path.relative(normalizedAbsolute(item.root), candidate).replace(/\\/gu, "/");
+    return `${item.label}:${relative || "."}`;
+  }
+  return `outside:${createHash("sha256").update(candidate).digest("hex")}`;
+}
+
+async function visit(root, current, result, options) {
   const entries = await readdir(current, { withFileTypes: true });
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     const absolute = path.join(current, entry.name);
@@ -79,12 +143,15 @@ async function visit(root, current, result) {
       continue;
     }
     if (info.isSymbolicLink()) {
-      result[relative] = { kind: "symlink", target: await readlink(absolute) };
+      result[relative] = {
+        kind: "symlink",
+        target: normalizedLinkTarget(absolute, await readlink(absolute), options.linkTargetRoots)
+      };
       continue;
     }
     if (info.isDirectory()) {
       result[`${relative}/`] = { kind: "directory" };
-      await visit(root, absolute, result);
+      await visit(root, absolute, result, options);
       continue;
     }
     if (!info.isFile()) continue;
@@ -98,9 +165,12 @@ async function visit(root, current, result) {
   }
 }
 
-export async function snapshotWorkspace(workspace) {
+export async function snapshotWorkspace(workspace, options = {}) {
   const entries = {};
-  await visit(workspace, workspace, entries);
+  const snapshotOptions = {
+    linkTargetRoots: options.linkTargetRoots ?? [{ root: workspace, label: "workspace" }]
+  };
+  await visit(workspace, workspace, entries, snapshotOptions);
   return entries;
 }
 

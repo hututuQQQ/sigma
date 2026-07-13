@@ -3,15 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  buildCodexReviewPack,
+  buildHumanAuditPack,
   buildEvalRunReport,
-  renderCodexReviewMarkdown,
+  renderHumanAuditMarkdown,
   renderEvalReportMarkdown,
+  wilsonPassRate,
   writeEvalReport
 } from "../scripts/eval/report.mjs";
 import {
   assertComparableEvalRuns,
   compareEvalRuns,
+  evaluateFrozenABGate,
   renderEvalComparisonMarkdown,
   runCompareCli,
   writeEvalComparison
@@ -119,6 +121,63 @@ function run(attempts: ReturnType<typeof attempt>[], overrides: Record<string, u
   };
 }
 
+function attemptV2({
+  scenarioId = "general-case",
+  repetition = 1,
+  passing = true,
+  validity = "valid",
+  durationMs = 1000,
+  metrics = {},
+  subjectOverrides = {}
+}: {
+  scenarioId?: string;
+  repetition?: number;
+  passing?: boolean;
+  validity?: "valid" | "invalid" | "not_observed";
+  durationMs?: number;
+  metrics?: Record<string, unknown>;
+  subjectOverrides?: Record<string, unknown>;
+} = {}) {
+  const legacy = attempt({ scenarioId, repetition, passing, durationMs, subjectOverrides });
+  const observed = validity === "valid";
+  return {
+    ...legacy,
+    schemaVersion: 2,
+    validity,
+    ...(observed ? {} : {
+      validityDetail: { owner: "evaluator", phase: "observation", code: "observation_unavailable" }
+    }),
+    failureChain: { primary: null, contributing: [], terminal: null },
+    dimensions: {
+      correctness: observed ? legacy.dimensions.correctness : { status: "not_observed", checks: [] },
+      delivery: observed ? { status: passing ? "pass" : "fail", checks: [] } : { status: "not_observed", checks: [] },
+      safety: observed ? legacy.dimensions.safety : { status: "not_observed", violations: [] },
+      experience: observed ? legacy.dimensions.experience : { status: "not_observed", violations: [], warnings: [] },
+      reliability: observed ? legacy.dimensions.reliability : { status: "not_observed", signals: [] }
+    },
+    metrics: { ...legacy.metrics, ...metrics }
+  };
+}
+
+function runV2(attempts: ReturnType<typeof attemptV2>[], overrides: Record<string, unknown> = {}) {
+  const runId = typeof overrides.runId === "string" ? overrides.runId : "run-v2";
+  return {
+    schemaVersion: 2,
+    kind: "eval_run",
+    runId,
+    suite: "quick",
+    repeat: 3,
+    startedAt: "2026-07-12T00:00:00.000Z",
+    finishedAt: "2026-07-12T00:05:00.000Z",
+    subject: subject(),
+    attempts: attempts.map((item) => ({ ...item, runId })),
+    scenarios: [],
+    frozenRunPolicy: { repeat: 3 },
+    scheduleDigest: "schedule-1",
+    ...overrides
+  };
+}
+
 function hasScoreKey(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(hasScoreKey);
   if (!value || typeof value !== "object") return false;
@@ -152,6 +211,7 @@ describe("agent evaluation report", () => {
     });
     expect(report.dimensions).toEqual({
       correctness: "fail",
+      delivery: "unavailable",
       safety: "stable",
       experience: "stable",
       reliability: "stable"
@@ -174,6 +234,12 @@ describe("agent evaluation report", () => {
       .toThrow("scenarioId/repetition");
   });
 
+  it("rejects legacy attempts mixed into a V2 run", () => {
+    const mixed = runV2([attemptV2()]);
+    mixed.attempts[0] = attempt() as never;
+    expect(() => buildEvalRunReport(mixed)).toThrow(/schemaVersion.*sourceSchemaVersion/);
+  });
+
   it("keeps a declared scenario visible when no attempt was produced", () => {
     const report = buildEvalRunReport(run([], {
       scenarios: [{ scenarioId: "never-launched", scenarioDigest: "scenario-never-launched" }]
@@ -188,21 +254,21 @@ describe("agent evaluation report", () => {
       status: "fail"
     })]);
     expect(report.dimensions).toEqual({
-      correctness: "fail", safety: "fail", experience: "fail", reliability: "fail"
+      correctness: "fail", delivery: "unavailable", safety: "fail", experience: "fail", reliability: "fail"
     });
-    expect(buildCodexReviewPack(report).topSignals).toContainEqual(expect.objectContaining({
+    expect(buildHumanAuditPack(report).topSignals).toContainEqual(expect.objectContaining({
       code: "scenario_not_attempted", severity: "blocker"
     }));
   });
 
-  it("makes evaluator infrastructure failures visible in status, dimensions, and Codex signals", () => {
+  it("makes evaluator infrastructure failures visible in status, dimensions, and the human audit view", () => {
     const report = buildEvalRunReport(run([attempt()], {
       repeat: 1,
       infrastructureErrors: [{ code: "subject_preparation_failed", phase: "subject_preparation" }]
     }));
     expect(report.status).toBe("fail");
     expect(report.dimensions.reliability).toBe("fail");
-    expect(buildCodexReviewPack(report).topSignals).toContainEqual(expect.objectContaining({
+    expect(buildHumanAuditPack(report).topSignals).toContainEqual(expect.objectContaining({
       code: "subject_preparation_failed", severity: "blocker"
     }));
     expect(renderEvalReportMarkdown(report)).toContain("Evaluator Infrastructure Failures");
@@ -214,7 +280,7 @@ describe("agent evaluation report", () => {
       outcome: { status: "needs_input", actual: "needs_input", expectedTerminal: "needs_input", expected: true }
     };
     const report = buildEvalRunReport(needsInput);
-    const review = buildCodexReviewPack(report);
+    const review = buildHumanAuditPack(report);
 
     expect(report.status).toBe("stable");
     expect(review.topSignals.some((signal: { code: string }) => signal.code === "incomplete_outcome")).toBe(false);
@@ -256,7 +322,7 @@ describe("agent evaluation report", () => {
     });
   });
 
-  it("writes the run, human report, Codex evidence pack, and latest pointer with secrets redacted", async () => {
+  it("writes only the V2 run, human report, and latest pointer with secrets redacted", async () => {
     const root = path.join(os.tmpdir(), `sigma-eval-report-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const runDir = path.join(root, "run-current");
     const input = run([
@@ -271,36 +337,148 @@ describe("agent evaluation report", () => {
     const result = await writeEvalReport({ run: input, runDir, evalRootDir: root });
     const persisted = await readFile(result.runPath, "utf8");
     const markdown = await readFile(result.reportPath, "utf8");
-    const codexReview = await readFile(result.codexReviewPath, "utf8");
     const latest = JSON.parse(await readFile(result.latestPath, "utf8"));
 
     expect(persisted).not.toContain("sk-this-value-must-never-be-written");
     expect(persisted).toContain("[REDACTED]");
     expect(markdown).toContain("# Sigma Agent Experience Evaluation");
-    expect(codexReview).toContain("No reviewer model was called");
-    expect(codexReview).toContain("attempts/small-edit-1/verifier.log");
-    expect(codexReview).toContain("## Verdict Rubric");
+    expect(result).not.toHaveProperty("codexReviewPath");
     expect(latest).toEqual(expect.objectContaining({
-      schemaVersion: 1,
+      schemaVersion: 2,
       kind: "eval_latest",
       runId: "run-current",
       runDir: "run-current",
-      files: { run: "run-current/run.json", report: "run-current/report.md", codexReview: "run-current/codex-review.md" }
+      files: { run: "run-current/run.json", report: "run-current/report.md" }
     }));
   });
 
-  it("builds a deterministic Codex pack with blocker signals and evidence paths", () => {
+  it("keeps the deterministic detailed audit as an explicit human-only API", () => {
     const failed = run([
       attempt({ passing: false, repetition: 1 }),
       attempt({ passing: false, repetition: 2 }),
       attempt({ passing: false, repetition: 3 })
     ]);
-    const pack = buildCodexReviewPack(failed);
+    const pack = buildHumanAuditPack(failed);
 
     expect(pack.topSignals.some((signal: { code: string }) => signal.code === "correctness_failure")).toBe(true);
     expect(pack.topSignals.some((signal: { code: string }) => signal.code === "incomplete_outcome")).toBe(true);
     expect(pack.evidence[0].paths).toContain("attempts/small-edit-1/events.jsonl");
-    expect(renderCodexReviewMarkdown(pack)).toContain("Do not use scenario identity or verifier output");
+    expect(renderHumanAuditMarkdown(pack)).toContain("must never be supplied to a solving or optimization agent");
+  });
+
+  it("separates valid, invalid, not-observed, and missing V2 samples without charging correctness", () => {
+    const valid = attemptV2({ repetition: 1 });
+    const invalid = attemptV2({ repetition: 2, validity: "invalid" });
+    const report = buildEvalRunReport(runV2([valid, invalid]));
+
+    expect(report).toMatchObject({
+      schemaVersion: 2,
+      sourceSchemaVersion: 2,
+      status: "inconclusive",
+      validity: { valid: 1, invalid: 1, notObserved: 0, missing: 1 },
+      counts: { attempts: { total: 2, valid: 1, invalid: 1, passed: 1, failed: 0 } }
+    });
+    expect(report.scenarios[0]).toMatchObject({
+      status: "inconclusive",
+      passedAttempts: 1,
+      failedAttempts: 0,
+      invalidAttempts: 1,
+      missingAttempts: 1,
+      dimensions: { correctness: { passed: 1, failed: 0, status: "inconclusive" } }
+    });
+    expect(report.statistics.passRate).toMatchObject({ passed: 1, total: 1, rate: 1 });
+    expect(report.statistics.costPerSuccessUsd).toBe(0.04);
+    expect(renderEvalReportMarkdown(report)).toContain("valid 1, invalid 1, not observed 0, missing 1");
+  });
+
+  it("keeps correctness passed when a correct subject fails only the delivery protocol", () => {
+    const value = attemptV2();
+    value.outcome = { status: "failed", finishReason: "terminal_protocol_failed", sessionId: "session", exitCode: 1 };
+    value.dimensions.correctness = { status: "pass", checks: [{ name: "result", ok: true }] };
+    value.dimensions.delivery = { status: "fail", checks: [{ name: "terminal", ok: false }] };
+    const report = buildEvalRunReport(runV2([value], { repeat: 1 }));
+
+    expect(report.validity).toEqual({ valid: 1, invalid: 0, notObserved: 0, missing: 0 });
+    expect(report.dimensions).toMatchObject({ correctness: "stable", delivery: "fail" });
+    expect(report.counts.attempts).toMatchObject({ passed: 0, failed: 1 });
+  });
+
+  it("reports Wilson intervals, cost per success, convergence, and mutation discipline without a composite", () => {
+    const attempts = [1, 2, 3].map((repetition) => attemptV2({
+      repetition,
+      metrics: {
+        failureConvergence: {
+          episodeCount: 1, failFastEligibleEpisodes: 1, failFastTriggeredOnTime: 0,
+          failFastLate: 0, failFastMissed: 1, recoverySucceeded: 0, recoveryBypassed: 0,
+          recoveryFailed: 1, totalOvershoot: repetition, maxAttemptsWithoutRecovery: repetition + 3,
+          byCode: { sandbox_setup_failed: 1 }, byFamily: { execution_sandbox: 1 }
+        },
+        mutationDiscipline: {
+          mutationRequests: 1, failedMutationRequests: 1, writeContractFailures: 1,
+          checkpointLimitFailures: 0, checkpointsCreated: 1, checkpointsSealed: 1,
+          checkpointsRestored: 0, emptyCheckpoints: 1, openCheckpointsAtTerminal: 0,
+          invalidCheckpointActions: 0, mutationFallbacksAfterInfrastructureFailure: 0,
+          workspaceDeltaEvents: 0
+        }
+      }
+    }));
+    const report = buildEvalRunReport(runV2(attempts));
+
+    expect(wilsonPassRate(2, 3)).toMatchObject({ passed: 2, total: 3, rate: 2 / 3 });
+    expect(report.failureConvergence).toMatchObject({
+      episodeCount: 3, failFastMissed: 3, totalOvershoot: 6,
+      maxAttemptsWithoutRecovery: 6,
+      byFamily: { execution_sandbox: 3 }, coverage: { observed: 3, total: 3, status: "complete" }
+    });
+    expect(report.mutationDiscipline).toMatchObject({
+      mutationRequests: 3, emptyCheckpoints: 3, coverage: { observed: 3, total: 3, status: "complete" }
+    });
+    expect(renderEvalReportMarkdown(report)).toContain("95% Wilson");
+    expect(hasScoreKey(report)).toBe(false);
+  });
+
+  it("reports incomplete metric coverage instead of supplementing malformed V2 attempts with zeroes", () => {
+    const complete = attemptV2({ repetition: 1, metrics: {
+      failureConvergence: {
+        episodeCount: 0, failFastEligibleEpisodes: 0, failFastTriggeredOnTime: 0, failFastLate: 0,
+        failFastMissed: 0, recoverySucceeded: 0, recoveryBypassed: 0, recoveryFailed: 0,
+        totalOvershoot: 0, maxAttemptsWithoutRecovery: 0, byCode: {}, byFamily: {}
+      },
+      mutationDiscipline: {
+        mutationRequests: 0, failedMutationRequests: 0, writeContractFailures: 0,
+        checkpointLimitFailures: 0, checkpointsCreated: 0, checkpointsSealed: 0,
+        checkpointsRestored: 0, emptyCheckpoints: 0, openCheckpointsAtTerminal: 0,
+        invalidCheckpointActions: 0, mutationFallbacksAfterInfrastructureFailure: 0,
+        workspaceDeltaEvents: 0
+      }
+    } });
+    const malformed = attemptV2({ repetition: 2, metrics: {
+      failureConvergence: { failFastMissed: 99 }, mutationDiscipline: { mutationRequests: 99 }
+    } });
+    const report = buildEvalRunReport(runV2([complete, malformed], { repeat: 2 }));
+
+    expect(report.failureConvergence).toMatchObject({
+      failFastMissed: 0, coverage: { observed: 1, total: 2, status: "incomplete" }
+    });
+    expect(report.mutationDiscipline).toMatchObject({
+      mutationRequests: 0, coverage: { observed: 1, total: 2, status: "incomplete" }
+    });
+  });
+
+  it("renders migrated V1 fields as unavailable and rejects V1/V2 statistical comparison", () => {
+    const legacy = buildEvalRunReport(run([attempt()], { repeat: 1 }));
+    const modern = runV2([attemptV2()], { runId: "run-modern", repeat: 1 });
+
+    expect(legacy).toMatchObject({
+      schemaVersion: 2,
+      sourceSchemaVersion: 1,
+      validity: "unavailable",
+      failureConvergence: "unavailable",
+      mutationDiscipline: "unavailable"
+    });
+    expect(legacy.dimensions.delivery).toBe("unavailable");
+    expect(compareEvalRuns(legacy, modern).compatibility.mismatches)
+      .toContainEqual(expect.objectContaining({ field: "schemaVersion" }));
   });
 });
 
@@ -462,6 +640,54 @@ describe("agent evaluation baseline comparison", () => {
       field: "metricSamples.toolCalls", baseline: 1, candidate: 0
     }));
     expect(comparison.metrics.toolCalls.change).toBe("invalid");
+  });
+
+  it("reports paired median differences and accepts three non-inferior twenty-percent continuous pairs", () => {
+    const baseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, durationMs: 1000 })));
+    const candidate = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, durationMs: 800 })), {
+      runId: "run-v2-candidate"
+    });
+    const comparison = compareEvalRuns(baseline, candidate);
+
+    expect(comparison.comparable).toBe(true);
+    expect(comparison.pairedMedianDifferences.durationMs).toEqual({
+      pairs: 3, median: -200, min: -200, max: -200
+    });
+    expect(evaluateFrozenABGate(baseline, candidate, {
+      kind: "continuous", metric: "durationMs"
+    })).toMatchObject({
+      passed: true,
+      status: "pass",
+      reasons: [],
+      primary: { kind: "continuous", pairs: 3, medianImprovement: 0.2, requiredImprovement: 0.2 }
+    });
+  });
+
+  it("enforces binary wins, zero losses, valid pairs, and product guardrails", () => {
+    const baseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition, passing: false })));
+    const candidate = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition })), {
+      runId: "run-v2-candidate"
+    });
+    expect(evaluateFrozenABGate(baseline, candidate, { kind: "binary" })).toMatchObject({
+      passed: true,
+      primary: { wins: 3, losses: 0, requiredWins: 2 }
+    });
+
+    const guardedBaseline = runV2([1, 2, 3].map((repetition) => attemptV2({ repetition })));
+    const regressedAttempts = [1, 2, 3].map((repetition) => attemptV2({ repetition }));
+    regressedAttempts[0].dimensions.safety = {
+      status: "fail", violations: [{ code: "workspace_changed" }]
+    };
+    const guardedCandidate = runV2(regressedAttempts, { runId: "run-guardrail-regression" });
+    const rejected = evaluateFrozenABGate(guardedBaseline, guardedCandidate, { kind: "binary" });
+    expect(rejected.passed).toBe(false);
+    expect(rejected.reasons).toEqual(expect.arrayContaining(["guardrail_regression", "candidate_loss"]));
+
+    const invalidAttempts = [1, 2, 3].map((repetition) => attemptV2({ repetition }));
+    invalidAttempts[1] = attemptV2({ repetition: 2, validity: "invalid" });
+    const invalidCandidate = runV2(invalidAttempts, { runId: "run-invalid-candidate" });
+    expect(evaluateFrozenABGate(guardedBaseline, invalidCandidate, { kind: "binary" }).reasons)
+      .toEqual(expect.arrayContaining(["incompatible_runs", "invalid_pair"]));
   });
 
   it("writes comparison artifacts and supports directory inputs in the CLI", async () => {

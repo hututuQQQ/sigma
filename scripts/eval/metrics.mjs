@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  FAILURE_TAXONOMY_VERSION,
+  INFRASTRUCTURE_FAILURE_LIMIT,
+  classifyInfrastructureFailureCodesV1
+} from "../../packages/agent-protocol/src/failure-taxonomy.ts";
 
 const TERMINAL_TYPES = new Set(["run.completed", "run.cancelled", "run.failed", "run.suspended"]);
 const AGENT_ACTION_TYPES = new Set([
@@ -40,11 +45,13 @@ function digest(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function requestIdentity(event) {
+function requestIdentity(event, revision = {}) {
   const payload = record(event.payload);
   const name = typeof payload.name === "string" ? payload.name : "unknown";
   const serialized = canonical(payload.arguments ?? null);
-  return { name, hash: digest(`${name}\0${serialized}`) };
+  const workspaceRevision = Number.isSafeInteger(revision.workspaceRevision) ? revision.workspaceRevision : 0;
+  const effectRevision = Number.isSafeInteger(payload.effectRevision) ? payload.effectRevision : null;
+  return { name, hash: digest(`${name}\0${serialized}\0${workspaceRevision}\0${effectRevision ?? "unavailable"}`) };
 }
 
 function outputIdentity(event) {
@@ -56,6 +63,28 @@ function outputIdentity(event) {
 
 function sortedEvents(input) {
   return [...input].sort((left, right) => left.seq - right.seq);
+}
+
+function deltaSize(delta) {
+  const value = record(delta);
+  return [value.added, value.modified, value.deleted]
+    .reduce((total, entries) => total + (Array.isArray(entries) ? entries.length : 0), 0);
+}
+
+function revisionAwareRequestIdentities(events) {
+  const identities = new Map();
+  let workspaceRevision = 0;
+  for (const event of events) {
+    if (event.type === "tool.requested") {
+      identities.set(event.seq, requestIdentity(event, { workspaceRevision }));
+    }
+    const delta = workspaceDeltaFrom(event);
+    if (deltaSize(delta) > 0) workspaceRevision += 1;
+    else if (event.type === "tool.completed" && hasEffect(record(event.payload), "filesystem.write")) {
+      workspaceRevision += 1;
+    }
+  }
+  return identities;
 }
 
 function terminalSummary(events) {
@@ -150,9 +179,10 @@ function usageTotals(events) {
 
 function groupRepeatedRequests(events) {
   const groups = new Map();
+  const identities = revisionAwareRequestIdentities(events);
   for (const event of events) {
     if (event.type !== "tool.requested") continue;
-    const identity = requestIdentity(event);
+    const identity = identities.get(event.seq) ?? requestIdentity(event);
     const group = groups.get(identity.hash) ?? {
       fingerprint: identity.hash, name: identity.name, count: 0, firstSeq: event.seq, lastSeq: event.seq
     };
@@ -230,6 +260,7 @@ function workspaceDeltas(events) {
     added,
     modified,
     deleted,
+    evidenceSeq: deltas.map((item) => item.seq),
     changedFiles: [...new Set([...added, ...modified, ...deleted])].sort()
   };
 }
@@ -275,11 +306,11 @@ function newStagnationWindow(event) {
   };
 }
 
-function updateStagnationWindow(active, event, seenRequests, isFailure) {
+function updateStagnationWindow(active, event, seenRequests, requestIdentities, isFailure) {
     if (event.type === "model.started") active.modelTurns += 1;
     if (event.type === "tool.requested") {
       active.toolCalls += 1;
-      const identity = requestIdentity(event).hash;
+      const identity = requestIdentities.get(event.seq)?.hash ?? requestIdentity(event).hash;
       if (seenRequests.has(identity)) active.repeatedRequests += 1;
       seenRequests.add(identity);
     }
@@ -294,6 +325,7 @@ function stagnationWindows(events, minimumWorkUnits) {
   const windows = [];
   const seenRequests = new Set();
   const seenSuccessfulOutputs = new Set();
+  const requestIdentities = revisionAwareRequestIdentities(events);
   let active = null;
   const finish = (endEvent) => {
     if (!active) return;
@@ -312,7 +344,7 @@ function stagnationWindows(events, minimumWorkUnits) {
     const isFailure = ["tool.failed", "model.failed", "execution.failed"].includes(event.type);
     if (!WORK_TYPES.has(event.type) && !isFailure) continue;
     active ??= newStagnationWindow(event);
-    updateStagnationWindow(active, event, seenRequests, isFailure);
+    updateStagnationWindow(active, event, seenRequests, requestIdentities, isFailure);
   }
   if (active) finish(events.at(-1) ?? { seq: active.endSeq, occurredAt: active.endedAt });
   return windows.sort((left, right) => right.workUnits - left.workUnits || right.durationMs - left.durationMs).slice(0, 20);
@@ -321,28 +353,24 @@ function stagnationWindows(events, minimumWorkUnits) {
 function postAnswerChurn(events) {
   const lastFollowUp = events.reduce((latest, event, index) =>
     event.type === "user.follow_up" ? index : latest, -1);
-  const relativeAnswerIndex = events.slice(lastFollowUp + 1).findIndex(isAnswer);
-  const answerIndex = relativeAnswerIndex < 0 ? -1 : lastFollowUp + 1 + relativeAnswerIndex;
-  if (answerIndex < 0) {
+  const candidates = events.slice(lastFollowUp + 1);
+  const acceptedCompletionIndex = candidates.findIndex((event) => {
+    if (event.type !== "tool.completed") return false;
+    const payload = record(event.payload);
+    return payload.name === "complete_task" && payload.ok !== false
+      && record(payload.outcome).status !== "failed";
+  });
+  const terminalIndex = candidates.findIndex((event) => TERMINAL_TYPES.has(event.type));
+  const observedBoundaries = [acceptedCompletionIndex, terminalIndex].filter((index) => index >= 0);
+  const relativeBoundaryIndex = observedBoundaries.length > 0 ? Math.min(...observedBoundaries) : -1;
+  const boundaryIndex = relativeBoundaryIndex < 0 ? -1 : lastFollowUp + 1 + relativeBoundaryIndex;
+  if (boundaryIndex < 0) {
     return { answerSeq: null, answeredAt: null, events: 0, modelTurns: 0, toolCalls: 0, durationMs: 0 };
   }
-  const answer = events[answerIndex];
-  const later = events.slice(answerIndex + 1);
-  const completionIds = new Set((Array.isArray(record(answer.payload).toolCalls) ? record(answer.payload).toolCalls : [])
-    .filter((call) => modelToolCallName(call) === "complete_task")
-    .flatMap((call) => {
-      const value = record(call);
-      const identity = value.id ?? value.callId;
-      return typeof identity === "string" ? [identity] : [];
-    }));
-  const finalizationEvent = (event) => {
-    const payload = record(event.payload);
-    const identity = typeof payload.callId === "string" ? payload.callId
-      : typeof payload.executionId === "string" ? payload.executionId : null;
-    return identity !== null && completionIds.has(identity);
-  };
+  const answer = events[boundaryIndex];
+  const later = events.slice(boundaryIndex + 1);
   const churn = later.filter((event) => (AGENT_ACTION_TYPES.has(event.type) || event.type === "context.compacted")
-    && !finalizationEvent(event));
+    && !TERMINAL_TYPES.has(event.type));
   const last = churn.at(-1);
   return {
     answerSeq: answer.seq,
@@ -523,6 +551,348 @@ function timing(events, durationMs) {
   };
 }
 
+function failureCodes(event) {
+  const payload = record(event.payload);
+  const outcome = record(payload.outcome);
+  const failure = record(payload.failure);
+  return [...new Set([
+    payload.code,
+    failure.code,
+    ...(Array.isArray(payload.diagnosticCodes) ? payload.diagnosticCodes : []),
+    ...(Array.isArray(outcome.diagnosticCodes) ? outcome.diagnosticCodes : []),
+    ...(Array.isArray(payload.diagnostics) ? payload.diagnostics : [])
+  ].filter((value) => typeof value === "string" && value.length > 0))];
+}
+
+function eventWorkId(event, aliases = new Map()) {
+  const payload = record(event.payload);
+  const candidate = [payload.executionId, payload.callId, payload.toolCallId]
+    .find((value) => typeof value === "string");
+  if (candidate) return aliases.get(candidate) ?? candidate;
+  return `event:${event.seq}`;
+}
+
+function executionPlans(events) {
+  const plans = new Map();
+  const aliases = new Map();
+  for (const event of events) {
+    if (event.type !== "execution.planned") continue;
+    const payload = record(event.payload);
+    if (typeof payload.executionId !== "string") continue;
+    const identifiers = [payload.executionId, payload.toolCallId, payload.callId]
+      .filter((value) => typeof value === "string");
+    for (const identifier of identifiers) {
+      aliases.set(identifier, payload.executionId);
+      plans.set(identifier, record(payload.plan));
+    }
+  }
+  return { plans, aliases };
+}
+
+function planEffects(plan) {
+  return Array.isArray(record(plan).exactEffects)
+    ? record(plan).exactEffects.filter((effect) => typeof effect === "string").sort()
+    : [];
+}
+
+function processEffects(effects) {
+  return effects.includes("process.spawn") || effects.includes("process.spawn.readonly");
+}
+
+function mutatingEffects(effects) {
+  return effects.some((effect) => ["filesystem.write", "checkpoint.restore", "destructive"].includes(effect));
+}
+
+function closeFailureEpisode(active, event, status, failFastTriggered = false) {
+  active.status = status;
+  active.terminalSeq = event?.seq ?? null;
+  active.lastSeq = event?.seq ?? active.lastFailureSeq;
+  active.endedAt = event?.occurredAt ?? active.endedAt;
+  active.failFastTriggered = failFastTriggered;
+}
+
+function countBetween(events, type, startSeq, endSeq) {
+  return events.filter((event) => event.type === type && event.seq > startSeq && event.seq <= endSeq).length;
+}
+
+function convergenceState(events, options) {
+  const correlation = executionPlans(events);
+  return {
+    plans: correlation.plans,
+    aliases: correlation.aliases,
+    activeByFingerprint: new Map(),
+    episodes: [],
+    seenAttempts: new Map(),
+    byCode: {},
+    byFamily: {},
+    platform: typeof options.platform === "string" ? options.platform : "unknown"
+  };
+}
+
+function failureClusterKey(state, classification, workId, semanticRevision) {
+  const effects = planEffects(state.plans.get(workId));
+  return digest(canonical({
+    taxonomyVersion: FAILURE_TAXONOMY_VERSION,
+    family: classification.family,
+    codes: [...classification.codes].sort(),
+    toolFamily: processEffects(effects) ? "process" : mutatingEffects(effects) ? "mutation" : "tool",
+    effectClass: effects.join("+") || "unknown",
+    platform: state.platform,
+    semanticRevision
+  }));
+}
+
+function startFailureEpisode(state, classification, event, workId, semanticRevision, clusterKey) {
+  const effects = planEffects(state.plans.get(workId));
+  const episode = {
+    taxonomyVersion: FAILURE_TAXONOMY_VERSION,
+    family: classification.family,
+    codes: [...classification.codes],
+    fingerprint: "",
+    toolFamily: processEffects(effects) ? "process" : mutatingEffects(effects) ? "mutation" : "tool",
+    effectClass: effects.join("+") || "unknown",
+    platform: state.platform,
+    semanticRevision,
+    firstSeq: event.seq,
+    lastFailureSeq: event.seq,
+    lastSeq: event.seq,
+    startedAt: event.occurredAt,
+    endedAt: event.occurredAt,
+    attempts: 0,
+    eligibleSeq: null,
+    missedSeq: null,
+    terminalSeq: null,
+    status: "failed",
+    failFastTriggered: false,
+    evidenceSeq: []
+  };
+  state.activeByFingerprint.set(clusterKey, episode);
+  state.episodes.push(episode);
+  return episode;
+}
+
+function mergeDuplicateFailure(episode, classification, event) {
+  episode.codes = [...new Set([...episode.codes, ...classification.codes])].sort();
+  episode.evidenceSeq.push(event.seq);
+  episode.lastFailureSeq = Math.max(episode.lastFailureSeq, event.seq);
+}
+
+function countFailureAttempt(state, episode, classification, event, attemptKey) {
+  episode.attempts += 1;
+  episode.codes = [...new Set([...episode.codes, ...classification.codes])].sort();
+  episode.evidenceSeq.push(event.seq);
+  episode.lastFailureSeq = event.seq;
+  episode.lastSeq = event.seq;
+  episode.endedAt = event.occurredAt;
+  if (episode.attempts === INFRASTRUCTURE_FAILURE_LIMIT) episode.eligibleSeq = event.seq;
+  if (episode.attempts === INFRASTRUCTURE_FAILURE_LIMIT + 1) episode.missedSeq = event.seq;
+  state.seenAttempts.set(attemptKey, episode);
+  state.byFamily[classification.family] = (state.byFamily[classification.family] ?? 0) + 1;
+  for (const code of classification.codes) state.byCode[code] = (state.byCode[code] ?? 0) + 1;
+}
+
+function recordInfrastructureFailure(state, event, semanticRevision) {
+  if (event.type !== "tool.failed" && event.type !== "execution.failed") return;
+  const classification = classifyInfrastructureFailureCodesV1(failureCodes(event));
+  if (!classification) return;
+  const workId = eventWorkId(event, state.aliases);
+  const attemptKey = `${workId}\0${classification.family}`;
+  const duplicate = state.seenAttempts.get(attemptKey);
+  if (duplicate) return mergeDuplicateFailure(duplicate, classification, event);
+  const clusterKey = failureClusterKey(state, classification, workId, semanticRevision);
+  const episode = state.activeByFingerprint.get(clusterKey)
+    ?? startFailureEpisode(state, classification, event, workId, semanticRevision, clusterKey);
+  countFailureAttempt(state, episode, classification, event, attemptKey);
+}
+
+function closeMatchingEpisodes(state, event, predicate, status, failFast = false) {
+  for (const [fingerprint, episode] of state.activeByFingerprint) {
+    if (!predicate(episode.family, episode)) continue;
+    closeFailureEpisode(episode, event, status,
+      failFast && episode.attempts >= INFRASTRUCTURE_FAILURE_LIMIT);
+    state.activeByFingerprint.delete(fingerprint);
+  }
+}
+
+function successfulProcessEvent(state, event) {
+  const payload = record(event.payload);
+  const effects = planEffects(state.plans.get(eventWorkId(event, state.aliases)));
+  return event.type === "process.spawned"
+    || (event.type === "execution.completed" && processEffects(effects))
+    || (event.type === "tool.completed" && (processEffects(effects)
+      || hasEffect(payload, "process.spawn") || hasEffect(payload, "process.spawn.readonly")));
+}
+
+function recordFailureRecovery(state, event) {
+  if (successfulProcessEvent(state, event)) {
+    closeMatchingEpisodes(state, event, (family) => family.startsWith("execution_"), "recovered");
+  }
+  if (event.type === "checkpoint.restored") {
+    closeMatchingEpisodes(state, event,
+      (family) => family === "workspace_transaction" || family === "checkpoint_recovery", "recovered");
+  }
+  if (!TERMINAL_TYPES.has(event.type)) return;
+  const payload = record(event.payload);
+  const failFast = event.type === "run.failed" && payload.code === "tool_infrastructure_failure_loop";
+  closeMatchingEpisodes(state, event, () => true,
+    event.type === "run.completed" ? "bypassed" : "failed", failFast);
+}
+
+function finalizeFailureEpisode(episode, events) {
+  episode.overshoot = Math.max(0, episode.attempts - INFRASTRUCTURE_FAILURE_LIMIT);
+  episode.failFastMissed = episode.overshoot > 0;
+  episode.recoveryToolCalls = countBetween(events, "tool.requested", episode.firstSeq, episode.lastSeq);
+  episode.recoveryModelTurns = countBetween(events, "model.started", episode.firstSeq, episode.lastSeq);
+  episode.recoveryLatencyMs = Math.max(0,
+    timestamp({ occurredAt: episode.endedAt }) - timestamp({ occurredAt: episode.startedAt }));
+  episode.fingerprint = digest(canonical({
+    taxonomyVersion: episode.taxonomyVersion,
+    family: episode.family,
+    codes: episode.codes,
+    toolFamily: episode.toolFamily,
+    effectClass: episode.effectClass,
+    platform: episode.platform,
+    semanticRevision: episode.semanticRevision
+  }));
+}
+
+function convergenceSummary(state) {
+  const { episodes } = state;
+  return {
+    taxonomyVersion: FAILURE_TAXONOMY_VERSION,
+    threshold: INFRASTRUCTURE_FAILURE_LIMIT,
+    byCode: Object.fromEntries(Object.entries(state.byCode).sort(([left], [right]) => left.localeCompare(right))),
+    byFamily: Object.fromEntries(Object.entries(state.byFamily).sort(([left], [right]) => left.localeCompare(right))),
+    episodeCount: episodes.length,
+    failFastEligibleEpisodes: episodes.filter((episode) => episode.attempts >= INFRASTRUCTURE_FAILURE_LIMIT).length,
+    failFastTriggeredOnTime: episodes.filter((episode) => episode.failFastTriggered && episode.overshoot === 0).length,
+    failFastLate: episodes.filter((episode) => episode.failFastTriggered && episode.overshoot > 0).length,
+    failFastMissed: episodes.filter((episode) => episode.failFastMissed).length,
+    recoverySucceeded: episodes.filter((episode) => episode.status === "recovered").length,
+    recoveryBypassed: episodes.filter((episode) => episode.status === "bypassed").length,
+    recoveryFailed: episodes.filter((episode) => episode.status === "failed").length,
+    maxAttemptsWithoutRecovery: episodes.reduce((maximum, episode) => Math.max(maximum, episode.attempts), 0),
+    totalOvershoot: episodes.reduce((total, episode) => total + episode.overshoot, 0),
+    episodes
+  };
+}
+
+/**
+ * Build infrastructure-failure episodes exclusively from product-wide stable
+ * codes. Generic policy denials, exit codes, messages, commands, paths, and
+ * benchmark identity are deliberately ignored.
+ */
+export function reduceFailureConvergence(events, options = {}) {
+  const state = convergenceState(events, options);
+  let workspaceRevision = 0;
+  for (const event of events) {
+    if (deltaSize(workspaceDeltaFrom(event)) > 0) workspaceRevision += 1;
+    recordInfrastructureFailure(state, event, workspaceRevision);
+    recordFailureRecovery(state, event);
+  }
+  const last = events.at(-1);
+  for (const [fingerprint, episode] of state.activeByFingerprint) {
+    closeFailureEpisode(episode, last, "failed");
+    state.activeByFingerprint.delete(fingerprint);
+  }
+  for (const episode of state.episodes) finalizeFailureEpisode(episode, events);
+  return convergenceSummary(state);
+}
+
+const WRITE_CONTRACT_CODES = new Set(["write_plan_invalid", "write_scope_required"]);
+const INVALID_CHECKPOINT_CODES = new Set([
+  "checkpoint_conflict", "checkpoint_not_found", "checkpoint_out_of_order",
+  "checkpoint_state_invalid", "checkpoint_recovery_required"
+]);
+
+function mutationState(correlation) {
+  return {
+    aliases: correlation.aliases,
+    plannedMutations: new Map(),
+    failedActions: new Set(),
+    writeContractActions: new Set(),
+    checkpointLimitActions: new Set(),
+    invalidCheckpointActions: new Set(),
+    checkpoints: new Map(),
+    emptyCheckpoints: new Set(),
+    checkpointsCreated: 0,
+    checkpointsSealed: 0,
+    checkpointsRestored: 0,
+    openCheckpointsAtTerminal: null,
+    workspaceDeltaEvents: 0
+  };
+}
+
+function recordMutationFailure(state, event, workId) {
+  if (event.type !== "tool.failed" && event.type !== "execution.failed") return;
+  state.failedActions.add(workId);
+  const codes = failureCodes(event).map((value) => value.trim().toLowerCase().split(":", 1)[0]);
+  for (const code of codes) {
+    if (WRITE_CONTRACT_CODES.has(code)) state.writeContractActions.add(workId);
+    if (code === "checkpoint_limit_exceeded") state.checkpointLimitActions.add(workId);
+    if (INVALID_CHECKPOINT_CODES.has(code)) state.invalidCheckpointActions.add(workId);
+  }
+}
+
+function recordCheckpointEvent(state, event, payload) {
+  if (!["checkpoint.created", "checkpoint.sealed", "checkpoint.restored"].includes(event.type)) return;
+  const checkpointId = typeof payload.checkpointId === "string" ? payload.checkpointId : `event:${event.seq}`;
+  const status = event.type.slice("checkpoint.".length);
+  state.checkpoints.set(checkpointId, status === "created" ? "open" : status);
+  if (event.type === "checkpoint.created") state.checkpointsCreated += 1;
+  if (event.type === "checkpoint.sealed") state.checkpointsSealed += 1;
+  if (event.type === "checkpoint.restored") state.checkpointsRestored += 1;
+  if (event.type === "checkpoint.sealed" && deltaSize(payload.delta) === 0) {
+    state.emptyCheckpoints.add(checkpointId);
+  }
+}
+
+function openCheckpointCount(state) {
+  return [...state.checkpoints.values()].filter((status) => status === "open").length;
+}
+
+function recordMutationEvent(state, event) {
+  const payload = record(event.payload);
+  const workId = eventWorkId(event, state.aliases);
+  if (event.type === "execution.planned" && mutatingEffects(planEffects(payload.plan))) {
+    state.plannedMutations.set(workId, event.seq);
+  }
+  if (deltaSize(workspaceDeltaFrom(event)) > 0) state.workspaceDeltaEvents += 1;
+  recordMutationFailure(state, event, workId);
+  recordCheckpointEvent(state, event, payload);
+  if (state.openCheckpointsAtTerminal === null && TERMINAL_TYPES.has(event.type)) {
+    state.openCheckpointsAtTerminal = openCheckpointCount(state);
+  }
+}
+
+function firstEligibleFailureSeq(convergence) {
+  return convergence.episodes.map((episode) => episode.eligibleSeq)
+    .filter(Number.isSafeInteger)
+    .sort((left, right) => left - right)[0] ?? null;
+}
+
+export function reduceMutationDiscipline(events, convergence = reduceFailureConvergence(events)) {
+  const state = mutationState(executionPlans(events));
+  for (const event of events) recordMutationEvent(state, event);
+  const mutationActionIds = new Set([...state.plannedMutations.keys(), ...state.writeContractActions]);
+  const firstEligibleSeq = firstEligibleFailureSeq(convergence);
+  return {
+    mutationRequests: mutationActionIds.size,
+    failedMutationRequests: [...mutationActionIds].filter((id) => state.failedActions.has(id)).length,
+    writeContractFailures: state.writeContractActions.size,
+    checkpointLimitFailures: state.checkpointLimitActions.size,
+    checkpointsCreated: state.checkpointsCreated,
+    checkpointsSealed: state.checkpointsSealed,
+    checkpointsRestored: state.checkpointsRestored,
+    emptyCheckpoints: state.emptyCheckpoints.size,
+    openCheckpointsAtTerminal: state.openCheckpointsAtTerminal ?? openCheckpointCount(state),
+    invalidCheckpointActions: state.invalidCheckpointActions.size,
+    mutationFallbacksAfterInfrastructureFailure: firstEligibleSeq === null ? 0
+      : [...state.plannedMutations.values()].filter((seq) => seq > firstEligibleSeq).length,
+    workspaceDeltaEvents: state.workspaceDeltaEvents
+  };
+}
+
 function hardFailures(events, mode, workspace) {
   const failures = [];
   const terminal = terminalSummary(events);
@@ -575,6 +945,8 @@ function sessionMetrics(events, options, boundaries, mode, workspace) {
   const { durationMs } = boundaries;
   const repetitions = groupRepeatedRequests(events);
   const repeatedOutputs = groupRepeatedOutputs(events);
+  const failureConvergence = reduceFailureConvergence(events, options);
+  const mutationDiscipline = reduceMutationDiscipline(events, failureConvergence);
   return {
     schemaVersion: 1,
     kind: "sigma.agent-session-metrics",
@@ -595,6 +967,8 @@ function sessionMetrics(events, options, boundaries, mode, workspace) {
     workspaceDeltas: workspace,
     postAnswerChurn: postAnswerChurn(events),
     steer: steerMetrics(events),
+    failureConvergence,
+    mutationDiscipline,
     hardFailures: hardFailures(events, mode, workspace)
   };
 }
@@ -643,6 +1017,10 @@ export function renderSessionMetricsMarkdown(metrics) {
     `| Repeated output bytes | ${metrics.repeatedOutputs.repeatedBytes} |`,
     `| Longest tool-failure streak | ${metrics.consecutiveToolFailures.longest} |`,
     `| Workspace delta files | ${metrics.workspaceDeltas.changedFiles.length} |`,
+    `| Infrastructure episodes / overshoot | ${metrics.failureConvergence.episodeCount} / ${metrics.failureConvergence.totalOvershoot} |`,
+    `| Fail-fast missed | ${metrics.failureConvergence.failFastMissed} |`,
+    `| Write-contract / checkpoint-limit failures | ${metrics.mutationDiscipline.writeContractFailures} / ${metrics.mutationDiscipline.checkpointLimitFailures} |`,
+    `| Open checkpoints at terminal | ${metrics.mutationDiscipline.openCheckpointsAtTerminal} |`,
     `| Post-answer tool calls | ${metrics.postAnswerChurn.toolCalls} |`,
     `| Stale actions after steer | ${metrics.steer.staleActions} |`,
     ""

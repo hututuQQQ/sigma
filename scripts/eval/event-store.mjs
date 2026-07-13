@@ -49,7 +49,7 @@ function jsonValue(value, seen = new Set()) {
   return valid;
 }
 
-function assertV4EventEnvelope(event) {
+export function assertV4EventEnvelope(event) {
   const valid = event && typeof event === "object" && !Array.isArray(event)
     && event.schemaVersion === EVENT_SCHEMA_VERSION
     && Number.isSafeInteger(event.seq) && event.seq >= 1
@@ -58,6 +58,24 @@ function assertV4EventEnvelope(event) {
     && jsonValue(event.payload);
   if (!valid) throw new Error("Invalid AgentEventEnvelope V4.");
   officialAssertAgentEventEnvelope?.(event);
+}
+
+export function assertV4EventStream(input) {
+  if (!Array.isArray(input) || input.length < 1) {
+    throw new Error("A V4 event stream must contain at least one event.");
+  }
+  let sessionId = null;
+  let expectedSeq = 1;
+  for (const event of input) {
+    assertV4EventEnvelope(event);
+    if (sessionId === null) sessionId = event.sessionId;
+    if (event.sessionId !== sessionId) throw new Error("A V4 event stream cannot mix sessions.");
+    if (event.seq !== expectedSeq) {
+      throw new Error(`V4 event sequence discontinuity: expected ${expectedSeq}, actual ${event.seq}.`);
+    }
+    expectedSeq += 1;
+  }
+  return input;
 }
 
 const SAFE_ID = /^[A-Za-z0-9._-]+$/u;

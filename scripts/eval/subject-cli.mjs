@@ -36,14 +36,24 @@ function eventFromLine(line) {
   return {};
 }
 
-function budgetState(events, startedAt) {
+function budgetState(events, startedAt, observedAt = Date.now()) {
   const usage = events.filter((event) => event.type === "usage.recorded").map((event) => event.payload ?? {});
   return {
-    wallTimeMs: Date.now() - startedAt,
+    wallTimeMs: observedAt - startedAt,
     modelTurns: events.filter((event) => event.type === "model.started").length,
     toolCalls: events.filter((event) => event.type === "tool.requested").length,
     costMicroUsd: usage.reduce((total, item) => total + Number(item.costMicroUsd ?? 0), 0)
   };
+}
+
+function terminalBudgetCancellation(events, startedAt, finishedAt, budget) {
+  const breach = breachedBudget(budgetState(events, startedAt, finishedAt), budget);
+  return breach ? {
+    reason: "experience_budget_exceeded",
+    ...breach,
+    observedAt: new Date(finishedAt).toISOString(),
+    observedAtTerminal: true
+  } : null;
 }
 
 function breachedBudget(state, budget) {
@@ -165,6 +175,9 @@ function startCliSubject({ workspace, stateHome, promptPath, runMode, env, subje
   };
 }
 
+// Lifecycle ownership is kept in one function so cleanup cannot be bypassed
+// by a return between spawn, cancellation, normal exit, and process-tree drain.
+// eslint-disable-next-line max-lines-per-function
 export async function runCliSubject(options) {
   const {
     workspace, stateHome, promptPath, runMode, env, budget, artifactDir, redactor,
@@ -181,6 +194,7 @@ export async function runCliSubject(options) {
   let cancelRequestedAt;
   let cancelPromise;
   let treeTerminationPromise;
+  let subjectFinishedAt;
 
   const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
   lines.on("line", (line) => {
@@ -214,7 +228,10 @@ export async function runCliSubject(options) {
       sessionId,
       workspace,
       env: { ...env, SIGMA_STATE_HOME: stateHome },
-      reason: `Evaluation experience budget exceeded: ${breach.dimension}.`,
+      // The suite budget remains evaluator-only. The subject receives one
+      // neutral external-stop request without thresholds, dimensions, scores,
+      // or any other evaluation state.
+      reason: "External controller requested stop.",
       subject
     }).then((cancelResult) => {
       cancellation.cancelExitCode = cancelResult.exitCode;
@@ -227,10 +244,24 @@ export async function runCliSubject(options) {
 
   const processResult = await new Promise((resolve, reject) => {
     child.on("error", reject);
-    child.on("close", (exitCode, signal) => resolve({ exitCode: exitCode ?? 1, signal }));
+    child.on("close", (exitCode, signal) => {
+      subjectFinishedAt = Date.now();
+      resolve({ exitCode: exitCode ?? 1, signal });
+    });
   }).finally(() => clearInterval(monitor));
+  if (!cancellation) {
+    cancellation = terminalBudgetCancellation(events, startedAt, subjectFinishedAt ?? Date.now(), budget) ?? undefined;
+  }
   await cancelPromise;
   await treeTerminationPromise;
+  let orphanCleanupError;
+  try {
+    // Drain the whole process group even after a normal parent exit. A solver
+    // must not keep descendants alive until verifier material is created.
+    await terminateProcessTree(child);
+  } catch (error) {
+    orphanCleanupError = error instanceof Error ? error.message : String(error);
+  }
   lines.close();
   await writeFile(path.join(artifactDir, "subject.stdout.log"), redactor(stdout), "utf8");
   await writeFile(path.join(artifactDir, "subject.stderr.log"), redactor(stderr), "utf8");
@@ -240,10 +271,11 @@ export async function runCliSubject(options) {
     result,
     events,
     cancellation,
+    ...(orphanCleanupError ? { orphanCleanupError } : {}),
     stdout,
     stderr,
-    durationMs: Date.now() - startedAt
+    durationMs: (subjectFinishedAt ?? Date.now()) - startedAt
   };
 }
 
-export { breachedBudget, budgetState, eventFromLine, nodeCliArgs };
+export { breachedBudget, budgetState, eventFromLine, nodeCliArgs, terminalBudgetCancellation };

@@ -26,6 +26,7 @@ import type { ProcessHandle } from "agent-execution";
 import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
 import type { ApprovalBinding } from "./approval-binding.js";
+import type { SubjectAttestationContextV1 } from "./subject-attestation.js";
 
 export interface RuntimeAgentProfile {
   profile: FrozenAgentProfile;
@@ -60,6 +61,9 @@ export interface RuntimeOptions {
   gatewayForRole?(role: ModelExecutionRole, profile: FrozenAgentProfile | undefined): ModelGateway;
   execution?: ProcessExecutionPort;
   runtimeEnvironment?: RuntimeEnvironment;
+  /** Runtime-authority provenance supplied by a trusted launcher. Never derive
+   * this from the workspace being operated on. */
+  subjectAttestation?: SubjectAttestationContextV1;
   joinChildren?(parentSessionId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
   cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
   hasActiveChildren?(parentSessionId: string): Promise<boolean> | boolean;

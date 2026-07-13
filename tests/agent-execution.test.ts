@@ -110,6 +110,16 @@ const handle = request => {
       } },
       timedOut: false, idleTimedOut: false, cancelled: false
     });
+  } else if (request.method === "exec" && mode === "launch-failure") {
+    ok(request, {
+      ...terminal("", "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE_V1@@private-nonce:{}"),
+      exitCode: 125,
+      failure: {
+        phase: "sandbox_launch", code: "sandbox_reparse_target_unresolvable",
+        message: "cannot resolve secret-value"
+      },
+      timedOut: false, idleTimedOut: false, cancelled: false
+    });
   } else if (request.method === "exec") {
     ok(request, { ...terminal("secret-value"), timedOut: false, idleTimedOut: false, cancelled: false });
   } else if (request.method === "process.spawn") {
@@ -460,6 +470,31 @@ describe("agent-execution protocol validation", () => {
       stderr: { data: "", nextOffset: 0, droppedBytes: 0 }
     };
     expect(parseProcessValue(processValue)).toMatchObject({ state: "exited", signal: "SIGTERM" });
+    expect(parseProcessValue({
+      ...processValue,
+      failure: {
+        phase: "sandbox_launch",
+        code: "sandbox_reparse_target_unresolvable",
+        message: "sandbox launch failed"
+      }
+    })).toMatchObject({
+      failure: {
+        phase: "sandbox_launch",
+        code: "sandbox_reparse_target_unresolvable"
+      }
+    });
+    expect(() => parseProcessValue({
+      ...processValue,
+      failure: { phase: "process", code: "sandbox_unavailable", message: "bad phase" }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessValue({
+      ...processValue,
+      failure: { phase: "sandbox_launch", code: "", message: "missing code" }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessValue({
+      ...processValue,
+      failure: { phase: "sandbox_launch", code: "policy-denied\nforged", message: "bad code" }
+    })).toThrow(BrokerProtocolError);
     expect(parseExecutionValue({ ...processValue, timedOut: false, idleTimedOut: false, cancelled: false })).toMatchObject({ state: "exited" });
     expect(() => parseExecutionValue({ ...processValue, timedOut: "false", idleTimedOut: false, cancelled: false }))
       .toThrow(BrokerProtocolError);
@@ -540,6 +575,27 @@ describe("SigmaExecBrokerClient", () => {
     await client.write(handle, "input\n");
     await expect(client.poll(handle)).resolves.toMatchObject({ state: "exited", stdout: "******" });
     await expect(client.terminate(handle)).rejects.toBeInstanceOf(BrokerProcessLostError);
+    await client.close();
+  });
+
+  it("propagates launch failure metadata without exposing its internal marker", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("launch-failure", {
+      secrets: { provider: "secret-value" }
+    }));
+    await client.connect();
+    const result = await client.execute({ ...spawnRequest(), timeoutMs: 500 });
+    expect(result).toMatchObject({
+      exitCode: 125,
+      failure: {
+        phase: "sandbox_launch",
+        code: "sandbox_reparse_target_unresolvable",
+        message: "cannot resolve [REDACTED:provider]"
+      }
+    });
+    expect(result.stderr).toBe(
+      "sigma-exec sandbox launch failed [sandbox_reparse_target_unresolvable]: cannot resolve [REDACTED:provider]"
+    );
+    expect(result.stderr).not.toContain("private-nonce");
     await client.close();
   });
 

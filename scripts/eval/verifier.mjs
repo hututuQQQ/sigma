@@ -145,7 +145,13 @@ function fileContentFailures(check, content) {
 
 async function fileCheck(check, workspace) {
   const relative = safeRelative(check.path, "verifier file path");
-  const { target, info } = await workspaceFile(workspace, relative);
+  let target;
+  let info;
+  try {
+    ({ target, info } = await workspaceFile(workspace, relative));
+  } catch (error) {
+    return { passed: false, message: error instanceof Error ? error.message : String(error) };
+  }
   const shouldExist = check.exists !== false && check.absent !== true;
   if (!shouldExist) return { passed: info === null, message: info === null ? `${relative} is absent.` : `${relative} unexpectedly exists.` };
   if (!info?.isFile()) return { passed: false, message: `${relative} is not a file.` };
@@ -252,6 +258,7 @@ function gitPreservationFailures(check, context) {
 }
 
 function terminalStatus(subjectResult, metrics) {
+  if (subjectResult.cancellation) return "cancelled";
   const outcome = subjectResult.result?.finishReason ?? subjectResult.result?.status ?? metrics?.terminal?.type;
   if (outcome === "completed" || outcome === "run.completed") return "completed";
   if (outcome === "needs_input" || outcome === "run.suspended") return "needs_input";
@@ -295,7 +302,11 @@ export async function runPostVerifier(context) {
           check, { ...context, workspace, manifestDir, delta, events }, answer, await brokerPromise
         );
       } catch (error) {
-        result = { passed: false, message: error instanceof Error ? error.message : String(error) };
+        result = {
+          passed: false,
+          infrastructureError: true,
+          message: error instanceof Error ? error.message : String(error)
+        };
       }
       checks.push({ index, type: check.type, ...result });
     }
@@ -305,27 +316,32 @@ export async function runPostVerifier(context) {
   }
   const expectedTerminal = scenario.expectedTerminal ?? "completed";
   const actualTerminal = terminalStatus(subjectResult, metrics);
-  checks.push({
+  const terminalCheck = {
     index: checks.length,
     type: "terminal",
     passed: actualTerminal === expectedTerminal,
     message: `Terminal status was ${actualTerminal}; expected ${expectedTerminal}.`
-  });
+  };
+  checks.push(terminalCheck);
   const log = checks.map((check) => [
-    `${check.passed ? "PASS" : "FAIL"} ${check.type}: ${check.message}`,
+    `${check.infrastructureError ? "INVALID" : check.passed ? "PASS" : "FAIL"} ${check.type}: ${check.message}`,
     check.command ? `command: ${check.command.join(" ")}` : "",
     check.stdout ? `stdout:\n${check.stdout}` : "",
     check.stderr ? `stderr:\n${check.stderr}` : ""
   ].filter(Boolean).join("\n")).join("\n\n");
   await writeFile(path.join(artifactDir, "verifier.log"), redactor(log), "utf8");
+  const productChecks = checks.filter((check) => check.type !== "terminal");
+  const invalid = productChecks.some((check) => check.infrastructureError);
   return {
-    status: checks.every((check) => check.passed) ? "pass" : "fail",
+    validity: invalid ? "invalid" : "valid",
+    status: invalid ? "not_observed" : productChecks.every((check) => check.passed) ? "pass" : "fail",
     checks: checks.map(({ stdout, stderr, ...check }) => ({
       ...check,
       ...(stdout ? { stdout: redactor(stdout) } : {}),
       ...(stderr ? { stderr: redactor(stderr) } : {})
     })),
     finalAnswer: redactor(answer),
-    terminal: { expected: expectedTerminal, actual: actualTerminal }
+    terminal: { expected: expectedTerminal, actual: actualTerminal },
+    delivery: { status: terminalCheck.passed ? "pass" : "fail", check: terminalCheck }
   };
 }

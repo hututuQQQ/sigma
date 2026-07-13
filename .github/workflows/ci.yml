@@ -16,6 +16,48 @@ env:
   CARGO_LLVM_COV_VERSION: 0.8.6
 
 jobs:
+  evaluation-conformance:
+    name: Evaluation V2 conformance (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x64
+          - os: windows-2022
+            label: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Install Linux native sandbox dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          bwrap --die-with-parent --new-session --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true
+      - name: Build protocol and product packages
+        run: pnpm build
+      - name: Run deterministic evaluation, fairness, metrics, and native conformance
+        run: pnpm eval:conformance
+
   build-test:
     name: Ubuntu product and portable release checks
     runs-on: ubuntu-24.04

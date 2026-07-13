@@ -285,6 +285,8 @@ pub struct PreparedCommand {
     pub command: Command,
     pub bootstrap_stdin: Vec<u8>,
     pub protected_path_guards: Vec<ProtectedPathGuard>,
+    /** Broker-held nonce shared only with the trusted internal sandbox launcher. */
+    pub launch_failure_nonce: Option<String>,
 }
 
 pub(crate) struct ProtectedPathGuard {
@@ -751,6 +753,7 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
         command,
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
+        launch_failure_nonce: None,
     })
 }
 
@@ -847,6 +850,7 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         command,
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
+        launch_failure_nonce: None,
     })
 }
 

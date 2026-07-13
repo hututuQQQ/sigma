@@ -1,0 +1,73 @@
+name: Weekly frozen live evaluation
+
+on:
+  schedule:
+    - cron: "30 19 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 26.4.0
+  PNPM_VERSION: 11.7.0
+  RUST_VERSION: 1.96.0
+
+jobs:
+  full-trend:
+    name: ${{ matrix.label }} complete set repeat three
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x64
+          - os: windows-2022
+            label: win32-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install and verify Linux sandbox dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if sysctl -n kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          bwrap --die-with-parent --new-session --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
+      - name: Run frozen complete set three times
+        run: pnpm eval:agent -- --suite experience --repeat 3 --eval-root .artifacts/eval-weekly
+      - name: Run frozen repository-scale family three times
+        if: always()
+        run: pnpm eval:agent -- --suite repo-scale --repeat 3 --eval-root .artifacts/eval-weekly-repo-scale
+      - name: Export aggregate trend status only
+        if: always()
+        run: node scripts/eval/export-status.mjs --mode weekly --output .artifacts/eval-status/weekly.json --input .artifacts/eval-weekly --input .artifacts/eval-weekly-repo-scale
+      - name: Upload aggregate trend status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-eval-${{ matrix.label }}-${{ github.run_id }}
+          if-no-files-found: error
+          include-hidden-files: true
+          path: .artifacts/eval-status/weekly.json

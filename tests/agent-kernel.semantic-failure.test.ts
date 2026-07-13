@@ -193,7 +193,7 @@ describe("semantic execution failure convergence", () => {
       semanticFailureCluster: { family: "workspace_transaction", attempts: 2 }
     });
 
-    state = failAlternative(state, "patch-attempt", "apply_patch", "checkpoint_recovery_failed");
+    state = failAlternative(state, "patch-attempt", "apply_patch", "workspace_transaction_cleanup_failed");
     expect(state).toMatchObject({
       phase: "outcome_pending",
       semanticFailureCluster: { family: "workspace_transaction", attempts: 3 },
@@ -201,6 +201,17 @@ describe("semantic execution failure convergence", () => {
         kind: "recoverable_failure",
         code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
       }
+    });
+  });
+
+  it("keeps checkpoint recovery failures in their own public family", () => {
+    let state = failAlternative(initial(), "restore-one", "apply_patch", "checkpoint_recovery_failed");
+    state = failAlternative(state, "restore-two", "edit", "recovery_retry_denied");
+    state = failAlternative(state, "restore-three", "write", "recovery_result_lost_no_replay");
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      semanticFailureCluster: { family: "checkpoint_recovery", attempts: 3 },
+      proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
     });
   });
 

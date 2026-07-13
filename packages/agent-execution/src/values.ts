@@ -1,7 +1,12 @@
 import path from "node:path";
 import { BrokerProtocolError } from "./errors.js";
 import { protocolRecord } from "./protocol.js";
-import { BROKER_PROTOCOL_VERSION, type BrokerDoctorReport, type ProcessState } from "./types.js";
+import {
+  BROKER_PROTOCOL_VERSION,
+  type BrokerDoctorReport,
+  type ProcessLaunchFailureV1,
+  type ProcessState
+} from "./types.js";
 
 export interface OutputChunkValue {
   data: string;
@@ -33,6 +38,7 @@ export interface ProcessValue {
   stdout: OutputChunkValue;
   stderr: OutputChunkValue;
   outputArtifacts: OutputArtifactValue[];
+  failure?: ProcessLaunchFailureV1;
 }
 
 export interface ExecutionValue extends ProcessValue {
@@ -67,6 +73,23 @@ function nullableExitCode(value: unknown): number | null {
   if (value === null) return null;
   if (!Number.isSafeInteger(value)) throw new BrokerProtocolError("Process exitCode must be an integer or null.");
   return value as number;
+}
+
+function processLaunchFailure(input: unknown): ProcessLaunchFailureV1 | undefined {
+  if (input === undefined) return undefined;
+  const value = protocolRecord(input, "Process failure");
+  if (value.phase !== "sandbox_launch") {
+    throw new BrokerProtocolError("Process failure.phase must be 'sandbox_launch'.");
+  }
+  const code = stringValue(value.code, "Process failure.code");
+  const message = stringValue(value.message, "Process failure.message");
+  if (!/^[a-z][a-z0-9_]{0,127}$/u.test(code)) {
+    throw new BrokerProtocolError("Process failure.code must be a stable lowercase code.");
+  }
+  if (message.length === 0 || message.length > 16_384 || message.includes("\0")) {
+    throw new BrokerProtocolError("Process failure.message has an invalid length or content.");
+  }
+  return { phase: "sandbox_launch", code, message };
 }
 
 function outputChunk(input: unknown, label: string): OutputChunkValue {
@@ -258,9 +281,13 @@ export function parseSpawnedProcess(input: unknown): { id: string; systemProcess
 export function parseProcessValue(input: unknown): ProcessValue {
   const value = protocolRecord(input, "Process result");
   const artifacts = outputArtifacts(value.outputArtifacts);
+  const failure = processLaunchFailure(value.failure);
   const state = processState(value.state);
   if (state === "running" && artifacts.length > 0) {
     throw new BrokerProtocolError("Running processes cannot publish final output artifacts.");
+  }
+  if (state === "running" && failure) {
+    throw new BrokerProtocolError("Running processes cannot publish a launch failure.");
   }
   return {
     state,
@@ -269,7 +296,8 @@ export function parseProcessValue(input: unknown): ProcessValue {
     durationMs: integerValue(value.durationMs, "Process durationMs"),
     stdout: outputChunk(value.stdout, "Process stdout"),
     stderr: outputChunk(value.stderr, "Process stderr"),
-    outputArtifacts: artifacts
+    outputArtifacts: artifacts,
+    ...(failure ? { failure } : {})
   };
 }
 

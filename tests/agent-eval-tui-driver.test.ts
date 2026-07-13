@@ -73,6 +73,22 @@ describe("evaluation TUI event tail", () => {
     expect(result.stdout.trim().split(/\r?\n/u)).toEqual(["run.suspended", "None", "run.suspended", "None", "None"]);
   });
 
+  it("detects a budget breach from the final durable event", () => {
+    const python = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
+    const source = [
+      "import importlib.util,sys,json",
+      "spec=importlib.util.spec_from_file_location('driver',sys.argv[1])",
+      "driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)",
+      "events=[{'type':'model.started','payload':{}} for _ in range(5)]",
+      "print(json.dumps(driver.budget_breach(events,100,{'wallTimeSec':45,'modelTurns':4,'toolCalls':6,'costUsd':0.03}),sort_keys=True))"
+    ].join(";");
+    const result = spawnSync(python, ["-c", source, path.resolve("scripts/eval/tui-driver.py")], {
+      cwd: process.cwd(), encoding: "utf8", windowsHide: true
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ dimension: "modelTurns", actual: 5, limit: 4 });
+  });
+
   it("drives initial input, one-shot approval, steering, and graceful exit through the terminal loop", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-tui-loop-"));
     temporary.push(root);

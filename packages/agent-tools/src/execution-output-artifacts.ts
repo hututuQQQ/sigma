@@ -127,6 +127,7 @@ export async function commandReceipt(
     artifacts: imported.ids, artifactRefs: imported.refs,
     diagnostics: [
       `exit_code=${String(result.exitCode)}`,
+      ...(result.failure ? [result.failure.code] : []),
       ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
       ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])
     ],
@@ -159,11 +160,15 @@ export async function processReceipt(
     data: { source: "sigma-exec", diagnostic: { type: "process_output_artifacts", artifacts: imported.metadata } }
   }];
   return {
-    callId: request.callId, ok: true,
+    callId: request.callId, ok: value.failure === undefined,
     output: JSON.stringify(outputValue, (_key, item: unknown) => item instanceof Uint8Array ? undefined : item),
     observedEffects: effects, actualEffects: effects,
     artifacts: imported.ids, artifactRefs: imported.refs,
-    diagnostics: [...(value.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics],
+    diagnostics: [
+      ...(value.failure ? [value.failure.code] : []),
+      ...(value.outputTruncated ? ["output_truncated"] : []),
+      ...imported.diagnostics
+    ],
     evidence, startedAt, completedAt
   };
 }

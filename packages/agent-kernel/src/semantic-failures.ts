@@ -1,61 +1,31 @@
-import type { EvidenceRecord, ToolReceipt, WorkspaceDelta } from "agent-protocol";
+import {
+  INFRASTRUCTURE_FAILURE_LIMIT,
+  classifyInfrastructureFailureCodesV1,
+  type EvidenceRecord,
+  type InfrastructureFailureClassificationV1,
+  type ToolReceipt,
+  type WorkspaceDelta
+} from "agent-protocol";
 import type {
   KernelState,
   SemanticFailureCluster,
   SemanticProgressWatermark
 } from "./state.js";
 
-export const SEMANTIC_INFRASTRUCTURE_FAILURE_LIMIT = 3;
+export const SEMANTIC_INFRASTRUCTURE_FAILURE_LIMIT = INFRASTRUCTURE_FAILURE_LIMIT;
 export const SEMANTIC_INFRASTRUCTURE_FAILURE_CODE = "tool_infrastructure_failure_loop";
-
-interface FailureClassification {
-  family: string;
-  diagnosticCodes: string[];
-}
 
 export interface SemanticFailureUpdate {
   state: KernelState;
   limitReached: boolean;
 }
 
-const CODE_FAMILIES: ReadonlyArray<readonly [RegExp, string]> = [
-  [/^(?:workspace_transaction_root_unavailable|workspace_transaction_cleanup_failed|checkpoint_recovery_failed)$/u,
-    "workspace_transaction"],
-  [/^(?:broker_connection_error|broker_protocol_error|process_lost)$/u, "execution_broker"],
-  [/^(?:sandbox_unavailable|sandbox_denied|sandbox_setup_failed|sandbox_self_test_failed)$/u, "execution_sandbox"],
-  [/^(?:process_spawn_failed|spawn_failed|executable_not_found|executable_unavailable|shell_unavailable|runtime_unavailable|toolchain_unavailable)$/u,
-    "execution_capability"],
-  [/^(?:invalid_output_encoding|output_decode_error|output_encoding_unsupported)$/u, "execution_output_encoding"],
-  [/^(?:broker_timeout|process_idle_timeout|process_deadline|process_timed_out)$/u, "execution_timeout"]
-];
-
-function normalizedCode(value: string): string {
-  return value.trim().toLowerCase().split(":", 1)[0] ?? "";
-}
-
-function familyForCode(code: string): string | null {
-  for (const [pattern, family] of CODE_FAMILIES) {
-    if (pattern.test(code)) return family;
-  }
-  return null;
-}
-
-function classifyFailure(receipt: ToolReceipt): FailureClassification | null {
-  if (receipt.ok) return null;
-  const codes = [...new Set([
+function classifyFailure(receipt: ToolReceipt): InfrastructureFailureClassificationV1 | undefined {
+  if (receipt.ok) return undefined;
+  return classifyInfrastructureFailureCodesV1([
     ...(receipt.outcome?.diagnosticCodes ?? []),
     ...receipt.diagnostics
-  ].map(normalizedCode).filter(Boolean))];
-  const classified = codes.flatMap((code) => {
-    const family = familyForCode(code);
-    return family ? [{ code, family }] : [];
-  });
-  if (classified.length === 0) return null;
-  const family = classified[0]!.family;
-  return {
-    family,
-    diagnosticCodes: classified.filter((item) => item.family === family).map((item) => item.code)
-  };
+  ]);
 }
 
 function deltaSize(delta: WorkspaceDelta | undefined): number {
@@ -83,7 +53,7 @@ function progressMatches(left: SemanticProgressWatermark, right: SemanticProgres
 
 function nextCluster(
   current: SemanticFailureCluster | undefined,
-  classification: FailureClassification,
+  classification: InfrastructureFailureClassificationV1,
   progress: SemanticProgressWatermark,
   revision: number
 ): SemanticFailureCluster {
@@ -93,7 +63,7 @@ function nextCluster(
       attempts: 1,
       firstRevision: revision,
       lastRevision: revision,
-      diagnosticCodes: classification.diagnosticCodes,
+      diagnosticCodes: classification.codes,
       progress: { ...progress }
     };
   }
@@ -101,7 +71,7 @@ function nextCluster(
     ...current,
     attempts: current.attempts + 1,
     lastRevision: revision,
-    diagnosticCodes: [...new Set([...current.diagnosticCodes, ...classification.diagnosticCodes])]
+    diagnosticCodes: [...new Set([...current.diagnosticCodes, ...classification.codes])]
   };
 }
 

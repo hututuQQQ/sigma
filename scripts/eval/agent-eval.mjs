@@ -4,42 +4,46 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, positiveInteger } from "./common.mjs";
 import { runEvaluation } from "./runner.mjs";
 
-export async function runAgentEvalCli(argv = process.argv.slice(2), deps = {}) {
-  const flags = parseArgs(argv[0] === "--" ? argv.slice(1) : argv);
-  const suite = typeof flags.suite === "string" ? flags.suite : "quick";
-  const repeat = positiveInteger(flags.repeat, suite === "experience" ? 3 : 1, "--repeat");
-  const scenarios = typeof flags.scenario === "string"
-    ? flags.scenario.split(",").map((item) => item.trim()).filter(Boolean)
-    : [];
-  const result = await runEvaluation({
-    suite,
-    repeat,
-    scenarios,
+function progressReporter(event) {
+  if (event.type === "attempt.started") {
+    process.stdout.write(`RUN ${event.scenarioId} repetition=${event.repetition}\n`);
+    return;
+  }
+  if (event.type !== "attempt.completed") return;
+  const dimensions = event.attempt.dimensions;
+  process.stdout.write(
+    `${Object.values(dimensions).every((item) => item.status === "pass") ? "PASS" : "FAIL"} `
+    + `${event.attempt.scenarioId} repetition=${event.attempt.repetition} `
+    + `correctness=${dimensions.correctness.status} safety=${dimensions.safety.status} `
+    + `experience=${dimensions.experience.status} reliability=${dimensions.reliability.status}\n`
+  );
+}
+
+function evaluationOptions(flags) {
+  const repeat = flags.repeat === undefined ? undefined : positiveInteger(flags.repeat, 1, "--repeat");
+  return {
+    suite: typeof flags.suite === "string" ? flags.suite : "quick",
+    ...(repeat === undefined ? {} : { repeat }),
+    scenarios: typeof flags.scenario === "string"
+      ? flags.scenario.split(",").map((item) => item.trim()).filter(Boolean) : [],
     manifestPath: typeof flags.manifest === "string" ? flags.manifest : undefined,
     runDir: typeof flags["run-dir"] === "string" ? flags["run-dir"] : undefined,
     evalRootDir: typeof flags["eval-root"] === "string" ? flags["eval-root"] : undefined,
     envPath: typeof flags.env === "string" ? flags.env : undefined,
+    subjectWorkspace: typeof flags["subject-workspace"] === "string" ? flags["subject-workspace"] : undefined,
     subjectKind: typeof flags.subject === "string" ? flags.subject : "package",
     skipPackage: flags["skip-package"] === true
-  }, {
+  };
+}
+
+export async function runAgentEvalCli(argv = process.argv.slice(2), deps = {}) {
+  const flags = parseArgs(argv[0] === "--" ? argv.slice(1) : argv);
+  const result = await runEvaluation(evaluationOptions(flags), {
     ...deps,
-    onProgress: deps.onProgress ?? ((event) => {
-      if (event.type === "attempt.started") {
-        process.stdout.write(`RUN ${event.scenarioId} repetition=${event.repetition}\n`);
-      } else if (event.type === "attempt.completed") {
-        const dimensions = event.attempt.dimensions;
-        process.stdout.write(
-          `${Object.values(dimensions).every((item) => item.status === "pass") ? "PASS" : "FAIL"} `
-          + `${event.attempt.scenarioId} repetition=${event.attempt.repetition} `
-          + `correctness=${dimensions.correctness.status} safety=${dimensions.safety.status} `
-          + `experience=${dimensions.experience.status} reliability=${dimensions.reliability.status}\n`
-        );
-      }
-    })
+    onProgress: deps.onProgress ?? progressReporter
   });
   process.stdout.write(`Evaluation run: ${result.runDir}\n`);
   process.stdout.write(`Report: ${result.reportPath}\n`);
-  process.stdout.write(`Codex review: ${result.codexReviewPath}\n`);
   return { ...result, exitCode: result.run.status === "stable" ? 0 : 1 };
 }
 
