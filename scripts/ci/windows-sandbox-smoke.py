@@ -605,12 +605,28 @@ setTimeout(() => process.exit(4), 3000);
         )
         if not crashed_tree.get("handleId"):
             raise RuntimeError(f"broker-crash fixture did not start: {crashed_tree}")
+        crash_journal_ready = False
         for _ in range(100):
             crash_journals = list(recovery_directory.glob("sigmacode.exec.*.json"))
-            if crash_journals:
-                break
+            if len(crash_journals) == 1:
+                try:
+                    candidate_journal = json.loads(
+                        crash_journals[0].read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    candidate_journal = {}
+                if not isinstance(candidate_journal, dict):
+                    candidate_journal = {}
+                candidate_entries = candidate_journal.get("entries")
+                if (
+                    isinstance(candidate_journal.get("profileName"), str)
+                    and isinstance(candidate_entries, list)
+                    and candidate_entries
+                ):
+                    crash_journal_ready = True
+                    break
             time.sleep(0.05)
-        if len(crash_journals) != 1:
+        if not crash_journal_ready:
             raise RuntimeError(
                 f"broker-crash fixture did not reach a durably journaled ACL state: {crash_journals}"
             )
