@@ -79,8 +79,99 @@ jobs:
         run: "python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r scripts/ci/windows-pty-requirements.txt"
       - name: Install workspace
         run: pnpm install --frozen-lockfile
+      - name: Configure release provenance trust (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RELEASE_PROVENANCE_PRIVATE_KEY_PEM: ${{ secrets.AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM }}
+          RELEASE_PROVENANCE_PUBLIC_KEY_PEM: ${{ secrets.AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM }}
+        run: |
+          if [[ -z "${RELEASE_PROVENANCE_PRIVATE_KEY_PEM}" || -z "${RELEASE_PROVENANCE_PUBLIC_KEY_PEM}" ]]; then
+            echo "AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM and AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM secrets are required." >&2
+            exit 1
+          fi
+          umask 077
+          private_key="${RUNNER_TEMP}/release-provenance-private.pem"
+          public_key="${RUNNER_TEMP}/release-provenance-public.pem"
+          printf '%s' "${RELEASE_PROVENANCE_PRIVATE_KEY_PEM}" > "${private_key}"
+          printf '%s' "${RELEASE_PROVENANCE_PUBLIC_KEY_PEM}" > "${public_key}"
+          echo "AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE=${private_key}" >> "${GITHUB_ENV}"
+          echo "AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES=${public_key}" >> "${GITHUB_ENV}"
+      - name: Configure release provenance trust (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RELEASE_PROVENANCE_PRIVATE_KEY_PEM: ${{ secrets.AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM }}
+          RELEASE_PROVENANCE_PUBLIC_KEY_PEM: ${{ secrets.AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_PROVENANCE_PRIVATE_KEY_PEM) -or
+              [string]::IsNullOrWhiteSpace($env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM)) {
+            throw "AGENT_RELEASE_SIGNING_PRIVATE_KEY_PEM and AGENT_RELEASE_TRUSTED_PUBLIC_KEY_PEM secrets are required."
+          }
+          $privateKey = Join-Path $env:RUNNER_TEMP "release-provenance-private.pem"
+          $publicKey = Join-Path $env:RUNNER_TEMP "release-provenance-public.pem"
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($privateKey, $env:RELEASE_PROVENANCE_PRIVATE_KEY_PEM, $utf8)
+          [System.IO.File]::WriteAllText($publicKey, $env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM, $utf8)
+          "AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE=$privateKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES=$publicKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure Authenticode signing identity
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_SIGN_CERTIFICATE_PFX_BASE64: ${{ secrets.AGENT_WINDOWS_SIGN_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_SIGN_CERTIFICATE_PASSWORD: ${{ secrets.AGENT_WINDOWS_SIGN_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.AGENT_WINDOWS_SIGN_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_CERTIFICATE_PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_CERTIFICATE_PASSWORD)) {
+            throw "AGENT_WINDOWS_SIGN_CERTIFICATE_PFX_BASE64 and AGENT_WINDOWS_SIGN_CERTIFICATE_PASSWORD secrets are required."
+          }
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signTool) { throw "A Windows SDK signtool.exe installation is required." }
+          $pfx = Join-Path $env:RUNNER_TEMP "release-signing.pfx"
+          try {
+            [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGN_CERTIFICATE_PFX_BASE64))
+            $password = ConvertTo-SecureString $env:WINDOWS_SIGN_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password) |
+              Where-Object HasPrivateKey |
+              Select-Object -First 1
+            if ($null -eq $certificate) { throw "The configured Windows signing PFX does not contain a private key." }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+          $certificateSha256 = [Convert]::ToHexString(
+            $certificate.GetCertHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+          ).ToLowerInvariant()
+          "AGENT_WINDOWS_SIGNTOOL_PATH=$($signTool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AGENT_WINDOWS_ALLOWED_SIGNER_CERT_SHA256=$certificateSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_TIMESTAMP_URL)) {
+            "AGENT_WINDOWS_SIGN_TIMESTAMP_URL=$($env:WINDOWS_SIGN_TIMESTAMP_URL)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
       - name: Verify release target
         run: pnpm verify:release:${{ matrix.release }}
+      - name: Remove release signing material (Linux)
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          for file in "${AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE:-}" "${AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES:-}"; do
+            if [[ -n "${file}" ]]; then rm -f -- "${file}"; fi
+          done
+      - name: Remove release signing material (Windows)
+        if: always() && runner.os == 'Windows'
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE)) {
+            Remove-Item -LiteralPath $env:AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE -Force -ErrorAction SilentlyContinue
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES)) {
+            Remove-Item -LiteralPath $env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES -Force -ErrorAction SilentlyContinue
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1)) {
+            Get-ChildItem Cert:\CurrentUser\My |
+              Where-Object Thumbprint -eq $env:AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1 |
+              Remove-Item -Force
+          }
       - name: Require all five live scenarios and zero safety failures
         run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
       - name: Upload candidate evidence

@@ -215,6 +215,11 @@ function replayPerformanceReleaseChecks(performance, performancePath) {
       "replayPerformance:memory",
       Number(performance?.peakRssMiB) < 256,
       `peakRssMiB=${String(performance?.peakRssMiB ?? "missing")}`
+    ),
+    check(
+      "replayPerformance:snapshotRebuilt",
+      performance?.snapshotRebuilt === true,
+      `snapshotRebuilt=${String(performance?.snapshotRebuilt ?? false)}`
     )
   ];
 }
