@@ -5,24 +5,60 @@ import type {
   ModelRequest,
   ModelToolDefinition
 } from "agent-protocol";
+import { ModelGatewayError } from "./catalog.js";
+
+export type OpenAIToolChoicePolicy = "always" | "non_thinking_only" | "never";
 
 export interface OpenAIWireProfile {
   developerRole: "developer" | "system";
-  supportsToolChoice: boolean;
+  toolChoicePolicy: OpenAIToolChoicePolicy;
+  /** @deprecated Use toolChoicePolicy. */
+  supportsToolChoice?: boolean;
   thinking?: "enabled" | "disabled";
   retryableFinishReasons: readonly string[];
 }
 
 const defaultWireProfile: OpenAIWireProfile = {
   developerRole: "developer",
-  supportsToolChoice: true,
+  toolChoicePolicy: "always",
   retryableFinishReasons: []
 };
+
+function legacyToolChoicePolicy(value: boolean | undefined): OpenAIToolChoicePolicy | undefined {
+  if (value === undefined) return undefined;
+  return value ? "always" : "never";
+}
+
+function validateToolChoiceProfile(
+  canonical: OpenAIToolChoicePolicy | undefined,
+  legacy: OpenAIToolChoicePolicy | undefined,
+  thinking: OpenAIWireProfile["thinking"]
+): void {
+  if (canonical && legacy && canonical !== legacy) {
+    throw new ModelGatewayError(
+      `OpenAI wire profile has conflicting tool choice settings: toolChoicePolicy='${canonical}' and supportsToolChoice=${String(legacy === "always")}.`,
+      "configuration"
+    );
+  }
+  if (canonical === "non_thinking_only" && !thinking) {
+    throw new ModelGatewayError(
+      "OpenAI wire profile requires a thinking mode when toolChoicePolicy='non_thinking_only'.",
+      "configuration"
+    );
+  }
+}
+
+function resolvedToolChoicePolicy(profile: Partial<OpenAIWireProfile> | undefined): OpenAIToolChoicePolicy {
+  const canonical = profile?.toolChoicePolicy;
+  const legacy = legacyToolChoicePolicy(profile?.supportsToolChoice);
+  validateToolChoiceProfile(canonical, legacy, profile?.thinking);
+  return canonical ?? legacy ?? defaultWireProfile.toolChoicePolicy;
+}
 
 export function resolveWireProfile(profile: Partial<OpenAIWireProfile> | undefined): OpenAIWireProfile {
   return {
     developerRole: profile?.developerRole ?? defaultWireProfile.developerRole,
-    supportsToolChoice: profile?.supportsToolChoice ?? defaultWireProfile.supportsToolChoice,
+    toolChoicePolicy: resolvedToolChoicePolicy(profile),
     ...(profile?.thinking ? { thinking: profile.thinking } : {}),
     retryableFinishReasons: profile?.retryableFinishReasons ?? defaultWireProfile.retryableFinishReasons
   };
@@ -51,6 +87,34 @@ function openAiTools(tools: ModelToolDefinition[] | undefined): JsonValue[] | un
   }));
 }
 
+interface WireControls {
+  thinking?: "enabled" | "disabled";
+  toolChoice?: "auto" | "required" | "none";
+}
+
+function invalidToolChoice(message: string): ModelGatewayError {
+  return new ModelGatewayError(message, "configuration");
+}
+
+function wireControls(request: ModelRequest, hasTools: boolean, profile: OpenAIWireProfile): WireControls {
+  if (request.toolChoice === "required" && !hasTools) {
+    throw invalidToolChoice("toolChoice='required' requires at least one tool definition.");
+  }
+  const choice = hasTools ? request.toolChoice ?? "auto" : "none";
+  const strictChoice = request.toolChoice === "required" || request.toolChoice === "none";
+  if (profile.toolChoicePolicy === "always") {
+    return { ...(profile.thinking ? { thinking: profile.thinking } : {}), toolChoice: choice };
+  }
+  if (profile.toolChoicePolicy === "never") {
+    if (strictChoice) {
+      throw invalidToolChoice(`OpenAI wire profile cannot honor toolChoice='${request.toolChoice}'.`);
+    }
+    return profile.thinking ? { thinking: profile.thinking } : {};
+  }
+  if (strictChoice) return { thinking: "disabled", toolChoice: choice };
+  return profile.thinking ? { thinking: profile.thinking } : {};
+}
+
 export function bodyFor(
   request: ModelRequest,
   model: string,
@@ -58,14 +122,13 @@ export function bodyFor(
   profile: OpenAIWireProfile
 ): Record<string, JsonValue> {
   const tools = openAiTools(request.tools);
+  const controls = wireControls(request, Boolean(tools?.length), profile);
   return {
     model,
     messages: openAiMessages(request.messages, profile),
     ...(tools?.length ? { tools } : {}),
-    ...(profile.supportsToolChoice ? {
-      tool_choice: tools?.length ? (request.toolChoice ?? "auto") : "none"
-    } : {}),
-    ...(profile.thinking ? { thinking: { type: profile.thinking } } : {}),
+    ...(controls.toolChoice ? { tool_choice: controls.toolChoice } : {}),
+    ...(controls.thinking ? { thinking: { type: controls.thinking } } : {}),
     ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
     ...(stream ? { stream: true, stream_options: { include_usage: true } } : {})

@@ -13,29 +13,29 @@ export class RuntimeCheckpointControl {
 
   async create(session: RuntimeSession, scopePaths: string[]): Promise<CheckpointRef> {
     const created = checkpointRef(await this.options.checkpoints.create({
-      sessionId: session.sessionId,
-      runId: session.runId,
-      workspacePath: session.workspacePath,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      workspacePath: session.identity.workspacePath,
       scopePaths,
-      baseSeq: session.seq
+      baseSeq: session.durable.seq
     }));
     await this.options.emit(session, "checkpoint.created", "runtime", created);
     return created;
   }
 
   async undoLatest(session: RuntimeSession): Promise<CheckpointRef> {
-    const restored = checkpointRef(await this.options.checkpoints.undoLatest(session.sessionId));
+    const restored = checkpointRef(await this.options.checkpoints.undoLatest(session.identity.sessionId));
     await this.options.emit(session, "checkpoint.restored", "user", restored);
     return restored;
   }
 
   async restoreRun(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {
-    if (session.openCheckpointRecovery) {
+    if (session.recovery.openCheckpointRecovery) {
       throw Object.assign(new Error("Resolve the interrupted open checkpoint before restoring sealed run changes."), {
         code: "checkpoint_recovery_required"
       });
     }
-    const records = await this.options.checkpoints.list(session.sessionId);
+    const records = await this.options.checkpoints.list(session.identity.sessionId);
     const latest = [...records].reverse().find((item) => item.status !== "restored");
     if (!latest || latest.checkpointId !== checkpointId) {
       throw Object.assign(new Error(`Checkpoint ${checkpointId} is not the latest restorable checkpoint.`), {
@@ -47,7 +47,7 @@ export class RuntimeCheckpointControl {
         code: "checkpoint_not_sealed"
       });
     }
-    if (latest.runId !== session.runId) {
+    if (latest.runId !== session.durable.runId) {
       throw Object.assign(new Error(`Checkpoint ${checkpointId} was not created by the current run.`), {
         code: "checkpoint_run_mismatch"
       });
@@ -56,7 +56,7 @@ export class RuntimeCheckpointControl {
   }
 
   async seal(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {
-    const sealed = checkpointRef(await this.options.checkpoints.seal(session.sessionId, checkpointId));
+    const sealed = checkpointRef(await this.options.checkpoints.seal(session.identity.sessionId, checkpointId));
     await this.evidence.record(session, sealed);
     return sealed;
   }
@@ -65,7 +65,7 @@ export class RuntimeCheckpointControl {
     session: RuntimeSession,
     checkpointId: string
   ): Promise<{ currentManifestDigest: string; delta: { added: string[]; modified: string[]; deleted: string[] } }> {
-    const inspection = await this.options.checkpoints.inspectOpen(session.sessionId, checkpointId);
+    const inspection = await this.options.checkpoints.inspectOpen(session.identity.sessionId, checkpointId);
     return {
       currentManifestDigest: inspection.currentManifestDigest,
       delta: {
@@ -82,7 +82,7 @@ export class RuntimeCheckpointControl {
     expectedCurrentManifestDigest: string
   ): Promise<CheckpointRef> {
     const restored = checkpointRef(await this.options.checkpoints.restoreOpen(
-      session.sessionId,
+      session.identity.sessionId,
       checkpointId,
       expectedCurrentManifestDigest
     ));
@@ -94,11 +94,11 @@ export class RuntimeCheckpointControl {
   }
 
   async recoverOpen(session: RuntimeSession): Promise<OpenCheckpointRecoveryResult> {
-    const records = await this.options.checkpoints.list(session.sessionId);
+    const records = await this.options.checkpoints.list(session.identity.sessionId);
     await this.reconcileHead(session, records);
     const open = records.filter((item) => item.status === "open").at(-1);
     if (!open) return { kind: "clean" };
-    const inspection = await this.options.checkpoints.inspectOpen(session.sessionId, open.checkpointId);
+    const inspection = await this.options.checkpoints.inspectOpen(session.identity.sessionId, open.checkpointId);
     if (inspection.changed) {
       return {
         kind: "needs_input",
@@ -111,7 +111,7 @@ export class RuntimeCheckpointControl {
   }
 
   private async reconcileHead(session: RuntimeSession, records: CheckpointRecord[]): Promise<void> {
-    const head = session.state.checkpointHead;
+    const head = session.durable.state.checkpointHead;
     const persistedHead = head ? records.find((item) => item.checkpointId === head.checkpointId) : undefined;
     if (head?.status === "open" && persistedHead?.status === "sealed") {
       await this.evidence.record(session, checkpointRef(persistedHead));
@@ -119,8 +119,8 @@ export class RuntimeCheckpointControl {
       await this.evidence.record(session, checkpointRef(persistedHead));
     }
     const activeDeltaCheckpoints = new Set([
-      ...session.state.mutationEvidence,
-      ...session.state.evidence
+      ...session.durable.state.mutationEvidence,
+      ...session.durable.state.evidence
     ].flatMap((item) => item.kind === "workspace_delta" ? [item.data.checkpointId] : []));
     const restored = records.filter((item) => item.status === "restored"
       && (activeDeltaCheckpoints.has(item.checkpointId)
@@ -139,7 +139,7 @@ export class RuntimeCheckpointControl {
     decision: "restore" | "keep",
     expectedCurrentManifestDigest: string
   ): Promise<CheckpointRef> {
-    const records = await this.options.checkpoints.list(session.sessionId);
+    const records = await this.options.checkpoints.list(session.identity.sessionId);
     const existing = records.find((item) => item.checkpointId === checkpointId);
     if (!existing) throw new Error(`Checkpoint ${checkpointId} does not exist.`);
     const resolved = decision === "restore"
@@ -231,7 +231,7 @@ export class RuntimeCheckpointControl {
   ): Promise<CheckpointRef> {
     const restored = existing.status === "open"
       ? checkpointRef(await this.options.checkpoints.restoreOpen(
-        session.sessionId,
+        session.identity.sessionId,
         existing.checkpointId,
         expectedCurrentManifestDigest
       ))
@@ -239,8 +239,8 @@ export class RuntimeCheckpointControl {
     if (restored.status !== "restored") {
       throw new Error(`Checkpoint ${existing.checkpointId} was not restored by the requested recovery.`);
     }
-    if (session.state.checkpointHead?.checkpointId !== restored.checkpointId
-      || session.state.checkpointHead.status !== "restored") {
+    if (session.durable.state.checkpointHead?.checkpointId !== restored.checkpointId
+      || session.durable.state.checkpointHead.status !== "restored") {
       await this.options.emit(session, "checkpoint.restored", "user", restored);
     }
     return restored;
@@ -253,7 +253,7 @@ export class RuntimeCheckpointControl {
   ): Promise<CheckpointRef> {
     const sealed = existing.status === "open"
       ? checkpointRef(await this.options.checkpoints.seal(
-        session.sessionId,
+        session.identity.sessionId,
         existing.checkpointId,
         expectedCurrentManifestDigest
       ))
@@ -261,8 +261,8 @@ export class RuntimeCheckpointControl {
     if (sealed.status !== "sealed") {
       throw new Error(`Checkpoint ${existing.checkpointId} was not sealed by the requested recovery.`);
     }
-    if (session.state.checkpointHead?.checkpointId !== sealed.checkpointId
-      || session.state.checkpointHead.status !== "sealed") {
+    if (session.durable.state.checkpointHead?.checkpointId !== sealed.checkpointId
+      || session.durable.state.checkpointHead.status !== "sealed") {
       await this.evidence.record(session, sealed);
     }
     return sealed;

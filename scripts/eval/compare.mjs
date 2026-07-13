@@ -90,7 +90,7 @@ function compatibilityFields(baseline, candidate) {
   return hasEnvironmentDigest ? EVAL_COMPATIBILITY_FIELDS : LEGACY_COMPATIBILITY_FIELDS;
 }
 
-function compatibilityMismatches(baseline, candidate, requiredFields) {
+function runCompatibilityMismatches(baseline, candidate) {
   const mismatches = [];
   if (baseline.runId === candidate.runId) {
     mismatches.push({
@@ -123,40 +123,57 @@ function compatibilityMismatches(baseline, candidate, requiredFields) {
       reason: "Both runs must contain exactly the same scenario IDs."
     });
   }
-  for (const scenarioId of [...new Set([...baselineIds, ...candidateIds])].sort()) {
-    for (const field of requiredFields) {
-      const baselineValues = subjectValues(baseline, scenarioId, field);
-      const candidateValues = subjectValues(candidate, scenarioId, field);
-      const equal = baselineValues.length === 1 && candidateValues.length === 1
-        && baselineValues[0] === candidateValues[0];
-      if (!equal) {
-        mismatches.push({
-          scope: scenarioId,
-          field,
-          baseline: comparisonValue(baselineValues),
-          candidate: comparisonValue(candidateValues),
-          reason: baselineValues.length === 0 || candidateValues.length === 0
-            ? "Comparable evidence is missing."
-            : baselineValues.length > 1 || candidateValues.length > 1
-              ? "A run contains conflicting compatibility values."
-              : "Compatibility values differ."
-        });
-      }
-    }
-    const baselineMetrics = summarizeEvalMetrics(scenarioAttempts(baseline, scenarioId));
-    const candidateMetrics = summarizeEvalMetrics(scenarioAttempts(candidate, scenarioId));
-    for (const name of Object.keys(EVAL_METRIC_PATHS)) {
-      const baselineSamples = baselineMetrics[name]?.samples ?? 0;
-      const candidateSamples = candidateMetrics[name]?.samples ?? 0;
-      if (baselineSamples === candidateSamples) continue;
-      mismatches.push({
-        scope: scenarioId,
-        field: `metricSamples.${name}`,
-        baseline: baselineSamples,
-        candidate: candidateSamples,
-        reason: "Both runs must contain the same number of valid samples for each metric."
-      });
-    }
+  return { mismatches, baselineIds, candidateIds };
+}
+
+function scenarioFieldMismatches(baseline, candidate, scenarioId, requiredFields) {
+  const mismatches = [];
+  for (const field of requiredFields) {
+    const baselineValues = subjectValues(baseline, scenarioId, field);
+    const candidateValues = subjectValues(candidate, scenarioId, field);
+    const equal = baselineValues.length === 1 && candidateValues.length === 1
+      && baselineValues[0] === candidateValues[0];
+    if (equal) continue;
+    const missing = baselineValues.length === 0 || candidateValues.length === 0;
+    const conflicting = baselineValues.length > 1 || candidateValues.length > 1;
+    mismatches.push({
+      scope: scenarioId,
+      field,
+      baseline: comparisonValue(baselineValues),
+      candidate: comparisonValue(candidateValues),
+      reason: missing ? "Comparable evidence is missing."
+        : conflicting ? "A run contains conflicting compatibility values." : "Compatibility values differ."
+    });
+  }
+  return mismatches;
+}
+
+function metricSampleMismatches(baseline, candidate, scenarioId) {
+  const mismatches = [];
+  const baselineMetrics = summarizeEvalMetrics(scenarioAttempts(baseline, scenarioId));
+  const candidateMetrics = summarizeEvalMetrics(scenarioAttempts(candidate, scenarioId));
+  for (const name of Object.keys(EVAL_METRIC_PATHS)) {
+    const baselineSamples = baselineMetrics[name]?.samples ?? 0;
+    const candidateSamples = candidateMetrics[name]?.samples ?? 0;
+    if (baselineSamples === candidateSamples) continue;
+    mismatches.push({
+      scope: scenarioId,
+      field: `metricSamples.${name}`,
+      baseline: baselineSamples,
+      candidate: candidateSamples,
+      reason: "Both runs must contain the same number of valid samples for each metric."
+    });
+  }
+  return mismatches;
+}
+
+function compatibilityMismatches(baseline, candidate, requiredFields) {
+  const run = runCompatibilityMismatches(baseline, candidate);
+  const mismatches = [...run.mismatches];
+  const scenarioIds = [...new Set([...run.baselineIds, ...run.candidateIds])].sort();
+  for (const scenarioId of scenarioIds) {
+    mismatches.push(...scenarioFieldMismatches(baseline, candidate, scenarioId, requiredFields));
+    mismatches.push(...metricSampleMismatches(baseline, candidate, scenarioId));
   }
   return mismatches;
 }

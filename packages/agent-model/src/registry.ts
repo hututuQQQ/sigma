@@ -52,7 +52,7 @@ function deepseekGateway(options: CreateGatewayOptions, model: string, spec?: Mo
     apiKeyName: "DEEPSEEK_API_KEY",
     wireProfile: {
       developerRole: "system",
-      supportsToolChoice: false,
+      toolChoicePolicy: "non_thinking_only",
       thinking: "enabled",
       retryableFinishReasons: ["insufficient_system_resource"]
     },

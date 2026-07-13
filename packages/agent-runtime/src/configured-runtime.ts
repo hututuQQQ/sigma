@@ -8,8 +8,8 @@ import type {
   WorkspaceCustomizationTrustAttestation,
   WorkspaceMcpTrustAttestation
 } from "agent-config";
-import type { JsonValue, ModelGateway, RunStore } from "agent-protocol";
-import type { BrokerDoctorReport, ExecutionBroker } from "agent-execution";
+import type { JsonValue, ModelGateway, RunStore, RuntimeClient } from "agent-protocol";
+import { LazyExecutionBroker, type BrokerDoctorReport, type ExecutionBroker } from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
@@ -30,7 +30,6 @@ import type { ChildJoinSummary } from "./types.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { runtimeStateRoot } from "./runtime-state.js";
-import { LazyExecutionBroker } from "./execution-composition.js";
 import { resolveRuntimeCustomization, type RuntimeCustomization } from "./customization.js";
 import { BrokerCommandHookRunner } from "./hook-runner.js";
 import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
@@ -78,7 +77,7 @@ export interface RuntimeFactoryDeps {
 }
 
 export interface ConfiguredRuntime {
-  runtime: InProcessRuntimeClient;
+  runtime: RuntimeClient;
   workspace: string;
   storeRootDir: string;
   execution: ExecutionBroker;
@@ -157,8 +156,8 @@ export async function createConfiguredRuntime(
       agentProfileHookRunner: deps.agentProfileHookRunner,
       reviewer: new ModelReviewer(gateways.reviewer, reviewerRouteId(customization.profile)),
       reviewerForSession: (session) => new ModelReviewer(
-        gateways.forRole("reviewer", session.profile),
-        reviewerRouteId(session.profile)
+        gateways.forRole("reviewer", session.services.profile),
+        reviewerRouteId(session.services.profile)
       ),
       joinChildren: async (parentId, signal) => await joinChildren(supervisor, store, parentId, signal),
       cancelChildren: async (parentId, reason) => await supervisor.cancelParent(parentId, reason),

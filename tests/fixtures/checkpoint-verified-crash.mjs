@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { CheckpointManager } from "../../packages/agent-checkpoint/dist/index.js";
+import { createCheckpointManagerForTesting } from "../../packages/agent-checkpoint/dist/testing.js";
 
 const [stateRoot, workspace, marker] = process.argv.slice(2);
 if (!stateRoot || !workspace || !marker) throw new Error("checkpoint crash fixture requires state/workspace/marker paths");
@@ -18,12 +19,11 @@ const checkpoint = await manager.create({
 await writeFile(path.join(workspace, "target.txt"), "after", "utf8");
 await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
 
-const crashing = new CheckpointManager({
-  rootDir: stateRoot,
-  restoreFaultInjector: async ({ point }) => {
+const crashing = createCheckpointManagerForTesting({
+  rootDir: stateRoot
+}, async ({ point }) => {
     if (point !== "before_record") return;
     await writeFile(marker, "verified", "utf8");
     process.kill(process.pid, "SIGKILL");
-  }
 });
 await crashing.undoLatest(checkpoint.sessionId);

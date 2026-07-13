@@ -22,7 +22,7 @@ import {
   type ReviewEvidence,
   type UsageRecord
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/index.js";
+import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import type {
   AccountableReviewerPort,
   PreparedReviewerCall,
@@ -30,6 +30,7 @@ import type {
 } from "../packages/agent-runtime/src/reviewer.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 type Boundary =
   | "plan"
@@ -284,7 +285,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       occurredAt: new Date(1_800_000_000_000 + seq).toISOString(),
       type,
       authority,
-      payload
+      payload: completeAgentEventPayload(type, payload) as JsonValue
     }, seq - 1);
   };
 

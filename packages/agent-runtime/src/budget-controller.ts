@@ -110,7 +110,7 @@ export class BudgetController {
   constructor(private readonly emit: RuntimeEventEmitter) {}
 
   async reserve(session: RuntimeSession, ownerId: string, requestedInput: Partial<BudgetAmounts>): Promise<string> {
-    return await this.serial(session.sessionId, async () =>
+    return await this.serial(session.identity.sessionId, async () =>
       await this.reserveLocked(session, ownerId, requestedInput, 0));
   }
 
@@ -119,7 +119,7 @@ export class BudgetController {
     ownerId: string,
     prepare: () => { requested: Partial<BudgetAmounts>; result: T }
   ): Promise<T> {
-    return await this.serial(session.sessionId, async () => {
+    return await this.serial(session.identity.sessionId, async () => {
       await this.assertDepthLocked(session, 1);
       const child = prepare();
       await this.reserveLocked(session, ownerId, child.requested, 0);
@@ -128,8 +128,8 @@ export class BudgetController {
   }
 
   async commit(session: RuntimeSession, reservationId: string, actualInput: Partial<BudgetAmounts>): Promise<void> {
-    await this.serial(session.sessionId, async () => {
-      const ledger = session.state.budget;
+    await this.serial(session.identity.sessionId, async () => {
+      const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") throw new Error(`Unknown active budget reservation '${reservationId}'.`);
       const actual = amounts(actualInput);
@@ -148,8 +148,8 @@ export class BudgetController {
     reservationId: string,
     actualInput: Partial<BudgetAmounts>
   ): Promise<MeasuredBudgetSettlement> {
-    return await this.serial(session.sessionId, async () => {
-      const ledger = session.state.budget;
+    return await this.serial(session.identity.sessionId, async () => {
+      const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") {
         throw new Error(`Unknown active budget reservation '${reservationId}'.`);
@@ -193,8 +193,8 @@ export class BudgetController {
     reservationId: string,
     actualInput: Partial<BudgetAmounts>
   ): Promise<boolean> {
-    return await this.serial(session.sessionId, async () => {
-      const ledger = session.state.budget;
+    return await this.serial(session.identity.sessionId, async () => {
+      const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") return false;
       const actual = amounts(actualInput);
@@ -215,8 +215,8 @@ export class BudgetController {
     callId: string,
     checkpointId: string
   ): Promise<void> {
-    await this.serial(session.sessionId, async () => {
-      const ledger = session.state.budget;
+    await this.serial(session.identity.sessionId, async () => {
+      const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved" || reservation.ownerId !== `tool:${callId}`) {
         throw new Error(`Unknown active tool budget reservation '${reservationId}'.`);
@@ -232,8 +232,8 @@ export class BudgetController {
   }
 
   async release(session: RuntimeSession, reservationId: string): Promise<void> {
-    await this.serial(session.sessionId, async () => {
-      const ledger = session.state.budget;
+    await this.serial(session.identity.sessionId, async () => {
+      const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") return;
       const next = settle(ledger, reservation, "released", emptyBudgetAmounts());
@@ -247,7 +247,7 @@ export class BudgetController {
     disposition: "commit" | "release",
     checkpointId?: string
   ): Promise<void> {
-    let reservation = session.state.budget.reservations.find((item) => {
+    let reservation = session.durable.state.budget.reservations.find((item) => {
       const mutation = parseMutationBudgetOwner(item.ownerId);
       return item.status === "reserved" && (item.ownerId === `tool:${callId}` || mutation?.callId === callId);
     });
@@ -260,7 +260,7 @@ export class BudgetController {
       await this.bindToolCheckpoint(
         session, reservation.reservationId, callId, checkpointId
       );
-      reservation = session.state.budget.reservations.find((item) =>
+      reservation = session.durable.state.budget.reservations.find((item) =>
         item.reservationId === reservation!.reservationId) ?? reservation;
     }
     const mutation = parseMutationBudgetOwner(reservation.ownerId);
@@ -278,7 +278,7 @@ export class BudgetController {
    * without charging the reservation twice.
    */
   async settleInterruptedModel(session: RuntimeSession, requestId: string): Promise<BudgetAmounts | undefined> {
-    const reservation = session.state.budget.reservations.find((item) =>
+    const reservation = session.durable.state.budget.reservations.find((item) =>
       item.ownerId === `model:${requestId}` && (item.status === "reserved" || item.status === "committed"));
     if (!reservation) return undefined;
     if (reservation.status === "reserved") {
@@ -289,10 +289,10 @@ export class BudgetController {
   }
 
   async increaseLimits(session: RuntimeSession, requested: Partial<BudgetLimits>): Promise<BudgetLimits> {
-    return await this.serial(session.sessionId, async () => {
-      const previousLimits = { ...session.state.budget.limits };
+    return await this.serial(session.identity.sessionId, async () => {
+      const previousLimits = { ...session.durable.state.budget.limits };
       const { limits, increase } = increasedLimits(previousLimits, requested);
-      const ledger: BudgetLedgerState = { ...session.state.budget, limits };
+      const ledger: BudgetLedgerState = { ...session.durable.state.budget, limits };
       await this.emit(session, "budget.limit_increased", "user", { previousLimits, increase, ledger });
       return { ...limits };
     });
@@ -305,7 +305,7 @@ export class BudgetController {
     requiredDepth: number
   ): Promise<string> {
     const requested = amounts(requestedInput);
-    const ledger = session.state.budget;
+    const ledger = session.durable.state.budget;
     await this.assertDepthLocked(session, requiredDepth);
     for (const dimension of DIMENSIONS) {
       const used = ledger.consumed[dimension] + ledger.reserved[dimension];
@@ -336,7 +336,7 @@ export class BudgetController {
   }
 
   private async assertDepthLocked(session: RuntimeSession, requiredDepth: number): Promise<void> {
-    const available = session.state.budget.limits.maxDepth;
+    const available = session.durable.state.budget.limits.maxDepth;
     if (requiredDepth <= available) return;
     await this.emit(session, "budget.exhausted", "runtime", {
       dimension: "maxDepth", requested: requiredDepth, available

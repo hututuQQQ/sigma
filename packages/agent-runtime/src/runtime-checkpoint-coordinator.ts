@@ -14,13 +14,13 @@ export class RuntimeCheckpointCoordinator {
   ) {}
 
   async undoLatest(session: RuntimeSession): Promise<CheckpointRef> {
-    if (session.openCheckpointRecovery) {
+    if (session.recovery.openCheckpointRecovery) {
       throw Object.assign(new Error("Resolve the interrupted open checkpoint before undoing a sealed checkpoint."), {
         code: "checkpoint_recovery_required"
       });
     }
-    if (session.state.phase !== "terminal" && session.state.phase !== "needs_input") {
-      throw new Error(`Checkpoint undo is unavailable while session phase is '${session.state.phase}'.`);
+    if (session.durable.state.phase !== "terminal" && session.durable.state.phase !== "needs_input") {
+      throw new Error(`Checkpoint undo is unavailable while session phase is '${session.durable.state.phase}'.`);
     }
     const restored = await this.withWorkspaceLock(session, async () =>
       await this.control.undoLatestCheckpoint(session));
@@ -33,13 +33,13 @@ export class RuntimeCheckpointCoordinator {
     checkpointId: string,
     decision: "restore" | "keep"
   ): Promise<CheckpointRef> {
-    const recovery = session.openCheckpointRecovery;
+    const recovery = session.recovery.openCheckpointRecovery;
     if (!recovery || recovery.checkpointId !== checkpointId) {
       throw Object.assign(new Error(`Checkpoint ${checkpointId} is not awaiting user recovery.`), {
         code: "checkpoint_recovery_not_pending"
       });
     }
-    if (session.state.phase !== "needs_input") {
+    if (session.durable.state.phase !== "needs_input") {
       throw new Error("Open checkpoint recovery requires a NeedsInput session.");
     }
     try {
@@ -58,16 +58,16 @@ export class RuntimeCheckpointCoordinator {
         await this.control.recordChildCheckpointDecision(session, recovery, decision);
         return await this.control.applyChildCheckpointDecision(session, recovery, decision);
       }, true);
-      session.openCheckpointRecovery = undefined;
+      session.recovery.openCheckpointRecovery = undefined;
       await this.effects.settleMutationBudgets(session);
       return resolved;
     } catch (error) {
       if ((error as { code?: unknown })?.code === "checkpoint_conflict") {
         if (isChildCheckpointRecovery(recovery)) {
-          session.openCheckpointRecovery = await this.control.refreshChildCheckpointRecovery(recovery);
+          session.recovery.openCheckpointRecovery = await this.control.refreshChildCheckpointRecovery(recovery);
         } else {
           const refreshed = await this.control.recoverOpen(session);
-          session.openCheckpointRecovery = refreshed.kind === "needs_input"
+          session.recovery.openCheckpointRecovery = refreshed.kind === "needs_input"
             ? {
               checkpointId: refreshed.checkpointId,
               currentManifestDigest: refreshed.currentManifestDigest
@@ -80,13 +80,13 @@ export class RuntimeCheckpointCoordinator {
   }
 
   async replayRecordedChildDecision(session: RuntimeSession): Promise<CheckpointRef> {
-    const recovery = session.openCheckpointRecovery;
+    const recovery = session.recovery.openCheckpointRecovery;
     if (!isChildCheckpointRecovery(recovery) || !recovery.recordedDecision) {
       throw new Error("No durable child checkpoint recovery decision is pending replay.");
     }
     const resolved = await this.withWorkspaceLock(session, async () =>
       await this.control.applyChildCheckpointDecision(session, recovery, recovery.recordedDecision!), true);
-    session.openCheckpointRecovery = undefined;
+    session.recovery.openCheckpointRecovery = undefined;
     await this.effects.settleMutationBudgets(session);
     return resolved;
   }
@@ -96,18 +96,18 @@ export class RuntimeCheckpointCoordinator {
     action: () => Promise<T>,
     allowInterruptedTools = false
   ): Promise<T> {
-    if (this.activeSessions.has(session.sessionId)) {
+    if (this.activeSessions.has(session.identity.sessionId)) {
       throw Object.assign(new Error("Another checkpoint control operation is already active for this session."), {
         code: "checkpoint_busy"
       });
     }
     this.assertIdle(session, allowInterruptedTools);
-    this.activeSessions.add(session.sessionId);
+    this.activeSessions.add(session.identity.sessionId);
     try {
-      await this.effects.waitForQuiescence(session.sessionId);
+      await this.effects.waitForQuiescence(session.identity.sessionId);
       return await this.effects.withWorkspaceWriteLock(session, async () => {
         this.assertIdle(session, allowInterruptedTools);
-        if (await this.hasActiveChildren?.(session.sessionId)) {
+        if (await this.hasActiveChildren?.(session.identity.sessionId)) {
           throw Object.assign(new Error("Checkpoint control requires no running child agents."), {
             code: "checkpoint_children_active"
           });
@@ -115,13 +115,13 @@ export class RuntimeCheckpointCoordinator {
         return await action();
       });
     } finally {
-      this.activeSessions.delete(session.sessionId);
+      this.activeSessions.delete(session.identity.sessionId);
     }
   }
 
   private assertIdle(session: RuntimeSession, allowInterruptedTools = false): void {
-    const pendingTools = session.state.pendingTools.length > 0;
-    if (session.running || (pendingTools && !allowInterruptedTools) || session.controller || session.turnController) {
+    const pendingTools = session.durable.state.pendingTools.length > 0;
+    if (session.execution.running || (pendingTools && !allowInterruptedTools) || session.execution.controller || session.execution.turnController) {
       throw Object.assign(new Error("Checkpoint control requires an idle session with no pending tools."), {
         code: "checkpoint_session_active"
       });

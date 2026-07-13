@@ -20,13 +20,18 @@ export function sessionsDirectory(rootDir: string): string {
   return path.join(storeVersionDirectory(rootDir), "sessions");
 }
 
-/** V2 is read-only and intentionally remains outside the V3 store tree. */
+/** Legacy V2 data is detected only so callers can fail without modifying it. */
 export function legacySessionDirectoryV2(rootDir: string, sessionId: string): string {
   return path.join(path.resolve(rootDir), "sessions", safeId(sessionId));
 }
 
 export function legacySessionsDirectoryV2(rootDir: string): string {
   return path.join(path.resolve(rootDir), "sessions");
+}
+
+/** Legacy V3 data is detected only so callers can fail without modifying it. */
+export function legacySessionDirectoryV3(rootDir: string, sessionId: string): string {
+  return path.join(path.resolve(rootDir), "stores", "v3", "sessions", safeId(sessionId));
 }
 
 export function segmentName(index: number): string {

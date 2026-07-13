@@ -16,9 +16,7 @@ import {
   isStaleEffect,
   isTerminal,
   rehydrate,
-  upcastKernelStateV2,
-  type KernelState,
-  type KernelStateV2
+  type KernelState
 } from "../packages/agent-kernel/src/index.js";
 
 function diagnosticEvidence(id = "evidence"): EvidenceRecord {
@@ -206,8 +204,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
     expect(conversational).toMatchObject({
-      phase: "outcome_pending",
-      proposedOutcome: { kind: "needs_input", message: "answer" }
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      proposedOutcome: undefined
+    });
+    expect(conversational.messages.at(-1)).toMatchObject({ role: "developer" });
+    const conversationalFailure = settleModel(startModel(conversational, 2), "model.completed", {
+      message: { role: "assistant", content: "still just an answer" }, toolCalls: [], finishReason: "stop"
+    });
+    expect(conversationalFailure.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_protocol_missing"
     });
     const receipt = {
       callId: "progress", ok: true, output: "inspected", observedEffects: ["filesystem.read" as const],
@@ -515,41 +521,6 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(userTerminalWaiver.phase).toBe("terminal");
     expect(userTerminalWaiver.evidence).toContainEqual(waiver);
-  });
-
-  it("upcasts explicit V2 kernel state without treating old snapshots as V3", () => {
-    const current = initial();
-    const v2: KernelStateV2 = {
-      schemaVersion: 2,
-      sessionId: current.sessionId,
-      runId: current.runId,
-      mode: current.mode,
-      phase: current.phase,
-      revision: current.revision,
-      lastSeq: current.lastSeq,
-      startedAt: current.startedAt,
-      deadlineAt: current.deadlineAt,
-      messages: current.messages,
-      pendingTools: current.pendingTools,
-      toolCallIds: current.toolCallIds,
-      receipts: current.receipts,
-      evidence: [{ legacy: true }],
-      childIds: current.childIds,
-      completionRepairAttempts: current.completionRepairAttempts,
-      continuationAttempts: current.continuationAttempts,
-      repeatedToolBatchCount: current.repeatedToolBatchCount,
-      receiptCountAtLastUserInput: current.receiptCountAtLastUserInput
-    };
-    expect(isKernelState(v2)).toBe(false);
-    const upgraded = upcastKernelStateV2(v2);
-    expect(upgraded).toMatchObject({
-      schemaVersion: 4,
-      plan: { revision: 0, nodes: [] },
-      usage: [],
-      frozenSkills: [],
-      evidence: [{ kind: "diagnostic", data: { source: "v2-kernel-snapshot", diagnostic: { legacy: true } } }]
-    });
-    expect(isKernelState(upgraded)).toBe(true);
   });
 
   it("rehydrates deterministically and checks state invariants", () => {

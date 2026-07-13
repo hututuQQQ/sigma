@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  defaultSigmaExecPath,
   resolveSigmaExecBinary,
+  runtimeNodeBinding,
+  runtimeTrustedToolchains,
+  runtimeTrustedToolchainsForBinding,
   type BrokerDoctorReport,
   type BrokerVerifiedShell,
   type ExecutionBroker
@@ -16,12 +20,8 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import {
   createConfiguredRuntime,
-  defaultSigmaExecPath,
-  runtimeNodeBinding,
-  runtimeTrustedToolchains,
-  runtimeTrustedToolchainsForBinding,
   type RuntimeCompositionConfig
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fixtures: string[] = [];

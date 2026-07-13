@@ -107,9 +107,9 @@ export class ToolTransactionRunner {
   async withWorkspaceWriteLock<T>(session: RuntimeSession, action: () => Promise<T>): Promise<T> {
     const locallyLocked = async (): Promise<T> =>
       await this.locks.withLocks([workspaceWriteLockKey(session)], action);
-    return session.workspaceLeaseInherited
+    return session.identity.workspaceLeaseInherited
       ? await locallyLocked()
-      : await this.workspaceLease.withLease(session.workspacePath, session.controller?.signal, locallyLocked);
+      : await this.workspaceLease.withLease(session.identity.workspacePath, session.execution.controller?.signal, locallyLocked);
   }
 
   async settleBudgetsAfterReceipt(session: RuntimeSession): Promise<void> {
@@ -128,17 +128,17 @@ export class ToolTransactionRunner {
     await this.options.emit(session, "tool.requested", "runtime", {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });
-    if (!isToolAllowed(descriptor, session.mode)) {
-      return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.mode} mode.`, "mode_denied");
+    if (!isToolAllowed(descriptor, session.durable.mode)) {
+      return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.durable.mode} mode.`, "mode_denied");
     }
     if (!profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
     const context = {
-      sessionId: session.sessionId,
-      runId: session.runId,
-      workspacePath: session.workspacePath,
-      runMode: session.mode,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      workspacePath: session.identity.workspacePath,
+      runMode: session.durable.mode,
       runtimeControl: this.options.control.forSession(session)
     } as const;
     const plan = this.options.runtime.tools.prepare
@@ -165,7 +165,7 @@ export class ToolTransactionRunner {
     startedAt: string,
     signal: AbortSignal
   ): Promise<ToolReceipt | undefined> {
-    if (session.mode === "analyze" && mutatingPlan(plan)) {
+    if (session.durable.mode === "analyze" && mutatingPlan(plan)) {
       return failed(
         call,
         startedAt,
@@ -173,7 +173,7 @@ export class ToolTransactionRunner {
         "mode_denied"
       );
     }
-    if (session.mode === "change" && mutatingPlan(plan) && !planAllowsMutation(session)) {
+    if (session.durable.mode === "change" && mutatingPlan(plan) && !planAllowsMutation(session)) {
       return failed(
         call,
         startedAt,
@@ -198,7 +198,7 @@ export class ToolTransactionRunner {
     if (!descriptor.possibleEffects.includes("outcome.propose")) return undefined;
     const completed = completionPlan(session);
     if (completed) {
-      const previousRevision = session.state.plan.revision;
+      const previousRevision = session.durable.state.plan.revision;
       await this.options.emit(session, "plan.updated", "runtime", { previousRevision, plan: completed });
       await this.options.hooks.dispatch(session, "plan_changed", {
         previousRevision, plan: completed, source: "completion"
@@ -215,9 +215,9 @@ export class ToolTransactionRunner {
     const { call, plan, startedAt } = prepared;
     try {
       await this.options.hooks.dispatch(session, "pre_tool", {
-        sessionId: session.sessionId,
-        runId: session.runId,
-        mode: session.mode,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
+        mode: session.durable.mode,
         callId: call.id,
         toolName: call.name,
         arguments: call.arguments,
@@ -225,7 +225,7 @@ export class ToolTransactionRunner {
       }, signal);
       const decision = await this.approvals.decision(session, prepared, signal);
       if (decision === "deny") {
-        session.callApprovals.delete(call.id);
+        session.interaction.callApprovals.delete(call.id);
         return failed(call, startedAt, "Tool request denied.", "permission_denied");
       }
       const approval = this.approvals.consume(session, prepared);
@@ -258,8 +258,8 @@ export class ToolTransactionRunner {
       const run = async (): Promise<ToolReceipt> => await this.locks.withLocks(keys, async () =>
         await this.runLocked(session, prepared, reservationId, signal, keys, state));
       return mutatingPlan(prepared.plan) && !delegatesWorkspaceMutation(prepared.plan)
-        && !session.workspaceLeaseInherited
-        ? await this.workspaceLease.withLease(session.workspacePath, signal, run)
+        && !session.identity.workspaceLeaseInherited
+        ? await this.workspaceLease.withLease(session.identity.workspacePath, signal, run)
         : await run();
     } finally {
       if (!state.executionStarted) await this.options.budgets.release(session, reservationId);
@@ -280,7 +280,7 @@ export class ToolTransactionRunner {
     await assertCheckpointActionAllowed(
       session,
       plan,
-      async () => await this.options.runtime.hasActiveChildren?.(session.sessionId)
+      async () => await this.options.runtime.hasActiveChildren?.(session.identity.sessionId)
     );
     const checkpoint = await this.createCheckpoint(session, call, plan);
     if (checkpoint) {
@@ -332,8 +332,8 @@ export class ToolTransactionRunner {
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
       const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
-        sessionId: session.sessionId,
-        runId: session.runId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
         workspaceDeltas: plan.exactEffects.includes("validation")
           ? workspaceDeltas(session, prepared.validationTargetIds) : []
       });
@@ -353,7 +353,7 @@ export class ToolTransactionRunner {
         try {
           const recovery = await this.options.control.recoverOpen(session);
           if (recovery.kind === "needs_input") {
-            session.openCheckpointRecovery = {
+            session.recovery.openCheckpointRecovery = {
               checkpointId: recovery.checkpointId,
               currentManifestDigest: recovery.currentManifestDigest
             };
@@ -364,11 +364,11 @@ export class ToolTransactionRunner {
                 recovery.checkpointId,
                 recovery.currentManifestDigest
               );
-              delete session.openCheckpointRecovery;
+              session.recovery.openCheckpointRecovery = undefined;
             }
           }
         } catch (recoveryError) {
-          session.openCheckpointRecovery ??= {
+          session.recovery.openCheckpointRecovery ??= {
             checkpointId: checkpoint.checkpointId,
             // A preimage digest cannot authorize keeping/restoring a changed
             // postimage; it only provides a fail-closed placeholder until a

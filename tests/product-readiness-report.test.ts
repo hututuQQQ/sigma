@@ -89,14 +89,14 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       }
     }
   });
-  await writeJson(path.join(artifactsDir, "migration-v2-100k.json"), {
+  await writeJson(path.join(artifactsDir, "replay-v4-100k.json"), {
     schemaVersion: 1,
-    kind: "v2Migration100k",
+    kind: "v4Replay100k",
     ok: true,
     events: 100_000,
     elapsedMs: 5_000,
     peakRssMiB: 200,
-    sourceUnchanged: true
+    snapshotRebuilt: true
   });
   await writeJson(path.join(artifactsDir, "sigma-exec-branch-coverage.json"), {
     data: [{ files: [{
@@ -254,6 +254,37 @@ describe("product readiness report", () => {
       name: "package:tier1Target",
       ok: true,
       detail: "linux-x64"
+    });
+  });
+
+  it("requires the replay snapshot to be rebuilt before release", async () => {
+    const { rootDir, artifactsDir } = await fixture({
+      ok: true,
+      status: "passed",
+      transport: "native"
+    }, {
+      ok: true,
+      status: "passed",
+      provider: "deepseek",
+      checks: {
+        doctorApi: true,
+        runCompleted: true,
+        fileContent: true,
+        inspect: true
+      }
+    });
+    const evidencePath = path.join(artifactsDir, "replay-v4-100k.json");
+    const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+    evidence.snapshotRebuilt = false;
+    await writeJson(evidencePath, evidence);
+
+    const report = await buildProductReadinessReport({ rootDir, artifactsDir });
+
+    expect(report.releaseReady).toBe(false);
+    expect(report.releaseChecks).toContainEqual({
+      name: "replayPerformance:snapshotRebuilt",
+      ok: false,
+      detail: "snapshotRebuilt=false"
     });
   });
 

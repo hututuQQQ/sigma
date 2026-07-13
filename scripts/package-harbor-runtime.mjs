@@ -13,6 +13,7 @@ import {
   rootDir as defaultRootDir,
   terminalBenchDataset
 } from "./bench-common.mjs";
+import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 
 function resolveArtifactsDir(rootDir, options) {
   return options.artifactsDir ? path.resolve(options.artifactsDir) : path.join(rootDir, ".artifacts");
@@ -35,8 +36,8 @@ function resolveAgentCliTarball(rootDir, artifactsDir, env, options) {
 
 function baseBenchmarkOptions(agentCliTarball) {
   return {
-    provider: "deepseek",
-    model: "deepseek-v4-pro",
+    provider: sigmaManifest.evaluation.provider,
+    model: sigmaManifest.evaluation.model,
     maxTurns: 200,
     commandTimeoutSec: 180,
     validationMode: "auto",

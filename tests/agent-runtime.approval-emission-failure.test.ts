@@ -2,6 +2,7 @@ import type { ToolCallPlan, ToolDescriptor } from "../packages/agent-protocol/sr
 import { requestDelegatedApproval } from "../packages/agent-runtime/src/delegated-approval.js";
 import { ToolApprovalCoordinator } from "../packages/agent-runtime/src/tool-approval-coordinator.js";
 import type { ApprovalWaiter, RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 import { describe, expect, it } from "vitest";
 
 const call = {
@@ -33,25 +34,16 @@ const descriptor: ToolDescriptor = {
 };
 
 function runtimeSession(): RuntimeSession {
-  return {
-    sessionId: "session",
-    runId: "run",
-    state: {
-      phase: "tool_pending",
-      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
-      pendingTools: [{
-        request: { callId: call.id, name: call.name, arguments: call.arguments },
-        modelTurn: { turnId: 1, effectRevision: 1 },
-        approval: "not_required",
-        started: false
-      }]
-    },
-    controller: new AbortController(),
-    deadlineTimer: null,
-    approvals: new Map(),
-    callApprovals: new Map(),
-    alwaysAllowedEffects: new Set()
-  } as unknown as RuntimeSession;
+  const session = runtimeSessionFixture({ execution: { controller: new AbortController() } });
+  session.durable.state.phase = "tool_pending";
+  session.durable.state.deadlineAt = new Date(Date.now() + 60_000).toISOString();
+  session.durable.state.pendingTools = [{
+    request: { callId: call.id, name: call.name, arguments: call.arguments },
+    modelTurn: { turnId: 1, effectRevision: 1 },
+    approval: "not_required",
+    started: false
+  }];
+  return session;
 }
 
 function replacementWaiter(): ApprovalWaiter {
@@ -78,12 +70,12 @@ describe("approval emission failure cleanup", () => {
       plan
     }, new AbortController().signal)).rejects.toThrow(`emit ${failAt} failed`);
 
-    expect(session.approvals.size).toBe(0);
-    expect(session.deadlineTimer).not.toBeNull();
+    expect(session.interaction.approvals.size).toBe(0);
+    expect(session.execution.deadlineTimer).not.toBeNull();
     expect(emitted).toEqual(failAt === 1
       ? ["tool.approval_requested"]
       : ["tool.approval_requested", "run.suspended", "tool.approval_resolved"]);
-    if (session.deadlineTimer) clearTimeout(session.deadlineTimer);
+    if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
   });
 
   it("does not delete a concurrently replaced local waiter", async () => {
@@ -92,7 +84,7 @@ describe("approval emission failure cleanup", () => {
     const coordinator = new ToolApprovalCoordinator({
       runtime: { permissionMode: "ask" } as never,
       emit: (async () => {
-        session.approvals.set(call.id, replacement);
+        session.interaction.approvals.set(call.id, replacement);
         throw new Error("request emit failed");
       }) as never
     });
@@ -103,12 +95,12 @@ describe("approval emission failure cleanup", () => {
       descriptor,
       plan
     }, new AbortController().signal)).rejects.toThrow("request emit failed");
-    expect(session.approvals.get(call.id)).toBe(replacement);
+    expect(session.interaction.approvals.get(call.id)).toBe(replacement);
   });
 
   it("cleans a delegated waiter after emit failure without deleting a replacement", async () => {
     const cleanSession = runtimeSession();
-    cleanSession.state.phase = "ready_model";
+    cleanSession.durable.state.phase = "ready_model";
     await expect(requestDelegatedApproval(cleanSession, {
       requestId: "delegated",
       childId: "child",
@@ -119,10 +111,10 @@ describe("approval emission failure cleanup", () => {
     }, new AbortController().signal, (async () => {
       throw new Error("delegated emit failed");
     }) as never)).rejects.toThrow("delegated emit failed");
-    expect(cleanSession.approvals.size).toBe(0);
+    expect(cleanSession.interaction.approvals.size).toBe(0);
 
     const replacedSession = runtimeSession();
-    replacedSession.state.phase = "ready_model";
+    replacedSession.durable.state.phase = "ready_model";
     const replacement = replacementWaiter();
     await expect(requestDelegatedApproval(replacedSession, {
       requestId: "delegated",
@@ -132,9 +124,9 @@ describe("approval emission failure cleanup", () => {
       effects: ["network"],
       reason: "network"
     }, new AbortController().signal, (async () => {
-      replacedSession.approvals.set("delegated", replacement);
+      replacedSession.interaction.approvals.set("delegated", replacement);
       throw new Error("delegated emit failed");
     }) as never)).rejects.toThrow("delegated emit failed");
-    expect(replacedSession.approvals.get("delegated")).toBe(replacement);
+    expect(replacedSession.interaction.approvals.get("delegated")).toBe(replacement);
   });
 });

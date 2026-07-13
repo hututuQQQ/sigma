@@ -15,11 +15,11 @@ export class CheckpointEvidenceRecorder {
 
   async record(session: RuntimeSession, sealed: CheckpointRef): Promise<void> {
     const checkpointId = sealed.checkpointId;
-    if (session.state.checkpointHead?.checkpointId !== checkpointId
-      || session.state.checkpointHead.status !== "sealed") {
+    if (session.durable.state.checkpointHead?.checkpointId !== checkpointId
+      || session.durable.state.checkpointHead.status !== "sealed") {
       await this.emit(session, "checkpoint.sealed", "runtime", sealed);
     }
-    const existingCheckpointEvidence = session.state.evidence.find((item) =>
+    const existingCheckpointEvidence = session.durable.state.evidence.find((item) =>
       item.kind === "checkpoint" && item.data.checkpointId === checkpointId);
     if (!existingCheckpointEvidence) await this.recordCheckpoint(session, sealed);
     if (sealed.delta && sealed.delta.added.length + sealed.delta.modified.length + sealed.delta.deleted.length > 0) {
@@ -37,11 +37,11 @@ export class CheckpointEvidenceRecorder {
       throw new Error(`Child checkpoint ${sealed.checkpointId} is not a sealed mutation.`);
     }
     const checkpointEvidenceId = `checkpoint:${sourceSessionId}:${sealed.checkpointId}`;
-    if (!session.state.evidence.some((item) => item.evidenceId === checkpointEvidenceId)) {
+    if (!session.durable.state.evidence.some((item) => item.evidenceId === checkpointEvidenceId)) {
       const checkpoint: EvidenceRecord = {
         evidenceId: checkpointEvidenceId,
-        sessionId: session.sessionId,
-        runId: session.runId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
         kind: "checkpoint",
         status: "passed",
         createdAt: new Date().toISOString(),
@@ -59,13 +59,13 @@ export class CheckpointEvidenceRecorder {
       await this.emit(session, "evidence.recorded", "runtime", checkpoint);
     }
     const deltaEvidenceId = `workspace-delta:${sourceSessionId}:${sealed.checkpointId}`;
-    let delta = session.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
+    let delta = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
       item.kind === "workspace_delta" && item.evidenceId === deltaEvidenceId);
     if (!delta) {
       delta = {
         evidenceId: deltaEvidenceId,
-        sessionId: session.sessionId,
-        runId: session.runId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
         kind: "workspace_delta",
         status: "passed",
         createdAt: new Date().toISOString(),
@@ -86,11 +86,11 @@ export class CheckpointEvidenceRecorder {
       await this.emit(session, "evidence.recorded", "runtime", delta);
     }
     const validationId = `checkpoint-validation:${sourceSessionId}:${sealed.checkpointId}`;
-    if (!session.state.evidence.some((item) => item.evidenceId === validationId)) {
+    if (!session.durable.state.evidence.some((item) => item.evidenceId === validationId)) {
       const validation: EvidenceRecord = {
         evidenceId: validationId,
-        sessionId: session.sessionId,
-        runId: session.runId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
         kind: "validation",
         status: "passed",
         createdAt: new Date().toISOString(),
@@ -112,8 +112,8 @@ export class CheckpointEvidenceRecorder {
     const checkpointId = sealed.checkpointId;
     const evidence: EvidenceRecord = {
       evidenceId: `checkpoint:${checkpointId}`,
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       kind: "checkpoint",
       status: "passed",
       createdAt: new Date().toISOString(),
@@ -131,7 +131,7 @@ export class CheckpointEvidenceRecorder {
 
   private async recordDelta(session: RuntimeSession, sealed: CheckpointRef): Promise<void> {
     const delta = await this.existingOrRecordDelta(session, sealed);
-    const existingValidation = session.state.evidence.find((item) =>
+    const existingValidation = session.durable.state.evidence.find((item) =>
       item.kind === "validation"
       && item.data.validator === "checkpoint_postimage_integrity"
       && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
@@ -139,8 +139,8 @@ export class CheckpointEvidenceRecorder {
     const checkpointId = sealed.checkpointId;
     const validation: EvidenceRecord = {
       evidenceId: `checkpoint-validation:${checkpointId}`,
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       kind: "validation",
       status: "passed",
       createdAt: new Date().toISOString(),
@@ -160,14 +160,14 @@ export class CheckpointEvidenceRecorder {
     sealed: CheckpointRef
   ): Promise<WorkspaceDeltaEvidence> {
     const checkpointId = sealed.checkpointId;
-    const existing = session.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
+    const existing = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
       item.kind === "workspace_delta" && item.data.checkpointId === checkpointId);
     if (existing) return existing;
-    const reviewDiff = await this.checkpoints.reviewDiff(session.sessionId, checkpointId);
+    const reviewDiff = await this.checkpoints.reviewDiff(session.identity.sessionId, checkpointId);
     const evidence: WorkspaceDeltaEvidence = {
       evidenceId: `workspace-delta:${checkpointId}`,
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       kind: "workspace_delta",
       status: "passed",
       createdAt: new Date().toISOString(),

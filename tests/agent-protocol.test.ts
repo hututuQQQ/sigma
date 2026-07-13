@@ -1,378 +1,132 @@
 import { describe, expect, it } from "vitest";
 import {
-  AGENT_EVENT_TYPES,
-  EVENT_SCHEMA_VERSION,
-  SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION,
-  assertAgentEventEnvelope,
-  assertEvidenceRecord,
-  assertLegacyAgentEventEnvelopeV2,
-  assertLegacySnapshotEnvelopeV2,
-  assertMcpPersistentEffectsAllowed,
-  assertMcpWriteRootsEmpty,
-  assertSnapshotEnvelope,
-  createBudgetLedger,
-  createEmptyPlan,
-  isAgentEventEnvelope,
-  isBudgetLedgerState,
-  isCheckpointRef,
-  isEvidenceRecord,
-  isJsonValue,
-  isLegacyAgentEventEnvelopeV2,
-  isLegacySnapshotEnvelopeV2,
-  isPlanGraph,
-  isSnapshotEnvelope,
-  isSolverVisibleAuthority,
-  isUsageRecord,
-  McpCapabilityPolicyError,
-  upcastAgentEventV2,
-  type AgentEventType,
-  type CheckpointRef,
-  type EvidenceRecord,
-  type UsageRecord
+  AGENT_EVENT_TYPES, SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION, AgentEventValidationError,
+  assertAgentEventEnvelope, assertEvidenceRecord, assertMcpPersistentEffectsAllowed,
+  assertMcpWriteRootsEmpty, assertSnapshotEnvelope, createBudgetLedger, createEmptyPlan,
+  isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef, isEvidenceRecord, isJsonValue,
+  isPlanGraph, isSnapshotEnvelope, isSolverVisibleAuthority, isUsageRecord, McpCapabilityPolicyError,
+  SnapshotValidationError, type AgentEventType
 } from "../packages/agent-protocol/src/index.js";
+import {
+  agentEventPayloadFixtures as fixtures, checkpointFixture, evidenceFixture, fixtureOccurredAt,
+  usageFixture, validAgentEventFixture
+} from "./testkit/agent-event-fixtures.js";
 
-const occurredAt = "2026-07-10T00:00:00.000Z";
+describe("AgentEventEnvelope V4 runtime boundary", () => {
+  it("accepts a producer fixture for every declared durable event", () => {
+    expect(Object.keys(fixtures).sort()).toEqual([...AGENT_EVENT_TYPES].sort());
+    for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope(validAgentEventFixture(type)), type).toBe(true);
+  });
 
-function evidence(kind: "diagnostic" | "review" | "user_waiver" = "diagnostic"): EvidenceRecord {
-  const base = {
-    evidenceId: `evidence-${kind}`,
-    sessionId: "session",
-    runId: "run",
-    status: "passed" as const,
-    createdAt: occurredAt,
-    producer: { authority: kind === "user_waiver" ? "user" as const : "runtime" as const },
-    summary: "checked"
-  };
-  if (kind === "review") return {
-    ...base, kind, data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: ["delta"]
-    }
-  };
-  if (kind === "user_waiver") return {
-    ...base, kind, data: { scope: "review", reason: "explicit test waiver" }
-  };
-  return { ...base, kind, data: { source: "test", diagnostic: { ok: true } } };
-}
-
-function usage(): UsageRecord {
-  return {
-    usageId: "usage", requestId: "request", sessionId: "session", runId: "run", role: "orchestrator",
-    routeId: "route", providerId: "deepseek", modelId: "model", tokenizerId: "approx", tokenizerAccuracy: "approximate",
-    providerReported: false, inputTokens: 10, outputTokens: 2, reasoningTokens: 0, cacheReadTokens: 0,
-    cacheWriteTokens: 0, costMicroUsd: 100, latencyMs: 20, attempt: 1, occurredAt
-  };
-}
-
-function checkpoint(status: CheckpointRef["status"] = "open"): CheckpointRef {
-  return {
-    checkpointId: "checkpoint", sessionId: "session", runId: "run", status, createdAt: occurredAt,
-    preManifestDigest: "a".repeat(64),
-    ...(status === "sealed" ? { sealedAt: occurredAt, postManifestDigest: "b".repeat(64) } : {}),
-    ...(status === "restored" ? { restoredAt: occurredAt, postManifestDigest: "b".repeat(64) } : {})
-  };
-}
-
-function payloadFor(type: AgentEventType): unknown {
-  if (type === "execution.planned") return {
-    executionId: "execution", toolCallId: "tool", plan: {
-      exactEffects: ["filesystem.read"], readPaths: ["."], writePaths: [], network: "none",
-      processMode: "none", checkpointScope: [], idempotence: "read_only"
-    }
-  };
-  if (type === "execution.started") return { executionId: "execution" };
-  if (type === "execution.completed") return { executionId: "execution", evidenceIds: [] };
-  if (type === "execution.failed") return { executionId: "execution", code: "failed", message: "failed" };
-  if (type === "evidence.recorded") return evidence();
-  if (type === "usage.recorded") return usage();
-  if (type === "review.completed") return evidence("review");
-  if (type === "review.waived") return evidence("user_waiver");
-  if (type === "checkpoint.created") return checkpoint("open");
-  if (type === "checkpoint.sealed") return checkpoint("sealed");
-  if (type === "checkpoint.restored") return checkpoint("restored");
-  if (type === "checkpoint.recovery_resolved") return { checkpointId: "checkpoint", decision: "restore" };
-  if (type === "plan.updated") return { previousRevision: 0, plan: { revision: 1, goal: "goal", nodes: [] } };
-  if (type === "budget.reserved" || type === "budget.committed" || type === "budget.released") {
-    return { reservationId: "reservation", ledger: createBudgetLedger() };
-  }
-  if (type === "budget.reservation_bound") {
-    return { reservationId: "reservation", ownerId: "mutation", ledger: createBudgetLedger() };
-  }
-  if (type === "budget.limit_increased") return { ledger: createBudgetLedger(), increase: { toolCalls: 1 } };
-  if (type === "budget.exhausted") return { dimension: "toolCalls", requested: 1, available: 0 };
-  if (type === "budget.overrun") return {
-    reservationId: "reservation",
-    dimensions: [{
-      dimension: "inputTokens", reserved: 120, actual: 130, overReservation: 10,
-      limit: 125, consumed: 130, overLimit: 5
-    }]
-  };
-  if (type === "process.spawned") return { processId: "process", executionId: "execution", mode: "background" };
-  if (type === "process.output") return { processId: "process", stream: "stdout", chunk: "output" };
-  if (type === "process.exited") return { processId: "process", exitCode: 0 };
-  if (type === "process.lost") return { processId: "process", reason: "broker ended" };
-  if (type === "model.route_resolved") return {
-    role: "orchestrator", routeId: "route", modelSpecId: "deepseek/model", attempt: 0
-  };
-  if (type === "model.route_failed") return {
-    role: "orchestrator", routeId: "route", modelSpecId: "deepseek/model", attempt: 0,
-    category: "network", semanticDelta: false
-  };
-  if (type === "profile.resolved") return {
-    profileId: "profile", digest: "digest", artifactId: "artifact", source: "builtin"
-  };
-  if (type === "customization.frozen") return {
-    digest: "digest", artifactId: "artifact", skillCount: 0, hookCount: 0, profileCount: 0
-  };
-  if (type === "skill.loaded") return {
-    qualifiedName: "home:skill", digest: "digest", artifactId: "artifact", source: "home"
-  };
-  if (type === "hook.started") return { hookId: "hook", event: "pre_tool", required: true };
-  if (type === "hook.completed" || type === "hook.failed") return {
-    hookId: "hook", event: "pre_tool", required: true, durationMs: 1, outcome: { decision: "allow" }
-  };
-  if (type === "review.started") return { reviewerId: "reviewer", workspaceDeltaEvidenceIds: ["delta"] };
-  if (type === "run.completed") return { message: "done", evidence: [], outcomeRevision: 0 };
-  return { nested: [true, 1, "text", null] };
-}
-
-function validEvent(type: AgentEventType = "diagnostic"): Record<string, unknown> {
-  return {
-    schemaVersion: EVENT_SCHEMA_VERSION,
-    seq: 1,
-    eventId: "event",
-    sessionId: "session",
-    runId: "run",
-    occurredAt,
-    type,
-    authority: ["review.waived", "checkpoint.recovery_resolved", "budget.limit_increased"].includes(type)
-      ? "user" : "runtime",
-    payload: payloadFor(type)
-  };
-}
-
-describe("AgentEventEnvelope V3 runtime boundary", () => {
-  it("enforces the persistent read-only MCP capability boundary with typed errors", () => {
-    expect(() => assertMcpPersistentEffectsAllowed("safe", ["filesystem.read", "network"]))
-      .not.toThrow();
-    expect(() => assertMcpWriteRootsEmpty("safe", [])).not.toThrow();
-
-    const required = (() => {
-      try { assertMcpPersistentEffectsAllowed("implicit", undefined); } catch (error) { return error; }
-    })();
-    expect(required).toBeInstanceOf(McpCapabilityPolicyError);
-    expect(required).toMatchObject({
-      name: "McpCapabilityPolicyError", code: "mcp_effects_required",
-      serverName: "implicit", forbiddenEffects: []
-    });
-
-    for (const effect of ["filesystem.write", "destructive", "open_world"] as const) {
-      expect(() => assertMcpPersistentEffectsAllowed("unsafe", ["filesystem.read", effect]))
-        .toThrowError(expect.objectContaining({
-          code: "mcp_persistent_effect_forbidden", serverName: "unsafe", forbiddenEffects: [effect]
-        }));
-    }
-    expect(() => assertMcpPersistentEffectsAllowed("multiple", ["filesystem.write", "open_world"]))
-      .toThrowError(expect.objectContaining({ forbiddenEffects: ["filesystem.write", "open_world"] }));
-    expect(() => assertMcpWriteRootsEmpty("writer", ["/workspace"]))
-      .toThrowError(expect.objectContaining({
-        code: "mcp_write_roots_forbidden", serverName: "writer", forbiddenEffects: ["filesystem.write"]
+  it("fails closed for unknown types, missing fields, extra fields, and wrong optional fields", () => {
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), type: "unknown" })).toBe(false);
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), unexpected: true })).toBe(false);
+    for (const type of AGENT_EVENT_TYPES) {
+      const payload = fixtures[type] as Record<string, unknown>;
+      const missingRequired = Object.keys(payload).some((candidate) => !isAgentEventEnvelope({
+        ...validAgentEventFixture(type),
+        payload: Object.fromEntries(Object.entries(payload).filter(([key]) => key !== candidate))
       }));
-  });
-
-  it("accepts every declared event type and solver-visible authority", () => {
-    for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope(validEvent(type)), type).toBe(true);
-    for (const authority of ["system", "developer", "user", "project", "runtime", "tool"]) {
-      expect(isAgentEventEnvelope({ ...validEvent(), authority })).toBe(true);
-      expect(isSolverVisibleAuthority(authority as "runtime")).toBe(true);
+      expect(missingRequired, `${type} must have at least one required field`).toBe(true);
+      expect(isAgentEventEnvelope({ ...validAgentEventFixture(type), payload: { ...payload, unexpected: true } })).toBe(false);
     }
-    expect(isSolverVisibleAuthority("external_verifier")).toBe(false);
-    expect(() => assertAgentEventEnvelope(validEvent())).not.toThrow();
-  });
-
-  it("rejects malformed, V2, non-JSON, evaluator-controlled, and typed-payload-invalid envelopes", () => {
-    const invalid: unknown[] = [
-      null,
-      [],
-      { ...validEvent(), schemaVersion: 2 },
-      { ...validEvent(), seq: 0 },
-      { ...validEvent(), seq: 1.5 },
-      { ...validEvent(), eventId: "" },
-      { ...validEvent(), sessionId: "" },
-      { ...validEvent(), runId: "" },
-      { ...validEvent(), occurredAt: "not-a-date" },
-      { ...validEvent(), type: "unknown" },
-      { ...validEvent(), authority: "external_verifier" },
-      { ...validEvent(), payload: undefined },
-      { ...validEvent(), payload: Number.POSITIVE_INFINITY },
-      { ...validEvent("usage.recorded"), payload: { inputTokens: -1 } },
-      { ...validEvent("execution.planned"), payload: { executionId: "execution", toolCallId: "tool", plan: {} } },
-      { ...validEvent("execution.failed"), payload: { executionId: "execution", code: "failed" } },
-      { ...validEvent("model.route_resolved"), payload: { role: "orchestrator", attempt: -1 } },
-      { ...validEvent("model.route_failed"), payload: { ...payloadFor("model.route_failed"), semanticDelta: "no" } },
-      { ...validEvent("profile.resolved"), payload: { ...payloadFor("profile.resolved"), source: "remote" } },
-      { ...validEvent("customization.frozen"), payload: { ...payloadFor("customization.frozen"), skillCount: -1 } },
-      { ...validEvent("skill.loaded"), payload: { ...payloadFor("skill.loaded"), qualifiedName: "" } },
-      { ...validEvent("hook.completed"), payload: { ...payloadFor("hook.completed"), durationMs: -1 } },
-      { ...validEvent("budget.exhausted"), payload: { dimension: "tools", requested: 1, available: -1 } },
-      { ...validEvent("review.started"), payload: { reviewerId: "reviewer", workspaceDeltaEvidenceIds: [1] } },
-      { ...validEvent("checkpoint.created"), payload: { checkpointId: "missing-fields" } },
-      { ...validEvent("checkpoint.recovery_resolved"), authority: "runtime" },
-      { ...validEvent("budget.limit_increased"), authority: "runtime" },
-      { ...validEvent("evidence.recorded"), payload: { ...evidence(), runId: "older-run" } },
-      { ...validEvent("review.waived"), authority: "tool", payload: evidence("user_waiver") },
-      { ...validEvent("plan.updated"), payload: { previousRevision: 0, plan: { revision: 1, goal: "x", nodes: [
-        { id: "a", title: "a", dependencies: ["a"], status: "pending", owner: { kind: "root" }, acceptanceCriteria: [], evidence: [] }
-      ] } } }
-    ];
-    for (const value of invalid) expect(isAgentEventEnvelope(value)).toBe(false);
-    expect(() => assertAgentEventEnvelope(invalid[2])).toThrow("Invalid AgentEventEnvelope V3");
-  });
-
-  it("validates and upcasts immutable V2 event envelopes explicitly", () => {
-    const legacy = { ...validEvent("diagnostic"), schemaVersion: 2 };
-    expect(isLegacyAgentEventEnvelopeV2(legacy)).toBe(true);
-    expect(isAgentEventEnvelope(legacy)).toBe(false);
-    expect(() => assertLegacyAgentEventEnvelopeV2(legacy)).not.toThrow();
-    expect(upcastAgentEventV2(legacy as never)).toEqual({ ...legacy, schemaVersion: EVENT_SCHEMA_VERSION });
-    expect(isLegacyAgentEventEnvelopeV2({ ...legacy, type: "usage.recorded" })).toBe(false);
-    expect(() => assertLegacyAgentEventEnvelopeV2({ ...legacy, seq: 0 })).toThrow("V2");
-  });
-
-  it("keeps snapshot V2 and V3 validation separate", () => {
-    const state = { value: 1 };
-    const v2 = { schemaVersion: 2, sessionId: "session", seq: 1, createdAt: occurredAt, state };
-    const v3 = {
-      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
-      sessionId: "session", seq: 1, createdAt: occurredAt, state
-    };
-    expect(isLegacySnapshotEnvelopeV2(v2)).toBe(true);
-    expect(isSnapshotEnvelope(v2)).toBe(false);
-    expect(isSnapshotEnvelope(v3)).toBe(true);
-    expect(() => assertLegacySnapshotEnvelopeV2(v2)).not.toThrow();
-    expect(() => assertSnapshotEnvelope(v3)).not.toThrow();
-    expect(() => assertSnapshotEnvelope({ ...v3, createdAt: "invalid" })).toThrow("V3");
-    expect(() => assertLegacySnapshotEnvelopeV2({ ...v2, state: undefined })).toThrow("V2");
-  });
-
-  it("validates JSON and durable domain ledgers", () => {
-    expect(isJsonValue(null)).toBe(true);
-    expect(isJsonValue([1, { ok: true }])).toBe(true);
-    expect(isJsonValue(Number.NaN)).toBe(false);
-    expect(isJsonValue([() => undefined])).toBe(false);
-    expect(isJsonValue({ bad: undefined })).toBe(false);
-    expect(isEvidenceRecord(evidence())).toBe(true);
-    expect(isEvidenceRecord({ ...evidence(), createdAt: "invalid" })).toBe(false);
-    expect(isUsageRecord(usage())).toBe(true);
-    expect(isUsageRecord({ ...usage(), attempt: 0 })).toBe(false);
-    expect(isBudgetLedgerState(createBudgetLedger())).toBe(true);
-    expect(isBudgetLedgerState({ ...createBudgetLedger(), consumed: { inputTokens: -1 } })).toBe(false);
-    expect(isPlanGraph({ revision: 0, goal: "", nodes: [] })).toBe(true);
-    expect(isPlanGraph({ revision: 0, goal: "", activeNodeId: "missing", nodes: [] })).toBe(false);
-  });
-
-  it("validates every durable evidence shape and rejects malformed security metadata", () => {
-    const base = {
-      evidenceId: "evidence", sessionId: "session", runId: "run", status: "passed",
-      createdAt: occurredAt, producer: { authority: "runtime" }, summary: "checked"
-    };
-    const valid = [
-      { ...base, kind: "workspace_delta", data: {
-        checkpointId: "checkpoint", delta: { added: ["a"], modified: ["b"], deleted: ["c"] }
+    const badOptionals = [
+      { ...validAgentEventFixture("evidence.recorded"), payload: {
+        ...evidenceFixture(), producer: { authority: "runtime", id: 1 }
       } },
-      { ...base, kind: "command", data: { command: "pnpm test", exitCode: null } },
-      { ...base, kind: "command", data: { command: "pnpm lint", exitCode: 0 } },
-      { ...base, kind: "validation", data: { validator: "tests", workspaceDeltaEvidenceIds: ["delta"] } },
-      { ...base, kind: "diagnostic", data: { source: "lsp", diagnostic: null } },
-      { ...base, kind: "review", data: {
-        reviewerId: "reviewer", verdict: "changes_requested", findings: [],
-        workspaceDeltaEvidenceIds: ["delta"], validationEvidenceIds: ["validation"]
+      { ...validAgentEventFixture("evidence.recorded"), payload: {
+        ...evidenceFixture(), kind: "command", data: { command: "pnpm test", exitCode: 0, signal: 123 }
       } },
-      { ...base, kind: "checkpoint", data: {
-        checkpointId: "checkpoint", checkpointStatus: "sealed", preManifestDigest: "digest"
+      { ...validAgentEventFixture("evidence.recorded"), payload: {
+        ...evidenceFixture(), kind: "command", data: { command: "pnpm test", exitCode: 0, stdoutArtifactId: 1 }
       } },
-      ...["completed", "failed", "cancelled", "blocked"].map((outcome) => ({
-        ...base, kind: "child_outcome", data: { childId: "child", outcome, planNodeIds: ["node"] }
-      })),
-      { ...base, producer: { authority: "user" }, kind: "user_waiver", data: {
-        scope: "validation", reason: "operator decision"
+      { ...validAgentEventFixture("review.completed"), payload: {
+        ...evidenceFixture("review"), data: { ...evidenceFixture("review").data, checkpointId: 1 }
+      } },
+      { ...validAgentEventFixture("checkpoint.created"), payload: {
+        ...checkpointFixture("open"), postManifestDigest: 1
       } }
     ];
-    for (const value of valid) {
-      expect(isEvidenceRecord(value), value.kind).toBe(true);
-      expect(() => assertEvidenceRecord(value)).not.toThrow();
-    }
-
-    const invalid = [
-      null, [], { ...base, kind: "diagnostic", data: [] },
-      { ...base, producer: null, kind: "diagnostic", data: { source: "x", diagnostic: null } },
-      { ...base, kind: "workspace_delta", data: { checkpointId: "", delta: [] } },
-      { ...base, kind: "command", data: { command: "", exitCode: "zero" } },
-      { ...base, kind: "validation", data: { validator: "", workspaceDeltaEvidenceIds: [1] } },
-      { ...base, kind: "review", data: {
-        reviewerId: "reviewer", verdict: "unknown", findings: {}, workspaceDeltaEvidenceIds: []
-      } },
-      { ...base, kind: "review", data: {
-        reviewerId: "reviewer", verdict: "approved", findings: [],
-        workspaceDeltaEvidenceIds: ["delta"], validationEvidenceIds: [1]
-      } },
-      { ...base, kind: "checkpoint", data: {
-        checkpointId: "checkpoint", checkpointStatus: "unknown", preManifestDigest: ""
-      } },
-      { ...base, kind: "child_outcome", data: { childId: "", outcome: "unknown", planNodeIds: [1] } },
-      { ...base, kind: "user_waiver", data: { scope: "other", reason: "" } }
-    ];
-    for (const value of invalid) expect(isEvidenceRecord(value)).toBe(false);
-    expect(() => assertEvidenceRecord(invalid.at(-1))).toThrow("Invalid EvidenceRecord");
+    for (const value of badOptionals) expect(isAgentEventEnvelope(value)).toBe(false);
   });
 
-  it("checks plan graph topology, budget reservations, usage assets, and checkpoint postimages", () => {
-    const evidenceRef = { evidenceId: "evidence", kind: "validation" };
-    const node = (id: string, dependencies: string[] = []) => ({
-      id, title: id, dependencies, status: "pending", owner: { kind: "root" },
-      acceptanceCriteria: [], evidence: []
-    });
-    const completed = {
-      ...node("done"), status: "completed", owner: { kind: "child", childId: "child" },
-      evidence: [evidenceRef]
+  it("returns structured field paths from the shared assertion boundary", () => {
+    try {
+      assertAgentEventEnvelope({
+        ...validAgentEventFixture("process.exited"),
+        payload: { ...fixtures["process.exited"], signal: 123 }
+      });
+      expect.fail("expected validation to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentEventValidationError);
+      expect(error).toMatchObject({ code: "invalid_agent_event_envelope" });
+      expect((error as AgentEventValidationError).issues[0]?.path).toEqual(["payload", "signal"]);
+    }
+  });
+
+  it("rejects wrong versions and authority/scope violations", () => {
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 3 })).toBe(false);
+    expect(isAgentEventEnvelope({ ...validAgentEventFixture(), authority: "external_verifier" })).toBe(false);
+    expect(isAgentEventEnvelope({
+      ...validAgentEventFixture("checkpoint.recovery_resolved"), authority: "runtime"
+    })).toBe(false);
+    expect(isAgentEventEnvelope({
+      ...validAgentEventFixture("evidence.recorded"), payload: { ...evidenceFixture(), runId: "other" }
+    })).toBe(false);
+    expect(isSolverVisibleAuthority("external_verifier")).toBe(false);
+  });
+
+  it("validates strict V4 snapshots independently", () => {
+    const snapshot = {
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId: "session", seq: 1, createdAt: fixtureOccurredAt, state: { value: 1 }
     };
-    const blocked = { ...node("blocked", ["done"]), status: "blocked", blockedReason: "dependency unavailable" };
-    expect(isPlanGraph({ revision: 3, goal: "goal", activeNodeId: "blocked", nodes: [completed, blocked] })).toBe(true);
+    expect(isSnapshotEnvelope(snapshot)).toBe(true);
+    expect(isSnapshotEnvelope({ ...snapshot, schemaVersion: 3 })).toBe(false);
+    expect(isSnapshotEnvelope({ ...snapshot, extra: true })).toBe(false);
+    expect(() => assertSnapshotEnvelope({ ...snapshot, createdAt: "invalid" })).toThrow(SnapshotValidationError);
+  });
+
+  it("validates all evidence optional fields strictly", () => {
+    const command = {
+      evidenceId: "command", sessionId: "session", runId: "run", kind: "command", status: "passed",
+      createdAt: fixtureOccurredAt, producer: { authority: "tool", id: "process" }, summary: "ran",
+      data: {
+        command: "pnpm test", exitCode: 0, signal: "SIGTERM", artifactIds: ["artifact"],
+        stdoutArtifactId: "stdout", stderrArtifactId: "stderr"
+      }
+    };
+    expect(isEvidenceRecord(command)).toBe(true);
+    for (const [field, value] of [["signal", 123], ["stdoutArtifactId", 123], ["stderrArtifactId", 123]]) {
+      expect(isEvidenceRecord({ ...command, data: { ...command.data, [field]: value } })).toBe(false);
+    }
+    const validation = {
+      ...command, kind: "validation", data: {
+        validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [], workspaceDeltaEvidenceIds: []
+      }
+    };
+    expect(isEvidenceRecord(validation)).toBe(true);
+    expect(isEvidenceRecord({ ...validation, data: { ...validation.data, exitCode: "zero" } })).toBe(false);
+    expect(() => assertEvidenceRecord({ ...command, data: { ...command.data, signal: 123 } })).toThrow();
+  });
+
+  it("keeps domain ledgers, topology, JSON, and MCP policy strict", () => {
+    expect(isJsonValue([1, { ok: true }])).toBe(true);
+    expect(isJsonValue({ bad: undefined })).toBe(false);
+    expect(isUsageRecord(usageFixture())).toBe(true);
+    expect(isUsageRecord({ ...usageFixture(), attempt: 0 })).toBe(false);
+    expect(isBudgetLedgerState(createBudgetLedger())).toBe(true);
     expect(isPlanGraph(createEmptyPlan())).toBe(true);
-    expect(createEmptyPlan("goal").goal).toBe("goal");
-    for (const graph of [
-      null,
-      { revision: 0, goal: "", nodes: [null] },
-      { revision: 0, goal: "", nodes: [{ ...node("a"), owner: [] }] },
-      { revision: 0, goal: "", nodes: [{ ...node("a"), owner: { kind: "child", childId: "" } }] },
-      { revision: 0, goal: "", nodes: [{ ...node("a"), status: "blocked" }] },
-      { revision: 0, goal: "", nodes: [{ ...node("a"), status: "completed" }] },
-      { revision: 0, goal: "", nodes: [node("same"), node("same")] },
-      { revision: 0, goal: "", nodes: [node("a", ["missing"])] },
-      { revision: 0, goal: "", nodes: [node("a", ["b"]), node("b", ["a"])] }
-    ]) expect(isPlanGraph(graph)).toBe(false);
+    expect(isPlanGraph({ revision: 0, goal: "", activeNodeId: "missing", nodes: [] })).toBe(false);
+    expect(isCheckpointRef(checkpointFixture("restored"))).toBe(true);
+    expect(() => assertMcpPersistentEffectsAllowed("safe", ["filesystem.read", "network"])).not.toThrow();
+    expect(() => assertMcpWriteRootsEmpty("safe", [])).not.toThrow();
+    expect(() => assertMcpPersistentEffectsAllowed("unsafe", ["filesystem.write"]))
+      .toThrow(McpCapabilityPolicyError);
+  });
 
-    const ledger = createBudgetLedger();
-    const amount = { inputTokens: 1, outputTokens: 2, costMicroUsd: 3, modelTurns: 1, toolCalls: 1, children: 0 };
-    const reservation = {
-      reservationId: "reservation", ownerId: "owner", status: "committed",
-      requested: amount, consumed: amount, createdAt: occurredAt, settledAt: occurredAt
-    };
-    expect(isBudgetLedgerState({ ...ledger, reservations: [reservation] })).toBe(true);
-    expect(isBudgetLedgerState({ ...ledger, reservations: [{ ...reservation, settledAt: "invalid" }] })).toBe(false);
-    expect(isBudgetLedgerState({ ...ledger, limits: { ...ledger.limits, maxDepth: -1 } })).toBe(false);
-
-    expect(isUsageRecord({ ...usage(), tokenizerAccuracy: "exact", tokenizerAssetDigest: "a".repeat(64) })).toBe(true);
-    expect(isUsageRecord(null)).toBe(false);
-    expect(isUsageRecord({ ...usage(), tokenizerAssetDigest: "not-a-digest" })).toBe(false);
-    expect(isUsageRecord({ ...usage(), extra: () => undefined })).toBe(false);
-
-    const restored = {
-      ...checkpoint("restored"), sealedAt: occurredAt,
-      delta: { added: [], modified: ["file.ts"], deleted: [] }
-    };
-    expect(isCheckpointRef(restored)).toBe(true);
-    expect(isCheckpointRef({ ...restored, restoredAt: "invalid" })).toBe(false);
-    expect(isCheckpointRef({ ...restored, delta: { added: [], modified: [], deleted: [1] } })).toBe(false);
+  it("keeps the fixture builder exhaustive at compile time", () => {
+    const types: AgentEventType[] = Object.keys(fixtures) as AgentEventType[];
+    expect(types).toHaveLength(AGENT_EVENT_TYPES.length);
   });
 });

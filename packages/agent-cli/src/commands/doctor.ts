@@ -1,7 +1,8 @@
 import { access } from "node:fs/promises";
 import { discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
-import type { ExecutionBroker } from "agent-execution";
-import { checkProviderHealth, LazyExecutionBroker } from "agent-runtime";
+import { SIGMA_PROJECT_FACTS } from "agent-config";
+import { LazyExecutionBroker, type ExecutionBroker } from "agent-execution";
+import { checkProviderHealth } from "agent-model";
 import { loadCliConfig, parseArgs } from "../config.js";
 
 interface DoctorDeps {
@@ -51,9 +52,10 @@ function configuredKey(provider: "deepseek" | "glm"): boolean {
 }
 
 function nodeCheck(): DoctorCheck {
-  return process.versions.node === "26.4.0"
+  const expected = SIGMA_PROJECT_FACTS.toolchains.node;
+  return process.versions.node === expected
     ? { name: "node", status: "ok", message: `Node ${process.versions.node}` }
-    : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to 26.4.0.` };
+    : { name: "node", status: "warning", message: `Node ${process.versions.node}; release runtime is pinned to ${expected}.` };
 }
 
 async function apiCheck(provider: "deepseek" | "glm", model: string, enabled: boolean): Promise<DoctorCheck> {

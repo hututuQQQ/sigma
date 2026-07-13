@@ -8,7 +8,8 @@ export function reviewerWaivedDeltaIds(evidence: readonly EvidenceRecord[]): Rea
   const deltas = evidence.filter((item): item is WorkspaceDeltaEvidence =>
     item.kind === "workspace_delta" && item.status === "passed" && !documentationOnly(item));
   const assigned = new Set<string>();
-  for (const waiver of evidence.filter((item) => item.kind === "user_waiver" && item.data.scope === "review")) {
+  for (const waiver of evidence.filter((item): item is Extract<EvidenceRecord, { kind: "user_waiver" }> =>
+    item.kind === "user_waiver" && item.data.scope === "review")) {
     const selected = waiver.data.checkpointId
       ? deltas.find((delta) => delta.data.checkpointId === waiver.data.checkpointId && !assigned.has(delta.evidenceId))
       : deltas.find((delta) => delta.runId === waiver.runId && !assigned.has(delta.evidenceId));

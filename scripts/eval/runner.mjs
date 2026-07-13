@@ -7,7 +7,7 @@ import {
   artifactSecretValues as collectArtifactSecretValues, cliEntry, createRedactor, digest, evalRootDir, fixtureRootDir, loadEvalSecrets,
   makeRunId, relativeArtifact, rootDir, subjectEnvironment, writeJson
 } from "./common.mjs";
-import { listV3Sessions, readV3Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
+import { listV4Sessions, readV4Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
 import { reduceAgentEvents } from "./metrics.mjs";
 import { writeEvalReport } from "./report.mjs";
 import { EVAL_BUDGETS_V1, loadEvalManifestV1 } from "./schema.mjs";
@@ -20,6 +20,7 @@ import { runPostVerifier } from "./verifier.mjs";
 import {
   copyWorkspaceEvidence, diffWorkspaceSnapshots, gitDiff, seedWorkspace, snapshotWorkspace, unauthorizedChanges
 } from "./workspace.mjs";
+import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const DEFAULT_MANIFEST = path.join(fixtureRootDir, "manifest.json");
 
@@ -35,8 +36,18 @@ export function packageManagerInvocation(args, options = {}) {
   return { command: "pnpm", args: [...args] };
 }
 
-function sigmaExecName() {
-  return process.platform === "win32" ? "sigma-exec.exe" : "sigma-exec";
+export function resolveEvaluatorHost(platform = process.platform, arch = process.arch) {
+  if (platform === "linux" && arch === "x64") return {
+    packageTarget: "linux", targetPlatform: "linux", targetArch: "x64",
+    bundleName: "agent-cli-linux-x64", brokerName: "sigma-exec", nativeTarget: "linux-x64"
+  };
+  if (platform === "win32" && arch === "x64") return {
+    packageTarget: "windows", targetPlatform: "win32", targetArch: "x64",
+    bundleName: "agent-cli-win32-x64", brokerName: "sigma-exec.exe", nativeTarget: "win32-x64"
+  };
+  throw Object.assign(new Error(
+    `Unsupported evaluator host '${platform}-${arch}'. Supported hosts are linux-x64 and win32-x64.`
+  ), { code: "unsupported_evaluator_host", platform, arch });
 }
 
 function capture(command, args, options = {}) {
@@ -102,6 +113,7 @@ async function subjectIdentity({ subjectKind, cliTreeDigest, nodePath, brokerPat
 }
 
 async function prepareSubject(runDir, options = {}, redactor = String) {
+  const host = resolveEvaluatorHost(options.platform, options.arch);
   const subjectKind = options.subjectKind ?? "package";
   if (!new Set(["dev", "package"]).has(subjectKind)) {
     throw new Error("Evaluation subject must be 'package' or 'dev'.");
@@ -110,7 +122,7 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
     throw new Error("--skip-package is valid only with --subject package.");
   }
   if (subjectKind === "dev") {
-    const brokerPath = path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecName());
+    const brokerPath = path.join(rootDir, "native", "sigma-exec", "target", "release", host.brokerName);
     const invocation = packageManagerInvocation(["build:native:sigma-exec"]);
     const result = await capture(invocation.command, invocation.args, { cwd: rootDir });
     await writeFile(path.join(runDir, "native-build.stdout.log"), redactor(result.stdout), "utf8");
@@ -128,23 +140,20 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
       launch: createDevNodeLaunch(process.execPath, cliEntry),
       ...identity,
       nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
-      nativeTarget: `${process.platform}-${process.arch}`
+      nativeTarget: host.nativeTarget
     };
   }
-  const target = process.platform === "win32" ? "windows" : "linux";
-  const arch = process.arch === "arm64" ? "arm64" : "x64";
-  const bundleName = `agent-cli-${process.platform === "win32" ? "win32" : "linux"}-${arch}`;
-  const bundleRoot = path.join(rootDir, ".artifacts", bundleName);
+  const bundleRoot = path.join(rootDir, ".artifacts", host.bundleName);
   if (!options.skipPackage) {
-    const invocation = packageManagerInvocation([`package:agent-cli:${target}`]);
+    const invocation = packageManagerInvocation([`package:agent-cli:${host.packageTarget}`]);
     const result = await capture(invocation.command, invocation.args, { cwd: rootDir });
     await writeFile(path.join(runDir, "package.stdout.log"), redactor(result.stdout), "utf8");
     await writeFile(path.join(runDir, "package.stderr.log"), redactor(result.stderr), "utf8");
-    if (result.exitCode !== 0) throw new Error(`Packaging the ${target} evaluation subject failed; inspect package.stderr.log.`);
+    if (result.exitCode !== 0) throw new Error(`Packaging the ${host.packageTarget} evaluation subject failed; inspect package.stderr.log.`);
   }
   const packaged = await loadPackagedSubjectLaunch(bundleRoot, {
-    targetPlatform: process.platform === "win32" ? "win32" : "linux",
-    targetArch: arch
+    targetPlatform: host.targetPlatform,
+    targetArch: host.targetArch
   });
   const { nodePath, brokerPath } = packaged;
   const identity = await subjectIdentity({
@@ -156,7 +165,7 @@ async function prepareSubject(runDir, options = {}, redactor = String) {
   return {
     subjectKind, ...packaged, ...identity,
     nativeSourceDigest: directoryDigest(await snapshotWorkspace(path.join(rootDir, "native", "sigma-exec", "src"))),
-    nativeTarget: `${process.platform}-${process.arch}`
+    nativeTarget: host.nativeTarget
   };
 }
 
@@ -300,11 +309,11 @@ async function scanArtifactTree(directory, secretValues) {
 
 async function durableEvents(workspace, stateHome, subjectResult) {
   const stateRoot = await resolveWorkspaceStateRoot(workspace, { env: { SIGMA_STATE_HOME: stateHome } });
-  const sessions = await listV3Sessions(stateRoot);
+  const sessions = await listV4Sessions(stateRoot);
   const sessionId = subjectResult.sessionId ?? sessions[0]?.sessionId;
   if (!sessionId) return { stateRoot, sessionId: null, events: subjectResult.events ?? [] };
   try {
-    const stored = await readV3Session(stateRoot, sessionId);
+    const stored = await readV4Session(stateRoot, sessionId);
     return { stateRoot, sessionId, events: stored.events };
   } catch (error) {
     if ((subjectResult.events ?? []).length === 0) throw error;
@@ -346,7 +355,7 @@ function subjectConfiguration(context, fixtureSnapshot) {
   const budget = EVAL_BUDGETS_V1[scenario.budget];
   const configuration = {
     provider: "deepseek",
-    model: "deepseek-v4-pro",
+    model: sigmaManifest.evaluation.model,
     surface: scenario.surface,
     permissionPolicy: scenario.permissionPolicy,
     platform: process.platform,
@@ -454,11 +463,10 @@ function experienceViolationsFromEvidence(scenario, subjectResult, metrics) {
   return violations;
 }
 
-async function infrastructureFailureAttempt(context, lifecycle, error) {
-  const { runId, runDir, scenario, repetition, manifestDir, redactor } = context;
-  const { attemptId, attemptArtifactDir, startedAt, phase } = lifecycle;
+async function writeInfrastructureFailureArtifacts(context, lifecycle, message) {
+  const { scenario, redactor } = context;
+  const { attemptArtifactDir, phase } = lifecycle;
   await mkdir(attemptArtifactDir, { recursive: true });
-  const message = error instanceof Error ? error.stack ?? error.message : String(error);
   await ensureFile(path.join(attemptArtifactDir, "evaluator-error.log"), redactor(`${message}\n`));
   const stdoutName = scenario.surface === "tui" ? "tui-driver.stdout.log" : "subject.stdout.log";
   const stderrName = scenario.surface === "tui" ? "tui-driver.stderr.log" : "subject.stderr.log";
@@ -481,6 +489,13 @@ async function infrastructureFailureAttempt(context, lifecycle, error) {
     await writeFile(path.join(attemptArtifactDir, "git.status.txt"), redactor(lifecycle.git.status), "utf8");
   }
   if (scenario.surface === "tui") await ensureFile(path.join(attemptArtifactDir, "tui.transcript.log"), "");
+}
+
+async function infrastructureAttemptEvidence(context, lifecycle) {
+  const { scenario, manifestDir } = context;
+  const { startedAt, phase } = lifecycle;
+  const events = lifecycle.events ?? [];
+  const delta = lifecycle.delta ?? { added: [], modified: [], deleted: [] };
   const fixtureDirectory = path.resolve(manifestDir, scenario.fixture.workspace);
   const fixtureSnapshot = await snapshotWorkspace(fixtureDirectory).catch(() => ({}));
   const rawMetrics = lifecycle.rawMetrics ?? reduceAgentEvents(events, { mode: "change", sessionId: lifecycle.sessionId ?? null });
@@ -500,6 +515,17 @@ async function infrastructureFailureAttempt(context, lifecycle, error) {
   const correctness = lifecycle.verifier
     ? { status: lifecycle.verifier.status, checks: lifecycle.verifier.checks }
     : { status: "fail", checks: [{ index: 0, type: "infrastructure", passed: false, message: `Evaluator failed during ${phase}.` }] };
+  return {
+    fixtureSnapshot, rawMetrics, metrics, terminal, safetyViolations, experienceViolations, reliabilitySignals, correctness,
+    delta, events
+  };
+}
+
+function infrastructureAttemptReport(context, lifecycle, evidence) {
+  const { runId, runDir, scenario, repetition } = context;
+  const { attemptId, attemptArtifactDir, startedAt, phase } = lifecycle;
+  const { fixtureSnapshot, rawMetrics, metrics, terminal, safetyViolations, experienceViolations,
+    reliabilitySignals, correctness } = evidence;
   return {
     schemaVersion: 1,
     kind: "eval_attempt",
@@ -534,6 +560,13 @@ async function infrastructureFailureAttempt(context, lifecycle, error) {
   };
 }
 
+async function infrastructureFailureAttempt(context, lifecycle, error) {
+  const message = error instanceof Error ? error.stack ?? error.message : String(error);
+  await writeInfrastructureFailureArtifacts(context, lifecycle, message);
+  const evidence = await infrastructureAttemptEvidence(context, lifecycle);
+  return infrastructureAttemptReport(context, lifecycle, evidence);
+}
+
 function addSafetyViolation(attempt, violation) {
   attempt.dimensions.safety.status = "fail";
   attempt.dimensions.safety.violations ??= [];
@@ -546,11 +579,9 @@ function addReliabilityBlocker(attempt, signal) {
   attempt.dimensions.reliability.signals.push({ severity: "blocker", ...signal });
 }
 
-async function runAttemptCore(context, deps, lifecycle) {
-  const {
-    runId, runDir, scenario, repetition, manifestDir, subject, secrets, redactor
-  } = context;
-  const { attemptId, attemptArtifactDir, sandboxRoot, startedAt } = lifecycle;
+async function prepareAttemptExecution(context, deps, lifecycle) {
+  const { scenario, manifestDir, subject, secrets } = context;
+  const { attemptArtifactDir, sandboxRoot } = lifecycle;
   const controllerDir = path.join(sandboxRoot, "controller");
   const stateHome = path.join(sandboxRoot, "state");
   const homeDir = path.join(sandboxRoot, "home");
@@ -581,10 +612,19 @@ async function runAttemptCore(context, deps, lifecycle) {
     : applySubjectLaunchEnvironment(baseSubjectEnv, subject.launch);
   const budget = EVAL_BUDGETS_V1[scenario.budget];
   const runSubject = deps.runSubject ?? (scenario.surface === "tui" ? runTuiSubject : runCliSubject);
-  let subjectResult;
+  return {
+    controllerDir, stateHome, fixtureSnapshot, workspace, before, initialGit,
+    promptPath, env, budget, runSubject
+  };
+}
+
+async function executeAttemptSubject(context, lifecycle, prepared) {
+  const { scenario, subject, redactor } = context;
+  const { attemptArtifactDir, startedAt } = lifecycle;
+  const { runSubject, workspace, stateHome, promptPath, env, budget, controllerDir } = prepared;
   lifecycle.phase = "subject";
   try {
-    subjectResult = await runSubject({
+    const result = await runSubject({
       workspace,
       stateHome,
       promptPath,
@@ -599,8 +639,10 @@ async function runAttemptCore(context, deps, lifecycle) {
       redactor,
       subject
     });
+    lifecycle.subjectResult = result;
+    return result;
   } catch (error) {
-    subjectResult = {
+    const result = {
       exitCode: 1,
       stderr: error instanceof Error ? error.stack ?? error.message : String(error),
       events: [],
@@ -610,10 +652,17 @@ async function runAttemptCore(context, deps, lifecycle) {
     const stdoutName = scenario.surface === "tui" ? "tui-driver.stdout.log" : "subject.stdout.log";
     const stderrName = scenario.surface === "tui" ? "tui-driver.stderr.log" : "subject.stderr.log";
     await ensureFile(path.join(attemptArtifactDir, stdoutName), "");
-    await ensureFile(path.join(attemptArtifactDir, stderrName), redactor(subjectResult.stderr));
+    await ensureFile(path.join(attemptArtifactDir, stderrName), redactor(result.stderr));
     if (scenario.surface === "tui") await ensureFile(path.join(attemptArtifactDir, "tui.transcript.log"), "");
+    lifecycle.subjectResult = result;
+    return result;
   }
-  lifecycle.subjectResult = subjectResult;
+}
+
+async function collectAttemptEvidence(context, lifecycle, prepared, subjectResult) {
+  const { redactor } = context;
+  const { attemptArtifactDir } = lifecycle;
+  const { workspace, stateHome, before } = prepared;
   lifecycle.phase = "event_collection";
   const stored = await durableEvents(workspace, stateHome, subjectResult).catch((error) => ({
     stateRoot: null,
@@ -637,6 +686,14 @@ async function runAttemptCore(context, deps, lifecycle) {
   await writeJson(path.join(attemptArtifactDir, "workspace-delta.json"), delta, redactor);
   await writeFile(path.join(attemptArtifactDir, "git.diff"), redactor(git.diff), "utf8");
   await writeFile(path.join(attemptArtifactDir, "git.status.txt"), redactor(git.status), "utf8");
+  return { stored, events, rawMetrics, metrics, delta, git };
+}
+
+async function verifyAttempt(context, lifecycle, prepared, subjectResult, collected) {
+  const { scenario, manifestDir, subject, secrets, redactor } = context;
+  const { attemptArtifactDir } = lifecycle;
+  const { controllerDir, workspace, initialGit } = prepared;
+  const { delta, git, events, metrics } = collected;
   const verifierWorkspace = path.join(controllerDir, "verifier-workspace");
   const verifierManifestDir = path.join(controllerDir, "verifier-manifest");
   const verifierHome = path.join(controllerDir, "verifier-home");
@@ -669,13 +726,12 @@ async function runAttemptCore(context, deps, lifecycle) {
   const verifierDelta = diffWorkspaceSnapshots(verifierBefore, verifierAfter);
   lifecycle.verifierDelta = verifierDelta;
   await writeJson(path.join(attemptArtifactDir, "verifier-workspace-delta.json"), verifierDelta, redactor);
-  const safetyViolations = safetyViolationsFromEvidence(scenario, delta, rawMetrics, events);
-  const finalWorkspaceArtifact = path.join(attemptArtifactDir, "workspace-final");
-  lifecycle.phase = "evidence_copy";
-  const evidenceLinks = await copyWorkspaceEvidence(workspace, finalWorkspaceArtifact);
-  for (const link of evidenceLinks) safetyViolations.push({ code: "workspace_symbolic_link", ...link });
-  const experienceViolations = experienceViolationsFromEvidence(scenario, subjectResult, metrics);
-  const expectedActual = actualTerminal(metrics, subjectResult);
+  return { verifier, verifierDelta };
+}
+
+function attemptReliabilitySignals(collected, verified, expectedActual) {
+  const { rawMetrics, events, stored } = collected;
+  const { verifier, verifierDelta } = verified;
   const reliabilitySignals = rawMetrics.hardFailures.map((failure) => ({ severity: "blocker", ...failure }));
   const substantiveVerifierFailures = verifier.checks.filter((check) => check.type !== "terminal" && !check.passed);
   if (expectedActual === "completed" && substantiveVerifierFailures.length > 0) reliabilitySignals.push({
@@ -684,46 +740,43 @@ async function runAttemptCore(context, deps, lifecycle) {
     failedChecks: substantiveVerifierFailures.map((check) => ({ index: check.index, type: check.type }))
   });
   if (rawMetrics.consecutiveToolFailures.longest >= 3) reliabilitySignals.push({
-    severity: "warning",
-    code: "consecutive_tool_failures",
+    severity: "warning", code: "consecutive_tool_failures",
     count: rawMetrics.consecutiveToolFailures.longest,
     evidence: rawMetrics.consecutiveToolFailures.streaks[0]
   });
-  if (verifierDelta.added.length + verifierDelta.modified.length + verifierDelta.deleted.length > 0) reliabilitySignals.push({
-    severity: "warning",
-    code: "verifier_workspace_mutation",
-    delta: verifierDelta
+  const verifierChanges = verifierDelta.added.length + verifierDelta.modified.length + verifierDelta.deleted.length;
+  if (verifierChanges > 0) reliabilitySignals.push({
+    severity: "warning", code: "verifier_workspace_mutation", delta: verifierDelta
   });
   if (events.length === 0) reliabilitySignals.push({ severity: "blocker", code: "missing_durable_events" });
-  if (stored.storeError) reliabilitySignals.push({ severity: "warning", code: "event_store_read_failed", detail: stored.storeError });
-  const subjectConfig = subjectConfiguration(context, fixtureSnapshot);
-  lifecycle.phase = "report";
-  const finishedAt = new Date().toISOString();
-  const attempt = {
-    schemaVersion: 1,
-    kind: "eval_attempt",
-    runId,
-    attemptId,
-    scenarioId: scenario.id,
-    suites: scenario.suites,
-    repetition,
-    startedAt,
-    finishedAt,
-    subject: subjectConfig,
+  if (stored.storeError) reliabilitySignals.push({
+    severity: "warning", code: "event_store_read_failed", detail: stored.storeError
+  });
+  return reliabilitySignals;
+}
+
+function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
+  const { runId, runDir, scenario, repetition } = context;
+  const { attemptId, attemptArtifactDir, startedAt } = lifecycle;
+  const { subjectResult, safetyViolations, experienceViolations, expectedActual,
+    reliabilitySignals, subjectConfig, finalWorkspaceArtifact } = evidence;
+  const { stored, rawMetrics, metrics } = collected;
+  const { verifier } = verified;
+  return {
+    schemaVersion: 1, kind: "eval_attempt", runId, attemptId,
+    scenarioId: scenario.id, suites: scenario.suites, repetition, startedAt,
+    finishedAt: new Date().toISOString(), subject: subjectConfig,
     outcome: {
       status: expectedActual,
       finishReason: subjectResult.result?.finishReason ?? rawMetrics.terminal.code ?? rawMetrics.terminal.type,
-      sessionId: stored.sessionId,
-      exitCode: subjectResult.exitCode,
-      expectedTerminal: scenario.expectedTerminal,
-      expected: expectedActual === scenario.expectedTerminal
+      sessionId: stored.sessionId, exitCode: subjectResult.exitCode,
+      expectedTerminal: scenario.expectedTerminal, expected: expectedActual === scenario.expectedTerminal
     },
     dimensions: {
       correctness: { status: verifier.status, checks: verifier.checks },
       safety: { status: safetyViolations.length === 0 ? "pass" : "fail", violations: safetyViolations },
       experience: {
-        status: experienceViolations.length === 0 ? "pass" : "fail",
-        violations: experienceViolations,
+        status: experienceViolations.length === 0 ? "pass" : "fail", violations: experienceViolations,
         warnings: experienceWarnings(rawMetrics, scenario)
       },
       reliability: {
@@ -735,13 +788,40 @@ async function runAttemptCore(context, deps, lifecycle) {
     artifacts: attemptArtifactPaths(runDir, attemptArtifactDir, scenario.surface, finalWorkspaceArtifact),
     ...(subjectResult.cancellation ? { cancellation: subjectResult.cancellation } : {})
   };
-  return { attempt, stateRoot: stored.stateRoot };
 }
 
-async function runAttempt(context, deps = {}) {
-  const { runDir, redactor, artifactSecretValues } = context;
-  const secretValues = artifactSecretValues ?? Object.values(context.secrets ?? {});
-  const lifecycle = {
+async function runAttemptCore(context, deps, lifecycle) {
+  const { scenario } = context;
+  const prepared = await prepareAttemptExecution(context, deps, lifecycle);
+  const subjectResult = await executeAttemptSubject(context, lifecycle, prepared);
+  if (subjectResult.infrastructureError) {
+    throw new Error(`Evaluation subject infrastructure failed: ${JSON.stringify(
+      subjectResult.controllerInfrastructureError ?? { code: "subject_infrastructure_error" }
+    )}`);
+  }
+  const collected = await collectAttemptEvidence(context, lifecycle, prepared, subjectResult);
+  const verified = await verifyAttempt(context, lifecycle, prepared, subjectResult, collected);
+  const safetyViolations = safetyViolationsFromEvidence(
+    scenario, collected.delta, collected.rawMetrics, collected.events
+  );
+  const finalWorkspaceArtifact = path.join(lifecycle.attemptArtifactDir, "workspace-final");
+  lifecycle.phase = "evidence_copy";
+  const evidenceLinks = await copyWorkspaceEvidence(prepared.workspace, finalWorkspaceArtifact);
+  for (const link of evidenceLinks) safetyViolations.push({ code: "workspace_symbolic_link", ...link });
+  const experienceViolations = experienceViolationsFromEvidence(scenario, subjectResult, collected.metrics);
+  const expectedActual = actualTerminal(collected.metrics, subjectResult);
+  const reliabilitySignals = attemptReliabilitySignals(collected, verified, expectedActual);
+  const subjectConfig = subjectConfiguration(context, prepared.fixtureSnapshot);
+  lifecycle.phase = "report";
+  const attempt = buildAttemptReport(context, lifecycle, collected, verified, {
+    subjectResult, safetyViolations, experienceViolations, expectedActual,
+    reliabilitySignals, subjectConfig, finalWorkspaceArtifact
+  });
+  return { attempt, stateRoot: collected.stored.stateRoot };
+}
+
+function createAttemptLifecycle(runDir) {
+  return {
     attemptId: randomUUID(),
     // Keep evaluator identity out of every path visible to the subject or its
     // TUI parent process. The external report carries the mapping.
@@ -750,66 +830,97 @@ async function runAttempt(context, deps = {}) {
     startedAt: new Date().toISOString(),
     phase: "setup"
   };
-  let managedCleanup = false;
+}
+
+async function executeAttemptCoreSafely(context, deps, lifecycle) {
   try {
-    let result;
-    try {
-      result = await runAttemptCore(context, deps, lifecycle);
-    } catch (error) {
-      result = {
-        attempt: await infrastructureFailureAttempt(context, lifecycle, error),
-        stateRoot: null
-      };
-    }
-    const { attempt } = result;
-    let finalizationError;
-    try {
-      try {
-        const sandboxExposures = await redactArtifactTree(lifecycle.sandboxRoot, secretValues);
-        for (const file of sandboxExposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file: `sandbox/${file}` });
-      } catch (error) {
-        addSafetyViolation(attempt, { code: "incomplete_safety_evidence", phase: "sandbox_secret_scan" });
-        addReliabilityBlocker(attempt, { code: "evaluator_infrastructure_error", phase: "sandbox_secret_scan" });
-        await ensureFile(path.join(lifecycle.attemptArtifactDir, "evaluator-error.log"), redactor(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`));
-      }
-      const artifactExposures = await redactArtifactTree(lifecycle.attemptArtifactDir, secretValues);
-      for (const file of artifactExposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
-      await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), attempt, redactor);
-      if (result.stateRoot) await appendExternalReport(result.stateRoot, attempt);
-    } catch (error) {
-      finalizationError = error;
-    }
-    managedCleanup = true;
-    let cleanupError;
-    try {
-      await rm(lifecycle.sandboxRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch (error) {
-      cleanupError = error;
-      addSafetyViolation(attempt, { code: "sandbox_cleanup_failed" });
-      addReliabilityBlocker(attempt, { code: "sandbox_cleanup_failed" });
-      await writeFile(
-        path.join(lifecycle.attemptArtifactDir, "cleanup-error.log"),
-        redactor(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`),
-        "utf8"
-      ).catch(() => undefined);
-    }
-    if (cleanupError && !finalizationError) {
-      await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), attempt, redactor);
-    }
-    if (finalizationError) throw finalizationError;
-    return attempt;
-  } finally {
-    if (!managedCleanup) {
-      await rm(lifecycle.sandboxRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
-        .catch(async (error) => ensureFile(
-          path.join(lifecycle.attemptArtifactDir, "cleanup-error.log"),
-          redactor(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
-        ).catch(() => undefined));
-    }
+    return await runAttemptCore(context, deps, lifecycle);
+  } catch (error) {
+    return { attempt: await infrastructureFailureAttempt(context, lifecycle, error), stateRoot: null };
   }
 }
 
-export async function runEvaluation(options = {}, deps = {}) {
+async function scanAttemptSecrets(context, lifecycle, attempt, secretValues) {
+  const { redactor } = context;
+  try {
+    const exposures = await redactArtifactTree(lifecycle.sandboxRoot, secretValues);
+    for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file: `sandbox/${file}` });
+  } catch (error) {
+    addSafetyViolation(attempt, { code: "incomplete_safety_evidence", phase: "sandbox_secret_scan" });
+    addReliabilityBlocker(attempt, { code: "evaluator_infrastructure_error", phase: "sandbox_secret_scan" });
+    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    await ensureFile(path.join(lifecycle.attemptArtifactDir, "evaluator-error.log"), redactor(`${message}\n`));
+  }
+  const exposures = await redactArtifactTree(lifecycle.attemptArtifactDir, secretValues);
+  for (const file of exposures) addSafetyViolation(attempt, { code: "secret_in_artifact", file });
+}
+
+async function finalizeAttempt(context, lifecycle, result, secretValues) {
+  const { redactor } = context;
+  await scanAttemptSecrets(context, lifecycle, result.attempt, secretValues);
+  await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, redactor);
+  if (result.stateRoot) await appendExternalReport(result.stateRoot, result.attempt);
+}
+
+async function cleanupAttempt(context, lifecycle, attempt) {
+  try {
+    await rm(lifecycle.sandboxRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    return false;
+  } catch (error) {
+    addSafetyViolation(attempt, { code: "sandbox_cleanup_failed" });
+    addReliabilityBlocker(attempt, { code: "sandbox_cleanup_failed" });
+    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    await writeFile(path.join(lifecycle.attemptArtifactDir, "cleanup-error.log"), context.redactor(`${message}\n`), "utf8")
+      .catch(() => undefined);
+    return true;
+  }
+}
+
+async function emergencyAttemptCleanup(context, lifecycle) {
+  await rm(lifecycle.sandboxRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    .catch(async (error) => ensureFile(
+      path.join(lifecycle.attemptArtifactDir, "cleanup-error.log"),
+      context.redactor(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+    ).catch(() => undefined));
+}
+
+async function runAttempt(context, deps = {}) {
+  const secretValues = context.artifactSecretValues ?? Object.values(context.secrets ?? {});
+  const lifecycle = createAttemptLifecycle(context.runDir);
+  let cleanupManaged = false;
+  try {
+    const result = await executeAttemptCoreSafely(context, deps, lifecycle);
+    let finalizationError;
+    try { await finalizeAttempt(context, lifecycle, result, secretValues); } catch (error) { finalizationError = error; }
+    cleanupManaged = true;
+    const cleanupFailed = await cleanupAttempt(context, lifecycle, result.attempt);
+    if (cleanupFailed && !finalizationError) {
+      await writeJson(path.join(lifecycle.attemptArtifactDir, "attempt.json"), result.attempt, context.redactor);
+    }
+    if (finalizationError) throw finalizationError;
+    return result.attempt;
+  } finally {
+    if (!cleanupManaged) await emergencyAttemptCleanup(context, lifecycle);
+  }
+}
+
+async function resolveEvaluationInput(options) {
+  const { suite, subjectKind } = validateEvaluationOptions(options);
+  const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
+  const manifestDir = path.dirname(manifestPath);
+  const manifest = await loadEvalManifestV1(manifestPath);
+  const scenarios = selectEvaluationScenarios(manifest, suite, options.scenarios);
+  const repeat = evaluationRepeat(options.repeat, suite);
+  const runId = options.runId ?? makeRunId();
+  const destination = evaluationDestination(options, runId);
+  const runDir = await prepareRunDirectory(destination.destination);
+  return {
+    suite, subjectKind, manifestDir, scenarios, repeat, runId,
+    effectiveEvalRoot: destination.root, runDir
+  };
+}
+
+function validateEvaluationOptions(options) {
   const suite = options.suite ?? "quick";
   if (!new Set(["quick", "experience"]).has(suite)) throw new Error(`Unknown evaluation suite '${suite}'.`);
   const subjectKind = options.subjectKind ?? "package";
@@ -819,20 +930,28 @@ export async function runEvaluation(options = {}, deps = {}) {
   if (options.skipPackage && subjectKind !== "package") {
     throw new Error("--skip-package is valid only with --subject package.");
   }
-  const manifestPath = path.resolve(options.manifestPath ?? DEFAULT_MANIFEST);
-  const manifestDir = path.dirname(manifestPath);
-  const manifest = await loadEvalManifestV1(manifestPath);
+  return { suite, subjectKind };
+}
+
+function selectEvaluationScenarios(manifest, suite, requested) {
   let scenarios = manifest.scenarios.filter((scenario) => scenario.suites.includes(suite));
-  if (options.scenarios?.length) {
-    const selected = new Set(options.scenarios);
+  if (requested?.length) {
+    const selected = new Set(requested);
     scenarios = scenarios.filter((scenario) => selected.has(scenario.id));
     const missing = [...selected].filter((id) => !scenarios.some((scenario) => scenario.id === id));
     if (missing.length > 0) throw new Error(`Unknown or out-of-suite scenarios: ${missing.join(", ")}`);
   }
   if (scenarios.length === 0) throw new Error(`Suite '${suite}' selected no scenarios.`);
-  const repeat = options.repeat ?? (suite === "experience" ? 3 : 1);
+  return scenarios;
+}
+
+function evaluationRepeat(requested, suite) {
+  const repeat = requested ?? (suite === "experience" ? 3 : 1);
   if (!Number.isSafeInteger(repeat) || repeat <= 0) throw new Error("repeat must be a positive integer.");
-  const runId = options.runId ?? makeRunId();
+  return repeat;
+}
+
+function evaluationDestination(options, runId) {
   const requestedRunDir = options.runDir ? path.resolve(options.runDir) : undefined;
   const effectiveEvalRoot = path.resolve(options.evalRootDir
     ?? (requestedRunDir ? path.dirname(requestedRunDir) : evalRootDir));
@@ -841,7 +960,11 @@ export async function runEvaluation(options = {}, deps = {}) {
   if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination)) {
     throw new Error("Evaluation run directory must be inside its results root.");
   }
-  const runDir = await prepareRunDirectory(destination);
+  return { root: effectiveEvalRoot, destination };
+}
+
+async function prepareEvaluationContext(input, options, deps) {
+  const { suite, repeat, scenarios, runDir, manifestDir } = input;
   const secrets = deps.secrets ?? loadEvalSecrets(options.envPath);
   const artifactSecretValues = deps.artifactSecretValues ?? collectArtifactSecretValues(secrets);
   const redactor = createRedactor(artifactSecretValues);
@@ -857,21 +980,42 @@ export async function runEvaluation(options = {}, deps = {}) {
     schemaVersion: 1,
     suite,
     repeat,
-    attempts: schedule.map((item) => ({ scenarioId: item.scenario.id, repetition: item.repetition, scheduleId: item.scheduleId }))
+      attempts: schedule.map((item) => ({ scenarioId: item.scenario.id, repetition: item.repetition, scheduleId: item.scheduleId }))
   }, redactor);
-  const startedAt = new Date().toISOString();
-  const attempts = [];
-  const infrastructureErrors = [];
-  let subject;
+  return {
+    ...input, secrets, artifactSecretValues, redactor, sourceGitSha, evaluatorDigest, verifierDigest, schedule,
+    startedAt: new Date().toISOString()
+  };
+}
+
+async function prepareEvaluationSubject(context, options, deps, infrastructureErrors) {
+  const { runDir, redactor } = context;
   try {
-    subject = deps.prepareSubject
+    return deps.prepareSubject
       ? await deps.prepareSubject(runDir, options)
       : await prepareSubject(runDir, options, redactor);
   } catch (error) {
     const detail = redactor(error instanceof Error ? error.stack ?? error.message : String(error));
     infrastructureErrors.push({ code: "subject_preparation_failed", phase: "subject_preparation", detail });
     await writeFile(path.join(runDir, "infrastructure-error.log"), `${detail}\n`, "utf8");
+    return undefined;
   }
+}
+
+function attemptInfrastructureErrors(attempt, item) {
+  return (attempt.dimensions.reliability.signals ?? [])
+    .filter((signal) => new Set(["evaluator_infrastructure_error", "sandbox_cleanup_failed"]).has(signal.code))
+    .map((signal) => ({
+      code: signal.code, phase: signal.phase ?? "attempt",
+      scenarioId: item.scenario.id, repetition: item.repetition
+    }));
+}
+
+async function executeEvaluationSchedule(context, subject, deps, infrastructureErrors) {
+  const attempts = [];
+  if (!subject) return attempts;
+  const { schedule, runId, runDir, manifestDir, secrets, artifactSecretValues, redactor,
+    sourceGitSha, evaluatorDigest, verifierDigest } = context;
   if (subject) {
     for (const item of schedule) {
       deps.onProgress?.({ type: "attempt.started", scenarioId: item.scenario.id, repetition: item.repetition });
@@ -891,15 +1035,7 @@ export async function runEvaluation(options = {}, deps = {}) {
           verifierDigest
         }, deps);
         attempts.push(attempt);
-        for (const signal of attempt.dimensions.reliability.signals ?? []) {
-          if (!new Set(["evaluator_infrastructure_error", "sandbox_cleanup_failed"]).has(signal.code)) continue;
-          infrastructureErrors.push({
-            code: signal.code,
-            phase: signal.phase ?? "attempt",
-            scenarioId: item.scenario.id,
-            repetition: item.repetition
-          });
-        }
+        infrastructureErrors.push(...attemptInfrastructureErrors(attempt, item));
         deps.onProgress?.({ type: "attempt.completed", attempt });
       } catch (error) {
         infrastructureErrors.push({
@@ -912,7 +1048,13 @@ export async function runEvaluation(options = {}, deps = {}) {
       }
     }
   }
-  const rawRun = {
+  return attempts;
+}
+
+function rawEvaluationRun(context, subject, attempts, infrastructureErrors) {
+  const { runId, suite, repeat, startedAt, sourceGitSha, evaluatorDigest, verifierDigest, scenarios } = context;
+  const firstEnvironmentDigest = attempts[0]?.subject?.environmentDigest ?? null;
+  return {
     schemaVersion: 1,
     kind: "eval_run",
     runId,
@@ -920,29 +1062,32 @@ export async function runEvaluation(options = {}, deps = {}) {
     repeat,
     startedAt,
     finishedAt: new Date().toISOString(),
-    subject: {
-      provider: "deepseek",
-      model: "deepseek-v4-pro",
-      platform: process.platform,
-      arch: process.arch,
-      gitSha: sourceGitSha,
-      subjectKind: subject?.subjectKind ?? "unavailable",
-      surface: "mixed",
-      evaluatorDigest,
-      verifierDigest,
-      nodeDigest: subject?.nodeDigest ?? null,
-      cliTreeDigest: subject?.cliTreeDigest ?? null,
-      brokerDigest: subject?.brokerDigest ?? null,
-      subjectDigest: subject?.subjectDigest ?? null,
-      nativeSourceDigest: subject?.nativeSourceDigest ?? null,
-      nativeTarget: subject?.nativeTarget ?? null,
-      environmentDigest: attempts[0]?.subject?.environmentDigest ?? null,
-      configDigest: attempts[0]?.subject?.environmentDigest ?? null
-    },
+    subject: rawRunSubject(subject, sourceGitSha, evaluatorDigest, verifierDigest, firstEnvironmentDigest),
     scenarios: scenarios.map((scenario) => ({ scenarioId: scenario.id, scenarioDigest: digest(scenario) })),
     attempts,
     infrastructureErrors
   };
+}
+
+function subjectValue(subject, key) {
+  return subject && subject[key] !== undefined ? subject[key] : null;
+}
+
+function rawRunSubject(subject, sourceGitSha, evaluatorDigest, verifierDigest, environmentDigest) {
+  return {
+    provider: "deepseek", model: sigmaManifest.evaluation.model,
+    platform: process.platform, arch: process.arch, gitSha: sourceGitSha,
+    subjectKind: subjectValue(subject, "subjectKind") ?? "unavailable", surface: "mixed",
+    evaluatorDigest, verifierDigest,
+    nodeDigest: subjectValue(subject, "nodeDigest"), cliTreeDigest: subjectValue(subject, "cliTreeDigest"),
+    brokerDigest: subjectValue(subject, "brokerDigest"), subjectDigest: subjectValue(subject, "subjectDigest"),
+    nativeSourceDigest: subjectValue(subject, "nativeSourceDigest"),
+    nativeTarget: subjectValue(subject, "nativeTarget"), environmentDigest, configDigest: environmentDigest
+  };
+}
+
+async function writeSafeEvaluationReport(context, rawRun, infrastructureErrors) {
+  const { runDir, effectiveEvalRoot, artifactSecretValues, redactor } = context;
   const preReportExposures = await redactArtifactTree(runDir, artifactSecretValues);
   if (preReportExposures.length > 0) {
     infrastructureErrors.push({
@@ -968,6 +1113,16 @@ export async function runEvaluation(options = {}, deps = {}) {
     throw new Error(`Secret material could not be removed from evaluation artifacts: ${residualExposures.join(", ")}`);
   }
   return { ...written, runDir, run: written.report };
+}
+
+export async function runEvaluation(options = {}, deps = {}) {
+  const input = await resolveEvaluationInput(options);
+  const context = await prepareEvaluationContext(input, options, deps);
+  const infrastructureErrors = [];
+  const subject = await prepareEvaluationSubject(context, options, deps, infrastructureErrors);
+  const attempts = await executeEvaluationSchedule(context, subject, deps, infrastructureErrors);
+  const rawRun = rawEvaluationRun(context, subject, attempts, infrastructureErrors);
+  return await writeSafeEvaluationReport(context, rawRun, infrastructureErrors);
 }
 
 export { prepareSubject, runAttempt };

@@ -2,6 +2,7 @@ import type {
   ModelToolCall,
   RunOutcome,
   ToolDescriptor,
+  ToolOutcome,
   ToolReceipt
 } from "agent-protocol";
 import { decide, type ActiveModelTurn, type KernelEffect } from "agent-kernel";
@@ -42,7 +43,9 @@ export interface EffectRunnerOptions {
   hooks: RuntimeHookCoordinator;
 }
 
-function durableToolReceipt(receipt: ToolReceipt): ToolReceipt {
+type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
+
+function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
   const diagnosticCodes = [...new Set([
     ...(receipt.outcome?.diagnosticCodes ?? []),
     ...receipt.diagnostics
@@ -89,13 +92,13 @@ export class EffectRunner {
   async run(session: RuntimeSession, signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       if (await this.suspendForLostProcesses(session)) return;
-      const effects = decide(session.state);
+      const effects = decide(session.durable.state);
       const terminal = effects.find((effect): effect is Extract<KernelEffect, { type: "finish_run" }> => effect.type === "finish_run");
       if (terminal) {
         let outcome = terminal.outcome;
         let outcomeRevision = terminal.revision;
         if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
-          const children = await this.options.runtime.joinChildren(session.sessionId, signal);
+          const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
           if (children.failures.length > 0) {
             await this.options.emit(session, "diagnostic", "runtime", {
               kind: "child.join_failed",
@@ -107,8 +110,8 @@ export class EffectRunner {
           for (const [index, value] of children.evidence.entries()) {
             await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
           }
-          outcome = { ...outcome, evidence: [...session.state.evidence] };
-          outcomeRevision = session.state.revision;
+          outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
+          outcomeRevision = session.durable.state.revision;
         }
         if (await this.options.finish(session, outcome, outcomeRevision)) return;
         continue;
@@ -130,12 +133,12 @@ export class EffectRunner {
   }
 
   private async suspendForLostProcesses(session: RuntimeSession): Promise<boolean> {
-    const active = new Set(session.state.activeProcessIds);
+    const active = new Set(session.durable.state.activeProcessIds);
     const lost = (this.options.runtime.execution?.lostProcessHandles ?? [])
       .filter((handle) => active.has(handle.id));
     if (lost.length === 0) return false;
     for (const handle of lost) {
-      session.processHandles?.delete(handle.id);
+      session.execution.processHandles?.delete(handle.id);
       await this.options.emit(session, "process.lost", "runtime", {
         processId: handle.id,
         reason: "The sigma-exec broker connection ended and its process tree was terminated."
@@ -150,8 +153,8 @@ export class EffectRunner {
   }
 
   private async executeTools(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
-    const turnController = session.turnController ?? new AbortController();
-    session.turnController = turnController;
+    const turnController = session.execution.turnController ?? new AbortController();
+    session.execution.turnController = turnController;
     const turnSignal = AbortSignal.any([signal, turnController.signal]);
     if (steeringRestart(turnSignal)) return;
     try {
@@ -196,12 +199,12 @@ export class EffectRunner {
         await executeAttempt(completion);
       }
     } finally {
-      if (session.turnController === turnController) session.turnController = null;
+      if (session.execution.turnController === turnController) session.execution.turnController = null;
     }
   }
 
   private async suspendForCheckpointRecovery(session: RuntimeSession): Promise<boolean> {
-    const recovery = session.openCheckpointRecovery;
+    const recovery = session.recovery.openCheckpointRecovery;
     if (!recovery) return false;
     await this.options.finish(session, {
       kind: "needs_input",
@@ -217,11 +220,11 @@ export class EffectRunner {
     descriptor: ToolDescriptor
   ): Promise<boolean> {
     const discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) =>
-      await loadNestedInstructions({ workspacePath: session.workspacePath, targetPath })));
-    const unseen = discovered.flat().filter((item) => !session.loadedContextIds.has(item.id));
+      await loadNestedInstructions({ workspacePath: session.identity.workspacePath, targetPath })));
+    const unseen = discovered.flat().filter((item) => !session.interaction.loadedContextIds.has(item.id));
     for (const item of unseen) {
-      session.loadedContextIds.add(item.id);
-      session.contextItems.push(item);
+      session.interaction.loadedContextIds.add(item.id);
+      session.interaction.contextItems.push(item);
     }
     if (unseen.length === 0) return false;
     await this.options.emit(session, "diagnostic", "runtime", {
@@ -235,7 +238,7 @@ export class EffectRunner {
   }
 
   private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
-    const name = session.state.pendingTools.find((item) => item.request.callId === receipt.callId
+    const name = session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
       && item.modelTurn.turnId === modelTurn.turnId
       && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
     const durableReceipt = durableToolReceipt(receipt);
@@ -247,8 +250,8 @@ export class EffectRunner {
     }
     try {
       await this.options.hooks.dispatch(session, "post_tool", {
-        sessionId: session.sessionId,
-        runId: session.runId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
         callId: receipt.callId,
         toolName: name,
         ok: receipt.ok,
@@ -256,8 +259,8 @@ export class EffectRunner {
         actualEffects: receipt.actualEffects ?? receipt.observedEffects,
         evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
         artifactRefs: receipt.artifactRefs ?? []
-      }, session.controller?.signal ?? new AbortController().signal);
-      await this.reviews.maybeReview(session, session.controller?.signal ?? new AbortController().signal);
+      }, session.execution.controller?.signal ?? new AbortController().signal);
+      await this.reviews.maybeReview(session, session.execution.controller?.signal ?? new AbortController().signal);
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

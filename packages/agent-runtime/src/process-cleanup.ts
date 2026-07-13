@@ -22,14 +22,14 @@ export async function terminateRunProcesses(
   execution: ProcessExecutionPort | undefined,
   emit: RuntimeEventEmitter
 ): Promise<number> {
-  if (outcome.kind === "needs_input" || !session.processHandles?.size) return 0;
+  if (outcome.kind === "needs_input" || !session.execution.processHandles?.size) return 0;
   if (!execution?.terminate) {
     throw Object.assign(new Error("Cannot finish a run with active processes because the execution broker cannot terminate them."), {
       code: "process_termination_unavailable"
     });
   }
   let emitted = 0;
-  for (const handle of [...session.processHandles.values()]) {
+  for (const handle of [...session.execution.processHandles.values()]) {
     try {
       const result = await execution.terminate(handle, { timeoutMs: 10_000 });
       const artifactIds = result.outputArtifacts?.map((item) => item.brokerArtifactId) ?? [];
@@ -53,7 +53,7 @@ export async function terminateRunProcesses(
       });
       emitted += 1;
     } finally {
-      session.processHandles.delete(handle.id);
+      session.execution.processHandles.delete(handle.id);
     }
   }
   return emitted;

@@ -49,7 +49,7 @@ export class RuntimeHookCoordinator {
     signal: AbortSignal
   ): Promise<RuntimeHookDispatchResult> {
     if (!this.has(session, event)) return { allowed: true, contextAdditions: [], contextItems: [], outcomes: [] };
-    const key = `${session.sessionId}:${event}`;
+    const key = `${session.identity.sessionId}:${event}`;
     if (this.activeDispatches.getStore()?.has(key)) {
       throw new Error(`Recursive hook event '${event}' is forbidden.`);
     }
@@ -78,14 +78,14 @@ export class RuntimeHookCoordinator {
   }
 
   private dispatcher(session: RuntimeSession): HookDispatcher {
-    const existing = this.dispatchers.get(session.sessionId);
+    const existing = this.dispatchers.get(session.identity.sessionId);
     if (existing) return existing;
     const runner: HookRunnerPort = {
       run: async (request, signal) => {
-        const frozen = session.frozenCustomization?.hooks.find((item) => item.id === request.hook.id);
+        const frozen = session.durable.frozenCustomization?.hooks.find((item) => item.id === request.hook.id);
         let prepared: { definition: HookDefinition; cleanup(): Promise<void> } | undefined;
         if (frozen) {
-          verifyFrozenWorkspaceHookTrust(session.workspacePath, frozen);
+          verifyFrozenWorkspaceHookTrust(session.identity.workspacePath, frozen);
           if (frozen.source === "workspace" && frozen.definition.kind === "command") {
             if (!this.options.materializeWorkspaceHook) {
               throw new Error(`Frozen workspace hook '${frozen.id}' has no identity-bound execution materializer.`);
@@ -101,7 +101,7 @@ export class RuntimeHookCoordinator {
           ).run({
             ...request,
             hook: prepared?.definition ?? request.hook,
-            sessionId: session.sessionId
+            sessionId: session.identity.sessionId
           }, signal);
         } finally {
           await prepared?.cleanup();
@@ -116,16 +116,16 @@ export class RuntimeHookCoordinator {
       },
       settled: async (outcome) => await this.recordOutcome(session, outcome)
     });
-    this.dispatchers.set(session.sessionId, dispatcher);
+    this.dispatchers.set(session.identity.sessionId, dispatcher);
     return dispatcher;
   }
 
   private definitions(session: RuntimeSession): readonly HookDefinition[] {
-    if (session.frozenCustomization) {
-      return session.frozenCustomization.hooks.map((item) => item.definition);
+    if (session.durable.frozenCustomization) {
+      return session.durable.frozenCustomization.hooks.map((item) => item.definition);
     }
-    if (!session.profile) return this.options.definitions;
-    return session.profile.profile.hooks.map((id) => {
+    if (!session.services.profile) return this.options.definitions;
+    return session.services.profile.profile.hooks.map((id) => {
       const hook = this.definitionsById.get(id);
       if (!hook) throw new Error(`Frozen Agent Profile hook '${id}' is unavailable.`);
       return hook;
@@ -141,7 +141,7 @@ export class RuntimeHookCoordinator {
     const result = await this.dispatcher(session).dispatch(event, input, signal);
     if (result.contextAdditions.length === 0) return { ...result, contextItems: [] };
     const items: ContextItem[] = result.contextAdditions.map((addition, index) => ({
-      id: `hook:${session.runId}:${event}:${addition.provenance.hookId}:${session.seq}:${index}`,
+      id: `hook:${session.durable.runId}:${event}:${addition.provenance.hookId}:${session.durable.seq}:${index}`,
       authority: "runtime",
       provenance: `hook:${addition.provenance.hookId}:${addition.provenance.event}`,
       content: addition.text,

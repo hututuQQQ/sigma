@@ -1,28 +1,31 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { SigmaExecBrokerClient } from "./broker-client.js";
+import { isSecretEnvironmentKey } from "./environment.js";
 import {
   BrokerConnectionError,
   BrokerToolchainUnavailableError,
+  SandboxUnavailableError
+} from "./errors.js";
+import { resolvePortableNodeExecutable, resolveSigmaExecBinary } from "./paths.js";
+import type {
+  BrokerDoctorReport,
+  BrokerRequestOptions,
+  ExecutionBroker,
+  ExecutionRequest,
+  ExecutionResult,
+  ProcessHandle,
+  ProcessPollResult,
+  ProcessSpawnRequest,
+  TrustedToolchainManifestEntry
+} from "./types.js";
+import {
   createWindowsAppContainerNodeCompatibilityProof,
-  isSecretEnvironmentKey,
-  resolvePortableNodeExecutable,
-  resolveSigmaExecBinary,
-  SandboxUnavailableError,
-  SigmaExecBrokerClient,
-  WINDOWS_APPCONTAINER_NODE_COMPATIBILITY,
-  type BrokerDoctorReport,
-  type BrokerRequestOptions,
-  type ExecutionBroker,
-  type ExecutionRequest,
-  type ExecutionResult,
-  type ProcessHandle,
-  type ProcessPollResult,
-  type ProcessSpawnRequest,
-  type TrustedToolchainManifestEntry
-} from "agent-execution";
+  WINDOWS_APPCONTAINER_NODE_COMPATIBILITY
+} from "./windows-node-compatibility.js";
 
-export interface ExecutionCompositionOptions {
+export interface LazyExecutionBrokerOptions {
   sandboxMode: "required" | "unsafe";
   allowUnsafeHostExec: boolean;
   helperPath?: string;
@@ -35,8 +38,6 @@ export interface RuntimeNodeBinding {
   source: "portable" | "current-runtime";
 }
 
-/** Prefer the canonical regular Node file in the portable bundle even when a
- * caller loaded the CLI entry with a different host Node executable. */
 export function runtimeNodeBinding(
   packageModuleUrl: string | URL = import.meta.url,
   platform: NodeJS.Platform = process.platform,
@@ -59,9 +60,6 @@ export function runtimeTrustedToolchains(
     try {
       windowsCompatibility = createWindowsAppContainerNodeCompatibilityProof(resolved, "runtime-node");
     } catch (error) {
-      // The host CLI can still use verified shells and non-Node toolchains. Do
-      // not claim an unpatched development Node as an LPAC capability; explicit
-      // manifests remain strict in SigmaExecBrokerClient.
       if (error instanceof BrokerToolchainUnavailableError) return [];
       throw error;
     }
@@ -88,8 +86,6 @@ export function runtimeTrustedToolchainsForBinding(
   if (binding.source !== "portable" || platform !== "win32" || sandboxMode !== "required") {
     return runtimeTrustedToolchains(binding.executable, platform, sandboxMode);
   }
-  // A present portable Windows executable is part of the product contract. Do
-  // not silently downgrade to "no Node" when its dynamic proof is invalid.
   const compatibility = createWindowsAppContainerNodeCompatibilityProof(binding.executable, "runtime-node");
   return [{
     id: "runtime-node",
@@ -128,7 +124,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
   private connecting?: Promise<BrokerDoctorReport>;
   private failure?: Error;
 
-  constructor(options: ExecutionCompositionOptions) {
+  constructor(options: LazyExecutionBrokerOptions) {
     const env = options.env ?? process.env;
     const runtime = runtimeNodeBinding();
     this.client = new SigmaExecBrokerClient({
@@ -148,9 +144,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
     this.connecting ??= this.client.connect(signal).catch((error: unknown) => {
       this.failure = error instanceof SandboxUnavailableError || error instanceof BrokerToolchainUnavailableError
         ? error
-        : new SandboxUnavailableError(
-        error instanceof Error ? error.message : "sigma-exec could not be started."
-      );
+        : new SandboxUnavailableError(error instanceof Error ? error.message : "sigma-exec could not be started.");
       throw this.failure;
     });
     return await this.connecting;

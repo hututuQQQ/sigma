@@ -2,15 +2,15 @@ import type { RunOutcome } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
 export async function waitForSessionOutcome(session: RuntimeSession, signal?: AbortSignal): Promise<RunOutcome> {
-  if (session.lastOutcome && (session.state.phase === "terminal" || (session.state.phase === "needs_input" && !session.running))) {
-    return session.lastOutcome;
+  if (session.recovery.lastOutcome && (session.durable.state.phase === "terminal" || (session.durable.state.phase === "needs_input" && !session.execution.running))) {
+    return session.recovery.lastOutcome;
   }
   return await new Promise<RunOutcome>((resolve, reject) => {
-    const waiter = { runId: session.runId, resolve };
+    const waiter = { runId: session.durable.runId, resolve };
     const onAbort = (): void => {
       signal?.removeEventListener("abort", onAbort);
-      const index = session.outcomeWaiters.indexOf(waiter);
-      if (index >= 0) session.outcomeWaiters.splice(index, 1);
+      const index = session.interaction.outcomeWaiters.indexOf(waiter);
+      if (index >= 0) session.interaction.outcomeWaiters.splice(index, 1);
       reject(signal?.reason ?? new Error("Outcome wait cancelled."));
     };
     if (signal?.aborted) return onAbort();
@@ -19,7 +19,7 @@ export async function waitForSessionOutcome(session: RuntimeSession, signal?: Ab
       signal?.removeEventListener("abort", onAbort);
       resolve(outcome);
     };
-    session.outcomeWaiters.push(waiter);
+    session.interaction.outcomeWaiters.push(waiter);
   });
 }
 
@@ -29,13 +29,13 @@ export async function waitForSessionIdleOutcome(
   signal?: AbortSignal
 ): Promise<RunOutcome> {
   while (true) {
-    while (session.running || session.followUps.length > 0) {
+    while (session.execution.running || session.interaction.followUps.length > 0) {
       await new Promise<void>((resolve, reject) => {
         const waiter = { resolve, reject };
         const onAbort = (): void => {
           signal?.removeEventListener("abort", onAbort);
-          const index = session.idleWaiters.indexOf(waiter);
-          if (index >= 0) session.idleWaiters.splice(index, 1);
+          const index = session.interaction.idleWaiters.indexOf(waiter);
+          if (index >= 0) session.interaction.idleWaiters.splice(index, 1);
           reject(signal?.reason ?? new Error("Idle wait cancelled."));
         };
         if (signal?.aborted) return onAbort();
@@ -48,28 +48,28 @@ export async function waitForSessionIdleOutcome(
           signal?.removeEventListener("abort", onAbort);
           reject(error);
         };
-        session.idleWaiters.push(waiter);
+        session.interaction.idleWaiters.push(waiter);
       });
     }
-    if (session.runError) throw session.runError;
+    if (session.recovery.runError) throw session.recovery.runError;
     await waitForQuiescence(signal);
-    if (!session.running && session.followUps.length === 0) break;
+    if (!session.execution.running && session.interaction.followUps.length === 0) break;
   }
-  const outcome = session.lastOutcome ?? session.state.outcome;
-  if (!outcome) throw new Error(`Session '${session.sessionId}' became idle without an outcome.`);
+  const outcome = session.recovery.lastOutcome ?? session.durable.state.outcome;
+  if (!outcome) throw new Error(`Session '${session.identity.sessionId}' became idle without an outcome.`);
   return outcome;
 }
 
 export function resolveOutcomeWaiters(session: RuntimeSession, runId: string, outcome: RunOutcome): void {
-  const matching = session.outcomeWaiters.filter((waiter) => waiter.runId === runId);
-  session.outcomeWaiters = session.outcomeWaiters.filter((waiter) => waiter.runId !== runId);
+  const matching = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId === runId);
+  session.interaction.outcomeWaiters = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId !== runId);
   for (const waiter of matching) waiter.resolve(outcome);
 }
 
 export function settleIdleWaiters(session: RuntimeSession, error?: unknown): void {
-  session.runError = error instanceof Error ? error : error === undefined ? undefined : new Error(String(error));
-  for (const waiter of session.idleWaiters.splice(0)) {
-    if (session.runError) waiter.reject(session.runError);
+  session.recovery.runError = error instanceof Error ? error : error === undefined ? undefined : new Error(String(error));
+  for (const waiter of session.interaction.idleWaiters.splice(0)) {
+    if (session.recovery.runError) waiter.reject(session.recovery.runError);
     else waiter.resolve();
   }
 }

@@ -10,9 +10,9 @@ import {
   restoreSkillExecutionManifest
 } from "../packages/agent-extensions/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { FrozenSkillMaterializer } from "../packages/agent-runtime/src/index.js";
+import { FrozenSkillMaterializer } from "../packages/agent-runtime/src/testing.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
-import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 import { ContentAddressedArtifactStore } from "../packages/agent-store/src/index.js";
 
 describe("frozen skill CAS materialization", () => {
@@ -111,13 +111,11 @@ describe("frozen skill CAS materialization", () => {
       startedAt: new Date().toISOString(),
       deadlineAt: new Date(Date.now() + 60_000).toISOString()
     });
-    const session = {
-      sessionId: "session",
-      runId: "run",
+    const session = runtimeSessionFixture({
+      state,
       workspacePath: workspace,
-      frozenCustomization: customization,
-      state
-    } as RuntimeSession;
+      durable: { frozenCustomization: customization }
+    });
     const materializer = new FrozenSkillMaterializer(storeRoot, artifacts);
     const control = new RuntimeControlService({
       checkpoints: {} as never,

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createRuntime } from "../packages/agent-runtime/src/index.js";
+import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { fakeFinalTurn, fakeToolCall, fakeToolTurn, SmokeFakeGateway } from "../scripts/smoke-fake-model.mjs";

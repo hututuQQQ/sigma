@@ -91,7 +91,7 @@ agent doctor --workspace . --check-api
 
 `run` uses `change` mode. `inspect` uses `analyze` mode: tools declaring `filesystem.write`, unrestricted `process.spawn`, or `destructive` effects are denied, while read-only tools remain available. Policy is evaluated from `ToolDescriptor` effects and approval metadata, not from a hard-coded tool-name list.
 
-A non-interactive `run` or `inspect` in `permissionMode=ask` returns `NeedsInput` before starting because no approval response can be collected. `--permission-mode auto` is an explicit unsafe opt-in that allows commands to access the host with the current user's authority; use it only for a workspace, instructions, and external tools you trust, or use the TUI for interactive approval.
+A non-interactive `run` or `inspect` in `permissionMode=ask` returns `NeedsInput` before starting because no approval response can be collected. `--permission-mode auto` controls tool approval; it does not disable process isolation. Process execution defaults independently to `sandbox=required` and `network=none`.
 
 Process exit codes are stable:
 
@@ -152,18 +152,18 @@ shutdown_grace_ms = 750
 
 Repository-level MCP configuration never starts on first use. Review `.agent/config.toml`, then explicitly grant durable trust with `--trust-workspace-mcp`; the grant is stored outside the repository and is valid only for the canonical workspace path and exact configuration digest. Any configuration change requires trust again. MCP supplied explicitly by a CLI flag, environment, or the user's home configuration is not treated as repository-authored.
 
-Sigma starts the configured executable directly, without a shell. Its working directory must resolve inside the workspace, and the child inherits only a small platform environment allowlist plus literal `env` entries from its configuration—not model keys or the rest of `process.env`. `possible_effects` is mandatory; V3 rejects `filesystem.write`, `destructive`, and `open_world` MCP servers before process spawn, and every accepted persistent server receives zero writable roots. MCP requests have cancellation, idle timeout, and absolute deadline handling; shutdown escalates to process-tree termination after the grace period. Global `permissionMode=deny` still denies prompt-gated MCP tools, while network effects remain subject to the normal approval and sandbox policy.
+Sigma starts the configured executable directly, without a shell. Its working directory must resolve inside the workspace, and the child inherits only a small platform environment allowlist plus literal `env` entries from its configuration—not model keys or the rest of `process.env`. `possible_effects` is mandatory; V4 rejects `filesystem.write`, `destructive`, and `open_world` MCP servers before process spawn, and every accepted persistent server receives zero writable roots. MCP requests have cancellation, idle timeout, and absolute deadline handling; shutdown escalates to process-tree termination after the grace period. Global `permissionMode=deny` still denies prompt-gated MCP tools, while network effects remain subject to the normal approval and sandbox policy.
 
 ## Permissions and containment
 
 Each tool invocation receives its own `ToolExecutionContext` and `AbortSignal`. Descriptors declare possible effects, approval mode, idempotency, execution mode, resource keys, context/write-path arguments, idle timeout, and hard timeout. The runtime uses those declarations for mode checks, approval, locking, receipt reuse, nested `AGENTS.md` discovery, and workspace-delta evidence. A newly discovered nested instruction is durably recorded and any affected mutating/open-world call is deferred until the model replans with that instruction.
 
-Filesystem tools reject lexical and symlink/junction escapes from the workspace. This is path containment, not an OS security sandbox. `agent doctor` intentionally reports that OS-level command sandboxing is not configured.
+Filesystem tools reject lexical and symlink/junction escapes from the workspace. Path containment and OS isolation are separate controls: containment limits accepted paths, while the native broker provides Linux namespace/Landlock/seccomp or Windows AppContainer isolation. The default is fail-closed `sandbox=required` with `network=none`; if the broker is unavailable or its self-test fails, execution is refused. Unsafe host execution requires both a home-level `allow_unsafe_host_exec` grant and an explicit request for that run. `agent doctor` reports the detected backend, self-test result, network modes, and PTY capability.
 
 ## Sessions and recovery
 
 ```text
-<user-state>/sigma/workspaces/<workspace-sha256>/sessions/<sessionId>/
+<user-state>/sigma/workspaces/<workspace-sha256>/stores/v4/sessions/<sessionId>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json
@@ -213,7 +213,9 @@ pnpm test:harbor
 pnpm smoke:product
 pnpm smoke:tui-product
 pnpm verify:containment
-pnpm verify:package:agent-cli
+pnpm verify:package:agent-cli:linux
+# On Windows:
+pnpm verify:package:agent-cli:windows
 ```
 
 `pnpm lint` runs TypeScript, ESLint complexity/function-size rules, dependency-cycle/public-export checks, Knip, and production file-size guards. Coverage gates are global and stricter for kernel/protocol/store; the exact commands and thresholds are documented in [VALIDATION.md](./VALIDATION.md).
@@ -222,7 +224,7 @@ Development and release use Node `26.4.0`. TUI entry points add `--experimental-
 
 ## Agent experience evaluation
 
-The external experience evaluator runs Sigma with `deepseek-v4-pro` in fresh, opaque workspaces and reduces the durable V3 event stream into separate correctness, safety, experience, and reliability results. It never sends scenario identity, verifier details, scores, or reviewer conclusions to the solving session.
+The external experience evaluator runs Sigma with the provider/model declared in `sigma-manifest.json` in fresh, opaque workspaces and reduces the durable V4 event stream into separate correctness, safety, experience, and reliability results. It never sends scenario identity, verifier details, scores, or reviewer conclusions to the solving session. Evaluation hosts are restricted to `linux-x64` and `win32-x64`; unsupported OS/architectures fail before packaging.
 
 ```powershell
 # Audit existing sessions without calling a model.

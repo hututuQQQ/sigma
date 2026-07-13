@@ -112,6 +112,37 @@ async function workspaceFile(workspace, relative) {
   return { target, info };
 }
 
+function stringList(value) {
+  if (Array.isArray(value)) return value;
+  return typeof value === "string" ? [value] : [];
+}
+
+function jsonFileFailure(check, content) {
+  if (check.json === undefined) return [];
+  try {
+    return JSON.stringify(JSON.parse(content)) === JSON.stringify(check.json) ? [] : ["JSON value did not match"];
+  } catch {
+    return ["file was not valid JSON"];
+  }
+}
+
+function fileContentFailures(check, content) {
+  const failures = [];
+  if (typeof check.content === "string" && content !== check.content) failures.push("content did not match exactly");
+  if (typeof check.equals === "string" && content !== check.equals) failures.push("content did not match exactly");
+  for (const expected of stringList(check.contains)) {
+    if (!content.includes(expected)) failures.push(`missing expected text ${JSON.stringify(expected)}`);
+  }
+  for (const forbidden of stringList(check.notContains)) {
+    if (content.includes(forbidden)) failures.push(`contained forbidden text ${JSON.stringify(forbidden)}`);
+  }
+  if (typeof check.matches === "string" && !new RegExp(check.matches, check.flags ?? "u").test(content)) {
+    failures.push("content did not match regex");
+  }
+  failures.push(...jsonFileFailure(check, content));
+  return failures;
+}
+
 async function fileCheck(check, workspace) {
   const relative = safeRelative(check.path, "verifier file path");
   const { target, info } = await workspaceFile(workspace, relative);
@@ -119,43 +150,31 @@ async function fileCheck(check, workspace) {
   if (!shouldExist) return { passed: info === null, message: info === null ? `${relative} is absent.` : `${relative} unexpectedly exists.` };
   if (!info?.isFile()) return { passed: false, message: `${relative} is not a file.` };
   const content = await readFile(target, "utf8");
-  const failures = [];
-  if (typeof check.content === "string" && content !== check.content) failures.push("content did not match exactly");
-  if (typeof check.equals === "string" && content !== check.equals) failures.push("content did not match exactly");
-  for (const expected of Array.isArray(check.contains) ? check.contains : typeof check.contains === "string" ? [check.contains] : []) {
-    if (!content.includes(expected)) failures.push(`missing expected text ${JSON.stringify(expected)}`);
-  }
-  for (const forbidden of Array.isArray(check.notContains) ? check.notContains : typeof check.notContains === "string" ? [check.notContains] : []) {
-    if (content.includes(forbidden)) failures.push(`contained forbidden text ${JSON.stringify(forbidden)}`);
-  }
-  if (typeof check.matches === "string" && !new RegExp(check.matches, check.flags ?? "u").test(content)) failures.push("content did not match regex");
-  if (check.json !== undefined) {
-    try {
-      if (JSON.stringify(JSON.parse(content)) !== JSON.stringify(check.json)) failures.push("JSON value did not match");
-    } catch {
-      failures.push("file was not valid JSON");
-    }
-  }
+  const failures = fileContentFailures(check, content);
   return { passed: failures.length === 0, message: failures.length === 0 ? `${relative} matched.` : `${relative}: ${failures.join("; ")}` };
 }
 
 function answerCheck(check, answer) {
   const failures = [];
   if (typeof check.equals === "string" && answer.trim() !== check.equals.trim()) failures.push("answer did not match exactly");
-  for (const expected of Array.isArray(check.contains) ? check.contains : typeof check.contains === "string" ? [check.contains] : []) {
+  for (const expected of stringList(check.contains)) {
     if (!answer.includes(expected)) failures.push(`answer missed ${JSON.stringify(expected)}`);
   }
   if (typeof check.matches === "string" && !new RegExp(check.matches, check.flags ?? "u").test(answer)) failures.push("answer did not match regex");
   if (typeof check.notMatches === "string" && new RegExp(check.notMatches, check.flags ?? "u").test(answer)) failures.push("answer matched forbidden regex");
-  if (typeof check.pattern === "string") {
-    const flags = check.flags ?? "iu";
-    const expression = new RegExp(check.pattern, flags.includes("g") ? flags : `${flags}g`);
-    const matches = [...answer.matchAll(expression)].length;
-    const minimum = Number.isInteger(check.minMatches) ? check.minMatches : 1;
-    const maximum = Number.isInteger(check.maxMatches) ? check.maxMatches : Number.POSITIVE_INFINITY;
-    if (matches < minimum || matches > maximum) failures.push(`answer regex matched ${matches} times; expected ${minimum}..${maximum}`);
-  }
+  failures.push(...answerPatternFailures(check, answer));
   return { passed: failures.length === 0, message: failures.length === 0 ? "Final answer matched." : failures.join("; ") };
+}
+
+function answerPatternFailures(check, answer) {
+  if (typeof check.pattern !== "string") return [];
+  const flags = check.flags ?? "iu";
+  const expression = new RegExp(check.pattern, flags.includes("g") ? flags : `${flags}g`);
+  const matches = [...answer.matchAll(expression)].length;
+  const minimum = Number.isInteger(check.minMatches) ? check.minMatches : 1;
+  const maximum = Number.isInteger(check.maxMatches) ? check.maxMatches : Number.POSITIVE_INFINITY;
+  return matches < minimum || matches > maximum
+    ? [`answer regex matched ${matches} times; expected ${minimum}..${maximum}`] : [];
 }
 
 function eventCountCheck(check, events) {
@@ -212,18 +231,24 @@ function gitDiffCheck(check, delta, context) {
   const failures = [];
   if ((check.clean === true || check.requireClean === true) && changed.length > 0) failures.push(`workspace changed: ${changed.join(", ")}`);
   if (check.required === true && changed.length === 0) failures.push("workspace did not change");
-  const allowed = check.allowedPaths ?? check.allowed ?? check.allowedChanges;
-  if (Array.isArray(allowed)) {
-    const unauthorized = unauthorizedChanges(delta, allowed);
-    if (unauthorized.length > 0) failures.push(`unauthorized changes: ${unauthorized.join(", ")}`);
-  }
-  if (check.preserveInitial === true) {
-    const initialLines = String(context.initialGit?.status ?? "").split(/\r?\n/u).filter(Boolean);
-    const finalLines = new Set(String(context.finalGit?.status ?? "").split(/\r?\n/u).filter(Boolean));
-    const missing = initialLines.filter((line) => !finalLines.has(line));
-    if (missing.length > 0) failures.push(`pre-existing worktree state changed: ${missing.join(", ")}`);
-  }
+  failures.push(...gitAllowedFailures(check, delta));
+  failures.push(...gitPreservationFailures(check, context));
   return { passed: failures.length === 0, message: failures.length === 0 ? "Workspace delta matched." : failures.join("; ") };
+}
+
+function gitAllowedFailures(check, delta) {
+  const allowed = check.allowedPaths ?? check.allowed ?? check.allowedChanges;
+  if (!Array.isArray(allowed)) return [];
+  const unauthorized = unauthorizedChanges(delta, allowed);
+  return unauthorized.length > 0 ? [`unauthorized changes: ${unauthorized.join(", ")}`] : [];
+}
+
+function gitPreservationFailures(check, context) {
+  if (check.preserveInitial !== true) return [];
+  const initialLines = String(context.initialGit?.status ?? "").split(/\r?\n/u).filter(Boolean);
+  const finalLines = new Set(String(context.finalGit?.status ?? "").split(/\r?\n/u).filter(Boolean));
+  const missing = initialLines.filter((line) => !finalLines.has(line));
+  return missing.length > 0 ? [`pre-existing worktree state changed: ${missing.join(", ")}`] : [];
 }
 
 function terminalStatus(subjectResult, metrics) {
@@ -243,6 +268,15 @@ export function finalAnswerFrom(subjectResult, events) {
   return visible.at(-1) ?? "";
 }
 
+async function executeVerifierCheck(check, context, answer, broker) {
+  if (check.type === "file") return await fileCheck(check, context.workspace);
+  if (check.type === "answer") return answerCheck(check, answer);
+  if (check.type === "event_count") return eventCountCheck(check, context.events);
+  if (check.type === "command") return await commandCheck(check, context, broker);
+  if (check.type === "git_diff") return gitDiffCheck(check, context.delta, context);
+  throw new Error(`Unknown verifier check type '${String(check.type)}'.`);
+}
+
 export async function runPostVerifier(context) {
   const {
     scenario, workspace, manifestDir, delta, subjectResult, events, metrics, artifactDir, redactor
@@ -254,14 +288,12 @@ export async function runPostVerifier(context) {
     for (const [index, check] of (scenario.verifier?.checks ?? []).entries()) {
       let result;
       try {
-        if (check.type === "file") result = await fileCheck(check, workspace);
-        else if (check.type === "answer") result = answerCheck(check, answer);
-        else if (check.type === "event_count") result = eventCountCheck(check, events);
-        else if (check.type === "command") {
+        if (check.type === "command") {
           brokerPromise ??= connectVerifierBroker(context);
-          result = await commandCheck(check, { ...context, workspace, manifestDir }, await brokerPromise);
-        } else if (check.type === "git_diff") result = gitDiffCheck(check, delta, context);
-        else throw new Error(`Unknown verifier check type '${String(check.type)}'.`);
+        }
+        result = await executeVerifierCheck(
+          check, { ...context, workspace, manifestDir, delta, events }, answer, await brokerPromise
+        );
       } catch (error) {
         result = { passed: false, message: error instanceof Error ? error.message : String(error) };
       }

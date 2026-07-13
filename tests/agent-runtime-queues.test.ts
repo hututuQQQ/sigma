@@ -20,13 +20,14 @@ import {
   STORE_LAYOUT_VERSION
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/index.js";
+import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 import { typedCompletion } from "./helpers/typed-evidence.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
@@ -167,12 +168,21 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
-  it("suspends a conversational natural stop without inventing execution evidence", async () => {
+  it("repairs a conversational natural stop through an explicit typed input request", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
-    const gateway = new ScriptedGateway([{
-      message: { role: "assistant", content: "Hello. What would you like me to work on?" },
-      finishReason: "stop"
-    }]);
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "Hello. What would you like me to work on?" },
+        finishReason: "stop"
+      },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "need-task", name: "request_user_input", arguments: { message: "What should I work on?" } }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
@@ -183,14 +193,82 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input",
-      requestId: "model-response-1",
-      message: "Hello. What would you like me to work on?"
+      requestId: "need-task",
+      message: "What should I work on?"
     });
-    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].toolChoice).toBe("required");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
     const events = await storedEvents(store, session.sessionId);
-    expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.started")).toHaveLength(2);
     expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
   });
+
+  it("requires current-run evidence after a natural stop before allowing completion", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidence-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "read-evidence", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("evidence-backed read completed")
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "evidence-backed read completed"
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[1].toolChoice).toBe("required");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("complete_task");
+  }, 30_000);
+
+  it("repairs an evidence-backed natural stop through strict typed completion", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "read-before-answer", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      completion("typed terminal repair completed")
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed", message: "The file contains seed."
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(gateway.requests[2].toolChoice).toBe("required");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
+  }, 30_000);
 
   it("supports an explicit typed request for user input", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-request-input-"));
@@ -307,8 +385,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const waiting = runtime.waitForOutcome(session.sessionId, controller.signal);
     controller.abort(new Error("stop waiting"));
     await expect(waiting).rejects.toThrow("stop waiting");
-    const sessions = (runtime as unknown as { sessions: Map<string, { outcomeWaiters: unknown[] }> }).sessions;
-    expect(sessions.get(session.sessionId)?.outcomeWaiters).toHaveLength(0);
+    const sessions = (runtime as unknown as {
+      sessions: Map<string, { interaction: { outcomeWaiters: unknown[] } }>;
+    }).sessions;
+    expect(sessions.get(session.sessionId)?.interaction.outcomeWaiters).toHaveLength(0);
     await runtime.command({ type: "cancel", sessionId: session.sessionId, reason: "test cleanup" });
   });
 
@@ -427,7 +507,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         occurredAt: new Date(Date.now() + seq).toISOString(),
         type,
         authority: type === "user.message" || type === "user.follow_up" ? "user" : "runtime",
-        payload
+        payload: completeAgentEventPayload(type, payload)
       };
       await store.append(event, seq);
       seq += 1;
@@ -474,7 +554,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       occurredAt: startedAt,
       type: "session.created",
       authority: "runtime",
-      payload: { workspacePath: workspace, mode: "change" }
+      payload: completeAgentEventPayload("session.created", { workspacePath: workspace, mode: "change" })
     }, 0);
     const snapshotState = {
       ...createKernelState({ sessionId, runId, mode: "change", startedAt, deadlineAt }),
@@ -525,7 +605,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         occurredAt: new Date(Date.now() + seq).toISOString(),
         type,
         authority: type === "user.message" ? "user" : "runtime",
-        payload
+        payload: completeAgentEventPayload(type, payload)
       };
       await store.append(stored, seq);
       seq += 1;
@@ -641,7 +721,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     let seq = 0;
     const append = async (type: "child.spawned" | "child.completed" | "child.message", detail: Record<string, unknown>): Promise<void> => {
       const event = {
-        schemaVersion: EVENT_SCHEMA_VERSION, seq: seq + 1, eventId: `child-event-${seq + 1}`, parentSessionId,
+        schemaVersion: EVENT_SCHEMA_VERSION, seq: seq + 1, eventId: `child-event-${seq + 1}`,
         sessionId: parentSessionId, runId: "parent-run", occurredAt: new Date(Date.now() + seq).toISOString(),
         type, authority: "runtime" as const, payload: { childId: "child-1", payload: detail }
       };

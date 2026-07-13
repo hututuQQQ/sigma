@@ -316,21 +316,21 @@ function emptyAccumulator(state?: KernelState): RestoreAccumulator {
   };
 }
 
-export interface V3SnapshotRebuildInput {
+export interface SnapshotRebuildInput {
   sessionId: string;
   lastSeq: number;
   events(): AsyncIterable<AgentEventEnvelope>;
 }
 
-/** Replays promoted events through the V3 kernel instead of trusting a V2 snapshot. */
-export async function rebuildV3SnapshotFromEvents(
-  input: V3SnapshotRebuildInput,
+/** Replays the durable event log through the kernel to rebuild a V4 snapshot. */
+export async function rebuildSnapshotFromEvents(
+  input: SnapshotRebuildInput,
   runDeadlineMs = 30 * 60 * 1_000
 ): Promise<SnapshotEnvelope> {
   const accumulator = emptyAccumulator();
   for await (const event of input.events()) replayEvent(accumulator, event, 0, runDeadlineMs);
   if (!accumulator.metadata || !accumulator.state || accumulator.lastSeq !== input.lastSeq) {
-    throw new Error(`Promoted session '${input.sessionId}' did not replay to seq ${input.lastSeq}.`);
+    throw new Error(`Session '${input.sessionId}' did not replay to seq ${input.lastSeq}.`);
   }
   assertKernelInvariants(accumulator.state);
   return {

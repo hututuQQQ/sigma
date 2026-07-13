@@ -280,7 +280,11 @@ async function runPyrightSmoke(api, broker, workspace, layout) {
     try {
       diagnostics = await waitForDiagnostics(client, filePath);
     } catch (error) {
-      throw new Error(`Pyright sandbox diagnostics failed. Logs: ${logs.join(" | ") || "none"}`, { cause: error });
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Pyright sandbox diagnostics failed: ${detail}. Logs: ${logs.join(" | ") || "none"}`,
+        { cause: error }
+      );
     }
     const unchanged = before === await sha256File(filePath);
     if (diagnostics.length === 0 || !unchanged) {

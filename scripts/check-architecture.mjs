@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packagesRoot = path.join(root, "packages");
 const productionExtensions = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"]);
-const maximumProductionLines = 1_000;
-const maximumTuiComponentLines = 250;
+const policy = JSON.parse(await readFile(path.join(root, "architecture-policy.json"), "utf8"));
+const maximumProductionLines = policy.fileLimits.production;
+const maximumTuiComponentLines = policy.fileLimits.tui;
 
 async function packageRecords() {
   const entries = await readdir(packagesRoot, { withFileTypes: true });
@@ -105,9 +106,25 @@ function childProcessViolation(specifier, record) {
   return record.name !== "agent-execution";
 }
 
+function importedWorkspacePackage(specifier, packageNames) {
+  for (const packageName of packageNames) {
+    if (specifier === packageName || specifier.startsWith(`${packageName}/`)) return packageName;
+  }
+  return undefined;
+}
+
 const records = await packageRecords();
 const byName = new Map(records.map((record) => [record.name, record]));
 const violations = packageCycles(records).map((cycle) => `package dependency cycle: ${cycle}`);
+const packageNames = new Set(byName.keys());
+
+for (const record of records) {
+  const allowed = new Set(policy.packages[record.name] ?? []);
+  if (!Object.hasOwn(policy.packages, record.name)) violations.push(`${record.name}: missing architecture policy`);
+  for (const dependency of workspaceDependencies(record, packageNames)) {
+    if (!allowed.has(dependency)) violations.push(`${record.name}: manifest dependency on ${dependency} is not allowed`);
+  }
+}
 
 for (const record of records) {
   for (const file of await sourceFiles(record.directory)) {
@@ -119,14 +136,20 @@ for (const record of records) {
       violations.push(`${relative}: ${lineCount} lines exceeds the ${lineLimit}-line production limit`);
     }
     const owner = { ...record, file };
+    const declared = new Set(workspaceDependencies(record, packageNames));
+    const allowed = new Set(policy.packages[record.name] ?? []);
     for (const specifier of importSpecifiers(source)) {
-      if (specifier === "node:child_process" && record.name !== "agent-execution") {
-        violations.push(`${relative}: only agent-execution may import node:child_process`);
-      }
       const target = directSourceViolation(specifier, owner, byName);
       if (target) violations.push(`${relative}: imports private source from ${target} via ${specifier}`);
       if (childProcessViolation(specifier, record)) {
         violations.push(`${relative}: imports ${specifier}; arbitrary process creation is owned exclusively by agent-execution`);
+      }
+      const imported = importedWorkspacePackage(specifier, packageNames);
+      if (imported && imported !== record.name && !allowed.has(imported)) {
+        violations.push(`${relative}: source import of ${imported} is not allowed by architecture policy`);
+      }
+      if (imported && imported !== record.name && !declared.has(imported)) {
+        violations.push(`${relative}: source import of ${imported} is missing from package manifest`);
       }
     }
   }

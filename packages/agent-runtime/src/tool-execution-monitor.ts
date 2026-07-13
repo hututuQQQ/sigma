@@ -101,10 +101,10 @@ export class ToolExecutionMonitor {
       const execution = this.options.runtime.tools.execute({
         callId: call.id, name: call.name, arguments: call.arguments
       }, {
-        sessionId: session.sessionId,
-        runId: session.runId,
-        workspacePath: session.workspacePath,
-        runMode: session.mode,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
+        workspacePath: session.identity.workspacePath,
+        runMode: session.durable.mode,
         callPlan: plan,
         ...(approval ? { approval } : {}),
         signal: controller.signal,
@@ -116,11 +116,11 @@ export class ToolExecutionMonitor {
           });
         },
         createArtifact: async (artifact) =>
-          await this.options.createArtifact(session.sessionId, artifact.content),
+          await this.options.createArtifact(session.identity.sessionId, artifact.content),
         runtimeControl: this.options.control.forSession(session)
       });
       const receipt = await this.settledReceipt(
-        execution, requiresSettlement, controller, session.sessionId, resourceKeys
+        execution, requiresSettlement, controller, session.identity.sessionId, resourceKeys
       );
       if (!before) return receipt;
       const after = await this.gitState(session, controller.signal);
@@ -185,11 +185,11 @@ export class ToolExecutionMonitor {
   private async gitState(session: RuntimeSession, signal: AbortSignal): Promise<Map<string, string> | null> {
     const execution = this.options.runtime.execution;
     if (!execution) return null;
-    const entries = await gitPorcelain(session.workspacePath, signal, execution)
+    const entries = await gitPorcelain(session.identity.workspacePath, signal, execution)
       .then((item) => item.exitCode === 0 ? porcelainEntries(item.stdout) : null, () => null);
     if (!entries) return null;
     await Promise.all([...entries].map(async ([file, status]) => {
-      entries.set(file, `${status}:${await fileFingerprint(session.workspacePath, file)}`);
+      entries.set(file, `${status}:${await fileFingerprint(session.identity.workspacePath, file)}`);
     }));
     return entries;
   }

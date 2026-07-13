@@ -3,7 +3,9 @@ import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from "node:fs/p
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJson } from "./common.mjs";
+import { STORE_LAYOUT_VERSION } from "./event-store.mjs";
 import { subjectNodeLaunch } from "./subject-launch.mjs";
+import { sigmaManifest } from "../lib/sigma-manifest.mjs";
 
 const driverPath = fileURLToPath(new URL("./tui-driver.py", import.meta.url));
 const SUBJECT_ENVIRONMENT_BRIDGE = "SIGMA_TUI_SUBJECT_ENVIRONMENT_B64";
@@ -106,10 +108,30 @@ export function tuiSubjectCommand(subject, args) {
   ];
 }
 
+function tuiRunResult(result, summary, startedAt) {
+  const settledStatus = {
+    "run.completed": "completed",
+    "run.suspended": "needs_input",
+    "run.cancelled": "cancelled",
+    "run.failed": "error"
+  }[summary?.settledTerminalType];
+  const controllerInfrastructureError = summary?.infrastructureError;
+  return {
+    ...result,
+    ...(summary ?? {}),
+    infrastructureError: Boolean(controllerInfrastructureError),
+    ...(controllerInfrastructureError ? { controllerInfrastructureError } : {}),
+    durationMs: summary?.durationMs ?? Date.now() - startedAt,
+    cancellation: summary?.cancellation,
+    result: settledStatus ? { status: settledStatus, finishReason: summary.settledTerminalType } : undefined,
+    events: []
+  };
+}
+
 export async function runTuiSubject(options) {
   const {
     workspace, stateHome, initialMessage, interactions, permissionPolicy, budget,
-    artifactDir, controllerDir = artifactDir, env, redactor, subject
+    artifactDir, controllerDir = artifactDir, env, redactor, subject, eventStreamTimeoutMs = 10_000
   } = options;
   await Promise.all([mkdir(artifactDir, { recursive: true }), mkdir(controllerDir, { recursive: true })]);
   const transcriptPath = path.join(controllerDir, "terminal.transcript.log");
@@ -122,7 +144,7 @@ export async function runTuiSubject(options) {
       "tui",
       "--workspace", workspace,
       "--provider", "deepseek",
-      "--model", "deepseek-v4-pro",
+      "--model", sigmaManifest.evaluation.model,
       "--permission-mode", permissionPolicy === "auto" ? "auto" : "ask"
     ]),
     workspace,
@@ -131,6 +153,8 @@ export async function runTuiSubject(options) {
     initialMessage,
     permissionPolicy,
     interactions,
+    storeLayoutVersion: STORE_LAYOUT_VERSION,
+    eventStreamTimeoutMs,
     budget
   };
   await writeJson(configPath, config, redactor);
@@ -154,18 +178,5 @@ export async function runTuiSubject(options) {
       // Keep looking for the final JSON result.
     }
   }
-  const settledStatus = {
-    "run.completed": "completed",
-    "run.suspended": "needs_input",
-    "run.cancelled": "cancelled",
-    "run.failed": "error"
-  }[summary?.settledTerminalType];
-  return {
-    ...result,
-    ...(summary ?? {}),
-    durationMs: summary?.durationMs ?? Date.now() - startedAt,
-    cancellation: summary?.cancellation,
-    result: settledStatus ? { status: settledStatus, finishReason: summary.settledTerminalType } : undefined,
-    events: []
-  };
+  return tuiRunResult(result, summary, startedAt);
 }

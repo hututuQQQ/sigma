@@ -14,8 +14,8 @@ const BUDGET_KEYS = [
 
 function allocation(session: RuntimeSession, requested: Partial<BudgetLimits> = {}): BudgetLimits {
   const value = Object.fromEntries(BUDGET_KEYS.map((key) => {
-    const remaining = Math.max(0, session.state.budget.limits[key]
-      - session.state.budget.consumed[key] - session.state.budget.reserved[key]);
+    const remaining = Math.max(0, session.durable.state.budget.limits[key]
+      - session.durable.state.budget.consumed[key] - session.durable.state.budget.reserved[key]);
     const defaultMaximum = key === "children" ? Math.max(0, remaining - 1) : remaining;
     const amount = requested[key] ?? Math.min(DEFAULT_CHILD_BUDGET[key], defaultMaximum);
     if (!Number.isSafeInteger(amount) || amount < 0) {
@@ -23,7 +23,7 @@ function allocation(session: RuntimeSession, requested: Partial<BudgetLimits> = 
     }
     return [key, amount];
   })) as unknown as Omit<BudgetLimits, "maxDepth">;
-  const availableDepth = Math.max(0, session.state.budget.limits.maxDepth - 1);
+  const availableDepth = Math.max(0, session.durable.state.budget.limits.maxDepth - 1);
   const maxDepth = requested.maxDepth ?? Math.min(DEFAULT_CHILD_BUDGET.maxDepth, availableDepth);
   if (!Number.isSafeInteger(maxDepth) || maxDepth < 0 || maxDepth > availableDepth) {
     throw new Error(`Child maxDepth must be between 0 and ${availableDepth}.`);
@@ -60,7 +60,7 @@ export class ChildBudgetControl {
     childId: string,
     reported: Partial<BudgetAmounts> = {}
   ): Promise<void> {
-    const reservation = session.state.budget.reservations.find((item) =>
+    const reservation = session.durable.state.budget.reservations.find((item) =>
       item.ownerId === `child:${childId}` && item.status === "reserved");
     if (!reservation) return;
     const consumed = Object.fromEntries(BUDGET_KEYS.map((key) => {
@@ -72,7 +72,7 @@ export class ChildBudgetControl {
   }
 
   async release(session: RuntimeSession, childId: string): Promise<void> {
-    const reservation = session.state.budget.reservations.find((item) =>
+    const reservation = session.durable.state.budget.reservations.find((item) =>
       item.ownerId === `child:${childId}` && item.status === "reserved");
     if (reservation) await this.budgets.release(session, reservation.reservationId);
   }

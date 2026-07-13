@@ -8,11 +8,11 @@ const MUTATION_KINDS = new Set(["workspace_delta", "validation", "review", "user
  * has not yet passed through the reducer (useful at emitter/test boundaries). */
 export function sessionMutationEvidence(session: RuntimeSession): EvidenceRecord[] {
   const byId = new Map<string, EvidenceRecord>();
-  for (const item of session.state.mutationEvidence) {
-    if (item.sessionId === session.sessionId) byId.set(item.evidenceId, item);
+  for (const item of session.durable.state.mutationEvidence) {
+    if (item.sessionId === session.identity.sessionId) byId.set(item.evidenceId, item);
   }
-  for (const item of session.state.evidence) {
-    if (item.sessionId === session.sessionId && MUTATION_KINDS.has(item.kind)) {
+  for (const item of session.durable.state.evidence) {
+    if (item.sessionId === session.identity.sessionId && MUTATION_KINDS.has(item.kind)) {
       byId.set(item.evidenceId, item);
     }
   }

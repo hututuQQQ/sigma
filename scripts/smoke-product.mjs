@@ -5,13 +5,14 @@ import path from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  createSmokeReviewer,
+  createSmokeExecutionBroker,
   fakeFinalTurn,
   fakeToolCall,
   fakeToolTurn,
-  fakeValidationTurn,
-  registerSmokeValidator,
-  SmokeFakeGateway
+  fakeProcessValidationTurn,
+  fakeReviewerTurn,
+  SmokeFakeGateway,
+  smokeRuntimeConfig
 } from "./smoke-fake-model.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,11 +46,9 @@ async function main() {
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
   if (missing.length) throw new Error(`Built product is missing:\n${missing.join("\n")}`);
-  const [{ runAgentCommand }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all([
+  const [{ runAgentCommand }, { createConfiguredRuntime }] = await Promise.all([
     import(pathToFileURL(entries[0]).href),
-    import(pathToFileURL(entries[1]).href),
-    import(pathToFileURL(entries[2]).href),
-    import(pathToFileURL(entries[3]).href)
+    import(pathToFileURL(entries[1]).href)
   ]);
 
   await rm(artifactsDir, { recursive: true, force: true });
@@ -57,20 +56,20 @@ async function main() {
   const initialized = await captureProcessWrites(() => runAgentCommand(["init", "--workspace", workspace, "--permission-mode", "auto"]));
   if (initialized.code !== 0) throw new Error(`init failed: ${initialized.stderr}`);
 
-  const storeRootDir = runtimeStateRoot(workspace);
-  const runtime = createRuntime({
-    gateway: new SmokeFakeGateway([
+  const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
-      fakeValidationTurn("validate-smoke", [{ path: "hello.txt", expected: "hello world" }]),
+      fakeProcessValidationTurn("validate-smoke", "hello.txt", "hello world"),
+      fakeReviewerTurn(),
       fakeFinalTurn("Product smoke completed.")
-    ]),
-    store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
-    storeRootDir,
-    tools: registerSmokeValidator(registerBuiltinTools(new EffectToolRegistry())),
-    reviewer: createSmokeReviewer(),
-    permissionMode: "auto",
-    runDeadlineMs: 30_000
+    ]);
+  const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {
+    gatewayFactory: () => gateway,
+    stateRootDir: path.join(artifactsDir, "private-state", "runtime"),
+    executionBroker: createSmokeExecutionBroker()
+  }, {
+    connectMcp: false
   });
+  const runtime = composition.runtime;
   const session = await runtime.createSession({ workspacePath: workspace, mode: "change", title: "product smoke" });
   await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Create hello.txt", mode: "change" });
   const outcome = await runtime.waitForOutcome(session.sessionId);
@@ -97,6 +96,7 @@ async function main() {
     sessions: sessionReport.sessions.length
   };
   await writeFile(path.join(artifactsDir, "product-smoke.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  await composition.close();
   process.stdout.write(`PASS product smoke session=${session.sessionId}\n`);
 }
 

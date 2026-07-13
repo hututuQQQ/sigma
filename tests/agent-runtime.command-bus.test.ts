@@ -9,7 +9,7 @@ import {
   activeSessionOwner,
   sendSessionCommand,
   type ExternalSessionCommand
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 import { acquireProcessOwnerLease } from "../packages/agent-platform/src/index.js";
 import { sessionDirectory } from "../packages/agent-store/src/index.js";
 

@@ -17,6 +17,7 @@ import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages
 import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
 import { unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 const now = "2026-01-01T00:00:00.000Z";
 
@@ -147,30 +148,7 @@ function session(evidence: EvidenceRecord[]): RuntimeSession {
   });
   state.receipts = [receipt()];
   state.evidence = [proofEvidence(), ...evidence];
-  return {
-    sessionId: "session",
-    runId: "run",
-    modelTurn: 0,
-    workspacePath: ".",
-    mode: "change",
-    writeScope: [],
-    strictWriteScope: false,
-    state,
-    seq: 1,
-    controller: null,
-    turnController: null,
-    deadlineTimer: null,
-    running: null,
-    subscribers: new Set(),
-    approvals: new Map(),
-    alwaysAllowedEffects: new Set(),
-    steeringPending: 0,
-    followUps: [],
-    contextItems: [],
-    loadedContextIds: new Set(),
-    outcomeWaiters: [],
-    idleWaiters: []
-  };
+  return runtimeSessionFixture({ state, seq: 1 });
 }
 
 const completionDescriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
@@ -284,30 +262,30 @@ describe("run-scoped completion evidence", () => {
 
   it("clears evidence, waiver, receipts, and checkpoint head at a follow-up run boundary", () => {
     const active = session([waiver("waiver"), delta("delta")]);
-    active.state.checkpointHead = {
+    active.durable.state.checkpointHead = {
       checkpointId: "checkpoint", sessionId: "session", runId: "run", status: "sealed", createdAt: now,
       sealedAt: now, preManifestDigest: "a", postManifestDigest: "b"
     };
     beginNextRun(active, "change", 60_000);
-    expect(active.runId).not.toBe("run");
-    expect(active.state.evidence).toEqual([]);
-    expect(active.state.receipts).toEqual([]);
-    expect(active.state.checkpointHead).toBeUndefined();
+    expect(active.durable.runId).not.toBe("run");
+    expect(active.durable.state.evidence).toEqual([]);
+    expect(active.durable.state.receipts).toEqual([]);
+    expect(active.durable.state.checkpointHead).toBeUndefined();
   });
 
   it("retains unresolved mutation obligations across a follow-up run", () => {
     const changed = delta("old-delta", "src/pending.ts", "run");
     const active = session([changed]);
-    active.state.mutationEvidence = [changed];
+    active.durable.state.mutationEvidence = [changed];
     beginNextRun(active, "change", 60_000);
-    active.state.evidence = [{ ...proofEvidence(), runId: active.runId }];
+    active.durable.state.evidence = [{ ...proofEvidence(), runId: active.durable.runId }];
     expect(unresolvedWorkspaceDeltas(active).map((item) => item.evidenceId)).toEqual(["old-delta"]);
     expect(completionFailure(active, completionCall, completionDescriptor, now)?.diagnostics[0])
       .toBe("validation_evidence_required");
 
-    const checked = validation("follow-up-validation", [changed.evidenceId], active.runId);
-    const approved = review("follow-up-review", [changed.evidenceId], active.runId);
-    active.state.evidence.push(checked, approved);
+    const checked = validation("follow-up-validation", [changed.evidenceId], active.durable.runId);
+    const approved = review("follow-up-review", [changed.evidenceId], active.durable.runId);
+    active.durable.state.evidence.push(checked, approved);
     expect(unresolvedWorkspaceDeltas(active)).toEqual([]);
     expect(completionFailure(active, completionCall, completionDescriptor, now)).toBeNull();
   });
@@ -316,10 +294,10 @@ describe("run-scoped completion evidence", () => {
     const original = delta("original");
     const repair = delta("repair", "src/code.ts", "repair-run");
     const active = session([repair, validation("repair-validation", ["repair"], "repair-run")]);
-    active.runId = "repair-run";
-    active.state.runId = "repair-run";
-    active.state.evidence[0] = { ...proofEvidence(), runId: "repair-run" };
-    active.state.mutationEvidence = [
+    active.durable.runId = "repair-run";
+    active.durable.state.runId = "repair-run";
+    active.durable.state.evidence[0] = { ...proofEvidence(), runId: "repair-run" };
+    active.durable.state.mutationEvidence = [
       original,
       validation("original-validation", ["original"]),
       failedReview("requested-changes", ["original"])
@@ -331,7 +309,7 @@ describe("run-scoped completion evidence", () => {
         return review("approved", reviewedIds, input.runId) as ReviewEvidence;
       }
     }, async (_session, type, _authority, value) => {
-      if (type === "review.completed") active.state.evidence.push(value as ReviewEvidence);
+      if (type === "review.completed") active.durable.state.evidence.push(value as ReviewEvidence);
       return {} as AgentEventEnvelope;
     });
     await coordinator.maybeReview(active, new AbortController().signal);
@@ -345,7 +323,7 @@ describe("run-scoped completion evidence", () => {
     let selectedSessionId: string | undefined;
     let seq = 1;
     const coordinator = new ReviewCoordinator((runtimeSession) => {
-      selectedSessionId = runtimeSession.sessionId;
+      selectedSessionId = runtimeSession.identity.sessionId;
       return {
         review: async () => review("forged-review", ["unrelated-delta"], "old-run") as ReviewEvidence
       };
@@ -355,8 +333,8 @@ describe("run-scoped completion evidence", () => {
         schemaVersion: 3,
         seq: ++seq,
         eventId: `event-${seq}`,
-        sessionId: runtimeSession.sessionId,
-        runId: runtimeSession.runId,
+        sessionId: runtimeSession.identity.sessionId,
+        runId: runtimeSession.durable.runId,
         occurredAt: now,
         type,
         authority,
@@ -390,13 +368,13 @@ describe("run-scoped completion evidence", () => {
           : review("second-review", input.workspaceDeltas.map((item) => item.evidenceId)) as ReviewEvidence;
       }
     }, async (runtimeSession, type, authority, value) => {
-      if (type === "review.completed") active.state.evidence.push(value as ReviewEvidence);
+      if (type === "review.completed") active.durable.state.evidence.push(value as ReviewEvidence);
       return {
         schemaVersion: 3,
         seq: ++seq,
         eventId: `event-${seq}`,
-        sessionId: runtimeSession.sessionId,
-        runId: runtimeSession.runId,
+        sessionId: runtimeSession.identity.sessionId,
+        runId: runtimeSession.durable.runId,
         occurredAt: now,
         type,
         authority,
@@ -407,17 +385,17 @@ describe("run-scoped completion evidence", () => {
     await coordinator.maybeReview(active, new AbortController().signal);
     await coordinator.maybeReview(active, new AbortController().signal);
     expect(reviewCalls).toBe(1);
-    expect((active.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
+    expect((active.durable.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
       .toEqual([initialValidation.evidenceId]);
 
     const strongerValidation = validation("stronger-validation", [changed.evidenceId]);
-    active.state.evidence.push(strongerValidation);
+    active.durable.state.evidence.push(strongerValidation);
     await coordinator.maybeReview(active, new AbortController().signal);
     await coordinator.maybeReview(active, new AbortController().signal);
 
     expect(reviewCalls).toBe(2);
-    expect((active.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
+    expect((active.durable.state.evidence.at(-1) as ReviewEvidence).data.validationEvidenceIds)
       .toEqual([initialValidation.evidenceId, strongerValidation.evidenceId]);
-    expect((active.state.evidence.at(-1) as ReviewEvidence).status).toBe("passed");
+    expect((active.durable.state.evidence.at(-1) as ReviewEvidence).status).toBe("passed");
   });
 });

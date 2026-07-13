@@ -37,6 +37,18 @@ function serverReadRoots(preset: LanguageServerPreset, workspacePath: string, ex
   return [...new Set(roots.map((root) => path.resolve(root)))];
 }
 
+export function lspSandboxEnvironmentOverrides(
+  readRoots: string[],
+  platform: NodeJS.Platform = process.platform
+): Record<string, string> {
+  // The POSIX sandbox creates a private writable /tmp. A host TMPDIR can point
+  // outside the mounted namespace, which prevents language servers from starting.
+  return {
+    SIGMA_LSP_READ_ROOTS: JSON.stringify(readRoots),
+    ...(platform === "win32" ? {} : { TMPDIR: "/tmp" })
+  };
+}
+
 /** A read-only, offline LSP stdio transport owned exclusively by sigma-exec. */
 export class BrokerLspTransport implements LspTransport {
   private readonly broker: ExecutionBroker;
@@ -139,7 +151,7 @@ export class BrokerLspTransport implements LspTransport {
         executable: this.preset.executable,
         args: this.preset.args,
         cwd: this.workspacePath,
-        environment: { overrides: { SIGMA_LSP_READ_ROOTS: JSON.stringify(this.readRoots) } }
+        environment: { overrides: lspSandboxEnvironmentOverrides(this.readRoots) }
       },
       policy,
       maxOutputBytes: 64 * 1024 * 1024,

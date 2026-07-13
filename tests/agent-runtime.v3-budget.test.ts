@@ -13,6 +13,7 @@ import {
 } from "../packages/agent-runtime/src/budget-controller.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 import { describe, expect, it } from "vitest";
 
 function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
@@ -29,11 +30,9 @@ function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
 }
 
 function session(value: BudgetLimits): RuntimeSession {
-  return {
-    sessionId: "session",
-    runId: "run",
-    state: { budget: createBudgetLedger(value), evidence: [] }
-  } as unknown as RuntimeSession;
+  const target = runtimeSessionFixture();
+  target.durable.state.budget = createBudgetLedger(value);
+  return target;
 }
 
 function event(): AgentEventEnvelope {
@@ -43,7 +42,7 @@ function event(): AgentEventEnvelope {
 function controller(target: RuntimeSession): BudgetController {
   return new BudgetController(async (_session, type, _authority, value) => {
     if (type !== "budget.exhausted") {
-      target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+      target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
     }
     return event();
   });
@@ -56,7 +55,7 @@ describe("V3 shared budget ledger", () => {
     const budgets = new BudgetController(async (_session, type, _authority, value) => {
       events.push(type);
       if (type === "budget.reserved" || type === "budget.committed") {
-        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+        target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
       }
       return event();
     });
@@ -68,9 +67,9 @@ describe("V3 shared budget ledger", () => {
     })).resolves.toMatchObject({
       overReservation: { inputTokens: 10, costMicroUsd: 10 }, overLimit: {}
     });
-    expect(target.state.budget.consumed.inputTokens).toBe(130);
-    expect(target.state.budget.consumed.costMicroUsd).toBe(130);
-    expect(target.state.budget.reserved.inputTokens).toBe(0);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(130);
+    expect(target.durable.state.budget.consumed.costMicroUsd).toBe(130);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
     expect(events).toEqual(["budget.reserved", "budget.committed"]);
   });
 
@@ -79,7 +78,7 @@ describe("V3 shared budget ledger", () => {
     const overruns: unknown[] = [];
     const budgets = new BudgetController(async (_session, type, _authority, value) => {
       if (type === "budget.committed" || type === "budget.reserved") {
-        target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+        target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
       } else if (type === "budget.overrun") overruns.push(value);
       return event();
     });
@@ -95,17 +94,17 @@ describe("V3 shared budget ledger", () => {
 
   it("allows only an explicit additive user budget increase without resetting usage", async () => {
     const target = session(limits({ inputTokens: 100, maxDepth: 2 }));
-    target.state.budget.consumed.inputTokens = 25;
+    target.durable.state.budget.consumed.inputTokens = 25;
     const authorities: string[] = [];
     const budgets = new BudgetController(async (_session, type, authority, value) => {
       authorities.push(`${type}:${authority}`);
-      target.state.budget = (value as { ledger: RuntimeSession["state"]["budget"] }).ledger;
+      target.durable.state.budget = (value as { ledger: RuntimeSession["durable"]["state"]["budget"] }).ledger;
       return event();
     });
 
     await expect(budgets.increaseLimits(target, { inputTokens: 50, maxDepth: 1 }))
       .resolves.toMatchObject({ inputTokens: 150, maxDepth: 3 });
-    expect(target.state.budget.consumed.inputTokens).toBe(25);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(25);
     expect(authorities).toEqual(["budget.limit_increased:user"]);
     await expect(budgets.increaseLimits(target, {})).rejects.toThrow(/at least one/iu);
     await expect(budgets.increaseLimits(target, { toolCalls: -1 })).rejects.toThrow("non-negative");
@@ -119,13 +118,13 @@ describe("V3 shared budget ledger", () => {
     const settled = await Promise.allSettled(requests);
     const reservations = settled.filter((item): item is PromiseFulfilledResult<string> => item.status === "fulfilled");
     expect(reservations).toHaveLength(58);
-    expect(target.state.budget.reserved.inputTokens).toBe(986);
-    expect(target.state.budget.consumed.inputTokens).toBe(0);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(986);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(0);
     expect(settled.filter((item) => item.status === "rejected").every((item) =>
       item.status === "rejected" && item.reason instanceof BudgetExceededError)).toBe(true);
     await Promise.all(reservations.map(async (item) => await budgets.release(target, item.value)));
-    expect(target.state.budget.reserved.inputTokens).toBe(0);
-    expect(target.state.budget.consumed.inputTokens).toBe(0);
+    expect(target.durable.state.budget.reserved.inputTokens).toBe(0);
+    expect(target.durable.state.budget.consumed.inputTokens).toBe(0);
   });
 
   it("settles an interrupted model reservation conservatively and only once", async () => {
@@ -143,13 +142,13 @@ describe("V3 shared budget ledger", () => {
       costMicroUsd: 900,
       modelTurns: 2
     });
-    const afterFirst = structuredClone(target.state.budget);
+    const afterFirst = structuredClone(target.durable.state.budget);
     await expect(budgets.settleInterruptedModel(target, "run:7")).resolves.toEqual(
       afterFirst.reservations[0]?.consumed
     );
-    expect(target.state.budget).toEqual(afterFirst);
-    expect(target.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0 });
-    expect(target.state.budget.consumed).toMatchObject({
+    expect(target.durable.state.budget).toEqual(afterFirst);
+    expect(target.durable.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0 });
+    expect(target.durable.state.budget.consumed).toMatchObject({
       inputTokens: 120,
       outputTokens: 40,
       costMicroUsd: 900,
@@ -177,7 +176,7 @@ describe("V3 shared budget ledger", () => {
       maxDepth: 2
     });
     expect(allocation.maxDepth).toBe(2);
-    expect(target.state.budget.reserved).toMatchObject({ inputTokens: 100, outputTokens: 80, children: 3 });
+    expect(target.durable.state.budget.reserved).toMatchObject({ inputTokens: 100, outputTokens: 80, children: 3 });
     await control.settleChildBudget(target, "child", {
       inputTokens: 40,
       outputTokens: 7,
@@ -186,8 +185,8 @@ describe("V3 shared budget ledger", () => {
       toolCalls: 8,
       children: 1
     });
-    expect(target.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, children: 0 });
-    expect(target.state.budget.consumed).toMatchObject({
+    expect(target.durable.state.budget.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0, children: 0 });
+    expect(target.durable.state.budget.consumed).toMatchObject({
       inputTokens: 40, outputTokens: 7, costMicroUsd: 50, modelTurns: 3, toolCalls: 8, children: 2
     });
   });
@@ -202,7 +201,7 @@ describe("V3 shared budget ledger", () => {
       children: 4,
       maxDepth: 3
     }));
-    target.state.budget.consumed.inputTokens = 100_000;
+    target.durable.state.budget.consumed.inputTokens = 100_000;
     const budgets = controller(target);
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-budget-descendant-"));
     const control = new RuntimeControlService({
@@ -219,12 +218,12 @@ describe("V3 shared budget ledger", () => {
       children: 3,
       maxDepth: 2
     });
-    expect(target.state.budget.reserved.children).toBe(4);
+    expect(target.durable.state.budget.reserved.children).toBe(4);
   });
 
   it("enforces optimistic plan revisions under concurrent updates", async () => {
     const target = session(limits());
-    target.state.plan = {
+    target.durable.state.plan = {
       revision: 1,
       goal: "initial",
       activeNodeId: "root",
@@ -240,14 +239,14 @@ describe("V3 shared budget ledger", () => {
       emit: async (_session, type, _authority, value) => {
         if (type === "plan.updated") {
           await new Promise((resolve) => setTimeout(resolve, 2));
-          target.state.plan = structuredClone((value as { plan: RuntimeSession["state"]["plan"] }).plan);
+          target.durable.state.plan = structuredClone((value as { plan: RuntimeSession["durable"]["state"]["plan"] }).plan);
         }
         return event();
       },
       createArtifact: async () => "artifact"
     });
     const port = control.forSession(target);
-    const proposed = (goal: string) => ({ ...target.state.plan, revision: 2, goal });
+    const proposed = (goal: string) => ({ ...target.durable.state.plan, revision: 2, goal });
     const results = await Promise.allSettled([
       port.updatePlan({ expectedRevision: 1, plan: proposed("left") }),
       port.updatePlan({ expectedRevision: 1, plan: proposed("right") })
@@ -255,6 +254,6 @@ describe("V3 shared budget ledger", () => {
     expect(results.filter((item) => item.status === "fulfilled")).toHaveLength(1);
     const rejected = results.find((item): item is PromiseRejectedResult => item.status === "rejected");
     expect(rejected?.reason).toMatchObject({ code: "plan_revision_conflict" });
-    expect(target.state.plan.revision).toBe(2);
+    expect(target.durable.state.plan.revision).toBe(2);
   });
 });

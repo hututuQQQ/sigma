@@ -5,13 +5,14 @@ import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  createSmokeReviewer,
+  createSmokeExecutionBroker,
   fakeFinalTurn,
+  fakeProcessValidationTurn,
+  fakeReviewerTurn,
   fakeToolCall,
   fakeToolTurn,
-  fakeValidationTurn,
-  registerSmokeValidator,
-  SmokeFakeGateway
+  SmokeFakeGateway,
+  smokeRuntimeConfig
 } from "./smoke-fake-model.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -44,23 +45,26 @@ async function main() {
     .map((name) => path.join(rootDir, "packages", name, "dist", "index.js"));
   const missing = entries.filter((entry) => !existsSync(entry));
   if (missing.length) throw new Error(`Built TUI product is missing:\n${missing.join("\n")}`);
-  const [{ runTuiApp }, { createRuntime, runtimeStateRoot }, { SegmentedJsonlStore }, { EffectToolRegistry, registerBuiltinTools }] = await Promise.all(entries.map((entry) => import(pathToFileURL(entry).href)));
+  const [{ runTuiApp }, { createConfiguredRuntime }] = await Promise.all([
+    import(pathToFileURL(entries[0]).href),
+    import(pathToFileURL(entries[1]).href)
+  ]);
   await rm(artifactsDir, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
-  const storeRootDir = runtimeStateRoot(workspace);
-  const runtime = createRuntime({
-    gateway: new SmokeFakeGateway([
+  const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
-      fakeValidationTurn("validate-smoke", [{ path: "hello.txt", expected: "hello world" }]),
+      fakeProcessValidationTurn("validate-smoke", "hello.txt", "hello world"),
+      fakeReviewerTurn(),
       fakeFinalTurn("TUI smoke completed.")
-    ]),
-    store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
-    storeRootDir,
-    tools: registerSmokeValidator(registerBuiltinTools(new EffectToolRegistry())),
-    reviewer: createSmokeReviewer(),
-    permissionMode: "auto",
-    runDeadlineMs: 30_000
+    ]);
+  const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {
+    gatewayFactory: () => gateway,
+    stateRootDir: path.join(artifactsDir, "private-state", "runtime"),
+    executionBroker: createSmokeExecutionBroker()
+  }, {
+    connectMcp: false
   });
+  const runtime = composition.runtime;
   const stdin = new FakeInput();
   const stdout = new FakeOutput();
   const running = runTuiApp({ runtime, workspace, stdin, stdout, maxFps: 30 });
@@ -90,6 +94,7 @@ async function main() {
     checks: { alternateScreen: true, cursorLifecycle: true, rawModeLifecycle: true, runCompleted: latest?.status === "completed", resize: true }
   };
   await writeFile(path.join(artifactsDir, "tui-smoke.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  await composition.close();
   process.stdout.write("PASS TUI product smoke\n");
 }
 

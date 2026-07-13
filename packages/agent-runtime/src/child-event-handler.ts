@@ -49,13 +49,13 @@ export async function finalizeChildCompletion(
   const planNodeIds = strings(metadata.planNodeIds);
   const outcome = childOutcome(detail);
   const recoveryReason = typeof detail.error === "string" && detail.error ? detail.error : undefined;
-  const evidenceId = childOutcomeEvidenceId(session.runId, childId);
-  let evidence = session.state.evidence.find((item) => item.evidenceId === evidenceId);
+  const evidenceId = childOutcomeEvidenceId(session.durable.runId, childId);
+  let evidence = session.durable.state.evidence.find((item) => item.evidenceId === evidenceId);
   if (!evidence) {
     evidence = {
       evidenceId,
-      sessionId: session.sessionId,
-      runId: session.runId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
       kind: "child_outcome",
       status: outcome === "completed" ? "passed" : "failed",
       createdAt: new Date().toISOString(),
@@ -85,7 +85,11 @@ export async function handleChildEvent(
   emit: RuntimeEventEmitter
 ): Promise<void> {
   const envelope = object(payload);
-  await emit(session, type, "runtime", envelope);
+  const childId = envelope.childId;
+  if (typeof childId !== "string" || childId.length === 0 || !Object.hasOwn(envelope, "payload")) {
+    throw new Error(`Invalid ${type} supervisor event envelope.`);
+  }
+  await emit(session, type, "runtime", { childId, payload: envelope.payload! });
   if (type !== "child.completed") return;
   await finalizeChildCompletion(session, envelope, control, emit);
 }

@@ -17,6 +17,84 @@ export function fakeValidationTurn(id, checks) {
   return fakeToolTurn([fakeToolCall(id, "verify_smoke_files", { checks })]);
 }
 
+export function fakeProcessValidationTurn(id, relativePath, expected) {
+  return (request) => {
+    const delta = currentRunEvidence(request).findLast((item) => item.kind === "workspace_delta");
+    if (!delta) throw new Error("The smoke validator requires current-run workspace delta evidence.");
+    return fakeToolTurn([fakeToolCall(id, "validate", {
+      executable: "sigma-smoke-validate",
+      args: [relativePath, expected],
+      access: "readonly",
+      workspaceDeltaEvidenceIds: [delta.evidenceId]
+    })]);
+  };
+}
+
+export function fakeReviewerTurn() {
+  return {
+    message: { role: "assistant", content: JSON.stringify({ verdict: "approved", findings: [] }) },
+    finishReason: "stop",
+    inputTokens: 1,
+    outputTokens: 1
+  };
+}
+
+export function smokeRuntimeConfig(workspace) {
+  return {
+    workspace,
+    provider: "deepseek",
+    model: "smoke-fake-model",
+    permissionMode: "auto",
+    runDeadlineSec: 30,
+    modelDeadlineSec: 10,
+    streamIdleSec: 5,
+    maxParallelTools: 4,
+    maxParallelAgents: 1,
+    mcpServers: [],
+    mcpSource: "none",
+    sandboxMode: "required",
+    networkMode: "none"
+  };
+}
+
+export function createSmokeExecutionBroker() {
+  const report = {
+    protocolVersion: 1,
+    brokerVersion: "smoke",
+    platform: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
+    architecture: process.arch,
+    sandbox: { available: true, backend: "smoke", selfTestPassed: true, setupRequired: false },
+    capabilities: {
+      foreground: true, background: false, stdin: false, pty: false, networkModes: ["none"], shells: []
+    }
+  };
+  const exited = (ok, output) => ({
+    state: "exited", exitCode: ok ? 0 : 1, signal: null, durationMs: 1,
+    timedOut: false, idleTimedOut: false, cancelled: false,
+    stdout: ok ? output : "", stderr: ok ? "" : output,
+    stdoutDroppedBytes: 0, stderrDroppedBytes: 0, outputTruncated: false
+  });
+  return {
+    lostProcessHandles: [],
+    connect: async () => report,
+    doctor: async () => report,
+    execute: async (input) => {
+      const [relativePath, expected] = input.command.args;
+      try {
+        const actual = await readFile(path.resolve(input.command.cwd, relativePath), "utf8");
+        return exited(actual === expected, actual === expected ? "validation passed" : "content mismatch");
+      } catch (error) {
+        return exited(false, error instanceof Error ? error.message : String(error));
+      }
+    },
+    spawn: async () => { throw new Error("Smoke broker does not support background processes."); },
+    poll: async () => { throw new Error("Smoke broker has no background processes."); },
+    write: async () => { throw new Error("Smoke broker has no background processes."); },
+    terminate: async () => { throw new Error("Smoke broker has no background processes."); },
+    close: async () => undefined
+  };
+}
+
 export function registerSmokeValidator(registry) {
   registry.register({
     descriptor: {

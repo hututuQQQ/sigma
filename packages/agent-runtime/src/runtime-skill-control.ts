@@ -25,13 +25,13 @@ export class RuntimeSkillControl {
 
   async loadSkill(session: RuntimeSession, qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }> {
     assertSkillAllowed(session, qualifiedName);
-    const previouslyLoaded = session.state.frozenSkills.find((item) => item.qualifiedName === qualifiedName);
+    const previouslyLoaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === qualifiedName);
     const skill = await this.resolveSessionSkill(session, qualifiedName, previouslyLoaded);
     const artifactId = previouslyLoaded?.artifactId
-      ?? await this.options.createArtifact(session.sessionId, skill.instructions);
-    const manifest = previouslyLoaded ? undefined : await this.freezeManifest(session.sessionId, skill);
+      ?? await this.options.createArtifact(session.identity.sessionId, skill.instructions);
+    const manifest = previouslyLoaded ? undefined : await this.freezeManifest(session.identity.sessionId, skill);
     const manifestArtifactId = manifest
-      ? await this.options.createArtifact(session.sessionId, manifest.canonicalJson)
+      ? await this.options.createArtifact(session.identity.sessionId, manifest.canonicalJson)
       : undefined;
     if (manifest && manifestArtifactId !== manifest.digest) {
       throw new Error("Skill execution manifest store returned a non-content-addressed identifier.");
@@ -57,9 +57,9 @@ export class RuntimeSkillControl {
     session: RuntimeSession,
     input: { qualifiedName: string; relativePath: string; purpose: "plan" | "execute" }
   ): Promise<LoadedSkillResourceAccess> {
-    const frozen = session.frozenCustomization?.skills.find((item) => item.qualifiedName === input.qualifiedName);
+    const frozen = session.durable.frozenCustomization?.skills.find((item) => item.qualifiedName === input.qualifiedName);
     if (!frozen) return fail(`Skill '${input.qualifiedName}' is not frozen in this session.`, "skill_unknown");
-    const loaded = session.state.frozenSkills.find((item) => item.qualifiedName === input.qualifiedName);
+    const loaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === input.qualifiedName);
     if (!loaded) return fail(
       `Skill '${input.qualifiedName}' must be loaded with load_skill before executing resources.`,
       "skill_not_loaded"
@@ -70,7 +70,7 @@ export class RuntimeSkillControl {
     if (!loaded.executionManifestArtifactId || !loaded.executionManifestDigest) {
       return fail(`Skill '${input.qualifiedName}' has no frozen execution-resource manifest.`, "skill_execution_unavailable");
     }
-    const artifact = await this.options.readArtifact(session.sessionId, loaded.executionManifestArtifactId);
+    const artifact = await this.options.readArtifact(session.identity.sessionId, loaded.executionManifestArtifactId);
     const manifest = restoreSkillExecutionManifest(artifact, loaded.executionManifestDigest);
     if (manifest.qualifiedName !== frozen.qualifiedName || manifest.skillDigest !== frozen.digest
       || manifest.source !== frozen.source) {
@@ -85,10 +85,10 @@ export class RuntimeSkillControl {
       "Frozen skill resource materialization is unavailable.",
       "skill_execution_unavailable"
     );
-    const planned = this.options.skillMaterializer.plannedAccess(session.sessionId, manifest, relativePath);
-    assertExternalRoot(session.workspacePath, planned.readRoot);
+    const planned = this.options.skillMaterializer.plannedAccess(session.identity.sessionId, manifest, relativePath);
+    assertExternalRoot(session.identity.workspacePath, planned.readRoot);
     return input.purpose === "execute"
-      ? await this.options.skillMaterializer.materialize(session.sessionId, manifest, relativePath)
+      ? await this.options.skillMaterializer.materialize(session.identity.sessionId, manifest, relativePath)
       : planned;
   }
 
@@ -113,15 +113,15 @@ export class RuntimeSkillControl {
   private async resolveSessionSkill(
     session: RuntimeSession,
     qualifiedName: string,
-    previouslyLoaded: RuntimeSession["state"]["frozenSkills"][number] | undefined
+    previouslyLoaded: RuntimeSession["durable"]["state"]["frozenSkills"][number] | undefined
   ): Promise<{ qualifiedName: string; instructions: string; digest: string; source: "home" | "workspace" }> {
-    const frozen = session.frozenCustomization?.skills.find((item) => item.qualifiedName === qualifiedName);
+    const frozen = session.durable.frozenCustomization?.skills.find((item) => item.qualifiedName === qualifiedName);
     if (frozen) return { ...frozen };
-    if (session.frozenCustomization) return fail(`Unknown frozen skill '${qualifiedName}'.`, "skill_unknown");
+    if (session.durable.frozenCustomization) return fail(`Unknown frozen skill '${qualifiedName}'.`, "skill_unknown");
     if (previouslyLoaded) {
       return {
         qualifiedName,
-        instructions: await this.options.readArtifact(session.sessionId, previouslyLoaded.artifactId),
+        instructions: await this.options.readArtifact(session.identity.sessionId, previouslyLoaded.artifactId),
         digest: previouslyLoaded.digest,
         source: previouslyLoaded.source === "home" ? "home" : "workspace"
       };
@@ -133,7 +133,7 @@ export class RuntimeSkillControl {
 }
 
 function assertSkillAllowed(session: RuntimeSession, qualifiedName: string): void {
-  if (!session.profile || session.profile.profile.skills.includes(qualifiedName)) return;
+  if (!session.services.profile || session.services.profile.profile.skills.includes(qualifiedName)) return;
   fail(`Skill '${qualifiedName}' is not allowed by the frozen Agent Profile.`, "profile_denied");
 }
 
@@ -144,8 +144,8 @@ function skillEvidence(
 ): EvidenceRecord {
   return {
     evidenceId: randomUUID(),
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     kind: "diagnostic",
     status: "informational",
     createdAt: new Date().toISOString(),

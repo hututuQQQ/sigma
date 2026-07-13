@@ -7,6 +7,7 @@ import {
   BrokerLspTransport,
   discoverLanguageServers,
   encodeLspMessage,
+  lspSandboxEnvironmentOverrides,
   LspClient,
   LspFrameDecoder,
   type LspTransport
@@ -373,6 +374,17 @@ describe("agent-code-intel", () => {
       path.resolve(workspace), path.dirname(process.execPath)
     ]));
     await client.close();
+  });
+
+  it("uses the writable in-sandbox temp directory on POSIX", () => {
+    const readRoots = [path.resolve("workspace"), path.resolve("runtime")];
+    expect(lspSandboxEnvironmentOverrides(readRoots, "linux")).toEqual({
+      SIGMA_LSP_READ_ROOTS: JSON.stringify(readRoots),
+      TMPDIR: "/tmp"
+    });
+    expect(lspSandboxEnvironmentOverrides(readRoots, "win32")).toEqual({
+      SIGMA_LSP_READ_ROOTS: JSON.stringify(readRoots)
+    });
   });
 
   it("retries a transient first language-server spawn failure", async () => {

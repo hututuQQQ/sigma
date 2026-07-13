@@ -185,10 +185,28 @@ def long_path(value: Path) -> str:
 
 
 class EventTail:
-    def __init__(self, state_home: Path, workspace: Path) -> None:
-        self.sessions_root = state_home / "workspaces" / workspace_digest(workspace) / "stores" / "v3" / "sessions"
+    def __init__(self, state_home: Path, workspace: Path, store_layout_version: int) -> None:
+        self.store_layout_version = store_layout_version
+        self.stores_root = state_home / "workspaces" / workspace_digest(workspace) / "stores"
+        self.sessions_root = self.stores_root / f"v{store_layout_version}" / "sessions"
         self.offsets: dict[Path, int] = {}
         self.seen: set[str] = set()
+
+    def version_mismatch(self) -> dict[str, Any] | None:
+        if not self.stores_root.is_dir():
+            return None
+        observed = sorted(
+            entry.name for entry in self.stores_root.iterdir()
+            if entry.is_dir() and entry.name.startswith("v") and entry.name[1:].isdigit()
+        )
+        expected = f"v{self.store_layout_version}"
+        if observed and expected not in observed:
+            return {
+                "code": "event_store_version_mismatch",
+                "expectedStoreLayoutVersion": self.store_layout_version,
+                "observedStoreVersions": observed,
+            }
+        return None
 
     def read(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -320,15 +338,21 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     chunks: queue.Queue[str | None] = queue.Queue()
     thread = threading.Thread(target=reader, args=(terminal, chunks), daemon=True)
     thread.start()
-    tail = EventTail(state_home, workspace)
+    store_layout_version = int(config["storeLayoutVersion"])
+    event_stream_timeout_ms = int(config.get("eventStreamTimeoutMs", 10_000))
+    if store_layout_version <= 0 or event_stream_timeout_ms <= 0:
+        raise ValueError("TUI event stream version and timeout must be positive integers.")
+    tail = EventTail(state_home, workspace, store_layout_version)
     transcript = ""
     events: list[dict[str, Any]] = []
     approvals: set[str] = set()
     interactions_done: set[int] = set()
     initial_sent = False
+    initial_sent_at: float | None = None
     quit_sent = False
     cancel_sent = False
     cancellation: dict[str, Any] | None = None
+    infrastructure_error: dict[str, Any] | None = None
     reader_done = False
     started = time.monotonic()
     hard_deadline = started + int(config["budget"]["wallTimeSec"]) + 35
@@ -354,6 +378,19 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             if not initial_sent and contains_ready_frame(transcript):
                 terminal.write(f"{clean_text(config['initialMessage'])}\r")
                 initial_sent = True
+                initial_sent_at = time.monotonic()
+
+            if initial_sent and not events:
+                mismatch = tail.version_mismatch()
+                stream_wait_ms = int((time.monotonic() - (initial_sent_at or time.monotonic())) * 1000)
+                if mismatch or stream_wait_ms >= event_stream_timeout_ms:
+                    infrastructure_error = mismatch or {
+                        "code": "event_stream_unavailable",
+                        "expectedStoreLayoutVersion": store_layout_version,
+                        "timeoutMs": event_stream_timeout_ms,
+                    }
+                    terminal.terminate()
+                    break
 
             for event in events:
                 if event.get("type") != "tool.approval_requested":
@@ -433,6 +470,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         "interactionsDelivered": len(interactions_done),
         "settledTerminalType": settled_terminal_type,
         "cancellation": cancellation,
+        "infrastructureError": infrastructure_error,
     }
 
 

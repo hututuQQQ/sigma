@@ -10,6 +10,7 @@ import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-con
 import { RuntimeEventLog } from "../packages/agent-runtime/src/runtime-event-log.js";
 import type { RuntimeEventEmitter } from "../packages/agent-runtime/src/runtime-event-emitter.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -46,14 +47,7 @@ async function harness(nodes: PlanGraph["nodes"]): Promise<{
     deadlineAt: new Date(Date.now() + 60_000).toISOString()
   });
   state.plan = { revision: 1, goal: "delegate", nodes };
-  const session = {
-    sessionId: state.sessionId,
-    runId: state.runId,
-    state,
-    seq: 0,
-    workspacePath: root,
-    subscribers: new Set()
-  } as unknown as RuntimeSession;
+  const session = runtimeSessionFixture({ state, workspacePath: root });
   const eventLog = new RuntimeEventLog(new SegmentedJsonlStore({ rootDir: root }));
   const emit: RuntimeEventEmitter = async (target, type, authority, payload) =>
     await eventLog.emit(target, type, authority, payload);
@@ -103,11 +97,11 @@ describe("child Plan terminal ownership", () => {
     await handleChildEvent(fixture.session, "child.completed", completion(childId, ["implementation"]),
       fixture.control, fixture.emit);
 
-    const returned = fixture.session.state.plan.nodes[0]!;
+    const returned = fixture.session.durable.state.plan.nodes[0]!;
     expect(returned).toMatchObject({ status: "in_progress", owner: { kind: "root" } });
     expect(returned.evidence).toHaveLength(1);
 
-    const current = fixture.session.state.plan;
+    const current = fixture.session.durable.state.plan;
     await expect(fixture.control.updatePlan(fixture.session, {
       expectedRevision: current.revision,
       plan: {
@@ -125,7 +119,7 @@ describe("child Plan terminal ownership", () => {
     await handleChildEvent(fixture.session, "child.completed", failure(childId, ["validation"]),
       fixture.control, fixture.emit);
 
-    const blocked = fixture.session.state.plan;
+    const blocked = fixture.session.durable.state.plan;
     expect(blocked.nodes[0]).toMatchObject({
       status: "blocked",
       owner: { kind: "root" },
@@ -145,7 +139,7 @@ describe("child Plan terminal ownership", () => {
         }]
       }
     });
-    const reopened = fixture.session.state.plan;
+    const reopened = fixture.session.durable.state.plan;
     await expect(fixture.control.updatePlan(fixture.session, {
       expectedRevision: reopened.revision,
       plan: {
@@ -159,7 +153,7 @@ describe("child Plan terminal ownership", () => {
     });
     await handleChildEvent(fixture.session, "child.completed", completion(replacementId, ["validation"]),
       fixture.control, fixture.emit);
-    const returned = fixture.session.state.plan;
+    const returned = fixture.session.durable.state.plan;
     await expect(fixture.control.updatePlan(fixture.session, {
       expectedRevision: returned.revision,
       plan: {
@@ -180,8 +174,8 @@ describe("child Plan terminal ownership", () => {
       handleChildEvent(fixture.session, "child.completed", completion(second, ["second"]), fixture.control, fixture.emit)
     ])).resolves.toHaveLength(2);
 
-    expect(fixture.session.state.plan.revision).toBe(3);
-    expect(fixture.session.state.plan.nodes).toMatchObject([
+    expect(fixture.session.durable.state.plan.revision).toBe(3);
+    expect(fixture.session.durable.state.plan.nodes).toMatchObject([
       { id: "first", status: "in_progress", owner: { kind: "root" }, evidence: [expect.any(Object)] },
       { id: "second", status: "in_progress", owner: { kind: "root" }, evidence: [expect.any(Object)] }
     ]);

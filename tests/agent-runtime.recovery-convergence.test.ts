@@ -14,7 +14,9 @@ import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
 import { resolveToolIdleWatchdogMs } from "../packages/agent-runtime/src/tool-execution-monitor.js";
-import type { RuntimeOptions, RuntimeSession } from "../packages/agent-runtime/src/types.js";
+import type { RuntimeOptions } from "../packages/agent-runtime/src/types.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 function descriptor(idleTimeoutMs?: number): ToolDescriptor {
   return {
@@ -51,13 +53,8 @@ describe("runtime recovery convergence", () => {
     try {
       vi.setSystemTime(new Date("2026-07-12T00:00:00.000Z"));
       const controller = new AbortController();
-      const session = {
-        controller,
-        deadlineTimer: null,
-        state: {
-          deadlineAt: "2026-07-12T00:00:00.010Z"
-        }
-      } as RuntimeSession;
+      const session = runtimeSessionFixture({ execution: { controller } });
+      session.durable.state.deadlineAt = "2026-07-12T00:00:00.010Z";
       armRunDeadline(session);
       await vi.advanceTimersByTimeAsync(11);
       expect(controller.signal.reason).toMatchObject({
@@ -84,7 +81,7 @@ describe("runtime recovery convergence", () => {
       occurredAt: startedAt,
       type: "session.created",
       authority: "runtime",
-      payload: { workspacePath, mode: "change" }
+      payload: completeAgentEventPayload("session.created", { workspacePath, mode: "change" })
     }, 0);
     const current = createKernelState({
       sessionId,

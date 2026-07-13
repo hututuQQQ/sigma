@@ -1,14 +1,21 @@
 import {
   CLI_OUTPUT_SCHEMA_VERSION as CURRENT_CLI_OUTPUT_SCHEMA_VERSION,
-  LEGACY_AGENT_EVENT_TYPES_V2,
   type AgentEventEnvelope
 } from "agent-protocol";
 
 export const CLI_OUTPUT_SCHEMA_VERSION = CURRENT_CLI_OUTPUT_SCHEMA_VERSION;
 
+const V2_OUTPUT_EVENT_TYPES = new Set<string>([
+  "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
+  "user.message", "user.steer", "user.follow_up", "model.started", "model.delta",
+  "model.reasoning_delta", "model.completed", "model.failed", "tool.requested",
+  "tool.approval_requested", "tool.approval_resolved", "tool.started", "tool.progress",
+  "tool.completed", "tool.failed", "context.compacted", "child.spawned", "child.message",
+  "child.completed", "diagnostic"
+]);
+
 function outputEventV2(event: AgentEventEnvelope): unknown {
-  const legacy = new Set<string>(LEGACY_AGENT_EVENT_TYPES_V2);
-  if (legacy.has(event.type)) return { ...event, schemaVersion: 2 };
+  if (V2_OUTPUT_EVENT_TYPES.has(event.type)) return { ...event, schemaVersion: 2 };
   return {
     ...event,
     schemaVersion: 2,

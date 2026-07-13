@@ -1,6 +1,5 @@
 import {
   KERNEL_STATE_VERSION,
-  LEGACY_KERNEL_STATE_VERSION_V2,
   createBudgetLedger,
   createEmptyPlan,
   isBudgetLedgerState,
@@ -10,11 +9,9 @@ import {
   isUsageRecord,
   type BudgetLedgerState,
   type CheckpointRef,
-  type DiagnosticEvidence,
   type EvidenceRecord,
   type FrozenArtifactRef,
   type FrozenCustomizationRef,
-  type JsonValue,
   type ModelMessage,
   type PlanGraph,
   type RunMode,
@@ -109,33 +106,6 @@ export interface KernelState {
   outcome?: RunOutcome;
 }
 
-/** Exact persisted V2 shape, retained solely for explicit migration. */
-export interface KernelStateV2 {
-  schemaVersion: typeof LEGACY_KERNEL_STATE_VERSION_V2;
-  sessionId: string;
-  runId: string;
-  mode: RunMode;
-  phase: KernelPhase;
-  revision: number;
-  lastSeq: number;
-  startedAt: string;
-  deadlineAt: string;
-  activeModelTurn?: ActiveModelTurn;
-  messages: ModelMessage[];
-  pendingTools: PendingTool[];
-  toolCallIds: string[];
-  receipts: ToolReceipt[];
-  evidence: JsonValue[];
-  childIds: string[];
-  completionRepairAttempts: number;
-  continuationAttempts: number;
-  repeatedToolBatchCount: number;
-  receiptCountAtLastUserInput: number;
-  lastToolBatchSignature?: string;
-  proposedOutcome?: RunOutcome;
-  outcome?: RunOutcome;
-}
-
 export interface CreateKernelStateOptions {
   sessionId: string;
   runId: string;
@@ -215,36 +185,6 @@ function validSemanticState(state: Record<string, unknown>): boolean {
     && state.semanticFailureCluster.lastRevision <= revision;
 }
 
-export function isKernelStateV2(value: unknown): value is KernelStateV2 {
-  const state = record(value);
-  if (!state || state.schemaVersion !== LEGACY_KERNEL_STATE_VERSION_V2) return false;
-  const phases: readonly KernelPhase[] = [
-    "idle", "ready_model", "model_in_flight", "tool_pending", "tool_in_flight", "needs_input", "outcome_pending", "terminal"
-  ];
-  return [
-    typeof state.sessionId === "string" && state.sessionId.length > 0,
-    typeof state.runId === "string" && state.runId.length > 0,
-    state.mode === "analyze" || state.mode === "change",
-    phases.includes(state.phase as KernelPhase),
-    Number.isSafeInteger(state.revision) && Number(state.revision) >= 0,
-    Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
-    typeof state.startedAt === "string",
-    validDeadlineState(state),
-    Array.isArray(state.messages),
-    Array.isArray(state.pendingTools),
-    Array.isArray(state.toolCallIds),
-    Array.isArray(state.receipts),
-    Array.isArray(state.evidence),
-    Array.isArray(state.childIds),
-    [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
-      state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
-  ].every(Boolean);
-}
-
-export function assertKernelStateV2(value: unknown): asserts value is KernelStateV2 {
-  if (!isKernelStateV2(value)) throw new Error("Invalid KernelState V2.");
-}
-
 export function isKernelState(value: unknown): value is KernelState {
   const state = record(value);
   if (!state || state.schemaVersion !== KERNEL_STATE_VERSION) return false;
@@ -315,40 +255,6 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
   if (!isKernelState(value)) throw new Error("Invalid KernelState V4.");
-}
-
-function legacyEvidence(value: JsonValue, index: number, state: KernelStateV2): DiagnosticEvidence {
-  return {
-    evidenceId: `v2:${state.sessionId}:${index + 1}`,
-    sessionId: state.sessionId,
-    runId: state.runId,
-    kind: "diagnostic",
-    status: "informational",
-    createdAt: state.startedAt,
-    producer: { authority: "runtime", id: "v2-kernel-upcast" },
-    summary: "Evidence retained from a V2 kernel snapshot.",
-    data: { source: "v2-kernel-snapshot", diagnostic: value }
-  };
-}
-
-/**
- * Explicit in-memory upcast for diagnostics/import tooling. Session promotion
- * should normally rebuild V3 state by replaying upcast events instead.
- */
-export function upcastKernelStateV2(state: KernelStateV2): KernelState {
-  assertKernelStateV2(state);
-  return {
-    ...state,
-    schemaVersion: KERNEL_STATE_VERSION,
-    mutationEvidence: [],
-    evidence: state.evidence.map((item, index) => legacyEvidence(item, index, state)),
-    usage: [],
-    plan: createEmptyPlan(),
-    budget: createBudgetLedger(),
-    frozenSkills: [],
-    activeProcessIds: [],
-    semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
-  };
 }
 
 export function isTerminal(state: KernelState): boolean {

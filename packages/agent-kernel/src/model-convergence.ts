@@ -78,11 +78,22 @@ export function incompleteModelCompletion(
   }
   const hasCurrentRunReceipt = state.receipts.length > state.receiptCountAtLastUserInput;
   if (!hasCurrentRunReceipt) {
-    return propose({ ...state, messages }, {
-      kind: "needs_input",
-      requestId: `model-response-${Number(payload.turnId) || state.revision}`,
-      message: response
-    });
+    if (state.completionRepairAttempts >= 1) {
+      return propose({ ...state, messages }, {
+        kind: "recoverable_failure",
+        code: "terminal_protocol_missing",
+        message: "The model repeatedly stopped without obtaining current-run evidence or requesting user input."
+      });
+    }
+    return {
+      ...state,
+      messages: [...messages, {
+        role: "developer",
+        content: "Your response did not use a current-run tool, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain successful durable evidence, or call request_user_input if a concrete user decision is required. Do not repeat the natural-language response and do not call complete_task before evidence exists."
+      }],
+      completionRepairAttempts: state.completionRepairAttempts + 1,
+      phase: "ready_model"
+    };
   }
   if (state.completionRepairAttempts >= 1) {
     return propose({ ...state, messages }, {

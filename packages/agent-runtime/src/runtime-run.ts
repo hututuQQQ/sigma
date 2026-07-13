@@ -12,24 +12,24 @@ export interface RuntimeRunOptions {
 
 export async function runRuntimeSession(options: RuntimeRunOptions, session: RuntimeSession): Promise<void> {
   const controller = new AbortController();
-  session.controller = controller;
-  const remainingMs = Date.parse(session.state.deadlineAt) - Date.now();
+  session.execution.controller = controller;
+  const remainingMs = Date.parse(session.durable.state.deadlineAt) - Date.now();
   if (remainingMs <= 0) {
     await options.finish(session, {
       kind: "recoverable_failure",
       code: "budget_exhausted",
-      message: `Run deadline ${session.state.deadlineAt} has already elapsed.`
+      message: `Run deadline ${session.durable.state.deadlineAt} has already elapsed.`
     });
-    session.controller = null;
+    session.execution.controller = null;
     return;
   }
   armRunDeadline(session);
   try {
     await options.hooks.dispatch(session, "run_start", {
-      sessionId: session.sessionId,
-      runId: session.runId,
-      mode: session.mode,
-      deadlineAt: session.state.deadlineAt
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      mode: session.durable.mode,
+      deadlineAt: session.durable.state.deadlineAt
     }, controller.signal);
     await options.effects.run(session, controller.signal);
   } catch (error) {
@@ -49,8 +49,8 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
       });
     }
   } finally {
-    if (session.deadlineTimer) clearTimeout(session.deadlineTimer);
-    session.deadlineTimer = null;
-    session.controller = null;
+    if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
+    session.execution.deadlineTimer = null;
+    session.execution.controller = null;
   }
 }

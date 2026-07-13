@@ -18,7 +18,7 @@ import {
 import {
   resolveRuntimeCustomization,
   verifyWorkspaceCustomizationTrust
-} from "../packages/agent-runtime/src/index.js";
+} from "../packages/agent-runtime/src/testing.js";
 
 const temporary: string[] = [];
 

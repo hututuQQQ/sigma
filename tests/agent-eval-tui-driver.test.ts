@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
+import { STORE_LAYOUT_VERSION } from "../scripts/eval/event-store.mjs";
 import { tuiControllerEnvironment } from "../scripts/eval/subject-tui.mjs";
 
 const temporary: string[] = [];
@@ -21,7 +22,7 @@ describe("evaluation TUI event tail", () => {
     const identity = process.platform === "win32" ? path.resolve(workspace).toLowerCase() : path.resolve(workspace);
     const workspaceHash = createHash("sha256").update(identity).digest("hex");
     const stateHome = path.join(root, "state", "long-segment-".repeat(5));
-    const eventFile = path.join(stateHome, "workspaces", workspaceHash, "stores", "v3", "sessions", "session", "events", "000001.jsonl");
+    const eventFile = path.join(stateHome, "workspaces", workspaceHash, "stores", `v${STORE_LAYOUT_VERSION}`, "sessions", "session", "events", "000001.jsonl");
     await mkdir(path.dirname(eventFile), { recursive: true });
     const event = {
       eventId: "event-1", sessionId: "session", runId: "run", seq: 1,
@@ -36,12 +37,12 @@ describe("evaluation TUI event tail", () => {
       "from pathlib import Path",
       "spec=importlib.util.spec_from_file_location('driver',sys.argv[1])",
       "driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)",
-      "tail=driver.EventTail(Path(sys.argv[2]),Path(sys.argv[3]))",
+      "tail=driver.EventTail(Path(sys.argv[2]),Path(sys.argv[3]),int(sys.argv[6]))",
       "print(len(tail.read()))",
       "handle=open(driver.long_path(Path(sys.argv[4])),'ab');handle.write(sys.argv[5].encode('utf-8')+b'\\n');handle.close()",
       "events=tail.read();print(len(events),events[-1]['type'] if events else 'none')"
     ].join(";");
-    const result = spawnSync(python, ["-c", source, path.resolve("scripts/eval/tui-driver.py"), stateHome, workspace, eventFile, record.slice(split)], {
+    const result = spawnSync(python, ["-c", source, path.resolve("scripts/eval/tui-driver.py"), stateHome, workspace, eventFile, record.slice(split), String(STORE_LAYOUT_VERSION)], {
       cwd: process.cwd(), encoding: "utf8", windowsHide: true
     });
     expect(result.status, result.stderr).toBe(0);
@@ -114,7 +115,7 @@ events = [
     {"eventId":"d","seq":4,"type":"run.completed","payload":{}},
 ]
 class FakeTail:
-    def __init__(self, state_home, workspace): self.pending = list(events)
+    def __init__(self, state_home, workspace, store_layout_version): self.pending = list(events)
     def read(self):
         result, self.pending = self.pending, []
         return result
@@ -128,6 +129,7 @@ result = driver.run({
     "transcriptPath":str(root / "transcript.log"), "initialMessage":"initial request",
     "permissionPolicy":"allow_once",
     "interactions":[{"triggers":[{"kind":"first_mutation"}],"action":"steer","text":"stop now"}],
+    "storeLayoutVersion":${STORE_LAYOUT_VERSION}, "eventStreamTimeoutMs":1000,
     "budget":{"wallTimeSec":5,"modelTurns":8,"toolCalls":12,"costUsd":0.1},
 })
 print(json.dumps({"writes":terminal.writes,"result":result}))
@@ -150,6 +152,71 @@ print(json.dumps({"writes":terminal.writes,"result":result}))
     });
   });
 
+  it("reports an incompatible or missing event stream as evaluator infrastructure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-tui-stream-"));
+    temporary.push(root);
+    const harness = path.join(root, "stream-harness.py");
+    await writeFile(harness, `
+import importlib.util, json, sys, time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("driver", sys.argv[1])
+driver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(driver)
+
+class FakeTerminal:
+    backend = "fake-conpty"
+    def __init__(self):
+        self.chunks = ["New session. Type a request and press Enter."]
+        self.running = True
+    def read(self):
+        if self.chunks: return self.chunks.pop(0)
+        time.sleep(0.01)
+        return ""
+    def write(self, value): pass
+    def alive(self): return self.running
+    def wait(self): return 2
+    def terminate(self): self.running = False
+    def close(self): pass
+
+driver.terminal_for = lambda command, cwd, env: FakeTerminal()
+root = Path(sys.argv[2])
+mode = sys.argv[3]
+workspace = root / "workspace"
+state_home = root / "state"
+workspace.mkdir(parents=True)
+if mode == "mismatch":
+    incompatible = state_home / "workspaces" / driver.workspace_digest(workspace) / "stores" / "v${STORE_LAYOUT_VERSION - 1}"
+    incompatible.mkdir(parents=True)
+result = driver.run({
+    "command":["unused"], "workspace":str(workspace), "stateHome":str(state_home),
+    "transcriptPath":str(root / "transcript.log"), "initialMessage":"inspect",
+    "permissionPolicy":"auto", "interactions":[],
+    "storeLayoutVersion":${STORE_LAYOUT_VERSION}, "eventStreamTimeoutMs":50,
+    "budget":{"wallTimeSec":5,"modelTurns":8,"toolCalls":12,"costUsd":0.1},
+})
+print(json.dumps(result))
+`, "utf8");
+    const python = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
+    for (const [mode, code] of [
+      ["mismatch", "event_store_version_mismatch"],
+      ["missing", "event_stream_unavailable"]
+    ] as const) {
+      const caseRoot = path.join(root, mode);
+      const stateHome = path.join(caseRoot, "state");
+      const result = spawnSync(python, [harness, path.resolve("scripts/eval/tui-driver.py"), caseRoot, mode], {
+        cwd: process.cwd(), encoding: "utf8", windowsHide: true,
+        env: tuiControllerEnvironment(process.env, stateHome)
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({
+        eventCount: 0,
+        settledTerminalType: null,
+        infrastructureError: { code, expectedStoreLayoutVersion: STORE_LAYOUT_VERSION }
+      });
+    }
+  });
+
   it("carries input, approval, steer, and quit through a real PTY or ConPTY process", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-real-terminal-"));
     temporary.push(root);
@@ -167,7 +234,8 @@ workspace = Path(sys.argv[1]).resolve()
 state_home = Path(sys.argv[2]).resolve()
 identity = str(workspace).lower() if os.name == "nt" else str(workspace)
 session = "real-terminal-session"
-events = state_home / "workspaces" / hashlib.sha256(identity.encode()).hexdigest() / "stores" / "v3" / "sessions" / session / "events" / "000001.jsonl"
+store_layout_version = sys.argv[3]
+events = state_home / "workspaces" / hashlib.sha256(identity.encode()).hexdigest() / "stores" / f"v{store_layout_version}" / "sessions" / session / "events" / "000001.jsonl"
 events.parent.mkdir(parents=True)
 sequence = 0
 
@@ -219,13 +287,15 @@ finally:
     const python = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
     await writeFile(configPath, `${JSON.stringify({
       schemaVersion: 1,
-      command: [python, childPath, workspace, stateHome],
+      command: [python, childPath, workspace, stateHome, String(STORE_LAYOUT_VERSION)],
       workspace,
       stateHome,
       transcriptPath,
       initialMessage: "create a draft",
       permissionPolicy: "allow_once",
       interactions: [{ triggers: [{ kind: "first_mutation" }], action: "steer", text: "stop and clean" }],
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      eventStreamTimeoutMs: 1_000,
       budget: { wallTimeSec: 10, modelTurns: 8, toolCalls: 12, costUsd: 0.1 }
     })}\n`, "utf8");
 

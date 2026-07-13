@@ -5,8 +5,6 @@ export function createCheckpointManager(options: RuntimeOptions & { storeRootDir
   return new CheckpointManager({
     rootDir: options.storeRootDir,
     maxFiles: options.checkpointMaxFiles,
-    maxBytes: options.checkpointMaxBytes,
-    ...(options.checkpointRestoreFaultInjector
-      ? { restoreFaultInjector: options.checkpointRestoreFaultInjector } : {})
+    maxBytes: options.checkpointMaxBytes
   });
 }

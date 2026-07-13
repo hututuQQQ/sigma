@@ -13,6 +13,10 @@ import {
   CheckpointRecoveryError
 } from "../packages/agent-checkpoint/src/index.js";
 import {
+  createCheckpointManagerForTesting,
+  type CheckpointRestoreFaultInjector
+} from "../packages/agent-checkpoint/src/testing.js";
+import {
   captureCheckpointManifest,
   preflightCheckpointByteReservation
 } from "../packages/agent-checkpoint/src/safe-capture.js";
@@ -26,6 +30,17 @@ import {
 } from "../packages/agent-platform/src/workspace-transaction-root.js";
 
 const checkpointTemporaryRoots = new Set<string>();
+
+function checkpointManager(
+  options: ConstructorParameters<typeof CheckpointManager>[0] & {
+    restoreFaultInjector?: CheckpointRestoreFaultInjector;
+  }
+): CheckpointManager {
+  const { restoreFaultInjector, ...productionOptions } = options;
+  return restoreFaultInjector
+    ? createCheckpointManagerForTesting(productionOptions, restoreFaultInjector)
+    : new CheckpointManager(productionOptions);
+}
 
 async function checkpointTemporaryRoot(prefix: string): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -48,7 +63,7 @@ async function fixture(): Promise<{ root: string; workspace: string; manager: Ch
   await writeFile(path.join(workspace, "existing.txt"), "before", "utf8");
   await writeFile(path.join(workspace, "deleted.txt"), "keep me", "utf8");
   await writeFile(path.join(workspace, ".git", "protected"), "user state", "utf8");
-  return { root, workspace, manager: new CheckpointManager({ rootDir: path.join(root, "state") }) };
+  return { root, workspace, manager: checkpointManager({ rootDir: path.join(root, "state") }) };
 }
 
 async function checkpointTransactionRoot(root: string, workspacePath: string): Promise<string> {
@@ -345,7 +360,7 @@ describe("CheckpointManager", () => {
     await writeFile(path.join(workspace, "existing.txt"), "first after", "utf8");
     await writeFile(path.join(workspace, "second.txt"), "second after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: ({ point, operationIndex }) => {
         if (point === "after_install" && operationIndex === 0) throw new Error("injected commit failure");
@@ -361,7 +376,7 @@ describe("CheckpointManager", () => {
     }));
     await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
 
-    const beforeRecord = new CheckpointManager({
+    const beforeRecord = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: ({ point }) => {
         if (point === "before_record") throw new Error("injected record failure");
@@ -381,7 +396,7 @@ describe("CheckpointManager", () => {
     });
     await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: async ({ point }) => {
         if (point === "before_backup_move") {
@@ -404,7 +419,7 @@ describe("CheckpointManager", () => {
     });
     await rm(restoredPath);
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: async ({ point }) => {
         if (point === "before_install_move") await writeFile(restoredPath, "concurrent owner", "utf8");
@@ -423,7 +438,7 @@ describe("CheckpointManager", () => {
     });
     await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: async ({ point }) => {
         if (point === "after_install") {
@@ -673,7 +688,7 @@ describe("CheckpointManager", () => {
     });
     await writeFile(path.join(workspace, "existing.txt"), "after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: ({ point }) => {
         if (point === "after_install") throw new Error("injected commit failure");
@@ -760,7 +775,7 @@ describe("CheckpointManager", () => {
     await writeFile(path.join(tree, "inside.txt"), "after", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
     let swapped = false;
-    const transactional = new CheckpointManager({
+    const transactional = checkpointManager({
       rootDir: path.join(root, "state"),
       restoreFaultInjector: async ({ point }) => {
         if (point !== "before_commit" || swapped) return;
@@ -796,7 +811,7 @@ describe("CheckpointManager", () => {
       await writeFile(path.join(nested, "inside.txt"), "after", "utf8");
       await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
       let swapAttempted = false;
-      const transactional = new CheckpointManager({
+      const transactional = checkpointManager({
         rootDir: path.join(root, "state"),
         restoreFaultInjector: async ({ point }) => {
           if (point !== "before_backup_move") return;

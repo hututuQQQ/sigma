@@ -22,8 +22,8 @@ export function resolveHookProfile(
   session: RuntimeSession,
   profileId: string
 ): FrozenAgentProfile | undefined {
-  if (session.profile?.profile.id === profileId) return session.profile;
-  const frozen = session.frozenCustomization?.profiles.find((item) => item.id === profileId);
+  if (session.services.profile?.profile.id === profileId) return session.services.profile;
+  const frozen = session.durable.frozenCustomization?.profiles.find((item) => item.id === profileId);
   if (frozen) return restoreFrozenAgentProfile(frozen.canonicalJson, frozen.digest);
   return options.availableProfiles?.find((item) => item.profile.profile.id === profileId)?.profile;
 }
@@ -68,18 +68,18 @@ export function resolveChildProfile(
   if (requestedProfileId !== undefined && requestedProfileId !== null && !requested) {
     throw profileError("child_profile_invalid", "Child Agent Profile id must be non-empty.");
   }
-  if (!requested || requested === parent.profile?.profile.id) {
-    return parent.profile
-      ? { profile: parent.profile, profileSource: parent.profileSource ?? "builtin" }
+  if (!requested || requested === parent.services.profile?.profile.id) {
+    return parent.services.profile
+      ? { profile: parent.services.profile, profileSource: parent.services.profileSource ?? "builtin" }
       : {};
   }
-  if (!parent.profile) {
+  if (!parent.services.profile) {
     throw profileError("child_profile_denied", "A child Agent Profile cannot be selected without a frozen parent profile.");
   }
-  if (!parent.profile.profile.allowedChildProfiles.includes(requested)) {
+  if (!parent.services.profile.profile.allowedChildProfiles.includes(requested)) {
     throw profileError(
       "child_profile_denied",
-      `Agent Profile '${requested}' is not allowed by frozen parent profile '${parent.profile.profile.id}'.`
+      `Agent Profile '${requested}' is not allowed by frozen parent profile '${parent.services.profile.profile.id}'.`
     );
   }
   return resolveAllowedChildProfile(options, parent, requested);
@@ -90,7 +90,7 @@ function resolveAllowedChildProfile(
   parent: RuntimeSession,
   requested: string
 ): SessionProfileSelection {
-  const frozen = parent.frozenCustomization?.profiles.find((item) => item.id === requested);
+  const frozen = parent.durable.frozenCustomization?.profiles.find((item) => item.id === requested);
   const candidate: RuntimeAgentProfile | undefined = frozen ? {
     profile: restoreFrozenAgentProfile(frozen.canonicalJson, frozen.digest),
     source: frozen.source
@@ -98,7 +98,7 @@ function resolveAllowedChildProfile(
   if (!candidate) throw profileError("child_profile_unknown", `Unknown child Agent Profile '${requested}'.`);
   try {
     return {
-      profile: freezeAgentProfile(narrowAgentProfile(parent.profile!.profile, candidate.profile.profile)),
+      profile: freezeAgentProfile(narrowAgentProfile(parent.services.profile!.profile, candidate.profile.profile)),
       profileSource: candidate.source
     };
   } catch (error) {

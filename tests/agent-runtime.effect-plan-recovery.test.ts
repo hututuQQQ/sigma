@@ -8,7 +8,10 @@ import type {
   ExecutionResult
 } from "../packages/agent-execution/src/index.js";
 import type { AgentEventEnvelope } from "../packages/agent-protocol/src/index.js";
-import { createRuntime } from "../packages/agent-runtime/src/index.js";
+import {
+  createRuntime,
+  createRuntimeForTesting
+} from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import {
@@ -262,17 +265,16 @@ describe("effect-plan recovery", () => {
         message: "Rollback failure was ignored."
       })])
     ]);
-    const runtime = createRuntime({
+    const runtime = createRuntimeForTesting({
       gateway,
       tools: registerBuiltinTools(new EffectToolRegistry(), { broker }),
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000,
-      checkpointRestoreFaultInjector: ({ point }) => {
+      runDeadlineMs: 10_000
+    }, ({ point }) => {
         if (point === "after_install") throw new Error("injected restore failure");
         if (point === "before_rollback_restore") throw new Error("injected rollback failure");
-      }
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
 

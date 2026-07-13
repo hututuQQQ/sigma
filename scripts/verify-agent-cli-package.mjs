@@ -1147,7 +1147,12 @@ export async function verifyAgentCliPackage(options = {}) {
       metadata
     };
   } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    await rm(tempDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 100
+    });
   }
 }
 

@@ -5,6 +5,7 @@ import type { ModelGateway, RunStore } from "agent-protocol";
 import { baseContext } from "./runtime-context.js";
 import { restoreStoredSession } from "./restore-session.js";
 import type { RuntimeSession } from "./types.js";
+import { createRuntimeSessionAggregate } from "./runtime-session-state.js";
 
 export async function hydrateRuntimeSession(
   store: RunStore,
@@ -25,7 +26,7 @@ export async function hydrateRuntimeSession(
   const project = await loadNestedInstructions({ workspacePath });
   const base = baseContext(environment);
   const allContext = [...base, ...project, ...contextItems];
-  return {
+  return createRuntimeSessionAggregate({
     sessionId,
     ...(parentSessionId ? { parentSessionId } : {}),
     runId: state.runId,
@@ -61,5 +62,5 @@ export async function hydrateRuntimeSession(
     outcomeWaiters: [],
     idleWaiters: [],
     lastOutcome: state.outcome
-  };
+  });
 }

@@ -155,7 +155,7 @@ function conservativeUsage(ledger: BudgetLedgerState | undefined): Partial<Budge
 }
 
 function ownedPlanNodes(session: RuntimeSession, childId: string): string[] {
-  return session.state.plan.nodes.flatMap((node) =>
+  return session.durable.state.plan.nodes.flatMap((node) =>
     node.owner.kind === "child" && node.owner.childId === childId ? [node.id] : []);
 }
 
@@ -165,7 +165,7 @@ function childReservationId(ownerId: string): string | null {
 }
 
 function recordedOutcomeChildIds(session: RuntimeSession): Set<string> {
-  return new Set(session.state.evidence.flatMap((item) => item.kind === "child_outcome"
+  return new Set(session.durable.state.evidence.flatMap((item) => item.kind === "child_outcome"
     && typeof item.data.childId === "string" ? [item.data.childId] : []));
 }
 
@@ -176,18 +176,18 @@ async function reconcileOrphanChildReservations(
   emit: Parameters<typeof handleChildEvent>[4]
 ): Promise<number> {
   const childIds = new Set([
-    ...session.state.budget.reservations.flatMap((item) => {
+    ...session.durable.state.budget.reservations.flatMap((item) => {
       const childId = childReservationId(item.ownerId);
       return childId ? [childId] : [];
     }),
-    ...session.state.plan.nodes.flatMap((node) => node.owner.kind === "child" ? [node.owner.childId] : [])
+    ...session.durable.state.plan.nodes.flatMap((node) => node.owner.kind === "child" ? [node.owner.childId] : [])
   ]);
   const recorded = recordedOutcomeChildIds(session);
   let reconciled = 0;
   for (const childId of childIds) {
     if (children.has(childId)) continue;
     const planNodeIds = ownedPlanNodes(session, childId);
-    const reservation = session.state.budget.reservations.find((item) =>
+    const reservation = session.durable.state.budget.reservations.find((item) =>
       item.ownerId === `child:${childId}` && item.status === "reserved");
     if (!reservation && planNodeIds.length === 0 && recorded.has(childId)) continue;
     // No durable spawn exists, so no child could legitimately consume this
@@ -230,10 +230,10 @@ export async function reconcileInterruptedChildren(
   control: RuntimeControlService,
   emit: Parameters<typeof handleChildEvent>[4]
 ): Promise<number> {
-  const children = await readDurableChildren(store, session.sessionId);
+  const children = await readDurableChildren(store, session.identity.sessionId);
   let reconciled = await reconcileOrphanChildReservations(children, session, control, emit);
   for (const child of children.values()) {
-    const reservation = session.state.budget.reservations.find((item) =>
+    const reservation = session.durable.state.budget.reservations.find((item) =>
       item.ownerId === `child:${child.childId}` && item.status === "reserved");
     const planNodeIds = ownedPlanNodes(session, child.childId);
     if (child.completed) {

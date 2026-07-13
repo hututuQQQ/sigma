@@ -1,22 +1,12 @@
-import type { AnyTypedAgentEvent, ExternalEvaluationReport } from "./events.js";
-import { isJsonValue, type JsonValue } from "./json.js";
-import {
-  LEGACY_SNAPSHOT_SCHEMA_VERSION_V2,
-  SNAPSHOT_SCHEMA_VERSION,
-  STORE_LAYOUT_VERSION
-} from "./versions.js";
+import { z } from "zod";
+import type { AnyTypedAgentEvent, ExternalEvaluationReport, ProtocolValidationIssue } from "./events.js";
+import { jsonValueSchema } from "./domain-schemas.js";
+import type { JsonValue } from "./json.js";
+import { SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION } from "./versions.js";
 
 export interface SnapshotEnvelope<TState extends JsonValue = JsonValue> {
   schemaVersion: typeof SNAPSHOT_SCHEMA_VERSION;
   storeLayoutVersion: typeof STORE_LAYOUT_VERSION;
-  sessionId: string;
-  seq: number;
-  createdAt: string;
-  state: TState;
-}
-
-export interface LegacySnapshotEnvelopeV2<TState extends JsonValue = JsonValue> {
-  schemaVersion: typeof LEGACY_SNAPSHOT_SCHEMA_VERSION_V2;
   sessionId: string;
   seq: number;
   createdAt: string;
@@ -39,33 +29,35 @@ export interface EvaluationSink {
   append(report: ExternalEvaluationReport): Promise<void>;
 }
 
-function snapshotRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
+const snapshotEnvelopeSchema = z.object({
+  schemaVersion: z.literal(SNAPSHOT_SCHEMA_VERSION),
+  storeLayoutVersion: z.literal(STORE_LAYOUT_VERSION),
+  sessionId: z.string().min(1),
+  seq: z.number().int().nonnegative(),
+  createdAt: z.string().refine((value) => Number.isFinite(Date.parse(value)), "Invalid date-time"),
+  state: jsonValueSchema
+}).strict();
 
-function validSnapshotMetadata(value: Record<string, unknown>): boolean {
-  return typeof value.sessionId === "string" && value.sessionId.length > 0
-    && Number.isSafeInteger(value.seq) && Number(value.seq) >= 0
-    && typeof value.createdAt === "string" && Number.isFinite(Date.parse(value.createdAt))
-    && isJsonValue(value.state);
+export class SnapshotValidationError extends Error {
+  readonly code = "invalid_snapshot_envelope";
+
+  constructor(readonly issues: readonly ProtocolValidationIssue[]) {
+    const details = issues.map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`).join("; ");
+    super(`Invalid SnapshotEnvelope V${SNAPSHOT_SCHEMA_VERSION}: ${details}`);
+    this.name = "SnapshotValidationError";
+  }
 }
 
 export function isSnapshotEnvelope(value: unknown): value is SnapshotEnvelope {
-  const snapshot = snapshotRecord(value);
-  return Boolean(snapshot && snapshot.schemaVersion === SNAPSHOT_SCHEMA_VERSION
-    && snapshot.storeLayoutVersion === STORE_LAYOUT_VERSION && validSnapshotMetadata(snapshot));
+  return snapshotEnvelopeSchema.safeParse(value).success;
 }
 
 export function assertSnapshotEnvelope(value: unknown): asserts value is SnapshotEnvelope {
-  if (!isSnapshotEnvelope(value)) throw new Error("Invalid SnapshotEnvelope V3.");
-}
-
-export function isLegacySnapshotEnvelopeV2(value: unknown): value is LegacySnapshotEnvelopeV2 {
-  const snapshot = snapshotRecord(value);
-  return Boolean(snapshot && snapshot.schemaVersion === LEGACY_SNAPSHOT_SCHEMA_VERSION_V2
-    && validSnapshotMetadata(snapshot));
-}
-
-export function assertLegacySnapshotEnvelopeV2(value: unknown): asserts value is LegacySnapshotEnvelopeV2 {
-  if (!isLegacySnapshotEnvelopeV2(value)) throw new Error("Invalid SnapshotEnvelope V2.");
+  const result = snapshotEnvelopeSchema.safeParse(value);
+  if (result.success) return;
+  throw new SnapshotValidationError(result.error.issues.map((issue) => ({
+    path: issue.path.map((part) => typeof part === "symbol" ? String(part) : part),
+    code: issue.code,
+    message: issue.message
+  })));
 }

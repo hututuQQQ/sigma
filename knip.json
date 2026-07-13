@@ -1,16 +1,19 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "include": ["files", "dependencies", "unlisted", "binaries"],
-  "ignoreBinaries": ["python", "python3", "taskkill.exe"],
-  "ignoreDependencies": ["pyright"],
+  "ignoreBinaries": ["python", "taskkill.exe"],
+  "ignoreDependencies": ["pyright", "@stryker-mutator/vitest-runner"],
   "workspaces": {
     ".": {
       "entry": [
         "scripts/*.mjs",
+        "scripts/**/*.ts",
+        "stryker.*.conf.mjs",
+        "vitest.mutation.*.config.ts",
         "tests/**/*.{ts,tsx}"
       ],
       "project": [
-        "scripts/**/*.mjs",
+        "scripts/**/*.{mjs,ts}",
         "tests/**/*.{ts,tsx}",
         "*.{js,mjs,cjs,ts}"
       ]

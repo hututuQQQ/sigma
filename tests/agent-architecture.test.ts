@@ -17,13 +17,14 @@ import { createKernelState, evolve } from "../packages/agent-kernel/src/index.js
 import { lexicalScore, lexicalTokens, planContext } from "../packages/agent-context/src/index.js";
 import { resolveWorkspacePath } from "../packages/agent-platform/src/index.js";
 import { SegmentedJsonlStore, sessionDirectory } from "../packages/agent-store/src/index.js";
-import { createRuntime as createBaseRuntime, sendSessionCommand } from "../packages/agent-runtime/src/index.js";
+import { createRuntime as createBaseRuntime, sendSessionCommand } from "../packages/agent-runtime/src/testing.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 import { currentRunEvidence, typedCompletion } from "./helpers/typed-evidence.js";
+import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
@@ -44,7 +45,7 @@ function event(
     occurredAt: new Date(1_700_000_000_000 + seq).toISOString(),
     type,
     authority: "runtime",
-    payload
+    payload: completeAgentEventPayload(type, payload)
   };
 }
 
@@ -191,7 +192,7 @@ describe("Sigma architecture", () => {
 
   it("stores checksummed segmented events and ignores only a torn tail", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-store-"));
-    const store = new SegmentedJsonlStore({ rootDir: root, segmentBytes: 600 });
+    const store = new SegmentedJsonlStore({ rootDir: root, segmentBytes: 6_000 });
     await store.append(event(1, "session.created"), 0);
     await store.append(event(2, "run.started"), 1);
     const eventsPath = path.join(sessionDirectory(root, "session"), "events", "000001.jsonl");

@@ -10,29 +10,29 @@ function timeoutError(deadlineAt: string): Error {
 }
 
 export function pauseRunDeadline(session: RuntimeSession): number {
-  const remaining = session.state.deadlineRemainingMs
-    ?? Math.max(1, Date.parse(session.state.deadlineAt) - Date.now());
-  if (session.deadlineTimer) clearTimeout(session.deadlineTimer);
-  session.deadlineTimer = null;
+  const remaining = session.durable.state.deadlineRemainingMs
+    ?? Math.max(1, Date.parse(session.durable.state.deadlineAt) - Date.now());
+  if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
+  session.execution.deadlineTimer = null;
   return remaining;
 }
 
 export function resumedDeadlineAt(session: RuntimeSession): string | undefined {
-  const remaining = session.state.deadlineRemainingMs;
+  const remaining = session.durable.state.deadlineRemainingMs;
   return remaining === undefined ? undefined : new Date(Date.now() + remaining).toISOString();
 }
 
 export function armRunDeadline(session: RuntimeSession): void {
-  if (session.deadlineTimer) clearTimeout(session.deadlineTimer);
-  session.deadlineTimer = null;
-  const controller = session.controller;
-  if (!controller || session.state.deadlineRemainingMs !== undefined) return;
-  const remaining = Date.parse(session.state.deadlineAt) - Date.now();
+  if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
+  session.execution.deadlineTimer = null;
+  const controller = session.execution.controller;
+  if (!controller || session.durable.state.deadlineRemainingMs !== undefined) return;
+  const remaining = Date.parse(session.durable.state.deadlineAt) - Date.now();
   if (remaining <= 0) {
-    controller.abort(timeoutError(session.state.deadlineAt));
+    controller.abort(timeoutError(session.durable.state.deadlineAt));
     return;
   }
-  session.deadlineTimer = setTimeout(() => {
-    controller.abort(timeoutError(session.state.deadlineAt));
+  session.execution.deadlineTimer = setTimeout(() => {
+    controller.abort(timeoutError(session.durable.state.deadlineAt));
   }, remaining);
 }

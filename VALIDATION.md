@@ -1,4 +1,4 @@
-# Sigma Code 2.0 validation
+# Sigma Code 3.0.0-beta.1 validation
 
 Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 
@@ -43,10 +43,11 @@ Run the neutral product checks without live provider credentials:
 pnpm smoke:product
 pnpm smoke:tui-product
 pnpm verify:containment
-pnpm verify:package:agent-cli
+pnpm verify:package:agent-cli:linux
 pnpm perf:repo-100k
+pnpm perf:replay-v4-100k
 pnpm package:harbor-runtime
-pnpm product:readiness
+pnpm product:readiness -- --internal-only
 ```
 
 What these commands prove:
@@ -54,11 +55,13 @@ What these commands prove:
 - `smoke:product`: a fake gateway completes a normal multi-turn tool/session workflow through the built CLI.
 - `smoke:tui-product`: the built OpenTUI application starts with FFI and exercises alternate-screen, cursor, raw-mode, completion, cleanup, and responsive resize with controlled terminal streams.
 - `verify:containment`: lexical and symlink/junction workspace escapes are rejected and a cancelled process tree returns in under one second in that check. This command does not claim process isolation.
-- `verify:package:agent-cli`: the default Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime; verification runs the bundled CLI entry with host Node and attempts the target wrapper when the native/WSL environment supports it.
+- `verify:package:agent-cli:linux`: the Linux portable archive contains the manifest-derived dependency closure, wrapper, metadata, and pinned runtime and must execute its target wrapper.
+- `verify:package:agent-cli:windows`: the Windows portable archive provides the equivalent native-wrapper proof; `verify:package:agent-cli:windows:structure` is structure-only and is not release evidence.
+- `perf:replay-v4-100k`: validates segmented V4 reads, envelope validation, reducer replay, snapshot rebuild, and tail replay over 100,000 events.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
 - `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness from release readiness.
 
-`pnpm verify:product` combines lint, coverage, fake product/TUI smoke, Windows package structure inspection, and the readiness report. It deliberately excludes benchmark execution and a live provider call, and it does not require a successful target-wrapper execution result.
+`pnpm verify:product` combines only platform-neutral lint, coverage, fake product/TUI smoke, and internal readiness. Target archive, wrapper, sandbox, provider smoke, replay performance, and release readiness belong to `verify:release:linux` or `verify:release:windows`.
 
 ## Windows release check
 
@@ -98,7 +101,7 @@ The automated suites cover:
 
 Do not interpret the checks above as claims beyond their scope:
 
-- Sigma enforces workspace path containment and process cancellation, but does not currently configure an OS-level command sandbox. `agent doctor` reports this as a warning.
+- Sigma defaults to required OS isolation and no process network. Linux uses namespace/Landlock/seccomp and Windows uses AppContainer when the native broker self-test succeeds. Execution fails closed when required isolation is unavailable; unsafe host execution needs both a home-level grant and a per-run request. `agent doctor` reports the actual backend and self-test state.
 - CI exercises packaged `/quit` startup and cleanup through Linux PTY and Windows ConPTY. It does not replace manual IME, rapid-resize, font, and terminal-emulator matrix signoff.
 - A trusted MCP process still runs with the user's OS authority. Repository MCP requires path-and-digest-bound trust and receives a restricted environment, but policy cannot independently prove what a remote server does.
 - A dirty/non-Git writer runs under an exclusive lease in the source workspace, not an isolated worktree. In that mode only path-addressable writes inside its required `writeScope` are allowed; broad process/MCP mutation tools are denied.

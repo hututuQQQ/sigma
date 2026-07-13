@@ -23,7 +23,6 @@ import type {
 } from "agent-extensions";
 import type { ProcessExecutionPort, RuntimeEnvironment } from "agent-platform";
 import type { ProcessHandle } from "agent-execution";
-import type { CheckpointRestoreFaultEvent } from "agent-checkpoint";
 import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
 import type { ApprovalBinding } from "./approval-binding.js";
@@ -48,14 +47,13 @@ export interface RuntimeOptions {
   budgetLimits?: BudgetLimits;
   checkpointMaxFiles?: number;
   checkpointMaxBytes?: number;
-  checkpointRestoreFaultInjector?: (event: CheckpointRestoreFaultEvent) => void | Promise<void>;
   skills?: SkillCatalog;
   hooks?: readonly HookDefinition[];
   hookArtifacts?: readonly RuntimeHookArtifact[];
   hookRunner?: HookRunnerPort;
   agentProfileHookRunner?: HookRunnerPort;
   reviewer?: ReviewerPort;
-  reviewerForSession?(session: Pick<RuntimeSession, "sessionId" | "modelRole" | "profile">): ReviewerPort;
+  reviewerForSession?(session: Pick<RuntimeSession, "identity" | "services">): ReviewerPort;
   profile?: FrozenAgentProfile;
   profileSource?: "home" | "workspace" | "builtin";
   availableProfiles?: readonly RuntimeAgentProfile[];
@@ -121,42 +119,65 @@ export type OpenCheckpointRecovery = {
   currentManifestDigest: string;
 } | ChildCheckpointRecovery;
 
-export interface RuntimeSession {
-  sessionId: string;
-  /** Durable ancestry marker. Undefined means this is a root user session. */
-  parentSessionId?: string;
+export interface RuntimeSessionIdentity {
+  readonly sessionId: string;
+  readonly parentSessionId?: string;
+  readonly workspacePath: string;
+  readonly writeScope: string[];
+  readonly strictWriteScope: boolean;
+  readonly workspaceLeaseInherited?: boolean;
+}
+
+export interface RuntimeSessionDurableState {
   runId: string;
   modelTurn: number;
-  workspacePath: string;
   mode: RunMode;
-  writeScope: string[];
-  strictWriteScope: boolean;
-  workspaceLeaseInherited?: boolean;
-  gateway: ModelGateway;
-  modelRole: ModelExecutionRole;
-  profile?: FrozenAgentProfile;
-  profileSource?: "home" | "workspace" | "builtin";
-  frozenCustomization?: FrozenSessionCustomization;
   state: KernelState;
   seq: number;
+  frozenCustomization?: FrozenSessionCustomization;
+}
+
+export interface RuntimeSessionExecutionState {
   controller: AbortController | null;
   turnController: AbortController | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   running: Promise<void> | null;
+  /** Runtime-local broker handles; never restored across process restart. */
+  processHandles: Map<string, ProcessHandle>;
+}
+
+export interface RuntimeSessionInteractionState {
   subscribers: Set<AsyncQueue<AgentEventEnvelope>>;
   approvals: Map<string, ApprovalWaiter>;
   /** One-shot human grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
-  /** Runtime-local broker handles; never restored across process restart. */
-  processHandles?: Map<string, ProcessHandle>;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];
   loadedContextIds: Set<string>;
-  lastOutcome?: RunOutcome;
   outcomeWaiters: OutcomeWaiter[];
   idleWaiters: IdleWaiter[];
+}
+
+export interface RuntimeSessionRecoveryState {
+  lastOutcome?: RunOutcome;
   runError?: Error;
   openCheckpointRecovery?: OpenCheckpointRecovery;
+}
+
+export interface RuntimeSessionServices {
+  gateway: ModelGateway;
+  modelRole: ModelExecutionRole;
+  profile?: FrozenAgentProfile;
+  profileSource?: "home" | "workspace" | "builtin";
+}
+
+export interface RuntimeSession {
+  readonly identity: RuntimeSessionIdentity;
+  readonly durable: RuntimeSessionDurableState;
+  readonly execution: RuntimeSessionExecutionState;
+  readonly interaction: RuntimeSessionInteractionState;
+  readonly recovery: RuntimeSessionRecoveryState;
+  readonly services: RuntimeSessionServices;
 }

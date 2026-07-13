@@ -20,7 +20,11 @@ import {
   type ValidationEvidence,
   type WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
-import { createRuntime, reconcileInterruptedChildren } from "../packages/agent-runtime/src/index.js";
+import {
+  createRuntime,
+  createRuntimeSessionAggregate,
+  reconcileInterruptedChildren
+} from "../packages/agent-runtime/src/testing.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import { RuntimeEventLog } from "../packages/agent-runtime/src/runtime-event-log.js";
@@ -52,6 +56,41 @@ function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
+function runtimeSessionFixture(
+  state: ReturnType<typeof createKernelState>,
+  workspacePath: string,
+  seq = 0
+): RuntimeSession {
+  return createRuntimeSessionAggregate({
+    sessionId: state.sessionId,
+    runId: state.runId,
+    modelTurn: 0,
+    workspacePath,
+    mode: state.mode,
+    writeScope: [],
+    strictWriteScope: false,
+    gateway: new IdleGateway(),
+    modelRole: "orchestrator",
+    state,
+    seq,
+    controller: null,
+    turnController: null,
+    deadlineTimer: null,
+    running: null,
+    subscribers: new Set(),
+    approvals: new Map(),
+    callApprovals: new Map(),
+    alwaysAllowedEffects: new Set(),
+    processHandles: new Map(),
+    steeringPending: 0,
+    followUps: [],
+    contextItems: [],
+    loadedContextIds: new Set(),
+    outcomeWaiters: [],
+    idleWaiters: []
+  });
+}
+
 async function append(
   store: SegmentedJsonlStore,
   sessionId: string,
@@ -70,8 +109,7 @@ async function append(
     occurredAt: new Date(Date.now() + seq).toISOString(),
     type,
     authority,
-    payload: json(payload),
-    checksum: ""
+    payload: json(payload)
   }, seq - 1);
 }
 
@@ -172,9 +210,7 @@ describe("durable child identity and crash recovery", () => {
     };
     state.budget.reservations.push(reservation);
     state.budget.reserved = { ...reservation.requested };
-    const session = {
-      sessionId, runId, state, seq: 0, workspacePath: root, subscribers: new Set()
-    } as unknown as RuntimeSession;
+    const session = runtimeSessionFixture(state, root);
     const eventLog = new RuntimeEventLog(store);
     let crashAfterRelease = true;
     const emit: RuntimeEventEmitter = async (target, type, authority, payload) => {
@@ -195,17 +231,17 @@ describe("durable child identity and crash recovery", () => {
 
     await expect(reconcileInterruptedChildren(store, session, control, emit))
       .rejects.toThrow("simulated crash after durable budget release");
-    expect(session.state.budget.reservations[0]?.status).toBe("released");
+    expect(session.durable.state.budget.reservations[0]?.status).toBe("released");
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
-    expect(session.state.budget.reserved).toEqual(emptyBudgetAmounts());
-    expect(session.state.budget.consumed).toEqual(emptyBudgetAmounts());
-    expect(session.state.budget.reservations[0]?.status).toBe("released");
-    expect(session.state.plan.nodes[0]).toMatchObject({
+    expect(session.durable.state.budget.reserved).toEqual(emptyBudgetAmounts());
+    expect(session.durable.state.budget.consumed).toEqual(emptyBudgetAmounts());
+    expect(session.durable.state.budget.reservations[0]?.status).toBe("released");
+    expect(session.durable.state.plan.nodes[0]).toMatchObject({
       status: "blocked",
       owner: { kind: "root" },
       blockedReason: `Child ${childId} failed.`
     });
-    expect(session.state.evidence).toContainEqual(expect.objectContaining({
+    expect(session.durable.state.evidence).toContainEqual(expect.objectContaining({
       kind: "child_outcome",
       status: "failed",
       data: expect.objectContaining({ childId, planNodeIds: ["delegated"] })
@@ -335,12 +371,7 @@ describe("durable child identity and crash recovery", () => {
     };
     state.budget.reservations.push(reservation);
     state.budget.reserved = { ...reservation.requested };
-    const session = {
-      sessionId: parentSessionId,
-      runId: parentRunId,
-      state,
-      workspacePath: root
-    } as unknown as RuntimeSession;
+    const session = runtimeSessionFixture(state, root);
     let seq = 2;
     const emit = async (
       target: RuntimeSession,
@@ -352,18 +383,20 @@ describe("durable child identity and crash recovery", () => {
         schemaVersion: EVENT_SCHEMA_VERSION,
         seq: ++seq,
         eventId: randomUUID(),
-        sessionId: target.sessionId,
-        runId: target.runId,
+        sessionId: target.identity.sessionId,
+        runId: target.durable.runId,
         occurredAt: new Date(Date.now() + seq).toISOString(),
         type,
         authority,
-        payload: json(value),
-        checksum: ""
+        payload: json(value)
       }, seq - 1);
-      const payload = value as { ledger?: BudgetLedgerState; plan?: RuntimeSession["state"]["plan"] };
-      if (payload.ledger) target.state.budget = structuredClone(payload.ledger);
-      if (type === "plan.updated" && payload.plan) target.state.plan = structuredClone(payload.plan);
-      if (type === "evidence.recorded") target.state.evidence.push(structuredClone(value) as never);
+      const payload = value as {
+        ledger?: BudgetLedgerState;
+        plan?: RuntimeSession["durable"]["state"]["plan"];
+      };
+      if (payload.ledger) target.durable.state.budget = structuredClone(payload.ledger);
+      if (type === "plan.updated" && payload.plan) target.durable.state.plan = structuredClone(payload.plan);
+      if (type === "evidence.recorded") target.durable.state.evidence.push(structuredClone(value) as never);
       return event;
     };
     const budgets = new BudgetController(emit);
@@ -375,16 +408,16 @@ describe("durable child identity and crash recovery", () => {
     });
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
-    expect(session.state.budget.reserved).toMatchObject({ inputTokens: 0, toolCalls: 0, children: 0 });
-    expect(session.state.budget.consumed).toMatchObject({ inputTokens: 128, toolCalls: 3, children: 2 });
-    expect(session.state.budget.reservations[0]?.status).toBe("committed");
-    expect(session.state.plan.nodes[0]).toMatchObject({
+    expect(session.durable.state.budget.reserved).toMatchObject({ inputTokens: 0, toolCalls: 0, children: 0 });
+    expect(session.durable.state.budget.consumed).toMatchObject({ inputTokens: 128, toolCalls: 3, children: 2 });
+    expect(session.durable.state.budget.reservations[0]?.status).toBe("committed");
+    expect(session.durable.state.plan.nodes[0]).toMatchObject({
       status: "blocked",
       owner: { kind: "root" },
       blockedReason: `Child ${childId} failed.`
     });
-    expect(session.state.plan.nodes[0]?.evidence).toHaveLength(1);
-    expect(session.state.evidence[0]).toMatchObject({ kind: "child_outcome", status: "failed" });
+    expect(session.durable.state.plan.nodes[0]?.evidence).toHaveLength(1);
+    expect(session.durable.state.evidence[0]).toMatchObject({ kind: "child_outcome", status: "failed" });
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(0);
     const childCompletions = [];
@@ -442,14 +475,7 @@ describe("durable child identity and crash recovery", () => {
         owner: { kind: "child", childId }, acceptanceCriteria: ["done"], evidence: []
       }]
     };
-    const session = {
-      sessionId,
-      runId,
-      state,
-      seq: 2,
-      workspacePath: root,
-      subscribers: new Set()
-    } as unknown as RuntimeSession;
+    const session = runtimeSessionFixture(state, root, 2);
     const eventLog = new RuntimeEventLog(store);
     const emit: RuntimeEventEmitter = async (target, type, authority, payload) =>
       await eventLog.emit(target, type, authority, payload);
@@ -463,12 +489,12 @@ describe("durable child identity and crash recovery", () => {
     });
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
-    expect(session.state.plan.nodes[0]).toMatchObject({
+    expect(session.durable.state.plan.nodes[0]).toMatchObject({
       status: "in_progress",
       owner: { kind: "root" },
       evidence: [expect.objectContaining({ kind: "child_outcome" })]
     });
-    expect(session.state.evidence).toContainEqual(expect.objectContaining({
+    expect(session.durable.state.evidence).toContainEqual(expect.objectContaining({
       kind: "child_outcome",
       status: "passed",
       data: expect.objectContaining({ childId, outcome: "completed" })

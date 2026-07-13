@@ -31,8 +31,8 @@ function normalizeReview(
   const verdict = raw.data.verdict === "approved" ? "approved" : "changes_requested";
   return {
     evidenceId: randomUUID(),
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     kind: "review",
     status: verdict === "approved" ? "passed" : "failed",
     createdAt: new Date().toISOString(),
@@ -98,8 +98,8 @@ function requestIdentity(
   const attempt = evidence.filter((item) => item.kind === "review"
     && sameIdSet(item.data.workspaceDeltaEvidenceIds, ids)).length + 1;
   const digest = createHash("sha256").update(JSON.stringify({
-    sessionId: session.sessionId,
-    runId: session.runId,
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
     reviewerId,
     ids: [...ids].sort(),
     attempt
@@ -112,7 +112,7 @@ function stableUsage(usage: UsageRecord, requestId: string): UsageRecord {
 }
 
 function activeReservation(session: RuntimeSession, ownerId: string): BudgetReservation | undefined {
-  return [...session.state.budget.reservations].reverse().find((item) =>
+  return [...session.durable.state.budget.reservations].reverse().find((item) =>
     item.ownerId === ownerId && item.status !== "released");
 }
 
@@ -129,12 +129,12 @@ export class ReviewCoordinator {
   }
 
   async maybeReview(session: RuntimeSession, signal: AbortSignal): Promise<void> {
-    const existing = this.active.get(session.sessionId);
+    const existing = this.active.get(session.identity.sessionId);
     if (existing) return await existing;
     const task = this.reviewEligibleChange(session, signal);
-    this.active.set(session.sessionId, task);
+    this.active.set(session.identity.sessionId, task);
     try { await task; } finally {
-      if (this.active.get(session.sessionId) === task) this.active.delete(session.sessionId);
+      if (this.active.get(session.identity.sessionId) === task) this.active.delete(session.identity.sessionId);
     }
   }
 
@@ -165,9 +165,9 @@ export class ReviewCoordinator {
     const reviewer = this.reviewerForSession(session);
     const reviewerId = reviewer.reviewerId ?? "builtin-reviewer";
     const input: ReviewerInput = {
-      sessionId: session.sessionId,
-      runId: session.runId,
-      goal: session.state.plan.goal,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      goal: session.durable.state.plan.goal,
       workspaceDeltas: eligible,
       validations: relevantValidations
     };
@@ -202,9 +202,9 @@ export class ReviewCoordinator {
       await this.recoverInterruptedReview(session, reviewer, reviewerId, input, requestId, prior);
       return;
     }
-    const remainingCost = Math.max(0, session.state.budget.limits.costMicroUsd
-      - session.state.budget.consumed.costMicroUsd
-      - session.state.budget.reserved.costMicroUsd);
+    const remainingCost = Math.max(0, session.durable.state.budget.limits.costMicroUsd
+      - session.durable.state.budget.consumed.costMicroUsd
+      - session.durable.state.budget.reserved.costMicroUsd);
     const prepared = await reviewer.prepareReview(input, remainingCost);
     const reservationId = await this.budgets!.reserve(session, ownerId, prepared.budget.reserved);
     await this.emit(session, "review.started", "runtime", {
@@ -253,7 +253,7 @@ export class ReviewCoordinator {
     if (reservation.status === "reserved") {
       await this.budgets!.commit(session, reservation.reservationId, amounts);
     }
-    if (!session.state.usage.some((item) => item.requestId === requestId && item.role === "reviewer")) {
+    if (!session.durable.state.usage.some((item) => item.requestId === requestId && item.role === "reviewer")) {
       await this.emit(session, "usage.recorded", "runtime", stableUsage(
         reviewer.recoveredUsage(input, requestId, amounts), requestId
       ));
