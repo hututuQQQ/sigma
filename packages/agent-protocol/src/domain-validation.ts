@@ -81,8 +81,7 @@ const EVIDENCE_DATA_VALIDATORS: Record<EvidenceKind, EvidenceDataValidator> = {
     nonEmptyString(data.reviewerId),
     data.verdict === "approved" || data.verdict === "changes_requested",
     Array.isArray(data.findings),
-    stringArray(data.workspaceDeltaEvidenceIds),
-    data.validationEvidenceIds === undefined || stringArray(data.validationEvidenceIds)
+    stringArray(data.workspaceDeltaEvidenceIds)
   ].every(Boolean),
   checkpoint: (data) => [
     nonEmptyString(data.checkpointId),

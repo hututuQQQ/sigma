@@ -10,7 +10,6 @@ import {
   type JsonValue
 } from "agent-protocol";
 import type { KernelState } from "./state.js";
-import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 
 export type KernelEventReducer = (
   state: KernelState,
@@ -40,14 +39,14 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
     || event.runId !== state.runId || !evidenceAuthorityAllowed(event, evidence)
     || state.evidence.some((item) => item.evidenceId === evidence.evidenceId)) return state;
   if (evidence.kind === "user_waiver" && state.evidence.some((item) => item.kind === "user_waiver")) return state;
-  return recordSemanticEvidenceProgress({
+  return {
     ...state,
     evidence: [...state.evidence, evidence],
     mutationEvidence: MUTATION_EVIDENCE_KINDS.has(evidence.kind)
       && !state.mutationEvidence.some((item) => item.evidenceId === evidence.evidenceId)
       ? [...state.mutationEvidence, evidence]
       : state.mutationEvidence
-  }, evidence);
+  };
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {
@@ -121,11 +120,11 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
   if (event.authority !== "runtime" && event.authority !== "user") return state;
   const checkpointHead = event.payload.runId === state.runId
     ? event.payload : { ...event.payload, runId: state.runId };
-  return recordSemanticWorkspaceRestore({
+  return {
     ...state,
     ...pruneRestoredCheckpointEvidence(state, event.payload.checkpointId),
     checkpointHead
-  });
+  };
 };
 
 const reviewEvidence: KernelEventReducer = (state, event, payload) => evidenceRecorded(state, event, payload);

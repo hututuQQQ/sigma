@@ -437,7 +437,6 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::OutputDecoder;
 
     #[test]
     fn redacts_literal_values_across_chunks_and_secret_named_assignments() {
@@ -472,34 +471,5 @@ mod tests {
             "[REDACTED:oversized-output-line]"
         );
         assert!(redactor.lossy);
-    }
-
-    #[test]
-    fn utf16le_is_normalized_before_literal_and_named_secret_redaction() {
-        let secret = "秘密abcd";
-        let text = format!("prefix {secret} API_KEY=visible\n");
-        let mut encoded = vec![0xff, 0xfe];
-        encoded.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-        let mut decoder = OutputDecoder::default();
-        let mut redactor = OutputRedactor::new(
-            RedactionConfig::new(vec![RedactionSecret {
-                name: "provider".into(),
-                value: secret.into(),
-            }])
-            .unwrap(),
-        );
-        let mut output = Vec::new();
-        for chunk in encoded.chunks(3) {
-            let normalized = decoder.push(chunk, false).unwrap();
-            output.extend(redactor.push(&normalized, false));
-        }
-        let normalized = decoder.push(&[], true).unwrap();
-        output.extend(redactor.push(&normalized, true));
-        let value = String::from_utf8(output).unwrap();
-        assert!(!value.contains(secret));
-        assert!(!value.contains("API_KEY"));
-        assert!(!value.contains("visible"));
-        assert!(value.contains("[REDACTED]"));
-        assert!(!value.contains('\u{fffd}'));
     }
 }

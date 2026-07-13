@@ -640,11 +640,22 @@ export function renderCodexReviewMarkdown(input) {
   ].join("\n");
 }
 
+const pendingAtomicWrites = new Map();
+
 async function atomicWrite(filePath, content) {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-  await writeFile(temporary, content, "utf8");
-  await rename(temporary, filePath);
+  const previous = pendingAtomicWrites.get(filePath) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(async () => {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const temporary = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+    await writeFile(temporary, content, "utf8");
+    await rename(temporary, filePath);
+  });
+  pendingAtomicWrites.set(filePath, current);
+  try {
+    await current;
+  } finally {
+    if (pendingAtomicWrites.get(filePath) === current) pendingAtomicWrites.delete(filePath);
+  }
 }
 
 async function writeJson(filePath, value) {

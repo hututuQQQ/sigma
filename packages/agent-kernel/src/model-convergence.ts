@@ -76,26 +76,18 @@ export function incompleteModelCompletion(
       message: "The model stopped without a response or tool call."
     });
   }
-  const hasCurrentRunReceipt = state.receipts.length > state.receiptCountAtLastUserInput;
-  if (!hasCurrentRunReceipt) {
+  if (state.receipts.length <= state.receiptCountAtLastUserInput || state.completionRepairAttempts >= 1) {
     return propose({ ...state, messages }, {
       kind: "needs_input",
       requestId: `model-response-${Number(payload.turnId) || state.revision}`,
       message: response
     });
   }
-  if (state.completionRepairAttempts >= 1) {
-    return propose({ ...state, messages }, {
-      kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: "The model repeatedly stopped without choosing complete_task or request_user_input."
-    });
-  }
   return {
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "Your response did not choose a terminal protocol action. This repair turn requires exactly one terminal tool call: complete_task with explicit criteria and exact evidence IDs, or request_user_input if a concrete user decision is required. Do not repeat the natural-language response."
+      content: "Your response did not choose a terminal protocol action. If the work is complete, call complete_task with explicit criteria and successful receipt IDs. If no actionable task was provided or user guidance is required, call request_user_input. Do not repeat the same natural-language response."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
     phase: "ready_model"

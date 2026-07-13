@@ -1,12 +1,9 @@
-import { spawnSync } from "node:child_process";
 import { access, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { artifactSecretValues, evalRootDir, loadEvalSecrets, subjectEnvironment } from "../scripts/eval/common.mjs";
-import {
-  evaluatorDigestFromSnapshot, packageManagerInvocation, runEvaluation, verifierSourceDigest
-} from "../scripts/eval/runner.mjs";
+import { evaluatorDigestFromSnapshot, runEvaluation, verifierSourceDigest } from "../scripts/eval/runner.mjs";
 import { breachedBudget } from "../scripts/eval/subject-cli.mjs";
 
 const temporary: string[] = [];
@@ -78,36 +75,6 @@ async function manifest(options: { verifierPass?: boolean; initialDirty?: boolea
 }
 
 describe("agent experience evaluation runner", () => {
-  it("routes Windows package-manager scripts through the command processor", () => {
-    expect(packageManagerInvocation(["package:agent-cli:windows"], {
-      platform: "win32", env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }
-    })).toEqual({
-      command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", "pnpm.cmd", "package:agent-cli:windows"]
-    });
-    expect(packageManagerInvocation(["build"], { platform: "win32", env: {} })).toEqual({
-      command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm.cmd", "build"]
-    });
-    expect(packageManagerInvocation(["build"], { platform: "linux", env: {} })).toEqual({
-      command: "pnpm", args: ["build"]
-    });
-  });
-
-  it.runIf(process.platform === "win32")("launches Windows command scripts through the command processor", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-command-"));
-    temporary.push(root);
-    await writeFile(path.join(root, "pnpm.cmd"), "@echo off\r\necho invoked:%*\r\n", "utf8");
-    const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-    const env = { ...process.env, [pathKey]: `${root}${path.delimiter}${process.env[pathKey] ?? ""}` };
-    const invocation = packageManagerInvocation(["probe"], { env });
-    const result = spawnSync(invocation.command, invocation.args, {
-      env, encoding: "utf8", windowsHide: true
-    });
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe("invoked:probe");
-  });
-
   it("refuses a non-empty run directory without modifying its files", async () => {
     const fixture = await manifest();
     const runDir = path.join(fixture.root, "existing-output");

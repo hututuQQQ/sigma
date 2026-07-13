@@ -1,8 +1,3 @@
-import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
-import { once } from "node:events";
-import os from "node:os";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   BrokerCancelledError,
@@ -11,8 +6,6 @@ import {
 } from "../packages/agent-execution/src/index.js";
 import {
   ProcessExecutionUnavailableError,
-  lockWindowsDirectories,
-  normalizeWindowsShellInvocation,
   runProcess,
   shellInvocation,
   type ProcessExecutionPort,
@@ -82,15 +75,9 @@ describe("agent-platform execution boundary", () => {
   });
 
   it("constructs shell invocations without enabling a shell on the broker", () => {
-    expect(normalizeWindowsShellInvocation("cmd.exe", ["/d", "/s", "/c", "cd"], "win32"))
-      .toEqual({ executable: "cmd.exe", args: ["/d", "/s", "/c", "chcp 65001>nul & cd"] });
-    expect(normalizeWindowsShellInvocation("powershell.exe", ["-Command", "Get-Date"], "win32").args[1])
-      .toContain("[Console]::OutputEncoding");
-    expect(normalizeWindowsShellInvocation("cmd.exe", ["/c", "cd"], "linux"))
-      .toEqual({ executable: "cmd.exe", args: ["/c", "cd"] });
-    expect(shellInvocation("cmd", "echo ok")).toEqual(process.platform === "win32"
-      ? { executable: "cmd.exe", args: ["/d", "/s", "/c", "chcp 65001>nul & echo ok"] }
-      : { executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"] });
+    expect(shellInvocation("cmd", "echo ok")).toEqual({
+      executable: "cmd.exe", args: ["/d", "/s", "/c", "echo ok"]
+    });
     expect(shellInvocation("bash", "echo ok")).toEqual({ executable: "bash", args: ["-lc", "echo ok"] });
   });
 
@@ -113,76 +100,4 @@ describe("agent-platform execution boundary", () => {
       stderr: ""
     });
   });
-
-  it.skipIf(process.platform !== "win32")(
-    "holds Windows directories without delete sharing until the lock is released",
-    async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "sigma-windows-directory-lock-"));
-      const held = path.join(root, "held");
-      const moved = path.join(root, "moved");
-      await mkdir(held);
-      const lock = await lockWindowsDirectories([held]);
-      try {
-        await expect(rename(held, moved)).rejects.toMatchObject({
-          code: expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
-        });
-      } finally {
-        await lock.close();
-      }
-      await expect(rename(held, moved)).resolves.toBeUndefined();
-      await rm(root, { recursive: true, force: true });
-    }
-  );
-
-  it.skipIf(process.platform !== "win32")(
-    "releases helper-owned directory handles when the locking parent crashes",
-    async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "sigma-windows-directory-lock-crash-"));
-      const held = path.join(root, "held");
-      const moved = path.join(root, "moved");
-      await mkdir(held);
-      const fixture = path.resolve("tests/fixtures/windows-directory-lock-holder.mjs");
-      const environment = { ...process.env };
-      delete environment.NODE_OPTIONS;
-      const child = spawn(process.execPath, [fixture, held], {
-        cwd: path.resolve("."),
-        env: environment,
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true
-      });
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error(
-            "Windows directory-lock crash fixture did not become ready."
-          )), 5_000);
-          let output = "";
-          child.stdout.setEncoding("utf8");
-          child.stdout.on("data", (chunk: string) => {
-            output += chunk;
-            if (output !== "ready\n") return;
-            clearTimeout(timeout);
-            resolve();
-          });
-          child.once("error", reject);
-          child.once("exit", (code) => reject(new Error(
-            `Windows directory-lock crash fixture exited before readiness (${code ?? "signal"}).`
-          )));
-        });
-        await expect(rename(held, moved)).rejects.toMatchObject({
-          code: expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
-        });
-        child.kill();
-        await once(child, "exit");
-        let renamed = false;
-        for (let attempt = 0; attempt < 100 && !renamed; attempt += 1) {
-          renamed = await rename(held, moved).then(() => true, () => false);
-          if (!renamed) await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-        expect(renamed).toBe(true);
-      } finally {
-        child.kill();
-        await rm(root, { recursive: true, force: true });
-      }
-    }
-  );
 });

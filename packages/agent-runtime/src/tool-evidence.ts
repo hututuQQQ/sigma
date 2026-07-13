@@ -83,7 +83,7 @@ function sanitizeDiagnostic(raw: DiagnosticEvidence, receipt: ToolReceipt, scope
   return {
     ...evidenceBase(scope, receipt),
     kind: "diagnostic",
-    status: receipt.ok ? raw.status : "failed",
+    status: raw.status,
     summary: raw.summary,
     data: { source: raw.data.source, diagnostic: raw.data.diagnostic }
   };

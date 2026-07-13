@@ -4,7 +4,8 @@ import type {
   ToolCallApproval,
   ToolCallPlan,
   ToolDescriptor,
-  ToolReceipt
+  ToolReceipt,
+  WorkspaceDeltaEvidence
 } from "agent-protocol";
 import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
 import {
@@ -13,7 +14,6 @@ import {
   completionPlanError,
   failed,
   lockKeys,
-  mergeDelta,
   workspaceWriteLockKey,
   writeScopeFailure
 } from "./effect-helpers.js";
@@ -27,20 +27,16 @@ import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profileAllowsTool } from "./profile-policy.js";
 import {
   assertToolReceiptIdentity,
+  effectsOutsidePlan,
   normalizeReceiptEvidence
 } from "./tool-evidence.js";
-import {
-  assertCheckpointActionAllowed,
-  assertReceiptWithinPlan,
-  validationTargetIds,
-  workspaceDeltas
-} from "./tool-plan-enforcement.js";
 import type { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import type { RuntimeSession } from "./types.js";
 import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
+import { sessionMutationEvidence, unresolvedWorkspaceDeltas } from "./mutation-evidence.js";
 
 interface PreparedTool extends ToolAttempt {
   descriptor: ToolDescriptor;
@@ -73,6 +69,42 @@ function executionFailureCode(error: unknown): string {
   return typeof code === "string" ? code : "tool_exception";
 }
 
+function validationTargetIds(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  plan: ToolCallPlan
+): string[] | undefined {
+  if (!plan.exactEffects.includes("validation")) return undefined;
+  const argumentsValue = call.arguments;
+  const input = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
+    ? argumentsValue as Record<string, unknown> : {};
+  const requested = input.workspaceDeltaEvidenceIds;
+  if (requested === undefined) return undefined;
+  if (!Array.isArray(requested) || requested.length === 0
+    || requested.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw Object.assign(new Error(
+      "workspaceDeltaEvidenceIds must be a non-empty array of unresolved workspace delta evidence IDs."
+    ), { code: "validation_scope_invalid" });
+  }
+  const unresolved = new Set(unresolvedWorkspaceDeltas(session).map((item) => item.evidenceId));
+  const ids = [...new Set(requested as string[])];
+  const invalid = ids.filter((id) => !unresolved.has(id));
+  if (invalid.length > 0) {
+    throw Object.assign(new Error(
+      `Validation targets are missing, foreign, or already covered: ${invalid.join(", ")}.`
+    ), { code: "validation_scope_invalid" });
+  }
+  return ids;
+}
+
+function workspaceDeltas(session: RuntimeSession, selectedIds: string[] | undefined): WorkspaceDeltaEvidence[] {
+  if (!selectedIds) return unresolvedWorkspaceDeltas(session);
+  const byId = new Map(sessionMutationEvidence(session)
+    .filter((item): item is WorkspaceDeltaEvidence => item.kind === "workspace_delta" && item.status === "passed")
+    .map((item) => [item.evidenceId, item]));
+  return selectedIds.map((id) => byId.get(id)).filter((item): item is WorkspaceDeltaEvidence => Boolean(item));
+}
+
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -90,18 +122,9 @@ export class ToolTransactionRunner {
 
   async execute(session: RuntimeSession, attempt: ToolAttempt, signal: AbortSignal): Promise<ToolReceipt> {
     const startedAt = new Date().toISOString();
-    try {
-      const prepared = await this.prepare(session, attempt, startedAt, signal);
-      if (isReceipt(prepared)) return prepared;
-      return await this.executePrepared(session, prepared, signal);
-    } catch (error) {
-      return failed(
-        attempt.call,
-        startedAt,
-        error instanceof Error ? error.message : String(error),
-        failureCode(error, signal)
-      );
-    }
+    const prepared = await this.prepare(session, attempt, startedAt, signal);
+    if (isReceipt(prepared)) return prepared;
+    return await this.executePrepared(session, prepared, signal);
   }
 
   async withWorkspaceWriteLock<T>(session: RuntimeSession, action: () => Promise<T>): Promise<T> {
@@ -165,14 +188,6 @@ export class ToolTransactionRunner {
     startedAt: string,
     signal: AbortSignal
   ): Promise<ToolReceipt | undefined> {
-    if (session.mode === "analyze" && mutatingPlan(plan)) {
-      return failed(
-        call,
-        startedAt,
-        `Tool '${call.name}' planned mutating effects that are not allowed in analyze mode.`,
-        "mode_denied"
-      );
-    }
     if (session.mode === "change" && mutatingPlan(plan) && !planAllowsMutation(session)) {
       return failed(
         call,
@@ -181,7 +196,7 @@ export class ToolTransactionRunner {
         "plan_required"
       );
     }
-    const scopeError = await writeScopeFailure(session, call, descriptor, startedAt, plan);
+    const scopeError = await writeScopeFailure(session, call, descriptor, startedAt);
     if (scopeError) return scopeError;
     const completionError = completionFailure(session, call, descriptor, startedAt);
     if (completionError) return completionError;
@@ -251,7 +266,7 @@ export class ToolTransactionRunner {
     reservationId: string,
     signal: AbortSignal
   ): Promise<ToolReceipt> {
-    const keys = lockKeys(session, prepared.descriptor, prepared.plan);
+    const keys = lockKeys(session, prepared.descriptor);
     const state: TransactionState = { executionStarted: false };
     try {
       await this.execution.awaitSettled(keys, signal);
@@ -275,13 +290,8 @@ export class ToolTransactionRunner {
     state: TransactionState
   ): Promise<ToolReceipt> {
     const { call, descriptor, plan, startedAt } = prepared;
-    const scopeError = await writeScopeFailure(session, call, descriptor, startedAt, plan);
+    const scopeError = await writeScopeFailure(session, call, descriptor, startedAt);
     if (scopeError) return scopeError;
-    await assertCheckpointActionAllowed(
-      session,
-      plan,
-      async () => await this.options.runtime.hasActiveChildren?.(session.sessionId)
-    );
     const checkpoint = await this.createCheckpoint(session, call, plan);
     if (checkpoint) {
       await this.options.budgets.bindToolCheckpoint(
@@ -298,7 +308,6 @@ export class ToolTransactionRunner {
     call: ModelToolCall,
     plan: ToolCallPlan
   ): Promise<CheckpointRef | undefined> {
-    if (plan.checkpointAction) return undefined;
     if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;
     const scope = plan.checkpointScope.length > 0 ? plan.checkpointScope : ["."];
     return await this.options.control.createCheckpoint(session, scope);
@@ -314,24 +323,13 @@ export class ToolTransactionRunner {
     const { call, modelTurn, descriptor, plan } = prepared;
     try {
       const rawReceipt = await this.execution.execute(
-        session, call, modelTurn, descriptor, plan, signal, keys, prepared.approval
+        session, call, modelTurn, descriptor, signal, keys, prepared.approval
       );
       assertToolReceiptIdentity(rawReceipt, call.id);
-      let receipt = rawReceipt;
-      if (checkpoint) {
-        const inspection = await this.options.control.inspectOpenCheckpoint(
-          session,
-          checkpoint.checkpointId
-        );
-        receipt = {
-          ...rawReceipt,
-          workspaceDelta: mergeDelta(rawReceipt.workspaceDelta, inspection.delta)
-        };
-      }
-      await assertReceiptWithinPlan(session, receipt, plan);
+      this.assertEffectsWithinPlan(rawReceipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
-      await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
-      const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
+      await recordProcessReceipt(session, call, plan, rawReceipt, this.options.emit);
+      const receipt = normalizeReceiptEvidence(rawReceipt, descriptor.name, plan, {
         sessionId: session.sessionId,
         runId: session.runId,
         workspaceDeltas: plan.exactEffects.includes("validation")
@@ -339,9 +337,9 @@ export class ToolTransactionRunner {
       });
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,
-        evidenceIds: (normalizedReceipt.evidence ?? []).map((item) => item.evidenceId)
+        evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId)
       });
-      return normalizedReceipt;
+      return receipt;
     } catch (error) {
       await recordLostProcess(session, call, error, this.options.emit);
       await this.options.emit(session, "execution.failed", "runtime", {
@@ -357,33 +355,23 @@ export class ToolTransactionRunner {
               checkpointId: recovery.checkpointId,
               currentManifestDigest: recovery.currentManifestDigest
             };
-            if (executionFailureCode(error) === "effect_plan_violation"
-              && recovery.checkpointId === checkpoint.checkpointId) {
-              await this.options.control.restorePolicyViolation(
-                session,
-                recovery.checkpointId,
-                recovery.currentManifestDigest
-              );
-              delete session.openCheckpointRecovery;
-            }
           }
         } catch (recoveryError) {
-          session.openCheckpointRecovery ??= {
-            checkpointId: checkpoint.checkpointId,
-            // A preimage digest cannot authorize keeping/restoring a changed
-            // postimage; it only provides a fail-closed placeholder until a
-            // later inspection refreshes the recovery state.
-            currentManifestDigest: checkpoint.preManifestDigest
-          };
-          throw Object.assign(new AggregateError(
-            [error],
-            "Failed to settle the mutation checkpoint after tool failure.",
-            { cause: recoveryError }
-          ), { code: "checkpoint_recovery_failed" });
+          throw new AggregateError([error], "Failed to inspect the mutation checkpoint after tool failure.", {
+            cause: recoveryError
+          });
         }
       }
       throw error;
     }
+  }
+
+  private assertEffectsWithinPlan(receipt: ToolReceipt, plan: ToolCallPlan): void {
+    const outside = effectsOutsidePlan(receipt, plan);
+    if (outside.length === 0) return;
+    throw Object.assign(new Error(
+      `Tool observed effects outside its approved plan: ${outside.join(", ")}.`
+    ), { code: "effect_plan_violation" });
   }
 
 }

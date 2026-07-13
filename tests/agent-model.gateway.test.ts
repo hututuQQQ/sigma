@@ -99,7 +99,6 @@ describe("OpenAI-compatible model gateway", () => {
         { role: "tool", content: "contents", toolCallId: "call_1" }
       ],
       tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object" } }],
-      toolChoice: "required",
       maxOutputTokens: 256,
       temperature: 0,
       signal: new AbortController().signal
@@ -109,7 +108,7 @@ describe("OpenAI-compatible model gateway", () => {
     expect(requestedInit?.headers).toMatchObject({ Authorization: "Bearer secret", "Content-Type": "application/json" });
     expect(JSON.parse(String(requestedInit?.body))).toMatchObject({
       model: "fake",
-      tool_choice: "required",
+      tool_choice: "auto",
       max_tokens: 256,
       temperature: 0,
       tools: [{ type: "function", function: { name: "read_file" } }],

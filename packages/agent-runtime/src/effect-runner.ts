@@ -42,21 +42,6 @@ export interface EffectRunnerOptions {
   hooks: RuntimeHookCoordinator;
 }
 
-function durableToolReceipt(receipt: ToolReceipt): ToolReceipt {
-  const diagnosticCodes = [...new Set([
-    ...(receipt.outcome?.diagnosticCodes ?? []),
-    ...receipt.diagnostics
-  ])];
-  return {
-    ...receipt,
-    outcome: {
-      status: receipt.ok ? "succeeded" : "failed",
-      output: receipt.output,
-      diagnosticCodes
-    }
-  };
-}
-
 export class EffectRunner {
   private readonly models: ModelEffectRunner;
   private readonly reviews: ReviewCoordinator;
@@ -238,7 +223,14 @@ export class EffectRunner {
     const name = session.state.pendingTools.find((item) => item.request.callId === receipt.callId
       && item.modelTurn.turnId === modelTurn.turnId
       && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
-    const durableReceipt = durableToolReceipt(receipt);
+    const durableReceipt: ToolReceipt = receipt.outcome ? receipt : {
+      ...receipt,
+      outcome: {
+        status: receipt.ok ? "succeeded" : "failed",
+        output: receipt.output,
+        diagnosticCodes: [...receipt.diagnostics]
+      }
+    };
     await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
       ...durableReceipt, name, ...turnPayload(modelTurn)
     });

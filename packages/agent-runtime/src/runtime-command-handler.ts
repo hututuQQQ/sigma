@@ -44,28 +44,13 @@ function installCallGrant(
   decision: "allow" | "deny" | "always_allow",
   hasPendingTool: boolean
 ): void {
-  const binding = approval.binding ?? (approval.recovered ? {
-    sessionId: session.sessionId,
-    runId: session.runId,
-    callId: requestId,
-    // Legacy approval events without a durable plan deliberately create a
-    // non-matching sentinel so the resumed runner must present its fresh plan.
-    planEffectsDigest: "unbound"
-  } : undefined);
-  // Every explicit local approval receives a one-shot, plan-bound grant. The
-  // execution gate consumes it before starting a sensitive or mutating call.
-  if (decision === "deny" || !hasPendingTool || !binding
-    || binding.sessionId !== session.sessionId || binding.runId !== session.runId
-    || binding.callId !== requestId) return;
+  if (decision !== "allow" || !hasPendingTool
+    || !approval.effects.some((effect) => effect === "network" || effect === "open_world")) return;
   session.callApprovals.set(requestId, {
-    ...binding,
     callId: requestId,
     authority: "user",
     networkApproved: approval.effects.includes("network"),
-    unsafeHostExecApproved: approval.effects.includes("open_world"),
-    ...(decision === "always_allow"
-      ? { alwaysAllowEffectGrant: approval.effects.slice().sort().join("\0") }
-      : {})
+    unsafeHostExecApproved: approval.effects.includes("open_world")
   });
 }
 
@@ -97,8 +82,6 @@ async function persistApprovalResolution(
 }
 
 export class RuntimeCommandHandler {
-  private readonly approvalResolutions = new Map<string, Promise<void>>();
-
   constructor(private readonly options: RuntimeCommandHandlerOptions) {}
 
   async cancel(session: RuntimeSession, command: Extract<RunCommand, { type: "cancel" }>): Promise<void> {
@@ -114,24 +97,6 @@ export class RuntimeCommandHandler {
   }
 
   async approval(session: RuntimeSession, command: Extract<RunCommand, { type: "approve" }>): Promise<void> {
-    const previous = this.approvalResolutions.get(session.sessionId) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(async () => {
-      await this.resolveApproval(session, command);
-    });
-    this.approvalResolutions.set(session.sessionId, current);
-    try {
-      await current;
-    } finally {
-      if (this.approvalResolutions.get(session.sessionId) === current) {
-        this.approvalResolutions.delete(session.sessionId);
-      }
-    }
-  }
-
-  private async resolveApproval(
-    session: RuntimeSession,
-    command: Extract<RunCommand, { type: "approve" }>
-  ): Promise<void> {
     const approval = session.approvals.get(command.requestId);
     const pendingTool = session.state.pendingTools.find((item) => item.request.callId === command.requestId);
     if (!approval || approval.resolving || (!pendingTool && !approval.external)) {
@@ -144,6 +109,9 @@ export class RuntimeCommandHandler {
     session.approvals.delete(command.requestId);
     if (session.approvals.size === 0) armRunDeadline(session);
     installCallGrant(session, command.requestId, approval, decision, Boolean(pendingTool));
+    if (decision === "always_allow") {
+      session.alwaysAllowedEffects.add(approval.effects.slice().sort().join("\0"));
+    }
     approval.resolve(decision);
     if (approval.recovered && decision === "deny" && pendingTool) {
       await this.options.emit(

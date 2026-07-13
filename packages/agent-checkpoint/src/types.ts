@@ -52,62 +52,6 @@ export interface CheckpointRecord {
   delta?: CheckpointDelta;
 }
 
-function stringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function checkpointDeltaValue(value: unknown): value is CheckpointDelta {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const delta = value as Partial<CheckpointDelta>;
-  return stringArray(delta.added) && stringArray(delta.modified) && stringArray(delta.deleted);
-}
-
-function optionalString(value: unknown): boolean {
-  return value === undefined || typeof value === "string";
-}
-
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-function checkpointDigest(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
-}
-
-function optionalCheckpointDigest(value: unknown): boolean {
-  return value === undefined || checkpointDigest(value);
-}
-
-function checkpointStatus(value: unknown): value is CheckpointStatus {
-  return value === "open" || value === "sealed" || value === "restored";
-}
-
-function optionalCheckpointDelta(value: unknown): boolean {
-  return value === undefined || checkpointDeltaValue(value);
-}
-
-/** Strictly validates records before persisted state is trusted or replayed. */
-export function isCheckpointRecord(value: unknown): value is CheckpointRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Partial<CheckpointRecord>;
-  return [
-    record.schemaVersion === 1,
-    nonEmptyString(record.checkpointId),
-    nonEmptyString(record.sessionId),
-    nonEmptyString(record.runId),
-    checkpointStatus(record.status),
-    nonEmptyString(record.workspacePath),
-    stringArray(record.scopePaths),
-    Number.isSafeInteger(record.baseSeq),
-    nonEmptyString(record.createdAt),
-    optionalString(record.sealedAt),
-    optionalString(record.restoredAt),
-    checkpointDigest(record.preManifestDigest),
-    optionalCheckpointDigest(record.postManifestDigest),
-    optionalCheckpointDelta(record.delta)
-  ].every(Boolean);
-}
-
 export interface CreateCheckpointInput {
   sessionId: string;
   runId: string;
@@ -174,12 +118,10 @@ export class CheckpointLimitError extends Error {
 export class CheckpointRecoveryError extends Error {
   readonly code = "checkpoint_recovery_failed";
   readonly transactionPath: string;
-  readonly recoveryPath: string;
 
   constructor(message: string, transactionPath: string, cause?: unknown) {
     super(message, { cause });
     this.name = "CheckpointRecoveryError";
     this.transactionPath = transactionPath;
-    this.recoveryPath = transactionPath;
   }
 }

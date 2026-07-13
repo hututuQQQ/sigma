@@ -21,7 +21,6 @@ export type ToolEffect =
   | "outcome.propose"
   | "outcome.request_input"
   | "runtime.control"
-  | "checkpoint.restore"
   | "destructive"
   | "open_world";
 
@@ -58,18 +57,10 @@ export interface ToolPreparationContext {
 export interface ToolCallPlan {
   exactEffects: ToolEffect[];
   readPaths: string[];
-  /** Paths whose contents are approved to change. A directory entry approves
-   * changes below it; process tools may use a broader checkpointScope to make
-   * every sandbox-authorized write recoverable. */
   writePaths: string[];
   network: "none" | "full";
   processMode: "none" | "pipe" | "pty" | "background";
-  /** Complete rollback scope for the call. For process tools this is also the
-   * maximum filesystem scope granted write access by the execution broker. */
   checkpointScope: string[];
-  /** Transaction-control actions are executed by the runtime without opening
-   * a nested mutation checkpoint. The target is frozen during preparation. */
-  checkpointAction?: { kind: "restore"; checkpointId: string };
   idempotence: "read_only" | "replay_safe" | "non_replayable";
 }
 
@@ -116,7 +107,6 @@ export interface RuntimeControlPort {
   readBudget(): Promise<BudgetLedgerState>;
   listCheckpoints(): Promise<CheckpointRef[]>;
   createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
-  restoreRunCheckpoint(checkpointId: string): Promise<CheckpointRef>;
   loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
   resolveLoadedSkillResource(input: {
     qualifiedName: string;
@@ -142,9 +132,6 @@ export interface ToolExecutionContext {
   runId: string;
   workspacePath: string;
   runMode: import("./outcomes.js").RunMode;
-  /** Immutable runtime-approved plan for this exact call. Mutating tools must
-   * fail closed when it is unavailable. */
-  callPlan?: ToolCallPlan;
   /** Ephemeral, call-bound human authorization. Never persisted or restored. */
   approval?: ToolCallApproval;
   signal: AbortSignal;

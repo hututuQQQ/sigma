@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { BrokerDoctorReport, ExecutionBroker } from "../packages/agent-execution/src/index.js";
+import type { ExecutionBroker } from "../packages/agent-execution/src/index.js";
 import {
   DEFAULT_PROFILE_BUDGET,
   freezeAgentProfile,
@@ -129,21 +129,10 @@ function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
 
 function unusedBroker(): ExecutionBroker {
   const fail = async (): Promise<never> => await Promise.reject(new Error("broker must not run"));
-  const report: BrokerDoctorReport = {
-    protocolVersion: 1,
-    brokerVersion: "fixture",
-    platform: process.platform,
-    architecture: process.arch,
-    sandbox: { available: true, backend: "fixture", selfTestPassed: true, setupRequired: false },
-    capabilities: {
-      foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"],
-      shells: [{ kind: process.platform === "win32" ? "cmd" : "bash", executable: "fixture", verified: true }]
-    }
-  };
   return {
     lostProcessHandles: [],
-    connect: async () => report,
-    doctor: async () => report,
+    connect: fail,
+    doctor: fail,
     execute: fail,
     spawn: fail,
     poll: fail,
@@ -176,11 +165,10 @@ afterEach(async () => {
 describe("production agent-profile hook runner", () => {
   it("runs through configured-runtime without an injected agent-profile runner", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-profile-hook-configured-"));
-    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-profile-hook-state-"));
-    fixtures.push(workspace, stateRoot);
+    fixtures.push(workspace);
     const gateway = new HookGateway("{}");
     const runtime = await createConfiguredRuntime(configured(workspace), {
-      stateRootDir: stateRoot,
+      stateRootDir: path.join(workspace, "state"),
       executionBroker: unusedBroker(),
       gatewayFactory: () => gateway,
       hookDefinitions: [hook("standard")]

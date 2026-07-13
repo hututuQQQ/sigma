@@ -1,10 +1,7 @@
 import type { RuntimeSession } from "./types.js";
 
 function timeoutError(deadlineAt: string): Error {
-  const error = Object.assign(
-    new Error(`Run exceeded its durable active-time deadline ${deadlineAt}.`),
-    { code: "run_deadline" }
-  );
+  const error = new Error(`Run exceeded its durable active-time deadline ${deadlineAt}.`);
   error.name = "TimeoutError";
   return error;
 }

@@ -221,9 +221,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
       message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
     });
-    expect(incomplete.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure", code: "terminal_protocol_missing"
-    });
+    expect(incomplete.proposedOutcome).toMatchObject({ kind: "needs_input", message: "still no action" });
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
@@ -348,21 +346,6 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       observedEffects: ["outcome.propose"], artifacts: ["artifact"], diagnostics: ["checked"], startedAt: "start", completedAt: "end"
     });
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
-
-    let repairedCompletion = withPendingTool("repair-complete", "complete_task");
-    repairedCompletion = {
-      ...repairedCompletion,
-      completionRepairAttempts: 1,
-      messages: [...repairedCompletion.messages, { role: "assistant", content: "Detailed final answer." }]
-    };
-    repairedCompletion = toolEvent(repairedCompletion, "tool.completed", "repair-complete", {
-      ok: true, output: JSON.stringify({ summary: "short summary" }),
-      observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [],
-      startedAt: "start", completedAt: "end"
-    });
-    expect(repairedCompletion).toMatchObject({
-      proposedOutcome: { kind: "completed", message: "Detailed final answer." }
-    });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
       message: "committed", outcomeRevision: committedRevision, evidence: [diagnosticEvidence("durable-child")]

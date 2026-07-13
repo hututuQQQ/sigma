@@ -4,21 +4,15 @@ use std::process::Child;
 #[cfg(windows)]
 pub(crate) struct PlatformGuard {
     handle: isize,
-    process_handle: isize,
-    recover_sandbox: bool,
-    quiesced: bool,
-    recovered: bool,
 }
 
 #[cfg(windows)]
 impl PlatformGuard {
-    pub(crate) fn attach(child: &mut Child, recover_sandbox: bool) -> Result<Self, RpcError> {
+    pub(crate) fn attach(child: &mut Child) -> Result<Self, RpcError> {
         use std::mem::size_of;
         use std::os::windows::io::AsRawHandle;
-        use std::ptr::{null, null_mut};
-        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use std::ptr::null;
         use windows_sys::Win32::System::JobObjects::*;
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         unsafe {
             let job = CreateJobObjectW(null(), null());
             if job.is_null() {
@@ -45,117 +39,75 @@ impl PlatformGuard {
                     "failed to assign process to kill-on-close Job Object",
                 ));
             }
-            let mut process_handle = null_mut();
-            if DuplicateHandle(
-                GetCurrentProcess(),
-                child.as_raw_handle(),
-                GetCurrentProcess(),
-                &mut process_handle,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            ) == 0
-            {
-                windows_sys::Win32::Foundation::CloseHandle(job);
-                let _ = child.kill();
-                return Err(RpcError::new(
-                    "process_containment_failed",
-                    format!(
-                        "failed to retain launcher process handle: {}",
-                        std::io::Error::last_os_error()
-                    ),
-                ));
-            }
             Ok(Self {
                 handle: job as isize,
-                process_handle: process_handle as isize,
-                recover_sandbox,
-                quiesced: false,
-                recovered: false,
             })
         }
     }
 
-    fn terminate_job_and_wait(&mut self) -> Result<(), RpcError> {
+    fn terminate_job_and_wait(&self) -> Result<(), RpcError> {
         use std::mem::size_of;
         use std::ptr::null_mut;
         use std::thread;
         use std::time::{Duration, Instant};
-        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::JobObjects::*;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        if !self.quiesced {
-            unsafe {
-                if TerminateJobObject(self.handle as _, 1) == 0 {
-                    return Err(RpcError::new(
-                        "process_containment_failed",
-                        format!(
-                            "TerminateJobObject failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    ));
-                }
-            }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-                let queried = unsafe {
-                    QueryInformationJobObject(
-                        self.handle as _,
-                        JobObjectBasicAccountingInformation,
-                        &mut accounting as *mut _ as *mut _,
-                        size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                        null_mut(),
-                    )
-                };
-                if queried == 0 {
-                    return Err(RpcError::new(
-                        "process_containment_failed",
-                        format!(
-                            "QueryInformationJobObject failed: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    ));
-                }
-                if accounting.ActiveProcesses == 0 {
-                    self.quiesced = true;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    return Err(RpcError::new(
-                        "process_containment_failed",
-                        format!(
-                            "Windows Job Object retained {} active processes after termination",
-                            accounting.ActiveProcesses
-                        ),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            let waited = unsafe { WaitForSingleObject(self.process_handle as _, u32::MAX) };
-            if waited != WAIT_OBJECT_0 {
+        unsafe {
+            if TerminateJobObject(self.handle as _, 1) == 0 {
                 return Err(RpcError::new(
                     "process_containment_failed",
-                    format!("waiting for sandbox launcher failed (wait result {waited})"),
+                    format!(
+                        "TerminateJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
                 ));
             }
         }
-        if self.recover_sandbox && !self.recovered {
-            crate::windows_sandbox::recover_after_process_quiesced()?;
-            self.recovered = true;
+        let deadline = Instant::now() + Duration::from_millis(750);
+        loop {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle as _,
+                    JobObjectBasicAccountingInformation,
+                    &mut accounting as *mut _ as *mut _,
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(RpcError::new(
+                    "process_containment_failed",
+                    format!(
+                        "QueryInformationJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+            if accounting.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RpcError::new(
+                    "process_containment_failed",
+                    format!(
+                        "Windows Job Object retained {} active processes after termination",
+                        accounting.ActiveProcesses
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
         }
-        Ok(())
     }
 
-    pub(crate) fn terminate(&mut self, _child: &mut Child) -> Result<(), RpcError> {
+    pub(crate) fn terminate(&self, _child: &mut Child) -> Result<(), RpcError> {
         self.terminate_job_and_wait()
     }
 
-    pub(crate) fn force_terminate(&mut self, child: &mut Child) -> Result<(), RpcError> {
+    pub(crate) fn force_terminate(&self, child: &mut Child) -> Result<(), RpcError> {
         self.terminate(child)
     }
 
-    pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
+    pub(crate) fn cleanup_descendants(&self) -> Result<(), RpcError> {
         self.terminate_job_and_wait()
     }
 }
@@ -163,9 +115,7 @@ impl PlatformGuard {
 #[cfg(windows)]
 impl Drop for PlatformGuard {
     fn drop(&mut self) {
-        let _ = self.cleanup_descendants();
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.process_handle as _);
             windows_sys::Win32::Foundation::CloseHandle(self.handle as _);
         }
     }
@@ -178,7 +128,7 @@ pub(crate) struct PlatformGuard {
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 impl PlatformGuard {
-    pub(crate) fn attach(child: &mut Child, _recover_sandbox: bool) -> Result<Self, RpcError> {
+    pub(crate) fn attach(child: &mut Child) -> Result<Self, RpcError> {
         Ok(Self {
             process_group: child.id() as i32,
         })
@@ -212,7 +162,7 @@ impl PlatformGuard {
         Ok(())
     }
 
-    pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
+    pub(crate) fn cleanup_descendants(&self) -> Result<(), RpcError> {
         #[cfg(unix)]
         unsafe {
             libc::kill(-self.process_group, libc::SIGKILL);
@@ -239,7 +189,7 @@ pub(crate) struct PlatformGuard {
 
 #[cfg(target_os = "linux")]
 impl PlatformGuard {
-    pub(crate) fn attach(child: &mut Child, _recover_sandbox: bool) -> Result<Self, RpcError> {
+    pub(crate) fn attach(child: &mut Child) -> Result<Self, RpcError> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 

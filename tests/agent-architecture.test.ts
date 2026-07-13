@@ -603,15 +603,6 @@ describe("Sigma architecture", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-resume-"));
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const restoredPlan = {
-      exactEffects: ["filesystem.write"],
-      readPaths: ["restored.txt"],
-      writePaths: ["restored.txt"],
-      network: "none",
-      processMode: "none",
-      checkpointScope: ["restored.txt"],
-      idempotence: "replay_safe"
-    };
     const persisted = [
       event(1, "session.created", { workspacePath: workspace, mode: "change" }),
       event(2, "plan.updated", {
@@ -641,15 +632,8 @@ describe("Sigma architecture", () => {
         toolCalls: [{ id: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }]
       }),
       event(7, "tool.requested", { turnId: 1, effectRevision: 4, callId: "restored-write", name: "write", arguments: { path: "restored.txt", content: "ok" } }),
-      event(8, "execution.planned", {
-        executionId: "restored-write", toolCallId: "restored-write", plan: restoredPlan
-      }),
-      event(9, "tool.approval_requested", {
-        turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write",
-        toolName: "write", arguments: { path: "restored.txt", content: "ok" },
-        effects: ["filesystem.write"], plan: restoredPlan
-      }),
-      event(10, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", message: "approval required" })
+      event(8, "tool.approval_requested", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", toolName: "write" }),
+      event(9, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", message: "approval required" })
     ];
     for (const stored of persisted) await store.append(stored, stored.seq - 1);
     const runtime = createRuntime({
@@ -720,36 +704,6 @@ describe("Sigma architecture", () => {
     await cancelledRuntime.command({ type: "resume", sessionId: "session" });
     await cancelledRuntime.command({ type: "cancel", sessionId: "session", reason: "do not retry" });
     await expect(cancelledRuntime.waitForOutcome("session")).resolves.toMatchObject({ kind: "cancelled", reason: "do not retry" });
-
-    const durableDeniedWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-durable-deny-resume-"));
-    const durableDeniedStore = await createSuspendedStore(durableDeniedWorkspace);
-    await durableDeniedStore.store.append({
-      ...event(9, "tool.approval_resolved", {
-        turnId: 1,
-        effectRevision: 3,
-        requestId: "pending-write",
-        callId: "pending-write",
-        decision: "deny"
-      }),
-      authority: "user"
-    }, 8);
-    const durableDeniedRuntime = createRuntime({
-      gateway: new FakeGateway([{ message: { role: "assistant", content: "durable denial settled" }, finishReason: "stop" }]),
-      store: durableDeniedStore.store,
-      storeRootDir: durableDeniedStore.storeRootDir,
-      tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "ask",
-      runDeadlineMs: 10_000
-    });
-    await durableDeniedRuntime.command({ type: "resume", sessionId: "session" });
-    await expect(durableDeniedRuntime.waitForOutcome("session")).resolves.toMatchObject({
-      kind: "completed", message: "durable denial settled"
-    });
-    await expect(readFile(path.join(durableDeniedWorkspace, "result.txt"), "utf8")).rejects.toThrow();
-    const durableDeniedEvents: AgentEventEnvelope[] = [];
-    for await (const stored of durableDeniedStore.store.events("session")) durableDeniedEvents.push(stored);
-    expect(durableDeniedEvents.some((stored) => stored.type === "tool.failed"
-      && (stored.payload as { diagnostics?: string[] }).diagnostics?.includes("recovery_retry_denied"))).toBe(true);
   });
 
   it("normalizes a throwing tool into a protocol receipt", async () => {

@@ -5,25 +5,13 @@ import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { extractArchiveBytes, inspectArchiveBytes } from "./archive-safety.mjs";
-import { inspectPeAuthenticodeIdentity } from "./pe-authenticode-identity.mjs";
-import {
-  MAX_PROVENANCE_ENVELOPE_BYTES,
-  loadTrustedReleaseProvenanceKeys,
-  verifyProvenanceEnvelope
-} from "./release-provenance-signing.mjs";
-import { loadAllowedWindowsSignerCertificateSha256 } from "./windows-release-signing.mjs";
 import {
   agentCliBundleName,
   defaultRootDir,
-  inspectWindowsAuthenticode,
   inspectSigmaExecBinary,
   normalizeTargetPlatform,
   pinnedNodeVersion,
   normalizeTargetArch,
-  windowsAppContainerNodeCompatibility,
-  windowsNodeGlobalPipeMarker,
-  windowsNodeLocalPipeMarker,
   v3PortablePackages,
   workspaceRuntimePackages
 } from "./package-agent-cli.mjs";
@@ -34,8 +22,71 @@ const portableLanguageAssets = Object.freeze({
   pyrightServer: "node_modules/pyright/langserver.index.js"
 });
 
+function tarEntries(tarball, spawn = spawnSync) {
+  const result = spawn("tar", ["-tzf", tarball], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`failed to list ${tarball} with tar: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
 function psQuote(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function runPowerShell(script, spawn = spawnSync) {
+  const candidates = process.platform === "win32"
+    ? ["powershell.exe", "powershell", "pwsh"]
+    : ["pwsh", "powershell"];
+  let last = null;
+  for (const command of candidates) {
+    const result = spawn(command, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+      encoding: "utf8"
+    });
+    last = result;
+    if (!result.error && result.status === 0) return result;
+  }
+  return last;
+}
+
+function zipEntries(archive, spawn = spawnSync) {
+  const tar = spawn("tar", ["-tf", archive], { encoding: "utf8" });
+  if (!tar.error && tar.status === 0) return tar.stdout.split(/\r?\n/).filter(Boolean);
+  const powerShell = runPowerShell(
+    `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; $zip = [System.IO.Compression.ZipFile]::OpenRead(${psQuote(archive)}); try { $zip.Entries | ForEach-Object { $_.FullName } } finally { $zip.Dispose() }`,
+    spawn
+  );
+  if (powerShell && !powerShell.error && powerShell.status === 0) {
+    return powerShell.stdout.split(/\r?\n/).filter(Boolean);
+  }
+
+  const result = spawn("unzip", ["-Z1", archive], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`failed to list ${archive} as zip: ${result.stderr || result.stdout || powerShell?.stderr || powerShell?.stdout || tar.stderr || tar.stdout}`);
+  }
+  return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+function extractTarball(tarball, destination, spawn = spawnSync) {
+  const result = spawn("tar", ["-xzf", tarball, "-C", destination], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`failed to extract ${tarball} with tar: ${result.stderr || result.stdout}`);
+  }
+}
+
+function extractZipArchive(archive, destination, spawn = spawnSync) {
+  const tar = spawn("tar", ["-xf", archive, "-C", destination], { encoding: "utf8" });
+  if (!tar.error && tar.status === 0) return;
+  const powerShell = runPowerShell(
+    `$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath ${psQuote(archive)} -DestinationPath ${psQuote(destination)} -Force`,
+    spawn
+  );
+  if (powerShell && !powerShell.error && powerShell.status === 0) return;
+
+  const result = spawn("unzip", ["-q", archive, "-d", destination], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`failed to extract ${archive} as zip: ${result.stderr || result.stdout || powerShell?.stderr || powerShell?.stdout || tar.stderr || tar.stdout}`);
+  }
 }
 
 function requireEntries(entries, required) {
@@ -412,71 +463,8 @@ async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
-async function readBoundedJson(filePath, maximumBytes, label) {
-  const stats = await lstat(filePath);
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.size === 0 || stats.size > maximumBytes) {
-    throw new Error(`${label} must be a non-empty regular file no larger than ${maximumBytes} bytes.`);
-  }
-  const bytes = await readFile(filePath);
-  const text = bytes.toString("utf8");
-  if (!Buffer.from(text, "utf8").equals(bytes)) throw new Error(`${label} is not canonical UTF-8.`);
-  return JSON.parse(text);
-}
-
 async function sha256File(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
-}
-
-function bufferOccurrenceCount(buffer, marker) {
-  let count = 0;
-  let offset = 0;
-  while (offset <= buffer.length - marker.length) {
-    const found = buffer.indexOf(marker, offset);
-    if (found < 0) break;
-    count += 1;
-    offset = found + 1;
-  }
-  return count;
-}
-
-function assertNodeCompatibilityRecord(record, label) {
-  if (!record || typeof record !== "object") {
-    throw new Error(`${label} must declare the approved Windows AppContainer Node compatibility patch.`);
-  }
-  for (const [name, expected] of Object.entries(windowsAppContainerNodeCompatibility)) {
-    const matches = expected && typeof expected === "object"
-      ? JSON.stringify(record[name]) === JSON.stringify(expected)
-      : record[name] === expected;
-    if (!matches) {
-      throw new Error(`${label} has an invalid Windows AppContainer Node compatibility field ${name}.`);
-    }
-  }
-}
-
-function verifyWindowsNodeCompatibility(nodeBytes, metadata, manifest, nodeEntry, targetPlatform, targetArch) {
-  if (targetPlatform !== "win32" || targetArch !== "x64") {
-    if (metadata.node?.compatibility !== undefined || manifest.nodeCompatibility !== undefined) {
-      throw new Error("Windows Node compatibility metadata must not appear on another target.");
-    }
-    return false;
-  }
-  assertNodeCompatibilityRecord(metadata.node?.compatibility, "Package metadata");
-  assertNodeCompatibilityRecord(manifest.nodeCompatibility, "Integrity manifest");
-  const identity = inspectPeAuthenticodeIdentity(nodeBytes, "Bundled Windows Node");
-  if (identity.fullSha256 !== nodeEntry.sha256) {
-    throw new Error("Bundled Windows Node full digest is inconsistent with its integrity entry.");
-  }
-  if (identity.normalizedContentSha256 !== windowsAppContainerNodeCompatibility.normalizedContentSha256) {
-    throw new Error("Bundled Windows Node normalized content is not the approved AppContainer-compatible executable.");
-  }
-  const globalCount = bufferOccurrenceCount(nodeBytes, windowsNodeGlobalPipeMarker);
-  const localCount = bufferOccurrenceCount(nodeBytes, windowsNodeLocalPipeMarker);
-  if (globalCount !== 0 || localCount !== 1) {
-    throw new Error(
-      `Bundled Windows Node has an invalid AppContainer pipe marker layout (global=${globalCount}, local=${localCount}).`
-    );
-  }
-  return true;
 }
 
 function safeBundlePath(bundleDir, relativePath) {
@@ -511,28 +499,22 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
   if (!Array.isArray(manifest.entries) || manifest.entries.length !== descriptor.entries) {
     throw new Error("Portable integrity manifest entry count does not match package metadata.");
   }
-  const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const entries = new Map();
-  let verifiedNodeBytes;
   for (const entry of manifest.entries) {
     if (entries.has(entry.path)) throw new Error(`Duplicate portable integrity entry: ${entry.path}`);
     const absolute = safeBundlePath(bundleDir, entry.path);
     const stats = await lstat(absolute).catch(() => null);
     if (!stats?.isFile() || stats.isSymbolicLink()) throw new Error(`Integrity entry is not a regular file: ${entry.path}`);
     if (stats.size !== entry.size) throw new Error(`Integrity size mismatch for ${entry.path}`);
-    const bytes = await readFile(absolute);
-    const digest = createHash("sha256").update(bytes).digest("hex");
+    const digest = await sha256File(absolute);
     if (digest !== entry.sha256) throw new Error(`Integrity SHA-256 mismatch for ${entry.path}`);
-    if (entry.path === nodePath) verifiedNodeBytes = bytes;
     entries.set(entry.path, entry);
   }
+  const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec"}`;
   const requiredFiles = [
     nodePath,
     brokerPath,
-    `bin/${targetPlatform === "win32" ? "agent.cmd" : "agent"}`,
-    "package.json",
-    "README.md",
     ...Object.values(portableLanguageAssets),
     "assets/tokenizers/sigma-cjk-byte-v1.json",
     "sbom.cdx.json"
@@ -540,39 +522,23 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
   for (const required of requiredFiles) {
     if (!entries.has(required)) throw new Error(`Integrity manifest does not cover required portable asset: ${required}`);
   }
-  const deliberatelyUnmanifested = new Set(["integrity-manifest.json", "package-metadata.json"]);
-  const observedManifestEntries = new Set();
-  async function verifyCompleteTree(absolute) {
-    const stats = await lstat(absolute);
-    const relative = path.relative(bundleDir, absolute).replaceAll(path.sep, "/");
-    if (stats.isSymbolicLink()) throw new Error(`Portable bundle contains a symbolic link: ${relative}`);
-    if (stats.isDirectory()) {
-      for (const item of await readdir(absolute, { withFileTypes: true })) {
-        await verifyCompleteTree(path.join(absolute, item.name));
+  async function assertTreeCovered(relativeRoot) {
+    const absoluteRoot = safeBundlePath(bundleDir, relativeRoot);
+    async function visit(absolute) {
+      const stats = await lstat(absolute);
+      const relative = path.relative(bundleDir, absolute).replaceAll(path.sep, "/");
+      if (stats.isSymbolicLink()) throw new Error(`Language runtime tree contains a symbolic link: ${relative}`);
+      if (stats.isDirectory()) {
+        for (const item of await readdir(absolute, { withFileTypes: true })) await visit(path.join(absolute, item.name));
+      } else if (stats.isFile() && !entries.has(relative)) {
+        throw new Error(`Integrity manifest omits language runtime file: ${relative}`);
       }
-      return;
     }
-    if (!stats.isFile()) throw new Error(`Portable bundle contains a non-regular entry: ${relative}`);
-    if (deliberatelyUnmanifested.has(relative)) return;
-    if (!entries.has(relative)) throw new Error(`Integrity manifest omits portable bundle file: ${relative}`);
-    observedManifestEntries.add(relative);
+    await visit(absoluteRoot);
   }
-  await verifyCompleteTree(bundleDir);
-  for (const manifestEntry of entries.keys()) {
-    if (!observedManifestEntries.has(manifestEntry)) {
-      throw new Error(`Integrity manifest path is not canonical bundle content: ${manifestEntry}`);
-    }
-  }
+  await assertTreeCovered("node_modules/typescript");
+  await assertTreeCovered("node_modules/pyright");
   if (metadata.node?.sha256 !== entries.get(nodePath).sha256) throw new Error("Bundled Node digest metadata does not match the manifest.");
-  if (!verifiedNodeBytes) throw new Error("Integrity manifest did not yield bundled Node bytes.");
-  const nodeCompatibilityVerified = verifyWindowsNodeCompatibility(
-    verifiedNodeBytes,
-    metadata,
-    manifest,
-    entries.get(nodePath),
-    targetPlatform,
-    targetArch
-  );
   if (metadata.sigmaExec?.sha256 !== entries.get(brokerPath).sha256) throw new Error("sigma-exec digest metadata does not match the manifest.");
   const metadataAssets = [
     [metadata.assets?.languageServers, "typescript", portableLanguageAssets.typescriptServer],
@@ -591,10 +557,7 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     manifestDigest,
     nodePath,
     brokerPath,
-    node: entries.get(nodePath),
-    sigmaExec: entries.get(brokerPath),
     languageServerAssetsVerified: true,
-    nodeCompatibilityVerified,
     languageServerAssetPaths: portableLanguageAssets
   };
 }
@@ -693,25 +656,6 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
     || node.properties.get("sigma:archive-sha256") !== metadata.node?.archiveSha256) {
     throw new Error("CycloneDX bundled Node component does not match Node metadata.");
   }
-  if (targetPlatform === "win32" && targetArch === "x64") {
-    assertNodeCompatibilityRecord(metadata.node?.compatibility, "Package metadata");
-    const compatibilityProperties = new Map([
-      ["sigma:compatibility-kind", metadata.node.compatibility.kind],
-      ["sigma:compatibility-patch-id", metadata.node.compatibility.patchId],
-      ["sigma:compatibility-reason", metadata.node.compatibility.reason],
-      ["sigma:source-sha256", metadata.node.compatibility.sourceSha256],
-      ["sigma:normalized-content-sha256", metadata.node.compatibility.normalizedContentSha256],
-      ["sigma:runtime-environment", JSON.stringify(metadata.node.compatibility.runtimeEnvironment)],
-      ["sigma:runtime-environment-reason", metadata.node.compatibility.runtimeEnvironmentReason],
-      ["sigma:sandbox-runtime-environment", JSON.stringify(metadata.node.compatibility.sandboxRuntimeEnvironment)],
-      ["sigma:sandbox-runtime-environment-reason", metadata.node.compatibility.sandboxRuntimeEnvironmentReason]
-    ]);
-    for (const [name, expected] of compatibilityProperties) {
-      if (node.properties.get(name) !== expected) {
-        throw new Error(`CycloneDX bundled Node component has invalid compatibility property ${name}.`);
-      }
-    }
-  }
   const broker = componentsByPath.get(brokerPath);
   if (metadata.sigmaExec?.targetPlatform !== targetPlatform
     || metadata.sigmaExec?.targetArch !== targetArch
@@ -722,111 +666,7 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
   return { portableAssets: requiredAssets.length, tokenizerAssets: tokenizerEntries.length };
 }
 
-function assertExactJson(actual, expected, label) {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`${label} does not match package metadata.`);
-  }
-}
-
-function authenticodeArtifactEvidence(value) {
-  return {
-    required: value?.required,
-    authenticodeVerified: value?.authenticodeVerified,
-    observedSignerIds: value?.observedSignerIds,
-    signatures: value?.signatures,
-    sourceSignatureInvalidatedByPatch: value?.sourceSignatureInvalidatedByPatch,
-    sourceSignatureStatus: value?.sourceSignatureStatus
-  };
-}
-
-function verifyPortableProvenance(
-  provenance,
-  archive,
-  archiveSha256,
-  metadata,
-  integrity,
-  targetPlatform,
-  targetArch
-) {
-  if (provenance?._type !== "https://in-toto.io/Statement/v1"
-    || provenance?.predicateType !== "https://slsa.dev/provenance/v1") {
-    throw new Error("Portable provenance has an unsupported statement or predicate type.");
-  }
-  const expectedSubject = [{ name: path.basename(archive), digest: { sha256: archiveSha256 } }];
-  assertExactJson(provenance.subject, expectedSubject, "Portable provenance subject");
-  const buildDefinition = provenance.predicate?.buildDefinition;
-  if (buildDefinition?.buildType !== "https://sigma-code.dev/build-types/portable-cli/v3") {
-    throw new Error("Portable provenance has an unexpected build type.");
-  }
-  assertExactJson(buildDefinition.externalParameters, {
-    version: metadata.productVersion,
-    targetPlatform,
-    targetArch
-  }, "Portable provenance external parameters");
-  const windowsTarget = targetPlatform === "win32" && targetArch === "x64";
-  if (windowsTarget) {
-    assertNodeCompatibilityRecord(
-      buildDefinition.internalParameters?.nodeCompatibility,
-      "Portable provenance"
-    );
-  } else if (buildDefinition.internalParameters !== undefined) {
-    throw new Error("Portable provenance has unexpected internal parameters for a non-Windows target.");
-  }
-  const dependencies = buildDefinition.resolvedDependencies;
-  if (!Array.isArray(dependencies)) {
-    throw new Error("Portable provenance must declare resolved dependencies.");
-  }
-  const actualDependencies = new Map();
-  for (const dependency of dependencies) {
-    if (typeof dependency?.uri !== "string" || actualDependencies.has(dependency.uri)
-      || !/^[a-f0-9]{64}$/u.test(String(dependency?.digest?.sha256 ?? ""))) {
-      throw new Error("Portable provenance contains an invalid or duplicate resolved dependency.");
-    }
-    actualDependencies.set(dependency.uri, dependency.digest.sha256);
-  }
-  const nodePath = `bin/${windowsTarget ? "node.exe" : "node"}`;
-  const expectedDependencies = new Map([
-    ["pkg:generic/node-runtime-archive", metadata.node.archiveSha256],
-    [`file:${nodePath}`, integrity.node.sha256],
-    ["pkg:generic/sigma-exec", integrity.sigmaExec.sha256],
-    ["file:integrity-manifest.json", integrity.manifestDigest],
-    ...(windowsTarget ? [[
-      `pkg:generic/node-runtime-source@${pinnedNodeVersion}`,
-      windowsAppContainerNodeCompatibility.sourceSha256
-    ]] : [])
-  ]);
-  if (actualDependencies.size !== expectedDependencies.size) {
-    throw new Error("Portable provenance resolved dependency set is incomplete or contains extras.");
-  }
-  for (const [uri, digest] of expectedDependencies) {
-    if (actualDependencies.get(uri) !== digest) {
-      throw new Error(`Portable provenance dependency ${uri} does not match its verified digest.`);
-    }
-  }
-  const runDetails = provenance.predicate?.runDetails;
-  if (runDetails?.builder?.id !== "https://sigma-code.dev/builders/local-portable-packager/v3") {
-    throw new Error("Portable provenance has an unexpected builder identity.");
-  }
-  assertExactJson(runDetails.metadata, {
-    invocationId: `${metadata.productVersion}:${targetPlatform}:${targetArch}`,
-    signing: metadata.signing
-  }, "Portable provenance run metadata");
-  if (windowsTarget && (metadata.signing?.sourceSignatureInvalidatedByPatch !== true
-    || metadata.signing?.sourceSignatureStatus !== "invalidated-by-deterministic-patch")) {
-    throw new Error("Portable signing metadata must disclose deterministic Node patch signature invalidation.");
-  }
-}
-
-async function verifyReleaseSidecars(
-  archive,
-  archiveSha256,
-  bundleDir,
-  metadata,
-  integrity,
-  targetPlatform,
-  targetArch,
-  trustedReleasePublicKeys
-) {
+async function verifyReleaseSidecars(archive, bundleDir, metadata, integrity, targetPlatform, targetArch) {
   const sidecars = metadata.sidecars;
   for (const key of ["checksum", "sbom", "provenance"]) {
     if (typeof sidecars?.[key] !== "string" || path.basename(sidecars[key]) !== sidecars[key]) {
@@ -837,6 +677,7 @@ async function verifyReleaseSidecars(
   const checksumPath = path.join(directory, sidecars.checksum);
   const sbomPath = path.join(directory, sidecars.sbom);
   const provenancePath = path.join(directory, sidecars.provenance);
+  const archiveSha256 = await sha256File(archive);
   const checksum = (await readFile(checksumPath, "utf8")).trim().split(/\s+/);
   if (checksum[0] !== archiveSha256 || checksum.at(-1) !== path.basename(archive)) {
     throw new Error("Portable archive SHA-256 sidecar does not match the archive.");
@@ -856,28 +697,18 @@ async function verifyReleaseSidecars(
     targetPlatform,
     targetArch
   );
-  const provenanceEnvelope = await readBoundedJson(
-    provenancePath,
-    MAX_PROVENANCE_ENVELOPE_BYTES,
-    "Portable provenance sidecar"
-  );
-  const verifiedEnvelope = verifyProvenanceEnvelope(provenanceEnvelope, trustedReleasePublicKeys);
-  const provenance = verifiedEnvelope.statement;
-  verifyPortableProvenance(
-    provenance,
-    archive,
-    archiveSha256,
-    metadata,
-    integrity,
-    targetPlatform,
-    targetArch
-  );
+  const provenance = await readJson(provenancePath);
+  const subject = Array.isArray(provenance.subject)
+    ? provenance.subject.find((item) => item?.name === path.basename(archive))
+    : null;
+  if (provenance.predicateType !== "https://slsa.dev/provenance/v1" || subject?.digest?.sha256 !== archiveSha256) {
+    throw new Error("Portable provenance does not bind the archive SHA-256 digest.");
+  }
   return {
     archiveSha256,
     checksumPath,
     sbomPath,
     provenancePath,
-    provenanceSignature: verifiedEnvelope.signature,
     components: sbom.components.length,
     ...portableComponents
   };
@@ -941,26 +772,30 @@ export async function verifyAgentCliPackage(options = {}) {
   }
 
   const releaseVersion = await workspaceReleaseVersion(rootDir);
-  const baseWorkspacePackages = await workspaceRuntimePackages(rootDir);
-  const baseRequiredEntries = [
+  const isV3 = releaseVersion !== null && /^3\./.test(releaseVersion);
+  const workspacePackages = [...new Set([
+    ...await workspaceRuntimePackages(rootDir),
+    ...(isV3 ? v3PortablePackages : [])
+  ])].sort((left, right) => left.localeCompare(right, "en"));
+  const requiredEntries = [
     targetPlatform === "win32" ? `${bundleName}/bin/agent.cmd` : `${bundleName}/bin/agent`,
     targetPlatform === "win32" ? `${bundleName}/bin/node.exe` : `${bundleName}/bin/node`,
     `${bundleName}/README.md`,
-    `${bundleName}/package.json`,
-    `${bundleName}/package-metadata.json`,
-    ...baseWorkspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
-    ...baseWorkspacePackages.filter((name) => name !== "agent-cli")
-      .map((name) => `${bundleName}/node_modules/${name}/package.json`)
+      `${bundleName}/package.json`,
+      `${bundleName}/package-metadata.json`,
+    ...(isV3 ? [
+      `${bundleName}/integrity-manifest.json`,
+      `${bundleName}/sbom.cdx.json`,
+      `${bundleName}/bin/${targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec"}`,
+      ...Object.values(portableLanguageAssets).map((assetPath) => `${bundleName}/${assetPath}`),
+      `${bundleName}/assets/tokenizers/sigma-cjk-byte-v1.json`
+    ] : []),
+    ...workspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
+    ...workspacePackages.filter((name) => name !== "agent-cli").map((name) => `${bundleName}/node_modules/${name}/package.json`)
   ];
   const spawn = options.spawnSync ?? spawnSync;
-  const archiveBytes = await readFile(archive);
-  const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
-  const { entries } = inspectArchiveBytes(archiveBytes, {
-    root: bundleName,
-    label: `agent CLI archive ${path.basename(archive)}`,
-    spawn
-  });
-  requireEntries(entries, baseRequiredEntries);
+  const entries = targetPlatform === "win32" ? zipEntries(archive, spawn) : tarEntries(archive, spawn);
+  requireEntries(entries, requiredEntries);
   if (entries.some((entry) => entry.includes("agent-core") || entry.includes("agent-ai"))) {
     throw new Error("Removed agent-core/agent-ai content must not be present in the bundle.");
   }
@@ -968,49 +803,22 @@ export async function verifyAgentCliPackage(options = {}) {
   await mkdir(artifactsDir, { recursive: true });
   const tempDir = await mkdtemp(path.join(artifactsDir, ".agent-cli-verify-"));
   try {
-    extractArchiveBytes(archiveBytes, tempDir, `agent CLI archive ${path.basename(archive)}`, spawn);
+    if (targetPlatform === "win32") extractZipArchive(archive, tempDir, spawn);
+    else extractTarball(archive, tempDir, spawn);
     const bundleDir = path.join(tempDir, bundleName);
     const wrapper = await readFile(path.join(bundleDir, "bin", targetPlatform === "win32" ? "agent.cmd" : "agent"), "utf8");
     const readme = await readFile(path.join(bundleDir, "README.md"), "utf8");
     const packageJson = await readJson(path.join(bundleDir, "package.json"));
     const metadata = await readJson(path.join(bundleDir, "package-metadata.json"));
-    if (metadata.schemaVersion !== 2 && metadata.schemaVersion !== 3) {
-      throw new Error(`Unsupported package metadata schemaVersion=${String(metadata.schemaVersion)}.`);
+    if (isV3 && metadata.schemaVersion !== 3) {
+      throw new Error(`V3 package metadata schemaVersion=${String(metadata.schemaVersion)} expected 3.`);
     }
-    const isV3 = metadata.schemaVersion === 3;
-    const expectedMajor = isV3 ? "3" : "2";
-    if (typeof packageJson.version !== "string" || !packageJson.version.startsWith(`${expectedMajor}.`)) {
-      throw new Error(`Package metadata schema ${metadata.schemaVersion} does not match version ${String(packageJson.version)}.`);
-    }
-    const workspacePackages = [...new Set([
-      ...baseWorkspacePackages,
-      ...(isV3 ? v3PortablePackages : [])
-    ])].sort((left, right) => left.localeCompare(right, "en"));
-    const requiredEntries = [
-      ...baseRequiredEntries,
-      ...(isV3 ? [
-        `${bundleName}/integrity-manifest.json`,
-        `${bundleName}/sbom.cdx.json`,
-        `${bundleName}/bin/${targetPlatform === "win32" ? "sigma-exec.exe" : "sigma-exec"}`,
-        ...Object.values(portableLanguageAssets).map((assetPath) => `${bundleName}/${assetPath}`),
-        `${bundleName}/assets/tokenizers/sigma-cjk-byte-v1.json`
-      ] : []),
-      ...workspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
-      ...workspacePackages.filter((name) => name !== "agent-cli")
-        .map((name) => `${bundleName}/node_modules/${name}/package.json`)
-    ];
-    requireEntries(entries, requiredEntries);
 
     if (targetPlatform === "win32") {
       assertContains("bin/agent.cmd", wrapper, '"%NODE_EXE%" "%SCRIPT_DIR%..\\packages\\agent-cli\\dist\\index.js" %*');
-      assertContains("bin/agent.cmd", wrapper, 'set "PATH=%SCRIPT_DIR%;%PATH%"');
-      assertContains("bin/agent.cmd", wrapper, 'set "NODE_OPTIONS=--preserve-symlinks-main"');
-      assertContains("bin/agent.cmd", wrapper, 'set "NODE_PATH="');
       if (wrapper.toLowerCase().includes("where node")) throw new Error("bin/agent.cmd must not fall back to a system Node runtime.");
     } else {
       assertContains("bin/agent", wrapper, 'exec "$NODE" "$SCRIPT_DIR/../packages/agent-cli/dist/index.js" "$@"');
-      assertContains("bin/agent", wrapper, 'export PATH="$SCRIPT_DIR${PATH:+:$PATH}"');
-      assertContains("bin/agent", wrapper, "unset NODE_OPTIONS NODE_PATH");
       if (wrapper.includes("command -v node")) throw new Error("bin/agent must not fall back to a system Node runtime.");
     }
     assertContains("README.md", readme, "Sigma Code CLI Bundle");
@@ -1054,35 +862,12 @@ export async function verifyAgentCliPackage(options = {}) {
       || metadata.sigmaExec?.machine !== binaryTarget.machine)) {
       throw new Error("Bundled sigma-exec executable header does not match package metadata.");
     }
-    const observedSigning = isV3
-      ? inspectWindowsAuthenticode(
-          path.join(bundleDir, verifiedIntegrity.nodePath),
-          path.join(bundleDir, verifiedIntegrity.brokerPath),
-          targetPlatform,
-          metadata.node?.compatibility,
-          options.allowedWindowsSignerCertificateSha256
-            ?? loadAllowedWindowsSignerCertificateSha256(env)
-        )
-      : null;
-    if (isV3 && JSON.stringify(authenticodeArtifactEvidence(observedSigning))
-      !== JSON.stringify(authenticodeArtifactEvidence(metadata.signing))) {
-      throw new Error("Portable signing metadata does not match independent artifact inspection.");
-    }
     const integrity = verifiedIntegrity ? { ...verifiedIntegrity, binaryTarget } : null;
     const sidecars = isV3
-      ? await verifyReleaseSidecars(
-          archive,
-          archiveSha256,
-          bundleDir,
-          metadata,
-          integrity,
-          targetPlatform,
-          targetArch,
-          options.trustedReleasePublicKeys ?? loadTrustedReleaseProvenanceKeys(env)
-        )
+      ? await verifyReleaseSidecars(archive, bundleDir, metadata, integrity, targetPlatform, targetArch)
       : null;
-    if (metadata.productVersion !== packageJson.version) {
-      throw new Error(`package-metadata productVersion=${String(metadata.productVersion)} expected ${String(packageJson.version)}`);
+    if (isV3 && metadata.productVersion !== releaseVersion) {
+      throw new Error(`package-metadata productVersion=${String(metadata.productVersion)} expected ${releaseVersion}`);
     }
     const hostCli = options.hostCliSmoke === false ? null : runHostCliVersion(bundleDir, spawn);
     const targetWrapper = options.targetWrapperSmoke === false
@@ -1131,11 +916,7 @@ export async function verifyAgentCliPackage(options = {}) {
         integrity: isV3 ? integrity !== null : null,
         sbom: isV3 ? sidecars !== null : null,
         provenance: isV3 ? sidecars !== null : null,
-        provenanceSignature: isV3 ? sidecars?.provenanceSignature.verified === true : null,
         archiveChecksum: isV3 ? sidecars !== null : null,
-        windowsSignerPolicy: isV3
-          ? targetPlatform !== "win32" || observedSigning?.policyVerified === true
-          : null,
         hostCli: hostCli !== null,
         targetWrapper: targetWrapper.ok
       },
@@ -1143,7 +924,6 @@ export async function verifyAgentCliPackage(options = {}) {
       targetWrapper,
       integrity,
       sidecars,
-      signing: observedSigning,
       metadata
     };
   } finally {

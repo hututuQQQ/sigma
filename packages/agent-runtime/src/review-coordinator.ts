@@ -25,8 +25,7 @@ import { sessionMutationEvidence } from "./mutation-evidence.js";
 function normalizeReview(
   session: RuntimeSession,
   raw: ReviewEvidence,
-  workspaceDeltas: WorkspaceDeltaEvidence[],
-  validations: ValidationEvidence[]
+  workspaceDeltas: WorkspaceDeltaEvidence[]
 ): ReviewEvidence {
   const verdict = raw.data.verdict === "approved" ? "approved" : "changes_requested";
   return {
@@ -43,7 +42,6 @@ function normalizeReview(
       verdict,
       findings: [...raw.data.findings],
       workspaceDeltaEvidenceIds: workspaceDeltas.map((item) => item.evidenceId),
-      validationEvidenceIds: validations.map((item) => item.evidenceId),
       ...(workspaceDeltas.at(-1)?.data.checkpointId
         ? { checkpointId: workspaceDeltas.at(-1)!.data.checkpointId } : {})
     }
@@ -64,29 +62,15 @@ function failedReview(input: ReviewerInput, reviewerId: string, message: string)
       reviewerId,
       verdict: "changes_requested",
       findings: [message],
-      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
-      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
     }
   };
 }
 
-function sameIdSet(actualIds: readonly string[], expectedIds: readonly string[]): boolean {
-  if (actualIds.length !== expectedIds.length) return false;
-  const actual = new Set(actualIds);
-  return expectedIds.every((id) => actual.has(id));
-}
-
-function sameReviewInput(
-  item: EvidenceRecord,
-  deltaIds: readonly string[],
-  validationIds: readonly string[]
-): boolean {
-  if (item.kind !== "review" || !sameIdSet(item.data.workspaceDeltaEvidenceIds, deltaIds)) return false;
-  // A legacy record cannot prove which validations were reviewed. Permit one
-  // migration review; the newly emitted record then carries an exact input set
-  // and restores the no-replay guarantee.
-  return item.data.validationEvidenceIds !== undefined
-    && sameIdSet(item.data.validationEvidenceIds, validationIds);
+function sameDeltaSet(item: EvidenceRecord, ids: readonly string[]): boolean {
+  if (item.kind !== "review" || item.data.workspaceDeltaEvidenceIds.length !== ids.length) return false;
+  const actual = new Set(item.data.workspaceDeltaEvidenceIds);
+  return ids.every((id) => actual.has(id));
 }
 
 function requestIdentity(
@@ -95,8 +79,7 @@ function requestIdentity(
   ids: readonly string[],
   evidence: readonly EvidenceRecord[]
 ): string {
-  const attempt = evidence.filter((item) => item.kind === "review"
-    && sameIdSet(item.data.workspaceDeltaEvidenceIds, ids)).length + 1;
+  const attempt = evidence.filter((item) => sameDeltaSet(item, ids)).length + 1;
   const digest = createHash("sha256").update(JSON.stringify({
     sessionId: session.sessionId,
     runId: session.runId,
@@ -152,16 +135,15 @@ export class ReviewCoordinator {
     const eligible = pending.filter((delta) => validations.some((validation) =>
       validationCoversDelta(validation, delta)));
     if (eligible.length === 0) return;
+    const lastFailedReview = evidence.filter((item): item is ReviewEvidence =>
+      item.kind === "review" && item.status === "failed").at(-1);
+    if (lastFailedReview) {
+      const failedIds = new Set(lastFailedReview.data.workspaceDeltaEvidenceIds);
+      if (eligible.every((delta) => failedIds.has(delta.evidenceId))) return;
+    }
     const eligibleIds = new Set(eligible.map((item) => item.evidenceId));
     const relevantValidations = validations.filter((item) =>
       item.data.workspaceDeltaEvidenceIds.some((evidenceId) => eligibleIds.has(evidenceId)));
-    const lastFailedReview = evidence.filter((item): item is ReviewEvidence =>
-      item.kind === "review" && item.status === "failed").at(-1);
-    if (lastFailedReview && sameReviewInput(
-      lastFailedReview,
-      [...eligibleIds],
-      relevantValidations.map((item) => item.evidenceId)
-    )) return;
     const reviewer = this.reviewerForSession(session);
     const reviewerId = reviewer.reviewerId ?? "builtin-reviewer";
     const input: ReviewerInput = {
@@ -177,13 +159,10 @@ export class ReviewCoordinator {
     }
     await this.emit(session, "review.started", "runtime", {
       reviewerId,
-      workspaceDeltaEvidenceIds: [...eligibleIds],
-      validationEvidenceIds: relevantValidations.map((item) => item.evidenceId)
+      workspaceDeltaEvidenceIds: [...eligibleIds]
     });
     const rawReview = await reviewer.review(input, signal);
-    await this.emit(session, "review.completed", "runtime", normalizeReview(
-      session, rawReview, eligible, relevantValidations
-    ));
+    await this.emit(session, "review.completed", "runtime", normalizeReview(session, rawReview, eligible));
   }
 
   private async reviewAccounted(
@@ -210,8 +189,7 @@ export class ReviewCoordinator {
     await this.emit(session, "review.started", "runtime", {
       reviewerId,
       requestId,
-      workspaceDeltaEvidenceIds: ids,
-      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+      workspaceDeltaEvidenceIds: ids
     });
     const startedAt = performance.now();
     let result;
@@ -228,8 +206,7 @@ export class ReviewCoordinator {
       await this.emit(session, "review.completed", "runtime", normalizeReview(
         session,
         failedReview(input, reviewerId, `Independent reviewer failed: ${message}`),
-        input.workspaceDeltas,
-        input.validations
+        input.workspaceDeltas
       ));
       return;
     }
@@ -237,7 +214,7 @@ export class ReviewCoordinator {
     await this.budgets!.commitMeasured(session, reservationId, consumedBudget(usage, prepared.budget));
     await this.emit(session, "usage.recorded", "runtime", usage);
     await this.emit(session, "review.completed", "runtime", normalizeReview(
-      session, result.evidence, input.workspaceDeltas, input.validations
+      session, result.evidence, input.workspaceDeltas
     ));
   }
 
@@ -261,8 +238,7 @@ export class ReviewCoordinator {
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session,
       failedReview(input, reviewerId, "Independent review was interrupted; the model call was not replayed."),
-      input.workspaceDeltas,
-      input.validations
+      input.workspaceDeltas
     ));
   }
 }

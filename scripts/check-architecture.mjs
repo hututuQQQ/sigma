@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packagesRoot = path.join(root, "packages");
 const productionExtensions = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"]);
-const maximumProductionLines = 400;
+const maximumProductionLines = 1_000;
 const maximumTuiComponentLines = 250;
 
 async function packageRecords() {

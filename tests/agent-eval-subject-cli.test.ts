@@ -1,9 +1,9 @@
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runCliSubject } from "../scripts/eval/subject-cli.mjs";
-import { createDevNodeLaunch } from "../scripts/eval/subject-launch.mjs";
+import { runCliSubject, terminateProcessTree } from "../scripts/eval/subject-cli.mjs";
 
 const temporary: string[] = [];
 
@@ -12,6 +12,45 @@ afterEach(async () => {
 });
 
 describe("evaluation CLI subject lifecycle", () => {
+  it("force-terminates descendants before returning from fallback cleanup", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-process-tree-"));
+    temporary.push(root);
+    const marker = path.join(root, "descendant-survived");
+    const pidFile = path.join(root, "descendant.pid");
+    const descendant = path.join(root, "descendant.mjs");
+    const parent = path.join(root, "parent.mjs");
+    await writeFile(descendant, `
+import { writeFileSync } from "node:fs";
+setTimeout(() => writeFileSync(process.argv[2], "survived"), 700);
+setInterval(() => undefined, 1_000);
+`, "utf8");
+    await writeFile(parent, `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const child = spawn(process.execPath, [process.argv[2], process.argv[3]], { stdio: "ignore" });
+writeFileSync(process.argv[4], String(child.pid));
+setInterval(() => undefined, 1_000);
+`, "utf8");
+    const child = spawn(process.execPath, [parent, descendant, marker, pidFile], {
+      detached: process.platform !== "win32",
+      stdio: "ignore",
+      windowsHide: true
+    });
+    const exited = new Promise<void>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", () => resolve());
+    });
+    for (let attempts = 0; attempts < 100; attempts += 1) {
+      if (await access(pidFile).then(() => true, () => false)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(Number(await readFile(pidFile, "utf8"))).toBeGreaterThan(0);
+    await terminateProcessTree(child);
+    await exited;
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("cancels a real process at the external wall budget and waits for the cancel helper to exit", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-subject-"));
     temporary.push(root);
@@ -61,12 +100,7 @@ if (args[0] === "session" && args[1] === "cancel") {
       budget: { wallTimeSec: 0.05, modelTurns: 8, toolCalls: 12, costUsd: 0.1 },
       artifactDir,
       redactor: String,
-      subject: {
-        subjectKind: "dev",
-        nodePath: process.execPath,
-        cliEntry: subjectPath,
-        launch: createDevNodeLaunch(process.execPath, subjectPath)
-      }
+      subject: { nodePath: process.execPath, cliEntry: subjectPath }
     });
 
     expect(result.cancellation).toMatchObject({ reason: "experience_budget_exceeded", dimension: "wallTime", cancelExitCode: 0 });

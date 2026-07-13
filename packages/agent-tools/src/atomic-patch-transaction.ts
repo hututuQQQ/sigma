@@ -1,11 +1,6 @@
 import { chmod, lstat, mkdir, open, rename, rm, symlink } from "node:fs/promises";
 import path from "node:path";
-import {
-  durableReplaceFile,
-  pinWorkspaceTransactionDirectories,
-  syncDirectory,
-  type WorkspaceTransactionDirectoryLease
-} from "agent-platform";
+import { durableReplaceFile, syncDirectory } from "agent-platform";
 import { readPatchPath } from "./atomic-patch-file-state.js";
 import {
   createPatchJournal,
@@ -30,7 +25,6 @@ export interface AtomicPatchTransactionOptions extends AtomicPatchTransactionHoo
   transaction: string;
   changes: readonly PreparedPatchChange[];
   beforeCommit?: () => Promise<void>;
-  verifyTransaction?: () => Promise<void>;
   validators: AtomicPatchTransactionValidators;
 }
 
@@ -125,10 +119,8 @@ function journalOperation(journal: AtomicPatchJournal, changeIndex: number): Ato
 }
 
 async function persistApplying(options: AtomicPatchTransactionOptions, journal: AtomicPatchJournal): Promise<void> {
-  await options.verifyTransaction?.();
   journal.phase = "applying";
   await writePatchJournal(options.transaction, journal);
-  await options.verifyTransaction?.();
 }
 
 async function ensureTargetParents(
@@ -201,7 +193,6 @@ async function moveSource(
     await runHook(options.beforeMutation, {
       direction: "commit", phase: "backup_source_pinned", changeIndex, relativePath: change.source!
     });
-    await options.verifyTransaction?.();
     await rename(pinned.targetPath, saved);
     await syncDirectory(path.dirname(pinned.targetPath));
     await syncDirectory(path.dirname(saved));
@@ -255,7 +246,6 @@ async function installTarget(
     await runHook(options.beforeMutation, {
       direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
     });
-    await options.verifyTransaction?.();
     await rename(candidate, pinned.targetPath);
     await syncDirectory(path.dirname(candidate));
     await syncDirectory(path.dirname(pinned.targetPath));
@@ -318,12 +308,16 @@ export async function commitPreparedPatch(
   const staged = path.join(options.transaction, "staged");
   const backup = path.join(options.transaction, "backup");
   try {
-    const parent = await lstat(path.dirname(options.transaction));
-    if (!parent.isDirectory() || parent.isSymbolicLink()) {
-      throw new AtomicPatchError("Patch transaction root is unsafe.");
+    const relative = relativeFrom(options.workspace, options.transaction);
+    const pinned = await pinPatchParent(options.workspace, relative);
+    try {
+      await pinned.verify();
+      await mkdir(pinned.targetPath, { mode: 0o700 });
+      await syncDirectory(path.dirname(pinned.targetPath));
+      await pinned.verify();
+    } finally {
+      await pinned.close();
     }
-    await mkdir(options.transaction, { mode: 0o700 });
-    await syncDirectory(path.dirname(options.transaction));
   } catch (error) {
     throw patchError(error);
   }
@@ -333,25 +327,15 @@ export async function commitPreparedPatch(
   } catch (error) {
     return await throwAfterCleanup(error, options.transaction);
   }
-  let lease: WorkspaceTransactionDirectoryLease | undefined;
   try {
     await initializeTransaction(options, staged, backup, journal);
-    lease = await pinWorkspaceTransactionDirectories([
-      path.dirname(options.transaction), options.transaction, staged, backup
-    ]);
-    options.verifyTransaction = async () => await lease!.verify();
-    await options.verifyTransaction();
     await installChanges(options, staged, backup, journal);
     for (const change of options.changes) {
       if (change.target) await options.validators.assertInstalled(change);
     }
     journal.phase = "committed";
     await writePatchJournal(options.transaction, journal);
-    await options.verifyTransaction();
   } catch (error) {
-    await lease?.close().catch(() => undefined);
-    lease = undefined;
-    options.verifyTransaction = undefined;
     try {
       await recoverAtomicPatchTransaction(options.workspace, options.transaction, options.beforeMutation);
     } catch (rollbackError) {
@@ -362,9 +346,6 @@ export async function commitPreparedPatch(
       );
     }
     throw patchError(error);
-  } finally {
-    await lease?.close();
-    options.verifyTransaction = undefined;
   }
   const cleanupError = await cleanup(options.transaction);
   return cleanupError ? { transactionPath: options.transaction, error: cleanupError.message } : undefined;

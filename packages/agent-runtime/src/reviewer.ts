@@ -229,7 +229,6 @@ function reviewEvidence(
         verdict,
         findings,
         workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
         ...(input.workspaceDeltas.at(-1)?.data.checkpointId
           ? { checkpointId: input.workspaceDeltas.at(-1)!.data.checkpointId } : {})
       }

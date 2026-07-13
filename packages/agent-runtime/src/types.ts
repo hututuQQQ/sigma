@@ -21,12 +21,11 @@ import type {
   RuntimeHookArtifact,
   SkillCatalog
 } from "agent-extensions";
-import type { ProcessExecutionPort, RuntimeEnvironment } from "agent-platform";
+import type { ProcessExecutionPort } from "agent-platform";
 import type { ProcessHandle } from "agent-execution";
 import type { CheckpointRestoreFaultEvent } from "agent-checkpoint";
 import type { ReviewerPort } from "./reviewer.js";
 import type { AsyncQueue } from "./async-queue.js";
-import type { ApprovalBinding } from "./approval-binding.js";
 
 export interface RuntimeAgentProfile {
   profile: FrozenAgentProfile;
@@ -39,10 +38,6 @@ export interface RuntimeOptions {
   store: RunStore;
   runDeadlineMs?: number;
   maxParallelTools?: number;
-  /** Outer runtime liveness watchdog. By default it trails a tool's own idle
-   * deadline so broker-managed foreground execution remains authoritative.
-   * Set false to disable it, or a positive number for an explicit timeout. */
-  toolIdleWatchdogMs?: number | false;
   permissionMode?: "ask" | "auto" | "deny";
   outputReserveTokens?: number;
   budgetLimits?: BudgetLimits;
@@ -61,7 +56,6 @@ export interface RuntimeOptions {
   availableProfiles?: readonly RuntimeAgentProfile[];
   gatewayForRole?(role: ModelExecutionRole, profile: FrozenAgentProfile | undefined): ModelGateway;
   execution?: ProcessExecutionPort;
-  runtimeEnvironment?: RuntimeEnvironment;
   joinChildren?(parentSessionId: string, signal: AbortSignal): Promise<ChildJoinSummary>;
   cancelChildren?(parentSessionId: string, reason: string): Promise<void> | void;
   hasActiveChildren?(parentSessionId: string): Promise<boolean> | boolean;
@@ -74,8 +68,6 @@ export interface ChildJoinSummary {
 
 export interface ApprovalWaiter {
   effects: readonly ToolEffect[];
-  /** Exact durable authority shown to the user for this request. */
-  binding?: ApprovalBinding;
   recovered?: boolean;
   resolving?: boolean;
   external?: {
@@ -84,11 +76,6 @@ export interface ApprovalWaiter {
     childId: string;
   };
   resolve(decision: "allow" | "deny" | "always_allow"): void;
-}
-
-export interface CallApprovalGrant extends ToolCallApproval, ApprovalBinding {
-  /** Committed to the session effect policy only after this exact grant is consumed. */
-  alwaysAllowEffectGrant?: string;
 }
 
 export interface QueuedFollowUp {
@@ -146,7 +133,7 @@ export interface RuntimeSession {
   subscribers: Set<AsyncQueue<AgentEventEnvelope>>;
   approvals: Map<string, ApprovalWaiter>;
   /** One-shot human grants, bound to a call and intentionally not restored. */
-  callApprovals: Map<string, CallApprovalGrant>;
+  callApprovals: Map<string, ToolCallApproval>;
   alwaysAllowedEffects: Set<string>;
   /** Runtime-local broker handles; never restored across process restart. */
   processHandles?: Map<string, ProcessHandle>;

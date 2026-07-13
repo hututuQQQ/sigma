@@ -21,15 +21,7 @@ async function main() {
   const execution = new SigmaExecBrokerClient({
     helperPath,
     sandboxMode: "unsafe",
-    allowUnsafeHostExec: false,
-    trustedToolchains: [{
-      id: "verification-runtime",
-      runtime: "node",
-      executable: process.execPath,
-      aliases: process.platform === "win32" ? ["node", "node.exe"] : ["node"],
-      executionRoots: [process.execPath],
-      pathEntries: []
-    }]
+    allowUnsafeHostExec: false
   });
   try {
     await execution.connect();

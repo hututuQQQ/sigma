@@ -2,17 +2,16 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import { subjectNodeLaunch } from "./subject-launch.mjs";
+import { cliEntry } from "./common.mjs";
 
 const OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 const CANCEL_GRACE_MS = 15_000;
 
-function nodeCliArgs(commandArgs, subject) {
-  const launch = subjectNodeLaunch(subject);
+function nodeCliArgs(commandArgs, subject = {}) {
   return [
     "--experimental-ffi",
     "--disable-warning=ExperimentalWarning",
-    launch.entryPath,
+    subject.cliEntry ?? cliEntry,
     ...commandArgs
   ];
 }
@@ -55,10 +54,47 @@ function breachedBudget(state, budget) {
   return null;
 }
 
+function terminateWindowsProcessTree(processId) {
+  return new Promise((resolve, reject) => {
+    const killer = spawn("taskkill.exe", ["/pid", String(processId), "/T", "/F"], {
+      shell: false,
+      windowsHide: true,
+      stdio: "ignore"
+    });
+    killer.on("error", reject);
+    killer.on("close", (exitCode) => {
+      if (exitCode === 0) {
+        resolve();
+        return;
+      }
+      try {
+        process.kill(processId, 0);
+        reject(new Error(`taskkill failed to terminate process tree ${processId} (exit ${exitCode ?? "unknown"}).`));
+      } catch {
+        resolve();
+      }
+    });
+  });
+}
+
+export async function terminateProcessTree(child) {
+  if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) return;
+  if (process.platform === "win32") {
+    await terminateWindowsProcessTree(child.pid);
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
 function spawnCapture(command, args, options = {}) {
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env,
+    detached: process.platform !== "win32",
     shell: false,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
@@ -67,13 +103,11 @@ function spawnCapture(command, args, options = {}) {
   let stderr = "";
   let timedOut = false;
   let terminationTimer;
-  let forceTimer;
   child.stdout.on("data", (chunk) => { stdout = appendLimited(stdout, chunk.toString("utf8")); });
   child.stderr.on("data", (chunk) => { stderr = appendLimited(stderr, chunk.toString("utf8")); });
   const exited = new Promise((resolve, reject) => {
     const clear = () => {
       clearTimeout(terminationTimer);
-      clearTimeout(forceTimer);
     };
     child.on("error", (error) => { clear(); reject(error); });
     child.on("close", (exitCode, signal) => {
@@ -83,8 +117,7 @@ function spawnCapture(command, args, options = {}) {
     if (options.timeoutMs) {
       terminationTimer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
-        forceTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        void terminateProcessTree(child).catch(() => child.kill("SIGKILL"));
       }, options.timeoutMs);
     }
   });
@@ -93,8 +126,7 @@ function spawnCapture(command, args, options = {}) {
 
 async function cancelSession({ sessionId, workspace, env, reason, subject }) {
   if (!sessionId) return { exitCode: 1, stderr: "Session id was not observed before cancellation." };
-  const launch = subjectNodeLaunch(subject);
-  const operation = spawnCapture(launch.executablePath, nodeCliArgs([
+  const operation = spawnCapture(subject?.nodePath ?? process.execPath, nodeCliArgs([
     "session", "cancel", sessionId,
     "--workspace", workspace,
     "--provider", "deepseek",
@@ -121,11 +153,11 @@ export async function runCliSubject(options) {
     "--output-format", "stream-json",
     "--output-schema", "3"
   ], subject);
-  const launch = subjectNodeLaunch(subject);
   const startedAt = Date.now();
-  const child = spawn(launch.executablePath, args, {
+  const child = spawn(subject.nodePath ?? process.execPath, args, {
     cwd: workspace,
     env: { ...env, SIGMA_STATE_HOME: stateHome },
+    detached: process.platform !== "win32",
     shell: false,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"]
@@ -138,8 +170,7 @@ export async function runCliSubject(options) {
   let cancellation;
   let cancelRequestedAt;
   let cancelPromise;
-  let terminateSent = false;
-  let forceKillSent = false;
+  let treeTerminationPromise;
 
   const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
   lines.on("line", (line) => {
@@ -160,13 +191,8 @@ export async function runCliSubject(options) {
   const monitor = setInterval(() => {
     if (cancellation) {
       const elapsed = cancelRequestedAt ? Date.now() - cancelRequestedAt : 0;
-      if (elapsed > CANCEL_GRACE_MS && !terminateSent) {
-        terminateSent = true;
-        child.kill("SIGTERM");
-      }
-      if (elapsed > CANCEL_GRACE_MS + 5_000 && !forceKillSent) {
-        forceKillSent = true;
-        child.kill("SIGKILL");
+      if (elapsed > CANCEL_GRACE_MS && !treeTerminationPromise) {
+        treeTerminationPromise = terminateProcessTree(child);
       }
       return;
     }
@@ -180,7 +206,12 @@ export async function runCliSubject(options) {
       env: { ...env, SIGMA_STATE_HOME: stateHome },
       reason: `Evaluation experience budget exceeded: ${breach.dimension}.`,
       subject
-    }).then((cancelResult) => { cancellation.cancelExitCode = cancelResult.exitCode; })
+    }).then((cancelResult) => {
+      cancellation.cancelExitCode = cancelResult.exitCode;
+      if (cancelResult.exitCode !== 0 && !treeTerminationPromise) {
+        treeTerminationPromise = terminateProcessTree(child);
+      }
+    })
       .catch((error) => { cancellation.cancelError = error instanceof Error ? error.message : String(error); });
   }, 250);
 
@@ -189,6 +220,7 @@ export async function runCliSubject(options) {
     child.on("close", (exitCode, signal) => resolve({ exitCode: exitCode ?? 1, signal }));
   }).finally(() => clearInterval(monitor));
   await cancelPromise;
+  await treeTerminationPromise;
   lines.close();
   await writeFile(path.join(artifactDir, "subject.stdout.log"), redactor(stdout), "utf8");
   await writeFile(path.join(artifactDir, "subject.stderr.log"), redactor(stderr), "utf8");

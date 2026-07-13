@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
@@ -21,22 +20,6 @@ from typing import Any, Protocol
 READY_TOKENS = ("New", "session.", "Type", "a", "request", "and", "press", "Enter.")
 TERMINAL_TYPES = {"run.completed", "run.failed", "run.cancelled"}
 RUN_BOUNDARY_TYPES = TERMINAL_TYPES | {"run.started", "run.suspended"}
-SUBJECT_ENVIRONMENT_BRIDGE = "SIGMA_TUI_SUBJECT_ENVIRONMENT_B64"
-
-
-def subject_environment() -> dict[str, str]:
-    encoded = os.environ.get(SUBJECT_ENVIRONMENT_BRIDGE, "")
-    if not encoded:
-        raise RuntimeError("TUI controller did not receive the prepared subject environment.")
-    try:
-        value = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("TUI subject environment bridge is invalid.") from error
-    if not isinstance(value, dict) or any(not isinstance(key, str) or not isinstance(item, str)
-                                          for key, item in value.items()):
-        raise RuntimeError("TUI subject environment must contain only string entries.")
-    value.pop(SUBJECT_ENVIRONMENT_BRIDGE, None)
-    return value
 
 
 class Terminal(Protocol):
@@ -316,7 +299,7 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(config["workspace"]).resolve()
     state_home = Path(config["stateHome"]).resolve()
     transcript_path = Path(config["transcriptPath"]).resolve()
-    terminal = terminal_for(list(config["command"]), workspace, subject_environment())
+    terminal = terminal_for(list(config["command"]), workspace, os.environ.copy())
     chunks: queue.Queue[str | None] = queue.Queue()
     thread = threading.Thread(target=reader, args=(terminal, chunks), daemon=True)
     thread.start()

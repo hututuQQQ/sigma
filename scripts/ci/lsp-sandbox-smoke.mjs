@@ -5,7 +5,6 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isDeepStrictEqual } from "node:util";
 
 const scriptPath = fileURLToPath(import.meta.url);
 
@@ -105,7 +104,7 @@ async function verifyPortableIntegrity(layout, metadata) {
   }
   await assertTreeCovered("node_modules/typescript");
   await assertTreeCovered("node_modules/pyright");
-  return { manifestDigest, entries: entries.size, manifest };
+  return { manifestDigest, entries: entries.size };
 }
 
 function assertMetadata(metadata, targetPlatform, brokerPath, brokerDigest, layout) {
@@ -116,59 +115,6 @@ function assertMetadata(metadata, targetPlatform, brokerPath, brokerDigest, layo
   const expectedBroker = path.resolve(layout.bundle, String(metadata.sigmaExec?.path ?? ""));
   if (path.resolve(brokerPath) !== expectedBroker) throw new Error("--broker must identify the broker inside --bundle.");
   if (metadata.sigmaExec?.sha256 !== brokerDigest) throw new Error("Packaged broker digest does not match package metadata.");
-}
-
-export function portableNodeToolchain(api, layout, metadata, integrityManifest, nodeDigest) {
-  if (metadata.node?.sha256 !== nodeDigest) {
-    throw new Error("Bundled Node digest does not match package metadata.");
-  }
-  const targetPlatform = metadata.targetPlatform;
-  const metadataCompatibility = metadata.node?.compatibility;
-  const manifestCompatibility = integrityManifest?.nodeCompatibility;
-  const toolchain = {
-    id: "bundled-runtime",
-    runtime: "node",
-    executable: layout.node,
-    aliases: targetPlatform === "win32" ? ["node", "node.exe"] : ["node"],
-    executionRoots: [layout.node],
-    pathEntries: [],
-    environment: {}
-  };
-  if (targetPlatform !== "win32") {
-    if (metadataCompatibility !== undefined || manifestCompatibility !== undefined) {
-      throw new Error("Windows Node compatibility metadata must not appear on another target.");
-    }
-    return toolchain;
-  }
-  if (!metadataCompatibility || !isDeepStrictEqual(metadataCompatibility, manifestCompatibility)) {
-    throw new Error("Windows Node compatibility metadata does not match the integrity manifest.");
-  }
-  const contract = api.WINDOWS_APPCONTAINER_NODE_COMPATIBILITY;
-  if (!contract || typeof api.createWindowsAppContainerNodeCompatibilityProof !== "function") {
-    throw new Error("Portable agent-execution does not expose the Windows Node compatibility contract.");
-  }
-  for (const field of [
-    "kind", "patchId", "reason", "nodeVersion", "targetPlatform", "targetArch", "sourceSha256",
-    "unsignedPatchedSha256", "normalizedContentSha256"
-  ]) {
-    if (metadataCompatibility[field] !== contract[field]) {
-      throw new Error(`Windows Node compatibility field ${field} does not match packaged agent-execution.`);
-    }
-  }
-  if (!isDeepStrictEqual(metadataCompatibility.sandboxRuntimeEnvironment, {
-    NODE_OPTIONS: contract.requiredNodeOptions
-  })) {
-    throw new Error("Windows Node sandbox compatibility environment is not the required exact environment.");
-  }
-  const compatibility = api.createWindowsAppContainerNodeCompatibilityProof(layout.node, toolchain.id);
-  if (compatibility.executableSha256 !== nodeDigest) {
-    throw new Error("Windows Node compatibility proof is not bound to the verified bundled executable.");
-  }
-  return {
-    ...toolchain,
-    environment: { ...metadataCompatibility.sandboxRuntimeEnvironment },
-    compatibility
-  };
 }
 
 function assertBrokerTarget(doctor, targetPlatform, targetArch) {
@@ -307,14 +253,7 @@ async function eventually(predicate, label, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for ${label}.`);
 }
 
-function mcpExecution(
-  broker,
-  workspace,
-  possibleEffects,
-  writeRoots = [],
-  additionalReadRoots = [],
-  executionRoots = []
-) {
+function mcpExecution(broker, workspace, possibleEffects, writeRoots = [], additionalReadRoots = []) {
   return {
     broker,
     possibleEffects,
@@ -324,7 +263,6 @@ function mcpExecution(
       network: "none",
       readRoots: [workspace, ...additionalReadRoots],
       writeRoots,
-      executionRoots,
       protectedPaths: [path.join(workspace, ".git"), path.join(workspace, ".agent")]
     }
   };
@@ -386,14 +324,7 @@ async function runMcpSandboxSmoke(api, broker, workspace, brokerPath) {
       if (notification.method === "sigma/read-only-probe"
         && notification.params?.phase === "idle-write-attempted") idleAttempted = true;
     }
-  }, mcpExecution(
-    broker,
-    workspace,
-    ["filesystem.read"],
-    [],
-    [path.dirname(brokerPath)],
-    [brokerPath]
-  ));
+  }, mcpExecution(broker, workspace, ["filesystem.read"], [], [path.dirname(brokerPath)]));
   try {
     await client.connect();
     const processStarted = Number.isInteger(client.processId) && client.processId > 0;
@@ -425,8 +356,6 @@ async function importPortableApi(layout) {
     import(pathToFileURL(layout.mcpModule).href)
   ]);
   if (typeof execution.SigmaExecBrokerClient !== "function"
-    || typeof execution.createWindowsAppContainerNodeCompatibilityProof !== "function"
-    || !execution.WINDOWS_APPCONTAINER_NODE_COMPATIBILITY
     || typeof codeIntel.BrokerLspTransport !== "function"
     || typeof codeIntel.LspClient !== "function"
     || typeof codeIntel.discoverLanguageServers !== "function"
@@ -434,13 +363,7 @@ async function importPortableApi(layout) {
     || typeof mcp.McpStdioClient !== "function") {
     throw new Error("Portable broker/LSP/MCP client exports are incomplete.");
   }
-  return {
-    SigmaExecBrokerClient: execution.SigmaExecBrokerClient,
-    createWindowsAppContainerNodeCompatibilityProof: execution.createWindowsAppContainerNodeCompatibilityProof,
-    WINDOWS_APPCONTAINER_NODE_COMPATIBILITY: execution.WINDOWS_APPCONTAINER_NODE_COMPATIBILITY,
-    McpStdioClient: mcp.McpStdioClient,
-    ...codeIntel
-  };
+  return { SigmaExecBrokerClient: execution.SigmaExecBrokerClient, McpStdioClient: mcp.McpStdioClient, ...codeIntel };
 }
 
 async function writeEvidence(outputPath, evidence) {
@@ -482,11 +405,7 @@ export async function runLspSandboxSmoke(options) {
     throw new Error("Portable Pyright discovery did not resolve the packaged server.");
   }
   const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-lsp-sandbox-"));
-  const broker = new api.SigmaExecBrokerClient({
-    helperPath: brokerPath,
-    sandboxMode: "required",
-    trustedToolchains: [portableNodeToolchain(api, layout, metadata, integrity.manifest, nodeDigest)]
-  });
+  const broker = new api.SigmaExecBrokerClient({ helperPath: brokerPath, sandboxMode: "required" });
   let doctor;
   try {
     doctor = await broker.connect();

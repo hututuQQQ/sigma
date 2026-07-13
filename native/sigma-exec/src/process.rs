@@ -1,11 +1,11 @@
-use crate::output::{OutputDecoder, OutputRing, OutputSnapshot};
+use crate::output::{OutputRing, OutputSnapshot};
 use crate::output_artifact::{
     ArtifactCapture, OutputArtifactMetadata, RedactionConfig, RedactionSecret,
     cleanup_artifact_root, prepare_artifact_root,
 };
 use crate::platform::PlatformGuard;
 use crate::protocol::RpcError;
-use crate::sandbox::{ProcessParams, ProtectedPathGuard, SandboxMode, build_command};
+use crate::sandbox::{ProcessParams, ProtectedPathGuard, build_command};
 use serde::Deserialize;
 use serde_json::{Value, json, to_value};
 use std::collections::{HashMap, HashSet};
@@ -353,7 +353,6 @@ impl BrokerState {
     ) -> Result<(String, Arc<Mutex<ManagedProcess>>), RpcError> {
         let maximum = params.max_output_bytes;
         let initial_input = params.command.stdin.clone();
-        let recover_sandbox = params.policy.sandbox == SandboxMode::Required;
         let mut prepared = build_command(&params, self.allow_unsafe)?;
         let handle = format!(
             "{}-{}",
@@ -377,7 +376,7 @@ impl BrokerState {
             .command
             .spawn()
             .map_err(|error| RpcError::new("process_spawn_failed", error.to_string()))?;
-        let guard = PlatformGuard::attach(&mut child, recover_sandbox)?;
+        let guard = PlatformGuard::attach(&mut child)?;
         let stdout = Arc::new(Mutex::new(OutputRing::new(maximum)));
         let stderr = Arc::new(Mutex::new(OutputRing::new(maximum)));
         let stdout_capture = capture(
@@ -473,8 +472,6 @@ fn capture(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut chunk = [0_u8; 8192];
-        let mut decoder = OutputDecoder::default();
-        let mut discard = false;
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
@@ -485,47 +482,11 @@ fn capture(
                     break;
                 }
                 Ok(count) => {
-                    if discard {
-                        continue;
-                    }
-                    match decoder.push(&chunk[..count], false) {
-                        Ok(normalized) => {
-                            if let Ok(mut ring) = output.lock() {
-                                ring.append(&normalized);
-                            }
-                            if let Ok(mut capture) = artifact.lock() {
-                                capture.append(&normalized);
-                            }
-                        }
-                        Err(error) => {
-                            if let Ok(mut ring) = output.lock() {
-                                ring.mark_decoding_error(error);
-                            }
-                            if let Ok(mut capture) = artifact.lock() {
-                                capture.mark_incomplete();
-                            }
-                            discard = true;
-                        }
-                    }
-                }
-            }
-        }
-        if !discard {
-            match decoder.push(&[], true) {
-                Ok(normalized) => {
                     if let Ok(mut ring) = output.lock() {
-                        ring.append(&normalized);
+                        ring.append(&chunk[..count]);
                     }
                     if let Ok(mut capture) = artifact.lock() {
-                        capture.append(&normalized);
-                    }
-                }
-                Err(error) => {
-                    if let Ok(mut ring) = output.lock() {
-                        ring.mark_decoding_error(error);
-                    }
-                    if let Ok(mut capture) = artifact.lock() {
-                        capture.mark_incomplete();
+                        capture.append(&chunk[..count]);
                     }
                 }
             }
@@ -724,7 +685,6 @@ mod tests {
                 network_approved: false,
                 read_roots: vec![std::env::current_dir().unwrap()],
                 write_roots: Vec::new(),
-                execution_roots: Vec::new(),
                 protected_paths: Vec::<PathBuf>::new(),
                 unsafe_host_exec_approved: true,
             },

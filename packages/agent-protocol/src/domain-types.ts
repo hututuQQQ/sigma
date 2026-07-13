@@ -70,7 +70,6 @@ export type ReviewEvidence = EvidenceBase<"review", JsonObject & {
   verdict: "approved" | "changes_requested";
   findings: JsonValue[];
   workspaceDeltaEvidenceIds: string[];
-  validationEvidenceIds?: string[];
   checkpointId?: string;
 }>;
 

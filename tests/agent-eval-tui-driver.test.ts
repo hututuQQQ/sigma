@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { tuiControllerEnvironment } from "../scripts/eval/subject-tui.mjs";
 
 const temporary: string[] = [];
 
@@ -134,10 +133,7 @@ print(json.dumps({"writes":terminal.writes,"result":result}))
 `, "utf8");
     const python = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
     const result = spawnSync(python, [harness, path.resolve("scripts/eval/tui-driver.py"), root], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      windowsHide: true,
-      env: tuiControllerEnvironment(process.env, path.join(root, "state"))
+      cwd: process.cwd(), encoding: "utf8", windowsHide: true
     });
     expect(result.status, result.stderr).toBe(0);
     const output = JSON.parse(result.stdout.trim());
@@ -230,11 +226,7 @@ finally:
     })}\n`, "utf8");
 
     const result = spawnSync(python, [path.resolve("scripts/eval/tui-driver.py"), configPath], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 30_000,
-      env: tuiControllerEnvironment(process.env, stateHome)
+      cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 30_000
     });
 
     expect(result.status, result.stderr).toBe(0);
