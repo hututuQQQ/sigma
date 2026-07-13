@@ -259,17 +259,20 @@ def verify_dangling_read_only_conformance(
             dangling.append(link)
 
         before = read_tree_fingerprint(root)
-        probe_request = params(root, "type ordinary.txt >nul")
+        probe_request = params(root, "type ordinary.txt")
         probe_request["policy"]["writeRoots"] = []
         spawned = require_ok(broker.request("process.spawn", probe_request))
         probe = poll_until_settled(broker, spawned["handleId"])
-        if probe["exitCode"] != 0:
+        if (
+            probe["exitCode"] != 0
+            or probe["stdout"]["data"].strip() != "ordinary read-only content"
+        ):
             raise RuntimeError(
                 "dangling descendants blocked an unrelated read-only process: "
                 f"{probe}"
             )
 
-        outside_request = params(root, "type outside-link\\secret.txt >nul")
+        outside_request = params(root, "type outside-link\\secret.txt")
         outside_request["policy"]["writeRoots"] = []
         outside_probe = require_ok(
             broker.request("exec", {**outside_request, "timeoutMs": 10000})
