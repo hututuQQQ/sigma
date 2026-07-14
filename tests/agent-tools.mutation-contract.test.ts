@@ -6,7 +6,8 @@ import type {
   BrokerDoctorReport,
   ExecutionBroker,
   ExecutionRequest,
-  ExecutionResult
+  ExecutionResult,
+  ProcessSpawnRequest
 } from "../packages/agent-execution/src/index.js";
 import type {
   JsonValue,
@@ -14,7 +15,7 @@ import type {
   ToolPreparationContext,
   ToolRequest
 } from "../packages/agent-protocol/src/index.js";
-import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { EffectToolRegistry, executionTools, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 
 const report: BrokerDoctorReport = {
   protocolVersion: 1,
@@ -47,16 +48,25 @@ const exited: ExecutionResult = {
   outputArtifacts: []
 };
 
-function brokerFixture(): { broker: ExecutionBroker; executions: ExecutionRequest[] } {
+function brokerFixture(): {
+  broker: ExecutionBroker;
+  executions: ExecutionRequest[];
+  spawns: ProcessSpawnRequest[];
+} {
   const executions: ExecutionRequest[] = [];
+  const spawns: ProcessSpawnRequest[] = [];
   return {
     executions,
+    spawns,
     broker: {
       lostProcessHandles: [],
       connect: async () => report,
       doctor: async () => report,
       execute: async (input) => { executions.push(input); return exited; },
-      spawn: async () => ({ id: "process", brokerInstanceId: "broker" }),
+      spawn: async (input) => {
+        spawns.push(input);
+        return { id: "process", brokerInstanceId: "broker" };
+      },
       poll: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
       write: async () => undefined,
       terminate: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
@@ -227,6 +237,86 @@ describe("typed workspace mutation contracts", () => {
     });
   });
 
+  it("limits every process tool to its approved cwd and explicit read roots", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-scope-"));
+    await mkdir(path.join(workspace, "work"));
+    await mkdir(path.join(workspace, "inputs"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      shells: ["powershell"]
+    });
+    const calls = [
+      request("read-exec", "exec", {
+        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+      }),
+      request("read-shell", "shell", {
+        shell: "powershell", command: "Get-Location", cwd: "work", readRoots: ["inputs"]
+      }),
+      request("read-validate", "validate", {
+        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+      }),
+      request("read-spawn", "process_spawn", {
+        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+      })
+    ];
+
+    for (const call of calls) {
+      await expect(tools.prepare(call, preparation(workspace))).resolves.toMatchObject({
+        readPaths: ["work", "inputs"]
+      });
+      await expect(tools.execute(call, execution(workspace))).resolves.toMatchObject({ ok: true });
+    }
+    const expected = [path.join(workspace, "work"), path.join(workspace, "inputs")];
+    expect(fixture.executions).toHaveLength(3);
+    for (const item of fixture.executions) {
+      expect(item.policy.readRoots).toEqual(expected);
+      expect(item.policy.readRoots).not.toContain(workspace);
+    }
+    expect(fixture.spawns).toHaveLength(1);
+    expect(fixture.spawns[0]?.policy.readRoots).toEqual(expected);
+    for (const name of ["exec", "shell", "validate", "process_spawn"]) {
+      expect(tools.descriptor(name)?.inputSchema).toMatchObject({
+        properties: { readRoots: { type: "array", minItems: 1, uniqueItems: true } }
+      });
+    }
+  });
+
+  it("rejects escaping or unstable read roots and binds approved read paths into the plan signature", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-guards-"));
+    const approvedRoot = path.join(workspace, "approved");
+    const replacement = path.join(workspace, "replacement");
+    await mkdir(approvedRoot);
+    await mkdir(replacement);
+    await writeFile(path.join(workspace, "file.txt"), "not a directory", "utf8");
+    const fixture = brokerFixture();
+    const exec = executionTools({
+      broker: fixture.broker, sandboxMode: "required", networkMode: "none"
+    }).find((tool) => tool.descriptor.name === "exec")!;
+
+    for (const readRoot of ["../outside", "missing", "file.txt"]) {
+      await expect(exec.descriptor.prepare!({
+        executable: process.execPath,
+        readRoots: [readRoot]
+      }, preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
+    }
+
+    const originalInput = { executable: process.execPath, cwd: "approved" };
+    const approvedPlan = await exec.descriptor.prepare!(originalInput, preparation(workspace));
+    await expect(exec.execute(request("forged-read-plan", "exec", originalInput), {
+      ...execution(workspace),
+      callPlan: { ...approvedPlan, readPaths: ["."] }
+    })).rejects.toMatchObject({ code: "write_plan_stale" });
+
+    await rename(approvedRoot, path.join(workspace, "approved-original"));
+    await symlink(replacement, approvedRoot, process.platform === "win32" ? "junction" : "dir");
+    await expect(exec.execute(request("drifting-read-root", "exec", originalInput), {
+      ...execution(workspace),
+      callPlan: approvedPlan
+    })).rejects.toMatchObject({ code: "write_plan_stale" });
+    expect(fixture.executions).toHaveLength(0);
+  });
+
   it("returns stable diagnostics for incomplete, inconsistent, protected, and changed write plans", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-plan-guards-"));
     await mkdir(path.join(workspace, "src"));
@@ -342,6 +432,51 @@ describe("typed workspace mutation contracts", () => {
       await expect(tools.execute(call, execution(workspace))).resolves.toMatchObject({ ok: true });
       expect(renameFailure?.code).toMatch(/^(?:EACCES|EBUSY|EPERM)$/u);
       await expect(rename(nested, moved)).resolves.toBeUndefined();
+    }
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "pins approved Windows read roots through foreground and background dispatch",
+    async () => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-pin-"));
+      const foreground = path.join(workspace, "foreground");
+      const background = path.join(workspace, "background");
+      await Promise.all([mkdir(foreground), mkdir(background)]);
+      const fixture = brokerFixture();
+      const renameFailures: Array<string | undefined> = [];
+      fixture.broker.execute = async (input) => {
+        fixture.executions.push(input);
+        try { await rename(foreground, `${foreground}-moved`); }
+        catch (error) { renameFailures.push((error as NodeJS.ErrnoException).code); }
+        return exited;
+      };
+      fixture.broker.spawn = async (input) => {
+        fixture.spawns.push(input);
+        try { await rename(background, `${background}-moved`); }
+        catch (error) { renameFailures.push((error as NodeJS.ErrnoException).code); }
+        return { id: "process", brokerInstanceId: "broker" };
+      };
+      const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+      const foregroundCall = request("pinned-read-exec", "exec", {
+        executable: process.execPath, cwd: "foreground"
+      });
+      const backgroundCall = request("pinned-read-spawn", "process_spawn", {
+        executable: process.execPath, cwd: "background"
+      });
+      await tools.prepare(foregroundCall, preparation(workspace));
+      await tools.prepare(backgroundCall, preparation(workspace));
+
+      await expect(tools.execute(foregroundCall, execution(workspace)))
+        .resolves.toMatchObject({ ok: true });
+      await expect(tools.execute(backgroundCall, execution(workspace)))
+        .resolves.toMatchObject({ ok: true });
+      expect(renameFailures).toHaveLength(2);
+      expect(renameFailures).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u),
+        expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
+      ]));
+      await expect(rename(foreground, `${foreground}-moved`)).resolves.toBeUndefined();
+      await expect(rename(background, `${background}-moved`)).resolves.toBeUndefined();
     }
   );
 

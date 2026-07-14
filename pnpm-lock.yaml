@@ -122,6 +122,9 @@ importers:
       agent-protocol:
         specifier: workspace:*
         version: link:../agent-protocol
+      ignore:
+        specifier: 7.0.5
+        version: 7.0.5
 
   packages/agent-execution: {}
 

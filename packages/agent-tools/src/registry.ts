@@ -10,6 +10,7 @@ import type {
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
+import { assertDescriptorArguments } from "./tool-argument-validation.js";
 
 export interface RegisteredEffectTool {
   descriptor: ToolDescriptor;
@@ -89,6 +90,7 @@ export async function prepareToolCallPlan(
   argumentsValue: JsonValue,
   context: ToolPreparationContext
 ): Promise<ToolCallPlan> {
+  assertDescriptorArguments(descriptor, argumentsValue);
   const plan = descriptor.prepare
     ? await descriptor.prepare(argumentsValue, context)
     : (() => {
@@ -167,6 +169,7 @@ export class EffectToolRegistry implements ToolExecutor {
     const key = preparedPlanKey(context, request.callId);
     const prepared = this.preparedPlans.get(key);
     if (prepared) this.preparedPlans.delete(key);
+    assertDescriptorArguments(tool.descriptor, request.arguments);
     if (!context.callPlan && preparedPlanMismatch(prepared, request)) {
       throw Object.assign(new Error("Tool arguments changed after the call plan was prepared."), {
         code: "write_plan_invalid"

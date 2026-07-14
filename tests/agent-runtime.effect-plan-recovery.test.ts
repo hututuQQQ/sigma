@@ -157,7 +157,9 @@ describe("effect-plan recovery", () => {
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Violation handled." })])
       ]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker, runtimeCommands: ["fixture"]
+      }),
       store,
       storeRootDir,
       permissionMode: "auto",
@@ -215,7 +217,9 @@ describe("effect-plan recovery", () => {
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Nested write handled." })])
       ]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker, runtimeCommands: ["fixture"]
+      }),
       store,
       storeRootDir,
       permissionMode: "auto",
@@ -267,7 +271,9 @@ describe("effect-plan recovery", () => {
     ]);
     const runtime = createRuntimeForTesting({
       gateway,
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker, runtimeCommands: ["fixture"]
+      }),
       store,
       storeRootDir,
       permissionMode: "auto",

@@ -10,7 +10,13 @@ import type { KernelEffect } from "agent-kernel";
 import { approximateTokens, RepositoryContextProvider } from "agent-context";
 import type { ModelRouteConstraints } from "agent-model";
 import { isToolAllowed } from "agent-tools";
-import { modelTools, providerSizedPlan, steeringRestart } from "./effect-helpers.js";
+import {
+  modelTools,
+  projectModelToolDescriptors,
+  providerSizedPlan,
+  sessionSkillProjectionCapabilities,
+  steeringRestart
+} from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
 import {
@@ -60,7 +66,10 @@ export class ModelEffectRunner {
   private readonly repositoryContext: RepositoryContextProvider;
 
   constructor(private readonly options: EffectRunnerOptions) {
-    this.repositoryContext = new RepositoryContextProvider(options.runtime.execution);
+    // Pre-model context is trusted, read-only runtime work. Keeping it on the
+    // host filesystem prevents an indexing probe from consuming or closing the
+    // shared sandbox broker used by model-requested tools and background work.
+    this.repositoryContext = new RepositoryContextProvider();
   }
 
   async request(session: RuntimeSession, signal: AbortSignal, effect: RequestModelEffect): Promise<void> {
@@ -157,7 +166,16 @@ export class ModelEffectRunner {
       ? availableDescriptors.filter((item) => item.possibleEffects.includes("outcome.propose")
         || item.possibleEffects.includes("outcome.request_input"))
       : availableDescriptors;
-    const tools = modelTools(descriptors);
+    const projectedDescriptors = projectModelToolDescriptors(
+      descriptors,
+      sessionSkillProjectionCapabilities({
+        frozenCustomization: session.durable.frozenCustomization,
+        liveSkillDescriptors: this.options.runtime.skills?.descriptors,
+        loadedSkills: session.durable.state.frozenSkills,
+        profileSkillNames: session.services.profile?.profile.skills
+      })
+    );
+    const tools = modelTools(projectedDescriptors);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
       const ledger = evidenceLedger(session);

@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -6,15 +7,15 @@ use std::ptr::{null, null_mut};
 const INTERNAL_PTY_LAUNCHER: &str = "--internal-unix-pty-launcher";
 
 pub(crate) fn try_run_internal_mode() -> Option<i32> {
-    let mut arguments = std::env::args();
+    let mut arguments = std::env::args_os();
     let _program = arguments.next()?;
-    if arguments.next()?.as_str() != INTERNAL_PTY_LAUNCHER {
+    if arguments.next()? != OsStr::new(INTERNAL_PTY_LAUNCHER) {
         return None;
     }
     Some(run(arguments.collect()))
 }
 
-fn run(arguments: Vec<String>) -> i32 {
+fn run(arguments: Vec<OsString>) -> i32 {
     match run_pty(arguments) {
         Ok(code) => code,
         Err(error) => {
@@ -24,17 +25,18 @@ fn run(arguments: Vec<String>) -> i32 {
     }
 }
 
-fn run_pty(arguments: Vec<String>) -> io::Result<i32> {
-    if arguments.len() < 3 {
+fn run_pty(arguments: Vec<OsString>) -> io::Result<i32> {
+    if arguments.len() < 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "PTY launcher requires columns, rows, and an executable",
+            "PTY launcher requires columns, rows, an executable, and argv0",
         ));
     }
     let columns = dimension(&arguments[0], "columns")?;
     let rows = dimension(&arguments[1], "rows")?;
     let executable = &arguments[2];
-    let command_arguments = &arguments[3..];
+    let argv0 = &arguments[3];
+    let command_arguments = &arguments[4..];
     let size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
@@ -47,7 +49,10 @@ fn run_pty(arguments: Vec<String>) -> io::Result<i32> {
         return Err(io::Error::last_os_error());
     }
     if child == 0 {
-        let error = Command::new(executable).args(command_arguments).exec();
+        let error = Command::new(executable)
+            .arg0(argv0)
+            .args(command_arguments)
+            .exec();
         eprintln!("sigma-exec PTY exec failed: {error}");
         unsafe { libc::_exit(126) }
     }
@@ -72,10 +77,10 @@ fn run_pty(arguments: Vec<String>) -> io::Result<i32> {
     wait_for_child(child)
 }
 
-fn dimension(value: &str, label: &str) -> io::Result<u16> {
+fn dimension(value: &OsStr, label: &str) -> io::Result<u16> {
     value
-        .parse::<u16>()
-        .ok()
+        .to_str()
+        .and_then(|value| value.parse::<u16>().ok())
         .filter(|item| *item > 0)
         .ok_or_else(|| {
             io::Error::new(

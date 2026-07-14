@@ -1,13 +1,52 @@
-import { readFile, readdir, stat } from "node:fs/promises";
-import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import {
-  resolveWorkspacePath,
   runProcess,
   selfContainedGitRoot,
   type ProcessExecutionPort
 } from "agent-platform";
 import type { RegisteredEffectTool } from "./registry.js";
+
+export type RepositoryStatisticsProvider = (
+  workspace: string,
+  signal: AbortSignal
+) => Promise<RepositoryProviderResult>;
+
+export interface RepositoryProviderResult {
+  output: string;
+  diagnostics?: string[];
+}
+
+export interface RepositoryListRequest {
+  path: string;
+  glob: string;
+  limit: number;
+}
+
+export type RepositoryListProvider = (
+  workspace: string,
+  signal: AbortSignal,
+  request: RepositoryListRequest
+) => Promise<RepositoryProviderResult>;
+
+export interface RepositoryTextSearchRequest {
+  query: string;
+  path: string;
+  glob: string;
+  regex: boolean;
+  limit: number;
+}
+
+export type RepositoryTextSearchProvider = (
+  workspace: string,
+  signal: AbortSignal,
+  request: RepositoryTextSearchRequest
+) => Promise<RepositoryProviderResult>;
+
+export interface RepositoryToolProviders {
+  list?: RepositoryListProvider;
+  statistics?: RepositoryStatisticsProvider;
+  textSearch?: RepositoryTextSearchProvider;
+}
 
 function object(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -42,139 +81,75 @@ function result(
   return { callId: request.callId, ok, output, observedEffects: ["filesystem.read"], artifacts, diagnostics, startedAt, completedAt: new Date().toISOString() };
 }
 
-const ignoredDirectories = new Set([".git", ".agent", "node_modules", "dist", "coverage"]);
+const listGlobCharacterLimit = 512;
 
-async function walk(root: string, relativeRoot: string, limit: number, signal: AbortSignal): Promise<string[]> {
-  const files: string[] = [];
-  const queue = [relativeRoot];
-  while (queue.length > 0 && files.length < limit) {
-    if (signal.aborted) throw signal.reason ?? new Error("Repository scan cancelled.");
-    const relative = queue.shift()!;
-    const directory = await resolveWorkspacePath(root, relative || ".");
-    const entries = await readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      const child = path.join(relative, entry.name);
-      if (entry.isDirectory()) {
-        if (!ignoredDirectories.has(entry.name)) queue.push(child);
-      } else if (entry.isFile()) {
-        files.push(child.split(path.sep).join("/"));
-        if (files.length >= limit) break;
-      }
-    }
-  }
-  return files;
-}
-
-function globExpression(pattern: string): RegExp {
-  let expression = "^";
-  for (let index = 0; index < pattern.length; index += 1) {
-    const character = pattern[index];
-    if (character === "*" && pattern[index + 1] === "*") {
-      expression += ".*";
-      index += 1;
-    } else if (character === "*") expression += "[^/]*";
-    else if (character === "?") expression += "[^/]";
-    else expression += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-  }
-  return new RegExp(`${expression}$`, "u");
-}
-
-function listTool(): RegisteredEffectTool {
+function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
   return {
     descriptor: schema({
       name: "list",
-      description: "List repository files recursively with optional glob filtering. Standard generated/vendor directories are skipped.",
+      description: "List repository files recursively as bounded JSONL paths with optional glob filtering. Nested ignore rules and hidden, generated, vendor, control, sensitive, and symbolic-linked paths are excluded; diagnostics state completeness.",
       properties: { path: { type: "string" }, glob: { type: "string" }, limit: { type: "number" } },
       contextPathArguments: ["path"],
-      possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 30_000
+      possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = object(request.arguments);
       const limit = integer(input, "limit", 2_000, 20_000);
-      const files = await walk(context.workspacePath, text(input, "path", "."), limit, context.signal);
+      const searchPath = text(input, "path", ".");
       const pattern = text(input, "glob");
-      const selected = pattern ? files.filter((file) => globExpression(pattern).test(file)) : files;
-      return result(request, startedAt, selected.join("\n"), true, files.length >= limit ? [`result_limit=${limit}`] : []);
+      if (pattern.length > listGlobCharacterLimit) {
+        throw new Error(`List glob exceeds the ${listGlobCharacterLimit}-character safety limit.`);
+      }
+      const listing = await listProvider(
+        context.workspacePath,
+        context.signal,
+        { path: searchPath, glob: pattern, limit }
+      );
+      return result(request, startedAt, listing.output, true, listing.diagnostics ?? []);
     }
   };
 }
 
-async function fallbackSearch(
-  workspace: string,
-  searchPath: string,
-  query: string,
-  regex: boolean,
-  limit: number,
-  signal: AbortSignal
-): Promise<{ matches: string[]; truncated: boolean }> {
-  const matcher = regex ? new RegExp(query, "u") : null;
-  const files = await walk(workspace, searchPath, 20_000, signal);
-  const matches: string[] = [];
-  for (const file of files) {
-    if (matches.length > limit) break;
-    const target = await resolveWorkspacePath(workspace, file);
-    if ((await stat(target)).size > 2_000_000) continue;
-    const content = await readFile(target, "utf8").catch(() => "");
-    if (content.includes("\0")) continue;
-    for (const [index, line] of content.split(/\r?\n/).entries()) {
-      if (matcher ? matcher.test(line) : line.includes(query)) matches.push(`${file}:${index + 1}:${line}`);
-      if (matches.length > limit) break;
+function repositoryStatsTool(statisticsProvider: RepositoryStatisticsProvider): RegisteredEffectTool {
+  return {
+    descriptor: schema({
+      name: "repository_stats",
+      description: "Count source files and physical/non-blank text lines by language without starting a process; returns the exact scope and completeness limits.",
+      properties: {}, possibleEffects: ["filesystem.read"], executionMode: "parallel",
+      resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
+    }),
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const statistics = await statisticsProvider(context.workspacePath, context.signal);
+      return result(request, startedAt, statistics.output, true, statistics.diagnostics ?? []);
     }
-  }
-  return { matches: matches.slice(0, limit), truncated: matches.length > limit };
+  };
 }
 
-function grepTool(execution?: ProcessExecutionPort): RegisteredEffectTool {
+function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffectTool {
   return {
     descriptor: schema({
       name: "grep",
-      description: "Search repository text with ripgrep semantics and a built-in fallback.",
+      description: "Search bounded safe repository text without spawning a process. Hidden, ignored, generated, linked, and sensitive paths are excluded. Matching is literal unless regex=true; results are JSONL.",
       properties: { query: { type: "string" }, path: { type: "string" }, glob: { type: "string" }, regex: { type: "boolean" }, limit: { type: "number" } },
-      required: ["query"], possibleEffects: ["filesystem.read", "process.spawn.readonly"], executionMode: "parallel", resourceKeys: [],
-      contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 30_000
+      required: ["query"], possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [],
+      contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = object(request.arguments);
       const query = text(input, "query");
       const searchPath = text(input, "path", ".");
-      const workspaceRoot = await resolveWorkspacePath(context.workspacePath, ".");
-      const resolvedSearchPath = await resolveWorkspacePath(workspaceRoot, searchPath);
-      const safeSearchPath = path.relative(workspaceRoot, resolvedSearchPath) || ".";
       const limit = integer(input, "limit", 500, 5_000);
       const regex = input.regex === true;
-      const argv = ["--line-number", "--column", "--no-heading", "--color", "never"];
-      if (!regex) argv.push("--fixed-strings");
       const glob = text(input, "glob");
-      if (glob) argv.push("--glob", glob);
-      argv.push("--", query, safeSearchPath);
-      try {
-        if (!execution) throw new Error("Sandboxed process execution is unavailable.");
-        const output = await runProcess({
-          execution,
-          executable: "rg", args: argv, cwd: workspaceRoot, timeoutMs: 30_000,
-          maxStdoutLines: limit + 1, signal: context.signal
-        });
-        if (output.exitCode === 0 || output.exitCode === 1 || output.stdoutLimitReached) {
-          const matches = output.stdout.trimEnd().split(/\r?\n/u).filter(Boolean);
-          const truncated = matches.length > limit;
-          const diagnostics = [
-            ...(output.exitCode === 1 ? ["no_matches"] : []),
-            ...(truncated ? [`result_limit=${limit}`] : []),
-            ...(output.outputTruncated ? ["output_truncated=true"] : [])
-          ];
-          return result(request, startedAt, matches.slice(0, limit).join("\n"), true, diagnostics);
-        }
-      } catch {
-        // Use the portable scanner when ripgrep is unavailable.
-      }
-      const fallback = await fallbackSearch(workspaceRoot, safeSearchPath, query, regex, limit, context.signal);
-      return result(
-        request, startedAt, fallback.matches.join("\n"), true,
-        fallback.truncated ? [`result_limit=${limit}`] : []
+      const search = await searchProvider(
+        context.workspacePath,
+        context.signal,
+        { query, path: searchPath, glob, regex, limit }
       );
+      return result(request, startedAt, search.output, true, search.diagnostics ?? []);
     }
   };
 }
@@ -201,7 +176,7 @@ function gitReadTool(
   return {
     descriptor: schema({
       name, description, properties: {}, possibleEffects: ["filesystem.read", "process.spawn.readonly"], executionMode: "parallel",
-      resourceKeys: ["workspace:git-read"], approval: "auto", idempotent: true, timeoutMs: 30_000
+      resourceKeys: ["workspace:git-read"], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
@@ -234,10 +209,14 @@ function gitReadTool(
   };
 }
 
-export function repositoryTools(execution?: ProcessExecutionPort): RegisteredEffectTool[] {
+export function repositoryTools(
+  execution?: ProcessExecutionPort,
+  providers: RepositoryToolProviders = {}
+): RegisteredEffectTool[] {
   return [
-    listTool(),
-    grepTool(execution),
+    ...(providers.list ? [listTool(providers.list)] : []),
+    ...(providers.statistics ? [repositoryStatsTool(providers.statistics)] : []),
+    ...(providers.textSearch ? [grepTool(providers.textSearch)] : []),
     gitReadTool("git_status", ["status", "--short", "--branch"], "Show the repository branch and working-tree status without changing it.", execution),
     gitReadTool("git_diff", ["diff", "--no-ext-diff", "--stat", "--patch"], "Show the current unstaged Git diff without changing it.", execution)
   ];

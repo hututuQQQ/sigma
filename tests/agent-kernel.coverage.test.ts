@@ -707,12 +707,12 @@ describe("agent-kernel exhaustive protocol behavior", () => {
 
     expect(apply(state, "profile.resolved", { profileId: 1 }).frozenProfile).toBeUndefined();
     state = apply(state, "profile.resolved", {
-      profileId: "secure", digest: "digest", artifactId: "artifact", source: "workspace"
+      profileId: "secure", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "workspace"
     });
     expect(state.frozenProfile).toMatchObject({ qualifiedName: "secure", source: "workspace" });
     expect(apply(state, "skill.loaded", { qualifiedName: "bad", digest: 1 }).frozenSkills).toHaveLength(0);
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:review", digest: "digest", artifactId: "artifact", source: "workspace"
+      qualifiedName: "workspace:review", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "workspace"
     });
     expect(state.frozenSkills).toHaveLength(1);
     expect(apply(state, "customization.frozen", {
@@ -723,7 +723,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state.frozenCustomization).toEqual({ artifactId: "c".repeat(64), digest: "d".repeat(64) });
     expect(apply(state, "skill.loaded", {
-      qualifiedName: "workspace:review", digest: "digest-two", artifactId: "artifact-two", source: "home"
+      qualifiedName: "workspace:review", digest: "d".repeat(64), artifactId: "e".repeat(64), source: "home"
     }).frozenSkills).toHaveLength(1);
 
     state = apply(state, "process.spawned", {
@@ -886,12 +886,12 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(forgedByUser.evidence).toEqual([]);
 
     state = apply(forgedByUser, "profile.resolved", {
-      profileId: "builtin:secure", digest: "profile-digest", artifactId: "profile-artifact", source: "builtin"
+      profileId: "builtin:secure", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "builtin"
     });
     expect(state.frozenProfile).toMatchObject({ qualifiedName: "builtin:secure", source: "builtin" });
 
     state = apply(state, "skill.loaded", {
-      qualifiedName: "builtin:typescript", digest: "skill-digest", artifactId: "skill-artifact", source: "builtin",
+      qualifiedName: "builtin:typescript", digest: "c".repeat(64), artifactId: "d".repeat(64), source: "builtin",
       executionManifestArtifactId: "a".repeat(64), executionManifestDigest: "b".repeat(64)
     });
     expect(state.frozenSkills.at(-1)).toMatchObject({
@@ -900,15 +900,15 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
 
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:invalid-artifact", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:invalid-artifact", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "not-a-digest", executionManifestDigest: "b".repeat(64)
     });
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:missing-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:missing-manifest-digest", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "c".repeat(64)
     });
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:invalid-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:invalid-manifest-digest", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "c".repeat(64), executionManifestDigest: "not-a-digest"
     });
     expect(state.frozenSkills.slice(-3).every((item) => item.executionManifestArtifactId === undefined)).toBe(true);

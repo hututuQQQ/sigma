@@ -124,7 +124,9 @@ describe("restore_run_changes transaction control", () => {
         fakeToolTurn([fakeToolCall("restore", "restore_run_changes", {})]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Restore was blocked." })])
       ]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker, runtimeCommands: ["fixture-process"]
+      }),
       store,
       storeRootDir,
       permissionMode: "auto",
@@ -158,7 +160,7 @@ describe("restore_run_changes transaction control", () => {
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Prepare failure observed." })])
       ]),
-      tools: registerBuiltinTools(new EffectToolRegistry()),
+      tools: registerBuiltinTools(new EffectToolRegistry(), { runtimeCommands: ["fixture"] }),
       store,
       storeRootDir,
       permissionMode: "auto",

@@ -247,8 +247,8 @@ describe("durable reducer contracts", () => {
 
     const profile = {
       profileId: "workspace:secure",
-      digest: "digest",
-      artifactId: "artifact",
+      digest: DIGEST_A,
+      artifactId: DIGEST_B,
       source: "workspace"
     };
     expect(reduce(state, "profile.resolved", profile).frozenProfile)
@@ -257,12 +257,18 @@ describe("durable reducer contracts", () => {
       { ...profile, profileId: 1 },
       { ...profile, digest: 1 },
       { ...profile, artifactId: 1 },
+      { ...profile, digest: "short" },
+      { ...profile, artifactId: "A".repeat(64) },
       { ...profile, source: "remote" }
     ]) expect(reduce(state, "profile.resolved", invalid)).toBe(state);
+    expect(reduce(state, "profile.resolved", profile, { authority: "tool" })).toBe(state);
+    expect(reduce(state, "profile.resolved", profile, { sessionId: "other" })).toBe(state);
 
     const customization = { digest: DIGEST_A, artifactId: DIGEST_B };
     expect(reduce(state, "customization.frozen", customization).frozenCustomization)
       .toEqual(customization);
+    expect(reduce(state, "customization.frozen", customization, { authority: "user" })).toBe(state);
+    expect(reduce(state, "customization.frozen", customization, { sessionId: "other" })).toBe(state);
     for (const invalid of [
       { ...customization, digest: `x${DIGEST_A}` },
       { ...customization, digest: `${DIGEST_A}x` },
@@ -272,17 +278,21 @@ describe("durable reducer contracts", () => {
 
     const skill = {
       qualifiedName: "workspace:typescript",
-      digest: "digest",
-      artifactId: "artifact",
+      digest: DIGEST_A,
+      artifactId: DIGEST_B,
       source: "workspace"
     };
     const loaded = reduce(state, "skill.loaded", skill);
     expect(loaded.frozenSkills).toHaveLength(1);
     expect(reduce(loaded, "skill.loaded", skill)).toBe(loaded);
+    expect(reduce(state, "skill.loaded", skill, { authority: "tool" })).toBe(state);
+    expect(reduce(state, "skill.loaded", skill, { sessionId: "other" })).toBe(state);
     for (const invalid of [
       { ...skill, qualifiedName: 1 },
       { ...skill, digest: 1 },
       { ...skill, artifactId: 1 },
+      { ...skill, digest: "short" },
+      { ...skill, artifactId: "A".repeat(64) },
       { ...skill, source: "remote" }
     ]) expect(reduce(state, "skill.loaded", invalid)).toBe(state);
 

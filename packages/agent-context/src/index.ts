@@ -4,3 +4,7 @@ export * from "./instructions.js";
 export * from "./planner.js";
 export * from "./cache.js";
 export * from "./repository-context.js";
+export * from "./repository-listing.js";
+export * from "./repository-safe-read.js";
+export * from "./repository-statistics.js";
+export * from "./repository-text-search.js";

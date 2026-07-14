@@ -130,9 +130,11 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
 
 const reviewEvidence: KernelEventReducer = (state, event, payload) => evidenceRecorded(state, event, payload);
 
-const profileResolved: KernelEventReducer = (state, _event, payload) => {
-  if (typeof payload.profileId !== "string" || typeof payload.digest !== "string"
-    || typeof payload.artifactId !== "string"
+const profileResolved: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId
+    || typeof payload.profileId !== "string" || typeof payload.digest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(payload.digest)
+    || typeof payload.artifactId !== "string" || !/^[a-f0-9]{64}$/u.test(payload.artifactId)
     || (payload.source !== "home" && payload.source !== "workspace" && payload.source !== "builtin")) return state;
   return { ...state, frozenProfile: {
     artifactId: payload.artifactId,
@@ -142,16 +144,28 @@ const profileResolved: KernelEventReducer = (state, _event, payload) => {
   } };
 };
 
-const customizationFrozen: KernelEventReducer = (state, _event, payload) => {
-  if (typeof payload.digest !== "string" || !/^[a-f0-9]{64}$/u.test(payload.digest)
+const customizationFrozen: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId
+    || typeof payload.digest !== "string" || !/^[a-f0-9]{64}$/u.test(payload.digest)
     || typeof payload.artifactId !== "string" || !/^[a-f0-9]{64}$/u.test(payload.artifactId)) return state;
   return { ...state, frozenCustomization: { artifactId: payload.artifactId, digest: payload.digest } };
 };
 
-const skillLoaded: KernelEventReducer = (state, _event, payload) => {
-  if (typeof payload.qualifiedName !== "string" || typeof payload.digest !== "string"
-    || typeof payload.artifactId !== "string"
-    || (payload.source !== "home" && payload.source !== "workspace" && payload.source !== "builtin")) return state;
+function validSkillLoadedPayload(payload: Record<string, JsonValue>): payload is Record<string, JsonValue> & {
+  qualifiedName: string;
+  digest: string;
+  artifactId: string;
+  source: "home" | "workspace" | "builtin";
+} {
+  return typeof payload.qualifiedName === "string" && payload.qualifiedName.length > 0
+    && typeof payload.digest === "string" && /^[a-f0-9]{64}$/u.test(payload.digest)
+    && typeof payload.artifactId === "string" && /^[a-f0-9]{64}$/u.test(payload.artifactId)
+    && (payload.source === "home" || payload.source === "workspace" || payload.source === "builtin");
+}
+
+const skillLoaded: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId
+    || !validSkillLoadedPayload(payload)) return state;
   if (state.frozenSkills.some((item) => item.qualifiedName === payload.qualifiedName)) return state;
   return { ...state, frozenSkills: [...state.frozenSkills, {
     artifactId: payload.artifactId,

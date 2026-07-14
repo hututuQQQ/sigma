@@ -1,10 +1,15 @@
-import { readFile, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import { resolveWorkspacePath, runtimeEnvironment } from "agent-platform";
 import type { ExecutionBroker } from "agent-execution";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
-import { repositoryTools } from "./repository-tools.js";
+import {
+  repositoryTools,
+  type RepositoryListProvider,
+  type RepositoryStatisticsProvider,
+  type RepositoryTextSearchProvider
+} from "./repository-tools.js";
 import { registerCompletionTool } from "./completion-tool.js";
 import {
   applyUnifiedPatch,
@@ -19,6 +24,10 @@ import {
 } from "./execution-tools.js";
 import { codeIntelTool, type CodeIntelToolOptions } from "./lsp-tools.js";
 import { deleteWorkspaceFile } from "./delete-file.js";
+import {
+  MAX_EXPLICIT_WORKSPACE_READ_BYTES,
+  readStableWorkspaceTextFile
+} from "./stable-workspace-read.js";
 
 function args(value: JsonValue): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -83,7 +92,7 @@ function readTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor({
       name: "read",
-      description: "Read a UTF-8 text file inside the workspace.",
+      description: `Read a UTF-8 text file inside the workspace (maximum ${MAX_EXPLICIT_WORKSPACE_READ_BYTES} bytes).`,
       properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
       required: ["path"],
       possibleEffects: ["filesystem.read"],
@@ -97,8 +106,11 @@ function readTool(): RegisteredEffectTool {
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
-      const target = await resolveWorkspacePath(context.workspacePath, stringArg(input, "path"));
-      const content = await readFile(target, "utf8");
+      const content = await readStableWorkspaceTextFile(
+        context.workspacePath,
+        stringArg(input, "path"),
+        context.signal
+      );
       const offset = typeof input.offset === "number" ? Math.max(0, Math.floor(input.offset)) : 0;
       const limit = typeof input.limit === "number" ? Math.max(1, Math.floor(input.limit)) : 500;
       const lines = content.split(/\r?\n/).slice(offset, offset + limit);
@@ -297,6 +309,9 @@ function applyPatchTool(atomicPatchStateRootDir?: string): RegisteredEffectTool 
 export interface BuiltinToolOptions extends Partial<Omit<ExecutionToolOptions, "broker">> {
   broker?: ExecutionBroker;
   codeIntel?: Omit<CodeIntelToolOptions, "broker">;
+  repositoryList?: RepositoryListProvider;
+  repositoryStatistics?: RepositoryStatisticsProvider;
+  repositoryTextSearch?: RepositoryTextSearchProvider;
   /** Durable external root used for atomic write/edit/apply_patch recovery. */
   atomicPatchStateRootDir?: string;
 }
@@ -307,13 +322,24 @@ export function registerBuiltinTools(registry: EffectToolRegistry, options: Buil
     broker: options.broker ?? unavailableExecutionBroker(),
     sandboxMode: options.sandboxMode ?? "required",
     networkMode: options.networkMode ?? "none",
-    shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell])
+    shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell]),
+    runtimeCommands: options.runtimeCommands ?? [],
+    foreground: options.foreground ?? true,
+    background: options.background ?? true,
+    stdin: options.stdin ?? true,
+    pty: options.pty ?? true,
+    networkModes: options.networkModes ?? ["none", "full"]
   };
   const codeIntel = options.codeIntel ? [codeIntelTool({ broker: execution.broker, ...options.codeIntel })] : [];
   for (const tool of [
     readTool(), writeTool(options.atomicPatchStateRootDir), editTool(options.atomicPatchStateRootDir),
     deleteFileTool(), applyPatchTool(options.atomicPatchStateRootDir),
-    ...codeIntel, ...executionTools(execution), ...repositoryTools(options.broker)
+    ...codeIntel, ...executionTools(execution),
+    ...repositoryTools(options.broker, {
+      list: options.repositoryList,
+      statistics: options.repositoryStatistics,
+      textSearch: options.repositoryTextSearch
+    })
   ]) registry.register(tool);
   return registerControlTools(registerCompletionTool(registry));
 }

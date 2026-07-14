@@ -1,3 +1,4 @@
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 import type { ExecutionPolicy } from "agent-execution";
 import type {
@@ -6,15 +7,26 @@ import type {
   ToolCallPlan,
   ToolPreparationContext
 } from "agent-protocol";
-import { resolveWorkspacePath } from "agent-platform";
+import { isInside, resolveWorkspacePath } from "agent-platform";
 import type { ExecutionToolOptions } from "./execution-tool-types.js";
-import { executionArgs } from "./execution-tool-values.js";
+import {
+  assertAvailableExecutable,
+  availableNetworkModes,
+  executionArgs
+} from "./execution-tool-values.js";
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
 
-function network(input: Record<string, JsonValue>, fallback: "none" | "full"): "none" | "full" {
+function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "full" {
+  const available = availableNetworkModes(options);
+  const fallback = available.includes(options.networkMode) ? options.networkMode : available[0];
   const value = input.network ?? fallback;
   if (value !== "none" && value !== "full") throw new Error("network must be none or full.");
+  if (!available.includes(value)) {
+    throw Object.assign(new Error(`Network mode '${value}' is not available for this execution broker.`), {
+      code: "network_unavailable"
+    });
+  }
   return value;
 }
 
@@ -69,13 +81,72 @@ export async function loadedSkillResource(
   return await runtimeControl.resolveLoadedSkillResource({ ...reference, purpose });
 }
 
-function plannedReadPaths(
+function readScopeError(message: string): Error {
+  return Object.assign(new Error(message), { code: "policy_denied" });
+}
+
+function declaredReadRoots(input: Record<string, JsonValue>): string[] {
+  const value = input.readRoots;
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length === 0
+    || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw readScopeError("readRoots must be a non-empty array of workspace directory paths.");
+  }
+  return [...new Set(value as string[])];
+}
+
+function portableWorkspacePath(workspaceRoot: string, target: string): string {
+  const relative = path.relative(workspaceRoot, target).split(path.sep).join("/");
+  return relative || ".";
+}
+
+async function stableReadDirectory(workspaceRoot: string, requested: string): Promise<string> {
+  const lexical = path.resolve(workspaceRoot, requested);
+  if (!isInside(workspaceRoot, lexical)) {
+    throw readScopeError(`Process read root escapes the workspace: ${requested}.`);
+  }
+  const segments = path.relative(workspaceRoot, lexical).split(path.sep).filter(Boolean);
+  let current = workspaceRoot;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    const info = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!info) throw readScopeError(`Process read roots must already exist: ${requested}.`);
+    if (info.isSymbolicLink()) {
+      throw readScopeError(`Process read roots cannot traverse links: ${requested}.`);
+    }
+  }
+  const info = await lstat(lexical).catch(() => null);
+  if (!info?.isDirectory() || info.isSymbolicLink()) {
+    throw readScopeError(`Process read roots must be stable existing directories: ${requested}.`);
+  }
+  const resolved = await resolveWorkspacePath(workspaceRoot, requested).catch((error) => {
+    throw readScopeError(
+      `Invalid process read root '${requested}': ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
+  return portableWorkspacePath(workspaceRoot, resolved);
+}
+
+async function plannedReadPaths(
   input: Record<string, JsonValue>,
+  workspacePath: string,
   skillResource: LoadedSkillResourceAccess | undefined
-): string[] {
-  const paths = [typeof input.cwd === "string" ? input.cwd : "."];
+): Promise<string[]> {
+  if (input.cwd !== undefined && (typeof input.cwd !== "string" || input.cwd.length === 0)) {
+    throw readScopeError("cwd must be a non-empty workspace directory path.");
+  }
+  const cwd = typeof input.cwd === "string" ? input.cwd : ".";
+  const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
+  const paths = await Promise.all(
+    [...new Set([cwd, ...declaredReadRoots(input)])].map(async (item) =>
+      await stableReadDirectory(workspaceRoot, item)
+    )
+  );
   if (skillResource) paths.push(skillResource.readRoot, skillResource.absolutePath);
-  return paths;
+  return [...new Set(paths)];
 }
 
 function plannedProcessMode(
@@ -96,12 +167,22 @@ async function plannedCall(
 ): Promise<ToolCallPlan> {
   const sandboxMode = skillResource ? "required" : options.sandboxMode;
   assertSafeBackgroundMode(background, sandboxMode);
-  const networkMode = network(input, options.networkMode);
+  if (background && skillResource) {
+    throw Object.assign(new Error(
+      "Frozen skill resources require foreground execution so their path lease remains held until the interpreter exits."
+    ), { code: "skill_execution_unavailable" });
+  }
+  if (background && input.pty !== undefined && options.pty === false) {
+    throw Object.assign(new Error("PTY background execution is not available for this execution broker."), {
+      code: "pty_unavailable"
+    });
+  }
+  const networkMode = network(input, options);
   const mutation = await processMutationContract(input, context.workspacePath, context.runMode, background);
   const writes = mutation.access === "write";
   return {
     exactEffects: plannedEffects(writes, validation, networkMode, sandboxMode, Boolean(skillResource)),
-    readPaths: plannedReadPaths(input, skillResource),
+    readPaths: await plannedReadPaths(input, context.workspacePath, skillResource),
     writePaths: mutation.expectedChanges,
     network: networkMode,
     processMode: plannedProcessMode(input, background),
@@ -158,6 +239,7 @@ export async function prepareExecutionCallPlan(
   background = false
 ): Promise<ToolCallPlan> {
   const input = executionArgs(argumentsValue);
+  if (input.executable !== undefined) assertAvailableExecutable(input, options);
   const skillResource = await loadedSkillResource(input, context.runtimeControl, "plan");
   return await plannedCall(input, context, options, skillResource, validation, background);
 }
@@ -171,13 +253,21 @@ export function executionPolicy(
 ): ExecutionPolicy {
   const required = Boolean(skillResource) || context.runMode === "analyze" || options.sandboxMode === "required";
   const networkMode = plan.network;
+  const workspaceRoot = path.resolve(context.workspacePath);
+  const skillRoot = skillResource ? path.resolve(skillResource.readRoot) : undefined;
+  const readRoots = plan.readPaths.flatMap((item) => {
+    const resolved = path.resolve(workspaceRoot, item);
+    if (isInside(workspaceRoot, resolved)) return [resolved];
+    if (skillRoot && isInside(skillRoot, resolved)) return [];
+    throw readScopeError(`Approved process read path escapes the workspace: ${item}.`);
+  });
   return {
     sandbox: required ? "required" : "unsafe",
     network: networkMode,
     networkApproved: networkMode === "full" && context.approval?.networkApproved === true,
     readRoots: [...new Set([
-      path.resolve(context.workspacePath),
-      ...(skillResource ? [path.resolve(skillResource.readRoot)] : [])
+      ...readRoots,
+      ...(skillRoot ? [skillRoot] : [])
     ])],
     writeRoots: context.runMode === "change" ? writeRoots : [],
     protectedPaths: [

@@ -9,3 +9,4 @@ export * from "./completion-tool.js";
 export * from "./control-tools.js";
 export * from "./execution-tools.js";
 export * from "./lsp-tools.js";
+export * from "./stable-workspace-read.js";

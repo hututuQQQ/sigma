@@ -57,14 +57,9 @@ export class RuntimeSkillControl {
     session: RuntimeSession,
     input: { qualifiedName: string; relativePath: string; purpose: "plan" | "execute" }
   ): Promise<LoadedSkillResourceAccess> {
-    const frozen = session.durable.frozenCustomization?.skills.find((item) => item.qualifiedName === input.qualifiedName);
-    if (!frozen) return fail(`Skill '${input.qualifiedName}' is not frozen in this session.`, "skill_unknown");
-    const loaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === input.qualifiedName);
-    if (!loaded) return fail(
-      `Skill '${input.qualifiedName}' must be loaded with load_skill before executing resources.`,
-      "skill_not_loaded"
-    );
-    if (loaded.digest !== frozen.digest || loaded.source !== frozen.source) {
+    assertSkillAllowed(session, input.qualifiedName);
+    const { loaded, authority } = loadedSkillResourceIdentity(session, input.qualifiedName);
+    if (loaded.digest !== authority.digest || loaded.source !== authority.source) {
       return fail(`Loaded skill '${input.qualifiedName}' does not match the frozen session skill.`, "skill_manifest_invalid");
     }
     if (!loaded.executionManifestArtifactId || !loaded.executionManifestDigest) {
@@ -72,8 +67,8 @@ export class RuntimeSkillControl {
     }
     const artifact = await this.options.readArtifact(session.identity.sessionId, loaded.executionManifestArtifactId);
     const manifest = restoreSkillExecutionManifest(artifact, loaded.executionManifestDigest);
-    if (manifest.qualifiedName !== frozen.qualifiedName || manifest.skillDigest !== frozen.digest
-      || manifest.source !== frozen.source) {
+    if (manifest.qualifiedName !== authority.qualifiedName || manifest.skillDigest !== authority.digest
+      || manifest.source !== authority.source) {
       return fail(`Skill '${input.qualifiedName}' execution manifest has invalid provenance.`, "skill_manifest_invalid");
     }
     const relativePath = canonicalResourcePath(input.relativePath);
@@ -130,6 +125,29 @@ export class RuntimeSkillControl {
     const loaded = await this.options.skills.load(qualifiedName);
     return { ...loaded, source: loaded.qualifiedName.startsWith("home:") ? "home" : "workspace" };
   }
+}
+
+function loadedSkillResourceIdentity(
+  session: RuntimeSession,
+  qualifiedName: string
+): {
+  loaded: RuntimeSession["durable"]["state"]["frozenSkills"][number];
+  authority: { qualifiedName: string; digest: string; source: "home" | "workspace" | "builtin" };
+} {
+  const customization = session.durable.frozenCustomization;
+  const frozen = customization?.skills.find((item) => item.qualifiedName === qualifiedName);
+  if (customization && !frozen) {
+    return fail(`Skill '${qualifiedName}' is not frozen in this session.`, "skill_unknown");
+  }
+  const loaded = session.durable.state.frozenSkills.find((item) => item.qualifiedName === qualifiedName);
+  if (!loaded) return fail(
+    `Skill '${qualifiedName}' must be loaded with load_skill before executing resources.`,
+    "skill_not_loaded"
+  );
+  // Legacy sessions have no customization bundle. Their runtime-authored
+  // skill.loaded event and content-addressed execution manifest form the
+  // immutable compatibility authority after load_skill returns.
+  return { loaded, authority: frozen ?? loaded };
 }
 
 function assertSkillAllowed(session: RuntimeSession, qualifiedName: string): void {

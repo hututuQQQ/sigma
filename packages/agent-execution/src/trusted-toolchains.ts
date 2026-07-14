@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   BrokerPolicyError,
@@ -25,6 +25,8 @@ export interface NormalizedTrustedToolchain {
   environment: Record<string, string>;
   nodeRuntime: boolean;
   compatibility: TrustedToolchainManifestEntry["compatibility"];
+  /** Connection-bound identity forwarded to the native launcher. */
+  executableSha256?: string;
 }
 
 export function comparablePath(value: string): string {
@@ -176,12 +178,33 @@ export function normalizeTrustedToolchains(
   return configured.map((entry) => normalizeTrustedToolchain(entry, identifiers, aliasIdentifiers));
 }
 
+/** Returns only model-safe bare aliases. Callers must not present these as
+ * available until the broker connection has accepted the same manifest. */
+export function trustedToolchainCommandAliases(
+  entries: TrustedToolchainManifestEntry[] | undefined
+): string[] {
+  return normalizeTrustedToolchains(entries)
+    .flatMap((toolchain) => toolchain.aliases)
+    .sort((left, right) => left.localeCompare(right));
+}
+
 export function assertTrustedToolchainsAvailable(
   toolchains: NormalizedTrustedToolchain[],
   sandboxMode: SigmaExecBrokerClientOptions["sandboxMode"]
 ): void {
-  if (process.platform !== "win32" || (sandboxMode ?? "required") !== "required") return;
   for (const toolchain of toolchains) {
+    try {
+      if (!statSync(toolchain.executable).isFile()) {
+        throw new Error("the configured executable is not a regular file");
+      }
+      if (process.platform !== "win32") accessSync(toolchain.executable, constants.X_OK);
+    } catch (error) {
+      throw new BrokerToolchainUnavailableError(
+        toolchain.id,
+        error instanceof Error ? error.message : "the configured executable is unavailable"
+      );
+    }
+    if (process.platform !== "win32" || (sandboxMode ?? "required") !== "required") continue;
     if (!toolchain.nodeRuntime
       && (toolchain.executionRoots.length !== 1
         || !samePath(toolchain.executionRoots[0]!, toolchain.executable)
@@ -195,7 +218,10 @@ export function assertTrustedToolchainsAvailable(
   }
 }
 
-function inspectGenericWindowsExecutable(executable: string, toolchainId: string): void {
+function inspectGenericWindowsExecutable(
+  executable: string,
+  toolchainId: string
+): ReturnType<typeof inspectWindowsNodeMarkers> {
   let inspection: ReturnType<typeof inspectWindowsNodeMarkers>;
   try {
     inspection = inspectWindowsNodeMarkers(executable);
@@ -213,11 +239,16 @@ function inspectGenericWindowsExecutable(executable: string, toolchainId: string
       "an undeclared Node/libuv runtime cannot inherit generic Windows toolchain trust"
     );
   }
+  return inspection;
 }
 
 function assertWindowsToolchainExecutableIdentity(toolchain: NormalizedTrustedToolchain): void {
   if (!toolchain.nodeRuntime) {
-    inspectGenericWindowsExecutable(toolchain.executable, toolchain.id);
+    const inspection = inspectGenericWindowsExecutable(toolchain.executable, toolchain.id);
+    if (toolchain.executableSha256 && toolchain.executableSha256 !== inspection.sha256) {
+      throw new BrokerToolchainUnavailableError(toolchain.id, "the executable changed after broker connection");
+    }
+    toolchain.executableSha256 = inspection.sha256;
     return;
   }
   assertWindowsAppContainerNodeCompatibility(
@@ -233,6 +264,7 @@ function assertWindowsToolchainExecutableIdentity(toolchain: NormalizedTrustedTo
       `NODE_OPTIONS=${WINDOWS_APPCONTAINER_NODE_COMPATIBILITY.requiredNodeOptions} is required for LPAC startup`
     );
   }
+  toolchain.executableSha256 = toolchain.compatibility!.executableSha256;
 }
 
 /**
@@ -257,6 +289,21 @@ export function assertTrustedExecutableAvailable(
     toolchain.executionRoots.some((root) => pathWithin(executable, root))
   );
   if (containing) inspectGenericWindowsExecutable(executable, containing.id);
+}
+
+export function trustedExecutableSha256(
+  executable: string,
+  toolchains: NormalizedTrustedToolchain[],
+  sandboxMode: SigmaExecBrokerClientOptions["sandboxMode"]
+): string | undefined {
+  if (process.platform !== "win32" || (sandboxMode ?? "required") !== "required") return undefined;
+  const toolchain = toolchains.find((candidate) => samePath(candidate.executable, executable));
+  if (!toolchain?.executableSha256) return undefined;
+  // The per-call check above hashes the same path again. Returning only the
+  // connection-bound digest prevents a replacement from becoming the new
+  // trusted identity during an individual request.
+  assertWindowsToolchainExecutableIdentity(toolchain);
+  return toolchain.executableSha256;
 }
 
 function existingCanonicalFile(candidate: string): string | undefined {

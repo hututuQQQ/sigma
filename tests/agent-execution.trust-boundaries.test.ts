@@ -3,7 +3,10 @@ import { cp, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/pr
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { BrokerPolicyError, BrokerToolchainUnavailableError } from "../packages/agent-execution/src/errors.js";
+import {
+  BrokerExecutableUnavailableError,
+  BrokerToolchainUnavailableError
+} from "../packages/agent-execution/src/errors.js";
 import { resolvePortableNodeExecutable } from "../packages/agent-execution/src/paths.js";
 import { requestParams } from "../packages/agent-execution/src/broker-request-policy.js";
 import {
@@ -102,13 +105,13 @@ describe("trusted toolchain boundaries", () => {
       clientOptions("unsafe"),
       toolchains,
       []
-    )).toThrow(BrokerPolicyError);
+    )).toThrow(BrokerExecutableUnavailableError);
     expect(() => requestParams(
       request(`.${path.sep}${path.basename(sibling)}`, root),
       clientOptions("unsafe"),
       toolchains,
       []
-    )).toThrow(BrokerPolicyError);
+    )).toThrow(BrokerExecutableUnavailableError);
   });
 
   it.runIf(process.platform === "win32")(

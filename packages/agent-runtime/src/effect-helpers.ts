@@ -17,6 +17,78 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
   return descriptors.map((item) => ({ name: item.name, description: item.description, inputSchema: item.inputSchema }));
 }
 
+export interface ModelToolProjectionCapabilities {
+  skillsAvailable: boolean;
+  executableSkillResourcesLoaded: boolean;
+}
+
+/** Frozen sessions never acquire capabilities from changed live state.
+ * Legacy sessions may use current catalog entries or runtime-authored durable
+ * skill snapshots, subject to their currently bound profile. */
+export function sessionSkillProjectionCapabilities(input: {
+  frozenCustomization?: { readonly skills: readonly { qualifiedName: string }[] };
+  liveSkillDescriptors?: readonly { qualifiedName: string }[];
+  loadedSkills: readonly {
+    qualifiedName: string;
+    executionManifestArtifactId?: string;
+    executionManifestDigest?: string;
+  }[];
+  profileSkillNames?: readonly string[];
+}): ModelToolProjectionCapabilities {
+  const allowed = input.profileSkillNames ? new Set(input.profileSkillNames) : undefined;
+  const candidates = input.frozenCustomization
+    ? input.frozenCustomization.skills.map((skill) => skill.qualifiedName)
+    : [
+        ...(input.liveSkillDescriptors ?? []).map((skill) => skill.qualifiedName),
+        ...input.loadedSkills.map((skill) => skill.qualifiedName)
+      ];
+  const available = new Set(candidates.filter((name) => !allowed || allowed.has(name)));
+  return {
+    skillsAvailable: available.size > 0,
+    executableSkillResourcesLoaded: input.loadedSkills.some((skill) =>
+      available.has(skill.qualifiedName)
+      && Boolean(skill.executionManifestArtifactId && skill.executionManifestDigest)
+    )
+  };
+}
+
+/** Present only session-real capabilities to the model while leaving the
+ * authoritative registry unchanged for durable recovery and stale-call denial. */
+export function projectModelToolDescriptors(
+  descriptors: readonly ToolDescriptor[],
+  capabilities: ModelToolProjectionCapabilities
+): ToolDescriptor[] {
+  const visible = capabilities.skillsAvailable
+    ? descriptors
+    : descriptors.filter((descriptor) => descriptor.name !== "load_skill");
+  return visible.map((descriptor) => {
+    const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
+    const unavailable = descriptor.name === "process_spawn"
+      || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
+    if (!unavailable) return descriptor;
+    const rawProperties = descriptor.inputSchema.properties;
+    if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
+    const properties = { ...(rawProperties as Record<string, JsonValue>) };
+    delete properties.skill;
+    delete properties.skillScript;
+    const required = Array.isArray(descriptor.inputSchema.required)
+      ? descriptor.inputSchema.required.filter((item) => item !== "skill" && item !== "skillScript")
+      : undefined;
+    return {
+      ...descriptor,
+      description: descriptor.description.replace(
+        " With skill and skillScript, the frozen script is prepended to interpreter args.",
+        ""
+      ),
+      inputSchema: {
+        ...descriptor.inputSchema,
+        properties,
+        ...(required ? { required } : {})
+      }
+    };
+  });
+}
+
 export async function providerSizedPlan(
   gateway: ModelGateway,
   input: Omit<PlanContextOptions, "contextWindowTokens">

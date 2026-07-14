@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
+import { link, mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -22,6 +22,11 @@ import {
   registerSupervisorTools,
   ResourceLockManager
 } from "../packages/agent-tools/src/index.js";
+import {
+  repositoryListJsonLines,
+  repositoryStatisticsJson,
+  repositoryTextSearchJsonLines
+} from "../packages/agent-runtime/src/repository-statistics-provider.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 const execution = createHostExecutionBroker();
@@ -174,11 +179,26 @@ describe("context, platform, and repository tool capabilities", () => {
     await mkdir(path.join(workspace, "src"), { recursive: true });
     await writeFile(path.join(workspace, "src", "one.txt"), "alpha\nbeta\n", "utf8");
     await writeFile(path.join(workspace, "src", "two.md"), "alpha\n", "utf8");
+    await writeFile(path.join(workspace, "src", "code.ts"), "const alpha = 1;\n\n// comment\n", "utf8");
     await writeFile(path.join(workspace, "src", "options.txt"), "--pre=do-not-execute\n", "utf8");
+    await mkdir(path.join(workspace, "ignored"), { recursive: true });
+    await mkdir(path.join(workspace, ".hidden"), { recursive: true });
+    await writeFile(path.join(workspace, ".gitignore"), "ignored/\n", "utf8");
+    await writeFile(path.join(workspace, "src", ".gitignore"), "drop.txt\n", "utf8");
+    await writeFile(path.join(workspace, "root.txt"), "root\n", "utf8");
+    await writeFile(path.join(workspace, "src", "drop.txt"), "drop\n", "utf8");
+    await writeFile(path.join(workspace, "ignored", "ignored.txt"), "ignored\n", "utf8");
+    await writeFile(path.join(workspace, ".hidden", "hidden.txt"), "hidden\n", "utf8");
+    await writeFile(path.join(workspace, "credentials.json"), "secret\n", "utf8");
     const signal = new AbortController().signal;
     await runProcess({ execution, executable: "git", args: ["init", "-q"], cwd: workspace, timeoutMs: 10_000, signal });
     await mkdir(path.join(workspace, ".agent"), { recursive: true });
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: execution });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: execution,
+      repositoryList: repositoryListJsonLines,
+      repositoryStatistics: repositoryStatisticsJson,
+      repositoryTextSearch: repositoryTextSearchJsonLines
+    });
     expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["complete_task", "request_user_input"]));
     expect(tools.descriptor("exec")).toMatchObject({ timeoutMs: 750_000 });
     expect(tools.descriptor("exec")?.idleTimeoutMs).toBeUndefined();
@@ -194,8 +214,52 @@ describe("context, platform, and repository tool capabilities", () => {
     });
     const listed = await tools.execute(request("list", "list", { path: "src", glob: "**/*.txt" }), context(workspace));
     expect(listed.output).toContain("src/one.txt");
+    expect(listed.output).not.toMatch(/drop|ignored|hidden|credentials/u);
+    expect(listed.diagnostics).toContain("listing_complete=true");
+    const rootListed = await tools.execute(
+      request("list-root", "list", { path: ".", glob: "**/*.txt" }), context(workspace)
+    );
+    expect(rootListed.output).toContain("root.txt");
+    const statistics = await tools.execute(
+      request("repository-stats", "repository_stats", {}), context(workspace)
+    );
+    expect(JSON.parse(statistics.output)).toMatchObject({
+      complete: true,
+      totals: { files: 1, physicalLines: 3, nonBlankLines: 2 },
+      languages: [{ language: "TypeScript", extensions: [".ts"], files: 1 }]
+    });
+    expect(tools.descriptor("repository_stats")?.possibleEffects).toEqual(["filesystem.read"]);
+    expect(tools.descriptor("list")?.timeoutMs).toBe(45_000);
+    expect(tools.descriptor("grep")?.timeoutMs).toBe(45_000);
+    expect(tools.descriptor("git_status")?.timeoutMs).toBe(45_000);
+    const linkedSource = path.join(workspace, "src", "linked-source.ts");
+    await writeFile(linkedSource, "export const linked = true;\n", "utf8");
+    await link(linkedSource, path.join(workspace, "src", "linked-copy.ts"));
+    const partialStatistics = await tools.execute(
+      request("repository-stats-partial", "repository_stats", {}), context(workspace)
+    );
+    expect(partialStatistics.diagnostics).toEqual(expect.arrayContaining([
+      "statistics_partial=true",
+      "skipped_source_files=2"
+    ]));
     const found = await tools.execute(request("grep", "grep", { query: "alpha", path: "src", limit: 20 }), context(workspace));
     expect(found.output).toContain("one.txt");
+    const textOnly = await tools.execute(request("grep-glob", "grep", {
+      query: "alpha", path: "src", glob: "*.txt", limit: 20
+    }), context(workspace));
+    expect(textOnly.output).toContain("one.txt");
+    expect(textOnly.output).not.toContain("two.md");
+    expect(tools.descriptor("grep")?.possibleEffects).toEqual(["filesystem.read"]);
+    const deadlinePartial = await repositoryTextSearchJsonLines(
+      workspace,
+      new AbortController().signal,
+      { query: "alpha", path: "src", glob: "", regex: false, limit: 20 },
+      { deadline: performance.now() - 1 }
+    );
+    expect(deadlinePartial.diagnostics).toEqual(expect.arrayContaining([
+      "search_partial=true",
+      "search_deadline_exceeded=true"
+    ]));
     await writeFile(path.join(workspace, "src", "dense-a.txt"), "alpha\n".repeat(10), "utf8");
     await writeFile(path.join(workspace, "src", "dense-b.txt"), "alpha\n".repeat(10), "utf8");
     const limited = await tools.execute(request("grep-limited", "grep", {
@@ -273,6 +337,47 @@ describe("context, platform, and repository tool capabilities", () => {
     await expect(tools.execute(request("write-nested-agent", "write", {
       path: "src/.agent/config.toml", content: "forbidden"
     }), context(workspace))).rejects.toMatchObject({ code: "protected_path" });
+  });
+
+  it("bounds repository listings and reports their completeness", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-list-bounds-"));
+    const source = path.join(workspace, "src");
+    await mkdir(source, { recursive: true });
+    const names = Array.from({ length: 400 }, (_, index) =>
+      `file-${index.toString().padStart(4, "0")}-${"x".repeat(170)}.txt`
+    );
+    await Promise.all(names.map((name) => writeFile(path.join(source, name), "", "utf8")));
+    const withoutProvider = registerBuiltinTools(new EffectToolRegistry(), { broker: execution });
+    expect(withoutProvider.descriptor("list")).toBeUndefined();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: execution,
+      repositoryList: repositoryListJsonLines
+    });
+
+    const entryLimited = await tools.execute(
+      request("list-entry-limit", "list", { path: "src", limit: 1 }),
+      context(workspace)
+    );
+    expect(entryLimited.output.split("\n")).toHaveLength(1);
+    expect(entryLimited.diagnostics).toEqual(expect.arrayContaining([
+      "listing_complete=false",
+      "listing_truncated=true",
+      "entry_limit=1",
+      "listed_entries=1"
+    ]));
+
+    const characterLimited = await tools.execute(
+      request("list-character-limit", "list", { path: "src", limit: 2_000 }),
+      context(workspace)
+    );
+    expect(Buffer.byteLength(characterLimited.output, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    expect(characterLimited.output.split("\n").every((line) => typeof JSON.parse(line) === "string")).toBe(true);
+    expect(characterLimited.diagnostics).toEqual(expect.arrayContaining([
+      "listing_complete=false",
+      "listing_truncated=true",
+      "output_byte_limit_reached=true"
+    ]));
+    expect(characterLimited.diagnostics).toContain("output_byte_limit=65536");
   });
 
   it("rejects nested instruction links that escape the workspace", async () => {

@@ -9,6 +9,11 @@ import type { ProcessOutputArtifact } from "./types.js";
 import type { OutputArtifactValue } from "./values.js";
 
 const MAX_IMPORTED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+type ArtifactRootRemover = (root: string) => Promise<void>;
+
+async function removeArtifactRoot(root: string): Promise<void> {
+  await rm(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 50 });
+}
 
 function pathWithin(candidate: string, root: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -45,14 +50,24 @@ export class BrokerOutputArtifactImporter {
   private artifactRoot?: string;
   private readonly consumed = new Set<string>();
   private readonly paths = new Map<string, string>();
+  private cleanupPromise?: Promise<void>;
+  private activeOperations = 0;
+  private idlePromise?: Promise<void>;
+  private resolveIdle?: () => void;
+  private closing = false;
+  private cleaned = false;
 
   constructor(
     private readonly redactor: SecretRedactor,
-    private readonly releaseRemote: (artifactIds: string[]) => Promise<unknown>
+    private readonly releaseRemote: (artifactIds: string[]) => Promise<unknown>,
+    private readonly removeRoot: ArtifactRootRemover = removeArtifactRoot
   ) {}
 
   async configureRoot(value: string | undefined): Promise<void> {
     if (value === undefined) return;
+    if (this.closing || this.cleaned) {
+      throw new BrokerProtocolError("Broker output artifact importer is already closing.");
+    }
     if (!value || !path.isAbsolute(value)) {
       throw new BrokerProtocolError("Broker artifactRoot must be an absolute path.");
     }
@@ -73,6 +88,10 @@ export class BrokerOutputArtifactImporter {
   }
 
   async consume(artifacts: readonly OutputArtifactValue[]): Promise<ProcessOutputArtifact[]> {
+    return await this.runOperation(async () => await this.consumeOnce(artifacts));
+  }
+
+  private async consumeOnce(artifacts: readonly OutputArtifactValue[]): Promise<ProcessOutputArtifact[]> {
     const pending = artifacts.filter((artifact) => !this.consumed.has(artifact.artifactId));
     if (pending.length === 0) return [];
     const prepared: Array<{ imported: ProcessOutputArtifact; sourcePath: string }> = [];
@@ -106,6 +125,10 @@ export class BrokerOutputArtifactImporter {
   }
 
   async acknowledge(artifactIds: readonly string[]): Promise<void> {
+    await this.runOperation(async () => await this.acknowledgeOnce(artifactIds));
+  }
+
+  private async acknowledgeOnce(artifactIds: readonly string[]): Promise<void> {
     const ids = [...new Set(artifactIds.filter((id) => this.consumed.has(id)))];
     if (ids.length === 0) return;
     try {
@@ -120,11 +143,44 @@ export class BrokerOutputArtifactImporter {
   }
 
   async cleanup(): Promise<void> {
+    if (this.cleaned) return;
+    this.closing = true;
+    const operation = this.cleanupPromise ?? this.cleanupOnce();
+    this.cleanupPromise = operation;
+    try {
+      await operation;
+      this.cleaned = true;
+    } finally {
+      if (!this.cleaned && this.cleanupPromise === operation) this.cleanupPromise = undefined;
+    }
+  }
+
+  private async cleanupOnce(): Promise<void> {
+    if (this.activeOperations > 0) await this.idlePromise;
     const root = this.artifactRoot;
+    if (root) await this.removeRoot(root);
     this.artifactRoot = undefined;
     this.paths.clear();
     this.consumed.clear();
-    if (root) await rm(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 50 }).catch(() => undefined);
+  }
+
+  private async runOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closing || this.cleaned) {
+      throw new BrokerProtocolError("Broker output artifact importer is closing.");
+    }
+    if (this.activeOperations === 0) {
+      this.idlePromise = new Promise<void>((resolve) => { this.resolveIdle = resolve; });
+    }
+    this.activeOperations += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeOperations -= 1;
+      if (this.activeOperations === 0) {
+        this.resolveIdle?.();
+        this.resolveIdle = undefined;
+      }
+    }
   }
 
   private async validArtifactPath(value: string): Promise<string> {

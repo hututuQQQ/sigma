@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod linux_hardening;
+#[cfg(target_os = "linux")]
+mod linux_mount_source;
 mod output;
 mod output_artifact;
 mod platform;

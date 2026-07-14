@@ -1,6 +1,7 @@
 import {
   SandboxUnavailableError,
   type ExecutionBroker,
+  type ExecutionResult,
   type ProcessHandle
 } from "agent-execution";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
@@ -15,8 +16,11 @@ import {
 } from "./execution-tool-planning.js";
 import type { ExecutionToolOptions } from "./execution-tool-types.js";
 import {
+  assertAvailableExecutable,
   assertAvailableShell,
+  availableNetworkModes,
   availableShells,
+  executableCapabilitySchema,
   executionArgs,
   executionEnvironment,
   executionStrings,
@@ -26,9 +30,80 @@ import {
   shellInvocation
 } from "./execution-tool-values.js";
 import type { PlannedToolExecutionContext, RegisteredEffectTool } from "./registry.js";
-import { lockWindowsMutationRoots } from "./windows-mutation-lock.js";
+import {
+  lockWindowsMutationRoots,
+  pinProcessReadRoots
+} from "./windows-mutation-lock.js";
 
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
+
+async function closeLocks(
+  ...locks: Array<{ close(): Promise<void> } | undefined>
+): Promise<void> {
+  const failures: unknown[] = [];
+  for (const lock of locks) {
+    try { await lock?.close(); } catch (error) { failures.push(error); }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "Process path-lock cleanup failed.");
+}
+
+async function closeLocksPreservingPrimary(
+  failed: boolean,
+  primary: unknown,
+  ...locks: Array<{ close(): Promise<void> } | undefined>
+): Promise<void> {
+  try {
+    await closeLocks(...locks);
+  } catch (cleanupError) {
+    if (!failed) throw cleanupError;
+    if (!(primary instanceof Error)) {
+      throw new AggregateError(
+        [primary, cleanupError], "Process execution and path-lock cleanup failed.", { cause: cleanupError }
+      );
+    }
+    const causes = primary.cause === undefined
+      ? [cleanupError]
+      : [primary.cause, cleanupError];
+    Object.defineProperty(primary, "cause", {
+      configurable: true,
+      value: new AggregateError(causes, "Process path-lock cleanup failed after the primary operation error.")
+    });
+  }
+}
+
+async function revalidateSkillResource(
+  input: Record<string, JsonValue>,
+  context: PlannedToolExecutionContext,
+  previous: Awaited<ReturnType<typeof loadedSkillResource>>
+): Promise<Awaited<ReturnType<typeof loadedSkillResource>>> {
+  if (!previous) return undefined;
+  const current = await loadedSkillResource(input, context.runtimeControl, "execute");
+  const fields = ["qualifiedName", "relativePath", "absolutePath", "readRoot", "digest"] as const;
+  if (!current || fields.some((field) => current[field] !== previous[field])) {
+    throw Object.assign(new Error("Frozen skill resource identity changed after its path lease was acquired."), {
+      code: "skill_resource_stale"
+    });
+  }
+  return current;
+}
+
+async function releaseRejectedResultArtifacts(
+  broker: ExecutionBroker,
+  result: ExecutionResult,
+  primary: unknown
+): Promise<never> {
+  const ids = result.outputArtifacts?.map((artifact) => artifact.brokerArtifactId) ?? [];
+  if (ids.length === 0 || !broker.releaseOutputArtifacts) throw primary;
+  try {
+    await broker.releaseOutputArtifacts(ids);
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [primary, cleanupError], "Process result rejection and artifact cleanup failed.", { cause: cleanupError }
+    );
+  }
+  throw primary;
+}
 
 async function executeForegroundCommand(
   kind: "exec" | "shell" | "validate",
@@ -40,12 +115,9 @@ async function executeForegroundCommand(
   const input = executionArgs(request.arguments);
   const validation = kind === "validate";
   if (kind === "shell") assertAvailableShell(input, options);
-  const skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
+  else assertAvailableExecutable(input, options);
+  let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
-  const cwd = await resolveWorkspacePath(
-    context.workspacePath,
-    typeof input.cwd === "string" ? input.cwd : "."
-  );
   const invocation = kind === "shell"
     ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
     : normalizeWindowsShellInvocation(
@@ -54,18 +126,34 @@ async function executeForegroundCommand(
     );
   const timeoutMs = typeof input.timeoutMs === "number"
     ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 600_000;
-  const mutationLock = await lockWindowsMutationRoots(context, approvedPlan);
+  const readLock = await pinProcessReadRoots(context, approvedPlan);
+  let mutationLock: Awaited<ReturnType<typeof lockWindowsMutationRoots>> = undefined;
+  let failed = false;
+  let primary: unknown;
   try {
-    if (mutationLock) {
-      approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
-    }
+    skillResource = await revalidateSkillResource(input, context, skillResource);
+    approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
+    const cwd = await resolveWorkspacePath(
+      context.workspacePath,
+      typeof input.cwd === "string" ? input.cwd : "."
+    );
+    mutationLock = await lockWindowsMutationRoots(context, approvedPlan);
+    if (mutationLock) approvedPlan = await approvedProcessPlan(
+      input, context, options, skillResource, validation
+    );
     const writeRoots = await resolvedWriteRoots(context, approvedPlan);
+    await readLock.verify();
     const result = await options.broker.execute({
       command: { ...invocation, cwd, environment: executionEnvironment(input) },
       policy: executionPolicy(context, approvedPlan, options, writeRoots, skillResource),
       timeoutMs,
       idleTimeoutMs: Math.min(timeoutMs, 120_000)
     }, { signal: context.signal });
+    try {
+      await readLock.verify();
+    } catch (error) {
+      return await releaseRejectedResultArtifacts(options.broker, result, error);
+    }
     return await commandReceipt(
       request,
       startedAt,
@@ -76,14 +164,22 @@ async function executeForegroundCommand(
       context,
       options.broker
     );
+  } catch (error) {
+    failed = true;
+    primary = error;
+    throw error;
   } finally {
-    await mutationLock?.close();
+    await closeLocksPreservingPrimary(failed, primary, mutationLock, readLock);
   }
 }
 
 function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionToolOptions): RegisteredEffectTool {
   const validation = kind === "validate";
   const writeContractProperties: Record<string, JsonValue> = {
+    readRoots: {
+      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
+      description: "Additional stable existing workspace directories the process may read. The working directory is always included."
+    },
     access: {
       type: "string", enum: ["readonly", "write"],
       description: "Explicit process filesystem access. Defaults to readonly unless legacy writePaths is supplied."
@@ -103,12 +199,13 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   };
   const properties: Record<string, JsonValue> = kind === "shell" ? {
     shell: { type: "string", enum: availableShells(options) }, command: { type: "string" }, cwd: { type: "string" },
-    network: { type: "string", enum: ["none", "full"] }, env: { type: "object", additionalProperties: { type: "string" } },
+    network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
     ...writeContractProperties
   } : {
-    executable: { type: "string" }, args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
+    executable: executableCapabilitySchema(options),
+    args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
     skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
-    network: { type: "string", enum: ["none", "full"] }, env: { type: "object", additionalProperties: { type: "string" } },
+    network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
     timeoutMs: { type: "number", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   };
@@ -142,58 +239,85 @@ function handle(input: Record<string, JsonValue>): ProcessHandle {
   };
 }
 
+async function executeBackgroundProcess(
+  options: ExecutionToolOptions,
+  request: ToolRequest,
+  context: PlannedToolExecutionContext
+): Promise<ToolReceipt> {
+  const startedAt = new Date().toISOString();
+  const input = executionArgs(request.arguments);
+  assertAvailableExecutable(input, options);
+  let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
+  let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
+  const readLock = await pinProcessReadRoots(context, approvedPlan);
+  let failed = false;
+  let primary: unknown;
+  try {
+    skillResource = await revalidateSkillResource(input, context, skillResource);
+    approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
+    const cwd = await resolveWorkspacePath(
+      context.workspacePath, typeof input.cwd === "string" ? input.cwd : "."
+    );
+    await readLock.verify();
+    const processHandle = await options.broker.spawn({
+      command: {
+        executable: executionText(input, "executable"),
+        args: [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")],
+        cwd,
+        environment: executionEnvironment(input)
+      },
+      policy: executionPolicy(context, approvedPlan, options, [], skillResource),
+      ...(input.pty === true ? { pty: true } : {})
+    }, { signal: context.signal });
+    return simpleReceipt(request, startedAt, processHandle, [
+      "process.spawn.readonly", ...(skillResource ? ["filesystem.read" as const] : [])
+    ]);
+  } catch (error) {
+    failed = true;
+    primary = error;
+    throw error;
+  } finally {
+    await closeLocksPreservingPrimary(failed, primary, readLock);
+  }
+}
+
 function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] {
   const handleProperties = { handleId: { type: "string" }, brokerInstanceId: { type: "string" } };
   return [{
     descriptor: {
-      ...executionToolSchema("process_spawn", "Start a sandboxed background process and return an in-session handle. With skill and skillScript, the frozen script is prepended to interpreter args.", {
-        executable: { type: "string" }, args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
-        skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
-        network: { type: "string", enum: ["none", "full"] }, env: { type: "object", additionalProperties: { type: "string" } },
-        pty: { type: "boolean" }, access: { type: "string", enum: ["readonly"] }
+      ...executionToolSchema("process_spawn", "Start a sandboxed background process and return an in-session handle.", {
+        executable: executableCapabilitySchema(options),
+        args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
+        network: { type: "string", enum: availableNetworkModes(options) },
+        env: { type: "object", additionalProperties: { type: "string" } },
+        ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
+        access: { type: "string", enum: ["readonly"] },
+        readRoots: {
+          type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
+          description: "Additional stable existing workspace directories the process may read. The working directory is always included."
+        }
       }, ["executable"], ["process.spawn.readonly", "filesystem.read", "network", "open_world"]),
       prepare(value, context) { return prepareExecutionCallPlan(value, context, options, false, true); }
     },
-    async execute(request, context) {
-      const startedAt = new Date().toISOString();
-      const input = executionArgs(request.arguments);
-      const skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
-      const approvedPlan = await approvedProcessPlan(
-        input, context, options, skillResource, false, true
-      );
-      const cwd = await resolveWorkspacePath(context.workspacePath, typeof input.cwd === "string" ? input.cwd : ".");
-      const processHandle = await options.broker.spawn({
-        command: {
-          executable: executionText(input, "executable"),
-          args: [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")],
-          cwd,
-          environment: executionEnvironment(input)
-        },
-        policy: executionPolicy(context, approvedPlan, options, [], skillResource),
-        ...(input.pty === true ? { pty: true } : {})
-      }, { signal: context.signal });
-      return simpleReceipt(request, startedAt, processHandle, [
-        "process.spawn.readonly", ...(skillResource ? ["filesystem.read" as const] : [])
-      ]);
-    }
+    async execute(request, context) { return await executeBackgroundProcess(options, request, context); }
   }, {
     descriptor: executionToolSchema("process_poll", "Poll incremental output from an in-session background process.", handleProperties, ["handleId", "brokerInstanceId"], ["process.spawn.readonly"]),
-    async execute(request, context) {
+    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
       const startedAt = new Date().toISOString();
       const result = await options.broker.poll(handle(executionArgs(request.arguments)), { signal: context.signal });
       return await processReceipt(request, startedAt, result, ["process.spawn.readonly"], context, options.broker);
     }
-  }, {
+  }, ...(options.stdin === false ? [] : [{
     descriptor: executionToolSchema("process_write", "Write UTF-8 input to an in-session background process.", {
       ...handleProperties, data: { type: "string" }
     }, ["handleId", "brokerInstanceId", "data"], ["process.spawn.readonly"]),
-    async execute(request, context) {
+    async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
       const startedAt = new Date().toISOString();
       const input = executionArgs(request.arguments);
       await options.broker.write(handle(input), executionText(input, "data"), { signal: context.signal });
       return simpleReceipt(request, startedAt, { written: true }, ["process.spawn.readonly"]);
     }
-  }, {
+  }]), {
     descriptor: executionToolSchema("process_terminate", "Terminate an in-session background process tree.", handleProperties, ["handleId", "brokerInstanceId"], ["process.spawn.readonly"]),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
@@ -224,10 +348,13 @@ export function unavailableExecutionBroker(message = "sigma-exec broker is not c
 }
 
 export function executionTools(options: ExecutionToolOptions): RegisteredEffectTool[] {
+  if (availableNetworkModes(options).length === 0) return [];
   return [
-    foregroundTool("exec", options),
-    ...(availableShells(options).length > 0 ? [foregroundTool("shell", options)] : []),
-    foregroundTool("validate", options),
-    ...backgroundTools(options)
+    ...(options.foreground === false ? [] : [
+      foregroundTool("exec", options),
+      ...(availableShells(options).length > 0 ? [foregroundTool("shell", options)] : []),
+      foregroundTool("validate", options)
+    ]),
+    ...(options.background === false ? [] : backgroundTools(options))
   ];
 }

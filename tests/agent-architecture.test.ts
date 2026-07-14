@@ -18,7 +18,8 @@ import { lexicalScore, lexicalTokens, planContext } from "../packages/agent-cont
 import { resolveWorkspacePath } from "../packages/agent-platform/src/index.js";
 import { SegmentedJsonlStore, sessionDirectory } from "../packages/agent-store/src/index.js";
 import { createRuntime as createBaseRuntime, sendSessionCommand } from "../packages/agent-runtime/src/testing.js";
-import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+import { repositoryListJsonLines } from "../packages/agent-runtime/src/repository-statistics-provider.js";
+import { EffectToolRegistry, registerBuiltinTools as registerBuiltinToolsBase } from "../packages/agent-tools/src/index.js";
 import { createPresentationState, projectEvent } from "../packages/agent-presentation/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
@@ -30,6 +31,16 @@ const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => crea
   ...options,
   reviewer: createApprovingReviewer()
 });
+
+function registerBuiltinTools(
+  registry: EffectToolRegistry,
+  options: Parameters<typeof registerBuiltinToolsBase>[1] = {}
+): EffectToolRegistry {
+  return registerBuiltinToolsBase(registry, {
+    ...options,
+    repositoryList: options.repositoryList ?? repositoryListJsonLines
+  });
+}
 
 function event(
   seq: number,
