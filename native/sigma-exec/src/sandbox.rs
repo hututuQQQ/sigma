@@ -1,7 +1,11 @@
+#[cfg(target_os = "linux")]
+use crate::linux_mount_source::{PinnedMountSource, ResolvedMountSource, inherit_mount_sources};
 use crate::protocol::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs::{create_dir, read_dir, read_to_string, remove_dir, remove_file, write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -51,6 +55,8 @@ pub struct ExecutionPolicy {
     pub write_roots: Vec<PathBuf>,
     #[serde(default)]
     pub execution_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub executable_sha256: Option<String>,
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -105,6 +111,8 @@ struct SandboxStatus {
 static STATUS: OnceLock<Mutex<Option<SandboxStatus>>> = OnceLock::new();
 #[cfg(target_os = "linux")]
 static VERIFIED_BASH: OnceLock<Option<PathBuf>> = OnceLock::new();
+#[cfg(target_os = "linux")]
+const INTERNAL_HELPER_MOUNT: &str = "/.sigma-exec";
 static PROTECTED_GUARD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROTECTED_GUARD_MARKER: &str = ".sigma-exec-protected";
 
@@ -261,6 +269,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     read_roots: vec![root.clone()],
                     write_roots: Vec::new(),
                     execution_roots: Vec::new(),
+                    executable_sha256: None,
                     protected_paths: Vec::new(),
                     unsafe_host_exec_approved: false,
                 },
@@ -287,6 +296,16 @@ pub struct PreparedCommand {
     pub protected_path_guards: Vec<ProtectedPathGuard>,
     /** Broker-held nonce shared only with the trusted internal sandbox launcher. */
     pub launch_failure_nonce: Option<String>,
+    /** Keeps O_PATH mount sources alive until bwrap has inherited them. */
+    #[cfg(target_os = "linux")]
+    _mount_source_descriptors: Vec<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AuthorizedLinuxExecutable {
+    source: PinnedMountSource,
+    invocation_arg0: OsString,
 }
 
 pub(crate) struct ProtectedPathGuard {
@@ -381,6 +400,22 @@ fn validate(params: &ProcessParams, allow_unsafe: bool) -> Result<(), RpcError> 
         return Err(RpcError::new(
             "policy_denied",
             "full network requires per-call approval",
+        ));
+    }
+    if params
+        .policy
+        .executable_sha256
+        .as_ref()
+        .is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "executableSha256 must be a lowercase SHA-256 digest",
         ));
     }
     if params.policy.sandbox == SandboxMode::Unsafe
@@ -758,12 +793,13 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        #[cfg(target_os = "linux")]
+        _mount_source_descriptors: Vec::new(),
     })
 }
 
 #[cfg(target_os = "linux")]
 fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
-    const HELPER_MOUNT: &str = "/.sigma-exec";
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
     command.args([
@@ -776,61 +812,118 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         command.arg("--share-net");
     }
     let system_roots = linux_system_roots();
-    let read_roots = canonical_roots(&params.policy.read_roots)?;
-    let write_roots = canonical_roots(&params.policy.write_roots)?;
-    let execution_roots = canonical_roots(&params.policy.execution_roots)?;
-    authorize_linux_executable(params, &system_roots, &execution_roots)?;
+    // Resolve every policy mount into one identity snapshot before opening any
+    // bwrap source descriptor. If an ancestor is replaced between groups, at
+    // least one later identity check fails instead of combining roots from two
+    // different trees.
+    let resolved_read_roots = resolve_mount_sources(&params.policy.read_roots)?;
+    let resolved_write_roots = resolve_mount_sources(&params.policy.write_roots)?;
+    let resolved_execution_roots = resolve_mount_sources(&params.policy.execution_roots)?;
+    let resolved_cwd = ResolvedMountSource::resolve(&params.command.cwd)?;
+    if !resolved_cwd.is_directory() {
+        return Err(RpcError::new(
+            "policy_denied",
+            "command cwd must resolve to a directory",
+        ));
+    }
+    if !resolved_read_roots
+        .iter()
+        .chain(resolved_write_roots.iter())
+        .any(|root| resolved_cwd.destination().starts_with(root.destination()))
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "cwd is outside the resolved sandbox roots",
+        ));
+    }
+    let cwd = resolved_cwd.destination().to_owned();
+    validate_resolved_root_relationships(
+        &resolved_read_roots,
+        &resolved_write_roots,
+        &resolved_execution_roots,
+    )?;
+    let resolved_protected_roots = resolve_protected(params, &resolved_read_roots)?;
+    let read_roots = pin_resolved_mount_sources(resolved_read_roots)?;
+    let write_roots = pin_resolved_mount_sources(resolved_write_roots)?;
+    let execution_roots = pin_resolved_mount_sources(resolved_execution_roots)?;
+    let protected_roots = pin_resolved_mount_sources(resolved_protected_roots)?;
+    let cwd_source = resolved_cwd.pin()?;
+    verify_pinned_root_hierarchy(
+        &read_roots,
+        &write_roots,
+        &execution_roots,
+        &protected_roots,
+    )?;
+    verify_pinned_descendants("cwd", std::slice::from_ref(&cwd_source), &read_roots, true)?;
+    reject_internal_mount_conflicts(
+        &read_roots,
+        &write_roots,
+        &execution_roots,
+        &protected_roots,
+    )?;
+    let executable =
+        authorize_linux_executable(params, &system_roots, &execution_roots, &cwd_source)?;
+    let executable_destination = executable.source.destination().to_owned();
     for root in &system_roots {
         let value = root.to_string_lossy();
         command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
     }
     command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-    bind_roots(&mut command, &params.policy.read_roots, true)?;
-    bind_roots(&mut command, &params.policy.write_roots, false)?;
-    bind_roots_excluding(
+    bind_pinned_roots(&mut command, &read_roots, true, &system_roots);
+    bind_pinned_roots(&mut command, &write_roots, false, &[]);
+    bind_pinned_roots(&mut command, &execution_roots, true, &system_roots);
+    bind_pinned_roots(&mut command, &protected_roots, true, &[]);
+    cwd_source.append_bind_at(
         &mut command,
-        &params.policy.execution_roots,
         true,
-        &system_roots,
-    )?;
-    bind_protected(&mut command, params)?;
+        Path::new(crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT),
+    );
+    // The strict pathname bind requires the canonical destination to exist
+    // with the right type. The following FD bind mounts the pinned object and
+    // verifies the resulting inode against that descriptor. Keep this pair
+    // after all policy mounts so no later layer can replace it.
+    append_pinned_executable_bind(&mut command, &executable.source)?;
     command.arg("--clearenv");
     for (key, value) in &params.command.env {
         command.args(["--setenv", key, value]);
     }
-    let cwd = params
-        .command
-        .cwd
-        .canonicalize()
-        .map_err(|error| RpcError::new("policy_denied", format!("invalid cwd: {error}")))?;
     let helper = std::env::current_exe().map_err(|error| {
         RpcError::new(
             "sandbox_unavailable",
             format!("cannot resolve sigma-exec hardening helper: {error}"),
         )
     })?;
-    command.arg("--ro-bind").arg(&helper).arg(HELPER_MOUNT);
-    command.args(["--chdir", cwd.to_string_lossy().as_ref(), "--"]);
+    let helper_source = PinnedMountSource::pin(&helper)?;
+    helper_source.append_bind_at(&mut command, true, Path::new(INTERNAL_HELPER_MOUNT));
+    command.arg("--chdir").arg(&cwd).arg("--");
     command
-        .arg(HELPER_MOUNT)
-        .arg(crate::linux_hardening::INTERNAL_HARDENED_LAUNCHER);
+        .arg(INTERNAL_HELPER_MOUNT)
+        .arg(crate::linux_hardening::INTERNAL_HARDENED_LAUNCHER)
+        .arg("--cwd-pin")
+        .arg(crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT)
+        .arg("--argv0")
+        .arg(if params.pty {
+            std::ffi::OsStr::new(INTERNAL_HELPER_MOUNT)
+        } else {
+            executable.invocation_arg0.as_os_str()
+        });
     for root in system_roots
         .iter()
         .map(PathBuf::as_path)
-        .chain(read_roots.iter().map(PathBuf::as_path))
-        .chain(execution_roots.iter().map(PathBuf::as_path))
+        .chain(read_roots.iter().map(PinnedMountSource::destination))
+        .chain(execution_roots.iter().map(PinnedMountSource::destination))
         .chain([
             Path::new("/tmp"),
             Path::new("/proc"),
             Path::new("/dev"),
-            Path::new(HELPER_MOUNT),
+            Path::new(INTERNAL_HELPER_MOUNT),
         ])
     {
         command.arg("--read").arg(root);
     }
     for root in write_roots
         .iter()
-        .map(PathBuf::as_path)
+        .map(PinnedMountSource::destination)
         .chain([Path::new("/tmp"), Path::new("/dev")])
     {
         command.arg("--write").arg(root);
@@ -838,23 +931,50 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     command.arg("--");
     if params.pty {
         command
-            .arg(HELPER_MOUNT)
+            .arg(INTERNAL_HELPER_MOUNT)
             .arg("--internal-unix-pty-launcher")
             .arg(params.pty_columns.to_string())
             .arg(params.pty_rows.to_string())
-            .arg(&params.command.executable)
+            .arg(&executable_destination)
+            .arg(&executable.invocation_arg0)
             .args(&params.command.args);
     } else {
         command
-            .arg(&params.command.executable)
+            .arg(&executable_destination)
             .args(&params.command.args);
     }
     configure_common(&mut command, params);
+    let mount_source_fds = read_roots
+        .iter()
+        .chain(write_roots.iter())
+        .chain(execution_roots.iter())
+        .chain(protected_roots.iter())
+        .map(PinnedMountSource::raw_fd)
+        .chain([
+            helper_source.raw_fd(),
+            cwd_source.raw_fd(),
+            executable.source.raw_fd(),
+        ])
+        .collect::<Vec<_>>();
+    inherit_mount_sources(&mut command, &mount_source_fds)?;
+    let mount_source_descriptors = read_roots
+        .into_iter()
+        .chain(write_roots)
+        .chain(execution_roots)
+        .chain(protected_roots)
+        .map(PinnedMountSource::into_descriptor)
+        .chain([
+            helper_source.into_descriptor(),
+            cwd_source.into_descriptor(),
+            executable.source.into_descriptor(),
+        ])
+        .collect();
     Ok(PreparedCommand {
         command,
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        _mount_source_descriptors: mount_source_descriptors,
     })
 }
 
@@ -872,34 +992,207 @@ fn build_sandboxed_command(_params: &ProcessParams) -> Result<PreparedCommand, R
 }
 
 #[cfg(target_os = "linux")]
-fn bind_roots(command: &mut Command, roots: &[PathBuf], read_only: bool) -> Result<(), RpcError> {
-    bind_roots_excluding(command, roots, read_only, &[])
+fn resolve_mount_sources(roots: &[PathBuf]) -> Result<Vec<ResolvedMountSource>, RpcError> {
+    roots
+        .iter()
+        .map(|root| ResolvedMountSource::resolve(root))
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
-fn bind_roots_excluding(
+fn pin_resolved_mount_sources(
+    roots: Vec<ResolvedMountSource>,
+) -> Result<Vec<PinnedMountSource>, RpcError> {
+    roots.into_iter().map(ResolvedMountSource::pin).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn validate_resolved_root_relationships(
+    read_roots: &[ResolvedMountSource],
+    write_roots: &[ResolvedMountSource],
+    execution_roots: &[ResolvedMountSource],
+) -> Result<(), RpcError> {
+    for write_root in write_roots {
+        if !read_roots.iter().any(|read_root| {
+            write_root
+                .destination()
+                .starts_with(read_root.destination())
+        }) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "a pinned write root escaped its declared read root",
+            ));
+        }
+    }
+    for execution_root in execution_roots {
+        if write_roots.iter().any(|write_root| {
+            write_root
+                .destination()
+                .starts_with(execution_root.destination())
+                || execution_root
+                    .destination()
+                    .starts_with(write_root.destination())
+        }) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "a pinned execution root overlaps a writable root",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pinned_descendants(
+    label: &str,
+    descendants: &[PinnedMountSource],
+    ancestors: &[PinnedMountSource],
+    required: bool,
+) -> Result<(), RpcError> {
+    for descendant in descendants {
+        let candidates = ancestors
+            .iter()
+            .filter(|ancestor| descendant.destination().starts_with(ancestor.destination()))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            if required {
+                return Err(RpcError::new(
+                    "policy_denied",
+                    format!(
+                        "pinned {label} has no containing read root: '{}'",
+                        descendant.destination().display()
+                    ),
+                ));
+            }
+            continue;
+        }
+        for ancestor in candidates {
+            if !descendant.is_descendant_of(ancestor)? {
+                return Err(RpcError::new(
+                    "policy_denied",
+                    format!(
+                        "pinned {label} escaped its lexical ancestor object: '{}'",
+                        descendant.destination().display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pinned_group_hierarchy(label: &str, roots: &[PinnedMountSource]) -> Result<(), RpcError> {
+    for (descendant_index, descendant) in roots.iter().enumerate() {
+        for (ancestor_index, ancestor) in roots.iter().enumerate() {
+            if descendant_index == ancestor_index
+                || !descendant.destination().starts_with(ancestor.destination())
+            {
+                continue;
+            }
+            if !descendant.is_descendant_of(ancestor)? {
+                return Err(RpcError::new(
+                    "policy_denied",
+                    format!(
+                        "nested pinned {label} came from a different ancestor object: '{}'",
+                        descendant.destination().display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pinned_root_hierarchy(
+    read_roots: &[PinnedMountSource],
+    write_roots: &[PinnedMountSource],
+    execution_roots: &[PinnedMountSource],
+    protected_roots: &[PinnedMountSource],
+) -> Result<(), RpcError> {
+    verify_pinned_group_hierarchy("read root", read_roots)?;
+    verify_pinned_group_hierarchy("write root", write_roots)?;
+    verify_pinned_group_hierarchy("execution root", execution_roots)?;
+    verify_pinned_group_hierarchy("protected path", protected_roots)?;
+    verify_pinned_descendants("write root", write_roots, read_roots, true)?;
+    verify_pinned_descendants("protected path", protected_roots, read_roots, true)?;
+    verify_pinned_descendants("protected path", protected_roots, write_roots, false)?;
+    // Execution roots outside every read root are independent, explicitly
+    // declared mounts. When their destination is nested under a read root,
+    // however, the later bind must come from that exact pinned tree.
+    verify_pinned_descendants("execution root", execution_roots, read_roots, false)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_internal_mount_conflicts(
+    read_roots: &[PinnedMountSource],
+    write_roots: &[PinnedMountSource],
+    execution_roots: &[PinnedMountSource],
+    protected_roots: &[PinnedMountSource],
+) -> Result<(), RpcError> {
+    let reserved = [
+        Path::new(INTERNAL_HELPER_MOUNT),
+        Path::new(crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT),
+    ];
+    for destination in reserved {
+        for root in read_roots
+            .iter()
+            .chain(write_roots)
+            .chain(execution_roots)
+            .chain(protected_roots)
+        {
+            if root.occupies_destination(destination)? {
+                return Err(RpcError::new(
+                    "policy_denied",
+                    format!(
+                        "sandbox policy collides with reserved internal mount '{}'",
+                        destination.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_pinned_roots(
     command: &mut Command,
-    roots: &[PathBuf],
+    roots: &[PinnedMountSource],
     read_only: bool,
     covered_roots: &[PathBuf],
-) -> Result<(), RpcError> {
+) {
     for root in roots {
-        let canonical = root.canonicalize().map_err(|error| {
-            RpcError::new("policy_denied", format!("invalid sandbox root: {error}"))
-        })?;
         if covered_roots
             .iter()
-            .any(|covered| canonical.starts_with(covered))
+            .any(|covered| root.destination().starts_with(covered))
         {
             continue;
         }
-        let value = canonical.to_string_lossy().into_owned();
-        command.args([
-            if read_only { "--ro-bind" } else { "--bind" },
-            &value,
-            &value,
-        ]);
+        root.append_bind(command, read_only);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn append_pinned_executable_bind(
+    command: &mut Command,
+    executable: &PinnedMountSource,
+) -> Result<(), RpcError> {
+    let destination = executable.destination();
+    if !executable.destination_matches_identity()? {
+        return Err(RpcError::new(
+            "policy_denied",
+            format!(
+                "authorized executable destination changed before sandbox setup: '{}'",
+                destination.display()
+            ),
+        ));
+    }
+    command.arg("--ro-bind").arg(destination).arg(destination);
+    // bwrap verifies that the completed mount identifies this descriptor, so
+    // a race while resolving its proc-fd source fails before launcher exec.
+    executable.append_bind_at(command, true, destination);
     Ok(())
 }
 
@@ -907,65 +1200,104 @@ fn bind_roots_excluding(
 fn authorize_linux_executable(
     params: &ProcessParams,
     system_roots: &[PathBuf],
-    execution_roots: &[PathBuf],
-) -> Result<(), RpcError> {
+    execution_roots: &[PinnedMountSource],
+    cwd: &PinnedMountSource,
+) -> Result<AuthorizedLinuxExecutable, RpcError> {
     let requested = PathBuf::from(&params.command.executable);
     let mut candidates = Vec::new();
     if requested.is_absolute() {
         candidates.push(requested);
-    } else if requested.components().count() > 1 {
-        candidates.push(params.command.cwd.join(requested));
+    } else if params.command.executable.as_bytes().contains(&b'/') {
+        candidates.push(cwd.fd_path().join(requested));
     } else if let Some(search) = params.command.env.get("PATH") {
-        candidates
-            .extend(std::env::split_paths(search).map(|directory| directory.join(&requested)));
+        candidates.extend(std::env::split_paths(search).map(|directory| {
+            if directory.is_absolute() {
+                directory.join(&requested)
+            } else {
+                cwd.fd_path().join(directory).join(&requested)
+            }
+        }));
     }
-    let executable = candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .and_then(|candidate| candidate.canonicalize().ok())
-        .ok_or_else(|| {
-            RpcError::new(
-                "executable_not_found",
-                format!("cannot resolve executable '{}'", params.command.executable),
-            )
-        })?;
     let system_roots = system_roots
         .iter()
         .filter_map(|root| root.canonicalize().ok())
         .collect::<Vec<_>>();
-    if system_roots
-        .iter()
-        .chain(execution_roots.iter())
-        .any(|root| executable.starts_with(root))
-    {
-        return Ok(());
+    for candidate in candidates {
+        let Ok(source) = PinnedMountSource::pin(&candidate) else {
+            continue;
+        };
+        if !source.is_executable_file()? {
+            continue;
+        }
+        if system_roots
+            .iter()
+            .any(|root| source.destination().starts_with(root))
+        {
+            return Ok(AuthorizedLinuxExecutable {
+                source,
+                invocation_arg0: OsString::from(&params.command.executable),
+            });
+        }
+        for root in execution_roots
+            .iter()
+            .filter(|root| source.destination().starts_with(root.destination()))
+        {
+            if source.is_descendant_of(root)? {
+                return Ok(AuthorizedLinuxExecutable {
+                    source,
+                    invocation_arg0: OsString::from(&params.command.executable),
+                });
+            }
+        }
+        // This is the first candidate execvp could execute. Continuing the
+        // PATH search would authorize a different object from the one the
+        // declared command selects.
+        return Err(RpcError::new(
+            "executable_unavailable",
+            format!(
+                "resolved executable '{}' is outside trusted system and declared execution roots",
+                source.destination().display()
+            ),
+        ));
     }
     Err(RpcError::new(
-        "policy_denied",
-        format!(
-            "resolved executable '{}' is outside trusted system and declared execution roots",
-            executable.display()
-        ),
+        "executable_not_found",
+        format!("cannot resolve executable '{}'", params.command.executable),
     ))
 }
 
 #[cfg(target_os = "linux")]
-fn bind_protected(command: &mut Command, params: &ProcessParams) -> Result<(), RpcError> {
-    let read_roots = canonical_roots(&params.policy.read_roots)?;
-    let derived = minimal_roots(&read_roots)
+fn resolve_protected(
+    params: &ProcessParams,
+    read_roots: &[ResolvedMountSource],
+) -> Result<Vec<ResolvedMountSource>, RpcError> {
+    let read_paths = read_roots
+        .iter()
+        .map(|root| root.destination().to_owned())
+        .collect::<Vec<_>>();
+    let derived = minimal_roots(&read_paths)
         .into_iter()
         .flat_map(|root| [root.join(".git"), root.join(".agent")]);
+    let mut resolved = BTreeMap::<PathBuf, ResolvedMountSource>::new();
     for item in params.policy.protected_paths.iter().cloned().chain(derived) {
         if !item.exists() {
             continue;
         }
-        let canonical = item.canonicalize().map_err(|error| {
-            RpcError::new("policy_denied", format!("invalid protected path: {error}"))
-        })?;
-        let value = canonical.to_string_lossy().into_owned();
-        command.args(["--ro-bind", &value, &value]);
+        let source = ResolvedMountSource::resolve(&item)?;
+        if !read_roots
+            .iter()
+            .any(|root| source.destination().starts_with(root.destination()))
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "a protected path escaped its pinned read root",
+            ));
+        }
+        resolved
+            .entry(source.destination().to_owned())
+            .or_insert(source);
     }
-    Ok(())
+    Ok(resolved.into_values().collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -1032,46 +1364,68 @@ fn linux_system_roots() -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn bwrap_supports_pinned_mounts(bwrap: &Path) -> Result<(), String> {
+    let output = Command::new(bwrap)
+        .arg("--help")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot inspect bubblewrap capabilities: {error}"))?;
+    let mut help = output.stdout;
+    help.extend_from_slice(&output.stderr);
+    let help = String::from_utf8_lossy(&help);
+    if output.status.success() && help.contains("--bind-fd") && help.contains("--ro-bind-fd") {
+        Ok(())
+    } else {
+        Err("bubblewrap lacks descriptor-bound mounts required for stable sandbox roots".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unavailable_linux_sandbox(reason: String) -> SandboxStatus {
+    SandboxStatus {
+        available: false,
+        backend: "bubblewrap",
+        self_test_passed: false,
+        setup_required: true,
+        reason: Some(reason),
+        landlock_abi: None,
+        no_new_privileges: false,
+        seccomp_filter: false,
+        less_privileged_appcontainer: false,
+        mount_namespace: false,
+        pid_namespace: false,
+        network_namespace: false,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn detect_sandbox() -> SandboxStatus {
     let bwrap = match trusted_bwrap() {
         Ok(value) => value,
-        Err(error) => {
-            return SandboxStatus {
-                available: false,
-                backend: "bubblewrap",
-                self_test_passed: false,
-                setup_required: true,
-                reason: Some(error),
-                landlock_abi: None,
-                no_new_privileges: false,
-                seccomp_filter: false,
-                less_privileged_appcontainer: false,
-                mount_namespace: false,
-                pid_namespace: false,
-                network_namespace: false,
-            };
-        }
+        Err(error) => return unavailable_linux_sandbox(error),
     };
-    let base_passed = Command::new(&bwrap)
-        .args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
-            "--as-pid-1",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--",
-            "/bin/true",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    if let Err(error) = bwrap_supports_pinned_mounts(&bwrap) {
+        return unavailable_linux_sandbox(error);
+    }
+    let base_passed = PinnedMountSource::pin(Path::new("/"))
+        .and_then(|root| {
+            let mut command = Command::new(&bwrap);
+            command.args([
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-all",
+                "--as-pid-1",
+            ]);
+            root.append_bind(&mut command, true);
+            command
+                .args(["--proc", "/proc", "--dev", "/dev", "--", "/bin/true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            inherit_mount_sources(&mut command, &[root.raw_fd()])?;
+            command.status().map_err(RpcError::from)
+        })
         .map(|status| status.success())
         .unwrap_or(false);
     let hardening = base_passed
@@ -1126,6 +1480,11 @@ fn linux_pty_self_test(bwrap: &Path) -> bool {
             "--ro-bind",
             "/",
             "/",
+            "--ro-bind",
+            "/",
+            crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT,
+            "--chdir",
+            "/",
             "--proc",
             "/proc",
             "--dev",
@@ -1136,12 +1495,25 @@ fn linux_pty_self_test(bwrap: &Path) -> bool {
         ])
         .arg(&helper)
         .arg(crate::linux_hardening::INTERNAL_HARDENED_LAUNCHER)
-        .args(["--read", "/", "--write", "/tmp", "--write", "/dev", "--"])
+        .args([
+            "--cwd-pin",
+            crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT,
+            "--argv0",
+            "/sigma-exec",
+            "--read",
+            "/",
+            "--write",
+            "/tmp",
+            "--write",
+            "/dev",
+            "--",
+        ])
         .arg(&helper)
         .args([
             "--internal-unix-pty-launcher",
             "80",
             "24",
+            "/bin/sh",
             "/bin/sh",
             "-c",
             "test -t 0 && test -t 1",
@@ -1226,6 +1598,7 @@ mod tests {
                 read_roots: vec![root.to_owned()],
                 write_roots: vec![root.to_owned()],
                 execution_roots: Vec::new(),
+                executable_sha256: None,
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
                 unsafe_host_exec_approved: false,
             },
@@ -1320,5 +1693,355 @@ mod tests {
         let error = trusted_bwrap_from(&[fake]).unwrap_err();
         assert!(error.contains("trusted owner/permission"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_nested_mounts_pinned_from_a_replacement_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-pinned-hierarchy-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let declared = root.join("declared");
+        let moved = root.join("moved");
+        std::fs::create_dir_all(declared.join("nested")).expect("create original tree");
+        let outer = PinnedMountSource::pin(&declared).expect("pin outer root");
+        std::fs::rename(&declared, &moved).expect("move original tree");
+        std::fs::create_dir_all(declared.join("nested")).expect("create replacement tree");
+        let nested =
+            PinnedMountSource::pin(&declared.join("nested")).expect("pin replacement root");
+        let mismatched = vec![outer, nested];
+
+        for result in [
+            verify_pinned_root_hierarchy(&mismatched, &[], &[], &[]),
+            verify_pinned_root_hierarchy(&[], &mismatched, &[], &[]),
+            verify_pinned_root_hierarchy(&[], &[], &mismatched, &[]),
+            verify_pinned_root_hierarchy(&mismatched[..1], &[], &mismatched[1..], &[]),
+        ] {
+            let error = result.expect_err("mismatched nested root must fail closed");
+            assert_eq!(error.code, "policy_denied");
+        }
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_same_tree_nesting_and_an_independent_execution_root() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-valid-pinned-hierarchy-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let read = root.join("read");
+        let nested = read.join("nested");
+        let independent = root.join("independent-execution");
+        std::fs::create_dir_all(&nested).expect("create nested read tree");
+        std::fs::create_dir_all(&independent).expect("create independent execution root");
+        let read_roots = vec![
+            PinnedMountSource::pin(&read).expect("pin outer read root"),
+            PinnedMountSource::pin(&nested).expect("pin nested read root"),
+        ];
+        let nested_execution =
+            vec![PinnedMountSource::pin(&nested).expect("pin nested execution root")];
+        let independent_execution =
+            vec![PinnedMountSource::pin(&independent).expect("pin independent execution root")];
+
+        verify_pinned_root_hierarchy(&read_roots, &[], &nested_execution, &[])
+            .expect("same-tree nested execution root should pass");
+        verify_pinned_root_hierarchy(&read_roots, &[], &independent_execution, &[])
+            .expect("independent execution root should remain allowed");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_a_protected_path_from_a_replacement_write_subtree() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-protected-write-hierarchy-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let read_path = root.join("read");
+        let write_path = read_path.join("write");
+        let moved_write = read_path.join("moved-write");
+        std::fs::create_dir_all(write_path.join("protected")).expect("create original write tree");
+        let read_roots = vec![PinnedMountSource::pin(&read_path).expect("pin read root")];
+        let write_roots = vec![PinnedMountSource::pin(&write_path).expect("pin write root")];
+        std::fs::rename(&write_path, &moved_write).expect("move original write tree");
+        std::fs::create_dir_all(write_path.join("protected"))
+            .expect("create replacement write tree");
+        let protected_roots = vec![
+            PinnedMountSource::pin(&write_path.join("protected"))
+                .expect("pin replacement protected path"),
+        ];
+
+        let error = verify_pinned_root_hierarchy(&read_roots, &write_roots, &[], &protected_roots)
+            .expect_err("protected path from replacement write tree must fail closed");
+        assert_eq!(error.code, "policy_denied");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_nested_protected_paths_from_different_pinned_trees() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-protected-group-hierarchy-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let read_path = root.join("read");
+        let protected_path = read_path.join("protected");
+        let moved_protected = read_path.join("moved-protected");
+        std::fs::create_dir_all(protected_path.join("nested"))
+            .expect("create original protected tree");
+        let read_roots = vec![PinnedMountSource::pin(&read_path).expect("pin read root")];
+        let outer = PinnedMountSource::pin(&protected_path).expect("pin protected root");
+        std::fs::rename(&protected_path, &moved_protected).expect("move original protected tree");
+        std::fs::create_dir_all(protected_path.join("nested"))
+            .expect("create replacement protected tree");
+        let nested =
+            PinnedMountSource::pin(&protected_path.join("nested")).expect("pin nested replacement");
+
+        let error = verify_pinned_root_hierarchy(&read_roots, &[], &[], &[outer, nested])
+            .expect_err("mixed protected trees must fail closed");
+        assert_eq!(error.code, "policy_denied");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_same_tree_protected_paths_inside_and_outside_write_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-valid-protected-hierarchy-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let read_path = root.join("read");
+        let write_path = read_path.join("write");
+        let protected_path = write_path.join("protected");
+        let nested_path = protected_path.join("nested");
+        let read_only_path = read_path.join("read-only-protected");
+        std::fs::create_dir_all(&nested_path).expect("create protected write tree");
+        std::fs::create_dir_all(&read_only_path).expect("create read-only protected tree");
+        let read_roots = vec![PinnedMountSource::pin(&read_path).expect("pin read root")];
+        let write_roots = vec![PinnedMountSource::pin(&write_path).expect("pin write root")];
+        let protected_roots = vec![
+            PinnedMountSource::pin(&protected_path).expect("pin protected path"),
+            PinnedMountSource::pin(&nested_path).expect("pin nested protected path"),
+            PinnedMountSource::pin(&read_only_path).expect("pin read-only protected path"),
+        ];
+
+        verify_pinned_root_hierarchy(&read_roots, &write_roots, &[], &protected_roots)
+            .expect("same-tree protected paths should pass");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_replacement_keeps_the_pin_but_fails_destination_attestation() {
+        use std::os::unix::process::CommandExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sigma-pinned-executable-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create executable test root");
+        let requested = root.join("requested-tool");
+        let moved = root.join("pinned-original");
+        let shell = Path::new("/bin/sh")
+            .canonicalize()
+            .expect("canonical system shell");
+        std::fs::copy(shell, &requested).expect("copy executable under test");
+        std::fs::set_permissions(&requested, std::fs::Permissions::from_mode(0o700))
+            .expect("make copied executable runnable");
+        let mut params = non_git_params(&root);
+        params.command.executable = requested.to_string_lossy().into_owned();
+        params.policy.write_roots.clear();
+        let cwd_source = PinnedMountSource::pin(&root).expect("pin cwd");
+        let execution_roots = vec![PinnedMountSource::pin(&root).expect("pin execution root")];
+        let executable = authorize_linux_executable(&params, &[], &execution_roots, &cwd_source)
+            .expect("authorize requested executable");
+
+        std::fs::rename(&requested, &moved).expect("move authorized executable");
+        std::fs::write(&requested, "replacement").expect("write replacement executable");
+        std::fs::set_permissions(&requested, std::fs::Permissions::from_mode(0o700))
+            .expect("make replacement executable-shaped");
+        assert!(
+            !executable
+                .source
+                .destination_matches_identity()
+                .expect("compare executable identity")
+        );
+        let mut bind = Command::new("bwrap");
+        let error = append_pinned_executable_bind(&mut bind, &executable.source)
+            .expect_err("replacement must fail before bwrap setup");
+        assert_eq!(error.code, "policy_denied");
+
+        let output = Command::new(executable.source.fd_path())
+            .arg0("sh")
+            .args(["-c", "printf pinned-executable-ok"])
+            .output()
+            .expect("execute pinned file object");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned-executable-ok");
+        std::fs::remove_dir_all(root).expect("remove executable test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn separate_argv0_preserves_a_system_shell_alias() {
+        use std::os::unix::process::CommandExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sigma-executable-argv0-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create argv0 test root");
+        let mut params = non_git_params(&root);
+        params.command.executable = "/bin/sh".into();
+        params.policy.write_roots.clear();
+        let cwd_source = PinnedMountSource::pin(&root).expect("pin cwd");
+        let executable =
+            authorize_linux_executable(&params, &linux_system_roots(), &[], &cwd_source)
+                .expect("authorize system shell alias");
+        assert_eq!(executable.invocation_arg0, OsString::from("/bin/sh"));
+
+        let output = Command::new(executable.source.fd_path())
+            .arg0(&executable.invocation_arg0)
+            .args(["-c", "printf preserved-argv0"])
+            .output()
+            .expect("execute shell target with invocation argv0");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"preserved-argv0");
+        std::fs::remove_dir_all(root).expect("remove argv0 test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_search_skips_non_executable_file_then_rejects_executable_outside_roots() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "sigma-path-executable-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).expect("create allowed executable root");
+        std::fs::create_dir_all(&outside).expect("create outside executable root");
+        let first = allowed.join("tool");
+        std::fs::write(&first, "not executable").expect("write non-executable first candidate");
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o600))
+            .expect("remove executable permission");
+        symlink("/bin/sh", outside.join("tool")).expect("link executable second candidate");
+        let mut params = non_git_params(&root);
+        params.command.executable = "tool".into();
+        params.command.env.insert(
+            "PATH".into(),
+            std::env::join_paths([&allowed, &outside])
+                .expect("join executable search path")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        params.policy.write_roots.clear();
+        let cwd_source = PinnedMountSource::pin(&root).expect("pin cwd");
+        let execution_roots = vec![PinnedMountSource::pin(&allowed).expect("pin allowed root")];
+
+        let error = authorize_linux_executable(&params, &[], &execution_roots, &cwd_source)
+            .expect_err("the first runnable PATH candidate is outside execution roots");
+        assert_eq!(error.code, "executable_unavailable");
+        std::fs::remove_dir_all(root).expect("remove PATH test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_executable_destination_preserves_adjacent_script_resources() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-executable-adjacent-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create script root");
+        let script = root.join("tool.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/resource.txt\"\n",
+        )
+        .expect("write adjacent-resource script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make script executable");
+        std::fs::write(root.join("resource.txt"), "adjacent-resource")
+            .expect("write adjacent resource");
+        let mut params = non_git_params(&root);
+        params.command.executable = script.to_string_lossy().into_owned();
+        params.policy.write_roots.clear();
+        let cwd_source = PinnedMountSource::pin(&root).expect("pin cwd");
+        let execution_roots = vec![PinnedMountSource::pin(&root).expect("pin execution root")];
+        let executable = authorize_linux_executable(&params, &[], &execution_roots, &cwd_source)
+            .expect("authorize adjacent-resource script");
+        assert_eq!(
+            executable.source.destination(),
+            script.canonicalize().expect("canonical script")
+        );
+        assert_eq!(executable.invocation_arg0, script.as_os_str().to_owned());
+
+        let output = Command::new(executable.source.destination())
+            .output()
+            .expect("execute adjacent-resource script");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"adjacent-resource");
+
+        let mut bind = Command::new("bwrap");
+        append_pinned_executable_bind(&mut bind, &executable.source)
+            .expect("append executable attestation mounts");
+        let arguments = bind
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments[0], "--ro-bind");
+        assert_eq!(Path::new(&arguments[1]), executable.source.destination());
+        assert_eq!(Path::new(&arguments[2]), executable.source.destination());
+        assert_eq!(arguments[3], "--ro-bind-fd");
+        assert_eq!(Path::new(&arguments[5]), executable.source.destination());
+        std::fs::remove_dir_all(root).expect("remove script root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_executable_authorization_uses_the_pinned_cwd_object() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-relative-executable-cwd-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cwd = root.join("cwd");
+        let moved_cwd = root.join("moved-cwd");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let relative_tool = cwd.join("relative-tool");
+        std::fs::write(&relative_tool, "original").expect("write original executable");
+        std::fs::set_permissions(&relative_tool, std::fs::Permissions::from_mode(0o700))
+            .expect("make original executable runnable");
+        let mut params = non_git_params(&root);
+        params.command.cwd = cwd.clone();
+        params.command.executable = "./relative-tool".into();
+        params.policy.write_roots.clear();
+        let cwd_source = PinnedMountSource::pin(&cwd).expect("pin cwd");
+        let execution_roots = vec![PinnedMountSource::pin(&cwd).expect("pin execution root")];
+
+        authorize_linux_executable(&params, &[], &execution_roots, &cwd_source)
+            .expect("relative executable in pinned cwd should be authorized");
+
+        std::fs::rename(&cwd, &moved_cwd).expect("move pinned cwd");
+        std::fs::create_dir_all(&cwd).expect("create replacement cwd");
+        std::fs::write(cwd.join("relative-tool"), "replacement")
+            .expect("write replacement executable");
+        let error = authorize_linux_executable(&params, &[], &execution_roots, &cwd_source)
+            .expect_err("replacement cwd executable must not be authorized");
+        assert_eq!(error.code, "executable_unavailable");
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 }

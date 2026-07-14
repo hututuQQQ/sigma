@@ -785,6 +785,7 @@ mod tests {
                 read_roots: vec![std::env::current_dir().unwrap()],
                 write_roots: Vec::new(),
                 execution_roots: Vec::new(),
+                executable_sha256: None,
                 protected_paths: Vec::<PathBuf>::new(),
                 unsafe_host_exec_approved: true,
             },

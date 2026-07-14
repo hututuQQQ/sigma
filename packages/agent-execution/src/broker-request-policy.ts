@@ -1,5 +1,6 @@
 import path from "node:path";
 import {
+  BrokerExecutableUnavailableError,
   BrokerPolicyError
 } from "./errors.js";
 import { createMinimalEnvironment } from "./environment.js";
@@ -18,6 +19,7 @@ import {
   pathWithin,
   resolveTrustedExecutable,
   samePath,
+  trustedExecutableSha256,
   uniquePaths,
   type NormalizedTrustedToolchain
 } from "./trusted-toolchains.js";
@@ -69,7 +71,9 @@ function executionRoots(
     && !explicit.some((root) => pathWithin(command.executable, root))
     && !toolchains.some((toolchain) => samePath(toolchain.executable, command.executable))
     && !verifiedExecutables.some((candidate) => samePath(candidate, command.executable))) {
-    throw new BrokerPolicyError("The absolute executable is not an exact toolchain entry point, verified shell, or explicitly trusted primary.");
+    throw new BrokerExecutableUnavailableError(
+      "The absolute executable is not an exact toolchain entry point, verified shell, or explicitly trusted primary."
+    );
   }
   return roots;
 }
@@ -97,7 +101,8 @@ function wirePolicy(
   policy: ExecutionPolicy,
   options: SigmaExecBrokerClientOptions,
   toolchains: NormalizedTrustedToolchain[],
-  verifiedExecutables: string[]
+  verifiedExecutables: string[],
+  executableSha256: string | undefined
 ): Record<string, unknown> {
   assertAbsoluteRoots(policy.readRoots, "readRoots");
   assertAbsoluteRoots(policy.writeRoots, "writeRoots");
@@ -122,6 +127,7 @@ function wirePolicy(
     readRoots: policy.readRoots.map((root) => path.resolve(root)),
     writeRoots: resolvedWriteRoots,
     executionRoots: resolvedExecutionRoots,
+    ...(executableSha256 ? { executableSha256 } : {}),
     protectedPaths: defaultProtectedPaths(policy).map((item) => path.resolve(item)),
     unsafeHostExecApproved: policy.unsafeHostExecApproved === true
   };
@@ -135,6 +141,7 @@ export function requestParams(
 ): Record<string, unknown> {
   const executable = resolveTrustedExecutable(request.command.executable, toolchains, request.command.cwd);
   assertTrustedExecutableAvailable(executable, toolchains, options.sandboxMode);
+  const executableSha256 = trustedExecutableSha256(executable, toolchains, options.sandboxMode);
   const resolvedCommand = {
     ...request.command,
     executable
@@ -147,7 +154,9 @@ export function requestParams(
   }
   return {
     command: wireCommand(resolvedCommand, toolchains),
-    policy: wirePolicy(resolvedCommand, request.policy, options, toolchains, verifiedExecutables),
+    policy: wirePolicy(
+      resolvedCommand, request.policy, options, toolchains, verifiedExecutables, executableSha256
+    ),
     maxOutputBytes: positiveInteger(request.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES, "maxOutputBytes"),
     ...("pty" in request && request.pty === true ? {
       pty: true,

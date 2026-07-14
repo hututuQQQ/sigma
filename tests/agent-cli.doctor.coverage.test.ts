@@ -38,7 +38,7 @@ async function workspace(): Promise<string> {
   return await mkdtemp(path.join(os.tmpdir(), "sigma-doctor-coverage-"));
 }
 
-function healthyBroker(close: () => Promise<void>): ExecutionBroker {
+function healthyBroker(close: () => Promise<void> = async () => undefined): ExecutionBroker {
   const report: BrokerDoctorReport = {
     protocolVersion: 1,
     brokerVersion: "fixture",
@@ -97,7 +97,7 @@ describe("doctor command branch coverage", () => {
         "--model", "doctor-model",
         "--check-api",
         "--json"
-      ], { stdout })).resolves.toBe(0);
+      ], { stdout, executionBroker: healthyBroker() })).resolves.toBe(0);
       const report = JSON.parse(stdout.text()) as { status: string; checks: Array<{ name: string; status: string; message: string }> };
       expect(report.status).toBe("warning");
       expect(report.checks).toEqual(expect.arrayContaining([
@@ -116,7 +116,10 @@ describe("doctor command branch coverage", () => {
     vi.stubEnv("ZAI_API_KEY", "");
     vi.stubEnv("BIGMODEL_API_KEY", "");
     const skipped = new Capture();
-    await expect(runDoctorCommand(["--workspace", root, "--provider", "glm"], { stdout: skipped })).resolves.toBe(0);
+    await expect(runDoctorCommand(["--workspace", root, "--provider", "glm"], {
+      stdout: skipped,
+      executionBroker: healthyBroker()
+    })).resolves.toBe(0);
     expect(skipped.text()).toContain("api=skipped");
     expect(skipped.text()).toContain("provider_key=warning");
 
@@ -124,7 +127,7 @@ describe("doctor command branch coverage", () => {
     const strict = new Capture();
     await expect(runDoctorCommand([
       "--workspace", root, "--provider", "glm", "--check-api", "--strict", "--json"
-    ], { stdout: strict })).resolves.toBe(1);
+    ], { stdout: strict, executionBroker: healthyBroker() })).resolves.toBe(1);
     const report = JSON.parse(strict.text()) as { status: string; checks: Array<{ name: string; message: string }> };
     expect(report.status).toBe("error");
     expect(report.checks.find((check) => check.name === "api")?.message).toContain("empty response");
@@ -137,7 +140,10 @@ describe("doctor command branch coverage", () => {
     vi.stubEnv("BIGMODEL_API_KEY", "");
     vi.stubEnv(key, "configured-for-test");
     const stdout = new Capture();
-    await expect(runDoctorCommand(["--workspace", root, "--provider", "glm", "--json"], { stdout })).resolves.toBe(0);
+    await expect(runDoctorCommand(["--workspace", root, "--provider", "glm", "--json"], {
+      stdout,
+      executionBroker: healthyBroker()
+    })).resolves.toBe(0);
     const report = JSON.parse(stdout.text()) as { checks: Array<{ name: string; status: string }> };
     expect(report.checks.find((check) => check.name === "provider_key")?.status).toBe("ok");
   });
@@ -149,7 +155,10 @@ describe("doctor command branch coverage", () => {
     const root = await workspace();
     api.mode = mode;
     const stdout = new Capture();
-    await expect(runDoctorCommand(["--workspace", root, "--check-api", "--json"], { stdout })).resolves.toBe(1);
+    await expect(runDoctorCommand(["--workspace", root, "--check-api", "--json"], {
+      stdout,
+      executionBroker: healthyBroker()
+    })).resolves.toBe(1);
     const report = JSON.parse(stdout.text()) as { checks: Array<{ name: string; message: string }> };
     expect(report.checks.find((check) => check.name === "api")?.message).toContain(expected);
   });
@@ -157,7 +166,10 @@ describe("doctor command branch coverage", () => {
   it("reports inaccessible workspaces and invalid command arguments", async () => {
     const missing = path.join(os.tmpdir(), `sigma-doctor-missing-${Date.now()}`);
     const stdout = new Capture();
-    await expect(runDoctorCommand(["--workspace", missing, "--json"], { stdout })).resolves.toBe(1);
+    await expect(runDoctorCommand(["--workspace", missing, "--json"], {
+      stdout,
+      executionBroker: healthyBroker()
+    })).resolves.toBe(1);
     const report = JSON.parse(stdout.text()) as { checks: Array<{ name: string; status: string }> };
     expect(report.checks.find((check) => check.name === "workspace")?.status).toBe("error");
 

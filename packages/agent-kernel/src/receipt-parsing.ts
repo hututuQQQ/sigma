@@ -1,5 +1,6 @@
 import {
   isEvidenceRecord,
+  isJsonValue,
   type JsonValue,
   type ToolEffect,
   type ToolOutcome,
@@ -52,6 +53,7 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
     callId: item.callId,
     ok: item.ok,
     output: text(item.output),
+    ...(isJsonValue(item.result) ? { result: item.result } : {}),
     ...(outcome ? { outcome } : {}),
     observedEffects: toolEffects(item.observedEffects),
     ...(actualEffects ? { actualEffects } : {}),
@@ -81,6 +83,7 @@ export function receiptContent(receipt: ToolReceipt): string {
       status: item.status,
       summary: item.summary.slice(0, 240)
     })),
+    ...(receipt.result === undefined ? {} : { result: receipt.result }),
     ...(receipt.workspaceDelta ? { workspaceDelta: receipt.workspaceDelta } : {})
   };
   return `${heading}\nReceipt summary (JSON): ${JSON.stringify(summary)}\nOutput:\n${receipt.output}`;

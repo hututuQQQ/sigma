@@ -132,6 +132,9 @@ export interface BrokerCapabilities {
   executionRoots?: boolean;
   /** Shells listed here have passed the native sandbox self-test. */
   shells?: BrokerVerifiedShell[];
+  /** Bare executable aliases from package-trusted toolchains accepted during
+   * this broker connection. Absolute host paths are deliberately omitted. */
+  runtimeCommands?: string[];
 }
 
 export interface BrokerVerifiedShell {
@@ -211,6 +214,8 @@ export interface SigmaExecBrokerClientOptions {
   sandboxMode?: SandboxMode;
   allowUnsafeHostExec?: boolean;
   requestTimeoutMs?: number;
+  /** Deadline for startup doctor/recovery and explicit sandbox setup. */
+  startupTimeoutMs?: number;
   shutdownGraceMs?: number;
   /** Time allowed for an exec cancellation to return its terminal response.
    * On expiry the broker is closed and its process tree must exit before the

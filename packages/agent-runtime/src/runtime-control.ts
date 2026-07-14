@@ -1,4 +1,12 @@
-import type { BudgetAmounts, BudgetLimits, CheckpointRef, PlanGraph, RuntimeControlPort } from "agent-protocol";
+import {
+  isCompletionEligibleEvidence,
+  type BudgetAmounts,
+  type BudgetLimits,
+  type CheckpointRef,
+  type PlanGraph,
+  type ReviewRequestResult,
+  type RuntimeControlPort
+} from "agent-protocol";
 import type { ChildCheckpointRecovery, RuntimeSession } from "./types.js";
 import { ChildBudgetControl } from "./child-budget-control.js";
 import { planAfterChildOutcome, planAfterChildRollback, type ChildPlanOutcome } from "./child-plan-transitions.js";
@@ -10,6 +18,7 @@ import {
 } from "./runtime-control-contracts.js";
 import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
+import { reviewReadiness } from "./review-coordinator.js";
 
 export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
@@ -35,6 +44,7 @@ export class RuntimeControlService {
       listCheckpoints: async () => (await this.options.checkpoints.list(session.identity.sessionId)).map(checkpointRef),
       createCheckpoint: async (scopePaths) => await this.createCheckpoint(session, scopePaths),
       restoreRunCheckpoint: async (checkpointId) => await this.restoreRunCheckpoint(session, checkpointId),
+      requestReview: async () => this.requestReview(session),
       loadSkill: async (qualifiedName) => await this.skillControl.loadSkill(session, qualifiedName),
       resolveLoadedSkillResource: async (input) => await this.skillControl.resolveLoadedSkillResource(session, input),
       reserveChildBudget: async (childId, allocation) => await this.reserveChildBudget(session, childId, allocation),
@@ -42,6 +52,31 @@ export class RuntimeControlService {
       releaseChildBudget: async (childId) => await this.releaseChildBudget(session, childId),
       rollbackChildPlanAssignment: async (childId, nodeIds, previousPlan) =>
         await this.rollbackChildPlanAssignment(session, childId, nodeIds, previousPlan)
+    };
+  }
+
+  private requestReview(session: RuntimeSession): ReviewRequestResult {
+    const readiness = reviewReadiness(session);
+    const eligible = new Set(readiness.eligible.map((item) => item.evidenceId));
+    const missingValidationWorkspaceDeltaEvidenceIds = readiness.pending
+      .filter((item) => !eligible.has(item.evidenceId))
+      .map((item) => item.evidenceId);
+    return {
+      status: readiness.pending.length === 0
+        ? "not_required"
+        : readiness.eligible.length === 0 ? "validation_required"
+          : readiness.blockedReview ? "changes_required" : "review_requested",
+      workspaceDeltaEvidenceIds: readiness.eligible.map((item) => item.evidenceId),
+      validationEvidenceIds: readiness.relevantValidations.map((item) => item.evidenceId),
+      missingValidationWorkspaceDeltaEvidenceIds,
+      ...(readiness.blockedReview ? {
+        reviewEvidenceId: readiness.blockedReview.evidenceId,
+        findings: [...readiness.blockedReview.data.findings]
+      } : {}),
+      ...(readiness.retryableReview ? {
+        retryOfReviewEvidenceId: readiness.retryableReview.evidenceId,
+        findings: [...readiness.retryableReview.data.findings]
+      } : {})
     };
   }
 
@@ -92,7 +127,11 @@ export class RuntimeControlService {
       });
     }
     const currentRunEvidence = new Map(session.durable.state.evidence
-      .filter((item) => item.sessionId === session.identity.sessionId && item.runId === session.durable.runId)
+      .filter((item) => isCompletionEligibleEvidence(
+        item,
+        session.identity.sessionId,
+        session.durable.runId
+      ))
       .map((item) => [item.evidenceId, item] as const));
     assertPlanTransition(session.durable.state.plan, plan, currentRunEvidence, allowChildOwnedChanges);
     await this.options.emit(session, "plan.updated", "runtime", { previousRevision: expectedRevision, plan });

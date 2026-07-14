@@ -72,7 +72,8 @@ async function recoverInterruptedModel(session: RuntimeSession, options: Recover
   if (session.durable.state.activeModelSemanticDelta) {
     await options.emit("run.suspended", "runtime", {
       requestId: `model-recovery:${requestId}`,
-      message: "The interrupted model attempt produced durable content or reasoning. It will not be replayed automatically; send a follow-up to continue."
+      message: "The interrupted model attempt produced durable content or reasoning. It will not be replayed automatically; send a follow-up to continue.",
+      ...active
     });
     return;
   }

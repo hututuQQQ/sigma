@@ -5,12 +5,14 @@ use std::fs;
 use std::io;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const INTERNAL_HARDENED_LAUNCHER: &str = "--internal-linux-hardened-launcher";
+pub(crate) const INTERNAL_CWD_PIN_MOUNT: &str = "/.sigma-exec-cwd";
 const INTERNAL_HARDENING_PROBE: &str = "--internal-linux-hardening-probe";
 const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
 const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
@@ -67,6 +69,8 @@ impl Drop for OwnedFd {
 struct LauncherSpec {
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    cwd_pin: PathBuf,
+    argv0: OsString,
     command: Vec<OsString>,
 }
 
@@ -113,6 +117,7 @@ fn launch(spec: LauncherSpec) -> io::Result<i32> {
             "hardened launcher must be sandbox PID 1",
         ));
     }
+    attest_directory_identity(Path::new("."), &spec.cwd_pin)?;
     apply_landlock_and_seccomp(&spec.read_roots, &spec.write_roots)?;
     let child = unsafe { libc::fork() };
     if child < 0 {
@@ -120,6 +125,7 @@ fn launch(spec: LauncherSpec) -> io::Result<i32> {
     }
     if child == 0 {
         let error = Command::new(&spec.command[0])
+            .arg0(&spec.argv0)
             .args(&spec.command[1..])
             .exec();
         eprintln!("sigma-exec command launch failed: {error}");
@@ -177,6 +183,8 @@ fn exit_code(status: libc::c_int) -> i32 {
 fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
     let mut read_roots = Vec::new();
     let mut write_roots = Vec::new();
+    let mut cwd_pin = None;
+    let mut argv0 = None;
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == OsStr::new("--") {
@@ -189,31 +197,91 @@ fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
                     "hardening launcher requires at least one read root",
                 ));
             }
+            let cwd_pin = cwd_pin
+                .ok_or_else(|| invalid("hardening launcher requires exactly one cwd pin"))?;
+            let argv0 = argv0
+                .ok_or_else(|| invalid("hardening launcher requires exactly one argv0 value"))?;
             return Ok(LauncherSpec {
                 read_roots: canonical_roots(read_roots)?,
                 write_roots: canonical_roots(write_roots)?,
+                cwd_pin: canonical_directory(cwd_pin, "cwd pin")?,
+                argv0,
                 command,
             });
         }
-        let destination = match arguments[index].to_str() {
-            Some("--read") => &mut read_roots,
-            Some("--write") => &mut write_roots,
+        match arguments[index].to_str() {
+            Some("--read") | Some("--write") => {
+                let destination = if arguments[index] == OsStr::new("--read") {
+                    &mut read_roots
+                } else {
+                    &mut write_roots
+                };
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| invalid("hardening root flag requires a path"))?;
+                destination.push(PathBuf::from(value));
+                index += 1;
+            }
+            Some("--cwd-pin") => {
+                if cwd_pin.is_some() {
+                    return Err(invalid("hardening launcher accepts only one cwd pin"));
+                }
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| invalid("hardening cwd pin flag requires a path"))?;
+                cwd_pin = Some(PathBuf::from(value));
+                index += 1;
+            }
+            Some("--argv0") => {
+                if argv0.is_some() {
+                    return Err(invalid("hardening launcher accepts only one argv0 value"));
+                }
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or_else(|| invalid("hardening argv0 flag requires a value"))?;
+                argv0 = Some(value.clone());
+                index += 1;
+            }
             _ => {
                 return Err(invalid(
-                    "hardening launcher accepts only --read/--write roots",
+                    "hardening launcher accepts only --argv0/--cwd-pin/--read/--write roots",
                 ));
             }
-        };
-        index += 1;
-        let value = arguments
-            .get(index)
-            .ok_or_else(|| invalid("hardening root flag requires a path"))?;
-        destination.push(PathBuf::from(value));
-        index += 1;
+        }
     }
     Err(invalid(
         "hardening launcher is missing the '--' command delimiter",
     ))
+}
+
+fn canonical_directory(path: PathBuf, label: &str) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(invalid("hardening paths must be absolute"));
+    }
+    let canonical = path.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(invalid(&format!("hardening {label} must be a directory")));
+    }
+    Ok(canonical)
+}
+
+fn attest_directory_identity(current: &Path, pinned: &Path) -> io::Result<()> {
+    let current = fs::metadata(current)?;
+    let pinned = fs::metadata(pinned)?;
+    if !current.is_dir()
+        || !pinned.is_dir()
+        || current.dev() != pinned.dev()
+        || current.ino() != pinned.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "sandbox cwd does not match its pinned directory object",
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_roots(roots: Vec<PathBuf>) -> io::Result<Vec<PathBuf>> {
@@ -611,6 +679,11 @@ fn self_test_arguments(
         OsString::from("--bind"),
         denied.as_os_str().to_owned(),
         denied.as_os_str().to_owned(),
+        OsString::from("--ro-bind"),
+        allowed.as_os_str().to_owned(),
+        OsString::from(INTERNAL_CWD_PIN_MOUNT),
+        OsString::from("--chdir"),
+        allowed.as_os_str().to_owned(),
         OsString::from("--proc"),
         OsString::from("/proc"),
         OsString::from("--dev"),
@@ -618,6 +691,10 @@ fn self_test_arguments(
         OsString::from("--"),
         helper.as_os_str().to_owned(),
         OsString::from(INTERNAL_HARDENED_LAUNCHER),
+        OsString::from("--cwd-pin"),
+        OsString::from(INTERNAL_CWD_PIN_MOUNT),
+        OsString::from("--argv0"),
+        helper.as_os_str().to_owned(),
         OsString::from("--read"),
         OsString::from("/"),
         OsString::from("--write"),
@@ -669,8 +746,20 @@ mod tests {
                 "/tmp/denied",
             ]
         );
+        let cwd_pin = values
+            .windows(2)
+            .any(|pair| pair == ["--cwd-pin", INTERNAL_CWD_PIN_MOUNT]);
+        assert!(cwd_pin);
+        let argv0 = values
+            .windows(2)
+            .any(|pair| pair == ["--argv0", "/sigma-exec"]);
+        assert!(argv0);
+        let probe = values
+            .iter()
+            .position(|value| *value == INTERNAL_HARDENING_PROBE)
+            .expect("probe argument");
         assert_eq!(
-            &values[27..],
+            &values[probe + 1..],
             [
                 "/tmp/allowed",
                 "/tmp/denied",
@@ -687,6 +776,10 @@ mod tests {
         assert!(parse_launcher(vec!["--".into(), "/bin/true".into()]).is_err());
         assert!(parse_launcher(vec!["--read".into(), "/".into()]).is_err());
         let parsed = parse_launcher(vec![
+            "--cwd-pin".into(),
+            "/".into(),
+            "--argv0".into(),
+            "true".into(),
             "--read".into(),
             "/".into(),
             "--write".into(),
@@ -696,6 +789,60 @@ mod tests {
         ])
         .expect("valid launcher");
         assert_eq!(parsed.command[0], OsStr::new("/bin/true"));
+        assert_eq!(parsed.argv0, OsStr::new("true"));
+        assert!(
+            parse_launcher(vec![
+                "--cwd-pin".into(),
+                "/".into(),
+                "--cwd-pin".into(),
+                "/".into(),
+                "--argv0".into(),
+                "true".into(),
+                "--read".into(),
+                "/".into(),
+                "--".into(),
+                "/bin/true".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cwd_attestation_rejects_replacement_and_preserves_relative_execution() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "sigma-cwd-attestation-{}-{unique}",
+            std::process::id()
+        ));
+        let declared = root.join("declared");
+        let pin_alias = root.join("pin-alias");
+        fs::create_dir_all(&declared).expect("create cwd");
+        let executable = declared.join("relative-tool");
+        fs::write(&executable, "#!/bin/sh\nprintf pinned-cwd-ok")
+            .expect("write relative executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make relative executable runnable");
+        symlink(&declared, &pin_alias).expect("create cwd pin alias");
+
+        attest_directory_identity(&declared, &pin_alias).expect("same cwd object should attest");
+        let output = Command::new("./relative-tool")
+            .current_dir(&declared)
+            .output()
+            .expect("run relative executable");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"pinned-cwd-ok");
+
+        fs::remove_file(&pin_alias).expect("remove pin alias");
+        let pinned = root.join("pinned-original");
+        fs::rename(&declared, &pinned).expect("move original cwd");
+        fs::create_dir_all(&declared).expect("create replacement cwd");
+        assert!(attest_directory_identity(&declared, &pinned).is_err());
+        fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[cfg(target_arch = "x86_64")]

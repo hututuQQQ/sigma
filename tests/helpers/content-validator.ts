@@ -64,6 +64,16 @@ export function registerContentValidator(tools: EffectToolRegistry): EffectToolR
           summary: ok ? "Fixture file postconditions passed." : "Fixture file postconditions failed.",
           data: {
             validator: "fixture_content_check",
+            exitCode: ok ? 0 : 1,
+            termination: {
+              processStarted: true,
+              state: "exited",
+              exitCode: ok ? 0 : 1,
+              signal: null,
+              timedOut: false,
+              idleTimedOut: false,
+              cancelled: false
+            },
             artifactIds: [],
             workspaceDeltaEvidenceIds: []
           }

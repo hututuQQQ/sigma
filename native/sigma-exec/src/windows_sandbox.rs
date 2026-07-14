@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
@@ -242,6 +242,10 @@ pub(crate) fn try_run_internal_mode() -> Option<i32> {
 }
 
 pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+    // Resolve and authorize before the broker performs the recursive writable
+    // tree preflight. The launcher repeats this check before any ACL mutation
+    // and again immediately before CreateProcess, preserving defense in depth.
+    resolve_executable(params)?;
     validate_writable_acl_trees(params)?;
     let failure_nonce = secure_nonce("launch failure marker")?;
     let payload = serde_json::to_vec(&LauncherBootstrap {
@@ -403,6 +407,11 @@ fn run_launcher() -> Result<i32, LauncherFailure> {
 
 fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     validate_launcher_params(&params)?;
+    // Reject an unavailable or unauthorized primary before creating a
+    // profile, journaling ACLs, or walking the declared policy roots. The
+    // executable is resolved and authorized again immediately before launch,
+    // so this is only a fail-fast check and does not weaken the TOCTOU guard.
+    resolve_executable(&params)?;
     let profile_name = ephemeral_profile_name()?;
     // Persist the profile intent before profile creation. A hard kill in the
     // narrow create/journal window can therefore still be recovered exactly.
@@ -457,6 +466,22 @@ fn validate_launcher_params(params: &ProcessParams) -> Result<(), RpcError> {
         return Err(RpcError::new(
             "policy_denied",
             "command cwd must be absolute",
+        ));
+    }
+    if params
+        .policy
+        .executable_sha256
+        .as_ref()
+        .is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "executableSha256 must be a lowercase SHA-256 digest",
         ));
     }
     for root in params
@@ -940,7 +965,9 @@ fn check_acl_tree_limits(scanned: &mut usize, depth: usize, context: &str) -> Re
     if *scanned > MAX_RECOVERY_ENTRIES || depth > MAX_RECOVERY_SCAN_DEPTH {
         return Err(RpcError::new(
             "policy_denied",
-            format!("{context} exceeds sandbox ACL traversal limits"),
+            format!(
+                "{context} exceeds sandbox ACL traversal limits (maximum {MAX_RECOVERY_ENTRIES} objects; declare narrower read roots)"
+            ),
         ));
     }
     Ok(())
@@ -958,7 +985,9 @@ fn check_acl_plan_limits(
     {
         return Err(RpcError::new(
             "policy_denied",
-            "sandbox ACL plan exceeds durable recovery limits",
+            format!(
+                "sandbox ACL plan exceeds durable recovery limits (maximum {MAX_RECOVERY_ENTRIES} objects; declare narrower read roots)"
+            ),
         ));
     }
     Ok(())
@@ -2984,52 +3013,54 @@ fn cleanup_recovery_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(
             roots
         });
     let mut located: Option<HashMap<RecoveryFileIdentity, PathBuf>> = None;
+    let mut resolved_paths = HashMap::<RecoveryFileIdentity, PathBuf>::new();
     for entry in snapshot.entries.iter().rev() {
-        let original_path_exists = entry.path.try_exists().map_err(RpcError::from)?;
         let mut handle = open_matching_recovery_entry(&entry.path, entry, &writable_roots)?;
         if handle.is_none() {
-            if entry.writable_root.is_none() {
-                if !original_path_exists {
-                    // Read-only roots and traversal-only ancestors cannot be
-                    // renamed or deleted by the AppContainer. If the host
-                    // removed one after a broker crash, its object (and ACE)
-                    // is gone; treating that as deletion lets the next normal
-                    // setup converge without weakening writable recovery.
-                    continue;
+            if entry.writable_root.is_some() {
+                if located.is_none() {
+                    located = Some(scan_recovery_roots(&writable_roots)?);
                 }
+                if let Some(relocated) = located
+                    .as_ref()
+                    .and_then(|items| items.get(&entry.identity))
+                    .cloned()
+                {
+                    handle = open_matching_recovery_entry(&relocated, entry, &writable_roots)?;
+                    if handle.is_none() {
+                        return Err(RpcError::new(
+                            "sandbox_recovery_failed",
+                            format!(
+                                "sandbox ACL target changed after recovery scan: '{}'",
+                                relocated.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            if handle.is_none() {
+                // The sandbox cannot move a writable object outside its root,
+                // but the host can do so after a broker crash. Schema v3 did
+                // not persist an authenticated deletion witness or a trusted
+                // original-volume binding, so a complete scan of declared
+                // roots cannot distinguish deletion from an out-of-root move.
+                // Retain the claim until a future schema can prove either case.
+                let access = if entry.writable_root.is_some() {
+                    "write"
+                } else {
+                    "read"
+                };
                 return Err(RpcError::new(
                     "sandbox_recovery_failed",
                     format!(
-                        "sandbox ACL target identity changed without a controlled write root: '{}'",
+                        "cannot safely recover relocated or deleted schema-v3 {access} target: '{}'",
                         entry.path.display()
                     ),
                 ));
             }
-            if located.is_none() {
-                located = Some(scan_recovery_roots(&writable_roots)?);
-            }
-            if let Some(relocated) = located
-                .as_ref()
-                .and_then(|items| items.get(&entry.identity))
-                .cloned()
-            {
-                handle = open_matching_recovery_entry(&relocated, entry, &writable_roots)?;
-                if handle.is_none() {
-                    return Err(RpcError::new(
-                        "sandbox_recovery_failed",
-                        format!(
-                            "sandbox ACL target changed after recovery scan: '{}'",
-                            relocated.display()
-                        ),
-                    ));
-                }
-            }
-            // A complete, identity-checked scan of the durable write root is
-            // positive evidence that an unlocated object was deleted. The
-            // sandbox cannot move it outside that root, and pre-existing
-            // external hard links are rejected before any ACL is changed.
         }
         if let Some(handle) = handle {
+            resolved_paths.insert(entry.identity, final_handle_path(handle.0)?);
             remove_exact_acl_entry(
                 &handle,
                 sid,
@@ -3039,13 +3070,14 @@ fn cleanup_recovery_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(
             )?;
         }
     }
-    verify_recovery_scopes(snapshot, sid, &writable_roots)
+    verify_recovery_scopes(snapshot, sid, &writable_roots, &resolved_paths)
 }
 
 fn verify_recovery_scopes(
     snapshot: &RecoverySnapshot,
     sid: PSID,
     writable_roots: &[RecoveryRootIdentity],
+    resolved_paths: &HashMap<RecoveryFileIdentity, PathBuf>,
 ) -> Result<(), RpcError> {
     let mut baselines = HashMap::new();
     for entry in &snapshot.entries {
@@ -3070,16 +3102,24 @@ fn verify_recovery_scopes(
         .entries
         .iter()
         .filter(|entry| entry.inherit)
-        .map(|entry| (entry.path.clone(), entry.permissions))
+        .filter_map(|entry| {
+            resolved_paths
+                .get(&entry.identity)
+                .map(|path| (path.clone(), entry.permissions))
+        })
         .collect::<Vec<_>>();
     roots.extend(
         snapshot
             .entries
             .iter()
             .filter(|entry| entry.inherit && entry.writable_root.is_none())
-            .map(|entry| RecoveryRootIdentity {
-                path: entry.path.clone(),
-                identity: entry.identity,
+            .filter_map(|entry| {
+                resolved_paths
+                    .get(&entry.identity)
+                    .map(|path| RecoveryRootIdentity {
+                        path: path.clone(),
+                        identity: entry.identity,
+                    })
             }),
     );
     roots.sort_by(|left, right| {
@@ -3390,6 +3430,10 @@ fn recovery_path_within(candidate: &Path, root: &Path) -> bool {
 
 fn launch_appcontainer(params: &ProcessParams, sid: PSID) -> Result<i32, RpcError> {
     let executable = resolve_executable(params)?;
+    // Keep the exact executable object non-replaceable and non-writable from
+    // the final authorization check through CreateProcessW. CreateProcessW
+    // resolves the path again, so the handle closes that last pathname race.
+    let _executable_pin = pin_executable(&executable, params.policy.executable_sha256.as_deref())?;
     let mut command_line = windows_command_line(&executable, &params.command.args);
     let cwd = wide_null(params.command.cwd.as_os_str());
     let profile_folder = appcontainer_folder(sid)?;
@@ -3894,6 +3938,97 @@ fn resolve_executable(params: &ProcessParams) -> Result<PathBuf, RpcError> {
     Ok(resolved)
 }
 
+fn pin_executable(
+    executable: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<OwnedHandle, RpcError> {
+    let wide = wide_null(executable.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            // Existing readers may continue, but a host cannot open a writer,
+            // delete, rename, or replace this object while launch is pending.
+            FILE_SHARE_READ,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(RpcError::new(
+            "executable_unavailable",
+            format!(
+                "cannot pin executable '{}' for launch: {}",
+                executable.display(),
+                last_error("CreateFileW(executable)").message
+            ),
+        ));
+    }
+    let handle = OwnedHandle(handle);
+    let tag = acl_target_tag(handle.0)?;
+    if tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(RpcError::new(
+            "executable_unavailable",
+            format!(
+                "executable is not a stable regular file: '{}'",
+                executable.display()
+            ),
+        ));
+    }
+    let actual = final_handle_path(handle.0)?;
+    if !windows_path_eq(&actual, executable) {
+        return Err(RpcError::new(
+            "executable_unavailable",
+            format!(
+                "executable changed while being pinned: expected '{}', opened '{}'",
+                executable.display(),
+                actual.display()
+            ),
+        ));
+    }
+    if let Some(expected) = expected_sha256 {
+        let mut file = std::fs::File::open(executable).map_err(|error| {
+            RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot read pinned executable '{}': {error}",
+                    executable.display()
+                ),
+            )
+        })?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                RpcError::new(
+                    "executable_unavailable",
+                    format!(
+                        "cannot hash pinned executable '{}': {error}",
+                        executable.display()
+                    ),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let actual_digest = format!("{:x}", digest.finalize());
+        if actual_digest != expected {
+            return Err(RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "executable '{}' no longer matches its trusted digest",
+                    executable.display()
+                ),
+            ));
+        }
+    }
+    Ok(handle)
+}
+
 fn authorize_executable(params: &ProcessParams, executable: &Path) -> Result<(), RpcError> {
     let explicitly_trusted = canonical_unique(&params.policy.execution_roots)?
         .iter()
@@ -3908,7 +4043,7 @@ fn authorize_executable(params: &ProcessParams, executable: &Path) -> Result<(),
         return Ok(());
     }
     Err(RpcError::new(
-        "policy_denied",
+        "executable_unavailable",
         format!(
             "resolved executable '{}' is not a verified shell or inside a declared execution root",
             executable.display()
@@ -4174,6 +4309,7 @@ fn self_test() -> Result<(), RpcError> {
             read_roots: vec![root.clone()],
             write_roots: vec![root.clone()],
             execution_roots: Vec::new(),
+            executable_sha256: None,
             protected_paths: vec![root.join(".git"), root.join(".agent")],
             unsafe_host_exec_approved: false,
         },
@@ -4815,17 +4951,17 @@ mod tests {
         assert_eq!(persisted.profile_name, profile_name);
         assert_eq!(persisted.entries.len(), 1);
 
-        journal.snapshot.entries[0].identity.file_id[0] ^= 1;
+        journal.snapshot.entries[0].identity.volume_serial_number ^= 1;
         let error = cleanup_recovery_snapshot(&journal.snapshot, null_mut())
             .expect_err("changed file identity must fail closed before ACL mutation");
         assert_eq!(error.code, "sandbox_recovery_failed");
-        assert!(error.message.contains("controlled write root"));
+        assert!(error.message.contains("schema-v3 read target"));
         journal.remove().expect("remove recovery journal");
         std::fs::remove_dir_all(&root).expect("remove recovery fixture");
     }
 
     #[test]
-    fn recovery_accepts_a_host_deleted_read_only_target() {
+    fn recovery_retains_v3_journal_when_a_host_deleted_read_target_has_no_deletion_witness() {
         let unique = ephemeral_profile_name()
             .expect("create deleted read target profile name")
             .replace('.', "-");
@@ -4854,10 +4990,117 @@ mod tests {
             .apply(&plan, sid)
             .expect("grant deleted read target");
         std::fs::remove_file(&target).expect("host deletes read-only target after crash");
-        cleanup_recovery_snapshot(&journal.snapshot, sid)
-            .expect("deleted read-only object no longer carries an ACE");
+        let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
+            .expect_err("schema v3 must not guess that a missing file ID proves deletion");
+        assert_eq!(error.code, "sandbox_recovery_failed");
+        assert!(journal.path.is_file());
         journal.remove().expect("remove deleted read journal");
         std::fs::remove_dir_all(&root).expect("remove deleted read fixture");
+    }
+
+    #[test]
+    fn recovery_retains_v3_journal_for_a_host_relocated_read_only_target() {
+        let unique = ephemeral_profile_name()
+            .expect("create relocated read target profile name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-recovery-read-relocate-{unique}"));
+        let recovery = fixture
+            .join("host")
+            .join("SigmaCode")
+            .join(RECOVERY_DIRECTORY);
+        let target = fixture.join("read-only");
+        let relocated = fixture.join("relocated-by-host");
+        std::fs::create_dir_all(&target).expect("create relocated read target");
+        let mut profile = test_profile();
+        let mut journal = RecoveryJournal::create(&recovery, &profile.name)
+            .expect("create relocated read recovery journal");
+        let plan = [PlannedAcl {
+            path: target.clone(),
+            permissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            inherit: true,
+            propagate_inheritance: false,
+            read_reparse_target: None,
+            writable_root: None,
+        }];
+        journal
+            .prepare(&plan, profile.sid)
+            .expect("journal relocated read target");
+        journal
+            .apply(&plan, profile.sid)
+            .expect("grant relocated read target");
+        assert!(count_allowed_aces(&target, profile.sid) > 0);
+
+        std::fs::rename(&target, &relocated).expect("host relocates read-only target after crash");
+        std::fs::create_dir(&target).expect("host replaces original read-only path");
+        let error = cleanup_recovery_snapshot(&journal.snapshot, profile.sid)
+            .expect_err("schema v3 has no unique volume binding for relocated read recovery");
+        assert_eq!(error.code, "sandbox_recovery_failed");
+        assert!(count_allowed_aces(&relocated, profile.sid) > 0);
+        assert_tree_has_no_allowed_ace(&target, profile.sid);
+        assert!(journal.path.is_file());
+
+        journal.remove().expect("remove relocated read journal");
+        profile.delete().expect("delete relocated read profile");
+        std::fs::remove_dir_all(&fixture).expect("remove relocated read fixture");
+    }
+
+    #[test]
+    fn stale_v3_claim_remains_reopenable_after_cleanup_fails_closed() {
+        let unique = ephemeral_profile_name()
+            .expect("create stale claim profile name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-stale-claim-{unique}"));
+        let recovery = fixture
+            .join("host")
+            .join("SigmaCode")
+            .join(RECOVERY_DIRECTORY);
+        let target = fixture.join("read-only");
+        let relocated = fixture.join("relocated-by-host");
+        std::fs::create_dir_all(&target).expect("create stale claim read target");
+
+        let mut profile = test_profile();
+        let mut journal = RecoveryJournal::create(&recovery, &profile.name)
+            .expect("create stale recovery journal");
+        let plan = [PlannedAcl {
+            path: target.clone(),
+            permissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            inherit: true,
+            propagate_inheritance: false,
+            read_reparse_target: None,
+            writable_root: None,
+        }];
+        journal
+            .prepare(&plan, profile.sid)
+            .expect("journal stale read target");
+        journal
+            .apply(&plan, profile.sid)
+            .expect("grant stale read target");
+        assert_eq!(journal.snapshot.schema_version, 3);
+
+        std::fs::rename(&target, &relocated).expect("host relocates stale read target");
+        std::fs::create_dir(&target).expect("host replaces stale read target");
+        journal.snapshot.owner_process_creation_time ^= 1;
+        journal.persist().expect("persist stale recovery owner");
+
+        let canonical_path = journal.path.clone();
+        let claim_path = recovery_claim_path(&canonical_path).expect("derive claim path");
+        let first_error = recover_stale_profiles(&recovery)
+            .expect_err("first cleanup must fail closed for relocated schema-v3 target");
+        assert_eq!(first_error.code, "sandbox_recovery_failed");
+        assert!(first_error.message.contains("schema-v3 read target"));
+        assert!(!canonical_path.exists());
+        assert!(claim_path.is_file());
+
+        let second_error = recover_stale_profiles(&recovery)
+            .expect_err("retained claim must be visible and fail closed on the next scan");
+        assert_eq!(second_error.code, "sandbox_recovery_failed");
+        assert!(second_error.message.contains("schema-v3 read target"));
+        assert!(!canonical_path.exists());
+        assert!(claim_path.is_file());
+
+        remove_recovery_file(&claim_path).expect("remove retained recovery claim");
+        profile.delete().expect("delete stale claim profile");
+        std::fs::remove_dir_all(&fixture).expect("remove stale claim fixture");
     }
 
     #[test]
@@ -5273,7 +5516,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_accepts_a_host_deleted_complete_write_root() {
+    fn recovery_retains_v3_journal_for_a_host_deleted_complete_write_root() {
         let unique = ephemeral_profile_name()
             .expect("create deleted write root profile name")
             .replace('.', "-");
@@ -5300,10 +5543,80 @@ mod tests {
             .expect("journal deleted write root");
         journal.apply(&plan, sid).expect("grant deleted write root");
         std::fs::remove_dir_all(&root).expect("host deletes complete write root after crash");
-        cleanup_recovery_snapshot(&journal.snapshot, sid)
-            .expect("deleted write root objects no longer carry ACEs");
-        journal.remove().expect("remove deleted write journal");
+        let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
+            .expect_err("schema-v3 cannot prove that the write root was deleted rather than moved");
+        assert_eq!(error.code, "sandbox_recovery_failed");
+        assert!(error.message.contains("schema-v3 write target"));
+        assert!(
+            journal.path.is_file(),
+            "failed cleanup must retain its journal"
+        );
+        journal
+            .remove()
+            .expect("remove retained deleted-write fixture journal");
         std::fs::remove_dir_all(&fixture).expect("remove deleted write fixture");
+    }
+
+    #[test]
+    fn recovery_retains_v3_journal_for_a_host_relocated_write_target() {
+        let unique = ephemeral_profile_name()
+            .expect("create relocated write profile name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-recovery-write-move-{unique}"));
+        let recovery = fixture
+            .join("host")
+            .join("SigmaCode")
+            .join(RECOVERY_DIRECTORY);
+        let root = fixture.join("workspace");
+        let original = root.join("file.txt");
+        let relocated = fixture.join("relocated.txt");
+        std::fs::create_dir_all(&root).expect("create relocated write root");
+        std::fs::write(&original, b"write").expect("create relocated write target");
+        let mut plan = Vec::new();
+        let mut planned_objects = 0;
+        plan_write_tree(&root, &root, &[], &[], &mut plan, &mut planned_objects, 0)
+            .expect("plan relocated write root");
+        let profile_name = ephemeral_profile_name().expect("create relocated write profile");
+        let mut journal = RecoveryJournal::create(&recovery, &profile_name)
+            .expect("create relocated write recovery journal");
+        let mut sid = world_sid();
+        let sid = sid.as_mut_ptr().cast();
+        journal
+            .prepare(&plan, sid)
+            .expect("journal relocated write root");
+        journal
+            .apply(&plan, sid)
+            .expect("grant relocated write root");
+        let target_entry = journal
+            .snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.file_name() == Some(OsStr::new("file.txt")))
+            .expect("find relocated target journal entry");
+        std::fs::rename(&original, &relocated)
+            .expect("host relocates writable target outside its declared root");
+
+        let error = cleanup_recovery_snapshot(&journal.snapshot, sid)
+            .expect_err("out-of-root relocation must retain schema-v3 recovery state");
+        assert_eq!(error.code, "sandbox_recovery_failed");
+        assert!(error.message.contains("schema-v3 write target"));
+        assert!(
+            count_exact_allowed_aces(&relocated, sid, target_entry.permissions, 0)
+                > target_entry.preexisting_ace_count
+        );
+        assert!(
+            journal.path.is_file(),
+            "failed cleanup must retain its journal"
+        );
+
+        std::fs::rename(&relocated, &original).expect("restore relocated write target");
+        cleanup_recovery_snapshot(&journal.snapshot, sid)
+            .expect("recover after the target returns to its declared root");
+        assert_tree_has_no_allowed_ace(&root, sid);
+        journal
+            .remove()
+            .expect("remove relocated-write recovery journal");
+        std::fs::remove_dir_all(&fixture).expect("remove relocated write fixture");
     }
 
     #[test]
@@ -5711,6 +6024,88 @@ mod tests {
         std::fs::remove_file(&inside).expect("remove inside hardlink");
         std::fs::remove_dir_all(&root).expect("remove deep hardlink root");
         std::fs::remove_file(&outside).expect("remove external hardlink");
+    }
+
+    #[test]
+    fn unauthorized_primary_is_rejected_before_writable_tree_preflight() {
+        let unique = ephemeral_profile_name()
+            .expect("create fail-fast profile name")
+            .replace('.', "-");
+        let root = std::env::temp_dir().join(format!("sigma-fail-fast-root-{unique}"));
+        let outside = std::env::temp_dir().join(format!("sigma-fail-fast-outside-{unique}.txt"));
+        let linked = root.join("linked.txt");
+        let executable = root.join("untrusted.exe");
+        std::fs::create_dir_all(&root).expect("create fail-fast write root");
+        std::fs::write(&outside, b"outside").expect("create fail-fast hardlink target");
+        std::fs::hard_link(&outside, &linked).expect("create fail-fast hardlink alias");
+        std::fs::write(&executable, b"not an executable").expect("create untrusted primary");
+        let params = ProcessParams {
+            command: crate::sandbox::CommandSpec {
+                executable: executable.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: root.clone(),
+                env: BTreeMap::new(),
+                stdin: None,
+            },
+            policy: crate::sandbox::ExecutionPolicy {
+                sandbox: SandboxMode::Required,
+                network: NetworkMode::None,
+                network_approved: false,
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                execution_roots: Vec::new(),
+                executable_sha256: None,
+                protected_paths: Vec::new(),
+                unsafe_host_exec_approved: false,
+            },
+            max_output_bytes: 1_024,
+            timeout_ms: Some(1_000),
+            idle_timeout_ms: None,
+            pty: false,
+            pty_columns: 80,
+            pty_rows: 24,
+        };
+
+        let error = match prepare_command(&params) {
+            Err(error) => error,
+            Ok(_) => panic!("untrusted primary must fail before the hardlink preflight"),
+        };
+        assert_eq!(error.code, "executable_unavailable");
+        assert!(error.message.contains("resolved executable"));
+
+        std::fs::remove_file(&linked).expect("remove fail-fast hardlink alias");
+        std::fs::remove_file(&executable).expect("remove untrusted primary");
+        std::fs::remove_dir_all(&root).expect("remove fail-fast write root");
+        std::fs::remove_file(&outside).expect("remove fail-fast hardlink target");
+    }
+
+    #[test]
+    fn executable_pin_blocks_replacement_and_writes_until_release() {
+        let unique = ephemeral_profile_name()
+            .expect("create executable pin fixture name")
+            .replace('.', "-");
+        let root = std::env::temp_dir().join(format!("sigma-executable-pin-{unique}"));
+        let executable = root.join("tool.exe");
+        let moved = root.join("moved.exe");
+        std::fs::create_dir(&root).expect("create executable pin fixture");
+        std::fs::write(&executable, b"trusted bytes").expect("create executable fixture");
+
+        let expected = format!("{:x}", Sha256::digest(b"trusted bytes"));
+        let pin =
+            pin_executable(&executable, Some(&expected)).expect("pin exact executable object");
+        assert!(std::fs::rename(&executable, &moved).is_err());
+        assert!(std::fs::write(&executable, b"replacement bytes").is_err());
+        drop(pin);
+
+        let mismatch = match pin_executable(&executable, Some(&"0".repeat(64))) {
+            Err(error) => error,
+            Ok(_) => panic!("executable bytes must match the trusted digest"),
+        };
+        assert_eq!(mismatch.code, "executable_unavailable");
+
+        std::fs::rename(&executable, &moved).expect("rename after executable pin release");
+        std::fs::remove_file(&moved).expect("remove executable fixture");
+        std::fs::remove_dir(&root).expect("remove executable pin fixture");
     }
 
     #[test]

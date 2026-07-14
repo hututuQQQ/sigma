@@ -152,7 +152,52 @@ describe("frozen skill CAS materialization", () => {
       qualifiedName: "workspace:runner", relativePath: "../outside.mjs", purpose: "plan"
     })).rejects.toMatchObject({ code: "skill_resource_escape" });
 
+    const legacyState = createKernelState({
+      sessionId: "legacy-session",
+      runId: "run",
+      mode: "analyze",
+      startedAt: new Date().toISOString(),
+      deadlineAt: new Date(Date.now() + 60_000).toISOString()
+    });
+    const legacySession = runtimeSessionFixture({
+      state: legacyState,
+      workspacePath: workspace
+    });
+    const legacyControl = new RuntimeControlService({
+      checkpoints: {} as never,
+      budgets: {} as never,
+      skills: catalog,
+      emit: async (_session, type, _authority, payload) => {
+        if (type === "skill.loaded") legacyState.frozenSkills.push({ ...payload } as never);
+      },
+      createArtifact: async (sessionId, content) => await artifacts.put(sessionId, content),
+      readArtifact: async (sessionId, artifactId) => (await artifacts.get(sessionId, artifactId)).toString("utf8"),
+      skillMaterializer: materializer
+    }).forSession(legacySession);
+    await legacyControl.loadSkill("workspace:runner");
+    expect(legacyState.frozenSkills[0]).toMatchObject({
+      qualifiedName: "workspace:runner",
+      executionManifestArtifactId: expect.any(String),
+      executionManifestDigest: expect.any(String)
+    });
+    legacySession.services.profile = { profile: { skills: [] } } as never;
+    await expect(legacyControl.resolveLoadedSkillResource({
+      qualifiedName: "workspace:runner", relativePath: "scripts/run.mjs", purpose: "plan"
+    })).rejects.toMatchObject({ code: "profile_denied" });
+    legacySession.services.profile = undefined;
+
     await rm(skillRoot, { recursive: true, force: true });
+    const restoredLegacyControl = new RuntimeControlService({
+      checkpoints: {} as never,
+      budgets: {} as never,
+      emit: async () => undefined,
+      createArtifact: async (sessionId, content) => await artifacts.put(sessionId, content),
+      readArtifact: async (sessionId, artifactId) => (await artifacts.get(sessionId, artifactId)).toString("utf8"),
+      skillMaterializer: materializer
+    }).forSession(legacySession);
+    await expect(restoredLegacyControl.loadSkill("workspace:runner")).resolves.toMatchObject({
+      content: expect.stringContaining("Use scripts/run.mjs")
+    });
     const planned = await control.resolveLoadedSkillResource({
       qualifiedName: "workspace:runner", relativePath: "scripts/run.mjs", purpose: "plan"
     });
@@ -161,6 +206,10 @@ describe("frozen skill CAS materialization", () => {
     });
     expect(executed).toEqual(planned);
     expect(await readFile(executed.absolutePath, "utf8")).toBe("console.log('FROZEN');\n");
+    const legacyExecuted = await restoredLegacyControl.resolveLoadedSkillResource({
+      qualifiedName: "workspace:runner", relativePath: "scripts/run.mjs", purpose: "execute"
+    });
+    expect(await readFile(legacyExecuted.absolutePath, "utf8")).toBe("console.log('FROZEN');\n");
 
     loaded.executionManifestDigest = "0".repeat(64);
     await expect(control.resolveLoadedSkillResource({

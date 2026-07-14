@@ -77,6 +77,7 @@ export const durableToolReceiptShape = {
   name: nonEmptyStringSchema,
   ok: z.boolean(),
   output: z.string(),
+  result: jsonValueSchema.optional(),
   outcome: toolOutcomeSchema,
   observedEffects: z.array(toolEffectSchema),
   actualEffects: z.array(toolEffectSchema).optional(),

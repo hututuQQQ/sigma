@@ -54,8 +54,10 @@ function sanitizeValidation(
       validator: raw.data.validator,
       ...(raw.data.command ? { command: raw.data.command } : {}),
       ...(raw.data.exitCode === undefined ? {} : { exitCode: raw.data.exitCode }),
+      ...(raw.data.termination ? { termination: { ...raw.data.termination } } : {}),
       artifactIds: [...new Set(receipt.artifacts)],
-      workspaceDeltaEvidenceIds: scope.workspaceDeltas.map((item) => item.evidenceId)
+      workspaceDeltaEvidenceIds: scope.workspaceDeltas.map((item) => item.evidenceId),
+      checkpointIds: [...new Set(scope.workspaceDeltas.map((item) => item.data.checkpointId))]
     }
   };
 }

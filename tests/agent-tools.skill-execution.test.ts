@@ -1,3 +1,5 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -104,10 +106,12 @@ function brokerFixture(): {
 }
 
 describe("sandboxed skill resource execution", () => {
-  it("declares the external read and forces a read-only required sandbox for exec and process_spawn", async () => {
+  it("pins the external resource for foreground execution and denies unsafe background leasing", async () => {
     const workspace = path.resolve(".");
-    const skillRoot = path.join(path.parse(workspace).root, "sigma-test-skill-assets", "runner");
+    const skillRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-test-skill-assets-"));
     const script = path.join(skillRoot, "scripts", "run.mjs");
+    await mkdir(path.dirname(script), { recursive: true });
+    await writeFile(script, "console.log('trusted');\n");
     const resolve = vi.fn<RuntimeControlPort["resolveLoadedSkillResource"]>(async () => ({
       qualifiedName: "home:runner",
       relativePath: "scripts/run.mjs",
@@ -127,38 +131,36 @@ describe("sandboxed skill resource execution", () => {
       skillScript: "scripts/run.mjs"
     };
 
-    await expect(exec.descriptor.prepare!(input, preparation(workspace, control))).resolves.toMatchObject({
-      exactEffects: ["process.spawn.readonly", "filesystem.read"],
-      readPaths: [".", skillRoot, script],
-      writePaths: [],
-      checkpointScope: []
-    });
-    await exec.execute(request("exec", input), execution(workspace, control));
-    expect(fixture.executions).toEqual([expect.objectContaining({
-      command: expect.objectContaining({ executable: process.execPath, args: [script, "--flag"], environment: undefined }),
-      policy: expect.objectContaining({
-        sandbox: "required",
-        network: "none",
-        readRoots: [workspace, skillRoot],
-        writeRoots: [],
-        protectedPaths: [path.join(workspace, ".git"), path.join(workspace, ".agent"), skillRoot],
-        unsafeHostExecApproved: false
-      })
-    })]);
+    try {
+      await expect(exec.descriptor.prepare!(input, preparation(workspace, control))).resolves.toMatchObject({
+        exactEffects: ["process.spawn.readonly", "filesystem.read"],
+        readPaths: [".", skillRoot, script],
+        writePaths: [],
+        checkpointScope: []
+      });
+      await exec.execute(request("exec", input), execution(workspace, control));
+      expect(fixture.executions).toEqual([expect.objectContaining({
+        command: expect.objectContaining({ executable: process.execPath, args: [script, "--flag"], environment: undefined }),
+        policy: expect.objectContaining({
+          sandbox: "required",
+          network: "none",
+          readRoots: [workspace, skillRoot],
+          writeRoots: [],
+          protectedPaths: [skillRoot],
+          unsafeHostExecApproved: false
+        })
+      })]);
 
-    await expect(spawn.descriptor.prepare!(input, preparation(workspace, control))).resolves.toMatchObject({
-      exactEffects: ["process.spawn.readonly", "filesystem.read"],
-      processMode: "background"
-    });
-    await spawn.execute(request("process_spawn", input), execution(workspace, control));
-    expect(fixture.spawns[0]).toMatchObject({
-      command: { executable: process.execPath, args: [script, "--flag"] },
-      policy: { sandbox: "required", network: "none", readRoots: [workspace, skillRoot], writeRoots: [] }
-    });
-    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({
-      qualifiedName: "home:runner",
-      relativePath: "scripts/run.mjs"
-    }));
+      await expect(spawn.descriptor.prepare!(input, preparation(workspace, control)))
+        .rejects.toMatchObject({ code: "skill_execution_unavailable" });
+      expect(fixture.spawns).toHaveLength(0);
+      expect(resolve).toHaveBeenCalledWith(expect.objectContaining({
+        qualifiedName: "home:runner",
+        relativePath: "scripts/run.mjs"
+      }));
+    } finally {
+      await rm(skillRoot, { recursive: true, force: true });
+    }
   });
 
   it("does not reach the broker when the skill is unqualified, not loaded, escaping, or changed", async () => {
@@ -188,5 +190,37 @@ describe("sandboxed skill resource execution", () => {
       }), execution(workspace, denied))).rejects.toMatchObject({ code });
     }
     expect(fixture.executions).toHaveLength(0);
+  });
+
+  it("revalidates the frozen resource identity after acquiring its path lease", async () => {
+    const workspace = path.resolve(".");
+    const skillRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-skill-revalidation-"));
+    const script = path.join(skillRoot, "scripts", "run.mjs");
+    await mkdir(path.dirname(script), { recursive: true });
+    await writeFile(script, "console.log('trusted');\n");
+    let calls = 0;
+    const control = runtimeControl(async () => ({
+      qualifiedName: "home:runner",
+      relativePath: "scripts/run.mjs",
+      absolutePath: script,
+      readRoot: skillRoot,
+      digest: (calls++ === 0 ? "a" : "b").repeat(64)
+    }));
+    const fixture = brokerFixture();
+    const exec = executionTools({
+      broker: fixture.broker,
+      sandboxMode: "required",
+      networkMode: "none"
+    }).find((tool) => tool.descriptor.name === "exec")!;
+    try {
+      await expect(exec.execute(request("exec", {
+        executable: process.execPath,
+        skill: "home:runner",
+        skillScript: "scripts/run.mjs"
+      }), execution(workspace, control))).rejects.toMatchObject({ code: "skill_resource_stale" });
+      expect(fixture.executions).toHaveLength(0);
+    } finally {
+      await rm(skillRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -4,6 +4,11 @@ export interface WindowsDirectoryLockHelperHandle {
   close(): Promise<void>;
 }
 
+export interface WindowsPathLockRequest {
+  path: string;
+  kind: "directory" | "file";
+}
+
 const LOCK_HELPER = String.raw`
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
@@ -28,32 +33,38 @@ try {
   const first = await lines[Symbol.asyncIterator]().next();
   if (first.done) throw new Error("Windows directory-lock helper received no path manifest.");
   const paths = JSON.parse(first.value);
-  if (!Array.isArray(paths) || paths.some((item) => typeof item !== "string" || item.length === 0)) {
+  if (!Array.isArray(paths) || paths.some((item) => !item || typeof item.path !== "string"
+    || item.path.length === 0 || (item.kind !== "directory" && item.kind !== "file"))) {
     throw new Error("Windows directory-lock helper received an invalid path manifest.");
   }
   for (const target of paths) {
     const handle = library.functions.CreateFileW(
-      Buffer.from(path.toNamespacedPath(target) + "\0", "utf16le"),
-      0x0001,
-      0x0001 | 0x0002,
+      Buffer.from(path.toNamespacedPath(target.path) + "\0", "utf16le"),
+      target.kind === "directory" ? 0x0001 : 0x00120089,
+      target.kind === "directory" ? 0x0001 | 0x0002 : 0x0001,
       null,
       3,
-      0x02000000 | 0x00200000,
+      (target.kind === "directory" ? 0x02000000 : 0) | 0x00200000,
       null
     );
     if (handle === INVALID_HANDLE) {
-      throw new Error("Could not lock Windows directory " + JSON.stringify(target)
+      throw new Error("Could not lock Windows path " + JSON.stringify(target.path)
         + " (win32=" + library.functions.GetLastError() + ").");
     }
     const tag = Buffer.alloc(8);
     if (!library.functions.GetFileInformationByHandleEx(handle, 9, tag, tag.byteLength)) {
       library.functions.CloseHandle(handle);
-      throw new Error("Could not inspect Windows directory " + JSON.stringify(target)
+      throw new Error("Could not inspect Windows path " + JSON.stringify(target.path)
         + " (win32=" + library.functions.GetLastError() + ").");
     }
     if ((tag.readUInt32LE(0) & 0x0400) !== 0) {
       library.functions.CloseHandle(handle);
-      throw new Error("Windows directory is a reparse point: " + target);
+      throw new Error("Windows path is a reparse point: " + target.path);
+    }
+    const isDirectory = (tag.readUInt32LE(0) & 0x0010) !== 0;
+    if (isDirectory !== (target.kind === "directory")) {
+      library.functions.CloseHandle(handle);
+      throw new Error("Windows path kind changed while locking: " + target.path);
     }
     handles.push(handle);
   }
@@ -74,14 +85,14 @@ function exitPromise(child: ChildProcessWithoutNullStreams): Promise<void> {
 
 function readinessPromise(
   child: ChildProcessWithoutNullStreams,
-  paths: readonly string[],
+  paths: readonly WindowsPathLockRequest[],
   stderr: () => string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     let settled = false;
     const timeout = setTimeout(() => reject(new Error(
-      "Timed out while acquiring stable Windows directory handles."
+      "Timed out while acquiring stable Windows path handles."
     )), 10_000);
     const settle = (action: () => void): void => {
       if (settled) return;
@@ -115,6 +126,12 @@ function readinessPromise(
 
 export async function acquireWindowsDirectoryLockHelper(
   paths: readonly string[]
+): Promise<WindowsDirectoryLockHelperHandle> {
+  return await acquireWindowsPathLockHelper(paths.map((target) => ({ path: target, kind: "directory" })));
+}
+
+export async function acquireWindowsPathLockHelper(
+  paths: readonly WindowsPathLockRequest[]
 ): Promise<WindowsDirectoryLockHelperHandle> {
   const child = spawn(process.execPath, ["--experimental-ffi", "--input-type=module", "--eval", LOCK_HELPER], {
     stdio: ["pipe", "pipe", "pipe"],

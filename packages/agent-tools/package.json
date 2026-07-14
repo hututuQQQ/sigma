@@ -14,7 +14,8 @@
     "agent-code-intel": "workspace:*",
     "agent-execution": "workspace:*",
     "agent-platform": "workspace:*",
-    "agent-protocol": "workspace:*"
+    "agent-protocol": "workspace:*",
+    "ajv": "8.18.0"
   },
   "engines": { "node": ">=26.4.0" }
 }

@@ -1,12 +1,20 @@
 import { BrokerTransport } from "./broker-transport.js";
 import {
-  BrokerCancelledError,
-  BrokerConnectionError,
-  BrokerOutputDecodingError,
+  assertRequestSandbox, assertRequiredSandbox, cancellationError,
+  BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
+  containReusedProcessId, createProcessRedaction, decodedExecutionResult,
+  DEFAULT_DOCTOR_TIMEOUT_MS, DEFAULT_SANDBOX_SETUP_TIMEOUT_MS, DEFAULT_STARTUP_TIMEOUT_MS,
+  outputDecodingError, parsePostDispatchValue, rejectUndecodableExecution,
+  requestExecutionValue, reserveProcessId, runPostResponseOperation, SerializedProcessOperations,
+  type ClientState, type Cursor, type ProcessRedaction
+} from "./broker-client-support.js";
+import { settleCancelledSpawn } from "./broker-client-cancellation.js";
+import {
+  BrokerCancelledError, BrokerConnectionError,
   BrokerPolicyError,
   BrokerProcessLostError,
   BrokerTimeoutError,
-  SandboxUnavailableError
+  attachBrokerLifecycleFailure
 } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
 import {
@@ -14,7 +22,7 @@ import {
   redactionSecrets,
   requestParams
 } from "./broker-request-policy.js";
-import { SecretRedactor, type SecretRedactionStream } from "./redaction.js";
+import { SecretRedactor } from "./redaction.js";
 import {
   assertTrustedToolchainsAvailable,
   normalizeTrustedToolchains,
@@ -24,7 +32,6 @@ import type {
   BrokerDoctorReport,
   BrokerRequestOptions,
   ExecutionBroker,
-  ExecutionPolicy,
   ExecutionRequest,
   ExecutionResult,
   ProcessHandle,
@@ -32,31 +39,25 @@ import type {
   ProcessSpawnRequest,
   SigmaExecBrokerClientOptions
 } from "./types.js";
-import { parseDoctor, parseExecutionValue, parseHello, parseProcessValue, parseSpawnedProcess } from "./values.js";
-
-type ClientState = "new" | "connecting" | "ready" | "failed" | "closed";
-interface Cursor { stdout: number; stderr: number }
-interface RedactionStream {
-  push(input: string, options?: { final?: boolean; discontinuity?: boolean }): string;
-}
-interface ProcessRedaction { stdout: RedactionStream; stderr: SecretRedactionStream }
-
-function cancellationError(signal?: AbortSignal): BrokerCancelledError {
-  const cause = signal?.reason instanceof Error ? signal.reason : undefined;
-  return new BrokerCancelledError(cause?.message ?? "Execution request cancelled.", { cause });
-}
+import { parseDoctor, parseHello, parseProcessValue, parseSpawnedProcess } from "./values.js";
 
 export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly transport: BrokerTransport;
   private readonly redactor: SecretRedactor;
   private readonly cursors = new Map<string, Cursor>();
+  private readonly activeProcesses = new Map<string, ProcessHandle>();
+  private readonly seenProcessIds = new Set<string>();
+  private readonly processOperations = new SerializedProcessOperations();
+  private readonly postResponseOperations = new BrokerPostResponseOperations();
   private readonly processRedaction = new Map<string, ProcessRedaction>();
   private readonly lost = new Map<string, ProcessHandle>();
   private readonly outputArtifacts: BrokerOutputArtifactImporter;
+  private readonly lifecycle: BrokerClientLifecycle;
   private readonly trustedToolchains: NormalizedTrustedToolchain[];
   private state: ClientState = "new";
   private instanceId?: string;
-  private artifactCleanup?: Promise<void>;
+  private connectOperation?: Promise<BrokerDoctorReport>;
+  private closeRequested = false;
   private doctorValue?: BrokerDoctorReport;
 
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
@@ -64,9 +65,26 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     positiveInteger(options.cancellationGraceMs, 10_000, "cancellationGraceMs");
     this.trustedToolchains = normalizeTrustedToolchains(options.trustedToolchains);
     this.redactor = new SecretRedactor(options.secrets);
-    this.transport = new BrokerTransport(options, () => this.markProcessesLost());
+    this.transport = new BrokerTransport(options, (error) =>
+      containTransportFailure(error, () => this.markProcessesLost(), async () => await this.lifecycle.close()));
     this.outputArtifacts = new BrokerOutputArtifactImporter(this.redactor, async (artifactIds) =>
       await this.transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 })
+    );
+    this.lifecycle = new BrokerClientLifecycle(
+      () => { this.closeRequested = true; },
+      async () => {
+        this.markProcessesLost();
+        try { await this.transport.close(); }
+        finally { await this.connectOperation?.catch(() => undefined); }
+      },
+      async () => await this.postResponseOperations.waitForIdle(),
+      async () => await this.outputArtifacts.cleanup(),
+      (closed) => {
+        this.cursors.clear();
+        this.activeProcesses.clear();
+        this.processRedaction.clear();
+        this.state = closed ? "closed" : "failed";
+      }
     );
   }
 
@@ -75,6 +93,12 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
 
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot connect broker client in '${this.state}' state.`);
+    const operation = this.connectOnce(signal);
+    this.connectOperation = operation;
+    return await operation;
+  }
+
+  private async connectOnce(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.state = "connecting";
     try {
       assertTrustedToolchainsAvailable(this.trustedToolchains, this.options.sandboxMode);
@@ -85,40 +109,85 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       }, { signal, timeoutMs: 5_000 }));
       this.instanceId = hello.instanceId;
       await this.outputArtifacts.configureRoot(hello.artifactRoot);
-      const report = parseDoctor(await this.transport.request("doctor", {}, { signal, timeoutMs: 15_000 }));
-      this.assertRequiredSandbox(report);
+      const report = parseDoctor(await this.transport.request("doctor", {}, {
+        signal,
+        timeoutMs: this.options.startupTimeoutMs
+          ?? this.options.requestTimeoutMs
+          ?? DEFAULT_STARTUP_TIMEOUT_MS
+      }));
+      assertRequiredSandbox(report, this.options.sandboxMode);
+      if (this.closeRequested) {
+        throw new BrokerConnectionError("Broker client was closed during startup.", { retrySafe: true });
+      }
       this.doctorValue = report;
       this.state = "ready";
       return report;
     } catch (error) {
+      // An explicit close owns shutdown and waits for this startup operation to
+      // settle before deleting its artifact root. Avoid racing that cleanup.
+      if (this.closeRequested) throw error;
       this.state = "failed";
+      const failure = error instanceof Error ? error : new BrokerConnectionError(String(error));
       try {
         await this.transport.close();
-      } finally {
-        await this.outputArtifacts.cleanup();
+      } catch (shutdownError) {
+        throw attachBrokerLifecycleFailure(
+          failure, shutdownError,
+          "Broker startup failed and the helper process could not be confirmed closed."
+        );
       }
-      throw error;
+      try {
+        await this.outputArtifacts.cleanup();
+      } catch (cleanupError) {
+        throw attachBrokerLifecycleFailure(
+          failure, cleanupError,
+          "Broker startup failed and output artifact cleanup also failed."
+        );
+      }
+      throw failure;
     }
   }
 
   async doctor(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
-    const report = parseDoctor(await this.transport.request("doctor", {}, { signal, timeoutMs: 15_000 }));
-    this.assertRequiredSandbox(report);
+    const report = await parsePostDispatchValue(
+      await this.transport.request("doctor", {}, {
+        signal, timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_DOCTOR_TIMEOUT_MS
+      }), parseDoctor, async () => await this.close()
+    );
+    try {
+      assertRequiredSandbox(report, this.options.sandboxMode);
+    } catch (error) {
+      return await containPostDispatchFailure(error, async () => await this.close());
+    }
+    if (this.closeRequested) throw new BrokerConnectionError("Broker client closed during doctor response.");
     this.doctorValue = report;
     return report;
   }
 
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
-    const report = parseDoctor(await this.transport.request("sandbox.setup", {}, { signal, timeoutMs: 60_000 }));
+    const report = await parsePostDispatchValue(
+      await this.transport.request("sandbox.setup", {}, {
+        signal,
+        timeoutMs: this.options.startupTimeoutMs
+          ?? this.options.requestTimeoutMs
+          ?? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS
+      }), parseDoctor, async () => await this.close()
+    );
+    try {
+      assertRequiredSandbox(report, this.options.sandboxMode);
+    } catch (error) {
+      return await containPostDispatchFailure(error, async () => await this.close());
+    }
+    if (this.closeRequested) throw new BrokerConnectionError("Broker client closed during setup response.");
     this.doctorValue = report;
     return report;
   }
 
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {
     this.assertReady();
-    this.assertRequestSandbox(request.policy);
+    assertRequestSandbox(request.policy, this.doctorValue);
     const timeoutMs = positiveInteger(request.timeoutMs, 120_000, "timeoutMs");
     const params = {
       ...requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()), timeoutMs,
@@ -126,36 +195,28 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
         idleTimeoutMs: positiveInteger(request.idleTimeoutMs, 30_000, "idleTimeoutMs")
       })
     };
-    const value = parseExecutionValue(await this.transport.request("exec", params, {
-      ...options, timeoutMs: options.timeoutMs ?? timeoutMs + 5_000
-    }));
-    await this.assertDecoded(value, false);
-    const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
-    const failure = value.failure ? {
-      ...value.failure,
-      message: this.redactor.redactText(value.failure.message)
-    } : undefined;
-    return {
-      state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
-      timedOut: value.timedOut, idleTimedOut: value.idleTimedOut, cancelled: value.cancelled,
-      stdout: value.stdout.droppedBytes > 0
-        ? "[REDACTED:truncated-output]"
-        : this.redactor.redactText(value.stdout.data),
-      stderr: failure
-        ? `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`
-        : value.stderr.droppedBytes > 0
-        ? "[REDACTED:truncated-output]"
-        : this.redactor.redactText(value.stderr.data),
-      stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
-      outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
-      ...(failure ? { failure } : {}),
-      ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
-    };
+    return await runPostResponseOperation(this.postResponseOperations, async () => {
+      const value = await requestExecutionValue(
+        this.transport, params, options, timeoutMs, async () => await this.closeForActiveOperation()
+      );
+      const decodingError = outputDecodingError(value);
+      if (decodingError) {
+        await rejectUndecodableExecution(
+          this.transport, value, decodingError, async () => await this.closeForActiveOperation()
+        );
+      }
+      const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts).catch(
+        async (error: unknown) => await containPostDispatchFailure(
+          error, async () => await this.closeForActiveOperation()
+        )
+      );
+      return decodedExecutionResult(value, this.redactor, outputArtifacts);
+    }, async () => await this.close());
   }
 
   async spawn(request: ProcessSpawnRequest, options: BrokerRequestOptions = {}): Promise<ProcessHandle> {
     this.assertReady();
-    this.assertRequestSandbox(request.policy);
+    assertRequestSandbox(request.policy, this.doctorValue);
     if (options.signal?.aborted) throw cancellationError(options.signal);
     let cancelled = false;
     const onAbort = (): void => { cancelled = true; };
@@ -164,79 +225,109 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       // Receive a racing process handle first, then terminate it durably.
       let spawned: ReturnType<typeof parseSpawnedProcess>;
       try {
-        spawned = parseSpawnedProcess(await this.transport.request(
-          "process.spawn",
-          requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()),
-          { ...options, signal: undefined }
-        ));
+        spawned = await parsePostDispatchValue(
+          await this.transport.request(
+            "process.spawn",
+            requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()),
+            { ...options, signal: undefined }
+          ), parseSpawnedProcess, async () => await this.close()
+        );
       } catch (error) {
-        if (error instanceof BrokerTimeoutError) await this.close().catch(() => undefined);
+        if (error instanceof BrokerTimeoutError && !error.preDispatch) {
+          return await containPostDispatchFailure(error, async () => await this.close());
+        }
         throw error;
       }
+      // The spawn was already dispatched, so a close race must never carry
+      // the pre-dispatch retrySafe marker used by assertReady(). Once ready is
+      // confirmed, unique-id reservation and registration stay synchronous.
+      if (this.state !== "ready" || this.closeRequested) {
+        throw new BrokerConnectionError(
+          "Background process spawn completed after broker shutdown began."
+        );
+      }
+      const reuse = reserveProcessId(spawned.id, this.seenProcessIds);
+      if (reuse) return await containReusedProcessId(reuse, async () => await this.close());
       const handle = { id: spawned.id, brokerInstanceId: this.instanceId!, systemProcessId: spawned.systemProcessId };
       this.cursors.set(handle.id, { stdout: 0, stderr: 0 });
-      this.processRedaction.set(handle.id, this.createProcessRedaction(request.outputRedaction));
+      this.activeProcesses.set(handle.id, handle);
+      this.processRedaction.set(handle.id, createProcessRedaction(this.redactor, request.outputRedaction));
       if (!cancelled) return handle;
-      try { await this.terminate(handle); }
-      catch (error) {
-        await this.close();
-        throw new BrokerConnectionError("Cancelled process cleanup failed; the broker was closed.", { cause: error });
-      }
-      throw cancellationError(options.signal);
+      return await settleCancelledSpawn(
+        options.signal, async () => await this.terminate(handle), async () => await this.close()
+      );
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
     }
   }
 
   async poll(handle: ProcessHandle, options: BrokerRequestOptions = {}): Promise<ProcessPollResult> {
-    this.assertHandle(handle);
-    const cursor = this.cursors.get(handle.id)!;
-    const value = parseProcessValue(await this.transport.request("process.poll", {
-      handleId: handle.id, stdoutOffset: cursor.stdout, stderrOffset: cursor.stderr
-    }, options));
-    cursor.stdout = value.stdout.nextOffset;
-    cursor.stderr = value.stderr.nextOffset;
-    return await this.processResult(handle, value);
+    return await runPostResponseOperation(this.postResponseOperations, async () =>
+      await this.processOperations.run(handle.id, async () => {
+        this.assertHandle(handle);
+        const cursor = this.cursors.get(handle.id)!;
+        const value = await parsePostDispatchValue(
+          await this.transport.request("process.poll", {
+            handleId: handle.id, stdoutOffset: cursor.stdout, stderrOffset: cursor.stderr
+          }, options), parseProcessValue, async () => await this.closeForActiveOperation()
+        );
+        cursor.stdout = value.stdout.nextOffset;
+        cursor.stderr = value.stderr.nextOffset;
+        return await this.processResult(handle, value);
+      }), async () => await this.close());
   }
-
   async write(handle: ProcessHandle, data: string, options: BrokerRequestOptions = {}): Promise<void> {
-    this.assertHandle(handle);
-    if (typeof data !== "string" || data.includes("\0")) throw new BrokerPolicyError("Process input must be a NUL-free string.");
-    await this.transport.request("process.write", { handleId: handle.id, data }, options);
+    return await this.processOperations.run(handle.id, async () => {
+      this.assertHandle(handle);
+      if (typeof data !== "string" || data.includes("\0")) throw new BrokerPolicyError("Process input must be a NUL-free string.");
+      await this.transport.request("process.write", { handleId: handle.id, data }, options).catch(async (error: unknown) => {
+        if ((error instanceof BrokerTimeoutError || error instanceof BrokerCancelledError)
+          && !error.preDispatch) return await containPostDispatchFailure(error, async () => await this.close());
+        throw error;
+      });
+    });
   }
-
   async terminate(handle: ProcessHandle, options: BrokerRequestOptions = {}): Promise<ProcessPollResult> {
-    this.assertHandle(handle);
-    const cursor = this.cursors.get(handle.id)!;
-    const value = parseProcessValue(await this.transport.request("process.terminate", {
-      handleId: handle.id, stdoutOffset: cursor.stdout, stderrOffset: cursor.stderr
-    }, options));
-    cursor.stdout = value.stdout.nextOffset;
-    cursor.stderr = value.stderr.nextOffset;
-    return await this.processResult(handle, value);
+    return await runPostResponseOperation(this.postResponseOperations, async () =>
+      await this.processOperations.run(handle.id, async () => {
+        this.assertHandle(handle);
+        const cursor = this.cursors.get(handle.id)!;
+        const value = await parsePostDispatchValue(
+          await this.transport.request("process.terminate", {
+            handleId: handle.id, stdoutOffset: cursor.stdout, stderrOffset: cursor.stderr
+          }, options), parseProcessValue, async () => await this.closeForActiveOperation()
+        );
+        cursor.stdout = value.stdout.nextOffset;
+        cursor.stderr = value.stderr.nextOffset;
+        return await this.processResult(handle, value);
+      }), async () => await this.close());
   }
 
   async releaseOutputArtifacts(artifactIds: string[]): Promise<void> {
     this.assertReady();
-    await this.outputArtifacts.acknowledge(artifactIds);
+    await runPostResponseOperation(this.postResponseOperations, async () => {
+      await this.outputArtifacts.acknowledge(artifactIds).catch(
+        async (error: unknown) => await containPostDispatchFailure(
+          error, async () => await this.closeForActiveOperation()
+        )
+      );
+    }, async () => await this.close());
   }
 
   async close(): Promise<void> {
-    if (this.state === "closed") return;
-    try {
-      await this.transport.close();
-    } finally {
-      await this.artifactCleanup;
-      await this.outputArtifacts.cleanup();
-      this.cursors.clear();
-      this.processRedaction.clear();
-      this.state = "closed";
-    }
+    await this.lifecycle.close();
+  }
+
+  private async closeForActiveOperation(): Promise<void> {
+    await this.lifecycle.closeForActiveOperation();
   }
 
   private async processResult(handle: ProcessHandle, value: ReturnType<typeof parseProcessValue>): Promise<ProcessPollResult> {
-    await this.assertDecoded(value);
-    const streams = this.processRedaction.get(handle.id) ?? this.createProcessRedaction();
+    const decodingError = outputDecodingError(value);
+    if (decodingError) {
+      await containPostDispatchFailure(decodingError, async () => await this.closeForActiveOperation());
+    }
+    const streams = this.processRedaction.get(handle.id) ?? createProcessRedaction(this.redactor);
     this.processRedaction.set(handle.id, streams);
     const final = value.state !== "running";
     const stdout = streams.stdout.push(value.stdout.data, {
@@ -253,7 +344,11 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       stderr = `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`;
     }
     if (final) this.processRedaction.delete(handle.id);
-    const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts);
+    const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts).catch(
+      async (error: unknown) => await containPostDispatchFailure(
+        error, async () => await this.closeForActiveOperation()
+      )
+    );
     const result: ProcessPollResult = {
       handle, state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
       stdout, stderr,
@@ -263,45 +358,21 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
     };
     if (final) {
-      await this.transport.request("process.release", { handleId: handle.id }, { timeoutMs: 5_000 });
+      await this.transport.request("process.release", { handleId: handle.id }, { timeoutMs: 5_000 }).catch(
+        async (error: unknown) => await containPostDispatchFailure(
+          error, async () => await this.closeForActiveOperation()
+        )
+      );
       this.cursors.delete(handle.id);
+      this.activeProcesses.delete(handle.id);
     }
     return result;
-  }
-
-  private assertRequiredSandbox(report: BrokerDoctorReport): void {
-    if ((this.options.sandboxMode ?? "required") === "required" && (!report.sandbox.available || !report.sandbox.selfTestPassed)) {
-      throw new SandboxUnavailableError(report.sandbox.reason ?? "Required sandbox self-test failed.", report.sandbox);
-    }
-  }
-
-  private async assertDecoded(
-    value: ReturnType<typeof parseProcessValue>,
-    closeClient = true
-  ): Promise<void> {
-    const failure = (["stdout", "stderr"] as const).flatMap((stream) => {
-      const decodingError = value[stream].decodingError;
-      return decodingError ? [{ stream, ...decodingError }] : [];
-    })[0];
-    if (!failure) return;
-    // Foreground exec responses are already terminal, so an undecodable child
-    // stream can be rejected without discarding the healthy broker. Streaming
-    // processes still close the client because their unread output and process
-    // lifetime can no longer be managed safely.
-    if (closeClient) await this.close().catch(() => undefined);
-    throw new BrokerOutputDecodingError(failure.stream, failure.code, failure.message);
   }
 
   private verifiedShellExecutables(): string[] {
     return this.doctorValue?.capabilities.shells
       ?.filter((shell) => shell.verified)
       .map((shell) => shell.executable) ?? [];
-  }
-
-  private assertRequestSandbox(policy: ExecutionPolicy): void {
-    if (policy.sandbox === "required" && (!this.doctorValue?.sandbox.available || !this.doctorValue.sandbox.selfTestPassed)) {
-      throw new SandboxUnavailableError(this.doctorValue?.sandbox.reason ?? "Required sandbox is unavailable.");
-    }
   }
 
   private assertHandle(handle: ProcessHandle): void {
@@ -311,25 +382,17 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   }
 
   private assertReady(): void {
-    if (this.state !== "ready") throw new BrokerConnectionError(`Broker client is not ready (state: ${this.state}).`);
+    if (this.state !== "ready") {
+      throw new BrokerConnectionError(`Broker client is not ready (state: ${this.state}).`, { retrySafe: true });
+    }
   }
 
   private markProcessesLost(): void {
     if (this.state === "closed") return;
-    for (const id of this.cursors.keys()) this.lost.set(id, { id, brokerInstanceId: this.instanceId ?? "lost" });
+    for (const [id, handle] of this.activeProcesses) this.lost.set(id, handle);
     this.cursors.clear();
+    this.activeProcesses.clear();
     this.processRedaction.clear();
-    this.artifactCleanup = this.outputArtifacts.cleanup();
-    void this.artifactCleanup;
     this.state = "failed";
-  }
-
-  private createProcessRedaction(mode: ProcessSpawnRequest["outputRedaction"] = "default"): ProcessRedaction {
-    return {
-      stdout: mode === "framed_jsonrpc"
-        ? this.redactor.createFramedJsonRpcStream()
-        : this.redactor.createStream(mode),
-      stderr: this.redactor.createStream()
-    };
   }
 }

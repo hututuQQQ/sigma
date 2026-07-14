@@ -200,6 +200,87 @@ describe("execution output artifact receipts", () => {
     expect(released).toEqual([]);
   });
 
+  it("never marks a timed-out zero-exit validation as passed evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-timeout-evidence-"));
+    const execution: ExecutionResult = {
+      state: "terminated", exitCode: 0, signal: null, durationMs: 100,
+      timedOut: true, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      state: "terminated",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "validate")!.execute(
+      request("timed-out-validation", "validate", { executable: process.execPath }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("process_timed_out");
+    expect(receipt.evidence).toEqual([expect.objectContaining({
+      kind: "validation",
+      status: "failed",
+      data: expect.objectContaining({
+        exitCode: 0,
+        termination: expect.objectContaining({
+          processStarted: true,
+          state: "terminated",
+          timedOut: true
+        })
+      })
+    })]);
+  });
+
+  it("records a completed non-zero validation with exact failed termination evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-validation-evidence-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 12,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "test failed", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "validate")!.execute(
+      request("failed-validation", "validate", { executable: process.execPath }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.evidence).toEqual([expect.objectContaining({
+      kind: "validation",
+      status: "failed",
+      data: expect.objectContaining({
+        command: expect.any(String),
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        workspaceDeltaEvidenceIds: []
+      })
+    })]);
+  });
+
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-launch-failure-receipt-"));
     const failure = {
@@ -228,6 +309,21 @@ describe("execution output artifact receipts", () => {
     );
     expect(foreground).toMatchObject({ ok: false });
     expect(foreground.diagnostics).toContain(failure.code);
+
+    const validation = await tools.find((tool) => tool.descriptor.name === "validate")!.execute(
+      request("failed-validation-launch", "validate", { executable: process.execPath }),
+      context
+    );
+    expect(validation.evidence).toEqual([expect.objectContaining({
+      kind: "validation",
+      status: "failed",
+      data: expect.objectContaining({
+        termination: expect.objectContaining({
+          processStarted: false,
+          failureCode: failure.code
+        })
+      })
+    })]);
 
     const background = await tools.find((tool) => tool.descriptor.name === "process_poll")!.execute(
       request("failed-poll", "process_poll", { handleId: "process", brokerInstanceId: "broker" }),

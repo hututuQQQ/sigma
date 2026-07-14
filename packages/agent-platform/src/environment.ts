@@ -5,6 +5,8 @@ export interface RuntimeEnvironment {
   arch: string;
   defaultShell: ShellKind | "none";
   availableShells: ShellKind[];
+  availableRuntimeCommands: string[];
+  executionCapabilitiesVerified: boolean;
   pathSeparator: string;
 }
 
@@ -18,10 +20,28 @@ export function runtimeEnvironment(platform: NodeJS.Platform = process.platform)
     // vary by host and are not currently part of the verified broker contract.
     defaultShell,
     availableShells: [defaultShell],
+    availableRuntimeCommands: [],
+    executionCapabilitiesVerified: false,
     pathSeparator: platform === "win32" ? "\\" : "/"
   };
 }
 
 export function runtimePrompt(environment = runtimeEnvironment()): string {
-  return `Runtime environment: platform=${environment.platform}; arch=${environment.arch}; defaultShell=${environment.defaultShell}; verifiedShells=${environment.availableShells.join(",") || "none"}; pathSeparator=${environment.pathSeparator}`;
+  const verifiedShells = environment.executionCapabilitiesVerified
+    ? environment.availableShells : [];
+  const verifiedRuntimeCommands = environment.executionCapabilitiesVerified
+    ? environment.availableRuntimeCommands : [];
+  const defaultShell = environment.executionCapabilitiesVerified
+    ? environment.defaultShell : "none";
+  return [
+    `Runtime environment: platform=${environment.platform}`,
+    `arch=${environment.arch}`,
+    `executionCapabilities=${environment.executionCapabilitiesVerified ? "broker-verified" : "unverified"}`,
+    `defaultShell=${defaultShell}`,
+    `verifiedShells=${verifiedShells.join(",") || "none"}`,
+    `verifiedRuntimeCommands=${verifiedRuntimeCommands.join(",") || "none"}`,
+    `pathSeparator=${environment.pathSeparator}.`,
+    "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands.",
+    "Do not probe or retry unlisted host commands."
+  ].join("; ");
 }

@@ -122,6 +122,9 @@ importers:
       agent-protocol:
         specifier: workspace:*
         version: link:../agent-protocol
+      ignore:
+        specifier: 7.0.5
+        version: 7.0.5
 
   packages/agent-execution: {}
 
@@ -250,6 +253,9 @@ importers:
       agent-protocol:
         specifier: workspace:*
         version: link:../agent-protocol
+      ajv:
+        specifier: 8.18.0
+        version: 8.18.0
 
   packages/agent-tui:
     dependencies:

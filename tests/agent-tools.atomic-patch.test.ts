@@ -67,6 +67,7 @@ describe("applyUnifiedPatch", () => {
       "-beta",
       "+gamma"
     ].join("\n"), { preimageHashes: { "one.txt": before } });
+    expect(result.changed).toBe(true);
     expect(result.delta).toEqual({ added: [], modified: ["one.txt"], deleted: [] });
     expect(result.preimageHashes["one.txt"]).toBe(before);
     expect(result.postimageHashes["one.txt"]).toBe(

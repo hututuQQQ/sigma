@@ -61,6 +61,9 @@ async function emitResolvedProfile(
 ): Promise<void> {
   if (!options.profile) return;
   const artifactId = await options.putArtifact(session.identity.sessionId, options.profile.canonicalJson);
+  if (artifactId !== options.profile.digest) {
+    throw new Error("Agent Profile artifact store returned a non-content-addressed identifier.");
+  }
   await options.emit(session, "profile.resolved", "runtime", {
     profileId: options.profile.profile.id,
     digest: options.profile.digest,

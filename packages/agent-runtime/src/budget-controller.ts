@@ -151,11 +151,17 @@ export class BudgetController {
     return await this.serial(session.identity.sessionId, async () => {
       const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
-      if (!reservation || reservation.status !== "reserved") {
-        throw new Error(`Unknown active budget reservation '${reservationId}'.`);
+      if (!reservation || reservation.status === "released") {
+        throw new Error(`Unknown unsettled budget reservation '${reservationId}'.`);
       }
       const actual = amounts(actualInput);
-      const next = settle(ledger, reservation, "committed", actual);
+      if (reservation.status === "committed" && DIMENSIONS.some((dimension) =>
+        reservation.consumed[dimension] !== actual[dimension])) {
+        throw new Error(`Committed budget reservation '${reservationId}' does not match the measured usage.`);
+      }
+      const next = reservation.status === "reserved"
+        ? settle(ledger, reservation, "committed", actual)
+        : ledger;
       const overruns = DIMENSIONS.flatMap((dimension): MeasuredBudgetOverrun[] => {
         const overReservation = Math.max(0, actual[dimension] - reservation.requested[dimension]);
         const overLimit = Math.max(0, next.consumed[dimension] + next.reserved[dimension] - next.limits[dimension]);
@@ -169,13 +175,15 @@ export class BudgetController {
           overLimit
         }];
       });
-      await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
       const overLimitDimensions = overruns.filter((item) => item.overLimit > 0);
-      if (overLimitDimensions.length > 0) {
-        await this.emit(session, "budget.overrun", "runtime", {
-          reservationId,
-          dimensions: overLimitDimensions
-        });
+      if (reservation.status === "reserved") {
+        await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+        if (overLimitDimensions.length > 0) {
+          await this.emit(session, "budget.overrun", "runtime", {
+            reservationId,
+            dimensions: overLimitDimensions
+          });
+        }
       }
       return {
         overReservation: Object.fromEntries(overruns

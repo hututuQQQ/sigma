@@ -1,9 +1,14 @@
 #!/usr/bin/env node
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  access, lstat, mkdir, readFile, realpath, rename, unlink, writeFile
+} from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const EVAL_REPORT_SCHEMA_VERSION = 2;
+const HUMAN_AUDIT_AUDIENCE = "human_only";
+const HUMAN_AUDIT_FEEDBACK_POLICY = "never_supply_to_solving_or_optimization_agents";
 export const EVAL_DIMENSIONS = Object.freeze([
   "correctness",
   "delivery",
@@ -173,6 +178,12 @@ export function summarizeEvalMetrics(attempts) {
 
 function sanitizeString(value) {
   return value.replace(SECRET_VALUE, "[REDACTED]");
+}
+
+function compareText(left, right) {
+  const leftText = String(left ?? "");
+  const rightText = String(right ?? "");
+  return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
 }
 
 export function sanitizeEvalReportValue(value, seen = new WeakSet()) {
@@ -515,10 +526,17 @@ export function buildEvalRunReport(input) {
   if (!isRecord(input) || ![1, 2].includes(input.schemaVersion) || input.kind !== "eval_run") {
     throw new Error("input must be a versioned EvalRunReportV1/V2 or EvalAttemptReportV1/V2.");
   }
-  const sourceVersion = input.sourceSchemaVersion === 1 ? 1 : input.schemaVersion;
-  const { attempts, expected } = validateRunAttempts(input, sourceVersion);
+  const sanitizedInput = sanitizeEvalReportValue(input);
+  const sourceVersion = sanitizedInput.sourceSchemaVersion === 1
+    ? 1 : sanitizedInput.schemaVersion;
+  const validated = validateRunAttempts(sanitizedInput, sourceVersion);
+  const expected = validated.expected;
+  const attempts = [...validated.attempts].sort((left, right) =>
+    compareText(left.scenarioId, right.scenarioId)
+      || left.repetition - right.repetition
+      || compareText(left.attemptId, right.attemptId));
   const grouped = Map.groupBy(attempts, (attempt) => attempt.scenarioId);
-  const declared = declaredScenarios(input.scenarios);
+  const declared = declaredScenarios(sanitizedInput.scenarios);
   const scenarioIds = [...new Set([...grouped.keys(), ...declared.keys()])].sort();
   const scenarios = scenarioIds.map((scenarioId) => aggregateScenario(
     scenarioId,
@@ -527,15 +545,15 @@ export function buildEvalRunReport(input) {
     declared.get(scenarioId),
     sourceVersion
   ));
-  const infrastructureErrors = Array.isArray(input.infrastructureErrors) ? input.infrastructureErrors : [];
+  const infrastructureErrors = Array.isArray(sanitizedInput.infrastructureErrors)
+    ? sanitizedInput.infrastructureErrors : [];
   const infrastructureSafetyFailure = infrastructureErrors.some((error) =>
     String(error?.code ?? "").includes("secret") || String(error?.code ?? "").includes("safety"));
-  const sanitized = sanitizeEvalReportValue(input);
   const validAttempts = sourceVersion === 1 ? attempts : attempts.filter((attempt) => attempt.validity === "valid");
   const passed = validAttempts.filter(evalAttemptPassed).length;
   const missing = scenarios.reduce((total, scenario) => total + scenario.missingAttempts, 0);
   return {
-    ...sanitized,
+    ...sanitizedInput,
     schemaVersion: EVAL_REPORT_SCHEMA_VERSION,
     sourceSchemaVersion: sourceVersion,
     kind: "eval_run",
@@ -682,8 +700,7 @@ function reportEvidence(run) {
   ]);
 }
 
-export function renderEvalReportMarkdown(input) {
-  const run = buildEvalRunReport(input);
+function renderEvalReportMarkdownFromReport(run) {
   const dimensionRows = EVAL_DIMENSIONS.map((dimension) => `| ${dimension} | ${run.dimensions[dimension]} |`);
   return [
     `# Sigma Agent Experience Evaluation: ${run.runId}`,
@@ -727,6 +744,10 @@ export function renderEvalReportMarkdown(input) {
     "",
     ...reportEvidence(run)
   ].join("\n");
+}
+
+export function renderEvalReportMarkdown(input) {
+  return renderEvalReportMarkdownFromReport(buildEvalRunReport(input));
 }
 
 function itemText(item) {
@@ -821,11 +842,34 @@ function attemptSignals(attempt) {
 }
 
 function signalKey(signal) {
-  return `${signal.severity}|${signal.code}|${signal.scenarioId}|${signal.detail}`;
+  return JSON.stringify([signal.severity, signal.code, signal.scenarioId, signal.detail]);
 }
 
-export function buildHumanAuditPack(input) {
-  const run = buildEvalRunReport(input);
+function mergeAuditSignal(existing, signal) {
+  const attemptIds = [existing.attemptId, signal.attemptId]
+    .filter((value) => typeof value === "string" && value.length > 0)
+    .sort(compareText);
+  return {
+    ...existing,
+    attemptId: attemptIds[0] ?? null,
+    evidence: [...new Set([
+      ...(Array.isArray(existing.evidence) ? existing.evidence : []),
+      ...(Array.isArray(signal.evidence) ? signal.evidence : [])
+    ])].sort(compareText)
+  };
+}
+
+function compareAuditSignals(left, right) {
+  const weight = { blocker: 0, warning: 1 };
+  return (weight[left.severity] ?? 2) - (weight[right.severity] ?? 2)
+    || compareText(left.scenarioId, right.scenarioId)
+    || compareText(left.code, right.code)
+    || compareText(left.detail, right.detail)
+    || compareText(left.attemptId, right.attemptId)
+    || compareText((left.evidence ?? []).join("\n"), (right.evidence ?? []).join("\n"));
+}
+
+function humanAuditPackFromReport(run) {
   const unique = new Map();
   const scenarioSignals = run.scenarios.flatMap((scenario) => {
     if (scenario.status === "stable") return [];
@@ -850,17 +894,18 @@ export function buildHumanAuditPack(input) {
   }));
   for (const signal of [...run.attempts.flatMap(attemptSignals), ...scenarioSignals, ...infrastructureSignals]) {
     const key = signalKey(signal);
-    if (!unique.has(key)) unique.set(key, signal);
+    const normalized = {
+      ...signal,
+      evidence: [...new Set(Array.isArray(signal.evidence) ? signal.evidence : [])].sort(compareText)
+    };
+    unique.set(key, unique.has(key) ? mergeAuditSignal(unique.get(key), normalized) : normalized);
   }
-  const topSignals = [...unique.values()].sort((left, right) => {
-    const weight = { blocker: 0, warning: 1 };
-    return (weight[left.severity] ?? 2) - (weight[right.severity] ?? 2)
-      || left.scenarioId.localeCompare(right.scenarioId)
-      || left.code.localeCompare(right.code);
-  }).slice(0, 15);
+  const topSignals = [...unique.values()].sort(compareAuditSignals).slice(0, 15);
   return {
     schemaVersion: EVAL_REPORT_SCHEMA_VERSION,
     kind: "human_audit_pack",
+    audience: HUMAN_AUDIT_AUDIENCE,
+    feedbackPolicy: HUMAN_AUDIT_FEEDBACK_POLICY,
     runId: run.runId,
     runStatus: run.status,
     dimensions: run.dimensions,
@@ -882,6 +927,10 @@ export function buildHumanAuditPack(input) {
   };
 }
 
+export function buildHumanAuditPack(input) {
+  return humanAuditPackFromReport(buildEvalRunReport(input));
+}
+
 export function renderHumanAuditMarkdown(input) {
   const pack = input?.kind === "human_audit_pack" ? input : buildHumanAuditPack(input);
   const signalLine = (signal) => {
@@ -893,7 +942,7 @@ export function renderHumanAuditMarkdown(input) {
   return [
     `# Human Evaluation Audit: ${pack.runId}`,
     "",
-    "This is a deterministic human-audit view. It is never an optimizer input and is not written by the V2 report writer.",
+    "This deterministic audit is human-only. The report writer emits it as a terminal review artifact, never as an agent input.",
     "",
     "## Dimension Status",
     "",
@@ -924,13 +973,36 @@ export function renderHumanAuditMarkdown(input) {
 
 const pendingAtomicWrites = new Map();
 
+function pathIdentity(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function assertOrdinaryDirectory(directory) {
+  const [state, canonical] = await Promise.all([lstat(directory), realpath(directory)]);
+  if (!state.isDirectory() || state.isSymbolicLink()
+    || pathIdentity(canonical) !== pathIdentity(directory)) {
+    throw new Error(`Evaluation report directory must not be a symbolic link or reparse point: ${directory}`);
+  }
+  return canonical;
+}
+
 async function atomicWrite(filePath, content) {
   const previous = pendingAtomicWrites.get(filePath) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(async () => {
-    await mkdir(path.dirname(filePath), { recursive: true });
+    const parent = path.dirname(filePath);
+    await assertOrdinaryDirectory(parent);
     const temporary = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    await writeFile(temporary, content, "utf8");
-    await rename(temporary, filePath);
+    let renamed = false;
+    try {
+      await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+      await assertOrdinaryDirectory(parent);
+      await rename(temporary, filePath);
+      renamed = true;
+      await assertOrdinaryDirectory(parent);
+    } finally {
+      if (!renamed) await unlink(temporary).catch(() => undefined);
+    }
   });
   pendingAtomicWrites.set(filePath, current);
   try {
@@ -944,40 +1016,155 @@ async function writeJson(filePath, value) {
   await atomicWrite(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function jsonContent(value) {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function reportBundleDigest(contents) {
+  return createHash("sha256").update(JSON.stringify(contents)).digest("hex");
+}
+
 function portableRelative(from, to) {
   const relative = path.relative(from, to).replaceAll("\\", "/");
   return relative || ".";
 }
 
-export async function writeEvalReport({ run, runDir, outputDir, evalRootDir }) {
-  const report = buildEvalRunReport(run);
-  const destination = path.resolve(runDir ?? outputDir ?? path.join(".artifacts", "eval", String(report.runId)));
-  const root = path.resolve(evalRootDir ?? path.dirname(destination));
-  const relativeDestination = path.relative(root, destination);
-  if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination)) {
-    throw new Error("Evaluation report destination must be inside its results root.");
+function safeDefaultReportRunId(runId) {
+  const value = String(runId);
+  if (!/^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/iu.test(value)) {
+    throw new Error(
+      "Evaluation report runId must be a safe single path segment inside its results root."
+    );
   }
-  const runPath = path.join(destination, "run.json");
-  const reportPath = path.join(destination, "report.md");
-  const latestPath = path.join(root, "latest.json");
-  await mkdir(destination, { recursive: true });
-  await writeJson(runPath, report);
-  await atomicWrite(reportPath, `${renderEvalReportMarkdown(report).trimEnd()}\n`);
-  await Promise.all([access(runPath), access(reportPath)]);
-  await writeJson(latestPath, {
+  return value;
+}
+
+async function createOrdinaryDirectory(directory) {
+  try {
+    await mkdir(directory);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  return await assertOrdinaryDirectory(directory);
+}
+
+async function prepareReportDirectories(root, destination) {
+  await mkdir(root, { recursive: true });
+  const canonicalRoot = await realpath(root);
+  const rootState = await lstat(canonicalRoot);
+  if (!rootState.isDirectory()) throw new Error("Evaluation results root must be a directory.");
+  const relative = path.relative(path.resolve(root), path.resolve(destination));
+  let current = canonicalRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    await assertOrdinaryDirectory(current);
+    current = await createOrdinaryDirectory(path.join(current, segment));
+  }
+  await assertOrdinaryDirectory(current);
+  return { root: canonicalRoot, destination: current };
+}
+
+function evalReportPaths(destination, bundleDigest) {
+  return {
+    runPath: path.join(destination, "run.json"),
+    reportPath: path.join(destination, "report.md"),
+    humanAuditJsonPath: path.join(destination, "human-audit.json"),
+    humanAuditMarkdownPath: path.join(destination, "human-audit.md"),
+    publishedRunPath: path.join(destination, `run.${bundleDigest}.json`),
+    publishedReportPath: path.join(destination, `report.${bundleDigest}.md`),
+    publishedHumanAuditJsonPath: path.join(destination, `human-audit.${bundleDigest}.json`),
+    publishedHumanAuditMarkdownPath: path.join(destination, `human-audit.${bundleDigest}.md`)
+  };
+}
+
+async function writeAndVerifyReportFiles(files) {
+  await Promise.all(files.map(([filePath, content]) => atomicWrite(filePath, content)));
+  await Promise.all(files.map(async ([filePath]) => {
+    await access(filePath);
+    const state = await lstat(filePath);
+    if (!state.isFile() || state.isSymbolicLink()) {
+      throw new Error(`Evaluation report publication is not a regular file: ${filePath}`);
+    }
+  }));
+}
+
+async function publishEvalReportFiles(destination, paths, contents) {
+  await assertOrdinaryDirectory(destination);
+  await writeAndVerifyReportFiles([
+    [paths.publishedRunPath, contents.run],
+    [paths.publishedReportPath, contents.report],
+    [paths.publishedHumanAuditJsonPath, contents.humanAudit],
+    [paths.publishedHumanAuditMarkdownPath, contents.humanAuditReport]
+  ]);
+  await writeAndVerifyReportFiles([
+    [paths.runPath, contents.run],
+    [paths.reportPath, contents.report],
+    [paths.humanAuditJsonPath, contents.humanAudit],
+    [paths.humanAuditMarkdownPath, contents.humanAuditReport]
+  ]);
+}
+
+function latestEvalReportRecord({ report, humanAudit, root, destination, paths, bundleDigest }) {
+  return {
     schemaVersion: EVAL_REPORT_SCHEMA_VERSION,
     kind: "eval_latest",
     runId: report.runId,
     suite: report.suite ?? null,
     status: report.status,
+    bundleDigest,
     updatedAt: report.finishedAt ?? report.startedAt ?? null,
     runDir: portableRelative(root, destination),
     files: {
-      run: portableRelative(root, runPath),
-      report: portableRelative(root, reportPath)
+      run: portableRelative(root, paths.publishedRunPath),
+      report: portableRelative(root, paths.publishedReportPath)
+    },
+    humanReview: {
+      schemaVersion: humanAudit.schemaVersion,
+      kind: humanAudit.kind,
+      audience: HUMAN_AUDIT_AUDIENCE,
+      feedbackPolicy: HUMAN_AUDIT_FEEDBACK_POLICY,
+      files: {
+        audit: portableRelative(root, paths.publishedHumanAuditJsonPath),
+        report: portableRelative(root, paths.publishedHumanAuditMarkdownPath)
+      }
     }
-  });
-  return { report, runPath, reportPath, latestPath };
+  };
+}
+
+export async function writeEvalReport({ run, runDir, outputDir, evalRootDir }) {
+  const report = buildEvalRunReport(run);
+  const humanAudit = humanAuditPackFromReport(report);
+  const explicitDestination = runDir ?? outputDir;
+  const requestedRoot = path.resolve(evalRootDir
+    ?? (explicitDestination ? path.dirname(path.resolve(explicitDestination)) : path.join(".artifacts", "eval")));
+  const requestedDestination = path.resolve(explicitDestination ?? path.join(
+    requestedRoot, safeDefaultReportRunId(report.runId)
+  ));
+  const relativeDestination = path.relative(requestedRoot, requestedDestination);
+  if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination)) {
+    throw new Error("Evaluation report destination must be inside its results root.");
+  }
+  const prepared = await prepareReportDirectories(requestedRoot, requestedDestination);
+  const root = prepared.root;
+  const destination = prepared.destination;
+  const latestPath = path.join(root, "latest.json");
+  const contents = {
+    run: jsonContent(report),
+    report: `${renderEvalReportMarkdownFromReport(report).trimEnd()}\n`,
+    humanAudit: jsonContent(humanAudit),
+    humanAuditReport: `${renderHumanAuditMarkdown(humanAudit).trimEnd()}\n`
+  };
+  const bundleDigest = reportBundleDigest(contents);
+  const paths = evalReportPaths(destination, bundleDigest);
+  await publishEvalReportFiles(destination, paths, contents);
+  await writeJson(latestPath, latestEvalReportRecord({
+    report, humanAudit, root, destination, paths, bundleDigest
+  }));
+  return {
+    report,
+    ...paths,
+    bundleDigest,
+    latestPath
+  };
 }
 
 export const writeEvalRunReport = writeEvalReport;
@@ -1000,13 +1187,16 @@ export async function runReportCli(argv = process.argv.slice(2)) {
     throw new Error("Usage: node scripts/eval/report.mjs --input <attempt-or-run.json> [--output-dir <run-dir>] [--eval-root <dir>]");
   }
   const input = JSON.parse(await readFile(path.resolve(flags.input), "utf8"));
-  const run = buildEvalRunReport(input);
   const result = await writeEvalReport({
-    run,
+    run: input,
     outputDir: typeof flags["output-dir"] === "string" ? flags["output-dir"] : undefined,
     evalRootDir: typeof flags["eval-root"] === "string" ? flags["eval-root"] : undefined
   });
-  process.stdout.write(`Evaluation report: ${result.reportPath}\n`);
+  process.stdout.write([
+    `Evaluation report: ${result.publishedReportPath}`,
+    `Human review bundle: ${result.publishedHumanAuditJsonPath}, ${result.publishedHumanAuditMarkdownPath}`,
+    ""
+  ].join("\n"));
   return result;
 }
 

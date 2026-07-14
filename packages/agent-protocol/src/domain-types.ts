@@ -12,6 +12,7 @@ import type {
   commandEvidenceSchema,
   diagnosticEvidenceSchema,
   evidenceAuthoritySchema,
+  evidenceClaimSchema,
   evidenceKindSchema,
   evidenceProducerSchema,
   evidenceRecordSchema,
@@ -31,6 +32,7 @@ export type JsonObject = { [key: string]: JsonValue };
 export type EvidenceKind = z.infer<typeof evidenceKindSchema>;
 export type EvidenceStatus = z.infer<typeof evidenceStatusSchema>;
 export type EvidenceAuthority = z.infer<typeof evidenceAuthoritySchema>;
+export type EvidenceClaim = z.infer<typeof evidenceClaimSchema>;
 export type EvidenceProducer = z.infer<typeof evidenceProducerSchema>;
 
 export interface EvidenceBase<TKind extends EvidenceKind, TData> {

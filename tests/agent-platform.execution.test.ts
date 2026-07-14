@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,7 @@ import {
 import {
   ProcessExecutionUnavailableError,
   lockWindowsDirectories,
+  lockWindowsPaths,
   normalizeWindowsShellInvocation,
   runProcess,
   shellInvocation,
@@ -114,6 +115,25 @@ describe("agent-platform execution boundary", () => {
     });
   });
 
+  it("preserves authenticated sandbox launch failures", async () => {
+    const failure = {
+      phase: "sandbox_launch" as const,
+      code: "sandbox_acl_plan_limit",
+      message: "sandbox ACL plan exceeds durable recovery limits"
+    };
+    const execution: ProcessExecutionPort = {
+      execute: async () => executionResult({ exitCode: null, failure })
+    };
+    await expect(runProcess({
+      execution,
+      executable: "tool",
+      args: [],
+      cwd: process.cwd(),
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })).resolves.toMatchObject({ exitCode: null, failure });
+  });
+
   it.skipIf(process.platform !== "win32")(
     "holds Windows directories without delete sharing until the lock is released",
     async () => {
@@ -124,6 +144,29 @@ describe("agent-platform execution boundary", () => {
       const lock = await lockWindowsDirectories([held]);
       try {
         await expect(rename(held, moved)).rejects.toMatchObject({
+          code: expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
+        });
+      } finally {
+        await lock.close();
+      }
+      await expect(rename(held, moved)).resolves.toBeUndefined();
+      await rm(root, { recursive: true, force: true });
+    }
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "pins Windows files against replacement and writes until release",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "sigma-windows-file-lock-"));
+      const held = path.join(root, "script.js");
+      const moved = path.join(root, "moved.js");
+      await writeFile(held, "console.log('trusted');\n");
+      const lock = await lockWindowsPaths([{ path: held, kind: "file" }]);
+      try {
+        await expect(rename(held, moved)).rejects.toMatchObject({
+          code: expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
+        });
+        await expect(writeFile(held, "console.log('replaced');\n")).rejects.toMatchObject({
           code: expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
         });
       } finally {

@@ -4,6 +4,7 @@ import type {
   AgentEventEnvelope,
   EvidenceRecord,
   JsonValue,
+  ModelToolCall,
   ReviewEvidence,
   ToolCallPlan,
   ToolDescriptor,
@@ -13,8 +14,10 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
+import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
+import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
-import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
+import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
 import { unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -50,6 +53,31 @@ function validation(id: string, deltaIds: string[], runId = "run"): ValidationEv
     producer: { authority: "tool", id: "validate-call" },
     summary: "tests passed",
     data: { validator: "command", command: "pnpm test", exitCode: 0, artifactIds: [], workspaceDeltaEvidenceIds: deltaIds }
+  };
+}
+
+function failedValidation(id: string, deltaIds: string[], runId = "run"): ValidationEvidence {
+  return {
+    ...validation(id, deltaIds, runId),
+    status: "failed",
+    summary: "tests exited 1",
+    data: {
+      validator: "command",
+      command: "pnpm test",
+      exitCode: 1,
+      termination: {
+        processStarted: true,
+        state: "exited",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false
+      },
+      artifactIds: [],
+      workspaceDeltaEvidenceIds: deltaIds,
+      checkpointIds: deltaIds.map((deltaId) => `checkpoint-${deltaId}`)
+    }
   };
 }
 
@@ -169,6 +197,13 @@ function completionDiagnostic(evidence: EvidenceRecord[]): string | undefined {
   return completionFailure(session(evidence), completionCall, completionDescriptor, now)?.diagnostics[0];
 }
 
+function completionReceipt(
+  evidence: EvidenceRecord[],
+  call: ModelToolCall = completionCall
+): ToolReceipt | null {
+  return completionFailure(session(evidence), call, completionDescriptor, now);
+}
+
 describe("run-scoped completion evidence", () => {
   it("requires exact validation and review links for every current-run delta", () => {
     expect(completionDiagnostic([])).toBeUndefined();
@@ -186,6 +221,162 @@ describe("run-scoped completion evidence", () => {
     expect(completionDiagnostic([
       first, second, validation("all", ["delta-1", "delta-2"]), review("all-review", ["delta-1", "delta-2"])
     ])).toBeUndefined();
+  });
+
+  it("lets failed validation prove execution and honest reporting, but never validation success", () => {
+    const failed = failedValidation("failed-validation", []);
+    const call = (claim: "validation_executed" | "validation_passed" | "acceptance_met"): ModelToolCall => ({
+      id: `complete-${claim}`,
+      name: "complete_task",
+      arguments: {
+        summary: "reported",
+        criteria: [{
+          criterion: "Validation was executed and reported honestly.",
+          status: "met",
+          claim,
+          evidence: [{ evidenceId: failed.evidenceId, kind: "validation", claim }]
+        }]
+      }
+    });
+    expect(completionReceipt([failed], call("validation_executed"))).toBeNull();
+    expect(completionReceipt([failed], call("validation_passed"))).toMatchObject({
+      ok: false,
+      diagnostics: ["invalid_completion_evidence"],
+      result: {
+        status: "rejected",
+        code: "invalid_completion_evidence",
+        availableEvidence: expect.arrayContaining([expect.objectContaining({
+          evidenceId: failed.evidenceId,
+          status: "failed",
+          claims: ["validation_executed"]
+        })])
+      }
+    });
+    expect(completionReceipt([failed], call("acceptance_met"))?.diagnostics)
+      .toEqual(["invalid_completion_evidence"]);
+  });
+
+  it("does not let a failed validation discharge a delta's passed-validation obligation", () => {
+    const changed = delta("delta");
+    const failed = failedValidation("failed-validation", [changed.evidenceId]);
+    expect(completionReceipt([changed, failed])).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_evidence_required"],
+      result: {
+        status: "rejected",
+        code: "validation_evidence_required",
+        missing: [{
+          requirement: "validation_passed",
+          workspaceDeltaEvidenceId: changed.evidenceId,
+          checkpointId: changed.data.checkpointId,
+          expectedEvidence: {
+            kind: "validation",
+            status: "passed",
+            claim: "validation_passed"
+          }
+        }],
+        nextActions: [{
+          tool: "validate",
+          arguments: { workspaceDeltaEvidenceIds: [changed.evidenceId] }
+        }]
+      }
+    });
+  });
+
+  it("returns a structured, ID-free internal review repair path", async () => {
+    const changed = delta("delta");
+    const checked = validation("validation", [changed.evidenceId]);
+    const active = session([changed, checked]);
+    expect(reviewReadiness(active)).toMatchObject({
+      pending: [{ evidenceId: changed.evidenceId }],
+      eligible: [{ evidenceId: changed.evidenceId }],
+      relevantValidations: [{ evidenceId: checked.evidenceId }]
+    });
+    const control = new RuntimeControlService({} as RuntimeControlServiceOptions).forSession(active);
+    expect(await control.requestReview()).toEqual({
+      status: "review_requested",
+      workspaceDeltaEvidenceIds: [changed.evidenceId],
+      validationEvidenceIds: [checked.evidenceId],
+      missingValidationWorkspaceDeltaEvidenceIds: []
+    });
+    expect(completionReceipt([changed, checked])).toMatchObject({
+      ok: false,
+      diagnostics: ["review_evidence_required"],
+      result: {
+        status: "rejected",
+        code: "review_evidence_required",
+        missing: [{
+          requirement: "review_approved",
+          workspaceDeltaEvidenceId: changed.evidenceId,
+          expectedEvidence: {
+            kind: "review",
+            status: "passed",
+            verdict: "approved",
+            claim: "acceptance_met"
+          }
+        }],
+        nextActions: [{
+          tool: "request_review",
+          arguments: {},
+          citeOnSuccess: {
+            source: "next_current_run_evidence_ledger",
+            kind: "review",
+            status: "passed",
+            verdict: "approved",
+            claim: "acceptance_met",
+            workspaceDeltaEvidenceIds: [changed.evidenceId]
+          }
+        }]
+      }
+    });
+  });
+
+  it("does not treat a non-approved review verdict as completed review", async () => {
+    const changed = delta("delta");
+    const checked = validation("validation", [changed.evidenceId]);
+    const inconsistent = {
+      ...failedReview("not-approved", [changed.evidenceId], "run", [checked.evidenceId]),
+      status: "passed" as const
+    };
+    const readiness = reviewReadiness(session([changed, checked, inconsistent]));
+
+    expect(readiness.pending.map((item) => item.evidenceId)).toEqual([changed.evidenceId]);
+    expect(readiness.eligible.map((item) => item.evidenceId)).toEqual([changed.evidenceId]);
+    expect(completionDiagnostic([changed, checked, inconsistent])).toBe("review_evidence_required");
+  });
+
+  it("surfaces review findings instead of pretending an identical review can be replayed", async () => {
+    const changed = delta("delta");
+    const checked = validation("validation", [changed.evidenceId]);
+    const rejected = failedReview("review-failed", [changed.evidenceId], "run", [checked.evidenceId]);
+    const active = session([changed, checked, rejected]);
+    expect(reviewReadiness(active).blockedReview?.evidenceId)
+      .toBe(rejected.evidenceId);
+    const control = new RuntimeControlService({} as RuntimeControlServiceOptions).forSession(active);
+    expect(await control.requestReview()).toMatchObject({
+      status: "changes_required",
+      reviewEvidenceId: rejected.evidenceId,
+      findings: ["fix it"]
+    });
+    expect(completionReceipt([changed, checked, rejected])).toMatchObject({
+      ok: false,
+      diagnostics: ["review_evidence_required"],
+      result: {
+        missing: [{
+          latestReview: {
+            evidenceId: rejected.evidenceId,
+            status: "failed",
+            verdict: "changes_requested",
+            findings: ["fix it"]
+          }
+        }],
+        nextActions: [
+          { action: "address_review_findings", reviewEvidenceId: rejected.evidenceId, findings: ["fix it"] },
+          { tool: "validate" },
+          { tool: "request_review" }
+        ]
+      }
+    });
   });
 
   it("accepts one current-run waiver but never an older-run waiver", () => {
@@ -352,6 +543,81 @@ describe("run-scoped completion evidence", () => {
       data: { workspaceDeltaEvidenceIds: ["delta"] }
     });
     expect(completed.evidenceId).not.toBe("forged-review");
+  });
+
+  it("retries a reviewer infrastructure failure only through an explicit review request", async () => {
+    const changed = delta("delta");
+    const checked = validation("validation", [changed.evidenceId]);
+    const active = session([changed, checked]);
+    let calls = 0;
+    let seq = 1;
+    const coordinator = new ReviewCoordinator({
+      reviewerId: "transient-reviewer",
+      review: async (input) => {
+        calls += 1;
+        if (calls === 1) throw new Error("temporary reviewer outage");
+        return review(
+          "approved-after-retry",
+          input.workspaceDeltas.map((item) => item.evidenceId),
+          input.runId
+        ) as ReviewEvidence;
+      }
+    }, async (runtimeSession, type, authority, value) => {
+      if (type === "review.completed") active.durable.state.evidence.push(value as ReviewEvidence);
+      return {
+        schemaVersion: 3,
+        seq: ++seq,
+        eventId: `event-${seq}`,
+        sessionId: runtimeSession.identity.sessionId,
+        runId: runtimeSession.durable.runId,
+        occurredAt: now,
+        type,
+        authority,
+        payload: value as JsonValue
+      } as AgentEventEnvelope;
+    });
+
+    await coordinator.maybeReview(active, new AbortController().signal);
+    const failed = active.durable.state.evidence.at(-1) as ReviewEvidence;
+    expect(failed).toMatchObject({
+      kind: "review",
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        failureKind: "infrastructure",
+        workspaceDeltaEvidenceIds: [changed.evidenceId],
+        validationEvidenceIds: [checked.evidenceId]
+      }
+    });
+    const retryReadiness = reviewReadiness(active);
+    expect(retryReadiness.blockedReview).toBeUndefined();
+    expect(retryReadiness.retryableReview?.evidenceId).toBe(failed.evidenceId);
+    expect(completionReceipt([changed, checked, failed])).toMatchObject({
+      diagnostics: ["review_evidence_required"],
+      result: {
+        nextActions: [{
+          tool: "request_review",
+          arguments: {},
+          retryOfReviewEvidenceId: failed.evidenceId
+        }]
+      }
+    });
+
+    await coordinator.maybeReview(active, new AbortController().signal);
+    expect(calls).toBe(1);
+    const control = new RuntimeControlService({} as RuntimeControlServiceOptions).forSession(active);
+    await expect(control.requestReview()).resolves.toMatchObject({
+      status: "review_requested",
+      retryOfReviewEvidenceId: failed.evidenceId
+    });
+
+    await coordinator.maybeReview(active, new AbortController().signal, true);
+    expect(calls).toBe(2);
+    expect(active.durable.state.evidence.at(-1)).toMatchObject({
+      kind: "review",
+      status: "passed",
+      data: { verdict: "approved", workspaceDeltaEvidenceIds: [changed.evidenceId] }
+    });
   });
 
   it("re-enters review when stronger validation changes the review input", async () => {

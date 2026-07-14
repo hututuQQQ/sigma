@@ -27,6 +27,7 @@ import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
+import type { RunSuspensionContext } from "./runtime-session-finish.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
@@ -34,7 +35,12 @@ export interface EffectRunnerOptions {
   permissionMode: "ask" | "auto" | "deny";
   outputReserveTokens: number;
   emit: RuntimeEventEmitter;
-  finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean>;
+  finish(
+    session: RuntimeSession,
+    outcome: RunOutcome,
+    outcomeRevision?: number,
+    suspensionContext?: RunSuspensionContext
+  ): Promise<boolean>;
   createArtifact(sessionId: string, content: string | Uint8Array): Promise<string>;
   control: RuntimeControlService;
   budgets: BudgetController;
@@ -144,12 +150,11 @@ export class EffectRunner {
         reason: "The sigma-exec broker connection ended and its process tree was terminated."
       });
     }
-    await this.options.finish(session, {
+    return await this.options.finish(session, {
       kind: "needs_input",
       requestId: `process-recovery:${lost[0]!.id}`,
       message: "A background process was lost when the execution broker ended. It was not replayed; review its durable output before continuing."
-    });
-    return true;
+    }, undefined, { processIds: lost.map((handle) => handle.id) });
   }
 
   private async executeTools(session: RuntimeSession, attempts: ToolAttempt[], signal: AbortSignal): Promise<void> {
@@ -206,12 +211,11 @@ export class EffectRunner {
   private async suspendForCheckpointRecovery(session: RuntimeSession): Promise<boolean> {
     const recovery = session.recovery.openCheckpointRecovery;
     if (!recovery) return false;
-    await this.options.finish(session, {
+    return await this.options.finish(session, {
       kind: "needs_input",
       requestId: `checkpoint:${recovery.checkpointId}`,
       message: `Mutation checkpoint '${recovery.checkpointId}' contains an interrupted delta. Choose safe restore or keep before continuing.`
-    });
-    return true;
+    }, undefined, { checkpointId: recovery.checkpointId, choices: ["restore", "keep"] });
   }
 
   private async loadInstructions(
@@ -260,7 +264,11 @@ export class EffectRunner {
         evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
         artifactRefs: receipt.artifactRefs ?? []
       }, session.execution.controller?.signal ?? new AbortController().signal);
-      await this.reviews.maybeReview(session, session.execution.controller?.signal ?? new AbortController().signal);
+      await this.reviews.maybeReview(
+        session,
+        session.execution.controller?.signal ?? new AbortController().signal,
+        name === "request_review"
+      );
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

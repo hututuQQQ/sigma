@@ -13,6 +13,7 @@ import { runCommand } from "../packages/agent-cli/src/commands/run.js";
 import { runSessionCommand, runSessionsCommand } from "../packages/agent-cli/src/commands/session.js";
 import { loadCliConfig, parseArgs } from "../packages/agent-cli/src/config.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import { repositoryListJsonLines } from "../packages/agent-runtime/src/repository-statistics-provider.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
@@ -105,7 +106,7 @@ async function completedRuntime(workspace: string) {
     gateway: new FakeGateway([{ message: { role: "assistant", content: "done" }, finishReason: "stop" }]),
     store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
     storeRootDir,
-    tools: registerBuiltinTools(new EffectToolRegistry()),
+    tools: registerBuiltinTools(new EffectToolRegistry(), { repositoryList: repositoryListJsonLines }),
     permissionMode: "auto",
     runDeadlineMs: 5_000
   });
@@ -174,7 +175,10 @@ describe("Sigma CLI", () => {
   it("reports readiness without exposing credentials", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-doctor-"));
     const stdout = new Capture();
-    await expect(runDoctorCommand(["--workspace", workspace, "--json"], { stdout })).resolves.toBe(0);
+    await expect(runDoctorCommand(["--workspace", workspace, "--json"], {
+      stdout,
+      executionBroker: createHostExecutionBroker()
+    })).resolves.toBe(0);
     const report = JSON.parse(stdout.text());
     expect(report.checks.some((item: { name: string }) => item.name === "workspace")).toBe(true);
     expect(stdout.text()).not.toContain(process.env.DEEPSEEK_API_KEY ?? "__missing_secret__");

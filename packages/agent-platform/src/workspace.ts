@@ -54,6 +54,14 @@ export async function selfContainedGitRoot(
     return null;
   });
   processSignal.throwIfAborted();
+  if (result?.failure) {
+    throw Object.assign(new Error(
+      `Git root probe failed before process start [${result.failure.code}]: ${result.failure.message}`
+    ), {
+      code: result.failure.code,
+      cause: result.failure
+    });
+  }
   if (!result || result.exitCode !== 0) return null;
   const reported = result.stdout.trim();
   if (!reported) return null;

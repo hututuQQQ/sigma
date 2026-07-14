@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   defaultSigmaExecPath,
+  LazyExecutionBroker,
   resolveSigmaExecBinary,
   runtimeNodeBinding,
   runtimeTrustedToolchains,
@@ -18,6 +19,7 @@ import type {
   ModelResponse,
   ModelStreamEvent
 } from "../packages/agent-protocol/src/index.js";
+import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 } from "../packages/agent-protocol/src/index.js";
 import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
@@ -63,8 +65,11 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
   await mkdir(path.dirname(executable), { recursive: true });
   await writeFile(modulePath, "export {};\n", "utf8");
   await writeFile(executable, "portable node", "utf8");
+  const configured = path.join(root, "configured", "node");
 
-  const binding = runtimeNodeBinding(pathToFileURL(modulePath), "linux", process.execPath);
+  const binding = runtimeNodeBinding(pathToFileURL(modulePath), "linux", process.execPath, {
+    SIGMA_RUNTIME_NODE_PATH: configured
+  });
   expect(binding).toEqual({ executable: path.resolve(executable), source: "portable" });
   expect(runtimeTrustedToolchainsForBinding(binding, "linux", "required")).toEqual([{
     id: "runtime-node",
@@ -74,6 +79,48 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
     executionRoots: [path.resolve(executable)],
     pathEntries: []
   }]);
+});
+
+it("uses an explicitly configured absolute Node after the portable location", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-configured-runtime-node-"));
+  fixtures.push(root);
+  const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
+  const executable = path.join(root, "configured", process.platform === "win32" ? "node.exe" : "node");
+  await mkdir(path.dirname(modulePath), { recursive: true });
+  await mkdir(path.dirname(executable), { recursive: true });
+  await writeFile(modulePath, "export {};\n", "utf8");
+  await writeFile(executable, "configured node", "utf8");
+
+  expect(runtimeNodeBinding(pathToFileURL(modulePath), process.platform, process.execPath, {
+    SIGMA_RUNTIME_NODE_PATH: executable
+  })).toEqual({ executable: path.resolve(executable), source: "configured" });
+  expect(runtimeNodeBinding(
+    pathToFileURL(modulePath), process.platform, process.execPath, {}
+  )).toEqual({ executable: path.resolve(process.execPath), source: "current-runtime" });
+});
+
+it.each(["", "relative/node"])(
+  "rejects an explicit non-absolute runtime Node path %j without host fallback",
+  async (configuredPath) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-invalid-runtime-node-"));
+    fixtures.push(root);
+    const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
+    await mkdir(path.dirname(modulePath), { recursive: true });
+    await writeFile(modulePath, "export {};\n", "utf8");
+
+    expect(() => runtimeNodeBinding(pathToFileURL(modulePath), process.platform, process.execPath, {
+      SIGMA_RUNTIME_NODE_PATH: configuredPath
+    })).toThrow(expect.objectContaining({ code: "toolchain_unavailable" }));
+  }
+);
+
+it("uses the environment passed to the default broker factory", async () => {
+  expect(() => new LazyExecutionBroker({
+    sandboxMode: "unsafe",
+    allowUnsafeHostExec: true,
+    helperPath: process.execPath,
+    env: { SIGMA_RUNTIME_NODE_PATH: "relative/node" }
+  })).toThrow(expect.objectContaining({ code: "toolchain_unavailable" }));
 });
 
 it("fails closed when a present portable Windows Node cannot prove LPAC compatibility", async () => {
@@ -88,7 +135,38 @@ it("fails closed when a present portable Windows Node cannot prove LPAC compatib
   )).toThrow(/toolchain.*unavailable|could not be inspected|PE/iu);
 });
 
-function doctorReport(shells: BrokerVerifiedShell[]): BrokerDoctorReport {
+it("requires the same Windows LPAC proof for an explicitly configured Node", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-configured-windows-node-"));
+  fixtures.push(root);
+  const executable = path.join(root, "node.exe");
+  await writeFile(executable, "not an approved Windows Node runtime", "utf8");
+  const binding = { executable, source: "configured" as const };
+
+  expect(() => runtimeTrustedToolchainsForBinding(binding, "win32", "required"))
+    .toThrow(/toolchain.*unavailable|could not be inspected|PE/iu);
+  expect(runtimeTrustedToolchainsForBinding(binding, "win32", "unsafe")).toMatchObject([{
+    executable: path.resolve(executable),
+    aliases: ["node", "node.exe"]
+  }]);
+});
+
+function doctorReport(
+  shells: BrokerVerifiedShell[],
+  runtimeCommands: string[] = [],
+  processCapabilities: {
+    foreground: boolean;
+    background: boolean;
+    stdin: boolean;
+    pty: boolean;
+    networkModes: Array<"none" | "full">;
+  } = {
+    foreground: true,
+    background: false,
+    stdin: true,
+    pty: false,
+    networkModes: ["none"]
+  }
+): BrokerDoctorReport {
   return {
     protocolVersion: 1,
     brokerVersion: "fixture",
@@ -101,12 +179,13 @@ function doctorReport(shells: BrokerVerifiedShell[]): BrokerDoctorReport {
       setupRequired: false
     },
     capabilities: {
-      foreground: true,
-      background: false,
-      stdin: true,
-      pty: false,
-      networkModes: ["none"],
-      shells
+      foreground: processCapabilities.foreground,
+      background: processCapabilities.background,
+      stdin: processCapabilities.stdin,
+      pty: processCapabilities.pty,
+      networkModes: processCapabilities.networkModes,
+      shells,
+      runtimeCommands
     }
   };
 }
@@ -146,8 +225,12 @@ class CapturingGateway implements ModelGateway {
   };
   readonly requests: ModelRequest[] = [];
 
+  constructor(private readonly scripted: ModelResponse[] = []) {}
+
   async complete(request: ModelRequest): Promise<ModelResponse> {
     this.requests.push(request);
+    const response = this.scripted.shift();
+    if (response) return response;
     return {
       message: {
         role: "assistant",
@@ -228,6 +311,68 @@ describe("configured runtime execution capabilities", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("keeps subject attestation out of task evidence and first-stop terminal repair", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-attestation-state-"));
+    fixtures.push(stateRoot);
+    const runtimeConfig = configured(root);
+    runtimeConfig.permissionMode = "auto";
+    const gateway = new CapturingGateway([
+      { message: { role: "assistant", content: "Hello. What should I inspect?" }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "need-task-after-attestation",
+            name: "request_user_input",
+            arguments: { message: "What should I inspect?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([])),
+      gatewayFactory: () => gateway,
+      subjectProductAttestation: {
+        schemaVersion: 1,
+        productDigest: "a".repeat(64),
+        buildArtifactDigest: "b".repeat(64),
+        environmentDigest: "c".repeat(64),
+        platform: "linux"
+      }
+    }, { connectMcp: false, surface: "cli" });
+    try {
+      const session = await configuredRuntime.runtime.createSession({ workspacePath: root, mode: "analyze" });
+      await configuredRuntime.runtime.command({
+        type: "submit", sessionId: session.sessionId, text: "hello", mode: "analyze"
+      });
+      const outcome = await configuredRuntime.runtime.waitForOutcome(session.sessionId);
+      const events = [];
+      for await (const event of configuredRuntime.runtime.sessionEvents(session.sessionId)) events.push(event);
+      const toolResults = events.filter((event) => event.type === "tool.completed" || event.type === "tool.failed");
+      expect(outcome, JSON.stringify(toolResults.map((event) => event.payload))).toMatchObject({
+        kind: "needs_input", message: "What should I inspect?"
+      });
+
+      expect(gateway.requests).toHaveLength(2);
+      const initialContext = gateway.requests[0]!.messages.map((message) => message.content).join("\n");
+      expect(initialContext).not.toContain("Current-run typed durable evidence ledger");
+      expect(initialContext).not.toContain("subject-attestation:");
+      expect(gateway.requests[1]!.toolChoice).toBe("required");
+      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).toContain("request_user_input");
+      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).not.toContain("complete_task");
+
+      expect(events.filter((event) => event.type === "evidence.recorded"
+        && (event.payload as { data?: { source?: string } }).data?.source
+          === SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1)).toHaveLength(1);
+    } finally {
+      await configuredRuntime.close();
+    }
+  });
+
   it.each([
     {
       name: "one verified shell",
@@ -235,7 +380,14 @@ describe("configured runtime execution capabilities", () => {
         kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true
       }] as BrokerVerifiedShell[],
       expectedShells: ["bash"],
-      expectedDefault: "bash"
+      expectedDefault: "bash",
+      runtimeCommands: ["node", "node-runtime"],
+      expectedRuntimeCommands: ["node", "node-runtime"],
+      processCapabilities: {
+        foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"]
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
     },
     {
       name: "shell without child process capability",
@@ -244,26 +396,115 @@ describe("configured runtime execution capabilities", () => {
         supportsChildProcesses: false
       }] as BrokerVerifiedShell[],
       expectedShells: [],
-      expectedDefault: "none"
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: ["node"],
+      processCapabilities: {
+        foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"]
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
     },
     {
       name: "no verified shells",
       shells: [{ kind: "cmd", executable: "cmd.exe", verified: false }] as BrokerVerifiedShell[],
       expectedShells: [],
-      expectedDefault: "none"
+      expectedDefault: "none",
+      runtimeCommands: ["not a command", "line\nbreak"],
+      expectedRuntimeCommands: [],
+      processCapabilities: {
+        foreground: true, background: false, stdin: true, pty: false, networkModes: ["none"]
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
+    },
+    {
+      name: "no process execution capability",
+      shells: [{
+        kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true
+      }] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: [],
+      processCapabilities: {
+        foreground: false, background: false, stdin: false, pty: false, networkModes: ["none"]
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
+    },
+    {
+      name: "configuration narrows broker network support",
+      shells: [] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: ["node"],
+      processCapabilities: {
+        foreground: true, background: true, stdin: false, pty: false,
+        networkModes: ["none", "full"] as Array<"none" | "full">
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
+    },
+    {
+      name: "broker narrows configured network support",
+      shells: [] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: ["node"],
+      processCapabilities: {
+        foreground: true, background: true, stdin: true, pty: true, networkModes: ["none"]
+      },
+      configuredNetworkMode: "full" as const,
+      expectedNetworkModes: ["none"] as Array<"none" | "full">
+    },
+    {
+      name: "background execution without the network mode required by code intelligence",
+      shells: [] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: ["node"],
+      processCapabilities: {
+        foreground: true, background: true, stdin: true, pty: true, networkModes: ["full"]
+      },
+      configuredNetworkMode: "full" as const,
+      expectedNetworkModes: ["full"] as Array<"none" | "full">
+    },
+    {
+      name: "empty configured and broker network intersection",
+      shells: [] as BrokerVerifiedShell[],
+      expectedShells: [],
+      expectedDefault: "none",
+      runtimeCommands: ["node"],
+      expectedRuntimeCommands: ["node"],
+      processCapabilities: {
+        foreground: true, background: true, stdin: true, pty: true, networkModes: ["full"]
+      },
+      configuredNetworkMode: "none" as const,
+      expectedNetworkModes: [] as Array<"none" | "full">
     }
   ])("uses doctor capabilities for tools and runtime context with $name", async ({
     shells,
     expectedShells,
-    expectedDefault
+    expectedDefault,
+    runtimeCommands,
+    expectedRuntimeCommands,
+    processCapabilities,
+    configuredNetworkMode,
+    expectedNetworkModes
   }) => {
     const root = await workspace();
     const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-capabilities-state-"));
     fixtures.push(stateRoot);
     const gateway = new CapturingGateway();
-    const configuredRuntime = await createConfiguredRuntime(configured(root), {
+    const runtimeConfig = configured(root);
+    runtimeConfig.networkMode = configuredNetworkMode;
+    const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
       stateRootDir: stateRoot,
-      executionBroker: fixtureBroker(doctorReport(shells)),
+      executionBroker: fixtureBroker(doctorReport(shells, runtimeCommands, processCapabilities)),
       gatewayFactory: () => gateway
     }, { connectMcp: false });
     try {
@@ -280,6 +521,60 @@ describe("configured runtime execution capabilities", () => {
 
       expect(gateway.requests.length).toBeGreaterThan(0);
       const request = gateway.requests[0] as ModelRequest;
+      expect(request.tools?.find((tool) => tool.name === "list")).toBeDefined();
+      expect(request.tools?.find((tool) => tool.name === "grep")).toBeDefined();
+      expect(request.tools?.find((tool) => tool.name === "repository_stats")).toBeDefined();
+      expect(request.tools?.find((tool) => tool.name === "load_skill")).toBeUndefined();
+      const exec = request.tools?.find((tool) => tool.name === "exec");
+      const foregroundAvailable = processCapabilities.foreground && expectedNetworkModes.length > 0;
+      const backgroundAvailable = processCapabilities.background && expectedNetworkModes.length > 0;
+      if (foregroundAvailable) {
+        expect(exec?.inputSchema).not.toMatchObject({
+          properties: { skill: expect.anything() }
+        });
+        expect(exec?.inputSchema).toMatchObject({
+          properties: { network: { enum: expectedNetworkModes } }
+        });
+      } else {
+        expect(exec).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "validate")).toBeUndefined();
+      }
+      const spawn = request.tools?.find((tool) => tool.name === "process_spawn");
+      if (!backgroundAvailable) {
+        expect(request.tools?.find((tool) => tool.name === "process_spawn")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
+      } else {
+        expect(spawn?.inputSchema).toMatchObject({
+          properties: { network: { enum: expectedNetworkModes } }
+        });
+        if (processCapabilities.pty) {
+          expect(spawn?.inputSchema).toMatchObject({ properties: { pty: { type: "boolean" } } });
+        } else {
+          expect(spawn?.inputSchema).not.toMatchObject({ properties: { pty: expect.anything() } });
+        }
+        if (processCapabilities.stdin) {
+          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeDefined();
+        } else {
+          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        }
+      }
+      const codeIntelAvailable = backgroundAvailable
+        && processCapabilities.stdin
+        && expectedNetworkModes.includes("none");
+      expect(request.tools?.find((tool) => tool.name === "lsp") !== undefined).toBe(codeIntelAvailable);
+      const executionSchema = JSON.stringify(
+        exec?.inputSchema
+      );
+      if (!foregroundAvailable) {
+        expect(executionSchema).toBeUndefined();
+      } else if (expectedRuntimeCommands.length > 0) {
+        for (const command of expectedRuntimeCommands) expect(executionSchema).toContain(command);
+        expect(executionSchema).toContain("Unlisted bare commands are unavailable");
+      } else {
+        expect(executionSchema).toContain("No general bare runtime command alias is verified");
+      }
       const shell = request.tools?.find((tool) => tool.name === "shell");
       if (expectedShells.length === 0) {
         expect(shell).toBeUndefined();
@@ -293,8 +588,11 @@ describe("configured runtime execution capabilities", () => {
         .map((message) => message.content)
         .join("\n");
       expect(runtimePrompt).toContain(
-        `platform=linux; arch=fixture-arch; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; pathSeparator=/`
+        `platform=linux; arch=fixture-arch; executionCapabilities=broker-verified; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; verifiedRuntimeCommands=${expectedRuntimeCommands.join(",") || "none"}; pathSeparator=/`
       );
+      expect(runtimePrompt).toContain("Execution capabilities are closed-world");
+      expect(runtimePrompt).toContain("Do not probe or retry unlisted host commands");
+      expect(runtimePrompt).not.toContain(process.execPath);
     } finally {
       await configuredRuntime.close();
     }

@@ -44,13 +44,19 @@ function normalizeReview(
       findings: [...raw.data.findings],
       workspaceDeltaEvidenceIds: workspaceDeltas.map((item) => item.evidenceId),
       validationEvidenceIds: validations.map((item) => item.evidenceId),
+      ...(raw.data.failureKind ? { failureKind: raw.data.failureKind } : {}),
       ...(workspaceDeltas.at(-1)?.data.checkpointId
         ? { checkpointId: workspaceDeltas.at(-1)!.data.checkpointId } : {})
     }
   };
 }
 
-function failedReview(input: ReviewerInput, reviewerId: string, message: string): ReviewEvidence {
+function failedReview(
+  input: ReviewerInput,
+  reviewerId: string,
+  message: string,
+  failureKind: "infrastructure" | "interrupted"
+): ReviewEvidence {
   return {
     evidenceId: randomUUID(),
     sessionId: input.sessionId,
@@ -65,7 +71,8 @@ function failedReview(input: ReviewerInput, reviewerId: string, message: string)
       verdict: "changes_requested",
       findings: [message],
       workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
-      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+      validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+      failureKind
     }
   };
 }
@@ -116,6 +123,52 @@ function activeReservation(session: RuntimeSession, ownerId: string): BudgetRese
     item.ownerId === ownerId && item.status !== "released");
 }
 
+export interface ReviewReadiness {
+  pending: WorkspaceDeltaEvidence[];
+  eligible: WorkspaceDeltaEvidence[];
+  validations: ValidationEvidence[];
+  relevantValidations: ValidationEvidence[];
+  blockedReview?: ReviewEvidence;
+  retryableReview?: ReviewEvidence;
+}
+
+/** One authoritative selection policy shared by automatic and explicitly
+ * requested internal review. Callers never supply or guess evidence IDs. */
+export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
+  const evidence = sessionMutationEvidence(session);
+  const waivedIds = reviewerWaivedDeltaIds(evidence);
+  const reviewedIds = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
+    && item.data.verdict === "approved"
+    ? item.data.workspaceDeltaEvidenceIds : []));
+  const pending = evidence.filter((item): item is WorkspaceDeltaEvidence =>
+    item.kind === "workspace_delta" && item.status === "passed"
+    && !documentationOnly(item) && !reviewedIds.has(item.evidenceId) && !waivedIds.has(item.evidenceId));
+  const validations = evidence.filter((item): item is ValidationEvidence =>
+    item.kind === "validation" && item.status === "passed");
+  const eligible = pending.filter((delta) => validations.some((validation) =>
+    validationCoversDelta(validation, delta)));
+  const eligibleIds = new Set(eligible.map((item) => item.evidenceId));
+  const relevantValidations = validations.filter((item) =>
+    item.data.workspaceDeltaEvidenceIds.some((evidenceId) => eligibleIds.has(evidenceId)));
+  const latestFailedReview = evidence.filter((item): item is ReviewEvidence =>
+    item.kind === "review" && item.status === "failed" && sameReviewInput(
+      item,
+      [...eligibleIds],
+      relevantValidations.map((validation) => validation.evidenceId)
+    )).at(-1);
+  const retryableReview = latestFailedReview?.data.failureKind ? latestFailedReview : undefined;
+  const blockedReview = latestFailedReview && !latestFailedReview.data.failureKind
+    ? latestFailedReview : undefined;
+  return {
+    pending,
+    eligible,
+    validations,
+    relevantValidations,
+    ...(blockedReview ? { blockedReview } : {}),
+    ...(retryableReview ? { retryableReview } : {})
+  };
+}
+
 export class ReviewCoordinator {
   private readonly active = new Map<string, Promise<void>>();
   private readonly reviewerForSession: (session: RuntimeSession) => ReviewerPort;
@@ -128,40 +181,26 @@ export class ReviewCoordinator {
     this.reviewerForSession = typeof reviewer === "function" ? reviewer : () => reviewer;
   }
 
-  async maybeReview(session: RuntimeSession, signal: AbortSignal): Promise<void> {
+  async maybeReview(session: RuntimeSession, signal: AbortSignal, explicitlyRequested = false): Promise<void> {
     const existing = this.active.get(session.identity.sessionId);
     if (existing) return await existing;
-    const task = this.reviewEligibleChange(session, signal);
+    const task = this.reviewEligibleChange(session, signal, explicitlyRequested);
     this.active.set(session.identity.sessionId, task);
     try { await task; } finally {
       if (this.active.get(session.identity.sessionId) === task) this.active.delete(session.identity.sessionId);
     }
   }
 
-  private async reviewEligibleChange(session: RuntimeSession, signal: AbortSignal): Promise<void> {
+  private async reviewEligibleChange(
+    session: RuntimeSession,
+    signal: AbortSignal,
+    explicitlyRequested: boolean
+  ): Promise<void> {
     const evidence = sessionMutationEvidence(session);
-    const waivedIds = reviewerWaivedDeltaIds(evidence);
-    const reviewedIds = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
-      ? item.data.workspaceDeltaEvidenceIds : []));
-    const pending = evidence.filter((item): item is WorkspaceDeltaEvidence =>
-      item.kind === "workspace_delta" && item.status === "passed"
-      && !documentationOnly(item) && !reviewedIds.has(item.evidenceId) && !waivedIds.has(item.evidenceId));
-    if (pending.length === 0) return;
-    const validations = evidence.filter((item): item is ValidationEvidence =>
-      item.kind === "validation" && item.status === "passed");
-    const eligible = pending.filter((delta) => validations.some((validation) =>
-      validationCoversDelta(validation, delta)));
+    const { eligible, relevantValidations, blockedReview, retryableReview } = reviewReadiness(session);
     if (eligible.length === 0) return;
     const eligibleIds = new Set(eligible.map((item) => item.evidenceId));
-    const relevantValidations = validations.filter((item) =>
-      item.data.workspaceDeltaEvidenceIds.some((evidenceId) => eligibleIds.has(evidenceId)));
-    const lastFailedReview = evidence.filter((item): item is ReviewEvidence =>
-      item.kind === "review" && item.status === "failed").at(-1);
-    if (lastFailedReview && sameReviewInput(
-      lastFailedReview,
-      [...eligibleIds],
-      relevantValidations.map((item) => item.evidenceId)
-    )) return;
+    if (blockedReview || (retryableReview && !explicitlyRequested)) return;
     const reviewer = this.reviewerForSession(session);
     const reviewerId = reviewer.reviewerId ?? "builtin-reviewer";
     const input: ReviewerInput = {
@@ -180,7 +219,18 @@ export class ReviewCoordinator {
       workspaceDeltaEvidenceIds: [...eligibleIds],
       validationEvidenceIds: relevantValidations.map((item) => item.evidenceId)
     });
-    const rawReview = await reviewer.review(input, signal);
+    let rawReview: ReviewEvidence;
+    try {
+      rawReview = await reviewer.review(input, signal);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      rawReview = failedReview(
+        input,
+        reviewerId,
+        `Independent reviewer failed: ${message}`,
+        "infrastructure"
+      );
+    }
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session, rawReview, eligible, relevantValidations
     ));
@@ -227,7 +277,7 @@ export class ReviewCoordinator {
       const message = error instanceof Error ? error.message : String(error);
       await this.emit(session, "review.completed", "runtime", normalizeReview(
         session,
-        failedReview(input, reviewerId, `Independent reviewer failed: ${message}`),
+        failedReview(input, reviewerId, `Independent reviewer failed: ${message}`, "infrastructure"),
         input.workspaceDeltas,
         input.validations
       ));
@@ -260,7 +310,12 @@ export class ReviewCoordinator {
     }
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session,
-      failedReview(input, reviewerId, "Independent review was interrupted; the model call was not replayed."),
+      failedReview(
+        input,
+        reviewerId,
+        "Independent review was interrupted; the model call was not replayed.",
+        "interrupted"
+      ),
       input.workspaceDeltas,
       input.validations
     ));

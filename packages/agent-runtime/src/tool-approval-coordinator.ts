@@ -2,7 +2,8 @@ import type {
   ModelToolCall,
   ToolCallApproval,
   ToolCallPlan,
-  ToolDescriptor
+  ToolDescriptor,
+  ToolEffect
 } from "agent-protocol";
 import type { ActiveModelTurn } from "agent-kernel";
 import { abortable, steeringRestart } from "./effect-helpers.js";
@@ -16,6 +17,11 @@ import {
   createApprovalBinding,
   sameApprovalBinding
 } from "./approval-binding.js";
+
+const internalTerminalEffects: ReadonlySet<ToolEffect> = new Set([
+  "outcome.propose",
+  "outcome.request_input"
+]);
 
 export interface ApprovalRequest {
   call: ModelToolCall;
@@ -35,13 +41,35 @@ function requiresFreshRecoveredApproval(plan: ToolCallPlan): boolean {
     ["filesystem.write", "destructive", "checkpoint.restore", "open_world"].includes(effect));
 }
 
+function containsOnlyInternalTerminalEffects(
+  effects: readonly ToolEffect[]
+): boolean {
+  return effects.length > 0 && effects.every((effect) => internalTerminalEffects.has(effect));
+}
+
+function mandatoryApprovalDecision(
+  descriptor: ToolDescriptor,
+  effects: ToolDescriptor["possibleEffects"],
+  permissionMode: ReturnType<typeof profilePermissionMode>
+): "allow" | "deny" | undefined {
+  if (descriptor.approval === "deny") return "deny";
+  if (permissionMode !== "deny") return undefined;
+  const maximumEffects = descriptor.maximumEffects ?? descriptor.possibleEffects;
+  return containsOnlyInternalTerminalEffects(descriptor.possibleEffects)
+    && containsOnlyInternalTerminalEffects(maximumEffects)
+    && containsOnlyInternalTerminalEffects(effects)
+    ? "allow"
+    : "deny";
+}
+
 function immediateApprovalDecision(
   session: RuntimeSession,
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
   permissionMode: ReturnType<typeof profilePermissionMode>
 ): "allow" | "deny" | undefined {
-  if (descriptor.approval === "deny" || permissionMode === "deny") return "deny";
+  const mandatory = mandatoryApprovalDecision(descriptor, effects, permissionMode);
+  if (mandatory) return mandatory;
   const perCall = effects.some((effect) => effect === "network" || effect === "open_world");
   const effectGrant = effects.slice().sort().join("\0");
   return !perCall && (descriptor.approval === "auto" || permissionMode === "auto"
@@ -109,9 +137,10 @@ export class ToolApprovalCoordinator {
   ): Promise<"allow" | "deny" | "always_allow"> {
     const { call, modelTurn, descriptor, plan } = prepared;
     const permissionMode = profilePermissionMode(this.options.runtime, session);
-    if (descriptor.approval === "deny" || permissionMode === "deny") return "deny";
-    const restored = session.durable.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
     const effects = approvalEffectsForPlan(plan);
+    const mandatory = mandatoryApprovalDecision(descriptor, effects, permissionMode);
+    if (mandatory) return mandatory;
+    const restored = session.durable.state.pendingTools.find((item) => item.request.callId === call.id)?.approval;
     const expectedBinding = createApprovalBinding(
       session.identity.sessionId, session.durable.runId, call, plan, effects
     );

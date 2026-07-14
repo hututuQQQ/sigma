@@ -14,13 +14,7 @@ import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
-import {
-  ensurePrivateStateDirectory,
-  isInside,
-  runtimeEnvironment,
-  type RuntimeEnvironment,
-  type ShellKind
-} from "agent-platform";
+import { ensurePrivateStateDirectory, isInside } from "agent-platform";
 import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
@@ -38,7 +32,13 @@ import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-tru
 import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
 import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
 import { subjectConfigurationV1 } from "./subject-configuration.js";
-
+import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
+import {
+  brokerRuntimeEnvironment,
+  verifiedNetworkPolicy,
+  verifiedRuntimeCommands,
+  verifiedShellKinds
+} from "./execution-capabilities.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: "deepseek" | "glm";
@@ -364,36 +364,29 @@ function createTools(
   executionReport: BrokerDoctorReport,
   storeRootDir: string
 ): EffectToolRegistry {
+  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
     atomicPatchStateRootDir: storeRootDir,
     sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
-    networkMode: config.networkMode ?? "none",
+    networkMode: network.defaultMode,
+    networkModes: network.modes,
     shells: verifiedShellKinds(executionReport),
-    codeIntel: {
-      presets: discoverLanguageServers(),
-      additionalReadRoots: [defaultBundledLanguageServerRoot()].filter((value): value is string => Boolean(value))
-    }
+    runtimeCommands: verifiedRuntimeCommands(executionReport),
+    foreground: executionReport.capabilities.foreground,
+    background: executionReport.capabilities.background,
+    stdin: executionReport.capabilities.stdin,
+    pty: executionReport.capabilities.pty,
+    ...repositoryRuntimeProviders,
+    ...(executionReport.capabilities.background
+      && executionReport.capabilities.stdin
+      && network.modes.includes("none") ? {
+      codeIntel: {
+        presets: discoverLanguageServers(),
+        additionalReadRoots: [defaultBundledLanguageServerRoot()]
+          .filter((value): value is string => Boolean(value))
+      }
+    } : {})
   });
   return registerSupervisorTools(builtins, supervisor);
-}
-
-function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnvironment {
-  const reported = report.platform === "windows" ? "win32"
-    : report.platform === "macos" ? "darwin" : report.platform;
-  const platform = ["aix", "darwin", "freebsd", "linux", "openbsd", "sunos", "win32"]
-    .includes(reported) ? reported as NodeJS.Platform : process.platform;
-  const availableShells = verifiedShellKinds(report);
-  return {
-    ...runtimeEnvironment(platform),
-    arch: report.architecture,
-    defaultShell: availableShells[0] ?? "none",
-    availableShells
-  };
-}
-
-function verifiedShellKinds(report: BrokerDoctorReport): ShellKind[] {
-  return [...new Set((report.capabilities.shells ?? [])
-    .filter((shell) => shell.verified && shell.supportsChildProcesses === true)
-    .map((shell) => shell.kind))];
 }

@@ -28,6 +28,9 @@ import {
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const fixtures: string[] = [];
+// The fake broker accepts these explicit test entry points; production obtains
+// the equivalent closed-world alias list from a successful broker connection.
+const fixtureRuntimeCommands = ["host-fixture", "policy-fixture", "resume-fixture"];
 
 function executionResult(): ExecutionResult {
   return {
@@ -239,7 +242,8 @@ describe("sensitive per-call approvals", () => {
       const runtime = createRuntime({
         gateway: new SmokeFakeGateway([networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
         tools: registerBuiltinTools(new EffectToolRegistry(), {
-          broker: broker(requests), sandboxMode: "required", networkMode: "none"
+          broker: broker(requests), sandboxMode: "required", networkMode: "none",
+          runtimeCommands: fixtureRuntimeCommands
         }),
         store,
         storeRootDir: path.join(root, "state"),
@@ -267,7 +271,9 @@ describe("sensitive per-call approvals", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([networkTurn("slow-human"), fakeFinalTurn()]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker([]) }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker([]), runtimeCommands: fixtureRuntimeCommands
+      }),
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "ask",
@@ -300,7 +306,9 @@ describe("sensitive per-call approvals", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([networkTurn("network-denied"), fakeFinalTurn()]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker(requests) }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
+      }),
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "deny",
@@ -328,7 +336,8 @@ describe("sensitive per-call approvals", () => {
         fakeFinalTurn()
       ]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none"
+        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
+        runtimeCommands: fixtureRuntimeCommands
       }),
       store: new SegmentedJsonlStore({ rootDir: path.join(root, "state") }),
       storeRootDir: path.join(root, "state"),
@@ -446,8 +455,11 @@ describe("sensitive per-call approvals", () => {
         type: "tool.approval_requested",
         payload: {
           requestId: "recovered-write",
-          effects: ["filesystem.write"],
-          plan: recoveredWritePlan
+          effects: ["filesystem.read", "filesystem.write"],
+          plan: {
+            ...recoveredWritePlan,
+            exactEffects: ["filesystem.read", "filesystem.write"]
+          }
         }
       });
       await expect(readFile(path.join(root, "result.txt"), "utf8")).rejects.toThrow();
@@ -475,7 +487,9 @@ describe("sensitive per-call approvals", () => {
     };
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([networkTurn("release-wait")]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker([]) }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker([]), runtimeCommands: fixtureRuntimeCommands
+      }),
       store,
       storeRootDir,
       permissionMode: "ask",
@@ -553,7 +567,9 @@ describe("sensitive per-call approvals", () => {
     const requests: ExecutionRequest[] = [];
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([fakeFinalTurn()]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker(requests) }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
+      }),
       store,
       storeRootDir,
       permissionMode: "auto",
@@ -645,7 +661,8 @@ describe("sensitive per-call approvals", () => {
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none"
+        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
+        runtimeCommands: fixtureRuntimeCommands
       }),
       store,
       storeRootDir,
@@ -719,7 +736,9 @@ describe("sensitive per-call approvals", () => {
     const requests: ExecutionRequest[] = [];
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([networkTurn("child-network"), fakeFinalTurn()]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), { broker: broker(requests) }),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
+      }),
       store: new SegmentedJsonlStore({ rootDir: path.join(root, "state") }),
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",

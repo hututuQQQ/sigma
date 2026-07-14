@@ -22,6 +22,9 @@ export const evidenceKindSchema = z.enum([
   "review", "checkpoint", "child_outcome", "user_waiver"
 ]);
 export const evidenceStatusSchema = z.enum(["passed", "failed", "warning", "informational"]);
+export const evidenceClaimSchema = z.enum([
+  "acceptance_met", "validation_executed", "validation_passed"
+]);
 export const evidenceAuthoritySchema = z.enum(["system", "developer", "user", "project", "runtime", "tool"]);
 export const evidenceProducerSchema = z.object({
   authority: evidenceAuthoritySchema,
@@ -75,9 +78,20 @@ export const validationEvidenceSchema = z.object({
   data: z.object({
     validator: nonEmptyStringSchema,
     command: z.string().optional(),
-    exitCode: z.number().int().optional(),
+    exitCode: z.number().int().nullable().optional(),
+    termination: z.object({
+      processStarted: z.boolean(),
+      state: z.enum(["exited", "terminated"]),
+      exitCode: z.number().int().nullable(),
+      signal: z.string().nullable(),
+      timedOut: z.boolean(),
+      idleTimedOut: z.boolean(),
+      cancelled: z.boolean(),
+      failureCode: nonEmptyStringSchema.optional()
+    }).strict().optional(),
     artifactIds: z.array(z.string()).optional(),
     workspaceDeltaEvidenceIds: z.array(z.string()),
+    checkpointIds: z.array(nonEmptyStringSchema).optional(),
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional()
   }).strict()
@@ -101,6 +115,7 @@ export const reviewEvidenceSchema = z.object({
     findings: z.array(jsonValueSchema),
     workspaceDeltaEvidenceIds: z.array(z.string()),
     validationEvidenceIds: z.array(z.string()).optional(),
+    failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
     checkpointId: z.string().optional()
   }).strict()
 }).strict();
@@ -180,7 +195,8 @@ export const usageRecordSchema = z.object({
 
 export const evidenceRefSchema = z.object({
   evidenceId: nonEmptyStringSchema,
-  kind: evidenceKindSchema
+  kind: evidenceKindSchema,
+  claim: evidenceClaimSchema.optional()
 }).strict();
 
 const planNodeOwnerSchema = z.discriminatedUnion("kind", [

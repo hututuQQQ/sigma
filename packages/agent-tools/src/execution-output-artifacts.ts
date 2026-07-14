@@ -30,6 +30,12 @@ interface ImportedOutputArtifacts {
   diagnostics: string[];
 }
 
+function commandSucceeded(result: ExecutionResult): boolean {
+  return result.state === "exited" && result.exitCode === 0 && result.signal === null
+    && !result.timedOut && !result.idleTimedOut && !result.cancelled
+    && result.failure === undefined;
+}
+
 async function importOutputArtifacts(
   artifacts: readonly ProcessOutputArtifact[] | undefined,
   context: ToolExecutionContext
@@ -84,13 +90,23 @@ function commandEvidence(
 ): EvidenceRecord {
   const base = {
     evidenceId: randomUUID(), sessionId: context.sessionId, runId: context.runId,
-    status: result.exitCode === 0 ? "passed" as const : "failed" as const,
+    status: commandSucceeded(result) ? "passed" as const : "failed" as const,
     createdAt: completedAt, producer: { authority: "tool" as const, id: request.callId }
   };
   if (validation) return {
     ...base, kind: "validation", summary: `Validation '${command}' exited with ${String(result.exitCode)}.`,
     data: {
-      validator: "command", command, ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+      validator: "command", command, exitCode: result.exitCode,
+      termination: {
+        processStarted: result.failure === undefined,
+        state: result.state,
+        exitCode: result.exitCode,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        idleTimedOut: result.idleTimedOut,
+        cancelled: result.cancelled,
+        ...(result.failure ? { failureCode: result.failure.code } : {})
+      },
       artifactIds: imported.ids, workspaceDeltaEvidenceIds: []
     }
   };
@@ -116,7 +132,7 @@ export async function commandReceipt(
   broker: ExecutionBroker
 ): Promise<ToolReceipt> {
   const completedAt = new Date().toISOString();
-  const ok = result.exitCode === 0 && !result.timedOut && !result.idleTimedOut && !result.cancelled;
+  const ok = commandSucceeded(result);
   const imported = await importOutputArtifacts(result.outputArtifacts, context);
   await acknowledge(imported, broker);
   const evidence = commandEvidence(request, command, result, validation, completedAt, context, imported);

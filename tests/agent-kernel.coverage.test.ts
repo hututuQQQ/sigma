@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
   createBudgetLedger,
+  SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1,
   type AgentEventEnvelope,
   type AgentEventType,
   type EvidenceRecord,
@@ -98,7 +99,373 @@ function toolEvent(
   return apply(state, type, { callId, ...payload, ...pending.modelTurn });
 }
 
+function proposeToolBatch(
+  state: KernelState,
+  turnId: number,
+  calls: Array<{ id: string; name: string; arguments: JsonValue }>
+): KernelState {
+  return settleModel(startModel(state, turnId), "model.completed", {
+    message: { role: "assistant", content: "", toolCalls: calls },
+    toolCalls: calls,
+    finishReason: "tool_calls"
+  });
+}
+
+function completedReceipt(
+  output: string,
+  timestamp: string,
+  workspaceDelta?: { added: string[]; modified: string[]; deleted: string[] }
+): Record<string, JsonValue> {
+  return {
+    ok: true,
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
+    observedEffects: ["filesystem.read"],
+    actualEffects: ["filesystem.read"],
+    ...(workspaceDelta ? { workspaceDelta } : {}),
+    artifacts: [],
+    diagnostics: [],
+    evidence: [],
+    startedAt: timestamp,
+    completedAt: timestamp
+  };
+}
+
 describe("agent-kernel exhaustive protocol behavior", () => {
+  it("rejects a mixed terminal batch atomically and bounds a repeated conflict", () => {
+    let state = apply(initial(), "user.message", { text: "inspect or ask" });
+    const mixed = (turn: number) => [
+      { id: `ask-${turn}`, name: "request_user_input", arguments: { message: "Which path?" } },
+      { id: `read-${turn}`, name: "read", arguments: { path: "seed.txt" } }
+    ];
+    state = proposeToolBatch(state, 1, mixed(1));
+    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 1 });
+    expect(state.pendingTools).toEqual([]);
+    expect(state.receipts).toEqual([]);
+
+    state = proposeToolBatch(state, 2, mixed(2));
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_batch_conflict"
+    });
+  });
+
+  it("allows one completion alongside ordinary work outside a repair turn", () => {
+    let state = apply(initial(), "user.message", { text: "write the result and finish" });
+    state = proposeToolBatch(state, 1, [
+      { id: "write-1", name: "write", arguments: { path: "result.txt", content: "done" } },
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+    ]);
+    expect(state).toMatchObject({ phase: "tool_pending", completionRepairAttempts: 0 });
+    expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["write-1", "complete-1"]);
+  });
+
+  it("rejects completion mixed with ordinary work during a repair turn", () => {
+    let state = apply(initial(), "user.message", { text: "finish cleanly" });
+    state = {
+      ...state,
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "evidence_acquisition" }
+    };
+    state = proposeToolBatch(state, 1, [
+      { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+    ]);
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_batch_conflict"
+    });
+  });
+
+  it("returns recoverable task-state failures from terminal repair to normal tools", () => {
+    let state = apply(initial(), "user.message", { text: "finish after the process exits" });
+    state = {
+      ...state,
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "terminal_action" },
+      evidence: [diagnosticEvidence("current-run-evidence")]
+    };
+    state = proposeToolBatch(state, 1, [{
+      id: "complete-while-active", name: "complete_task", arguments: { summary: "done", criteria: [] }
+    }]);
+    const failed = {
+      ...completedReceipt("Background processes remain active.", "2026-01-01T00:00:01.000Z"),
+      ok: false,
+      outcome: {
+        status: "failed", output: "Background processes remain active.", diagnosticCodes: ["active_processes"]
+      },
+      diagnostics: ["active_processes"]
+    };
+    state = toolEvent(state, "tool.failed", "complete-while-active", failed);
+    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 0 });
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
+  });
+
+  it("converges an evidence-backed natural question through a typed durable input request", () => {
+    let state = apply(initial(), "user.message", { text: "inspect the current state" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
+    state = settleModel(startModel(state), "model.completed", {
+      message: { role: "assistant", content: "Which target should I change?" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "protected_completion",
+        answer: "Which target should I change?"
+      }
+    });
+    const forgedSuspension = apply(state, "run.suspended", {
+      requestId: "replace-with-suspension",
+      message: "Would you like anything else?"
+    });
+    expect(forgedSuspension).toMatchObject({
+      phase: "ready_model",
+      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
+      outcome: undefined
+    });
+
+    state = settleModel(startModel(state, 2), "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "typed-input-request",
+          name: "request_user_input",
+          arguments: { message: "Which target should I change?" }
+        }]
+      },
+      toolCalls: [{
+        id: "typed-input-request",
+        name: "request_user_input",
+        arguments: { message: "Which target should I change?" }
+      }],
+      finishReason: "tool_calls"
+    });
+    expect(state).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { callId: "typed-input-request", name: "request_user_input" } }]
+    });
+    state = toolEvent(state, "tool.completed", "typed-input-request", {
+      ok: true,
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
+      proposedOutcome: {
+        kind: "needs_input",
+        requestId: "typed-input-request",
+        message: "Which target should I change?"
+      }
+    });
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+
+    const outcomeRevision = state.revision;
+    state = apply(state, "run.suspended", {
+      requestId: "typed-input-request",
+      message: "Which target should I change?",
+      outcomeRevision
+    });
+    expect(state).toMatchObject({
+      phase: "needs_input",
+      completionRepairAttempts: 0,
+      outcome: {
+        kind: "needs_input",
+        requestId: "typed-input-request",
+        message: "Which target should I change?"
+      }
+    });
+    expect(state.completionRepair).toBeUndefined();
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+  });
+
+  it("keeps direct original-turn input requests valid even when evidence already exists", () => {
+    let state = apply(initial(), "user.message", { text: "change the selected target" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("preexisting-evidence"));
+    state = proposeToolBatch(state, 1, [{
+      id: "need-target",
+      name: "request_user_input",
+      arguments: { message: "Which target should I change?" }
+    }]);
+    state = toolEvent(state, "tool.completed", "need-target", {
+      ok: true,
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: {
+        kind: "needs_input",
+        requestId: "need-target",
+        message: "Which target should I change?"
+      }
+    });
+  });
+
+  it("keeps the answer protected while recovering from a real completion blocker", () => {
+    let state = apply(initial(), "user.message", { text: "finish after settling blockers" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("protected-blocker-evidence"));
+    state = settleModel(startModel(state), "model.completed", {
+      message: { role: "assistant", content: "The inspected result is stable." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    state = proposeToolBatch(state, 2, [{
+      id: "blocked-completion",
+      name: "complete_task",
+      arguments: { summary: "done", criteria: [] }
+    }]);
+    state = toolEvent(state, "tool.failed", "blocked-completion", {
+      ok: false,
+      output: "Background processes remain active.",
+      observedEffects: [],
+      artifacts: [],
+      diagnostics: ["active_processes"],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepairAttempts: 0,
+      completionRepair: {
+        kind: "protected_recovery",
+        answer: "The inspected result is stable."
+      }
+    });
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+
+    let requestedInput = proposeToolBatch(state, 3, [{
+      id: "blocked-input-request",
+      name: "request_user_input",
+      arguments: { message: "Should I stop the process?" }
+    }]);
+    expect(requestedInput).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { callId: "blocked-input-request", name: "request_user_input" } }],
+      completionRepair: { kind: "protected_recovery", answer: "The inspected result is stable." }
+    });
+    requestedInput = toolEvent(requestedInput, "tool.completed", "blocked-input-request", {
+      ok: true,
+      output: JSON.stringify({ message: "Should I stop the process?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(requestedInput.proposedOutcome).toMatchObject({
+      kind: "needs_input",
+      requestId: "blocked-input-request",
+      message: "Should I stop the process?"
+    });
+    expect(() => assertKernelInvariants(requestedInput)).not.toThrow();
+
+    const recoveryWork = proposeToolBatch(state, 3, [{
+      id: "poll-blocker",
+      name: "poll_process",
+      arguments: { processId: "process" }
+    }]);
+    expect(recoveryWork).toMatchObject({
+      phase: "tool_pending",
+      completionRepair: { kind: "protected_recovery" }
+    });
+  });
+
+  it("blocks a third identical batch only after two identical completed outcomes", () => {
+    let state = apply(initial(), "user.message", { text: "inspect repeatedly" });
+    for (const index of [1, 2]) {
+      const callId = `same-${index}`;
+      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "seed.txt" } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        "stable result",
+        `2026-01-01T00:00:0${index}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+    state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+    expect(state.repeatedToolBatchCount).toBe(2);
+  });
+
+  it("resets the completed-outcome streak when another batch intervenes", () => {
+    let state = apply(initial(), "user.message", { text: "inspect related paths" });
+    for (const index of [1, 2]) {
+      const callId = `first-path-${index}`;
+      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "a.txt" } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt("A", `2026-01-01T00:00:0${index}.000Z`));
+    }
+    state = proposeToolBatch(state, 3, [{ id: "other-path", name: "read", arguments: { path: "b.txt" } }]);
+    state = toolEvent(state, "tool.completed", "other-path", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
+    expect(state.repeatedToolBatchCount).toBe(1);
+    state = proposeToolBatch(state, 4, [{ id: "first-path-again", name: "read", arguments: { path: "a.txt" } }]);
+    expect(state.phase).toBe("tool_pending");
+    expect(state.proposedOutcome).toBeUndefined();
+  });
+
+  it.each([
+    ["receipt output", completedReceipt("first", "2026-01-01T00:00:01.000Z"),
+      completedReceipt("second", "2026-01-01T00:00:02.000Z")],
+    ["workspace delta", completedReceipt("stable", "2026-01-01T00:00:01.000Z", {
+      added: ["first.txt"], modified: [], deleted: []
+    }), completedReceipt("stable", "2026-01-01T00:00:02.000Z", {
+      added: [], modified: ["second.txt"], deleted: []
+    })]
+  ])("allows a third identical call when the completed %s changes", (_label, first, second) => {
+    let state = apply(initial(), "user.message", { text: "observe changing results" });
+    state = proposeToolBatch(state, 1, [{ id: "changing-1", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "changing-1", first);
+    state = proposeToolBatch(state, 2, [{ id: "changing-2", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "changing-2", second);
+    expect(state.repeatedToolBatchCount).toBe(1);
+    state = proposeToolBatch(state, 3, [{ id: "changing-3", name: "read", arguments: { path: "seed.txt" } }]);
+    expect(state.phase).toBe("tool_pending");
+    expect(state.pendingTools).toHaveLength(1);
+    expect(state.proposedOutcome).toBeUndefined();
+  });
+
+  it("makes multi-tool completed outcome signatures independent of call and receipt order", () => {
+    const calls = (batch: number, reverse = false) => {
+      const values = [
+        { id: `batch-${batch}-a`, name: "read", arguments: { path: "a.txt" } },
+        { id: `batch-${batch}-b`, name: "read", arguments: { path: "b.txt" } }
+      ];
+      return reverse ? values.reverse() : values;
+    };
+    let state = apply(initial(), "user.message", { text: "inspect both paths" });
+    state = proposeToolBatch(state, 1, calls(1));
+    state = toolEvent(state, "tool.completed", "batch-1-a", completedReceipt("A", "2026-01-01T00:00:01.000Z"));
+    state = toolEvent(state, "tool.completed", "batch-1-b", completedReceipt("B", "2026-01-01T00:00:02.000Z"));
+    state = proposeToolBatch(state, 2, calls(2));
+    state = toolEvent(state, "tool.completed", "batch-2-b", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
+    state = toolEvent(state, "tool.completed", "batch-2-a", completedReceipt("A", "2026-01-01T00:00:04.000Z"));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    state = proposeToolBatch(state, 3, calls(3, true));
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+  });
+
+  it("accepts legacy repetition snapshots without an outcome signature", () => {
+    expect(isKernelState({
+      ...initial(),
+      lastToolBatchSignature: "legacy-call-signature",
+      repeatedToolBatchCount: 2
+    })).toBe(true);
+    expect(isKernelState({ ...initial(), lastToolBatchOutcomeSignature: 42 })).toBe(false);
+  });
+
   it("decides every phase and rejects stale effects", () => {
     const base = initial();
     expect(isTerminal(base)).toBe(false);
@@ -224,11 +591,54 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(incomplete.phase).toBe("ready_model");
     expect(incomplete.messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(incomplete.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
     incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
       message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
     });
     expect(incomplete.proposedOutcome).toMatchObject({
       kind: "recoverable_failure", code: "terminal_protocol_missing"
+    });
+    const failedEvidence = settleModel({
+      ...inFlight(),
+      evidence: [{ ...diagnosticEvidence("failed-evidence"), status: "failed" }]
+    }, "model.completed", {
+      message: { role: "assistant", content: "failed evidence is insufficient" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(failedEvidence.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    const provenanceOnly = settleModel({
+      ...inFlight(),
+      evidence: [{
+        ...diagnosticEvidence("subject-attestation"),
+        data: { source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, diagnostic: { productDigest: "opaque" } }
+      }]
+    }, "model.completed", {
+      message: { role: "assistant", content: "attestation does not answer the task" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(provenanceOnly.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    const evidenceBacked = settleModel({
+      ...inFlight(),
+      evidence: [diagnosticEvidence("current-run-evidence")]
+    }, "model.completed", {
+      message: { role: "assistant", content: "evidence-backed answer" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one terminal action");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("complete_task");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("Non-terminal tools are unavailable");
+    const protocolError = settleModel(inFlight(), "model.completed", {
+      message: { role: "assistant", content: "invalid boundary" },
+      toolCalls: [],
+      finishReason: "protocol_error"
+    });
+    expect(protocolError.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: "model_protocol_error"
     });
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
@@ -355,11 +765,31 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
 
+    let bodyCompletion = withPendingTool("complete-with-body", "complete_task");
+    bodyCompletion = {
+      ...bodyCompletion,
+      messages: bodyCompletion.messages.map((message, index) => index === bodyCompletion.messages.length - 1
+        ? { ...message, content: "Detailed same-turn answer." } : message)
+    };
+    bodyCompletion = toolEvent(bodyCompletion, "tool.completed", "complete-with-body", {
+      ok: true, output: JSON.stringify({ summary: "short fallback" }),
+      observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
+    });
+    expect(bodyCompletion).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: { kind: "completed", message: "Detailed same-turn answer." }
+    });
+
     let repairedCompletion = withPendingTool("repair-complete", "complete_task");
     repairedCompletion = {
       ...repairedCompletion,
       completionRepairAttempts: 1,
-      messages: [...repairedCompletion.messages, { role: "assistant", content: "Detailed final answer." }]
+      completionRepair: { kind: "protected_completion", answer: "Detailed final answer." },
+      evidence: [diagnosticEvidence("repair-evidence")],
+      messages: [...repairedCompletion.messages, {
+        role: "assistant",
+        content: "Repair-turn text must not replace the protected answer."
+      }]
     };
     repairedCompletion = toolEvent(repairedCompletion, "tool.completed", "repair-complete", {
       ok: true, output: JSON.stringify({ summary: "short summary" }),
@@ -555,6 +985,49 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toThrow("active model turn must agree");
     expect(() => assertKernelInvariants({ ...initial(), phase: "needs_input", outcome: { kind: "needs_input", requestId: "x", message: "x" } })).not.toThrow();
     expect(() => assertKernelInvariants({ ...initial(), phase: "terminal", outcome: { kind: "completed", message: "x", evidence: [] } })).not.toThrow();
+    expect(isKernelState({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "   " }
+    })).toBe(false);
+    expect(() => assertKernelInvariants({
+      ...initial(), completionRepairAttempts: 1
+    })).toThrow("attempts require explicit repair state");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" }
+    })).toThrow("requires current-run referenceable evidence");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "outcome_pending",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-invariant")],
+      proposedOutcome: { kind: "needs_input", requestId: "ask", message: "question" }
+    })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "needs_input",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-snapshot")],
+      outcome: { kind: "needs_input", requestId: "forged", message: "question" }
+    })).toThrow("only for a pending tool approval");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "needs_input",
+      completionRepair: { kind: "protected_recovery", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-approval")],
+      toolCallIds: ["approve-read"],
+      pendingTools: [{
+        request: { callId: "approve-read", name: "read", arguments: null },
+        modelTurn: { turnId: 1, effectRevision: 1 },
+        approval: "pending",
+        started: false
+      }],
+      outcome: { kind: "needs_input", requestId: "approve-read", message: "Approve read." }
+    })).not.toThrow();
     expect(() => assertKernelInvariants({
       ...initial(), activeProcessIds: ["duplicate", "duplicate"]
     })).toThrow("Duplicate active process IDs");
@@ -707,12 +1180,12 @@ describe("agent-kernel exhaustive protocol behavior", () => {
 
     expect(apply(state, "profile.resolved", { profileId: 1 }).frozenProfile).toBeUndefined();
     state = apply(state, "profile.resolved", {
-      profileId: "secure", digest: "digest", artifactId: "artifact", source: "workspace"
+      profileId: "secure", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "workspace"
     });
     expect(state.frozenProfile).toMatchObject({ qualifiedName: "secure", source: "workspace" });
     expect(apply(state, "skill.loaded", { qualifiedName: "bad", digest: 1 }).frozenSkills).toHaveLength(0);
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:review", digest: "digest", artifactId: "artifact", source: "workspace"
+      qualifiedName: "workspace:review", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "workspace"
     });
     expect(state.frozenSkills).toHaveLength(1);
     expect(apply(state, "customization.frozen", {
@@ -723,7 +1196,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state.frozenCustomization).toEqual({ artifactId: "c".repeat(64), digest: "d".repeat(64) });
     expect(apply(state, "skill.loaded", {
-      qualifiedName: "workspace:review", digest: "digest-two", artifactId: "artifact-two", source: "home"
+      qualifiedName: "workspace:review", digest: "d".repeat(64), artifactId: "e".repeat(64), source: "home"
     }).frozenSkills).toHaveLength(1);
 
     state = apply(state, "process.spawned", {
@@ -886,12 +1359,12 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(forgedByUser.evidence).toEqual([]);
 
     state = apply(forgedByUser, "profile.resolved", {
-      profileId: "builtin:secure", digest: "profile-digest", artifactId: "profile-artifact", source: "builtin"
+      profileId: "builtin:secure", digest: "a".repeat(64), artifactId: "b".repeat(64), source: "builtin"
     });
     expect(state.frozenProfile).toMatchObject({ qualifiedName: "builtin:secure", source: "builtin" });
 
     state = apply(state, "skill.loaded", {
-      qualifiedName: "builtin:typescript", digest: "skill-digest", artifactId: "skill-artifact", source: "builtin",
+      qualifiedName: "builtin:typescript", digest: "c".repeat(64), artifactId: "d".repeat(64), source: "builtin",
       executionManifestArtifactId: "a".repeat(64), executionManifestDigest: "b".repeat(64)
     });
     expect(state.frozenSkills.at(-1)).toMatchObject({
@@ -900,15 +1373,15 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
 
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:invalid-artifact", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:invalid-artifact", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "not-a-digest", executionManifestDigest: "b".repeat(64)
     });
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:missing-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:missing-manifest-digest", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "c".repeat(64)
     });
     state = apply(state, "skill.loaded", {
-      qualifiedName: "workspace:invalid-manifest-digest", digest: "skill-digest", artifactId: "skill-artifact",
+      qualifiedName: "workspace:invalid-manifest-digest", digest: "c".repeat(64), artifactId: "d".repeat(64),
       source: "workspace", executionManifestArtifactId: "c".repeat(64), executionManifestDigest: "not-a-digest"
     });
     expect(state.frozenSkills.slice(-3).every((item) => item.executionManifestArtifactId === undefined)).toBe(true);

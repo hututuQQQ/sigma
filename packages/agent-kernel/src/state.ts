@@ -64,6 +64,12 @@ export interface SemanticFailureCluster {
   progress: SemanticProgressWatermark;
 }
 
+export type CompletionRepairState =
+  | { kind: "evidence_acquisition" }
+  | { kind: "terminal_action" }
+  | { kind: "protected_completion"; answer: string }
+  | { kind: "protected_recovery"; answer: string };
+
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
   sessionId: string;
@@ -97,12 +103,19 @@ export interface KernelState {
   activeProcessIds: string[];
   childIds: string[];
   completionRepairAttempts: number;
+  /** Durable reason for a bounded protocol-repair turn. Protected completion
+   * locks the exact evidence-backed natural answer while the model chooses one
+   * typed terminal intent: finalize it or request concrete user input. */
+  completionRepair?: CompletionRepairState;
   continuationAttempts: number;
   repeatedToolBatchCount: number;
   receiptCountAtLastUserInput: number;
   semanticProgress: SemanticProgressWatermark;
   semanticFailureCluster?: SemanticFailureCluster;
+  /** Signature of the most recently fully completed tool-call batch. */
   lastToolBatchSignature?: string;
+  /** Stable receipt semantics for that completed batch; excludes call IDs and timestamps. */
+  lastToolBatchOutcomeSignature?: string;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -159,6 +172,15 @@ function nonNegativeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function validToolBatchProgressState(state: Record<string, unknown>): boolean {
+  if (state.lastToolBatchSignature !== undefined && typeof state.lastToolBatchSignature !== "string") return false;
+  if (state.lastToolBatchOutcomeSignature === undefined) return true;
+  return typeof state.lastToolBatchSignature === "string" && state.lastToolBatchSignature.length > 0
+    && typeof state.lastToolBatchOutcomeSignature === "string"
+    && /^[a-f0-9]{64}$/u.test(state.lastToolBatchOutcomeSignature)
+    && Number.isSafeInteger(state.repeatedToolBatchCount) && Number(state.repeatedToolBatchCount) >= 1;
+}
+
 export function isSemanticProgressWatermark(value: unknown): value is SemanticProgressWatermark {
   const progress = record(value);
   return Boolean(progress && [progress.workspaceChanges, progress.durableEvidence, progress.revision]
@@ -174,6 +196,18 @@ export function isSemanticFailureCluster(value: unknown): value is SemanticFailu
     && Array.isArray(cluster.diagnosticCodes)
     && cluster.diagnosticCodes.every((item) => typeof item === "string" && item.length > 0)
     && isSemanticProgressWatermark(cluster.progress));
+}
+
+export function isCompletionRepairState(value: unknown): value is CompletionRepairState {
+  const repair = record(value);
+  if (!repair) return false;
+  if (repair.kind === "evidence_acquisition" || repair.kind === "terminal_action") {
+    return Object.keys(repair).length === 1;
+  }
+  return (repair.kind === "protected_completion" || repair.kind === "protected_recovery")
+    && typeof repair.answer === "string"
+    && repair.answer.trim().length > 0
+    && Object.keys(repair).every((key) => key === "kind" || key === "answer");
 }
 
 function validSemanticState(state: Record<string, unknown>): boolean {
@@ -212,7 +246,9 @@ export function isKernelState(value: unknown): value is KernelState {
     validFrozenState(state),
     Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
     Array.isArray(state.childIds),
+    state.completionRepair === undefined || isCompletionRepairState(state.completionRepair),
     validSemanticState(state),
+    validToolBatchProgressState(state),
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
       state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
   ].every(Boolean);

@@ -40,6 +40,7 @@ function receipt(request: ToolRequest, startedAt: string, value: unknown, effect
     callId: request.callId,
     ok: true,
     output: JSON.stringify(value),
+    result: value as JsonValue,
     observedEffects: effects,
     actualEffects: effects,
     artifacts: [],
@@ -109,6 +110,27 @@ function checkpointTool(): RegisteredEffectTool {
     descriptor: descriptor("list_checkpoints", "List durable mutation checkpoints for this session.", {}),
     async execute(request, context) {
       return receipt(request, new Date().toISOString(), await requiredControl(context).listCheckpoints(), ["runtime.control"]);
+    }
+  };
+}
+
+function requestReviewTool(): RegisteredEffectTool {
+  return {
+    descriptor: descriptor(
+      "request_review",
+      "Request Sigma's internal read-only reviewer for every eligible non-documentation workspace delta. Supply no evidence IDs: the runtime selects pending deltas and their passed validation evidence. This is internal review, not a user decision or approval prompt. A prior reviewer infrastructure/interruption failure can be retried explicitly with this tool; genuine changes_requested findings must be addressed first. On success, cite the resulting review evidence ID from the next current-run evidence ledger.",
+      {}
+    ),
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const result = await requiredControl(context).requestReview();
+      const base = receipt(request, startedAt, result, ["runtime.control"]);
+      return result.status === "validation_required" || result.status === "changes_required" ? {
+        ...base,
+        ok: false,
+        diagnostics: [result.status === "validation_required"
+          ? "review_validation_required" : "review_changes_required"]
+      } : base;
     }
   };
 }
@@ -200,7 +222,8 @@ function loadSkillTool(): RegisteredEffectTool {
 
 export function registerControlTools(registry: EffectToolRegistry): EffectToolRegistry {
   for (const tool of [
-    readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), restoreRunChangesTool(), loadSkillTool()
+    readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), requestReviewTool(),
+    restoreRunChangesTool(), loadSkillTool()
   ]) {
     registry.register(tool);
   }

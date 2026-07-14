@@ -6,8 +6,10 @@ import {
   EVENT_SCHEMA_VERSION,
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
+  isCompletionReferenceableEvidence,
   type JsonValue,
-  type ToolDescriptor
+  type ToolDescriptor,
+  type ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -105,5 +107,71 @@ describe("runtime recovery convergence", () => {
     const restored = await restoreStoredSession(store, sessionId, 60_000);
     expect(restored.state.semanticProgress).toEqual({ workspaceChanges: 0, durableEvidence: 0, revision: 0 });
     expect(restored.state.semanticFailureCluster).toBeUndefined();
+  });
+
+  it("preserves failed validation status, scope, and execution claim across snapshot restore", async () => {
+    const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-validation-restore-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
+    const sessionId = "validation-session";
+    const runId = "validation-run";
+    const startedAt = "2026-07-12T00:00:00.000Z";
+    await store.append({
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      seq: 1,
+      eventId: "validation-created",
+      sessionId,
+      runId,
+      occurredAt: startedAt,
+      type: "session.created",
+      authority: "runtime",
+      payload: completeAgentEventPayload("session.created", { workspacePath, mode: "change" })
+    }, 0);
+    const current = createKernelState({
+      sessionId,
+      runId,
+      mode: "change",
+      startedAt,
+      deadlineAt: "2026-07-12T00:15:00.000Z"
+    });
+    const failed: ValidationEvidence = {
+      evidenceId: "failed-validation",
+      sessionId,
+      runId,
+      kind: "validation",
+      status: "failed",
+      createdAt: startedAt,
+      producer: { authority: "tool", id: "validate" },
+      summary: "tests exited 1",
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: ["stderr"],
+        workspaceDeltaEvidenceIds: ["delta"],
+        checkpointIds: ["checkpoint"]
+      }
+    };
+    current.evidence = [failed];
+    await store.writeSnapshot({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId,
+      seq: 1,
+      createdAt: startedAt,
+      state: { ...current, lastSeq: 1 }
+    });
+
+    const restored = await restoreStoredSession(store, sessionId, 60_000);
+    expect(restored.state.evidence).toEqual([failed]);
+    expect(isCompletionReferenceableEvidence(restored.state.evidence[0]!, sessionId, runId)).toBe(true);
   });
 });

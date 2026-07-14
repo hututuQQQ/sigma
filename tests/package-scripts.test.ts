@@ -23,6 +23,7 @@ describe("package script semantics", () => {
     }
     expect(scripts["package:harbor-runtime"]).toBe(scripts["bench:tb:config:portable"]);
     expect(scripts["eval:agent"]).toContain("scripts/eval/agent-eval.mjs");
+    expect(scripts["eval:report"]).toBe("node scripts/eval/report.mjs");
     expect(JSON.stringify(scripts)).not.toContain("DEEPSEEK_API_KEY=");
   });
 
