@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { createTestRenderer } from "@opentui/core/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventEnvelope, RunCommand, RunOutcome, RuntimeClient, SessionOverview, SessionRef, StartSession
 } from "../packages/agent-protocol/src/index.js";
@@ -230,9 +230,13 @@ describe("Sigma OpenTUI", () => {
   it("shows contextual help and routes approval choices without editing the composer", async () => {
     const harness = await viewHarness();
     try {
+      const activityToggle = vi.spyOn(harness.view, "toggleActivity");
       await harness.setup.mockInput.typeText("?");
       await harness.setup.flush();
       expect(harness.setup.captureCharFrame()).toContain("Sigma shortcuts");
+      harness.setup.mockInput.pressKey("o", { ctrl: true });
+      await harness.setup.flush();
+      expect(activityToggle).not.toHaveBeenCalled();
       await harness.setup.mockInput.typeText("must-not-leak");
       harness.setup.mockInput.pressEscape();
       await harness.setup.flush();
@@ -244,10 +248,89 @@ describe("Sigma OpenTUI", () => {
       }));
       harness.view.update(snapshot(presentation));
       await harness.setup.mockInput.typeText("x");
+      harness.setup.mockInput.pressKey("o", { ctrl: true });
+      harness.setup.mockInput.pressKey("a", { ctrl: true });
+      await harness.setup.mockInput.pressKeys(["\u001b[97;1:2u", "\u001b[13;1:2u"]);
+      await harness.setup.flush();
+      expect(activityToggle).not.toHaveBeenCalled();
+      expect(harness.approvals).toEqual([]);
+      harness.setup.mockInput.pressCtrlC();
+      await harness.setup.mockInput.pressKeys(["\u001b[99;5:2u"]);
+      await harness.setup.flush();
+      expect(harness.interrupts()).toBe(1);
       harness.setup.mockInput.pressKey("a");
       await harness.setup.flush();
       expect(harness.approvals).toEqual([{ requestId: "approval", decision: "always_allow" }]);
       expect(harness.setup.captureCharFrame()).toContain("pnpm test");
+    } finally { harness.view.destroy(); }
+  });
+
+  it("relayouts a scrolled help modal when the terminal is resized", async () => {
+    const harness = await viewHarness(56, 10);
+    try {
+      await harness.setup.mockInput.typeText("?");
+      await harness.setup.flush();
+      await harness.setup.mockInput.pressKeys(["\u001b[6~"]);
+      await harness.setup.flush();
+      expect(harness.setup.captureCharFrame()).not.toContain("Sigma shortcuts");
+
+      harness.setup.resize(56, 18);
+      await harness.setup.flush();
+      const resized = harness.setup.captureCharFrame();
+      expect(resized).not.toContain("Sigma shortcuts");
+      expect(resized).toContain("/help");
+    } finally { harness.view.destroy(); }
+  });
+
+  it("keeps approval chrome fixed, opaque, and usable while long arguments scroll", async () => {
+    const harness = await viewHarness(80, 24);
+    try {
+      let presentation = projectEvent(createPresentationState(), event(1, "user.message", {
+        text: "UNDERLYING_TRANSCRIPT_MUST_NOT_BLEED_THROUGH"
+      }));
+      presentation = projectEvent(presentation, event(2, "tool.approval_requested", {
+        requestId: "long-approval", toolName: "shell", reason: "Run the requested checks",
+        effects: ["process.spawn"],
+        arguments: { commands: Array.from({ length: 80 }, (_, index) => `command-${String(index).padStart(3, "0")}`) }
+      }));
+      harness.view.update(snapshot(presentation));
+      await harness.setup.flush();
+
+      const initial = harness.setup.captureCharFrame();
+      expect(initial).toContain("Approval required (1/1)");
+      expect(initial).toContain("Allow once");
+      expect(initial).toContain("Always allow matching effects this session");
+      expect(initial).toContain("PgUp/PgDn arguments");
+      expect(initial).not.toContain("UNDERLYING_TRANSCRIPT_MUST_NOT_BLEED_THROUGH");
+
+      await harness.setup.mockInput.pressKeys(["\u001b[6~"]);
+      await harness.setup.flush();
+      const scrolledLines = harness.setup.captureCharFrame().split("\n");
+      const choicesStart = scrolledLines.findIndex((line) => line.includes("Allow once"));
+      expect(choicesStart).toBeGreaterThan(0);
+      expect(scrolledLines.slice(0, choicesStart).join("\n")).not.toContain("command-000");
+
+      harness.setup.mockInput.pressArrow("down");
+      await harness.setup.flush();
+      const selectedLines = harness.setup.captureCharFrame().split("\n");
+      expect(selectedLines.slice(0, choicesStart)).toEqual(scrolledLines.slice(0, choicesStart));
+      expect(selectedLines.join("\n")).toContain("› 2. Always allow matching effects this session");
+
+      harness.setup.resize(100, 30);
+      await harness.setup.flush();
+      const resized = harness.setup.captureCharFrame();
+      expect(resized).not.toContain("command-000");
+      expect(resized).toContain("› 2. Always allow matching effects this session");
+
+      harness.setup.resize(40, 5);
+      await harness.setup.flush();
+      const compact = harness.setup.captureCharFrame();
+      expect(compact).toContain("Approval required");
+      expect(compact).toContain("1. Allow once");
+      expect(compact).toContain("2. Always allow matching effects");
+      expect(compact).toContain("3. Deny");
+      harness.setup.mockInput.pressEnter();
+      expect(harness.approvals).toContainEqual({ requestId: "long-approval", decision: "always_allow" });
     } finally { harness.view.destroy(); }
   });
 

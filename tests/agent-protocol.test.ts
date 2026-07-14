@@ -150,6 +150,8 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
   it("keeps provenance attestations durable but ineligible for task completion", () => {
     const diagnostic = evidenceFixture();
     expect(isCompletionEligibleEvidence(diagnostic, "session", "run")).toBe(true);
+    expect(evidenceSupportsClaim(diagnostic, "validation_passed")).toBe(false);
+    expect(evidenceSupportsClaim(diagnostic, "validation_executed")).toBe(false);
     expect(isCompletionEligibleEvidence({
       ...diagnostic,
       data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
@@ -192,6 +194,21 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     expect(evidenceSupportsClaim(failed, "validation_executed")).toBe(true);
     expect(evidenceSupportsClaim(failed, "validation_passed")).toBe(false);
     expect(evidenceSupportsClaim(failed, "acceptance_met")).toBe(false);
+    expect(isCompletionReferenceableEvidence(failed, "other-session", "run")).toBe(false);
+    expect(isCompletionReferenceableEvidence(failed, "session", "other-run")).toBe(false);
+
+    const passed: ValidationEvidence = {
+      ...failed,
+      evidenceId: "passed-validation",
+      status: "passed",
+      summary: "tests exited 0",
+      data: {
+        ...failed.data,
+        exitCode: 0,
+        termination: { ...failed.data.termination!, exitCode: 0 }
+      }
+    };
+    expect(evidenceSupportsClaim(passed)).toBe(true);
 
     const launchFailure: ValidationEvidence = {
       ...failed,
