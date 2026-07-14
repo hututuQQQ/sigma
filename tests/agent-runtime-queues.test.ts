@@ -274,14 +274,16 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("substantive answer is now protected");
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input and non-terminal tools are unavailable");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("substantive response is now protected");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("complete_task");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("Non-terminal tools are unavailable");
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task"]);
+      .toEqual(["complete_task", "request_user_input"]);
   }, 30_000);
 
-  it("rejects an unprojected input request without hiding the protected natural answer", async () => {
+  it("repairs an evidence-backed natural question into durable NeedsInput", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-protected-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -289,19 +291,19 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: {
           role: "assistant",
           content: "",
-          toolCalls: [{ id: "read-protected-answer", name: "read", arguments: { path: "seed.txt" } }]
+          toolCalls: [{ id: "read-protected-question", name: "read", arguments: { path: "seed.txt" } }]
         },
         finishReason: "tool_calls"
       },
-      { message: { role: "assistant", content: "The protected answer is seed." }, finishReason: "stop" },
+      { message: { role: "assistant", content: "Which target should I change?" }, finishReason: "stop" },
       {
         message: {
           role: "assistant",
           content: "",
           toolCalls: [{
-            id: "hidden-input-request",
+            id: "typed-protected-input",
             name: "request_user_input",
-            arguments: { message: "Would you like anything else?" }
+            arguments: { message: "Which target should I change?" }
           }]
         },
         finishReason: "tool_calls"
@@ -314,19 +316,42 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir: path.join(workspace, ".agent"),
       tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
     });
-    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
-    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
-
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: expect.stringContaining("The protected answer is seed.")
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "inspect seed, then change the target I select"
     });
-    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toEqual(["complete_task"]);
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input",
+      requestId: "typed-protected-input",
+      message: "Which target should I change?"
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].toolChoice).toBe("required");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
     const events = await storedEvents(store, session.sessionId);
-    expect(events.some((event) => event.type === "run.suspended")).toBe(false);
-    expect(events.some((event) => (event.type === "tool.requested" || event.type === "tool.failed")
-      && (event.payload as { callId?: string }).callId === "hidden-input-request")).toBe(false);
+    expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "run.completed" || event.type === "run.failed"))
+      .toHaveLength(0);
+    expect(events.some((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "typed-protected-input")).toBe(true);
+
+    const restored = await restoreStoredSession(store, session.sessionId, 30_000);
+    expect(restored.state).toMatchObject({
+      phase: "needs_input",
+      completionRepairAttempts: 0,
+      outcome: {
+        kind: "needs_input",
+        requestId: "typed-protected-input",
+        message: "Which target should I change?"
+      }
+    });
+    expect(restored.state.completionRepair).toBeUndefined();
+    expect(restored.state.toolCallIds).toEqual(["read-protected-question", "typed-protected-input"]);
+    expect(restored.state.evidence.length).toBeGreaterThan(0);
   }, 30_000);
 
   it("keeps a failed receipt in evidence repair until non-failed durable evidence exists", async () => {
@@ -401,12 +426,60 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
+      code: "terminal_protocol_invalid",
       message: expect.stringMatching(/The file contains seed[\s\S]*tool_arguments_invalid/u)
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task"]);
+      .toEqual(["complete_task", "request_user_input"]);
+  }, 30_000);
+
+  it("preserves a concrete question when a malformed input repair fails once", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-input-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-before-malformed-input", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "Which target should I change?" }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "malformed-input",
+            name: "request_user_input",
+            arguments: { message: "" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "change the selected target" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_invalid",
+      message: expect.stringMatching(/Which target should I change\?[\s\S]*invalid_user_input_request/u)
+    });
+    expect(gateway.requests).toHaveLength(3);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "tool.failed"
+      && (event.payload as { callId?: string }).callId === "malformed-input")).toHaveLength(1);
+    expect(events.some((event) => event.type === "run.suspended")).toBe(false);
   }, 30_000);
 
   it("does not execute a tool that was not offered during terminal repair", async () => {
@@ -439,8 +512,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: expect.stringMatching(/The file contains seed[\s\S]*single required complete_task/u)
+      code: "terminal_protocol_invalid",
+      message: expect.stringMatching(/The file contains seed[\s\S]*exactly one complete_task or request_user_input/u)
     });
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.completed"
@@ -542,7 +615,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task"]);
+      .toEqual(["complete_task", "request_user_input"]);
   }, 30_000);
 
   it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {

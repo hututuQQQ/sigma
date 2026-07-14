@@ -17,7 +17,27 @@ import {
 
 export interface RegisteredEffectTool {
   descriptor: ToolDescriptor;
+  /** Trusted, read-only execution probe. It runs only after runtime policy,
+   * approval, and workspace locks are held, but before a mutation checkpoint
+   * is created. Returning a receipt certifies that this exact call requires no
+   * mutation; returning undefined preserves the normal checkpointed path. */
+  probeNoChange?(
+    request: ToolRequest,
+    context: ToolNoChangeProbeContext
+  ): Promise<ToolReceipt | undefined>;
   execute(request: ToolRequest, context: PlannedToolExecutionContext): Promise<ToolReceipt>;
+}
+
+export interface ToolNoChangeProbeContext extends ToolPreparationContext {
+  signal: AbortSignal;
+  callPlan: ToolCallPlan;
+}
+
+export interface ToolNoChangeProbeExecutor {
+  probeNoChange(
+    request: ToolRequest,
+    context: ToolNoChangeProbeContext
+  ): Promise<ToolReceipt | undefined>;
 }
 
 export interface PlannedToolExecutionContext extends ToolExecutionContext {
@@ -196,5 +216,27 @@ export class EffectToolRegistry implements ToolExecutor {
       actualEffects: receipt.actualEffects ?? receipt.observedEffects,
       evidence: receipt.evidence ?? []
     };
+  }
+
+  async probeNoChange(
+    request: ToolRequest,
+    context: ToolNoChangeProbeContext
+  ): Promise<ToolReceipt | undefined> {
+    const tool = this.tools.get(request.name);
+    if (!tool) throw new Error(`Unknown tool '${request.name}'.`);
+    if (!tool.probeNoChange) return undefined;
+    if (context.signal.aborted) throw context.signal.reason ?? new Error("Tool cancelled.");
+    const key = preparedPlanKey(context, request.callId);
+    const prepared = this.preparedPlans.get(key);
+    assertDescriptorArguments(tool.descriptor, request.arguments);
+    if (preparedPlanMismatch(prepared, request)) {
+      throw Object.assign(new Error("Tool arguments changed after the call plan was prepared."), {
+        code: "write_plan_invalid"
+      });
+    }
+    assertPlanEffects(tool.descriptor, context.callPlan);
+    const receipt = await tool.probeNoChange(request, context);
+    if (receipt) this.preparedPlans.delete(key);
+    return receipt;
   }
 }

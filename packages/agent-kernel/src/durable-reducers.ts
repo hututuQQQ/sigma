@@ -1,7 +1,7 @@
 import {
   isBudgetLedgerState,
   isCheckpointRef,
-  isCompletionEligibleEvidence,
+  isCompletionReferenceableEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -40,7 +40,7 @@ function isEvidenceAcquisitionRepair(state: KernelState): boolean {
   return state.completionRepair === undefined
     && state.completionRepairAttempts > 0
     && !state.evidence.some((item) =>
-      isCompletionEligibleEvidence(item, state.sessionId, state.runId));
+      isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
 }
 
 const evidenceRecorded: KernelEventReducer = (state, event) => {
@@ -50,8 +50,8 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
     || state.evidence.some((item) => item.evidenceId === evidence.evidenceId)) return state;
   if (evidence.kind === "user_waiver" && state.evidence.some((item) => item.kind === "user_waiver")) return state;
   const firstCompletionEvidence = isEvidenceAcquisitionRepair(state)
-    && isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
-    && !state.evidence.some((item) => isCompletionEligibleEvidence(item, state.sessionId, state.runId));
+    && isCompletionReferenceableEvidence(evidence, state.sessionId, state.runId)
+    && !state.evidence.some((item) => isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
   const progressed = recordSemanticEvidenceProgress({
     ...state,
     evidence: [...state.evidence, evidence],
@@ -132,7 +132,7 @@ function checkpointRepairUpdate(
     || repair?.kind === "protected_recovery"
     || repair?.kind === "terminal_action";
   if (!protectedOrTerminal || evidence.some((item) =>
-    isCompletionEligibleEvidence(item, state.sessionId, state.runId))) return {};
+    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) return {};
   return {
     completionRepairAttempts: Math.max(1, state.completionRepairAttempts),
     completionRepair: { kind: "evidence_acquisition" },

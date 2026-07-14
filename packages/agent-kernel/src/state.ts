@@ -104,8 +104,8 @@ export interface KernelState {
   childIds: string[];
   completionRepairAttempts: number;
   /** Durable reason for a bounded protocol-repair turn. Protected completion
-   * locks the exact evidence-backed natural answer that the repair may only
-   * finalize, never replace with a user-input request. */
+   * locks the exact evidence-backed natural answer while the model chooses one
+   * typed terminal intent: finalize it or request concrete user input. */
   completionRepair?: CompletionRepairState;
   continuationAttempts: number;
   repeatedToolBatchCount: number;

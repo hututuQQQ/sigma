@@ -96,7 +96,17 @@ function commandEvidence(
   if (validation) return {
     ...base, kind: "validation", summary: `Validation '${command}' exited with ${String(result.exitCode)}.`,
     data: {
-      validator: "command", command, ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+      validator: "command", command, exitCode: result.exitCode,
+      termination: {
+        processStarted: result.failure === undefined,
+        state: result.state,
+        exitCode: result.exitCode,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        idleTimedOut: result.idleTimedOut,
+        cancelled: result.cancelled,
+        ...(result.failure ? { failureCode: result.failure.code } : {})
+      },
       artifactIds: imported.ids, workspaceDeltaEvidenceIds: []
     }
   };

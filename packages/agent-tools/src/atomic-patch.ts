@@ -18,6 +18,7 @@ import {
 } from "./atomic-patch-preparation.js";
 import { commitPreparedPatch, type AtomicPatchCleanupWarning } from "./atomic-patch-transaction.js";
 import type { AtomicPatchMutation, PreparedPatchChange } from "./atomic-patch-types.js";
+import { readStableWorkspaceTextFile } from "./stable-workspace-read.js";
 
 export { AtomicPatchError, parseUnifiedPatch } from "./atomic-patch-parser.js";
 export { AtomicPatchCleanupError, AtomicPatchRollbackError } from "./atomic-patch-transaction.js";
@@ -37,10 +38,12 @@ export interface AtomicTextReplaceOptions {
   requireExisting?: boolean;
   /** Durable state root. Transaction data is always kept outside the workspace. */
   stateRootDir?: string;
+  signal?: AbortSignal;
   transform(content: string, exists: boolean): string;
 }
 
 export interface AtomicPatchResult {
+  changed: boolean;
   files: string[];
   delta: WorkspaceDelta;
   preimageHashes: Record<string, string>;
@@ -160,8 +163,20 @@ async function patchResult(
   }
   for (const values of [delta.added, delta.modified, delta.deleted]) values.sort();
   return {
+    changed: true,
     files: [...touched].sort(), delta, preimageHashes, postimageHashes,
     ...(cleanupWarning ? { cleanupWarning } : {})
+  };
+}
+
+function unchangedTextResult(relative: string, bytes: Buffer): AtomicPatchResult {
+  const digest = patchFileHash(bytes);
+  return {
+    changed: false,
+    files: [relative],
+    delta: { added: [], modified: [], deleted: [] },
+    preimageHashes: { [relative]: digest },
+    postimageHashes: { [relative]: digest }
   };
 }
 
@@ -231,6 +246,16 @@ export async function replaceWorkspaceTextFile(
     throw new AtomicPatchError(`Text replacement requires a regular file: ${relative}`);
   }
   const content = options.transform(original.content, original.exists);
+  const replacementBytes = Buffer.from(content, "utf8");
+  if (original.exists && original.bytes.equals(replacementBytes)) {
+    const stable = await readStableWorkspaceTextFile(
+      workspace,
+      relative,
+      options.signal ?? new AbortController().signal,
+      { maxBytes: Math.max(1, original.bytes.byteLength) }
+    );
+    if (stable.bytes.equals(replacementBytes)) return unchangedTextResult(relative, stable.bytes);
+  }
   return await commitChanges(workspace, [{
     ...(original.exists ? { source: relative } : {}),
     target: relative,

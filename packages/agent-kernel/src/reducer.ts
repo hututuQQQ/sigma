@@ -3,20 +3,27 @@ import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
 import {
   completionRepairFailureMessage,
   completionRepairRequiresTerminalAction,
-  completionSummary,
   conflictingTerminalBatch,
-  failedTerminalRepairState,
   hasCompletionRepair,
   incompleteModelCompletion,
   protectedCompletionAnswer,
-  repairConflictingTerminalBatch,
-  requestedInput
+  repairConflictingTerminalBatch
 } from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
-import { recordSemanticToolResult, semanticInfrastructureFailureMessage, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
+import { recordSemanticToolResult } from "./semantic-failures.js";
 import { completedToolBatchProgress, repeatsCompletedToolBatch } from "./tool-batch-progress.js";
+import {
+  acceptsOutcomeRevision,
+  isRecoverySuspension,
+  nextPhase,
+  pendingForEvent,
+  protectedToolBatchFailure,
+  proposedOutcomeState,
+  terminalReceiptTransition,
+  terminalState
+} from "./terminal-reducer-helpers.js";
 function objectPayload(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, JsonValue>
@@ -30,35 +37,6 @@ function supersededToolMessages(state: KernelState): ModelMessage[] {
     content: `Failed tool receipt ID: ${pending.request.callId}\nSuperseded by a newer user instruction; no successful receipt or side effect may be inferred.`
   }));
 }
-function terminal(state: KernelState, outcome: RunOutcome): KernelState {
-  return {
-    ...state,
-    phase: "terminal",
-    activeModelTurn: undefined,
-    activeModelSemanticDelta: undefined,
-    pendingTools: [],
-    completionRepairAttempts: 0,
-    completionRepair: undefined,
-    proposedOutcome: undefined,
-    outcome
-  };
-}
-function propose(state: KernelState, outcome: RunOutcome): KernelState {
-  return {
-    ...state,
-    phase: "outcome_pending",
-    activeModelTurn: undefined,
-    activeModelSemanticDelta: undefined,
-    proposedOutcome: outcome
-  };
-}
-
-function nextPhase(pending: PendingTool[]): KernelState["phase"] {
-  if (pending.some((item) => item.approval === "pending")) return "needs_input";
-  if (pending.some((item) => item.started)) return "tool_in_flight";
-  return pending.length > 0 ? "tool_pending" : "ready_model";
-}
-
 function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): PendingTool[] {
   return calls.map((call): PendingTool => ({
     request: { callId: call.id, name: call.name, arguments: call.arguments },
@@ -135,22 +113,6 @@ const followUpInput: EventReducer = (state, event, payload) => payload.status ==
   ? state
   : userInput(state, event, payload);
 
-function pendingForEvent(state: KernelState, payload: Record<string, JsonValue>): PendingTool | undefined {
-  const turn = modelTurn(payload);
-  const callId = text(payload.callId);
-  if (!turn || !callId) return undefined;
-  return state.pendingTools.find((item) => item.request.callId === callId
-    && item.modelTurn.turnId === turn.turnId
-    && item.modelTurn.effectRevision === turn.effectRevision);
-}
-
-function acceptsOutcomeRevision(state: KernelState, payload: Record<string, JsonValue>): boolean {
-  if (payload.outcomeRevision === undefined) return true;
-  return Number.isInteger(payload.outcomeRevision)
-    && payload.outcomeRevision === state.revision - 1
-    && state.phase === "outcome_pending";
-}
-
 const modelStarted: EventReducer = (state, _event, payload) => {
   const turn = modelTurn(payload);
   if (state.phase !== "ready_model" || !turn || turn.effectRevision !== state.revision - 1) return state;
@@ -163,24 +125,6 @@ const modelSemanticDelta: EventReducer = (state, _event, payload) => {
   return { ...state, activeModelSemanticDelta: true };
 };
 
-function protectedToolBatchFailure(
-  state: KernelState,
-  calls: readonly ModelToolCall[]
-): string | null {
-  if (state.completionRepair?.kind === "protected_completion") {
-    return calls.length === 1 && calls[0]?.name === "complete_task"
-      ? null
-      : "The protected completion repair attempted an action other than the single required complete_task call.";
-  }
-  if (state.completionRepair?.kind !== "protected_recovery") return null;
-  if (calls.some((call) => call.name === "request_user_input")) {
-    return "Protected completion recovery attempted to replace the answer with a user-input request.";
-  }
-  return calls.length > 1 && calls.some((call) => call.name === "complete_task")
-    ? "Protected completion recovery mixed complete_task with other tool calls."
-    : null;
-}
-
 const modelCompleted: EventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
   const message = modelMessage(payload.message);
@@ -191,17 +135,17 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
   if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
   const protectedFailure = protectedToolBatchFailure(state, calls);
   if (protectedFailure) {
-    return propose({ ...completedState, messages }, {
+    return proposedOutcomeState({ ...completedState, messages }, {
       kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: completionRepairFailureMessage(state, protectedFailure)
+      code: protectedFailure.code,
+      message: completionRepairFailureMessage(state, protectedFailure.message)
     });
   }
   const identifiers = calls.map((call) => call.id);
   const seen = new Set(state.toolCallIds);
   const duplicate = identifiers.find((id, index) => identifiers.indexOf(id) !== index || seen.has(id));
   if (duplicate) {
-    return propose({ ...completedState, messages }, {
+    return proposedOutcomeState({ ...completedState, messages }, {
       kind: "recoverable_failure",
       code: "protocol_error",
       message: completionRepairFailureMessage(
@@ -214,7 +158,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
   }
   if (repeatsCompletedToolBatch(state, calls)) {
-    return propose({
+    return proposedOutcomeState({
       ...completedState,
       messages,
       toolCallIds: [...state.toolCallIds, ...identifiers]
@@ -241,7 +185,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
 
 const modelFailed: EventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
-  return propose(state, {
+  return proposedOutcomeState(state, {
     kind: "recoverable_failure",
     code: text(payload.code) || "model_error",
     message: completionRepairFailureMessage(state, text(payload.message))
@@ -307,58 +251,20 @@ const toolFinished: EventReducer = (state, event) => {
   const completedBatch = pendingTools.length === 0 ? completedToolBatchProgress(next, receipt.callId) : {};
   const semantic = recordSemanticToolResult({ ...next, ...completedBatch }, receipt, pending.request.name);
   const progressed = semantic.state;
-  const inputMessage = requestedInput(receipt);
-  if (inputMessage) {
-    if (protectedCompletionAnswer(state)) {
-      return propose(progressed, {
-        kind: "recoverable_failure",
-        code: "terminal_protocol_missing",
-        message: completionRepairFailureMessage(
-          state,
-          "A user-input receipt cannot replace the answer locked for completion finalization."
-        )
-      });
-    }
-    return propose(progressed, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
-  }
-  const summary = completionSummary(receipt);
-  if (summary) {
-    const repairedAnswer = protectedCompletionAnswer(state);
-    return propose(progressed, {
-      kind: "completed",
-      message: repairedAnswer || summary,
-      evidence: progressed.evidence
-    });
-  }
-  const failedTerminalRepair = failedTerminalRepairState(
-    progressed, repairPending, terminalRepairPending, receipt, pendingTools.length);
-  if (failedTerminalRepair) return failedTerminalRepair;
-  if (semantic.limitReached && pendingTools.length === 0 && progressed.semanticFailureCluster) {
-    const cluster = progressed.semanticFailureCluster;
-    return propose(progressed, {
-      kind: "recoverable_failure",
-      code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
-      message: semanticInfrastructureFailureMessage(cluster)
-    });
-  }
-  return progressed;
+  return terminalReceiptTransition({
+    state,
+    progressed,
+    receipt,
+    toolName: pending.request.name,
+    remainingTools: pendingTools.length,
+    repairPending,
+    terminalRepairPending,
+    semanticLimitReached: semantic.limitReached
+  }) ?? progressed;
 };
 
 function isApprovalSuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
   return pendingForEvent(state, payload)?.approval === "pending";
-}
-
-function isRecoverySuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
-  const checkpointRecovery = typeof payload.checkpointId === "string"
-    && Array.isArray(payload.choices)
-    && payload.choices.length === 2
-    && payload.choices[0] === "restore"
-    && payload.choices[1] === "keep";
-  const processRecovery = Array.isArray(payload.processIds)
-    && payload.processIds.length > 0
-    && payload.processIds.every((item) => typeof item === "string" && item.length > 0);
-  const interruptedModelRecovery = state.phase === "model_in_flight" && isCurrentModelTurn(state, payload);
-  return checkpointRecovery || processRecovery || interruptedModelRecovery;
 }
 
 const runSuspended: EventReducer = (state, _event, payload) => {
@@ -370,8 +276,7 @@ const runSuspended: EventReducer = (state, _event, payload) => {
   const legacySuspension = !protectedCompletionAnswer(state)
     && payload.outcomeRevision === undefined
     && payload.callId === undefined;
-  if ((!proposedInputSuspension && !approvalSuspension && !recoverySuspension && !legacySuspension)
-    || (protectedCompletionAnswer(state) && proposedInputSuspension)) return state;
+  if (!proposedInputSuspension && !approvalSuspension && !recoverySuspension && !legacySuspension) return state;
   return {
     ...state,
     ...(Number.isSafeInteger(payload.remainingDeadlineMs) && Number(payload.remainingDeadlineMs) >= 1
@@ -399,13 +304,13 @@ const runFailed: EventReducer = (state, _event, payload) => {
       code: text(payload.code) || "runtime_error",
       message: completionRepairFailureMessage(state, text(payload.message))
     };
-  return terminal(state, outcome);
+  return terminalState(state, outcome);
 };
 
 const runCompleted: EventReducer = (state, _event, payload) => {
   if (!Number.isInteger(payload.outcomeRevision) || !acceptsOutcomeRevision(state, payload)
     || state.proposedOutcome?.kind !== "completed") return state;
-  return terminal(state, { ...state.proposedOutcome, evidence: state.evidence });
+  return terminalState(state, { ...state.proposedOutcome, evidence: state.evidence });
 };
 
 const diagnostic: EventReducer = (state, _event, payload) => {
@@ -469,7 +374,7 @@ const reducers: Partial<Record<AgentEventType, EventReducer>> = {
   "tool.completed": toolFinished,
   "tool.failed": toolFinished,
   "run.suspended": runSuspended,
-  "run.cancelled": (state, _event, payload) => terminal(state, {
+  "run.cancelled": (state, _event, payload) => terminalState(state, {
     kind: "cancelled",
     reason: text(payload.reason) || "cancelled"
   }),

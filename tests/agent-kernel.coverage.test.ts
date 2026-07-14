@@ -202,11 +202,11 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
   });
 
-  it("locks an evidence-backed natural answer against repair-time input requests", () => {
+  it("converges an evidence-backed natural question through a typed durable input request", () => {
     let state = apply(initial(), "user.message", { text: "inspect the current state" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
     state = settleModel(startModel(state), "model.completed", {
-      message: { role: "assistant", content: "The durable result is ready." },
+      message: { role: "assistant", content: "Which target should I change?" },
       toolCalls: [],
       finishReason: "stop"
     });
@@ -215,7 +215,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       completionRepairAttempts: 1,
       completionRepair: {
         kind: "protected_completion",
-        answer: "The durable result is ready."
+        answer: "Which target should I change?"
       }
     });
     const forgedSuspension = apply(state, "run.suspended", {
@@ -224,34 +224,68 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(forgedSuspension).toMatchObject({
       phase: "ready_model",
-      completionRepair: { kind: "protected_completion", answer: "The durable result is ready." },
+      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
       outcome: undefined
     });
 
-    const rejected = settleModel(startModel(state, 2), "model.completed", {
+    state = settleModel(startModel(state, 2), "model.completed", {
       message: {
         role: "assistant",
         content: "",
         toolCalls: [{
-          id: "replace-answer",
+          id: "typed-input-request",
           name: "request_user_input",
-          arguments: { message: "Would you like anything else?" }
+          arguments: { message: "Which target should I change?" }
         }]
       },
       toolCalls: [{
-        id: "replace-answer",
+        id: "typed-input-request",
         name: "request_user_input",
-        arguments: { message: "Would you like anything else?" }
+        arguments: { message: "Which target should I change?" }
       }],
       finishReason: "tool_calls"
     });
-    expect(rejected.pendingTools).toEqual([]);
-    expect(rejected.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: expect.stringContaining("The durable result is ready.")
+    expect(state).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { callId: "typed-input-request", name: "request_user_input" } }]
     });
-    expect(rejected.proposedOutcome?.kind).not.toBe("needs_input");
+    state = toolEvent(state, "tool.completed", "typed-input-request", {
+      ok: true,
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
+      proposedOutcome: {
+        kind: "needs_input",
+        requestId: "typed-input-request",
+        message: "Which target should I change?"
+      }
+    });
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+
+    const outcomeRevision = state.revision;
+    state = apply(state, "run.suspended", {
+      requestId: "typed-input-request",
+      message: "Which target should I change?",
+      outcomeRevision
+    });
+    expect(state).toMatchObject({
+      phase: "needs_input",
+      completionRepairAttempts: 0,
+      outcome: {
+        kind: "needs_input",
+        requestId: "typed-input-request",
+        message: "Which target should I change?"
+      }
+    });
+    expect(state.completionRepair).toBeUndefined();
+    expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 
   it("keeps direct original-turn input requests valid even when evidence already exists", () => {
@@ -313,15 +347,31 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
-    const rejectedInput = proposeToolBatch(state, 3, [{
-      id: "blocked-answer-replacement",
+    let requestedInput = proposeToolBatch(state, 3, [{
+      id: "blocked-input-request",
       name: "request_user_input",
       arguments: { message: "Should I stop the process?" }
     }]);
-    expect(rejectedInput.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure",
-      message: expect.stringContaining("The inspected result is stable.")
+    expect(requestedInput).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { callId: "blocked-input-request", name: "request_user_input" } }],
+      completionRepair: { kind: "protected_recovery", answer: "The inspected result is stable." }
     });
+    requestedInput = toolEvent(requestedInput, "tool.completed", "blocked-input-request", {
+      ok: true,
+      output: JSON.stringify({ message: "Should I stop the process?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(requestedInput.proposedOutcome).toMatchObject({
+      kind: "needs_input",
+      requestId: "blocked-input-request",
+      message: "Should I stop the process?"
+    });
+    expect(() => assertKernelInvariants(requestedInput)).not.toThrow();
 
     const recoveryWork = proposeToolBatch(state, 3, [{
       id: "poll-blocker",
@@ -577,8 +627,19 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one complete_task call");
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input and non-terminal tools are unavailable");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one terminal action");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("complete_task");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("Non-terminal tools are unavailable");
+    const protocolError = settleModel(inFlight(), "model.completed", {
+      message: { role: "assistant", content: "invalid boundary" },
+      toolCalls: [],
+      finishReason: "protocol_error"
+    });
+    expect(protocolError.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: "model_protocol_error"
+    });
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
@@ -921,7 +982,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       ...initial(),
       completionRepairAttempts: 1,
       completionRepair: { kind: "protected_completion", answer: "answer" }
-    })).toThrow("requires current-run eligible evidence");
+    })).toThrow("requires current-run referenceable evidence");
     expect(() => assertKernelInvariants({
       ...initial(),
       phase: "outcome_pending",
@@ -929,7 +990,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       completionRepair: { kind: "protected_completion", answer: "answer" },
       evidence: [diagnosticEvidence("protected-invariant")],
       proposedOutcome: { kind: "needs_input", requestId: "ask", message: "question" }
-    })).toThrow("cannot propose a user-input outcome");
+    })).not.toThrow();
     expect(() => assertKernelInvariants({
       ...initial(),
       phase: "needs_input",

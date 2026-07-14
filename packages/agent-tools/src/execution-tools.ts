@@ -211,7 +211,8 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   };
   if (validation) {
     properties.workspaceDeltaEvidenceIds = {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true
+      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
+      description: "Optional exact unresolved workspace-delta evidence IDs to validate. Omit this field to let the runtime bind every unresolved delta automatically; never guess IDs."
     };
   }
   const required = kind === "shell" ? ["shell", "command"] : ["executable"];
@@ -221,7 +222,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   return {
     descriptor: {
       ...executionToolSchema(kind, validation
-        ? "Run a sandboxed validation command and return typed evidence. With skill and skillScript, the frozen script is prepended to interpreter args."
+        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. A non-zero exited command is referenceable only as validation_executed, never validation_passed. Omit workspaceDeltaEvidenceIds to bind all unresolved deltas automatically. Passed validation makes eligible non-documentation deltas available to Sigma's internal request_review path. With skill and skillScript, the frozen script is prepended to interpreter args."
         : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`, properties, required, effects),
       prepare(value, context) {
         if (kind === "shell") assertAvailableShell(executionArgs(value), options);

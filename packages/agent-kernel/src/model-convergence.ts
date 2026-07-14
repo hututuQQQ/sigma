@@ -1,4 +1,4 @@
-import { isCompletionEligibleEvidence, type JsonValue, type ModelMessage, type ModelToolCall, type RunOutcome, type ToolReceipt } from "agent-protocol";
+import { isCompletionReferenceableEvidence, type JsonValue, type ModelMessage, type ModelToolCall, type RunOutcome, type ToolReceipt } from "agent-protocol";
 import type { KernelState } from "./state.js";
 
 const TERMINAL_PROTOCOL_FAILURE_CODES = new Set([
@@ -93,7 +93,7 @@ export function failedTerminalRepairState(
   const detail = protocolCodes.length > 0 ? protocolCodes.join(", ") : "terminal_action_missing";
   return propose(state, {
     kind: "recoverable_failure",
-    code: "terminal_protocol_missing",
+    code: "terminal_protocol_invalid",
     message: completionRepairFailureMessage(
       state,
       `The model's protocol-repair action failed (${detail}).`
@@ -159,14 +159,14 @@ export function toolBatchSignature(calls: ModelToolCall[]): string {
 }
 
 export function hasCurrentRunEvidence(state: KernelState): boolean {
-  return state.evidence.some((item) => isCompletionEligibleEvidence(item, state.sessionId, state.runId));
+  return state.evidence.some((item) => isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
 }
 
-export function incompleteModelCompletion(
+function earlyFinishReasonState(
   state: KernelState,
   payload: Record<string, JsonValue>,
   messages: ModelMessage[]
-): KernelState {
+): KernelState | null {
   if (payload.finishReason === "length") {
     if (state.continuationAttempts >= 2) {
       return propose({ ...state, messages }, {
@@ -187,14 +187,34 @@ export function incompleteModelCompletion(
       message: completionRepairFailureMessage(state, "Provider blocked the response.")
     });
   }
+  if (payload.finishReason !== "protocol_error") return null;
+  return propose({ ...state, messages }, {
+    kind: "recoverable_failure",
+    code: "model_protocol_error",
+    message: completionRepairFailureMessage(
+      state,
+      "The provider ended the model response at an invalid protocol boundary."
+    )
+  });
+}
+
+export function incompleteModelCompletion(
+  state: KernelState,
+  payload: Record<string, JsonValue>,
+  messages: ModelMessage[]
+): KernelState {
+  const earlyState = earlyFinishReasonState(state, payload, messages);
+  if (earlyState) return earlyState;
   const response = [...messages].reverse().find((message) => message.role === "assistant")?.content.trim() ?? "";
   if (!response) {
     return propose({ ...state, messages }, {
       kind: "recoverable_failure",
-      code: "model_no_action",
+      code: hasCompletionRepair(state) ? "terminal_protocol_missing" : "model_no_action",
       message: completionRepairFailureMessage(
         state,
-        "The model stopped without a response or tool call."
+        hasCompletionRepair(state)
+          ? "The model's protocol-repair turn stopped without choosing a terminal action."
+          : "The model stopped without a response or tool call."
       )
     });
   }
@@ -231,10 +251,13 @@ export function incompleteModelCompletion(
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "Your evidence-backed response stopped without finalizing its terminal protocol. The substantive answer is now protected. This repair turn requires exactly one complete_task call with explicit criteria and exact evidence IDs. request_user_input and non-terminal tools are unavailable because this turn may finalize the prior answer but may not replace it. Do not repeat or revise the natural-language response."
+      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidence IDs when the task is finished, or call request_user_input with one concrete question when a user decision would materially change the result. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
-    completionRepair: { kind: "protected_completion", answer: response },
+    completionRepair: {
+      kind: "protected_completion",
+      answer: protectedCompletionAnswer(state) ?? response
+    },
     phase: "ready_model"
   };
 }

@@ -5,6 +5,7 @@ import {
   type BudgetLimits,
   type CheckpointRef,
   type EvidenceRecord,
+  type EvidenceClaim,
   type PlanGraph,
   type UsageRecord
 } from "./domain-types.js";
@@ -38,6 +39,34 @@ export function isCompletionEligibleEvidence(
 ): boolean {
   if (evidence.sessionId !== sessionId || evidence.runId !== runId || evidence.status === "failed") return false;
   return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
+}
+
+/** Returns whether an evidence record proves the typed claim attached to a
+ * completion reference. An omitted claim is the legacy acceptance_met claim. */
+export function evidenceSupportsClaim(
+  evidence: EvidenceRecord,
+  claim: EvidenceClaim = "acceptance_met"
+): boolean {
+  if (claim === "acceptance_met") {
+    return evidence.status !== "failed"
+      && (evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source));
+  }
+  if (evidence.kind !== "validation") return false;
+  if (claim === "validation_passed") return evidence.status === "passed";
+  return evidence.data.termination?.processStarted === true
+    && evidence.data.termination.state === "exited";
+}
+
+/** Failed validation is referenceable only for the narrow
+ * validation_executed claim. It remains ineligible to prove acceptance. */
+export function isCompletionReferenceableEvidence(
+  evidence: EvidenceRecord,
+  sessionId: string,
+  runId: string
+): boolean {
+  if (evidence.sessionId !== sessionId || evidence.runId !== runId) return false;
+  return isCompletionEligibleEvidence(evidence, sessionId, runId)
+    || (evidence.kind === "validation" && evidenceSupportsClaim(evidence, "validation_executed"));
 }
 
 export function isUsageRecord(value: unknown): value is UsageRecord {

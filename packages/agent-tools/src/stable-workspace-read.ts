@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
@@ -36,6 +37,17 @@ export interface StableWorkspaceReadOptions {
   maxBytes?: number;
   beforePinnedRead?: () => Promise<void>;
   afterPinnedRead?: () => Promise<void>;
+}
+
+/** Exact bytes and text metadata captured under one stable workspace-path
+ * lease. `byteLength` and `sha256` describe the original bytes, not a
+ * re-encoded approximation of `content`. */
+export interface StableWorkspaceTextRead {
+  content: string;
+  bytes: Buffer;
+  byteLength: number;
+  endsWithNewline: boolean;
+  sha256: string;
 }
 
 interface CapturedPath {
@@ -243,7 +255,7 @@ export async function readStableWorkspaceTextFile(
   requested: string,
   signal: AbortSignal,
   options: StableWorkspaceReadOptions = {}
-): Promise<string> {
+): Promise<StableWorkspaceTextRead> {
   signal.throwIfAborted();
   const maxBytes = options.maxBytes ?? MAX_EXPLICIT_WORKSPACE_READ_BYTES;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
@@ -263,7 +275,7 @@ export async function readStableWorkspaceTextFile(
   const captured = await capturedPaths(requests, maxBytes, requested, signal);
   let lease: WorkspaceTransactionDirectoryLease | undefined;
   let primary: unknown;
-  let content: string | undefined;
+  let result: StableWorkspaceTextRead | undefined;
   try {
     lease = await pinWorkspaceTransactionPaths(requests);
     await verifyCapturedPaths(captured, lease, maxBytes, requested, signal);
@@ -272,7 +284,14 @@ export async function readStableWorkspaceTextFile(
       const bytes = await readPinnedBytes(
         target, captured.at(-1)!.state, lease, maxBytes, requested, signal
       );
-      content = decodeUtf8(bytes, requested);
+      const content = decodeUtf8(bytes, requested);
+      result = {
+        content,
+        bytes,
+        byteLength: bytes.byteLength,
+        endsWithNewline: content.endsWith("\n") || content.endsWith("\r"),
+        sha256: createHash("sha256").update(bytes).digest("hex")
+      };
     } finally {
       await options.afterPinnedRead?.();
     }
@@ -282,5 +301,5 @@ export async function readStableWorkspaceTextFile(
       ? error : readError("workspace_read_changed", requested, "the path changed while it was being secured", error);
   }
   await closeLease(lease, primary, requested);
-  return content!;
+  return result!;
 }

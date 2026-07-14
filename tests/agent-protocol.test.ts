@@ -3,10 +3,12 @@ import {
   AGENT_EVENT_TYPES, SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION, AgentEventValidationError,
   assertAgentEventEnvelope, assertEvidenceRecord, assertMcpPersistentEffectsAllowed,
   assertMcpWriteRootsEmpty, assertSnapshotEnvelope, createBudgetLedger, createEmptyPlan,
-  isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef, isCompletionEligibleEvidence,
+  evidenceSupportsClaim, isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef,
+  isCompletionEligibleEvidence, isCompletionReferenceableEvidence,
   isEvidenceRecord, isJsonValue,
   isPlanGraph, isSnapshotEnvelope, isSolverVisibleAuthority, isUsageRecord, McpCapabilityPolicyError,
-  SnapshotValidationError, SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type AgentEventType
+  SnapshotValidationError, SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type AgentEventType,
+  type ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import {
   agentEventPayloadFixtures as fixtures, checkpointFixture, evidenceFixture, fixtureOccurredAt,
@@ -44,6 +46,9 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
       { ...validAgentEventFixture("review.completed"), payload: {
         ...evidenceFixture("review"), data: { ...evidenceFixture("review").data, checkpointId: 1 }
       } },
+      { ...validAgentEventFixture("review.completed"), payload: {
+        ...evidenceFixture("review"), data: { ...evidenceFixture("review").data, failureKind: "unknown" }
+      } },
       { ...validAgentEventFixture("checkpoint.created"), payload: {
         ...checkpointFixture("open"), postManifestDigest: 1
       } }
@@ -63,6 +68,37 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
       expect(error).toMatchObject({ code: "invalid_agent_event_envelope" });
       expect((error as AgentEventValidationError).issues[0]?.path).toEqual(["payload", "signal"]);
     }
+  });
+
+  it("persists structured tool results without relying on the text projection", () => {
+    const event = validAgentEventFixture("tool.completed");
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: {
+        ...event.payload,
+        result: { status: "rejected", code: "review_evidence_required", nextActions: [{ tool: "request_review" }] }
+      }
+    })).toBe(true);
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: { ...event.payload, result: { invalid: undefined } }
+    })).toBe(false);
+  });
+
+  it("persists typed retryable reviewer failures", () => {
+    const event = validAgentEventFixture("review.completed");
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: {
+        ...event.payload,
+        status: "failed",
+        data: {
+          ...(event.payload as { data: Record<string, unknown> }).data,
+          verdict: "changes_requested",
+          failureKind: "infrastructure"
+        }
+      }
+    })).toBe(true);
   });
 
   it("rejects wrong versions and authority/scope violations", () => {
@@ -120,6 +156,57 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     }, "session", "run")).toBe(false);
     expect(isCompletionEligibleEvidence({ ...diagnostic, status: "failed" }, "session", "run")).toBe(false);
     expect(isCompletionEligibleEvidence(diagnostic, "session", "other-run")).toBe(false);
+  });
+
+  it("types failed validation as executed evidence without treating it as passed", () => {
+    const failed: ValidationEvidence = {
+      evidenceId: "failed-validation",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "failed",
+      createdAt: fixtureOccurredAt,
+      producer: { authority: "tool", id: "validate" },
+      summary: "tests exited 1",
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: [],
+        workspaceDeltaEvidenceIds: ["delta"],
+        checkpointIds: ["checkpoint"]
+      }
+    };
+    expect(isEvidenceRecord(failed)).toBe(true);
+    expect(isCompletionEligibleEvidence(failed, "session", "run")).toBe(false);
+    expect(isCompletionReferenceableEvidence(failed, "session", "run")).toBe(true);
+    expect(evidenceSupportsClaim(failed, "validation_executed")).toBe(true);
+    expect(evidenceSupportsClaim(failed, "validation_passed")).toBe(false);
+    expect(evidenceSupportsClaim(failed, "acceptance_met")).toBe(false);
+
+    const launchFailure: ValidationEvidence = {
+      ...failed,
+      evidenceId: "launch-failure",
+      data: {
+        ...failed.data,
+        termination: {
+          ...failed.data.termination!,
+          processStarted: false,
+          failureCode: "sandbox_launch_failed"
+        }
+      }
+    };
+    expect(evidenceSupportsClaim(launchFailure, "validation_executed")).toBe(false);
+    expect(isCompletionReferenceableEvidence(launchFailure, "session", "run")).toBe(false);
   });
 
   it("keeps domain ledgers, topology, JSON, and MCP policy strict", () => {

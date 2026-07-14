@@ -6,7 +6,11 @@ import type {
   ToolDescriptor,
   ToolReceipt
 } from "agent-protocol";
-import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
+import {
+  isToolAllowed,
+  prepareToolCallPlan,
+  ResourceLockManager
+} from "agent-tools";
 import {
   completionFailure,
   completionPlan,
@@ -46,6 +50,14 @@ import {
   descriptorAllowedForRepair,
   effectsAllowedForRepair
 } from "./tool-turn-policy.js";
+import {
+  createMutationCheckpoint,
+  delegatesWorkspaceMutation,
+  executionFailureCode,
+  failureCode,
+  isToolReceipt,
+  settleNoChangeProbe
+} from "./tool-transaction-support.js";
 
 interface PreparedTool extends ToolAttempt {
   descriptor: ToolDescriptor;
@@ -57,25 +69,6 @@ interface PreparedTool extends ToolAttempt {
 
 interface TransactionState {
   executionStarted: boolean;
-}
-
-function delegatesWorkspaceMutation(plan: ToolCallPlan): boolean {
-  return plan.exactEffects.includes("agent.spawn") && plan.processMode === "background";
-}
-
-function isReceipt(value: PreparedTool | ToolReceipt): value is ToolReceipt {
-  return "ok" in value;
-}
-
-function failureCode(error: unknown, signal: AbortSignal): string {
-  const code = (error as { code?: unknown })?.code;
-  if (typeof code === "string") return code;
-  return signal.aborted ? "tool_cancelled" : "tool_exception";
-}
-
-function executionFailureCode(error: unknown): string {
-  const code = (error as { code?: unknown })?.code;
-  return typeof code === "string" ? code : "tool_exception";
 }
 
 export class ToolTransactionRunner {
@@ -97,7 +90,7 @@ export class ToolTransactionRunner {
     const startedAt = new Date().toISOString();
     try {
       const prepared = await this.prepare(session, attempt, startedAt, signal);
-      if (isReceipt(prepared)) return prepared;
+      if (isToolReceipt(prepared)) return prepared;
       return await this.executePrepared(session, prepared, signal);
     } catch (error) {
       return failed(
@@ -304,7 +297,15 @@ export class ToolTransactionRunner {
       plan,
       async () => await this.options.runtime.hasActiveChildren?.(session.identity.sessionId)
     );
-    const checkpoint = await this.createCheckpoint(session, call, plan);
+    const noChange = await settleNoChangeProbe(
+      this.options,
+      session,
+      prepared,
+      signal,
+      () => { state.executionStarted = true; }
+    );
+    if (noChange) return noChange;
+    const checkpoint = await createMutationCheckpoint(this.options, session, plan);
     if (checkpoint) {
       await this.options.budgets.bindToolCheckpoint(
         session, reservationId, call.id, checkpoint.checkpointId
@@ -313,17 +314,6 @@ export class ToolTransactionRunner {
     state.executionStarted = true;
     await this.options.emit(session, "execution.started", "runtime", { executionId: call.id });
     return await this.executeAndSeal(session, prepared, checkpoint, signal, keys);
-  }
-
-  private async createCheckpoint(
-    session: RuntimeSession,
-    call: ModelToolCall,
-    plan: ToolCallPlan
-  ): Promise<CheckpointRef | undefined> {
-    if (plan.checkpointAction) return undefined;
-    if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;
-    const scope = plan.checkpointScope.length > 0 ? plan.checkpointScope : ["."];
-    return await this.options.control.createCheckpoint(session, scope);
   }
 
   private async executeAndSeal(
@@ -407,5 +397,4 @@ export class ToolTransactionRunner {
       throw error;
     }
   }
-
 }

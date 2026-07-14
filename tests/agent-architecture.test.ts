@@ -616,7 +616,7 @@ describe("Sigma architecture", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const restoredPlan = {
-      exactEffects: ["filesystem.write"],
+      exactEffects: ["filesystem.read", "filesystem.write"],
       readPaths: ["restored.txt"],
       writePaths: ["restored.txt"],
       network: "none",
@@ -659,7 +659,7 @@ describe("Sigma architecture", () => {
       event(9, "tool.approval_requested", {
         turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write",
         toolName: "write", arguments: { path: "restored.txt", content: "ok" },
-        effects: ["filesystem.write"], plan: restoredPlan
+        effects: ["filesystem.read", "filesystem.write"], plan: restoredPlan
       }),
       event(10, "run.suspended", { turnId: 1, effectRevision: 4, requestId: "restored-write", callId: "restored-write", message: "approval required" })
     ];

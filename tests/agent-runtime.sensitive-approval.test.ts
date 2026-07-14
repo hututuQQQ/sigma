@@ -455,8 +455,11 @@ describe("sensitive per-call approvals", () => {
         type: "tool.approval_requested",
         payload: {
           requestId: "recovered-write",
-          effects: ["filesystem.write"],
-          plan: recoveredWritePlan
+          effects: ["filesystem.read", "filesystem.write"],
+          plan: {
+            ...recoveredWritePlan,
+            exactEffects: ["filesystem.read", "filesystem.write"]
+          }
         }
       });
       await expect(readFile(path.join(root, "result.txt"), "utf8")).rejects.toThrow();

@@ -1,9 +1,22 @@
-import type { EvidenceKind, EvidenceRef, JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
+import {
+  evidenceSupportsClaim,
+  type EvidenceClaim,
+  type EvidenceKind,
+  type EvidenceRecord,
+  type EvidenceRef,
+  type JsonValue,
+  type ToolDescriptor,
+  type ToolReceipt,
+  type ToolRequest
+} from "agent-protocol";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 export interface CompletionCriterion {
   criterion: string;
   status: "met";
+  /** Typed assertion made by the whole criterion. Optional only for legacy
+   * callers; parsing always normalizes it from the criterion or its refs. */
+  claim?: EvidenceClaim;
   evidence: EvidenceRef[];
   rationale: string;
 }
@@ -37,15 +50,41 @@ function record(value: JsonValue): Record<string, JsonValue> | null {
 const EVIDENCE_KINDS: readonly EvidenceKind[] = [
   "workspace_delta", "command", "validation", "diagnostic", "review", "checkpoint", "child_outcome", "user_waiver"
 ];
+const EVIDENCE_CLAIMS: readonly EvidenceClaim[] = [
+  "acceptance_met", "validation_executed", "validation_passed"
+];
 
-function evidenceReferences(value: JsonValue | undefined): EvidenceRef[] | null {
+function criterionClaim(
+  value: JsonValue | undefined,
+  evidence: JsonValue | undefined
+): EvidenceClaim | null {
+  if (value !== undefined && (typeof value !== "string"
+    || !EVIDENCE_CLAIMS.includes(value as EvidenceClaim))) return null;
+  const explicit = value as EvidenceClaim | undefined;
+  if (!Array.isArray(evidence)) return explicit ?? "acceptance_met";
+  const referenceClaims = [...new Set(evidence.flatMap((raw): EvidenceClaim[] => {
+    const item = record(raw);
+    return typeof item?.claim === "string" && EVIDENCE_CLAIMS.includes(item.claim as EvidenceClaim)
+      ? [item.claim as EvidenceClaim] : [];
+  }))];
+  if (referenceClaims.length > 1 || (explicit && referenceClaims.some((claim) => claim !== explicit))) return null;
+  return explicit ?? referenceClaims[0] ?? "acceptance_met";
+}
+
+function evidenceReferences(value: JsonValue | undefined, claim: EvidenceClaim): EvidenceRef[] | null {
   if (!Array.isArray(value) || value.length === 0) return null;
   const references: EvidenceRef[] = [];
   for (const raw of value) {
     const item = record(raw);
     if (!item || typeof item.evidenceId !== "string" || !item.evidenceId.trim()
       || typeof item.kind !== "string" || !EVIDENCE_KINDS.includes(item.kind as EvidenceKind)) return null;
-    references.push({ evidenceId: item.evidenceId, kind: item.kind as EvidenceKind });
+    const referenceClaim = item.claim ?? claim;
+    if (referenceClaim !== claim) return null;
+    references.push({
+      evidenceId: item.evidenceId,
+      kind: item.kind as EvidenceKind,
+      claim
+    });
   }
   return references;
 }
@@ -58,11 +97,14 @@ export function parseCompletionProposal(value: JsonValue): CompletionProposal | 
     const item = record(raw);
     if (!item || typeof item.criterion !== "string" || !item.criterion.trim()) return null;
     if (item.status !== "met") return null;
-    const evidence = evidenceReferences(item.evidence);
+    const claim = criterionClaim(item.claim, item.evidence);
+    if (!claim) return null;
+    const evidence = evidenceReferences(item.evidence, claim);
     if (!evidence) return null;
     criteria.push({
       criterion: item.criterion,
       status: item.status,
+      claim,
       evidence,
       rationale: typeof item.rationale === "string" ? item.rationale : ""
     });
@@ -72,14 +114,24 @@ export function parseCompletionProposal(value: JsonValue): CompletionProposal | 
 
 export function completionEvidenceError(
   proposal: CompletionProposal,
-  availableEvidence: ReadonlyMap<string, EvidenceKind>
+  availableEvidence: ReadonlyMap<string, EvidenceKind | EvidenceRecord>
 ): string | null {
   for (const criterion of proposal.criteria) {
-    const invalid = criterion.evidence.filter((reference) =>
-      availableEvidence.get(reference.evidenceId) !== reference.kind);
+    const claim = criterionClaim(criterion.claim, criterion.evidence as unknown as JsonValue);
+    if (!claim) return `Criterion '${criterion.criterion}' mixes incompatible typed evidence claims.`;
+    const invalid = criterion.evidence.filter((reference) => {
+      const available = availableEvidence.get(reference.evidenceId);
+      if (typeof available === "string") {
+        return available !== reference.kind || claim !== "acceptance_met"
+          || (reference.claim !== undefined && reference.claim !== claim);
+      }
+      return !available || available.kind !== reference.kind
+        || (reference.claim !== undefined && reference.claim !== claim)
+        || !evidenceSupportsClaim(available, claim);
+    });
     if (invalid.length > 0) {
       return `Criterion '${criterion.criterion}' cites unavailable or mismatched durable evidence: ${invalid
-        .map((item) => `${item.evidenceId}:${item.kind}`).join(", ")}.`;
+        .map((item) => `${item.evidenceId}:${item.kind}:${claim}`).join(", ")}.`;
     }
   }
   return null;
@@ -88,7 +140,7 @@ export function completionEvidenceError(
 function completionTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
     name: "complete_task",
-    description: "Propose terminal completion with explicit acceptance criteria and typed durable evidence from the current run. Every criterion must be met. Copy exact evidenceId and kind pairs from the current-run durable evidence ledger; never invent or reuse older-run evidence.",
+    description: "Propose terminal completion with explicit acceptance criteria and typed durable evidence from the current run. Every criterion must declare one typed claim and be met by evidence supporting that same claim. Copy exact evidenceId, kind, and allowed claim values from the current-run durable evidence ledger; never invent or reuse older-run evidence. acceptance_met is the backward-compatible default, validation_executed may cite an exited failed validation only to report that it ran, and validation_passed requires passed validation evidence.",
     inputSchema: {
       type: "object",
       properties: {
@@ -101,6 +153,11 @@ function completionTool(): RegisteredEffectTool {
             properties: {
               criterion: { type: "string", description: "One concrete acceptance criterion." },
               status: { type: "string", enum: ["met"], description: "Terminal completion accepts only criteria proven met by current-run receipts." },
+              claim: {
+                type: "string",
+                enum: [...EVIDENCE_CLAIMS],
+                description: "Typed assertion made by this entire criterion. Defaults to the references' one shared claim, or acceptance_met for legacy callers."
+              },
               evidence: {
                 type: "array",
                 minItems: 1,
@@ -109,7 +166,12 @@ function completionTool(): RegisteredEffectTool {
                   type: "object",
                   properties: {
                     evidenceId: { type: "string" },
-                    kind: { type: "string", enum: [...EVIDENCE_KINDS] }
+                    kind: { type: "string", enum: [...EVIDENCE_KINDS] },
+                    claim: {
+                      type: "string",
+                      enum: [...EVIDENCE_CLAIMS],
+                      description: "Compatibility mirror of the criterion claim. When present it must equal that criterion's claim."
+                    }
                   },
                   required: ["evidenceId", "kind"],
                   additionalProperties: false

@@ -39,6 +39,7 @@ function context(workspacePath: string): ToolExecutionContext {
     workspacePath,
     runMode: "analyze",
     signal: new AbortController().signal,
+    heartbeat: () => undefined,
     progress: async () => undefined,
     createArtifact: async ({ name }) => name
   };
@@ -68,6 +69,7 @@ describe("stable explicit workspace reads", () => {
     const workspace = await temporaryDirectory("sigma-stable-read-lines-");
     await writeFile(path.join(workspace, "mixed.txt"), "one\rtwo\r\nthree\n", "utf8");
     await writeFile(path.join(workspace, "empty.txt"), "", "utf8");
+    await writeFile(path.join(workspace, "no-newline.txt"), "tail", "utf8");
     const tools = registerBuiltinTools(new EffectToolRegistry());
 
     const mixed = await tools.execute(
@@ -76,9 +78,25 @@ describe("stable explicit workspace reads", () => {
     const empty = await tools.execute(
       request("empty-lines", { path: "empty.txt" }), context(workspace)
     );
+    const noNewline = await tools.execute(
+      request("no-newline", { path: "no-newline.txt" }), context(workspace)
+    );
 
     expect(mixed.output).toBe("1: one\n2: two\n3: three");
+    expect(mixed.result).toMatchObject({
+      status: "read",
+      byteLength: Buffer.byteLength("one\rtwo\r\nthree\n"),
+      endsWithNewline: true,
+      returnedLines: 3,
+      totalLines: 3
+    });
     expect(empty.output).toBe("");
+    expect(empty.result).toMatchObject({
+      status: "read", byteLength: 0, endsWithNewline: false, returnedLines: 0, totalLines: 0
+    });
+    expect(noNewline.result).toMatchObject({
+      status: "read", byteLength: 4, endsWithNewline: false, returnedLines: 1, totalLines: 1
+    });
   });
 
   it("rejects external hard links, links, and non-regular files", async () => {
@@ -130,7 +148,7 @@ describe("stable explicit workspace reads", () => {
     let swapped = false;
     let originalMoved = false;
 
-    const content = await readStableWorkspaceTextFile(
+    const loaded = await readStableWorkspaceTextFile(
       workspace,
       "active/value.txt",
       new AbortController().signal,
@@ -154,7 +172,13 @@ describe("stable explicit workspace reads", () => {
       }
     );
 
-    expect(content).toBe("original\n");
+    expect(loaded).toMatchObject({
+      content: "original\n",
+      byteLength: Buffer.byteLength("original\n"),
+      endsWithNewline: true
+    });
+    expect(loaded.bytes.equals(Buffer.from("original\n", "utf8"))).toBe(true);
+    expect(loaded.sha256).toMatch(/^[a-f0-9]{64}$/u);
   });
 
   it("rejects malformed UTF-8 with a stable diagnostic code", async () => {

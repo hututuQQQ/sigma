@@ -30,10 +30,13 @@ export function descriptorAllowedForRepair(
   const action = terminalProtocolAction(descriptor);
   if (phase === "evidence" && action === "request_input") return true;
   if (phase === "protected_completion") {
-    return descriptor.name === "complete_task" && action === "complete";
+    return (descriptor.name === "complete_task" && action === "complete")
+      || (descriptor.name === "request_user_input" && action === "request_input");
   }
-  if (phase === "protected_recovery" && descriptor.name === "request_user_input") return false;
-  if (phase === "protected_recovery" && action === "complete") return true;
+  if (phase === "protected_recovery" && action !== null) {
+    return (descriptor.name === "complete_task" && action === "complete")
+      || (descriptor.name === "request_user_input" && action === "request_input");
+  }
   if (phase === "terminal") return action !== null;
   const maximum = descriptor.maximumEffects ?? descriptor.possibleEffects;
   return [...descriptor.possibleEffects, ...maximum].every((effect) =>
@@ -49,8 +52,10 @@ export function effectsAllowedForRepair(
     effect === "outcome.propose" || effect === "outcome.request_input");
   if (terminalEffects.length === 0) return phase === "evidence" || phase === "protected_recovery";
   if (effects.length !== 1 || terminalEffects.length !== 1) return false;
-  if (phase === "protected_completion") return terminalEffects[0] === "outcome.propose";
-  if (phase === "protected_recovery") return terminalEffects[0] === "outcome.propose";
+  if (phase === "protected_completion") return terminalEffects[0] === "outcome.propose"
+    || terminalEffects[0] === "outcome.request_input";
+  if (phase === "protected_recovery") return terminalEffects[0] === "outcome.propose"
+    || terminalEffects[0] === "outcome.request_input";
   if (phase === "terminal") return true;
   return terminalEffects[0] === "outcome.request_input";
 }

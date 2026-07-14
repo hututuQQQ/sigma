@@ -15,8 +15,8 @@ import {
 const wrongString = fc.oneof(
   fc.integer(), fc.boolean(), fc.constant(null), fc.array(fc.integer()), fc.dictionary(fc.string(), fc.integer())
 );
-const wrongNumber = fc.oneof(
-  fc.string(), fc.boolean(), fc.constant(null), fc.array(fc.integer()), fc.dictionary(fc.string(), fc.integer())
+const wrongNullableNumber = fc.oneof(
+  fc.string(), fc.boolean(), fc.array(fc.integer()), fc.dictionary(fc.string(), fc.integer())
 );
 
 function invalidOptional(type: string, field: string, value: unknown): Record<string, unknown> {
@@ -66,7 +66,7 @@ describe("V4 protocol properties", () => {
   });
 
   it("rejects arbitrary non-number validation exit codes and unknown event types", () => {
-    fc.assert(fc.property(wrongNumber, (value) => {
+    fc.assert(fc.property(wrongNullableNumber, (value) => {
       expect(isAgentEventEnvelope(invalidOptional("validation", "exitCode", value))).toBe(false);
     }), { numRuns: 100 });
     fc.assert(fc.property(

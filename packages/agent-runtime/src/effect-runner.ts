@@ -264,7 +264,11 @@ export class EffectRunner {
         evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
         artifactRefs: receipt.artifactRefs ?? []
       }, session.execution.controller?.signal ?? new AbortController().signal);
-      await this.reviews.maybeReview(session, session.execution.controller?.signal ?? new AbortController().signal);
+      await this.reviews.maybeReview(
+        session,
+        session.execution.controller?.signal ?? new AbortController().signal,
+        name === "request_review"
+      );
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

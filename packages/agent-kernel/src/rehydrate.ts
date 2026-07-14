@@ -2,7 +2,7 @@ import {
   KERNEL_STATE_VERSION,
   isBudgetLedgerState,
   isCheckpointRef,
-  isCompletionEligibleEvidence,
+  isCompletionReferenceableEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -141,19 +141,15 @@ function assertProtectedRepairState(state: KernelState): void {
   const protectedAnswer = repair.kind === "protected_completion" || repair.kind === "protected_recovery";
   if (!protectedAnswer) return;
   if (!state.evidence.some((item) =>
-    isCompletionEligibleEvidence(item, state.sessionId, state.runId))) {
-    throw new Error("A protected completion repair requires current-run eligible evidence.");
+    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) {
+    throw new Error("A protected completion repair requires current-run referenceable evidence.");
   }
-  if (repair.kind === "protected_completion" && state.pendingTools.length > 0
-    && (state.pendingTools.length !== 1 || state.pendingTools[0]?.request.name !== "complete_task")) {
-    throw new Error("A protected completion repair can pend only one complete_task call.");
-  }
-  if (repair.kind === "protected_recovery"
-    && state.pendingTools.some((item) => item.request.name === "request_user_input")) {
-    throw new Error("Protected completion recovery cannot pend a user-input request.");
-  }
-  if (state.proposedOutcome?.kind === "needs_input") {
-    throw new Error("A protected completion state cannot propose a user-input outcome.");
+  if (repair.kind === "protected_completion" && state.pendingTools.length > 0) {
+    const terminalName = state.pendingTools[0]?.request.name;
+    if (state.pendingTools.length !== 1
+      || (terminalName !== "complete_task" && terminalName !== "request_user_input")) {
+      throw new Error("A protected terminal-intent repair can pend only one complete_task or request_user_input call.");
+    }
   }
   assertProtectedInputState(state);
 }

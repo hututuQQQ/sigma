@@ -50,13 +50,14 @@ Workspace packages communicate through public exports, and the production depend
 
 A provider `stop` response or a natural-language claim does not finish a run. The agent must call `complete_task` with a non-empty summary and explicit acceptance criteria:
 
-- every criterion must be `met` and cite at least one successful current-run tool receipt by call ID;
-- unknown or failed receipt IDs reject the proposal;
+- every criterion must be `met` and cite exact typed `evidenceId`/`kind` pairs from the current-run durable evidence ledger;
+- each criterion has one typed claim shared by all of its evidence references; the default `acceptance_met` claim accepts only non-failed evidence, `validation_passed` accepts only passed validation evidence, and `validation_executed` may cite a failed validation solely to prove that it ran and its result was reported;
+- unknown, mismatched, or semantically incompatible evidence references reject the proposal with a structured repair diagnostic;
 - non-detached children are joined before completion, and a failed child or retained, unintegrated writer worktree keeps the parent run open.
 
-When no actionable task was provided or a concrete decision is required, the agent calls `request_user_input`; this produces a durable `NeedsInput` outcome that can be continued in the same task. A natural `stop` before any tool work also falls back to `NeedsInput`. After tool work, the kernel permits one protocol-repair turn, then suspends instead of repeatedly buying identical model responses. Three consecutive identical tool batches and repeated output-limit continuations end as typed recoverable failures.
+When no actionable task was provided or a concrete decision is required, the agent calls `request_user_input`; this produces a durable `NeedsInput` outcome that can be continued in the same task. A natural `stop` never becomes an outcome by itself. After tool work, the kernel permits one bounded protocol-repair turn on which the model must choose exactly one typed terminal action: `complete_task` for an evidence-backed completion, or `request_user_input` for a concrete decision that changes the result. Repeated invalid repair calls and repeated output-limit continuations end as typed recoverable failures.
 
-Rejected completion proposals become ordinary tool failures and the kernel continues from the durable state. Completion correctness comes from acceptance criteria and typed evidence; bounded convergence guards prevent provider or prompt failures from turning into an unbounded agent loop.
+Rejected completion proposals become ordinary tool failures and the kernel continues from the durable state. Their structured result identifies each missing delta-scoped obligation, the allowed next tool, and the evidence kind/status that tool can produce. Non-documentation deltas require passed semantic validation and approved independent review evidence. Passed validation triggers the internal reviewer automatically, and `request_review` is the explicit, ID-free way to request the same internal review path; neither path asks the user to re-authorize an already authorized code change. Genuine review findings remain blocked until addressed, while a typed reviewer infrastructure/interruption failure may be retried explicitly and is never misrepresented as code feedback.
 
 ## Requirements
 
@@ -159,6 +160,8 @@ Sigma starts the configured executable directly, without a shell. Its working di
 Each tool invocation receives its own `ToolExecutionContext` and `AbortSignal`. Descriptors declare possible effects, approval mode, idempotency, execution mode, resource keys, context/write-path arguments, idle timeout, and hard timeout. The runtime uses those declarations for mode checks, approval, locking, receipt reuse, nested `AGENTS.md` discovery, and workspace-delta evidence. A newly discovered nested instruction is durably recorded and any affected mutating/open-world call is deferred until the model replans with that instruction.
 
 Filesystem tools reject lexical and symlink/junction escapes from the workspace. Path containment and OS isolation are separate controls: containment limits accepted paths, while the native broker provides Linux namespace/Landlock/seccomp or Windows AppContainer isolation. The default is fail-closed `sandbox=required` with `network=none`; if the broker is unavailable or its self-test fails, execution is refused. Unsafe host execution requires both a home-level `allow_unsafe_host_exec` grant and an explicit request for that run. `agent doctor` reports the detected backend, self-test result, network modes, and PTY capability.
+
+Text reads expose byte length, SHA-256, and whether the exact file ends with a newline in structured output. After the normal mode, scope, approval, and workspace-lock checks, `write` and `edit` compare the requested UTF-8 bytes with the pinned current file. An exact same-byte request returns `no_change` with read-only actual effects and creates no workspace delta or mutation checkpoint; analyze mode still rejects the mutating tool intent before this optimization is considered.
 
 ## Sessions and recovery
 

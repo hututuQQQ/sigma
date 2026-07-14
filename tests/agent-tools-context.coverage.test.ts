@@ -2,7 +2,14 @@ import { link, mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { JsonValue, SupervisorPort, ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
+import type {
+  JsonValue,
+  RuntimeControlPort,
+  SupervisorPort,
+  ToolExecutionContext,
+  ToolRequest,
+  ValidationEvidence
+} from "../packages/agent-protocol/src/index.js";
 import {
   approximateTokens,
   lexicalScore,
@@ -74,10 +81,117 @@ describe("context, platform, and repository tool capabilities", () => {
       .toContain("current-evidence");
   });
 
+  it("accepts failed validation only for the validation_executed claim", () => {
+    const failed: ValidationEvidence = {
+      evidenceId: "failed-validation",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool", id: "validate" },
+      summary: "exited 1",
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: [],
+        workspaceDeltaEvidenceIds: []
+      }
+    };
+    const proposal = parseCompletionProposal({
+      summary: "reported honestly",
+      criteria: [{
+        criterion: "Validation was run and its failure was reported.",
+        status: "met",
+        evidence: [{
+          evidenceId: failed.evidenceId,
+          kind: failed.kind,
+          claim: "validation_executed"
+        }]
+      }]
+    })!;
+    expect(completionEvidenceError(proposal, new Map([[failed.evidenceId, failed]]))).toBeNull();
+    expect(completionEvidenceError({
+      ...proposal,
+      criteria: [{
+        ...proposal.criteria[0]!,
+        claim: "validation_passed",
+        evidence: [{ evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_passed" }]
+      }]
+    }, new Map([[failed.evidenceId, failed]]))).toContain("failed-validation");
+    expect(parseCompletionProposal({
+      summary: "invalid claim mix",
+      criteria: [{
+        criterion: "Validation passed.",
+        status: "met",
+        claim: "validation_passed",
+        evidence: [{
+          evidenceId: failed.evidenceId,
+          kind: failed.kind,
+          claim: "validation_executed"
+        }]
+      }]
+    })).toBeNull();
+  });
+
+  it("exposes an ID-free internal review request without asking the user to re-authorize code", async () => {
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { execution });
+    const review = tools.descriptor("request_review")!;
+    expect(review.inputSchema).toMatchObject({
+      type: "object",
+      properties: {},
+      required: []
+    });
+    expect(review.description).toContain("internal review");
+    expect(review.description).toContain("Supply no evidence IDs");
+    const runtimeControl = {
+      requestReview: async () => ({
+        status: "review_requested" as const,
+        workspaceDeltaEvidenceIds: ["delta"],
+        validationEvidenceIds: ["validation"],
+        missingValidationWorkspaceDeltaEvidenceIds: []
+      })
+    } as RuntimeControlPort;
+    const result = await tools.execute(
+      request("review", "request_review", {}),
+      { ...context("."), runtimeControl }
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        status: "review_requested",
+        workspaceDeltaEvidenceIds: ["delta"],
+        validationEvidenceIds: ["validation"]
+      },
+      diagnostics: []
+    });
+  });
+
   it("keeps completion and user-input terminal capabilities orthogonal", async () => {
     const tools = registerCompletionTool(new EffectToolRegistry());
     const completion = tools.descriptor("complete_task")!;
     const input = tools.descriptor("request_user_input")!;
+    expect(completion.inputSchema).toMatchObject({
+      properties: {
+        criteria: {
+          items: {
+            properties: {
+              claim: { enum: ["acceptance_met", "validation_executed", "validation_passed"] }
+            }
+          }
+        }
+      }
+    });
     expect(terminalProtocolAction(completion)).toBe("complete");
     expect(terminalProtocolAction(input)).toBe("request_input");
     expect(terminalProtocolAction({
@@ -114,6 +228,9 @@ describe("context, platform, and repository tool capabilities", () => {
       ok: true,
       observedEffects: ["outcome.propose"],
       diagnostics: []
+    });
+    expect(JSON.parse(completed.output)).toMatchObject({
+      criteria: [{ claim: "acceptance_met" }]
     });
   });
 

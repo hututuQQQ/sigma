@@ -95,6 +95,9 @@ export interface ToolReceipt {
   callId: string;
   ok: boolean;
   output: string;
+  /** Optional structured result projected unchanged into the durable receipt
+   * and model-visible receipt summary. output remains the text projection. */
+  result?: JsonValue;
   /** V3 typed outcome; optional only on legacy executor input and normalized before durable emission. */
   outcome?: ToolOutcome;
   observedEffects: ToolEffect[];
@@ -117,6 +120,7 @@ export interface RuntimeControlPort {
   listCheckpoints(): Promise<CheckpointRef[]>;
   createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
   restoreRunCheckpoint(checkpointId: string): Promise<CheckpointRef>;
+  requestReview(): Promise<ReviewRequestResult>;
   loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
   resolveLoadedSkillResource(input: {
     qualifiedName: string;
@@ -127,6 +131,16 @@ export interface RuntimeControlPort {
   settleChildBudget(childId: string, consumed?: Partial<BudgetAmounts>): Promise<void>;
   releaseChildBudget(childId: string): Promise<void>;
   rollbackChildPlanAssignment(childId: string, nodeIds: string[], previousPlan: PlanGraph): Promise<PlanGraph>;
+}
+
+export interface ReviewRequestResult {
+  status: "review_requested" | "validation_required" | "changes_required" | "not_required";
+  workspaceDeltaEvidenceIds: string[];
+  validationEvidenceIds: string[];
+  missingValidationWorkspaceDeltaEvidenceIds: string[];
+  reviewEvidenceId?: string;
+  retryOfReviewEvidenceId?: string;
+  findings?: JsonValue[];
 }
 
 export interface LoadedSkillResourceAccess {
