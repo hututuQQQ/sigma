@@ -257,12 +257,14 @@ export class ModelRouter {
     let lastError: unknown;
     const attempts = Math.min(resolution.route.maxAttempts, resolution.candidates.length);
     for (let index = 0; index < attempts; index += 1) {
+      request.signal.throwIfAborted();
       const spec = resolution.candidates[index] as ModelSpec;
       const startedAt = performance.now();
       try {
         const response = await this.gateways(spec).complete(request);
         return routedResponse(role, resolution.route.id, spec, response, request, index, performance.now() - startedAt);
       } catch (error) {
+        request.signal.throwIfAborted();
         lastError = error;
         const category = classifyModelFailure(error);
         const semanticDelta = errorSemanticDelta(error);
@@ -283,14 +285,17 @@ export class ModelRouter {
     const resolution = this.resolveForRequest(routeId, request, constraints);
     const attempts = Math.min(resolution.route.maxAttempts, resolution.candidates.length);
     for (let index = 0; index < attempts; index += 1) {
+      request.signal.throwIfAborted();
       const spec = resolution.candidates[index] as ModelSpec;
       const startedAt = performance.now();
       let semanticDelta = false;
+      let completed = false;
       try {
         for await (const event of this.gateways(spec).stream(request)) {
           if (event.type === "content" || event.type === "reasoning" || event.type === "tool_call") semanticDelta = true;
           if (event.type === "done") {
             semanticDelta = true;
+            completed = true;
             yield { type: "done", response: routedResponse(
               role, routeId, spec, event.response, request, index, performance.now() - startedAt
             ) };
@@ -298,8 +303,16 @@ export class ModelRouter {
             yield { ...event, routeId, modelSpecId: spec.id, attempt: index };
           } else yield event;
         }
+        if (!completed) {
+          request.signal.throwIfAborted();
+          throw Object.assign(
+            new Error(`Model stream for '${spec.id}' ended without a terminal response.`),
+            { category: "network", semanticDelta }
+          );
+        }
         return;
       } catch (error) {
+        request.signal.throwIfAborted();
         const category = classifyModelFailure(error);
         semanticDelta ||= errorSemanticDelta(error);
         if (!canFallback(resolution.route, category, semanticDelta) || index + 1 >= attempts) {

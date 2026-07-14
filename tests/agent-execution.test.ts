@@ -529,6 +529,12 @@ describe("agent-execution protocol validation", () => {
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }
     }).sandbox.hardening).not.toHaveProperty("landlockAbi");
     expect(() => parseDoctor({ ...doctor, protocolVersion: 2 })).toThrow(BrokerProtocolError);
+    for (const platform of ["unknown", "linux\nforged"]) {
+      expect(() => parseDoctor({ ...doctor, platform })).toThrow(BrokerProtocolError);
+    }
+    for (const architecture of ["", "x64\nforged", "x".repeat(65)]) {
+      expect(() => parseDoctor({ ...doctor, architecture })).toThrow(BrokerProtocolError);
+    }
     expect(() => parseDoctor({ ...doctor, capabilities: { ...doctor.capabilities, networkModes: ["domain"] } })).toThrow(BrokerProtocolError);
     expect(() => parseDoctor({
       ...doctor,

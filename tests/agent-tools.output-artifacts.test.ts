@@ -200,6 +200,36 @@ describe("execution output artifact receipts", () => {
     expect(released).toEqual([]);
   });
 
+  it("never marks a timed-out zero-exit validation as passed evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-timeout-evidence-"));
+    const execution: ExecutionResult = {
+      state: "terminated", exitCode: 0, signal: null, durationMs: 100,
+      timedOut: true, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      state: "terminated",
+      handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "validate")!.execute(
+      request("timed-out-validation", "validate", { executable: process.execPath }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("process_timed_out");
+    expect(receipt.evidence).toEqual([expect.objectContaining({
+      kind: "validation",
+      status: "failed"
+    })]);
+  });
+
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-launch-failure-receipt-"));
     const failure = {

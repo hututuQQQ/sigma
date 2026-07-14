@@ -64,6 +64,23 @@ describe("stable explicit workspace reads", () => {
     expect(result.observedEffects).toEqual(["filesystem.read"]);
   });
 
+  it("uses shared CR, LF, and CRLF line semantics without synthetic empty lines", async () => {
+    const workspace = await temporaryDirectory("sigma-stable-read-lines-");
+    await writeFile(path.join(workspace, "mixed.txt"), "one\rtwo\r\nthree\n", "utf8");
+    await writeFile(path.join(workspace, "empty.txt"), "", "utf8");
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+
+    const mixed = await tools.execute(
+      request("mixed-lines", { path: "mixed.txt" }), context(workspace)
+    );
+    const empty = await tools.execute(
+      request("empty-lines", { path: "empty.txt" }), context(workspace)
+    );
+
+    expect(mixed.output).toBe("1: one\n2: two\n3: three");
+    expect(empty.output).toBe("");
+  });
+
   it("rejects external hard links, links, and non-regular files", async () => {
     const workspace = await temporaryDirectory("sigma-stable-read-");
     const external = await temporaryDirectory("sigma-stable-read-external-");

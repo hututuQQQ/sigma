@@ -5,6 +5,25 @@ import {
   type ShellKind
 } from "agent-platform";
 
+const runtimePlatforms = new Map<string, NodeJS.Platform>([
+  ["aix", "aix"],
+  ["darwin", "darwin"],
+  ["freebsd", "freebsd"],
+  ["linux", "linux"],
+  ["macos", "darwin"],
+  ["openbsd", "openbsd"],
+  ["sunos", "sunos"],
+  ["win32", "win32"],
+  ["windows", "win32"]
+]);
+const architecturePattern = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/u;
+
+function invalidBrokerEnvironment(detail: string): Error {
+  return Object.assign(new Error(`Invalid broker runtime environment: ${detail}`), {
+    code: "broker_protocol_error"
+  });
+}
+
 export function verifiedShellKinds(report: BrokerDoctorReport): ShellKind[] {
   if (!report.capabilities.foreground) return [];
   const verified = (report.capabilities.shells ?? [])
@@ -39,10 +58,11 @@ export function verifiedNetworkPolicy(
 }
 
 export function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnvironment {
-  const reported = report.platform === "windows" ? "win32"
-    : report.platform === "macos" ? "darwin" : report.platform;
-  const platform = ["aix", "darwin", "freebsd", "linux", "openbsd", "sunos", "win32"]
-    .includes(reported) ? reported as NodeJS.Platform : process.platform;
+  const platform = runtimePlatforms.get(report.platform);
+  if (!platform) throw invalidBrokerEnvironment(`unsupported platform '${report.platform}'.`);
+  if (!architecturePattern.test(report.architecture)) {
+    throw invalidBrokerEnvironment("architecture must be a short printable identifier.");
+  }
   const availableShells = verifiedShellKinds(report);
   return {
     ...runtimeEnvironment(platform),

@@ -1,18 +1,17 @@
 import type { AgentEventEnvelope, AgentEventType, JsonValue, ModelMessage, ModelToolCall, RunOutcome } from "agent-protocol";
 import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
-import { completionSummary, incompleteModelCompletion, requestedInput, toolBatchSignature } from "./model-convergence.js";
+import { completionSummary, conflictingTerminalBatch, failedTerminalRepairState, hasCurrentRunEvidence, incompleteModelCompletion, repairConflictingTerminalBatch, requestedInput } from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
 import { recordSemanticToolResult, semanticInfrastructureFailureMessage, SEMANTIC_INFRASTRUCTURE_FAILURE_CODE } from "./semantic-failures.js";
+import { completedToolBatchProgress, repeatsCompletedToolBatch } from "./tool-batch-progress.js";
 function objectPayload(value: unknown): Record<string, JsonValue> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, JsonValue>
     : {};
 }
-function text(value: JsonValue | undefined): string {
-  return typeof value === "string" ? value : "";
-}
+function text(value: JsonValue | undefined): string { return typeof value === "string" ? value : ""; }
 function supersededToolMessages(state: KernelState): ModelMessage[] {
   return state.pendingTools.map((pending) => ({
     role: "tool",
@@ -57,7 +56,6 @@ function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): P
 }
 
 type EventReducer = KernelEventReducer;
-
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
   mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
@@ -73,6 +71,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: state.revision },
   semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
+  lastToolBatchOutcomeSignature: undefined,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -89,6 +88,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   receiptCountAtLastUserInput: state.receipts.length,
   semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
+  lastToolBatchOutcomeSignature: undefined,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -110,6 +110,7 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   receiptCountAtLastUserInput: state.receipts.length,
   semanticFailureCluster: undefined,
   lastToolBatchSignature: undefined,
+  lastToolBatchOutcomeSignature: undefined,
   proposedOutcome: undefined,
   outcome: undefined
 });
@@ -164,20 +165,16 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
       message: `Model reused tool call id '${duplicate}' within the current run.`
     });
   }
-  const signature = toolBatchSignature(calls);
-  const repeatedToolBatchCount = signature === state.lastToolBatchSignature
-    ? state.repeatedToolBatchCount + 1 : 1;
-  if (repeatedToolBatchCount >= 3) {
+  if (conflictingTerminalBatch(calls, state.completionRepairAttempts > 0)) return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
+  if (repeatsCompletedToolBatch(state, calls)) {
     return propose({
       ...completedState,
       messages,
-      toolCallIds: [...state.toolCallIds, ...identifiers],
-      lastToolBatchSignature: signature,
-      repeatedToolBatchCount
+      toolCallIds: [...state.toolCallIds, ...identifiers]
     }, {
       kind: "recoverable_failure",
       code: "agent_no_progress",
-      message: "The model proposed the same tool batch three times without an intervening action."
+      message: "The same tool batch produced the same completed outcome twice and was proposed again without progress."
     });
   }
   const pendingTools = pendingFromCalls(calls, modelTurn);
@@ -188,8 +185,6 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     toolCallIds: [...state.toolCallIds, ...identifiers],
     completionRepairAttempts: state.completionRepairAttempts,
     continuationAttempts: 0,
-    lastToolBatchSignature: signature,
-    repeatedToolBatchCount,
     phase: "tool_pending"
   };
 };
@@ -242,7 +237,8 @@ const toolFinished: EventReducer = (state, event) => {
   const pending = pendingForEvent(state, objectPayload(event.payload));
   if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
   const pendingTools = state.pendingTools.filter((item) => item !== pending);
-  const terminalRepair = state.completionRepairAttempts > 0;
+  const repairPending = state.completionRepairAttempts > 0;
+  const terminalRepairPending = repairPending && hasCurrentRunEvidence(state);
   const next: KernelState = {
     ...state,
     messages: [...state.messages, {
@@ -255,11 +251,11 @@ const toolFinished: EventReducer = (state, event) => {
     // Receipt evidence is untrusted tool output. Only separately emitted,
     // authority-checked evidence.recorded/review events enter the ledger.
     evidence: state.evidence,
-    completionRepairAttempts: 0,
     continuationAttempts: 0,
     phase: nextPhase(pendingTools)
   };
-  const semantic = recordSemanticToolResult(next, receipt, pending.request.name);
+  const completedBatch = pendingTools.length === 0 ? completedToolBatchProgress(next, receipt.callId) : {};
+  const semantic = recordSemanticToolResult({ ...next, ...completedBatch }, receipt, pending.request.name);
   const progressed = semantic.state;
   const inputMessage = requestedInput(receipt);
   if (inputMessage) {
@@ -267,7 +263,7 @@ const toolFinished: EventReducer = (state, event) => {
   }
   const summary = completionSummary(receipt);
   if (summary) {
-    const repairedAnswer = terminalRepair
+    const repairedAnswer = repairPending
       ? [...state.messages].reverse().find((message) =>
         message.role === "assistant" && message.content.trim())?.content.trim()
       : undefined;
@@ -277,6 +273,9 @@ const toolFinished: EventReducer = (state, event) => {
       evidence: progressed.evidence
     });
   }
+  const failedTerminalRepair = failedTerminalRepairState(
+    progressed, repairPending, terminalRepairPending, receipt, pendingTools.length);
+  if (failedTerminalRepair) return failedTerminalRepair;
   if (semantic.limitReached && pendingTools.length === 0 && progressed.semanticFailureCluster) {
     const cluster = progressed.semanticFailureCluster;
     return propose(progressed, {

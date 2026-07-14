@@ -1,6 +1,7 @@
 import {
   isBudgetLedgerState,
   isCheckpointRef,
+  isCompletionEligibleEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -40,7 +41,10 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
     || event.runId !== state.runId || !evidenceAuthorityAllowed(event, evidence)
     || state.evidence.some((item) => item.evidenceId === evidence.evidenceId)) return state;
   if (evidence.kind === "user_waiver" && state.evidence.some((item) => item.kind === "user_waiver")) return state;
-  return recordSemanticEvidenceProgress({
+  const firstCompletionEvidence = state.completionRepairAttempts > 0
+    && isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
+    && !state.evidence.some((item) => isCompletionEligibleEvidence(item, state.sessionId, state.runId));
+  const progressed = recordSemanticEvidenceProgress({
     ...state,
     evidence: [...state.evidence, evidence],
     mutationEvidence: MUTATION_EVIDENCE_KINDS.has(evidence.kind)
@@ -48,6 +52,7 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
       ? [...state.mutationEvidence, evidence]
       : state.mutationEvidence
   }, evidence);
+  return firstCompletionEvidence ? { ...progressed, completionRepairAttempts: 0 } : progressed;
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {

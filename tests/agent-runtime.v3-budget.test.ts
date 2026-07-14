@@ -4,6 +4,7 @@ import path from "node:path";
 import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
 import {
   createBudgetLedger,
+  SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1,
   type AgentEventEnvelope,
   type BudgetLimits
 } from "../packages/agent-protocol/src/index.js";
@@ -255,5 +256,49 @@ describe("V3 shared budget ledger", () => {
     const rejected = results.find((item): item is PromiseRejectedResult => item.status === "rejected");
     expect(rejected?.reason).toMatchObject({ code: "plan_revision_conflict" });
     expect(target.durable.state.plan.revision).toBe(2);
+  });
+
+  it("does not allow provenance-only startup evidence to complete a plan node", async () => {
+    const target = session(limits());
+    target.durable.state.plan = {
+      revision: 1,
+      goal: "inspect the workspace",
+      activeNodeId: "root",
+      nodes: [{
+        id: "root", title: "root", dependencies: [], status: "in_progress",
+        owner: { kind: "root" }, acceptanceCriteria: ["inspection complete"], evidence: []
+      }]
+    };
+    target.durable.state.evidence = [{
+      evidenceId: "subject-attestation:run",
+      sessionId: target.identity.sessionId,
+      runId: target.durable.runId,
+      kind: "diagnostic",
+      status: "informational",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime", id: "subject-attestor" },
+      summary: "Subject build identity was frozen before execution.",
+      data: { source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, diagnostic: { productDigest: "a" } }
+    }];
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-plan-evidence-"));
+    const control = new RuntimeControlService({
+      checkpoints: new CheckpointManager({ rootDir: root }),
+      budgets: controller(target),
+      emit: async () => event(),
+      createArtifact: async () => "artifact"
+    });
+    const completed = {
+      ...target.durable.state.plan,
+      revision: 2,
+      activeNodeId: undefined,
+      nodes: [{
+        ...target.durable.state.plan.nodes[0]!,
+        status: "completed" as const,
+        evidence: [{ evidenceId: "subject-attestation:run", kind: "diagnostic" as const }]
+      }]
+    };
+
+    await expect(control.forSession(target).updatePlan({ expectedRevision: 1, plan: completed }))
+      .rejects.toThrow("unavailable, failed, or mismatched evidence");
   });
 });

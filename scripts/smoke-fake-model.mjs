@@ -22,7 +22,7 @@ export function fakeProcessValidationTurn(id, relativePath, expected) {
     const delta = currentRunEvidence(request).findLast((item) => item.kind === "workspace_delta");
     if (!delta) throw new Error("The smoke validator requires current-run workspace delta evidence.");
     return fakeToolTurn([fakeToolCall(id, "validate", {
-      executable: "sigma-smoke-validate",
+      executable: "./sigma-smoke-validate",
       args: [relativePath, expected],
       access: "readonly",
       workspaceDeltaEvidenceIds: [delta.evidenceId]

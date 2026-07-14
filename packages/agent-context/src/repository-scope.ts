@@ -4,7 +4,7 @@ import { isInside, resolveWorkspacePath } from "agent-platform";
 import {
   safeAutomaticDirectoryPath,
   safeAutomaticFilePath
-} from "./repository-path-metadata.js";
+} from "./repository-path-safety.js";
 
 export async function normalizedSafeRepositoryPath(
   workspace: string,

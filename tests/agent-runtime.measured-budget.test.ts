@@ -18,6 +18,7 @@ import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tool
 class UnderestimatedGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "measured-usage";
+  streamCalls = 0;
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 16_000,
     maxOutputTokens: 100,
@@ -34,6 +35,7 @@ class UnderestimatedGateway implements ModelGateway {
   }
 
   async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.streamCalls += 1;
     yield {
       type: "done",
       response: {
@@ -96,4 +98,69 @@ describe("provider-measured model budget settlement", () => {
       ledger: expect.objectContaining({ consumed: expect.objectContaining({ inputTokens: 130 }) })
     }));
   });
+
+  it.each(["budget.committed", "budget.overrun", "usage.recorded", "model.completed"] as const)(
+    "closes the final-response reservation once when %s persistence fails",
+    async (failingType) => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-settlement-workspace-"));
+      const state = await mkdtemp(path.join(os.tmpdir(), "sigma-model-settlement-state-"));
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const append = store.append.bind(store);
+      let injected = false;
+      store.append = async (event, expectedSeq) => {
+        if (!injected && event.type === failingType) {
+          injected = true;
+          throw new Error(`Injected ${failingType} persistence failure.`);
+        }
+        return await append(event, expectedSeq);
+      };
+      const gateway = new UnderestimatedGateway();
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        outputReserveTokens: 100
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 120,
+        outputTokens: 1_000,
+        costMicroUsd: 10_000_000,
+        modelTurns: 1_000,
+        toolCalls: 1_000,
+        children: 32,
+        maxDepth: 4
+      });
+      await runtime.command({ type: "submit", sessionId: session.sessionId, text: "simple question" });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "recoverable_failure"
+      });
+      const events = await storedEvents(store, session.sessionId);
+      const committed = events.filter((event) => event.type === "budget.committed");
+      const ledger = (committed[0]?.payload as {
+        ledger: {
+          reservations: {
+            status: string;
+            requested: { inputTokens: number; outputTokens: number };
+            consumed: { inputTokens: number; outputTokens: number };
+          }[];
+          reserved: { inputTokens: number; outputTokens: number };
+          consumed: { inputTokens: number; outputTokens: number };
+        };
+      }).ledger;
+      const modelReservation = ledger.reservations.find((reservation) => reservation.status === "committed");
+      expect(injected).toBe(true);
+      expect(gateway.streamCalls).toBe(1);
+      expect(committed).toHaveLength(1);
+      expect(ledger.reservations.filter((reservation) => reservation.status === "reserved")).toHaveLength(0);
+      expect(ledger.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0 });
+      expect(ledger.consumed).toMatchObject({ inputTokens: 130, outputTokens: 5 });
+      expect(modelReservation).toMatchObject({
+        requested: { inputTokens: 120, outputTokens: 150 },
+        consumed: { inputTokens: 130, outputTokens: 5 }
+      });
+    }
+  );
 });

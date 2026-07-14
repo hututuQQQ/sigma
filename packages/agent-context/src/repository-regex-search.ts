@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import { textLines } from "agent-platform";
 
 export const MAX_REPOSITORY_REGEX_CHARACTERS = 4_096;
 
@@ -67,26 +68,17 @@ export function literalLineMatches(
   signal: AbortSignal
 ): RegexSearchOutcome {
   const matches: RepositoryLineMatch[] = [];
-  let line = 1;
-  let start = 0;
-  while (start < content.length) {
-    if ((line & 63) === 0) signal.throwIfAborted();
+  for (const line of textLines(content)) {
+    if ((line.number & 63) === 0) signal.throwIfAborted();
     if (performance.now() >= deadline) {
       return { matches, limitReached: false, deadlineReached: true };
     }
-    let end = start;
-    while (end < content.length && content[end] !== "\r" && content[end] !== "\n") end += 1;
-    const text = content.slice(start, end);
-    if (text.includes(query)) {
+    if (line.text.includes(query)) {
       if (matches.length >= maximum) {
         return { matches, limitReached: true, deadlineReached: false };
       }
-      matches.push({ line, text });
+      matches.push({ line: line.number, text: line.text });
     }
-    if (end >= content.length) break;
-    if (content[end] === "\r" && content[end + 1] === "\n") end += 1;
-    start = end + 1;
-    line += 1;
   }
   signal.throwIfAborted();
   return { matches, limitReached: false, deadlineReached: false };

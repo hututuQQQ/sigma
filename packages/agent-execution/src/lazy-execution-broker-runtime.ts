@@ -22,7 +22,7 @@ import {
 
 export interface RuntimeNodeBinding {
   executable: string;
-  source: "portable" | "current-runtime";
+  source: "portable" | "configured" | "current-runtime";
 }
 
 export interface DefaultBrokerClientFactoryOptions {
@@ -79,12 +79,22 @@ export function withTrustedRuntimeCapabilities(
 export function runtimeNodeBinding(
   packageModuleUrl: string | URL = import.meta.url,
   platform: NodeJS.Platform = process.platform,
-  currentExecutable = process.execPath
+  currentExecutable = process.execPath,
+  env: NodeJS.ProcessEnv = process.env
 ): RuntimeNodeBinding {
   const portable = resolvePortableNodeExecutable(packageModuleUrl, platform);
-  return portable
-    ? { executable: portable, source: "portable" }
-    : { executable: path.resolve(currentExecutable), source: "current-runtime" };
+  if (portable) return { executable: portable, source: "portable" };
+  const configured = env.SIGMA_RUNTIME_NODE_PATH;
+  if (configured !== undefined) {
+    if (configured.length === 0 || !path.isAbsolute(configured)) {
+      throw new BrokerToolchainUnavailableError(
+        "runtime-node",
+        "SIGMA_RUNTIME_NODE_PATH must be a non-empty absolute path"
+      );
+    }
+    return { executable: path.resolve(configured), source: "configured" };
+  }
+  return { executable: path.resolve(currentExecutable), source: "current-runtime" };
 }
 
 export function runtimeTrustedToolchains(
@@ -121,7 +131,7 @@ export function runtimeTrustedToolchainsForBinding(
   platform: NodeJS.Platform,
   sandboxMode: "required" | "unsafe"
 ): TrustedToolchainManifestEntry[] {
-  if (binding.source !== "portable" || platform !== "win32" || sandboxMode !== "required") {
+  if (binding.source === "current-runtime" || platform !== "win32" || sandboxMode !== "required") {
     return runtimeTrustedToolchains(binding.executable, platform, sandboxMode);
   }
   const compatibility = createWindowsAppContainerNodeCompatibilityProof(binding.executable, "runtime-node");
@@ -155,7 +165,7 @@ export function defaultBrokerClientFactory(
   options: DefaultBrokerClientFactoryOptions
 ): () => ExecutionBroker {
   const env = options.env ?? process.env;
-  const runtime = runtimeNodeBinding();
+  const runtime = runtimeNodeBinding(import.meta.url, process.platform, process.execPath, env);
   const trustedToolchains = options.trustedToolchains
     ?? runtimeTrustedToolchainsForBinding(runtime, process.platform, options.sandboxMode);
   const secrets = Object.fromEntries(

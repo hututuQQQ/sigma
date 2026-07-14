@@ -1,4 +1,11 @@
-import type { BudgetAmounts, BudgetLimits, CheckpointRef, PlanGraph, RuntimeControlPort } from "agent-protocol";
+import {
+  isCompletionEligibleEvidence,
+  type BudgetAmounts,
+  type BudgetLimits,
+  type CheckpointRef,
+  type PlanGraph,
+  type RuntimeControlPort
+} from "agent-protocol";
 import type { ChildCheckpointRecovery, RuntimeSession } from "./types.js";
 import { ChildBudgetControl } from "./child-budget-control.js";
 import { planAfterChildOutcome, planAfterChildRollback, type ChildPlanOutcome } from "./child-plan-transitions.js";
@@ -92,7 +99,11 @@ export class RuntimeControlService {
       });
     }
     const currentRunEvidence = new Map(session.durable.state.evidence
-      .filter((item) => item.sessionId === session.identity.sessionId && item.runId === session.durable.runId)
+      .filter((item) => isCompletionEligibleEvidence(
+        item,
+        session.identity.sessionId,
+        session.durable.runId
+      ))
       .map((item) => [item.evidenceId, item] as const));
     assertPlanTransition(session.durable.state.plan, plan, currentRunEvidence, allowChildOwnedChanges);
     await this.options.emit(session, "plan.updated", "runtime", { previousRevision: expectedRevision, plan });

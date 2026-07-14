@@ -13,6 +13,7 @@ import {
   normalizeTrustedToolchains
 } from "../packages/agent-execution/src/trusted-toolchains.js";
 import { runtimeEnvironment, runtimePrompt } from "../packages/agent-platform/src/index.js";
+import { brokerRuntimeEnvironment } from "../packages/agent-runtime/src/execution-capabilities.js";
 
 function report(): BrokerDoctorReport {
   return {
@@ -96,6 +97,13 @@ describe("connection-bound runtime capability reporting", () => {
     expect(prompt).toContain("defaultShell=none");
     expect(prompt).toContain("verifiedShells=none");
     expect(prompt).toContain("verifiedRuntimeCommands=none");
+  });
+
+  it("does not fall back or interpolate malformed broker environment fields", () => {
+    expect(() => brokerRuntimeEnvironment({ ...report(), platform: "unknown" }))
+      .toThrow(/unsupported platform/u);
+    expect(() => brokerRuntimeEnvironment({ ...report(), architecture: "x64\nforged" }))
+      .toThrow(/architecture/u);
   });
 
   it("adds only trusted command aliases after the underlying connection succeeds", async () => {

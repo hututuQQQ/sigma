@@ -82,20 +82,25 @@ function result(
 }
 
 const listGlobCharacterLimit = 512;
+const maximumListEntries = 20_000;
+const maximumSearchMatches = 5_000;
 
 function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
   return {
     descriptor: schema({
       name: "list",
       description: "List repository files recursively as bounded JSONL paths with optional glob filtering. Nested ignore rules and hidden, generated, vendor, control, sensitive, and symbolic-linked paths are excluded; diagnostics state completeness.",
-      properties: { path: { type: "string" }, glob: { type: "string" }, limit: { type: "number" } },
+      properties: {
+        path: { type: "string" }, glob: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: maximumListEntries }
+      },
       contextPathArguments: ["path"],
       possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = object(request.arguments);
-      const limit = integer(input, "limit", 2_000, 20_000);
+      const limit = integer(input, "limit", 2_000, maximumListEntries);
       const searchPath = text(input, "path", ".");
       const pattern = text(input, "glob");
       if (pattern.length > listGlobCharacterLimit) {
@@ -132,7 +137,11 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
     descriptor: schema({
       name: "grep",
       description: "Search bounded safe repository text without spawning a process. Hidden, ignored, generated, linked, and sensitive paths are excluded. Matching is literal unless regex=true; results are JSONL.",
-      properties: { query: { type: "string" }, path: { type: "string" }, glob: { type: "string" }, regex: { type: "boolean" }, limit: { type: "number" } },
+      properties: {
+        query: { type: "string" }, path: { type: "string" }, glob: { type: "string" },
+        regex: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: maximumSearchMatches }
+      },
       required: ["query"], possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [],
       contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
@@ -141,7 +150,7 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
       const input = object(request.arguments);
       const query = text(input, "query");
       const searchPath = text(input, "path", ".");
-      const limit = integer(input, "limit", 500, 5_000);
+      const limit = integer(input, "limit", 500, maximumSearchMatches);
       const regex = input.regex === true;
       const glob = text(input, "glob");
       const search = await searchProvider(

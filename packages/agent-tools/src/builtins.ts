@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
-import { resolveWorkspacePath, runtimeEnvironment } from "agent-platform";
+import { resolveWorkspacePath, runtimeEnvironment, textLines } from "agent-platform";
 import type { ExecutionBroker } from "agent-execution";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 import {
@@ -93,7 +93,11 @@ function readTool(): RegisteredEffectTool {
     descriptor: descriptor({
       name: "read",
       description: `Read a UTF-8 text file inside the workspace (maximum ${MAX_EXPLICIT_WORKSPACE_READ_BYTES} bytes).`,
-      properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+      properties: {
+        path: { type: "string" },
+        offset: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1 }
+      },
       required: ["path"],
       possibleEffects: ["filesystem.read"],
       executionMode: "parallel",
@@ -113,8 +117,11 @@ function readTool(): RegisteredEffectTool {
       );
       const offset = typeof input.offset === "number" ? Math.max(0, Math.floor(input.offset)) : 0;
       const limit = typeof input.limit === "number" ? Math.max(1, Math.floor(input.limit)) : 500;
-      const lines = content.split(/\r?\n/).slice(offset, offset + limit);
-      return receipt(request, startedAt, { output: lines.map((line, index) => `${offset + index + 1}: ${line}`).join("\n"), observedEffects: ["filesystem.read"] });
+      const lines = [...textLines(content)].slice(offset, offset + limit);
+      return receipt(request, startedAt, {
+        output: lines.map((line) => `${line.number}: ${line.text}`).join("\n"),
+        observedEffects: ["filesystem.read"]
+      });
     }
   };
 }

@@ -119,12 +119,12 @@ describe("execution tool capability closure", () => {
     await expect(tools.prepare(
       request("exec", { executable: "runtime", network: "full" }),
       preparation(root)
-    )).rejects.toMatchObject({ code: "network_unavailable" });
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
     for (const pty of [false, true]) {
       await expect(tools.prepare(
         request("process_spawn", { executable: "runtime", pty }),
         preparation(root)
-      )).rejects.toMatchObject({ code: "pty_unavailable" });
+      )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
     }
     await expect(tools.prepare(
       request("exec", { executable: "runtime" }),
@@ -149,9 +149,9 @@ describe("execution tool capability closure", () => {
       for (const name of ["exec", "validate", "process_spawn"]) {
         const call = request(name, { executable: "unlisted-runtime", cwd: "missing" });
         await expect(tools.prepare(call, preparation(root)))
-          .rejects.toMatchObject({ code: "executable_unavailable" });
+          .rejects.toMatchObject({ code: "tool_arguments_invalid" });
         await expect(tools.execute(call, execution(root)))
-          .rejects.toMatchObject({ code: "executable_unavailable" });
+          .rejects.toMatchObject({ code: "tool_arguments_invalid" });
       }
       expect(pin).not.toHaveBeenCalled();
       expect(fixture.execute).not.toHaveBeenCalled();

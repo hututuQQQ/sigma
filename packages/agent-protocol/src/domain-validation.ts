@@ -16,12 +16,28 @@ import {
   usageRecordSchema
 } from "./domain-schemas.js";
 
+export const SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 = "sigma.subject_attestation.v1";
+const NON_ACTIONABLE_DIAGNOSTIC_SOURCES = new Set([SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1]);
+
 export function isEvidenceRecord(value: unknown): value is EvidenceRecord {
   return evidenceRecordSchema.safeParse(value).success;
 }
 
 export function assertEvidenceRecord(value: unknown): asserts value is EvidenceRecord {
   if (!isEvidenceRecord(value)) throw new Error("Invalid EvidenceRecord.");
+}
+
+/**
+ * Completion evidence must prove progress on the active user run. Durable
+ * provenance records remain auditable, but cannot satisfy task completion.
+ */
+export function isCompletionEligibleEvidence(
+  evidence: EvidenceRecord,
+  sessionId: string,
+  runId: string
+): boolean {
+  if (evidence.sessionId !== sessionId || evidence.runId !== runId || evidence.status === "failed") return false;
+  return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
 }
 
 export function isUsageRecord(value: unknown): value is UsageRecord {

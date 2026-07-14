@@ -1,9 +1,9 @@
 import path from "node:path";
 import {
   readStableBoundedText,
-  safeAutomaticFilePath,
   type StableTextRead
 } from "./repository-path-metadata.js";
+import { safeAutomaticFilePath } from "./repository-path-safety.js";
 
 const rejectedRead = (): StableTextRead => ({ content: null, rejected: true });
 

@@ -206,7 +206,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
     args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
     skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
     network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "number", minimum: 1, maximum: 600000 },
+    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   };
   if (validation) {

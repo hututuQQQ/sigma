@@ -14,6 +14,7 @@ import {
 } from "../packages/agent-context/src/repository-host-snapshot.js";
 import { BoundedRegexMatcher } from "../packages/agent-context/src/repository-regex-search.js";
 import { readStableWorkspaceText } from "../packages/agent-context/src/repository-safe-read.js";
+import { safeAutomaticFileName } from "../packages/agent-context/src/repository-path-safety.js";
 import type {
   ModelCapabilities,
   ModelGateway,
@@ -89,6 +90,11 @@ function exited(stdout: string) {
 }
 
 describe("host repository context", () => {
+  it("does not reinterpret a host filename separator as repository structure", () => {
+    expect(safeAutomaticFileName("literal\\nested.ts")).toBe(false);
+    expect(safeAutomaticFileName("literal/nested.ts")).toBe(false);
+  });
+
   it("counts source lines with stable reads and reports ignored or rejected coverage", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repository-stats-"));
     const linkedTarget = path.join(os.tmpdir(), `sigma-repository-stats-linked-${path.basename(workspace)}.ts`);
@@ -241,6 +247,61 @@ describe("host repository context", () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes compound sensitive and backup names from automatic listing and search", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repository-compound-sensitive-"));
+    try {
+      await Promise.all([
+        writeFile(path.join(workspace, "config.env.production"), "COMPOUND_SECRET=one\n", "utf8"),
+        writeFile(path.join(workspace, "identity.pem.bak"), "COMPOUND_SECRET=two\n", "utf8"),
+        writeFile(path.join(workspace, "credentials.json.backup"), "COMPOUND_SECRET=three\n", "utf8"),
+        writeFile(path.join(workspace, "AGENTS.md.bak"), "COMPOUND_SECRET=control\n", "utf8"),
+        writeFile(path.join(workspace, "visible.txt"), "ordinary content\n", "utf8")
+      ]);
+
+      const listing = await listRepositoryFiles(
+        workspace, new AbortController().signal, { deadline: performance.now() + 5_000 }
+      );
+      expect(listing.complete).toBe(true);
+      expect(listing.entries).toEqual(["visible.txt"]);
+
+      const search = await searchRepositoryText(workspace, new AbortController().signal, {
+        query: "COMPOUND_SECRET",
+        deadline: performance.now() + 5_000
+      });
+      expect(search.complete).toBe(true);
+      expect(search.matches).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects malformed UTF-8 from automatic statistics and search", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repository-invalid-utf8-"));
+    try {
+      await writeFile(path.join(workspace, "bad.ts"), Buffer.from([0x66, 0x80, 0x6f, 0x0a]));
+      const signal = new AbortController().signal;
+      const statistics = await collectRepositoryStatistics(workspace, signal, {
+        deadline: performance.now() + 5_000
+      });
+      expect(statistics).toMatchObject({
+        complete: false,
+        truncated: false,
+        observedSourceFiles: 1,
+        skippedSourceFiles: 1,
+        totals: { files: 0, physicalLines: 0, nonBlankLines: 0, bytes: 0 }
+      });
+
+      const search = await searchRepositoryText(workspace, signal, {
+        query: "\uFFFD",
+        deadline: performance.now() + 5_000
+      });
+      expect(search).toMatchObject({ complete: false, truncated: false, skippedFiles: 1 });
+      expect(search.matches).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 

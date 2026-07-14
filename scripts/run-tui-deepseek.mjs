@@ -3,11 +3,26 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(rootDir, "packages", "agent-cli", "dist", "index.js");
 const envPath = path.join(rootDir, ".env");
+
+export function standardRuntimeNodePath(
+  workspace = rootDir,
+  platform = process.platform,
+  architecture = process.arch
+) {
+  const executable = path.join(
+    workspace,
+    ".artifacts",
+    `agent-cli-${platform}-${architecture}`,
+    "bin",
+    platform === "win32" ? "node.exe" : "node"
+  );
+  return existsSync(executable) ? path.resolve(executable) : undefined;
+}
 
 function parseEnvLine(line) {
   const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
@@ -45,6 +60,7 @@ function assertBuiltCli() {
 async function main(argv = process.argv.slice(2)) {
   assertBuiltCli();
   const apiKey = await loadDeepSeekApiKey();
+  const runtimeNodePath = standardRuntimeNodePath();
   const passthrough = argv[0] === "--" ? argv.slice(1) : argv;
   const args = [
     "--experimental-ffi",
@@ -61,7 +77,8 @@ async function main(argv = process.argv.slice(2)) {
     cwd: rootDir,
     env: {
       ...process.env,
-      DEEPSEEK_API_KEY: apiKey
+      DEEPSEEK_API_KEY: apiKey,
+      ...(runtimeNodePath ? { SIGMA_RUNTIME_NODE_PATH: runtimeNodePath } : {})
     },
     stdio: "inherit"
   });
@@ -78,7 +95,9 @@ async function main(argv = process.argv.slice(2)) {
   });
 }
 
-await main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { textLines } from "agent-platform";
 import { withHostRepositorySnapshot } from "./repository-host-snapshot.js";
 import type { RepositorySnapshotAccess } from "./repository-snapshot-access.js";
 import {
@@ -57,21 +58,11 @@ function boundedPositive(value: number | undefined, fallback: number, maximum: n
 }
 
 function lineMetrics(content: string): { physicalLines: number; nonBlankLines: number } {
-  if (content.length === 0) return { physicalLines: 0, nonBlankLines: 0 };
   let physicalLines = 0;
   let nonBlankLines = 0;
-  let lineStart = 0;
-  for (let index = 0; index < content.length; index += 1) {
-    const character = content[index];
-    if (character !== "\n" && character !== "\r") continue;
-    if (content.slice(lineStart, index).trim().length > 0) nonBlankLines += 1;
+  for (const line of textLines(content)) {
     physicalLines += 1;
-    if (character === "\r" && content[index + 1] === "\n") index += 1;
-    lineStart = index + 1;
-  }
-  if (lineStart < content.length) {
-    physicalLines += 1;
-    if (content.slice(lineStart).trim().length > 0) nonBlankLines += 1;
+    if (line.text.trim().length > 0) nonBlankLines += 1;
   }
   return { physicalLines, nonBlankLines };
 }

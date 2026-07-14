@@ -53,6 +53,27 @@ function stringValue(value: unknown, label: string): string {
   return value;
 }
 
+const brokerPlatforms = new Set([
+  "aix", "darwin", "freebsd", "linux", "macos", "openbsd", "sunos", "win32", "windows"
+]);
+const architecturePattern = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/u;
+
+function brokerPlatform(value: unknown): string {
+  const platform = stringValue(value, "Broker platform");
+  if (!brokerPlatforms.has(platform)) {
+    throw new BrokerProtocolError(`Broker platform '${platform}' is unsupported.`);
+  }
+  return platform;
+}
+
+function brokerArchitecture(value: unknown): string {
+  const architecture = stringValue(value, "Broker architecture");
+  if (!architecturePattern.test(architecture)) {
+    throw new BrokerProtocolError("Broker architecture must be a short printable identifier.");
+  }
+  return architecture;
+}
+
 function booleanValue(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new BrokerProtocolError(`${label} must be boolean.`);
   return value;
@@ -222,13 +243,13 @@ export function parseDoctor(input: unknown): BrokerDoctorReport {
   if (!Array.isArray(networkModes) || networkModes.some((mode) => mode !== "none" && mode !== "full")) {
     throw new BrokerProtocolError("Broker networkModes are invalid.");
   }
-  const platform = stringValue(value.platform, "Broker platform");
+  const platform = brokerPlatform(value.platform);
   const shells = verifiedShells(capabilities.shells, platform);
   return {
     protocolVersion: BROKER_PROTOCOL_VERSION,
     brokerVersion: stringValue(value.brokerVersion, "Broker version"),
     platform,
-    architecture: stringValue(value.architecture, "Broker architecture"),
+    architecture: brokerArchitecture(value.architecture),
     sandbox: {
       available: booleanValue(sandbox.available, "sandbox.available"),
       backend: stringValue(sandbox.backend, "sandbox.backend"),

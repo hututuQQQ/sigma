@@ -1,10 +1,12 @@
-import type {
-  ContextItem,
-  ModelExecutionRole,
-  ModelMessage,
-  ModelRequest,
-  ModelResponse,
-  ModelToolDefinition
+import {
+  isCompletionEligibleEvidence,
+  type BudgetAmounts,
+  type ContextItem,
+  type ModelExecutionRole,
+  type ModelMessage,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelToolDefinition
 } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
 import { approximateTokens, RepositoryContextProvider } from "agent-context";
@@ -27,6 +29,7 @@ import {
   type PreparedModelBudget
 } from "./model-accounting.js";
 import { profileAllowsTool } from "./profile-policy.js";
+import { completionRepairPhase, descriptorsAllowedForRepair } from "./tool-turn-policy.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
@@ -39,12 +42,12 @@ interface PreparedModelTurn {
 
 interface ModelReservationState {
   settled: boolean;
-  response?: ModelResponse;
+  response?: ModelResponse; consumed?: Partial<BudgetAmounts>;
 }
 
 function evidenceLedger(session: RuntimeSession): ContextItem | undefined {
-  const available = session.durable.state.evidence.filter((item) => item.sessionId === session.identity.sessionId
-    && item.runId === session.durable.runId && item.status !== "failed");
+  const available = session.durable.state.evidence.filter((item) =>
+    isCompletionEligibleEvidence(item, session.identity.sessionId, session.durable.runId));
   if (available.length === 0) return undefined;
   const recent = available.slice(-96);
   const content = [
@@ -155,17 +158,10 @@ export class ModelEffectRunner {
   ): Promise<void> {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
-    const repairPending = session.durable.state.completionRepairAttempts > 0;
-    const hasCurrentRunReceipt = session.durable.state.receipts.length
-      > session.durable.state.receiptCountAtLastUserInput;
-    const evidenceRepair = repairPending && !hasCurrentRunReceipt;
-    const terminalRepair = repairPending && hasCurrentRunReceipt;
-    const descriptors = evidenceRepair
-      ? availableDescriptors.filter((item) => !item.possibleEffects.includes("outcome.propose"))
-      : terminalRepair
-      ? availableDescriptors.filter((item) => item.possibleEffects.includes("outcome.propose")
-        || item.possibleEffects.includes("outcome.request_input"))
-      : availableDescriptors;
+    const repairPhase = completionRepairPhase(session);
+    const repairPending = repairPhase !== "none";
+    const ledger = evidenceLedger(session);
+    const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
     const projectedDescriptors = projectModelToolDescriptors(
       descriptors,
       sessionSkillProjectionCapabilities({
@@ -178,7 +174,6 @@ export class ModelEffectRunner {
     const tools = modelTools(projectedDescriptors);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
-      const ledger = evidenceLedger(session);
     const plan = await providerSizedPlan(session.services.gateway, {
       system: ledger ? [...session.interaction.contextItems, ...hookContext, ledger] : [...session.interaction.contextItems, ...hookContext],
       history: session.durable.state.messages,
@@ -233,7 +228,12 @@ export class ModelEffectRunner {
         session, turnId, effectRevision, signal, turn, requestId, reservationId, response, startedAt, state
       );
     } catch (error) {
-      if (!state.settled && !state.response) {
+      if (!state.settled && state.response) {
+        await (state.consumed
+          ? this.options.budgets.commitMeasured(session, reservationId, state.consumed)
+          : this.options.budgets.settleInterruptedModel(session, requestId));
+        state.settled = true;
+      } else if (!state.settled) {
         await this.commitFailure(session, turn, requestId, reservationId, startedAt, error);
       }
       throw error;
@@ -262,7 +262,8 @@ export class ModelEffectRunner {
       performance.now() - startedAt,
       session.services.modelRole
     );
-    await this.options.budgets.commitMeasured(session, reservationId, consumedBudget(usage, turn.budget));
+    state.consumed = consumedBudget(usage, turn.budget);
+    await this.options.budgets.commitMeasured(session, reservationId, state.consumed);
     state.settled = true;
     await this.emitResolvedRoute(session, response);
     await this.options.emit(session, "usage.recorded", "runtime", usage);

@@ -209,7 +209,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidence-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
-      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      { message: { role: "assistant", content: "The file is empty." }, finishReason: "stop" },
       {
         message: {
           role: "assistant", content: "",
@@ -234,7 +234,9 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[1].toolChoice).toBe("required");
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+    expect(gateway.requests[2].toolChoice).toBeUndefined();
     expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("request_user_input");
   }, 30_000);
 
   it("repairs an evidence-backed natural stop through strict typed completion", async () => {
@@ -265,9 +267,135 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("requires exactly one terminal tool call");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input only when");
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
       .toEqual(["complete_task", "request_user_input"]);
+  }, 30_000);
+
+  it("keeps a failed receipt in evidence repair until non-failed durable evidence exists", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-evidence-repair-"));
+    const gateway = new ScriptedGateway([
+      { message: { role: "assistant", content: "I could not inspect the missing file." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "failed-read", name: "read", arguments: { path: "missing.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{
+            id: "need-existing-path",
+            name: "request_user_input",
+            arguments: { message: "Which existing path should I inspect?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect the requested file" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input", requestId: "need-existing-path", message: "Which existing path should I inspect?"
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].toolChoice).toBe("required");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("request_user_input");
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+  }, 30_000);
+
+  it("bounds a malformed complete_task during terminal repair", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-terminal-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "read-before-malformed-complete", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "malformed-complete", name: "complete_task", arguments: {} }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_missing",
+      message: "The model's protocol-repair action failed (tool_arguments_invalid)."
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
+  }, 30_000);
+
+  it("does not execute a tool that was not offered during terminal repair", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-policy-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "initial-policy-read", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant", content: "",
+          toolCalls: [{ id: "hidden-repair-read", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_missing",
+      message: "The model's protocol-repair action failed (tool_unavailable_for_repair)."
+    });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "initial-policy-read")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "tool.failed"
+      && (event.payload as { callId?: string }).callId === "hidden-repair-read"
+      && (event.payload as { diagnostics?: string[] }).diagnostics
+        ?.includes("tool_unavailable_for_repair"))).toHaveLength(1);
+    expect(events.filter((event) => event.type === "execution.planned"
+      && (event.payload as { executionId?: string }).executionId === "hidden-repair-read")).toHaveLength(0);
   }, 30_000);
 
   it("supports an explicit typed request for user input", async () => {
@@ -370,6 +498,64 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(receipts).toHaveLength(2);
     expect(receipts.every((event) => (event.payload as { outcome?: unknown }).outcome
       && (event.payload as { outcome: { status?: unknown } }).outcome.status === "succeeded")).toBe(true);
+    const restored = await restoreStoredSession(store, session.sessionId, 10_000);
+    expect(restored.state.repeatedToolBatchCount).toBe(2);
+    expect(restored.state.lastToolBatchOutcomeSignature).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it.each([
+    ["terminal before ordinary", [
+      { id: "ask-mixed-first", name: "request_user_input", arguments: { message: "Need input." } },
+      { id: "read-mixed-second", name: "read", arguments: { path: "seed.txt" } }
+    ]],
+    ["ordinary before terminal", [
+      { id: "read-mixed-first", name: "read", arguments: { path: "seed.txt" } },
+      { id: "ask-mixed-second", name: "request_user_input", arguments: { message: "Need input." } }
+    ]],
+    ["multiple terminal calls", [
+      { id: "ask-terminal-first", name: "request_user_input", arguments: { message: "Need input." } },
+      { id: "complete-terminal-second", name: "complete_task", arguments: {} }
+    ]]
+  ])("rejects a conflicting %s batch before any call executes", async (_label, toolCalls) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-batch-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "ask-alone",
+            name: "request_user_input",
+            arguments: { message: "Which target should I inspect?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect, or ask if a target is required." });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "needs_input", message: "Which target should I inspect?"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    const conflictingIds = new Set(toolCalls.map((call) => call.id));
+    const conflictLifecycle = events.filter((event) =>
+      (event.type === "tool.requested" || event.type === "tool.completed" || event.type === "tool.failed")
+      && conflictingIds.has((event.payload as { callId?: string }).callId ?? ""));
+    expect(conflictLifecycle).toHaveLength(0);
+    expect(events.filter((event) => event.type === "execution.started"
+      && conflictingIds.has((event.payload as { executionId?: string }).executionId ?? ""))).toHaveLength(0);
   });
 
   it("removes aborted outcome waiters", async () => {

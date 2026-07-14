@@ -15,10 +15,10 @@ import {
 import {
   escaped,
   rankedFiles,
-  safeAutomaticFilePath,
   structureSummary,
   type RepositorySnapshot
 } from "./repository-path-metadata.js";
+import { safeAutomaticFilePath } from "./repository-path-safety.js";
 import { readStableWorkspaceText } from "./repository-safe-read.js";
 import { approximateTokens, lexicalScore } from "./unicode.js";
 

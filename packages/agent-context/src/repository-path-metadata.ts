@@ -3,26 +3,6 @@ import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 import { lexicalTokens } from "./unicode.js";
 
-const ignoredDirectories = new Set([
-  ".agent", ".agents", ".artifacts", ".cache", ".codex", ".cursor", ".git", ".github",
-  ".hg", ".gradle", ".mypy_cache", ".next", ".nuxt", ".openai", ".pytest_cache",
-  ".ruff_cache", ".svn", ".turbo", ".venv", ".yarn", "__pycache__", "build", "coverage",
-  "dist", "node_modules", "obj", "out", "target", "vendor", "venv"
-]);
-const agentControlFiles = new Set([
-  "agents.md", "claude.md", "copilot-instructions.md", "gemini.md"
-]);
-const sensitiveFileNames = new Set([
-  "auth.json", "credentials", "credentials.json", "dockerconfigjson", "id_dsa", "id_ecdsa",
-  "id_ed25519", "id_rsa", "netrc", "npmrc", "nuget.config", "pip.conf", "pypirc", "secret",
-  "secret.json", "secrets", "secrets.json", "service-account.json", "service_account.json",
-  "settings.xml", "terraform.tfstate", "terraform.tfstate.backup", "token", "token.json",
-  "tokens", "tokens.json"
-]);
-const sensitiveExtensions = new Set([
-  ".der", ".env", ".jks", ".kdbx", ".key", ".keystore", ".ovpn", ".p12", ".pem", ".pfx",
-  ".tfstate"
-]);
 const orientationFiles = new Set([
   "cargo.toml", "go.mod", "package.json", "pom.xml", "pyproject.toml", "readme.md",
   "requirements.txt", "workspace.json"
@@ -47,6 +27,7 @@ const languageByExtension = new Map([
 ]);
 const MAX_STRUCTURE_GROUPS = 20;
 const MAX_MANIFEST_PATHS = 40;
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export interface RepositorySnapshot {
   files: string[];
@@ -73,44 +54,6 @@ export interface RankedFilesResult {
 export interface StructureSummaryResult {
   lines: string[];
   budgetExceeded: boolean;
-}
-
-function hiddenName(name: string): boolean {
-  return name.startsWith(".");
-}
-
-export function ignoredDirectory(name: string): boolean {
-  const normalized = name.toLowerCase();
-  return hiddenName(name) || ignoredDirectories.has(normalized)
-    || agentControlFiles.has(normalized) || sensitiveFileNames.has(normalized)
-    || normalized.startsWith(".env") || sensitiveExtensions.has(path.extname(normalized));
-}
-
-export function safeAutomaticFileName(name: string): boolean {
-  const normalized = name.toLowerCase();
-  if (hiddenName(name) || agentControlFiles.has(normalized) || sensitiveFileNames.has(normalized)) {
-    return false;
-  }
-  if (normalized.startsWith(".env")) return false;
-  return !sensitiveExtensions.has(path.extname(normalized));
-}
-
-export function safeAutomaticFilePath(file: string): boolean {
-  if (!file || path.isAbsolute(file) || /^[a-z]:/iu.test(file)) return false;
-  const segments = file.replaceAll("\\", "/").split("/");
-  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return false;
-  const basename = segments.at(-1);
-  return basename !== undefined
-    && segments.slice(0, -1).every((segment) => !ignoredDirectory(segment))
-    && safeAutomaticFileName(basename);
-}
-
-export function safeAutomaticDirectoryPath(directory: string): boolean {
-  if (directory === ".") return true;
-  if (!directory || path.isAbsolute(directory) || /^[a-z]:/iu.test(directory)) return false;
-  const segments = directory.replaceAll("\\", "/").split("/");
-  return segments.every((segment) => segment && segment !== "." && segment !== ".."
-    && !ignoredDirectory(segment));
 }
 
 export function repositoryLanguage(file: string): string | undefined {
@@ -193,7 +136,14 @@ async function readVerifiedHandle(
     || !sameStableFileState(openedAfter, pathAfter)) {
     return { content: null, rejected: true };
   }
-  return { content: bytes.toString("utf8"), rejected: false };
+  try {
+    return {
+      content: fatalUtf8Decoder.decode(bytes),
+      rejected: false
+    };
+  } catch {
+    return { content: null, rejected: true };
+  }
 }
 
 export async function readStableBoundedText(

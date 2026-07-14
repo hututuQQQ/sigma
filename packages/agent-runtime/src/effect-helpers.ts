@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
-import type {
-  EvidenceRecord, JsonValue, ModelGateway, ModelToolCall, ModelToolDefinition, ToolCallPlan, ToolDescriptor, ToolReceipt,
-  ValidationEvidence, WorkspaceDelta, WorkspaceDeltaEvidence
+import {
+  isCompletionEligibleEvidence,
+  type EvidenceRecord, type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
+  type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type ValidationEvidence, type WorkspaceDelta,
+  type WorkspaceDeltaEvidence
 } from "agent-protocol";
 import { planContext, type ContextPlan, type PlanContextOptions } from "agent-context";
 import { canonicalWorkspacePath, isInside, resolveWorkspacePath } from "agent-platform";
@@ -170,7 +172,7 @@ export function failed(call: ModelToolCall, startedAt: string, output: string, d
 
 export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
   return session.durable.state.evidence.filter((item) =>
-    item.sessionId === session.identity.sessionId && item.runId === session.durable.runId);
+    isCompletionEligibleEvidence(item, session.identity.sessionId, session.durable.runId));
 }
 
 function completionChangeEvidenceError(session: RuntimeSession): string | null {
@@ -235,9 +237,7 @@ export function completionFailure(session: RuntimeSession, call: ModelToolCall, 
 export function completionPlan(session: RuntimeSession): import("agent-protocol").PlanGraph | null {
   const pending = session.durable.state.plan.nodes.filter((node) => node.status !== "completed" && node.status !== "cancelled");
   if (pending.length !== 1 || pending[0]?.id !== "root" || pending[0].status !== "in_progress") return null;
-  const evidence = session.durable.state.evidence
-    .filter((item) => item.sessionId === session.identity.sessionId && item.runId === session.durable.runId)
-    .filter((item) => item.status !== "failed")
+  const evidence = currentRunEvidence(session)
     .map((item) => ({ evidenceId: item.evidenceId, kind: item.kind }));
   if (evidence.length === 0) return null;
   return {

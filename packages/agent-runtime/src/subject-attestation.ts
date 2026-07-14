@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import type { JsonValue } from "agent-protocol";
+import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type JsonValue } from "agent-protocol";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RuntimeSession } from "./types.js";
 
-export const SUBJECT_ATTESTATION_SOURCE_V1 = "sigma.subject_attestation.v1";
+export const SUBJECT_ATTESTATION_SOURCE_V1 = SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1;
 export const SUBJECT_ATTESTOR_ID_V1 = "subject-attestor";
 
 export interface SubjectProductAttestationV1 {

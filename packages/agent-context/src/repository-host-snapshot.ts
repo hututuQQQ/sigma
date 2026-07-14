@@ -8,11 +8,10 @@ import {
 } from "agent-platform";
 import createIgnore from "ignore";
 import {
-  ignoredDirectory,
   readStableBoundedText,
-  safeAutomaticFileName,
   type RepositorySnapshot
 } from "./repository-path-metadata.js";
+import { ignoredDirectory, safeAutomaticFileName } from "./repository-path-safety.js";
 import {
   HostRepositorySnapshotAccess,
   type RepositorySnapshotAccess

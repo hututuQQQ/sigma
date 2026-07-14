@@ -102,7 +102,10 @@ export interface KernelState {
   receiptCountAtLastUserInput: number;
   semanticProgress: SemanticProgressWatermark;
   semanticFailureCluster?: SemanticFailureCluster;
+  /** Signature of the most recently fully completed tool-call batch. */
   lastToolBatchSignature?: string;
+  /** Stable receipt semantics for that completed batch; excludes call IDs and timestamps. */
+  lastToolBatchOutcomeSignature?: string;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -159,6 +162,15 @@ function nonNegativeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function validToolBatchProgressState(state: Record<string, unknown>): boolean {
+  if (state.lastToolBatchSignature !== undefined && typeof state.lastToolBatchSignature !== "string") return false;
+  if (state.lastToolBatchOutcomeSignature === undefined) return true;
+  return typeof state.lastToolBatchSignature === "string" && state.lastToolBatchSignature.length > 0
+    && typeof state.lastToolBatchOutcomeSignature === "string"
+    && /^[a-f0-9]{64}$/u.test(state.lastToolBatchOutcomeSignature)
+    && Number.isSafeInteger(state.repeatedToolBatchCount) && Number(state.repeatedToolBatchCount) >= 1;
+}
+
 export function isSemanticProgressWatermark(value: unknown): value is SemanticProgressWatermark {
   const progress = record(value);
   return Boolean(progress && [progress.workspaceChanges, progress.durableEvidence, progress.revision]
@@ -213,6 +225,7 @@ export function isKernelState(value: unknown): value is KernelState {
     Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
     Array.isArray(state.childIds),
     validSemanticState(state),
+    validToolBatchProgressState(state),
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
       state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
   ].every(Boolean);

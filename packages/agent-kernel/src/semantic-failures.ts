@@ -1,6 +1,7 @@
 import {
   INFRASTRUCTURE_FAILURE_LIMIT,
   classifyInfrastructureFailureCodesV1,
+  isCompletionEligibleEvidence,
   type EvidenceRecord,
   type InfrastructureFailureClassificationV1,
   type ToolReceipt,
@@ -158,7 +159,7 @@ export function recordSemanticToolResult(
 }
 
 export function recordSemanticEvidenceProgress(state: KernelState, evidence: EvidenceRecord): KernelState {
-  if (evidence.status === "failed") return state;
+  if (!isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)) return state;
   const evidenceFromFailedTool = evidence.producer.authority === "tool"
     && state.receipts.some((receipt) => receipt.callId === evidence.producer.id && !receipt.ok);
   if (evidenceFromFailedTool) return state;

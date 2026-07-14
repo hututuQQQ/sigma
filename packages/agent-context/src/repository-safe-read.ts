@@ -8,9 +8,9 @@ import {
 import {
   captureStableBoundedTextState,
   readStableBoundedText,
-  safeAutomaticFilePath,
   type StableTextRead
 } from "./repository-path-metadata.js";
+import { safeAutomaticFilePath } from "./repository-path-safety.js";
 
 export interface StableWorkspaceReadOptions {
   afterTargetResolved?: (target: string) => Promise<void>;

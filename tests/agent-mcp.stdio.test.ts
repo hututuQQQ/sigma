@@ -25,6 +25,10 @@ import type {
   McpStdioServerConfig,
   McpToolDefinition
 } from "../packages/agent-mcp/src/types.js";
+import {
+  EffectToolRegistry,
+  registerToolExecutor
+} from "../packages/agent-tools/src/index.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 function mcpExecution() {
@@ -367,6 +371,32 @@ describe("MCP protocol normalization", () => {
       annotations: { readOnlyHint: "yes" }
     })).toEqual({ name: "ignored-annotation-types", inputSchema: {}, annotations: {} });
     expect(() => toolDefinition({ name: "bad", inputSchema: {}, annotations: [] })).toThrow("annotations must be an object");
+  });
+
+  it("registers an empty MCP input schema while still requiring object arguments", async () => {
+    const bridge = await McpToolBridge.create(fakeBridgeClient(
+      [{ name: "open", inputSchema: {} }],
+      { content: [] }
+    ), {
+      namespace: "empty_schema",
+      policy: { possibleEffects: ["filesystem.read"], approval: "auto" }
+    });
+    const registry = registerToolExecutor(new EffectToolRegistry(), bridge);
+    const context = executionContext(new AbortController().signal);
+    const request = {
+      callId: "empty-schema-call",
+      name: "empty_schema__open",
+      arguments: { arbitrary: { nested: true } }
+    } as const;
+    await expect(registry.prepare(request, context)).resolves.toMatchObject({
+      exactEffects: ["filesystem.read"]
+    });
+    await expect(registry.execute(request, context)).resolves.toMatchObject({ ok: true });
+    await expect(registry.prepare({
+      ...request,
+      callId: "empty-schema-array",
+      arguments: []
+    }, context)).rejects.toMatchObject({ code: "tool_arguments_invalid" });
   });
 
   it("normalizes bridge descriptors, results, errors, and progress", async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
   createBudgetLedger,
+  SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1,
   type AgentEventEnvelope,
   type AgentEventType,
   type EvidenceRecord,
@@ -98,7 +99,186 @@ function toolEvent(
   return apply(state, type, { callId, ...payload, ...pending.modelTurn });
 }
 
+function proposeToolBatch(
+  state: KernelState,
+  turnId: number,
+  calls: Array<{ id: string; name: string; arguments: JsonValue }>
+): KernelState {
+  return settleModel(startModel(state, turnId), "model.completed", {
+    message: { role: "assistant", content: "", toolCalls: calls },
+    toolCalls: calls,
+    finishReason: "tool_calls"
+  });
+}
+
+function completedReceipt(
+  output: string,
+  timestamp: string,
+  workspaceDelta?: { added: string[]; modified: string[]; deleted: string[] }
+): Record<string, JsonValue> {
+  return {
+    ok: true,
+    output,
+    outcome: { status: "succeeded", output, diagnosticCodes: [] },
+    observedEffects: ["filesystem.read"],
+    actualEffects: ["filesystem.read"],
+    ...(workspaceDelta ? { workspaceDelta } : {}),
+    artifacts: [],
+    diagnostics: [],
+    evidence: [],
+    startedAt: timestamp,
+    completedAt: timestamp
+  };
+}
+
 describe("agent-kernel exhaustive protocol behavior", () => {
+  it("rejects a mixed terminal batch atomically and bounds a repeated conflict", () => {
+    let state = apply(initial(), "user.message", { text: "inspect or ask" });
+    const mixed = (turn: number) => [
+      { id: `ask-${turn}`, name: "request_user_input", arguments: { message: "Which path?" } },
+      { id: `read-${turn}`, name: "read", arguments: { path: "seed.txt" } }
+    ];
+    state = proposeToolBatch(state, 1, mixed(1));
+    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 1 });
+    expect(state.pendingTools).toEqual([]);
+    expect(state.receipts).toEqual([]);
+
+    state = proposeToolBatch(state, 2, mixed(2));
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_batch_conflict"
+    });
+  });
+
+  it("allows one completion alongside ordinary work outside a repair turn", () => {
+    let state = apply(initial(), "user.message", { text: "write the result and finish" });
+    state = proposeToolBatch(state, 1, [
+      { id: "write-1", name: "write", arguments: { path: "result.txt", content: "done" } },
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+    ]);
+    expect(state).toMatchObject({ phase: "tool_pending", completionRepairAttempts: 0 });
+    expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["write-1", "complete-1"]);
+  });
+
+  it("rejects completion mixed with ordinary work during a repair turn", () => {
+    let state = apply(initial(), "user.message", { text: "finish cleanly" });
+    state = { ...state, completionRepairAttempts: 1 };
+    state = proposeToolBatch(state, 1, [
+      { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+    ]);
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure", code: "terminal_batch_conflict"
+    });
+  });
+
+  it("returns recoverable task-state failures from terminal repair to normal tools", () => {
+    let state = apply(initial(), "user.message", { text: "finish after the process exits" });
+    state = {
+      ...state,
+      completionRepairAttempts: 1,
+      evidence: [diagnosticEvidence("current-run-evidence")]
+    };
+    state = proposeToolBatch(state, 1, [{
+      id: "complete-while-active", name: "complete_task", arguments: { summary: "done", criteria: [] }
+    }]);
+    const failed = {
+      ...completedReceipt("Background processes remain active.", "2026-01-01T00:00:01.000Z"),
+      ok: false,
+      outcome: {
+        status: "failed", output: "Background processes remain active.", diagnosticCodes: ["active_processes"]
+      },
+      diagnostics: ["active_processes"]
+    };
+    state = toolEvent(state, "tool.failed", "complete-while-active", failed);
+    expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 0 });
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
+  });
+
+  it("blocks a third identical batch only after two identical completed outcomes", () => {
+    let state = apply(initial(), "user.message", { text: "inspect repeatedly" });
+    for (const index of [1, 2]) {
+      const callId = `same-${index}`;
+      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "seed.txt" } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        "stable result",
+        `2026-01-01T00:00:0${index}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+    state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+    expect(state.repeatedToolBatchCount).toBe(2);
+  });
+
+  it("resets the completed-outcome streak when another batch intervenes", () => {
+    let state = apply(initial(), "user.message", { text: "inspect related paths" });
+    for (const index of [1, 2]) {
+      const callId = `first-path-${index}`;
+      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "a.txt" } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt("A", `2026-01-01T00:00:0${index}.000Z`));
+    }
+    state = proposeToolBatch(state, 3, [{ id: "other-path", name: "read", arguments: { path: "b.txt" } }]);
+    state = toolEvent(state, "tool.completed", "other-path", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
+    expect(state.repeatedToolBatchCount).toBe(1);
+    state = proposeToolBatch(state, 4, [{ id: "first-path-again", name: "read", arguments: { path: "a.txt" } }]);
+    expect(state.phase).toBe("tool_pending");
+    expect(state.proposedOutcome).toBeUndefined();
+  });
+
+  it.each([
+    ["receipt output", completedReceipt("first", "2026-01-01T00:00:01.000Z"),
+      completedReceipt("second", "2026-01-01T00:00:02.000Z")],
+    ["workspace delta", completedReceipt("stable", "2026-01-01T00:00:01.000Z", {
+      added: ["first.txt"], modified: [], deleted: []
+    }), completedReceipt("stable", "2026-01-01T00:00:02.000Z", {
+      added: [], modified: ["second.txt"], deleted: []
+    })]
+  ])("allows a third identical call when the completed %s changes", (_label, first, second) => {
+    let state = apply(initial(), "user.message", { text: "observe changing results" });
+    state = proposeToolBatch(state, 1, [{ id: "changing-1", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "changing-1", first);
+    state = proposeToolBatch(state, 2, [{ id: "changing-2", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "changing-2", second);
+    expect(state.repeatedToolBatchCount).toBe(1);
+    state = proposeToolBatch(state, 3, [{ id: "changing-3", name: "read", arguments: { path: "seed.txt" } }]);
+    expect(state.phase).toBe("tool_pending");
+    expect(state.pendingTools).toHaveLength(1);
+    expect(state.proposedOutcome).toBeUndefined();
+  });
+
+  it("makes multi-tool completed outcome signatures independent of call and receipt order", () => {
+    const calls = (batch: number, reverse = false) => {
+      const values = [
+        { id: `batch-${batch}-a`, name: "read", arguments: { path: "a.txt" } },
+        { id: `batch-${batch}-b`, name: "read", arguments: { path: "b.txt" } }
+      ];
+      return reverse ? values.reverse() : values;
+    };
+    let state = apply(initial(), "user.message", { text: "inspect both paths" });
+    state = proposeToolBatch(state, 1, calls(1));
+    state = toolEvent(state, "tool.completed", "batch-1-a", completedReceipt("A", "2026-01-01T00:00:01.000Z"));
+    state = toolEvent(state, "tool.completed", "batch-1-b", completedReceipt("B", "2026-01-01T00:00:02.000Z"));
+    state = proposeToolBatch(state, 2, calls(2));
+    state = toolEvent(state, "tool.completed", "batch-2-b", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
+    state = toolEvent(state, "tool.completed", "batch-2-a", completedReceipt("A", "2026-01-01T00:00:04.000Z"));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    state = proposeToolBatch(state, 3, calls(3, true));
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+  });
+
+  it("accepts legacy repetition snapshots without an outcome signature", () => {
+    expect(isKernelState({
+      ...initial(),
+      lastToolBatchSignature: "legacy-call-signature",
+      repeatedToolBatchCount: 2
+    })).toBe(true);
+    expect(isKernelState({ ...initial(), lastToolBatchOutcomeSignature: 42 })).toBe(false);
+  });
+
   it("decides every phase and rejects stale effects", () => {
     const base = initial();
     expect(isTerminal(base)).toBe(false);
@@ -224,12 +404,44 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(incomplete.phase).toBe("ready_model");
     expect(incomplete.messages.at(-1)).toMatchObject({ role: "developer" });
+    expect(incomplete.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
     incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
       message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
     });
     expect(incomplete.proposedOutcome).toMatchObject({
       kind: "recoverable_failure", code: "terminal_protocol_missing"
     });
+    const failedEvidence = settleModel({
+      ...inFlight(),
+      evidence: [{ ...diagnosticEvidence("failed-evidence"), status: "failed" }]
+    }, "model.completed", {
+      message: { role: "assistant", content: "failed evidence is insufficient" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(failedEvidence.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    const provenanceOnly = settleModel({
+      ...inFlight(),
+      evidence: [{
+        ...diagnosticEvidence("subject-attestation"),
+        data: { source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, diagnostic: { productDigest: "opaque" } }
+      }]
+    }, "model.completed", {
+      message: { role: "assistant", content: "attestation does not answer the task" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(provenanceOnly.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    const evidenceBacked = settleModel({
+      ...inFlight(),
+      evidence: [diagnosticEvidence("current-run-evidence")]
+    }, "model.completed", {
+      message: { role: "assistant", content: "evidence-backed answer" },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one terminal tool call");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input only when");
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });

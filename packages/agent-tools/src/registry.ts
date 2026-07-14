@@ -10,7 +10,10 @@ import type {
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
-import { assertDescriptorArguments } from "./tool-argument-validation.js";
+import {
+  assertDescriptorArguments,
+  compileDescriptorArguments
+} from "./tool-argument-validation.js";
 
 export interface RegisteredEffectTool {
   descriptor: ToolDescriptor;
@@ -129,9 +132,11 @@ export class EffectToolRegistry implements ToolExecutor {
       if (mode === "change") return true;
       return !maximumEffects.some((effect) => ["filesystem.write", "process.spawn", "destructive"].includes(effect));
     });
+    const descriptor = { ...tool.descriptor, maximumEffects, availableModes };
+    compileDescriptorArguments(descriptor);
     this.tools.set(tool.descriptor.name, {
       ...tool,
-      descriptor: { ...tool.descriptor, maximumEffects, availableModes }
+      descriptor
     });
   }
 

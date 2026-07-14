@@ -3,9 +3,10 @@ import {
   AGENT_EVENT_TYPES, SNAPSHOT_SCHEMA_VERSION, STORE_LAYOUT_VERSION, AgentEventValidationError,
   assertAgentEventEnvelope, assertEvidenceRecord, assertMcpPersistentEffectsAllowed,
   assertMcpWriteRootsEmpty, assertSnapshotEnvelope, createBudgetLedger, createEmptyPlan,
-  isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef, isEvidenceRecord, isJsonValue,
+  isAgentEventEnvelope, isBudgetLedgerState, isCheckpointRef, isCompletionEligibleEvidence,
+  isEvidenceRecord, isJsonValue,
   isPlanGraph, isSnapshotEnvelope, isSolverVisibleAuthority, isUsageRecord, McpCapabilityPolicyError,
-  SnapshotValidationError, type AgentEventType
+  SnapshotValidationError, SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1, type AgentEventType
 } from "../packages/agent-protocol/src/index.js";
 import {
   agentEventPayloadFixtures as fixtures, checkpointFixture, evidenceFixture, fixtureOccurredAt,
@@ -108,6 +109,17 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     expect(isEvidenceRecord(validation)).toBe(true);
     expect(isEvidenceRecord({ ...validation, data: { ...validation.data, exitCode: "zero" } })).toBe(false);
     expect(() => assertEvidenceRecord({ ...command, data: { ...command.data, signal: 123 } })).toThrow();
+  });
+
+  it("keeps provenance attestations durable but ineligible for task completion", () => {
+    const diagnostic = evidenceFixture();
+    expect(isCompletionEligibleEvidence(diagnostic, "session", "run")).toBe(true);
+    expect(isCompletionEligibleEvidence({
+      ...diagnostic,
+      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
+    }, "session", "run")).toBe(false);
+    expect(isCompletionEligibleEvidence({ ...diagnostic, status: "failed" }, "session", "run")).toBe(false);
+    expect(isCompletionEligibleEvidence(diagnostic, "session", "other-run")).toBe(false);
   });
 
   it("keeps domain ledgers, topology, JSON, and MCP policy strict", () => {

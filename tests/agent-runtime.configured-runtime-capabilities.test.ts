@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   defaultSigmaExecPath,
+  LazyExecutionBroker,
   resolveSigmaExecBinary,
   runtimeNodeBinding,
   runtimeTrustedToolchains,
@@ -18,6 +19,7 @@ import type {
   ModelResponse,
   ModelStreamEvent
 } from "../packages/agent-protocol/src/index.js";
+import { SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 } from "../packages/agent-protocol/src/index.js";
 import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
@@ -63,8 +65,11 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
   await mkdir(path.dirname(executable), { recursive: true });
   await writeFile(modulePath, "export {};\n", "utf8");
   await writeFile(executable, "portable node", "utf8");
+  const configured = path.join(root, "configured", "node");
 
-  const binding = runtimeNodeBinding(pathToFileURL(modulePath), "linux", process.execPath);
+  const binding = runtimeNodeBinding(pathToFileURL(modulePath), "linux", process.execPath, {
+    SIGMA_RUNTIME_NODE_PATH: configured
+  });
   expect(binding).toEqual({ executable: path.resolve(executable), source: "portable" });
   expect(runtimeTrustedToolchainsForBinding(binding, "linux", "required")).toEqual([{
     id: "runtime-node",
@@ -74,6 +79,48 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
     executionRoots: [path.resolve(executable)],
     pathEntries: []
   }]);
+});
+
+it("uses an explicitly configured absolute Node after the portable location", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-configured-runtime-node-"));
+  fixtures.push(root);
+  const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
+  const executable = path.join(root, "configured", process.platform === "win32" ? "node.exe" : "node");
+  await mkdir(path.dirname(modulePath), { recursive: true });
+  await mkdir(path.dirname(executable), { recursive: true });
+  await writeFile(modulePath, "export {};\n", "utf8");
+  await writeFile(executable, "configured node", "utf8");
+
+  expect(runtimeNodeBinding(pathToFileURL(modulePath), process.platform, process.execPath, {
+    SIGMA_RUNTIME_NODE_PATH: executable
+  })).toEqual({ executable: path.resolve(executable), source: "configured" });
+  expect(runtimeNodeBinding(
+    pathToFileURL(modulePath), process.platform, process.execPath, {}
+  )).toEqual({ executable: path.resolve(process.execPath), source: "current-runtime" });
+});
+
+it.each(["", "relative/node"])(
+  "rejects an explicit non-absolute runtime Node path %j without host fallback",
+  async (configuredPath) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-invalid-runtime-node-"));
+    fixtures.push(root);
+    const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
+    await mkdir(path.dirname(modulePath), { recursive: true });
+    await writeFile(modulePath, "export {};\n", "utf8");
+
+    expect(() => runtimeNodeBinding(pathToFileURL(modulePath), process.platform, process.execPath, {
+      SIGMA_RUNTIME_NODE_PATH: configuredPath
+    })).toThrow(expect.objectContaining({ code: "toolchain_unavailable" }));
+  }
+);
+
+it("uses the environment passed to the default broker factory", async () => {
+  expect(() => new LazyExecutionBroker({
+    sandboxMode: "unsafe",
+    allowUnsafeHostExec: true,
+    helperPath: process.execPath,
+    env: { SIGMA_RUNTIME_NODE_PATH: "relative/node" }
+  })).toThrow(expect.objectContaining({ code: "toolchain_unavailable" }));
 });
 
 it("fails closed when a present portable Windows Node cannot prove LPAC compatibility", async () => {
@@ -86,6 +133,21 @@ it("fails closed when a present portable Windows Node cannot prove LPAC compatib
     "win32",
     "required"
   )).toThrow(/toolchain.*unavailable|could not be inspected|PE/iu);
+});
+
+it("requires the same Windows LPAC proof for an explicitly configured Node", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-configured-windows-node-"));
+  fixtures.push(root);
+  const executable = path.join(root, "node.exe");
+  await writeFile(executable, "not an approved Windows Node runtime", "utf8");
+  const binding = { executable, source: "configured" as const };
+
+  expect(() => runtimeTrustedToolchainsForBinding(binding, "win32", "required"))
+    .toThrow(/toolchain.*unavailable|could not be inspected|PE/iu);
+  expect(runtimeTrustedToolchainsForBinding(binding, "win32", "unsafe")).toMatchObject([{
+    executable: path.resolve(executable),
+    aliases: ["node", "node.exe"]
+  }]);
 });
 
 function doctorReport(
@@ -163,8 +225,12 @@ class CapturingGateway implements ModelGateway {
   };
   readonly requests: ModelRequest[] = [];
 
+  constructor(private readonly scripted: ModelResponse[] = []) {}
+
   async complete(request: ModelRequest): Promise<ModelResponse> {
     this.requests.push(request);
+    const response = this.scripted.shift();
+    if (response) return response;
     return {
       message: {
         role: "assistant",
@@ -243,6 +309,68 @@ describe("configured runtime execution capabilities", () => {
 
     expect(broker.connect).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps subject attestation out of task evidence and first-stop terminal repair", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-attestation-state-"));
+    fixtures.push(stateRoot);
+    const runtimeConfig = configured(root);
+    runtimeConfig.permissionMode = "auto";
+    const gateway = new CapturingGateway([
+      { message: { role: "assistant", content: "Hello. What should I inspect?" }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "need-task-after-attestation",
+            name: "request_user_input",
+            arguments: { message: "What should I inspect?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
+      stateRootDir: stateRoot,
+      executionBroker: fixtureBroker(doctorReport([])),
+      gatewayFactory: () => gateway,
+      subjectProductAttestation: {
+        schemaVersion: 1,
+        productDigest: "a".repeat(64),
+        buildArtifactDigest: "b".repeat(64),
+        environmentDigest: "c".repeat(64),
+        platform: "linux"
+      }
+    }, { connectMcp: false, surface: "cli" });
+    try {
+      const session = await configuredRuntime.runtime.createSession({ workspacePath: root, mode: "analyze" });
+      await configuredRuntime.runtime.command({
+        type: "submit", sessionId: session.sessionId, text: "hello", mode: "analyze"
+      });
+      const outcome = await configuredRuntime.runtime.waitForOutcome(session.sessionId);
+      const events = [];
+      for await (const event of configuredRuntime.runtime.sessionEvents(session.sessionId)) events.push(event);
+      const toolResults = events.filter((event) => event.type === "tool.completed" || event.type === "tool.failed");
+      expect(outcome, JSON.stringify(toolResults.map((event) => event.payload))).toMatchObject({
+        kind: "needs_input", message: "What should I inspect?"
+      });
+
+      expect(gateway.requests).toHaveLength(2);
+      const initialContext = gateway.requests[0]!.messages.map((message) => message.content).join("\n");
+      expect(initialContext).not.toContain("Current-run typed durable evidence ledger");
+      expect(initialContext).not.toContain("subject-attestation:");
+      expect(gateway.requests[1]!.toolChoice).toBe("required");
+      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).toContain("request_user_input");
+      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).not.toContain("complete_task");
+
+      expect(events.filter((event) => event.type === "evidence.recorded"
+        && (event.payload as { data?: { source?: string } }).data?.source
+          === SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1)).toHaveLength(1);
+    } finally {
+      await configuredRuntime.close();
+    }
   });
 
   it.each([

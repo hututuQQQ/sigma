@@ -41,6 +41,7 @@ import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
+import { completionRepairPhase, descriptorAllowedForRepair } from "./tool-turn-policy.js";
 
 interface PreparedTool extends ToolAttempt {
   descriptor: ToolDescriptor;
@@ -133,6 +134,14 @@ export class ToolTransactionRunner {
     }
     if (!profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
+    }
+    if (!descriptorAllowedForRepair(descriptor, completionRepairPhase(session))) {
+      return failed(
+        call,
+        startedAt,
+        `Tool '${call.name}' was not offered for the active protocol-repair turn.`,
+        "tool_unavailable_for_repair"
+      );
     }
     const context = {
       sessionId: session.identity.sessionId,
