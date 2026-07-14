@@ -2,6 +2,7 @@ import {
   KERNEL_STATE_VERSION,
   isBudgetLedgerState,
   isCheckpointRef,
+  isCompletionEligibleEvidence,
   isEvidenceRecord,
   isPlanGraph,
   isUsageRecord,
@@ -107,6 +108,61 @@ function assertToolLedger(state: KernelState): void {
   }
 }
 
+function assertRepairAttemptState(state: KernelState): void {
+  const repair = state.completionRepair;
+  if (!repair) {
+    if (state.completionRepairAttempts !== 0) {
+      throw new Error("Completion repair attempts require explicit repair state.");
+    }
+    return;
+  }
+  if (repair.kind === "protected_recovery") {
+    if (state.completionRepairAttempts !== 0) {
+      throw new Error("Protected completion recovery cannot consume a protocol-repair attempt.");
+    }
+  } else if (state.completionRepairAttempts === 0) {
+    throw new Error("Explicit protocol-repair state requires a repair attempt.");
+  }
+}
+
+function assertProtectedInputState(state: KernelState): void {
+  if (state.phase !== "needs_input" && state.outcome?.kind !== "needs_input") return;
+  const requestId = state.outcome?.kind === "needs_input" ? state.outcome.requestId : null;
+  const approval = state.pendingTools.some((item) =>
+    item.approval === "pending" && (requestId === null || item.request.callId === requestId));
+  if (!approval) {
+    throw new Error("A protected completion state can await input only for a pending tool approval.");
+  }
+}
+
+function assertProtectedRepairState(state: KernelState): void {
+  const repair = state.completionRepair;
+  if (!repair) return;
+  const protectedAnswer = repair.kind === "protected_completion" || repair.kind === "protected_recovery";
+  if (!protectedAnswer) return;
+  if (!state.evidence.some((item) =>
+    isCompletionEligibleEvidence(item, state.sessionId, state.runId))) {
+    throw new Error("A protected completion repair requires current-run eligible evidence.");
+  }
+  if (repair.kind === "protected_completion" && state.pendingTools.length > 0
+    && (state.pendingTools.length !== 1 || state.pendingTools[0]?.request.name !== "complete_task")) {
+    throw new Error("A protected completion repair can pend only one complete_task call.");
+  }
+  if (repair.kind === "protected_recovery"
+    && state.pendingTools.some((item) => item.request.name === "request_user_input")) {
+    throw new Error("Protected completion recovery cannot pend a user-input request.");
+  }
+  if (state.proposedOutcome?.kind === "needs_input") {
+    throw new Error("A protected completion state cannot propose a user-input outcome.");
+  }
+  assertProtectedInputState(state);
+}
+
+function assertCompletionRepairState(state: KernelState): void {
+  assertRepairAttemptState(state);
+  if (state.completionRepair) assertProtectedRepairState(state);
+}
+
 function assertPhaseState(state: KernelState): void {
   if ((state.phase === "model_in_flight") !== Boolean(state.activeModelTurn)) {
     throw new Error("Model-in-flight state and active model turn must agree.");
@@ -118,6 +174,7 @@ function assertPhaseState(state: KernelState): void {
   if (state.phase !== "terminal" && state.outcome?.kind !== "needs_input") {
     if (state.outcome) throw new Error("Non-terminal kernel state cannot have a terminal outcome.");
   }
+  assertCompletionRepairState(state);
 }
 
 export function assertKernelInvariants(state: KernelState): void {

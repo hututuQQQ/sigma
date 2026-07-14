@@ -22,6 +22,33 @@ function propose(state: KernelState, outcome: RunOutcome): KernelState {
   };
 }
 
+export function protectedCompletionAnswer(state: KernelState): string | null {
+  return state.completionRepair?.kind === "protected_completion"
+    || state.completionRepair?.kind === "protected_recovery"
+    ? state.completionRepair.answer
+    : null;
+}
+
+export function hasCompletionRepair(state: KernelState): boolean {
+  return state.completionRepair !== undefined || state.completionRepairAttempts > 0;
+}
+
+export function completionRepairRequiresTerminalAction(state: KernelState): boolean {
+  if (state.completionRepair?.kind === "evidence_acquisition") return false;
+  if (state.completionRepair?.kind === "protected_recovery") return false;
+  if (state.completionRepair?.kind === "terminal_action"
+    || state.completionRepair?.kind === "protected_completion") return true;
+  // Compatibility for snapshots written before the explicit repair intent was
+  // introduced. Newly reduced states always carry completionRepair.
+  return state.completionRepairAttempts > 0 && hasCurrentRunEvidence(state);
+}
+
+export function completionRepairFailureMessage(state: KernelState, detail: string): string {
+  const answer = protectedCompletionAnswer(state);
+  if (!answer || detail.startsWith(answer)) return detail;
+  return `${answer}\n\n[Completion protocol repair failed: ${detail}]`;
+}
+
 export function completionSummary(receipt: ToolReceipt): string | null {
   if (!receipt.ok || !receipt.observedEffects.includes("outcome.propose")) return null;
   try {
@@ -54,14 +81,23 @@ export function failedTerminalRepairState(
   if (!repairPending || remainingTools !== 0) return null;
   const protocolCodes = receipt.diagnostics.filter((code) => TERMINAL_PROTOCOL_FAILURE_CODES.has(code));
   if (protocolCodes.length === 0 && !receipt.ok) {
-    return terminalRepairPending ? { ...state, completionRepairAttempts: 0 } : null;
+    if (!terminalRepairPending) return null;
+    const answer = protectedCompletionAnswer(state);
+    return {
+      ...state,
+      completionRepairAttempts: 0,
+      completionRepair: answer ? { kind: "protected_recovery", answer } : undefined
+    };
   }
   if (protocolCodes.length === 0 && !terminalRepairPending) return null;
   const detail = protocolCodes.length > 0 ? protocolCodes.join(", ") : "terminal_action_missing";
   return propose(state, {
     kind: "recoverable_failure",
     code: "terminal_protocol_missing",
-    message: `The model's protocol-repair action failed (${detail}).`
+    message: completionRepairFailureMessage(
+      state,
+      `The model's protocol-repair action failed (${detail}).`
+    )
   });
 }
 
@@ -85,16 +121,25 @@ export function repairConflictingTerminalBatch(
     return propose({ ...state, messages }, {
       kind: "recoverable_failure",
       code: "terminal_batch_conflict",
-      message: "The model repeatedly mixed a terminal protocol action with other tool calls."
+      message: completionRepairFailureMessage(
+        state,
+        "The model repeatedly mixed a terminal protocol action with other tool calls."
+      )
     });
   }
+  const evidenceAvailable = hasCurrentRunEvidence(state);
   return {
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "A terminal protocol action must be the only call in its tool batch. On this repair turn, either call exactly one allowed terminal action, or issue only non-terminal calls and decide the outcome on a later turn."
+      content: evidenceAvailable
+        ? "A terminal protocol action must be the only call in its tool batch. On this repair turn, call exactly one allowed terminal action."
+        : "A terminal protocol action must be the only call in its tool batch. Completion is unavailable until current-run evidence exists; use only non-terminal evidence tools, or request user input alone when a concrete decision is required."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
+    completionRepair: evidenceAvailable
+      ? { kind: "terminal_action" }
+      : { kind: "evidence_acquisition" },
     continuationAttempts: 0,
     phase: "ready_model"
   };
@@ -127,7 +172,10 @@ export function incompleteModelCompletion(
       return propose({ ...state, messages }, {
         kind: "recoverable_failure",
         code: "model_output_limit",
-        message: "The model reached its output limit repeatedly without producing a protocol action."
+        message: completionRepairFailureMessage(
+          state,
+          "The model reached its output limit repeatedly without producing a protocol action."
+        )
       });
     }
     return { ...state, messages, continuationAttempts: state.continuationAttempts + 1, phase: "ready_model" };
@@ -136,7 +184,7 @@ export function incompleteModelCompletion(
     return propose({ ...state, messages }, {
       kind: "fatal",
       code: "content_filter",
-      message: "Provider blocked the response."
+      message: completionRepairFailureMessage(state, "Provider blocked the response.")
     });
   }
   const response = [...messages].reverse().find((message) => message.role === "assistant")?.content.trim() ?? "";
@@ -144,7 +192,10 @@ export function incompleteModelCompletion(
     return propose({ ...state, messages }, {
       kind: "recoverable_failure",
       code: "model_no_action",
-      message: "The model stopped without a response or tool call."
+      message: completionRepairFailureMessage(
+        state,
+        "The model stopped without a response or tool call."
+      )
     });
   }
   if (!hasCurrentRunEvidence(state)) {
@@ -162,6 +213,7 @@ export function incompleteModelCompletion(
         content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain successful durable evidence, or call request_user_input if a concrete user decision is required. Do not repeat the natural-language response and do not call complete_task before evidence exists."
       }],
       completionRepairAttempts: state.completionRepairAttempts + 1,
+      completionRepair: { kind: "evidence_acquisition" },
       phase: "ready_model"
     };
   }
@@ -169,16 +221,20 @@ export function incompleteModelCompletion(
     return propose({ ...state, messages }, {
       kind: "recoverable_failure",
       code: "terminal_protocol_missing",
-      message: "The model repeatedly stopped without choosing complete_task or request_user_input."
+      message: completionRepairFailureMessage(
+        state,
+        "The model repeatedly stopped without choosing the required terminal protocol action."
+      )
     });
   }
   return {
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "Your response stopped after obtaining current-run evidence but did not choose a terminal action. This repair turn requires exactly one terminal tool call. Use complete_task with explicit criteria and exact evidence IDs when the prior response already provides a substantive result. Use request_user_input only when that prior response identifies a specific blocking decision or missing fact without which the task cannot be completed; never use it for optional follow-up, confirmation, or an offer of more help. Do not repeat the natural-language response or call any non-terminal tool."
+      content: "Your evidence-backed response stopped without finalizing its terminal protocol. The substantive answer is now protected. This repair turn requires exactly one complete_task call with explicit criteria and exact evidence IDs. request_user_input and non-terminal tools are unavailable because this turn may finalize the prior answer but may not replace it. Do not repeat or revise the natural-language response."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
+    completionRepair: { kind: "protected_completion", answer: response },
     phase: "ready_model"
   };
 }

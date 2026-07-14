@@ -26,7 +26,7 @@ import { hydrateRuntimeSession } from "./runtime-session-restore.js";
 import { RuntimeRunScheduler } from "./runtime-run-scheduler.js";
 import { initializeRuntimeSession } from "./runtime-session-initialization.js";
 import { restoreRuntimeCustomization } from "./runtime-customization-restore.js";
-import { finishRuntimeSession } from "./runtime-session-finish.js";
+import { finishRuntimeSession, type RunSuspensionContext } from "./runtime-session-finish.js";
 import { RuntimeCheckpointCoordinator } from "./runtime-checkpoint-coordinator.js";
 import { assertProfileResources, constrainBudget, resolveHookProfile, resolveChildProfile, roleForMode, type SessionProfileSelection } from "./session-profile.js";
 import { createCheckpointManager } from "./runtime-checkpoint-manager.js";
@@ -92,7 +92,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
       permissionMode: options.permissionMode ?? "ask",
       outputReserveTokens: options.outputReserveTokens ?? Math.min(8_192, options.gateway.capabilities.maxOutputTokens),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
-      finish: async (session, outcome, outcomeRevision) => await this.finish(session, outcome, outcomeRevision),
+      finish: async (session, outcome, outcomeRevision, suspensionContext) =>
+        await this.finish(session, outcome, outcomeRevision, suspensionContext),
       createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
       control: this.control,
       budgets: this.budgets,
@@ -321,7 +322,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       finish: async (target, outcome) => await this.finish(target, outcome)
     }, session);
   }
-  private async finish(session: RuntimeSession, outcome: RunOutcome, outcomeRevision?: number): Promise<boolean> {
+  private async finish(
+    session: RuntimeSession,
+    outcome: RunOutcome,
+    outcomeRevision?: number,
+    suspensionContext?: RunSuspensionContext
+  ): Promise<boolean> {
     return await finishRuntimeSession({
       hooks: this.hooks,
       events: this.events,
@@ -333,7 +339,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
         this.options.execution,
         async (current, type, authority, value) => await this.emit(current, type, authority, value)
       )
-    }, session, outcome, outcomeRevision);
+    }, session, outcome, outcomeRevision, suspensionContext);
   }
 
   private async emit<TType extends AgentEventType>(

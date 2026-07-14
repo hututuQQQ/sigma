@@ -41,7 +41,11 @@ import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
-import { completionRepairPhase, descriptorAllowedForRepair } from "./tool-turn-policy.js";
+import {
+  completionRepairPhase,
+  descriptorAllowedForRepair,
+  effectsAllowedForRepair
+} from "./tool-turn-policy.js";
 
 interface PreparedTool extends ToolAttempt {
   descriptor: ToolDescriptor;
@@ -135,7 +139,8 @@ export class ToolTransactionRunner {
     if (!profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
-    if (!descriptorAllowedForRepair(descriptor, completionRepairPhase(session))) {
+    const repairPhase = completionRepairPhase(session);
+    if (!descriptorAllowedForRepair(descriptor, repairPhase)) {
       return failed(
         call,
         startedAt,
@@ -155,6 +160,14 @@ export class ToolTransactionRunner {
         callId: call.id, name: call.name, arguments: call.arguments
       }, context)
       : await prepareToolCallPlan(descriptor, call.arguments, context);
+    if (!effectsAllowedForRepair(plan.exactEffects, repairPhase)) {
+      return failed(
+        call,
+        startedAt,
+        `Tool '${call.name}' planned effects that were not offered for the active protocol-repair turn.`,
+        "tool_unavailable_for_repair"
+      );
+    }
     const selectedValidationTargets = validationTargetIds(session, call, plan);
     await this.options.emit(session, "execution.planned", "runtime", {
       executionId: call.id, toolCallId: call.id, plan

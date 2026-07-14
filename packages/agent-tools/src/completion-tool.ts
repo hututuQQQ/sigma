@@ -13,6 +13,23 @@ export interface CompletionProposal {
   criteria: CompletionCriterion[];
 }
 
+export type TerminalProtocolAction = "complete" | "request_input";
+
+/**
+ * Classify a descriptor only when its sole possible and maximum effect is one
+ * terminal protocol capability. A descriptor that combines terminal and
+ * non-terminal behavior is not safe to project into a restricted turn.
+ */
+export function terminalProtocolAction(
+  descriptor: Pick<ToolDescriptor, "possibleEffects" | "maximumEffects">
+): TerminalProtocolAction | null {
+  const possible = descriptor.possibleEffects;
+  const maximum = descriptor.maximumEffects ?? possible;
+  if (possible.length !== 1 || maximum.length !== 1 || possible[0] !== maximum[0]) return null;
+  if (possible[0] === "outcome.propose") return "complete";
+  return possible[0] === "outcome.request_input" ? "request_input" : null;
+}
+
 function record(value: JsonValue): Record<string, JsonValue> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }

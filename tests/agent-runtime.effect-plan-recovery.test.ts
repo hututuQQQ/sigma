@@ -303,6 +303,13 @@ describe("effect-plan recovery", () => {
         outcome: expect.objectContaining({ diagnosticCodes: ["checkpoint_recovery_failed"] })
       })
     }));
+    expect(stored).toContainEqual(expect.objectContaining({
+      type: "run.suspended",
+      payload: expect.objectContaining({
+        checkpointId: expect.any(String),
+        choices: ["restore", "keep"]
+      })
+    }));
     expect(stored.some((event) => event.type === "checkpoint.restored")).toBe(false);
     expect(stored.some((event) => event.type === "tool.requested"
       && (event.payload as { callId?: string }).callId === "must-not-run")).toBe(false);

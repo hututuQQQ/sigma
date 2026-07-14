@@ -64,6 +64,12 @@ export interface SemanticFailureCluster {
   progress: SemanticProgressWatermark;
 }
 
+export type CompletionRepairState =
+  | { kind: "evidence_acquisition" }
+  | { kind: "terminal_action" }
+  | { kind: "protected_completion"; answer: string }
+  | { kind: "protected_recovery"; answer: string };
+
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
   sessionId: string;
@@ -97,6 +103,10 @@ export interface KernelState {
   activeProcessIds: string[];
   childIds: string[];
   completionRepairAttempts: number;
+  /** Durable reason for a bounded protocol-repair turn. Protected completion
+   * locks the exact evidence-backed natural answer that the repair may only
+   * finalize, never replace with a user-input request. */
+  completionRepair?: CompletionRepairState;
   continuationAttempts: number;
   repeatedToolBatchCount: number;
   receiptCountAtLastUserInput: number;
@@ -188,6 +198,18 @@ export function isSemanticFailureCluster(value: unknown): value is SemanticFailu
     && isSemanticProgressWatermark(cluster.progress));
 }
 
+export function isCompletionRepairState(value: unknown): value is CompletionRepairState {
+  const repair = record(value);
+  if (!repair) return false;
+  if (repair.kind === "evidence_acquisition" || repair.kind === "terminal_action") {
+    return Object.keys(repair).length === 1;
+  }
+  return (repair.kind === "protected_completion" || repair.kind === "protected_recovery")
+    && typeof repair.answer === "string"
+    && repair.answer.trim().length > 0
+    && Object.keys(repair).every((key) => key === "kind" || key === "answer");
+}
+
 function validSemanticState(state: Record<string, unknown>): boolean {
   if (!isSemanticProgressWatermark(state.semanticProgress)) return false;
   const revision = Number(state.revision);
@@ -224,6 +246,7 @@ export function isKernelState(value: unknown): value is KernelState {
     validFrozenState(state),
     Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
     Array.isArray(state.childIds),
+    state.completionRepair === undefined || isCompletionRepairState(state.completionRepair),
     validSemanticState(state),
     validToolBatchProgressState(state),
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,

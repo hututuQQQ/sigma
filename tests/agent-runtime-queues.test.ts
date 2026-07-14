@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   AgentEventEnvelope,
+  JsonValue,
   ModelCapabilities,
   ModelGateway,
   ModelMessage,
@@ -20,7 +21,13 @@ import {
   STORE_LAYOUT_VERSION
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
-import { auditDurableChildren, createChildAgentFactory, createRuntime as createBaseRuntime, restoreStoredSession } from "../packages/agent-runtime/src/testing.js";
+import {
+  auditDurableChildren,
+  createChildAgentFactory,
+  createRuntime as createBaseRuntime,
+  rebuildSnapshotFromEvents,
+  restoreStoredSession
+} from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
@@ -267,11 +274,59 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("requires exactly one terminal tool call");
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input only when");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("substantive answer is now protected");
+    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input and non-terminal tools are unavailable");
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+      .toEqual(["complete_task"]);
+  }, 30_000);
+
+  it("rejects an unprojected input request without hiding the protected natural answer", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-protected-terminal-repair-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-protected-answer", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "The protected answer is seed." }, finishReason: "stop" },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "hidden-input-request",
+            name: "request_user_input",
+            arguments: { message: "Would you like anything else?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_missing",
+      message: expect.stringContaining("The protected answer is seed.")
+    });
+    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toEqual(["complete_task"]);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "run.suspended")).toBe(false);
+    expect(events.some((event) => (event.type === "tool.requested" || event.type === "tool.failed")
+      && (event.payload as { callId?: string }).callId === "hidden-input-request")).toBe(false);
   }, 30_000);
 
   it("keeps a failed receipt in evidence repair until non-failed durable evidence exists", async () => {
@@ -347,11 +402,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
       code: "terminal_protocol_missing",
-      message: "The model's protocol-repair action failed (tool_arguments_invalid)."
+      message: expect.stringMatching(/The file contains seed[\s\S]*tool_arguments_invalid/u)
     });
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+      .toEqual(["complete_task"]);
   }, 30_000);
 
   it("does not execute a tool that was not offered during terminal repair", async () => {
@@ -385,15 +440,14 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
       code: "terminal_protocol_missing",
-      message: "The model's protocol-repair action failed (tool_unavailable_for_repair)."
+      message: expect.stringMatching(/The file contains seed[\s\S]*single required complete_task/u)
     });
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.completed"
       && (event.payload as { callId?: string }).callId === "initial-policy-read")).toHaveLength(1);
-    expect(events.filter((event) => event.type === "tool.failed"
-      && (event.payload as { callId?: string }).callId === "hidden-repair-read"
-      && (event.payload as { diagnostics?: string[] }).diagnostics
-        ?.includes("tool_unavailable_for_repair"))).toHaveLength(1);
+    expect(events.filter((event) => (event.type === "tool.requested"
+      || event.type === "tool.completed" || event.type === "tool.failed")
+      && (event.payload as { callId?: string }).callId === "hidden-repair-read")).toHaveLength(0);
     expect(events.filter((event) => event.type === "execution.planned"
       && (event.payload as { executionId?: string }).executionId === "hidden-repair-read")).toHaveLength(0);
   }, 30_000);
@@ -418,6 +472,48 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input", requestId: "need-target", message: "Which target should I change?"
     });
+  });
+
+  it("supports a direct input request after evidence on an ordinary model turn", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidenced-request-input-"));
+    await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-before-input", name: "read", arguments: { path: "seed.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "need-target-after-evidence",
+            name: "request_user_input",
+            arguments: { message: "Which target should I change?" }
+          }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect, then change the selected target" });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input",
+      requestId: "need-target-after-evidence",
+      message: "Which target should I change?"
+    });
+    expect(gateway.requests[1].toolChoice).toBeUndefined();
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
   });
 
   it("bounds completion repair when a model keeps returning plain text", async () => {
@@ -446,7 +542,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+      .toEqual(["complete_task"]);
   }, 30_000);
 
   it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {
@@ -762,6 +858,131 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.messages).toEqual([
       { role: "assistant", content: "", reasoningContent: "durable reasoning" }
     ]);
+  });
+
+  it("restores a protected completion answer and its explicit repair intent", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-protected-completion-recovery-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const sessionId = "protected-completion-session";
+    const runId = "protected-completion-run";
+    const startedAt = new Date().toISOString();
+    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+    await store.append({
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      seq: 1,
+      eventId: "protected-completion-created",
+      sessionId,
+      runId,
+      occurredAt: startedAt,
+      type: "session.created",
+      authority: "runtime",
+      payload: completeAgentEventPayload("session.created", { workspacePath: workspace, mode: "change" })
+    }, 0);
+    const snapshotState = {
+      ...createKernelState({ sessionId, runId, mode: "change", startedAt, deadlineAt }),
+      phase: "ready_model" as const,
+      revision: 1,
+      lastSeq: 1,
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "protected_completion" as const,
+        answer: "The durable natural answer."
+      },
+      messages: [{ role: "assistant" as const, content: "The durable natural answer." }],
+      evidence: [{
+        evidenceId: "protected-completion-evidence",
+        sessionId,
+        runId,
+        kind: "diagnostic" as const,
+        status: "passed" as const,
+        createdAt: startedAt,
+        producer: { authority: "runtime" as const },
+        summary: "checked",
+        data: { source: "recovery-test", diagnostic: { ok: true } }
+      }]
+    };
+    await store.writeSnapshot({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId,
+      seq: 1,
+      createdAt: startedAt,
+      state: snapshotState
+    });
+
+    const restored = await restoreStoredSession(store, sessionId, 30_000);
+    expect(restored.state.completionRepair).toEqual({
+      kind: "protected_completion",
+      answer: "The durable natural answer."
+    });
+    expect(restored.state.completionRepairAttempts).toBe(1);
+  });
+
+  it("rejects an ambiguous legacy repair snapshot and replays its protected answer", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-completion-repair-"));
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const sessionId = "legacy-completion-session";
+    const runId = "legacy-completion-run";
+    const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+    let seq = 0;
+    const append = async (
+      type: AgentEventEnvelope["type"],
+      payload: AgentEventEnvelope["payload"]
+    ): Promise<void> => {
+      const stored: AgentEventEnvelope = {
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        seq: seq + 1,
+        eventId: `legacy-repair-${seq + 1}`,
+        sessionId,
+        runId,
+        occurredAt: new Date(Date.now() + seq).toISOString(),
+        type,
+        authority: type === "user.message" ? "user" : "runtime",
+        payload: completeAgentEventPayload(type, payload)
+      };
+      await store.append(stored, seq);
+      seq += 1;
+    };
+    await append("session.created", { workspacePath: workspace, mode: "change" });
+    await append("run.started", { mode: "change", deadlineAt });
+    await append("user.message", { text: "inspect the durable result" });
+    await append("evidence.recorded", {
+      evidenceId: "legacy-repair-evidence",
+      sessionId,
+      runId,
+      kind: "diagnostic",
+      status: "passed",
+      createdAt: new Date().toISOString(),
+      producer: { authority: "runtime" },
+      summary: "checked",
+      data: { source: "legacy-recovery-test", diagnostic: { ok: true } }
+    });
+    await append("model.started", { turnId: 1, effectRevision: 4 });
+    await append("model.completed", {
+      turnId: 1,
+      effectRevision: 4,
+      message: { role: "assistant", content: "Legacy protected answer." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const rebuilt = await rebuildSnapshotFromEvents({
+      sessionId,
+      lastSeq: seq,
+      events: () => store.events(sessionId)
+    }, 30_000);
+    const legacyState = structuredClone(rebuilt.state);
+    if (!legacyState || typeof legacyState !== "object" || Array.isArray(legacyState)) {
+      throw new Error("Rebuilt snapshot state must be an object.");
+    }
+    delete (legacyState as Record<string, JsonValue>).completionRepair;
+    await store.writeSnapshot({ ...rebuilt, state: legacyState });
+
+    const restored = await restoreStoredSession(store, sessionId, 30_000);
+    expect(restored.state.completionRepair).toEqual({
+      kind: "protected_completion",
+      answer: "Legacy protected answer."
+    });
+    expect(restored.state.completionRepairAttempts).toBe(1);
   });
 
   it.each([

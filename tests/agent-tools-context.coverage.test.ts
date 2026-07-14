@@ -19,8 +19,10 @@ import {
   isToolAllowed,
   parseCompletionProposal,
   registerBuiltinTools,
+  registerCompletionTool,
   registerSupervisorTools,
-  ResourceLockManager
+  ResourceLockManager,
+  terminalProtocolAction
 } from "../packages/agent-tools/src/index.js";
 import {
   repositoryListJsonLines,
@@ -70,6 +72,49 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(completionEvidenceError(proposal!, new Map([["current-evidence", "diagnostic"]]))).toBeNull();
     expect(completionEvidenceError(proposal!, new Map([["older-run-evidence", "diagnostic"]])))
       .toContain("current-evidence");
+  });
+
+  it("keeps completion and user-input terminal capabilities orthogonal", async () => {
+    const tools = registerCompletionTool(new EffectToolRegistry());
+    const completion = tools.descriptor("complete_task")!;
+    const input = tools.descriptor("request_user_input")!;
+    expect(terminalProtocolAction(completion)).toBe("complete");
+    expect(terminalProtocolAction(input)).toBe("request_input");
+    expect(terminalProtocolAction({
+      possibleEffects: ["outcome.propose", "outcome.request_input"]
+    })).toBeNull();
+    expect(terminalProtocolAction({
+      possibleEffects: ["outcome.propose"],
+      maximumEffects: ["outcome.propose", "filesystem.write"]
+    })).toBeNull();
+
+    const requested = await tools.execute(request(
+      "ask",
+      "request_user_input",
+      { message: "Which target should I change?" }
+    ), context("."));
+    expect(requested).toMatchObject({
+      ok: true,
+      observedEffects: ["outcome.request_input"],
+      diagnostics: []
+    });
+    const completed = await tools.execute(request(
+      "complete",
+      "complete_task",
+      {
+        summary: "done",
+        criteria: [{
+          criterion: "The requested work is complete.",
+          status: "met",
+          evidence: [{ evidenceId: "evidence", kind: "diagnostic" }]
+        }]
+      }
+    ), context("."));
+    expect(completed).toMatchObject({
+      ok: true,
+      observedEffects: ["outcome.propose"],
+      diagnostics: []
+    });
   });
 
   it("loads nested instructions and retrieves Unicode repository context incrementally", async () => {

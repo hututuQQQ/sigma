@@ -1,6 +1,17 @@
 import type { AgentEventEnvelope, AgentEventType, JsonValue, ModelMessage, ModelToolCall, RunOutcome } from "agent-protocol";
 import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
-import { completionSummary, conflictingTerminalBatch, failedTerminalRepairState, hasCurrentRunEvidence, incompleteModelCompletion, repairConflictingTerminalBatch, requestedInput } from "./model-convergence.js";
+import {
+  completionRepairFailureMessage,
+  completionRepairRequiresTerminalAction,
+  completionSummary,
+  conflictingTerminalBatch,
+  failedTerminalRepairState,
+  hasCompletionRepair,
+  incompleteModelCompletion,
+  protectedCompletionAnswer,
+  repairConflictingTerminalBatch,
+  requestedInput
+} from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
@@ -26,6 +37,8 @@ function terminal(state: KernelState, outcome: RunOutcome): KernelState {
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,
     pendingTools: [],
+    completionRepairAttempts: 0,
+    completionRepair: undefined,
     proposedOutcome: undefined,
     outcome
   };
@@ -65,6 +78,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   completionRepairAttempts: 0,
+  completionRepair: undefined,
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
@@ -83,6 +97,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   activeModelSemanticDelta: undefined,
   messages: [...state.messages, { role: "user", content: text(payload.text) }],
   completionRepairAttempts: 0,
+  completionRepair: undefined,
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
@@ -105,6 +120,7 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   activeModelSemanticDelta: undefined,
   pendingTools: [],
   completionRepairAttempts: 0,
+  completionRepair: undefined,
   continuationAttempts: 0,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
@@ -147,6 +163,24 @@ const modelSemanticDelta: EventReducer = (state, _event, payload) => {
   return { ...state, activeModelSemanticDelta: true };
 };
 
+function protectedToolBatchFailure(
+  state: KernelState,
+  calls: readonly ModelToolCall[]
+): string | null {
+  if (state.completionRepair?.kind === "protected_completion") {
+    return calls.length === 1 && calls[0]?.name === "complete_task"
+      ? null
+      : "The protected completion repair attempted an action other than the single required complete_task call.";
+  }
+  if (state.completionRepair?.kind !== "protected_recovery") return null;
+  if (calls.some((call) => call.name === "request_user_input")) {
+    return "Protected completion recovery attempted to replace the answer with a user-input request.";
+  }
+  return calls.length > 1 && calls.some((call) => call.name === "complete_task")
+    ? "Protected completion recovery mixed complete_task with other tool calls."
+    : null;
+}
+
 const modelCompleted: EventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
   const message = modelMessage(payload.message);
@@ -155,6 +189,14 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
   const modelTurn = state.activeModelTurn!;
   const completedState = { ...state, activeModelTurn: undefined, activeModelSemanticDelta: undefined };
   if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
+  const protectedFailure = protectedToolBatchFailure(state, calls);
+  if (protectedFailure) {
+    return propose({ ...completedState, messages }, {
+      kind: "recoverable_failure",
+      code: "terminal_protocol_missing",
+      message: completionRepairFailureMessage(state, protectedFailure)
+    });
+  }
   const identifiers = calls.map((call) => call.id);
   const seen = new Set(state.toolCallIds);
   const duplicate = identifiers.find((id, index) => identifiers.indexOf(id) !== index || seen.has(id));
@@ -162,10 +204,15 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     return propose({ ...completedState, messages }, {
       kind: "recoverable_failure",
       code: "protocol_error",
-      message: `Model reused tool call id '${duplicate}' within the current run.`
+      message: completionRepairFailureMessage(
+        state,
+        `Model reused tool call id '${duplicate}' within the current run.`
+      )
     });
   }
-  if (conflictingTerminalBatch(calls, state.completionRepairAttempts > 0)) return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
+  if (conflictingTerminalBatch(calls, hasCompletionRepair(state))) {
+    return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
+  }
   if (repeatsCompletedToolBatch(state, calls)) {
     return propose({
       ...completedState,
@@ -174,7 +221,10 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
     }, {
       kind: "recoverable_failure",
       code: "agent_no_progress",
-      message: "The same tool batch produced the same completed outcome twice and was proposed again without progress."
+      message: completionRepairFailureMessage(
+        state,
+        "The same tool batch produced the same completed outcome twice and was proposed again without progress."
+      )
     });
   }
   const pendingTools = pendingFromCalls(calls, modelTurn);
@@ -194,7 +244,7 @@ const modelFailed: EventReducer = (state, _event, payload) => {
   return propose(state, {
     kind: "recoverable_failure",
     code: text(payload.code) || "model_error",
-    message: text(payload.message)
+    message: completionRepairFailureMessage(state, text(payload.message))
   });
 };
 
@@ -237,8 +287,8 @@ const toolFinished: EventReducer = (state, event) => {
   const pending = pendingForEvent(state, objectPayload(event.payload));
   if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
   const pendingTools = state.pendingTools.filter((item) => item !== pending);
-  const repairPending = state.completionRepairAttempts > 0;
-  const terminalRepairPending = repairPending && hasCurrentRunEvidence(state);
+  const repairPending = hasCompletionRepair(state);
+  const terminalRepairPending = completionRepairRequiresTerminalAction(state);
   const next: KernelState = {
     ...state,
     messages: [...state.messages, {
@@ -259,14 +309,21 @@ const toolFinished: EventReducer = (state, event) => {
   const progressed = semantic.state;
   const inputMessage = requestedInput(receipt);
   if (inputMessage) {
+    if (protectedCompletionAnswer(state)) {
+      return propose(progressed, {
+        kind: "recoverable_failure",
+        code: "terminal_protocol_missing",
+        message: completionRepairFailureMessage(
+          state,
+          "A user-input receipt cannot replace the answer locked for completion finalization."
+        )
+      });
+    }
     return propose(progressed, { kind: "needs_input", requestId: receipt.callId, message: inputMessage });
   }
   const summary = completionSummary(receipt);
   if (summary) {
-    const repairedAnswer = repairPending
-      ? [...state.messages].reverse().find((message) =>
-        message.role === "assistant" && message.content.trim())?.content.trim()
-      : undefined;
+    const repairedAnswer = protectedCompletionAnswer(state);
     return propose(progressed, {
       kind: "completed",
       message: repairedAnswer || summary,
@@ -287,8 +344,34 @@ const toolFinished: EventReducer = (state, event) => {
   return progressed;
 };
 
+function isApprovalSuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
+  return pendingForEvent(state, payload)?.approval === "pending";
+}
+
+function isRecoverySuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
+  const checkpointRecovery = typeof payload.checkpointId === "string"
+    && Array.isArray(payload.choices)
+    && payload.choices.length === 2
+    && payload.choices[0] === "restore"
+    && payload.choices[1] === "keep";
+  const processRecovery = Array.isArray(payload.processIds)
+    && payload.processIds.length > 0
+    && payload.processIds.every((item) => typeof item === "string" && item.length > 0);
+  const interruptedModelRecovery = state.phase === "model_in_flight" && isCurrentModelTurn(state, payload);
+  return checkpointRecovery || processRecovery || interruptedModelRecovery;
+}
+
 const runSuspended: EventReducer = (state, _event, payload) => {
-  if (text(payload.callId) && !pendingForEvent(state, payload)) return state;
+  const proposedInputSuspension = Number.isInteger(payload.outcomeRevision)
+    && acceptsOutcomeRevision(state, payload)
+    && state.proposedOutcome?.kind === "needs_input";
+  const approvalSuspension = isApprovalSuspension(state, payload);
+  const recoverySuspension = isRecoverySuspension(state, payload);
+  const legacySuspension = !protectedCompletionAnswer(state)
+    && payload.outcomeRevision === undefined
+    && payload.callId === undefined;
+  if ((!proposedInputSuspension && !approvalSuspension && !recoverySuspension && !legacySuspension)
+    || (protectedCompletionAnswer(state) && proposedInputSuspension)) return state;
   return {
     ...state,
     ...(Number.isSafeInteger(payload.remainingDeadlineMs) && Number(payload.remainingDeadlineMs) >= 1
@@ -296,6 +379,7 @@ const runSuspended: EventReducer = (state, _event, payload) => {
     phase: "needs_input",
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,
+    ...(!approvalSuspension ? { completionRepairAttempts: 0, completionRepair: undefined } : {}),
     proposedOutcome: undefined,
     outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
   };
@@ -307,10 +391,14 @@ const runFailed: EventReducer = (state, _event, payload) => {
     ? {
       kind: "recoverable_failure",
       code: text(payload.code) || "runtime_error",
-      message: text(payload.message),
+      message: completionRepairFailureMessage(state, text(payload.message)),
       ...(typeof payload.resumeToken === "string" ? { resumeToken: payload.resumeToken } : {})
     }
-    : { kind: "fatal", code: text(payload.code) || "runtime_error", message: text(payload.message) };
+    : {
+      kind: "fatal",
+      code: text(payload.code) || "runtime_error",
+      message: completionRepairFailureMessage(state, text(payload.message))
+    };
   return terminal(state, outcome);
 };
 
@@ -334,11 +422,16 @@ const diagnostic: EventReducer = (state, _event, payload) => {
   };
   if (payload.kind === "child.join_failed") {
     const failures = Array.isArray(payload.failures) ? payload.failures.filter((item): item is string => typeof item === "string") : [];
+    const protectedAnswer = protectedCompletionAnswer(state);
     return {
       ...state,
       phase: "ready_model",
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
+      completionRepairAttempts: 0,
+      completionRepair: protectedAnswer
+        ? { kind: "protected_recovery", answer: protectedAnswer }
+        : undefined,
       proposedOutcome: undefined,
       outcome: undefined,
       messages: [...state.messages, {

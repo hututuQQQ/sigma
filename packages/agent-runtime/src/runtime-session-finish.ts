@@ -5,6 +5,10 @@ import type { RuntimeEventLog } from "./runtime-event-log.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
 
+export type RunSuspensionContext =
+  | { processIds: string[] }
+  | { checkpointId: string; choices: ["restore", "keep"] };
+
 export interface RuntimeSessionFinishOptions {
   hooks: RuntimeHookCoordinator;
   events: RuntimeEventLog;
@@ -65,13 +69,17 @@ async function emitOutcome(
   options: RuntimeSessionFinishOptions,
   session: RuntimeSession,
   outcome: RunOutcome,
-  outcomeRevision?: number
+  outcomeRevision?: number,
+  suspensionContext?: RunSuspensionContext
 ): Promise<AgentEventEnvelope | undefined> {
   const type = outcomeEventType(outcome);
+  const payload = outcome.kind === "needs_input" && suspensionContext
+    ? { ...outcome, ...suspensionContext }
+    : outcome;
   if (outcomeRevision === undefined) {
-    return await options.events.emit(session, type, "runtime", outcome);
+    return await options.events.emit(session, type, "runtime", payload);
   }
-  return await options.events.emitOutcomeIfCurrent(session, type, outcome, session.durable.state.revision);
+  return await options.events.emitOutcomeIfCurrent(session, type, payload, session.durable.state.revision);
 }
 
 function outcomeWasCommitted(session: RuntimeSession, outcome: RunOutcome): boolean {
@@ -93,7 +101,8 @@ export async function finishRuntimeSession(
   options: RuntimeSessionFinishOptions,
   session: RuntimeSession,
   outcome: RunOutcome,
-  outcomeRevision?: number
+  outcomeRevision?: number,
+  suspensionContext?: RunSuspensionContext
 ): Promise<boolean> {
   if (!isCurrentOutcomeRevision(session, outcomeRevision)) return false;
   const finalOutcome = await applyFinishHooks(options.hooks, session, outcome);
@@ -101,7 +110,7 @@ export async function finishRuntimeSession(
   await options.beforeOutcome?.(session, finalOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   const commitRevision = outcomeRevision === undefined ? undefined : session.durable.state.revision;
-  const event = await emitOutcome(options, session, finalOutcome, commitRevision);
+  const event = await emitOutcome(options, session, finalOutcome, commitRevision, suspensionContext);
   if (!event || session.durable.state.lastSeq !== event.seq || !outcomeWasCommitted(session, finalOutcome)) return false;
   await cancelChildrenAfterFailure(options, session, finalOutcome);
   session.recovery.lastOutcome = finalOutcome;

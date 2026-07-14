@@ -35,13 +35,21 @@ function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceR
     && evidence.kind !== "review" && evidence.kind !== "user_waiver";
 }
 
+function isEvidenceAcquisitionRepair(state: KernelState): boolean {
+  if (state.completionRepair?.kind === "evidence_acquisition") return true;
+  return state.completionRepair === undefined
+    && state.completionRepairAttempts > 0
+    && !state.evidence.some((item) =>
+      isCompletionEligibleEvidence(item, state.sessionId, state.runId));
+}
+
 const evidenceRecorded: KernelEventReducer = (state, event) => {
   const evidence = event.payload;
   if (!isEvidenceRecord(evidence) || evidence.sessionId !== state.sessionId || evidence.runId !== state.runId
     || event.runId !== state.runId || !evidenceAuthorityAllowed(event, evidence)
     || state.evidence.some((item) => item.evidenceId === evidence.evidenceId)) return state;
   if (evidence.kind === "user_waiver" && state.evidence.some((item) => item.kind === "user_waiver")) return state;
-  const firstCompletionEvidence = state.completionRepairAttempts > 0
+  const firstCompletionEvidence = isEvidenceAcquisitionRepair(state)
     && isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
     && !state.evidence.some((item) => isCompletionEligibleEvidence(item, state.sessionId, state.runId));
   const progressed = recordSemanticEvidenceProgress({
@@ -52,7 +60,9 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
       ? [...state.mutationEvidence, evidence]
       : state.mutationEvidence
   }, evidence);
-  return firstCompletionEvidence ? { ...progressed, completionRepairAttempts: 0 } : progressed;
+  return firstCompletionEvidence
+    ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
+    : progressed;
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {
@@ -113,6 +123,26 @@ function pruneRestoredCheckpointEvidence(
   };
 }
 
+function checkpointRepairUpdate(
+  state: KernelState,
+  evidence: readonly EvidenceRecord[]
+): Partial<Pick<KernelState, "completionRepairAttempts" | "completionRepair" | "messages">> {
+  const repair = state.completionRepair;
+  const protectedOrTerminal = repair?.kind === "protected_completion"
+    || repair?.kind === "protected_recovery"
+    || repair?.kind === "terminal_action";
+  if (!protectedOrTerminal || evidence.some((item) =>
+    isCompletionEligibleEvidence(item, state.sessionId, state.runId))) return {};
+  return {
+    completionRepairAttempts: Math.max(1, state.completionRepairAttempts),
+    completionRepair: { kind: "evidence_acquisition" },
+    messages: [...state.messages, {
+      role: "developer",
+      content: "Checkpoint restoration removed the durable evidence for the pending terminal result. Obtain fresh current-run evidence before finalizing; request user input only if a concrete decision is genuinely required."
+    }]
+  };
+}
+
 const checkpointUpdated: KernelEventReducer = (state, event) => {
   if (!isCheckpointRef(event.payload) || event.payload.sessionId !== state.sessionId
     || event.sessionId !== state.sessionId || event.runId !== state.runId) return state;
@@ -126,9 +156,11 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
   if (event.authority !== "runtime" && event.authority !== "user") return state;
   const checkpointHead = event.payload.runId === state.runId
     ? event.payload : { ...event.payload, runId: state.runId };
+  const pruned = pruneRestoredCheckpointEvidence(state, event.payload.checkpointId);
   return recordSemanticWorkspaceRestore({
     ...state,
-    ...pruneRestoredCheckpointEvidence(state, event.payload.checkpointId),
+    ...pruned,
+    ...checkpointRepairUpdate(state, pruned.evidence),
     checkpointHead
   });
 };

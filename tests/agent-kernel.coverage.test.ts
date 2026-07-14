@@ -162,7 +162,11 @@ describe("agent-kernel exhaustive protocol behavior", () => {
 
   it("rejects completion mixed with ordinary work during a repair turn", () => {
     let state = apply(initial(), "user.message", { text: "finish cleanly" });
-    state = { ...state, completionRepairAttempts: 1 };
+    state = {
+      ...state,
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "evidence_acquisition" }
+    };
     state = proposeToolBatch(state, 1, [
       { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
       { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
@@ -178,6 +182,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = {
       ...state,
       completionRepairAttempts: 1,
+      completionRepair: { kind: "terminal_action" },
       evidence: [diagnosticEvidence("current-run-evidence")]
     };
     state = proposeToolBatch(state, 1, [{
@@ -195,6 +200,138 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({ phase: "ready_model", completionRepairAttempts: 0 });
     expect(state.proposedOutcome).toBeUndefined();
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
+  });
+
+  it("locks an evidence-backed natural answer against repair-time input requests", () => {
+    let state = apply(initial(), "user.message", { text: "inspect the current state" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
+    state = settleModel(startModel(state), "model.completed", {
+      message: { role: "assistant", content: "The durable result is ready." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "protected_completion",
+        answer: "The durable result is ready."
+      }
+    });
+    const forgedSuspension = apply(state, "run.suspended", {
+      requestId: "replace-with-suspension",
+      message: "Would you like anything else?"
+    });
+    expect(forgedSuspension).toMatchObject({
+      phase: "ready_model",
+      completionRepair: { kind: "protected_completion", answer: "The durable result is ready." },
+      outcome: undefined
+    });
+
+    const rejected = settleModel(startModel(state, 2), "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "replace-answer",
+          name: "request_user_input",
+          arguments: { message: "Would you like anything else?" }
+        }]
+      },
+      toolCalls: [{
+        id: "replace-answer",
+        name: "request_user_input",
+        arguments: { message: "Would you like anything else?" }
+      }],
+      finishReason: "tool_calls"
+    });
+    expect(rejected.pendingTools).toEqual([]);
+    expect(rejected.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_missing",
+      message: expect.stringContaining("The durable result is ready.")
+    });
+    expect(rejected.proposedOutcome?.kind).not.toBe("needs_input");
+  });
+
+  it("keeps direct original-turn input requests valid even when evidence already exists", () => {
+    let state = apply(initial(), "user.message", { text: "change the selected target" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("preexisting-evidence"));
+    state = proposeToolBatch(state, 1, [{
+      id: "need-target",
+      name: "request_user_input",
+      arguments: { message: "Which target should I change?" }
+    }]);
+    state = toolEvent(state, "tool.completed", "need-target", {
+      ok: true,
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: {
+        kind: "needs_input",
+        requestId: "need-target",
+        message: "Which target should I change?"
+      }
+    });
+  });
+
+  it("keeps the answer protected while recovering from a real completion blocker", () => {
+    let state = apply(initial(), "user.message", { text: "finish after settling blockers" });
+    state = apply(state, "evidence.recorded", diagnosticEvidence("protected-blocker-evidence"));
+    state = settleModel(startModel(state), "model.completed", {
+      message: { role: "assistant", content: "The inspected result is stable." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    state = proposeToolBatch(state, 2, [{
+      id: "blocked-completion",
+      name: "complete_task",
+      arguments: { summary: "done", criteria: [] }
+    }]);
+    state = toolEvent(state, "tool.failed", "blocked-completion", {
+      ok: false,
+      output: "Background processes remain active.",
+      observedEffects: [],
+      artifacts: [],
+      diagnostics: ["active_processes"],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepairAttempts: 0,
+      completionRepair: {
+        kind: "protected_recovery",
+        answer: "The inspected result is stable."
+      }
+    });
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+
+    const rejectedInput = proposeToolBatch(state, 3, [{
+      id: "blocked-answer-replacement",
+      name: "request_user_input",
+      arguments: { message: "Should I stop the process?" }
+    }]);
+    expect(rejectedInput.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      message: expect.stringContaining("The inspected result is stable.")
+    });
+
+    const recoveryWork = proposeToolBatch(state, 3, [{
+      id: "poll-blocker",
+      name: "poll_process",
+      arguments: { processId: "process" }
+    }]);
+    expect(recoveryWork).toMatchObject({
+      phase: "tool_pending",
+      completionRepair: { kind: "protected_recovery" }
+    });
   });
 
   it("blocks a third identical batch only after two identical completed outcomes", () => {
@@ -440,8 +577,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one terminal tool call");
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input only when");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one complete_task call");
+    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input and non-terminal tools are unavailable");
     const invalidMessage = settleModel(inFlight(), "model.completed", { message: { role: "invalid" }, text: "fallback", toolCalls: [] });
     expect(invalidMessage.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
@@ -571,7 +708,12 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     repairedCompletion = {
       ...repairedCompletion,
       completionRepairAttempts: 1,
-      messages: [...repairedCompletion.messages, { role: "assistant", content: "Detailed final answer." }]
+      completionRepair: { kind: "protected_completion", answer: "Detailed final answer." },
+      evidence: [diagnosticEvidence("repair-evidence")],
+      messages: [...repairedCompletion.messages, {
+        role: "assistant",
+        content: "Repair-turn text must not replace the protected answer."
+      }]
     };
     repairedCompletion = toolEvent(repairedCompletion, "tool.completed", "repair-complete", {
       ok: true, output: JSON.stringify({ summary: "short summary" }),
@@ -767,6 +909,49 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toThrow("active model turn must agree");
     expect(() => assertKernelInvariants({ ...initial(), phase: "needs_input", outcome: { kind: "needs_input", requestId: "x", message: "x" } })).not.toThrow();
     expect(() => assertKernelInvariants({ ...initial(), phase: "terminal", outcome: { kind: "completed", message: "x", evidence: [] } })).not.toThrow();
+    expect(isKernelState({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "   " }
+    })).toBe(false);
+    expect(() => assertKernelInvariants({
+      ...initial(), completionRepairAttempts: 1
+    })).toThrow("attempts require explicit repair state");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" }
+    })).toThrow("requires current-run eligible evidence");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "outcome_pending",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-invariant")],
+      proposedOutcome: { kind: "needs_input", requestId: "ask", message: "question" }
+    })).toThrow("cannot propose a user-input outcome");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "needs_input",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-snapshot")],
+      outcome: { kind: "needs_input", requestId: "forged", message: "question" }
+    })).toThrow("only for a pending tool approval");
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "needs_input",
+      completionRepair: { kind: "protected_recovery", answer: "answer" },
+      evidence: [diagnosticEvidence("protected-approval")],
+      toolCallIds: ["approve-read"],
+      pendingTools: [{
+        request: { callId: "approve-read", name: "read", arguments: null },
+        modelTurn: { turnId: 1, effectRevision: 1 },
+        approval: "pending",
+        started: false
+      }],
+      outcome: { kind: "needs_input", requestId: "approve-read", message: "Approve read." }
+    })).not.toThrow();
     expect(() => assertKernelInvariants({
       ...initial(), activeProcessIds: ["duplicate", "duplicate"]
     })).toThrow("Duplicate active process IDs");

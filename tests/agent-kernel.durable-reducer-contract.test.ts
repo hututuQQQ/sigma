@@ -6,7 +6,11 @@ import {
   type EvidenceRecord,
   type JsonValue
 } from "../packages/agent-protocol/src/index.js";
-import { createKernelState, type KernelState } from "../packages/agent-kernel/src/index.js";
+import {
+  assertKernelInvariants,
+  createKernelState,
+  type KernelState
+} from "../packages/agent-kernel/src/index.js";
 import {
   durableReducers,
   type KernelEventReducer
@@ -350,6 +354,25 @@ describe("durable reducer contracts", () => {
     expect(reduce(state, "checkpoint.restored", restored, { authority: "tool" })).toBe(state);
     expect(reduce(state, "checkpoint.restored", { ...restored, status: "sealed" })).toBe(state);
     expect(reduce(state, "checkpoint.restored", { malformed: true })).toBe(state);
+
+    const delta = workspaceDelta("protected-delta");
+    const protectedCompletion: KernelState = {
+      ...state,
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "Protected answer." },
+      messages: [{ role: "assistant", content: "Protected answer." }],
+      evidence: [delta],
+      mutationEvidence: [delta]
+    };
+    const reconciled = reduce(protectedCompletion, "checkpoint.restored", restored);
+    expect(reconciled).toMatchObject({
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "evidence_acquisition" },
+      evidence: [],
+      mutationEvidence: []
+    });
+    expect(reconciled.messages.at(-1)?.content).toContain("removed the durable evidence");
+    expect(() => assertKernelInvariants(reconciled)).not.toThrow();
   });
 
   it("tracks only runtime-owned processes for the active run", () => {

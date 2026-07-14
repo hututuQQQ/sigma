@@ -16,6 +16,7 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
+  isCompletionRepairState,
   isKernelState,
   isSemanticFailureCluster,
   isSemanticProgressWatermark,
@@ -238,9 +239,27 @@ function restoredSemanticState(stored: Partial<KernelState>): Pick<
   };
 }
 
+function restoredCompletionRepairState(stored: Partial<KernelState>): Pick<
+  KernelState,
+  "completionRepairAttempts" | "completionRepair"
+> | null {
+  const completionRepairAttempts = Number.isInteger(stored.completionRepairAttempts)
+    ? Number(stored.completionRepairAttempts)
+    : 0;
+  const repair = stored.completionRepair;
+  if (repair !== undefined && !isCompletionRepairState(repair)) return null;
+  if (completionRepairAttempts > 0 && !isCompletionRepairState(repair)) return null;
+  return {
+    completionRepairAttempts,
+    completionRepair: isCompletionRepairState(repair) ? repair : undefined
+  };
+}
+
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
   const stored = snapshot.state as unknown as Partial<KernelState>;
+  const completionRepair = restoredCompletionRepairState(stored);
+  if (!completionRepair) return undefined;
   const state = {
     ...stored,
     toolCallIds: Array.isArray(stored.toolCallIds)
@@ -249,7 +268,7 @@ function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>
         ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
     activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
     ...restoredSemanticState(stored),
-    completionRepairAttempts: Number.isInteger(stored.completionRepairAttempts) ? stored.completionRepairAttempts : 0,
+    ...completionRepair,
     continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
     repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
     receiptCountAtLastUserInput: Number.isInteger(stored.receiptCountAtLastUserInput)

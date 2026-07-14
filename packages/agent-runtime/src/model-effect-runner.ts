@@ -159,7 +159,7 @@ export class ModelEffectRunner {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
     const repairPhase = completionRepairPhase(session);
-    const repairPending = repairPhase !== "none";
+    const repairPending = repairPhase !== "none" && repairPhase !== "protected_recovery";
     const ledger = evidenceLedger(session);
     const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
     const projectedDescriptors = projectModelToolDescriptors(
