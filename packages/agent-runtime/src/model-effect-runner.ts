@@ -139,7 +139,10 @@ export class ModelEffectRunner {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
     const repairPhase = completionRepairPhase(session);
-    const repairPending = repairPhase !== "none" && repairPhase !== "protected_recovery";
+    // Every protocol-repair phase is a tool sub-turn, including recovery after
+    // a failed terminal action. Keeping the choice forced prevents a provider
+    // from silently switching modes between the repair call and its recovery.
+    const repairPending = repairPhase !== "none";
     const ledger = evidenceLedger(session);
     const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
     const projectedDescriptors = projectModelToolDescriptors(

@@ -1,4 +1,8 @@
-import { isCompletionEligibleEvidence, type ToolDescriptor, type ToolEffect } from "agent-protocol";
+import {
+  isCompletionReferenceableEvidence,
+  type ToolDescriptor,
+  type ToolEffect
+} from "agent-protocol";
 import { terminalProtocolAction } from "agent-tools";
 import type { RuntimeSession } from "./types.js";
 
@@ -11,14 +15,23 @@ export type CompletionRepairPhase =
 
 export function completionRepairPhase(session: RuntimeSession): CompletionRepairPhase {
   const repair = session.durable.state.completionRepair;
-  if (repair?.kind === "evidence_acquisition") return "evidence";
+  if (repair?.kind === "evidence_acquisition") {
+    // A failed validation is still referenceable for the narrow
+    // validation_executed claim. Once it is durable, asking for another
+    // evidence tool would make an honest failure look like an unfinished
+    // validation obligation. Restrict the next turn to terminal actions so
+    // the agent can report exactly what happened.
+    const hasReferenceableEvidence = session.durable.state.evidence.some((item) =>
+      isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId));
+    return hasReferenceableEvidence ? "terminal" : "evidence";
+  }
   if (repair?.kind === "terminal_action") return "terminal";
   if (repair?.kind === "protected_completion") return "protected_completion";
   if (repair?.kind === "protected_recovery") return "protected_recovery";
   if (session.durable.state.completionRepairAttempts === 0) return "none";
   // Compatibility for snapshots created before repair intent was durable.
   const hasEvidence = session.durable.state.evidence.some((item) =>
-    isCompletionEligibleEvidence(item, session.identity.sessionId, session.durable.runId));
+    isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId));
   return hasEvidence ? "terminal" : "evidence";
 }
 

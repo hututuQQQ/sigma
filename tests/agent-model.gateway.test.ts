@@ -285,6 +285,17 @@ describe("OpenAI-compatible model gateway", () => {
       signal: new AbortController().signal
     });
 
+    await collectStream(gateway, {
+      messages: [
+        ...initialMessages,
+        firstDone.response.message,
+        { role: "tool", content: "tool failed: file was unavailable", toolCallId: "call_1" }
+      ],
+      tools,
+      toolChoice: "required",
+      signal: new AbortController().signal
+    });
+
     expect(bodies[0]).toMatchObject({
       model: "deepseek-v4-pro",
       thinking: { type: "enabled" },
@@ -296,6 +307,10 @@ describe("OpenAI-compatible model gateway", () => {
     });
     expect(bodies[0]).not.toHaveProperty("tool_choice");
     expect(bodies[1]).toMatchObject({
+      thinking: { type: "disabled" },
+      tool_choice: "required"
+    });
+    expect(bodies[2]).toMatchObject({
       thinking: { type: "disabled" },
       tool_choice: "required"
     });

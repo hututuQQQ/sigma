@@ -113,6 +113,17 @@ function terminalReceiptFailure(
   });
 }
 
+function assistantBodyForToolCall(state: KernelState, callId: string): string | null {
+  // Pending tools are created only from the latest model.completed message,
+  // so the latest assistant message is the same model turn even for legacy
+  // snapshots that did not retain toolCalls on the message itself.
+  const message = [...state.messages].reverse().find((item) =>
+    item.role === "assistant" && item.toolCalls?.some((call) => call.id === callId))
+    ?? [...state.messages].reverse().find((item) => item.role === "assistant");
+  if (!message || message.content.trim().length === 0) return null;
+  return message.content;
+}
+
 export interface TerminalReceiptTransition {
   state: KernelState;
   progressed: KernelState;
@@ -139,9 +150,14 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
   if (summary) {
     const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
     if (failure) return failure;
+    const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
     return proposedOutcomeState(input.progressed, {
       kind: "completed",
-      message: protectedCompletionAnswer(input.state) || summary,
+      // A protected substantive answer is intentionally immutable during its
+      // terminal repair. On an ordinary completion, preserve the assistant's
+      // body from the same model turn and use the tool summary only when it is
+      // absent.
+      message: protectedCompletionAnswer(input.state) || sameTurnAnswer || summary,
       evidence: input.progressed.evidence
     });
   }

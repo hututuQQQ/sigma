@@ -765,6 +765,21 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
 
+    let bodyCompletion = withPendingTool("complete-with-body", "complete_task");
+    bodyCompletion = {
+      ...bodyCompletion,
+      messages: bodyCompletion.messages.map((message, index) => index === bodyCompletion.messages.length - 1
+        ? { ...message, content: "Detailed same-turn answer." } : message)
+    };
+    bodyCompletion = toolEvent(bodyCompletion, "tool.completed", "complete-with-body", {
+      ok: true, output: JSON.stringify({ summary: "short fallback" }),
+      observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
+    });
+    expect(bodyCompletion).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: { kind: "completed", message: "Detailed same-turn answer." }
+    });
+
     let repairedCompletion = withPendingTool("repair-complete", "complete_task");
     repairedCompletion = {
       ...repairedCompletion,

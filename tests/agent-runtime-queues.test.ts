@@ -33,7 +33,7 @@ import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
-import { typedCompletion } from "./helpers/typed-evidence.js";
+import { currentRunEvidence, typedCompletion } from "./helpers/typed-evidence.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
@@ -61,6 +61,31 @@ function completion(summary: string): (request: ModelRequest) => ModelResponse {
     summary,
     criterion: "Requested work is complete."
   });
+}
+
+function validationFailureReport(request: ModelRequest): ModelResponse {
+  const validation = currentRunEvidence(request).find((item) => item.kind === "validation");
+  if (!validation) throw new Error("The validation failure was not exposed in the evidence ledger.");
+  return {
+    message: {
+      role: "assistant",
+      content: "The validation was executed and failed; that result is reported honestly.",
+      toolCalls: [{
+        id: "report-validation-failure",
+        name: "complete_task",
+        arguments: {
+          summary: "short fallback summary",
+          criteria: [{
+            criterion: "The validation was executed and its failure was reported.",
+            status: "met",
+            claim: "validation_executed",
+            evidence: [{ ...validation, claim: "validation_executed" }]
+          }]
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
 }
 
 class ScriptedGateway implements ModelGateway {
@@ -393,6 +418,37 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[2].toolChoice).toBe("required");
     expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("request_user_input");
     expect(gateway.requests[2].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+  }, 30_000);
+
+  it("terminates honestly after failed validation without rerunning evidence repair", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-validation-terminal-repair-"));
+    const gateway = new ScriptedGateway([
+      { message: { role: "assistant", content: "The requested validation failed." }, finishReason: "stop" },
+      validationTurn("failed-validation", [{ path: "missing.txt", expected: "present" }]),
+      validationFailureReport
+    ]);
+    const tools = registerContentValidator(registerBuiltinTools(new EffectToolRegistry()));
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools,
+      permissionMode: "auto",
+      runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "run the validation and report its result" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "completed",
+      message: "The validation was executed and failed; that result is reported honestly.",
+      evidence: expect.arrayContaining([expect.objectContaining({ kind: "validation", status: "failed" })])
+    });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[1]?.toolChoice).toBe("required");
+    expect(gateway.requests[2]?.toolChoice).toBe("required");
+    expect(gateway.requests[2]?.tools?.map((tool) => tool.name).sort())
+      .toEqual(["complete_task", "request_user_input"]);
   }, 30_000);
 
   it("bounds a malformed complete_task during terminal repair", async () => {

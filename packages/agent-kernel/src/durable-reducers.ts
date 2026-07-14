@@ -1,6 +1,7 @@
 import {
   isBudgetLedgerState,
   isCheckpointRef,
+  isCompletionEligibleEvidence,
   isCompletionReferenceableEvidence,
   isEvidenceRecord,
   isPlanGraph,
@@ -61,7 +62,9 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
       : state.mutationEvidence
   }, evidence);
   return firstCompletionEvidence
-    ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
+    ? isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
+      ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
+      : { ...progressed, completionRepairAttempts: Math.max(1, state.completionRepairAttempts), completionRepair: { kind: "terminal_action" } }
     : progressed;
 };
 
