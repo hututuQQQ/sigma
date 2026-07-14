@@ -33,6 +33,7 @@ export interface RepositorySnapshot {
   files: string[];
   diff: string;
   truncated: boolean;
+  deadlineReached?: boolean;
   source: "git" | "host";
 }
 

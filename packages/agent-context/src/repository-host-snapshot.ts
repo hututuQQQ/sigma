@@ -1,5 +1,4 @@
 import type { Dirent } from "node:fs";
-import { opendir } from "node:fs/promises";
 import path from "node:path";
 import {
   pinWorkspaceTransactionDirectories,
@@ -7,11 +6,15 @@ import {
   type WorkspaceTransactionDirectoryLease
 } from "agent-platform";
 import createIgnore from "ignore";
+import { boundedDirectoryEntries } from "./repository-directory-entries.js";
 import {
   readStableBoundedText,
   type RepositorySnapshot
 } from "./repository-path-metadata.js";
-import { ignoredDirectory, safeAutomaticFileName } from "./repository-path-safety.js";
+import {
+  safeAutomaticDirectoryName,
+  safeAutomaticFileName
+} from "./repository-path-safety.js";
 import {
   HostRepositorySnapshotAccess,
   type RepositorySnapshotAccess
@@ -62,6 +65,7 @@ interface HostScanState {
   scannedEntries: number;
   lockedDirectories: number;
   truncated: boolean;
+  deadlineReached: boolean;
   deadline: number;
   leases: WorkspaceTransactionDirectoryLease[];
   access: HostRepositorySnapshotAccess;
@@ -74,11 +78,17 @@ function repositoryPath(relative: string, name: string): string {
   return (relative ? `${relative}/${name}` : name).replaceAll("\\", "/");
 }
 
+function lexicalOrder(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function scanLimitReached(state: HostScanState, signal: AbortSignal): boolean {
   signal.throwIfAborted();
-  if (performance.now() < state.deadline
+  const deadlineReached = performance.now() >= state.deadline;
+  if (!deadlineReached
     && state.files.length < MAX_INDEXED_FILES
     && state.scannedEntries < MAX_SCANNED_ENTRIES) return false;
+  state.deadlineReached ||= deadlineReached;
   state.truncated = true;
   return true;
 }
@@ -143,8 +153,9 @@ function indexEntry(
   if (scanLimitReached(state, signal)) return false;
   state.scannedEntries += 1;
   const child = repositoryPath(queueEntry.relative, entry.name);
+  if (entry.isSymbolicLink()) return true;
   if (entry.isDirectory()) {
-    if (ignoredDirectory(entry.name) || ignoredByScope(scope, child, true)) return true;
+    if (!safeAutomaticDirectoryName(entry.name) || ignoredByScope(scope, child, true)) return true;
     if (queueEntry.depth >= MAX_DIRECTORY_DEPTH) state.truncated = true;
     else state.nextQueue.push({ relative: child, depth: queueEntry.depth + 1, ignoreScope: scope });
   } else if (entry.isFile()
@@ -171,8 +182,19 @@ async function scanDirectory(
     const filesStart = state.files.length;
     const queueStart = state.nextQueue.length;
     try {
-      const entries = await opendir(queueEntry.pinnedDirectory);
-      for await (const entry of entries) {
+      const collected = await boundedDirectoryEntries(
+        queueEntry.pinnedDirectory,
+        MAX_SCANNED_ENTRIES - state.scannedEntries,
+        state.deadline,
+        signal
+      );
+      if (collected.limitReached) {
+        state.truncated = true;
+        state.deadlineReached ||= collected.limitReached === "deadline";
+        if (collected.limitReached === "entries") state.scannedEntries = MAX_SCANNED_ENTRIES;
+        return;
+      }
+      for (const entry of collected.entries) {
         if (!indexEntry(state, queueEntry, extended.scope, entry, signal)) break;
       }
     } catch {
@@ -263,13 +285,14 @@ async function pinDirectoryEntries(
   state: HostScanState,
   signal: AbortSignal
 ): Promise<LockedHostQueueEntry[]> {
+  entries.sort((left, right) => lexicalOrder(left.relative, right.relative));
   const remaining = Math.max(0, MAX_LOCKED_DIRECTORIES - state.lockedDirectories);
   if (entries.length > remaining) state.truncated = true;
   const resolved: LockedHostQueueEntry[] = [];
   for (const entry of entries.slice(0, remaining)) {
     if (scanLimitReached(state, signal)) break;
     try {
-      const directory = await resolveWorkspacePath(workspace, entry.relative || ".");
+      const directory = path.resolve(workspace, entry.relative || ".");
       await state.afterDirectoryResolved?.(entry.relative, directory);
       resolved.push({ ...entry, directory, pinnedDirectory: directory });
     } catch {
@@ -311,10 +334,13 @@ export async function withHostRepositorySnapshot<T>(
   consume: HostSnapshotConsumer<T>
 ): Promise<T> {
   const requestedDeadline = options.deadline ?? performance.now() + HOST_CONTEXT_BUDGET_MS;
+  signal.throwIfAborted();
+  const repositoryRoot = await resolveWorkspacePath(workspace, ".");
+  signal.throwIfAborted();
   const reserve = process.platform === "win32"
     ? WINDOWS_POST_SCAN_RESERVE_MS : POSIX_POST_SCAN_RESERVE_MS;
   const state: HostScanState = {
-    files: [], nextQueue: [], scannedEntries: 0, lockedDirectories: 0, truncated: false,
+    files: [], nextQueue: [], scannedEntries: 0, lockedDirectories: 0, truncated: false, deadlineReached: false,
     deadline: Math.max(performance.now(), requestedDeadline - reserve),
     leases: [],
     access: new HostRepositorySnapshotAccess(),
@@ -327,7 +353,7 @@ export async function withHostRepositorySnapshot<T>(
   let result: T | undefined;
   try {
     let current = await pinDirectoryEntries(
-      workspace, [{ relative: "", depth: 0 }], state, signal
+      repositoryRoot, [{ relative: "", depth: 0 }], state, signal
     );
     while (current.length > 0 && !scanLimitReached(state, signal)) {
       state.nextQueue = [];
@@ -335,14 +361,15 @@ export async function withHostRepositorySnapshot<T>(
         if (scanLimitReached(state, signal)) break;
         await scanDirectory(entry, state, signal);
       }
-      current = await pinDirectoryEntries(workspace, state.nextQueue, state, signal);
+      current = await pinDirectoryEntries(repositoryRoot, state.nextQueue, state, signal);
     }
+    scanLimitReached(state, signal);
     await verifySnapshotLeases(state, signal);
+    state.files.sort(lexicalOrder);
     state.access.restrictFiles(state.files);
     result = await consume({
       files: state.files,
-      diff: "",
-      truncated: state.truncated,
+      diff: "", truncated: state.truncated, deadlineReached: state.deadlineReached,
       source: "host"
     }, state.access);
     await verifySnapshotLeases(state, signal);

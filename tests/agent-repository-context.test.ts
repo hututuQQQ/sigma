@@ -14,7 +14,12 @@ import {
 } from "../packages/agent-context/src/repository-host-snapshot.js";
 import { BoundedRegexMatcher } from "../packages/agent-context/src/repository-regex-search.js";
 import { readStableWorkspaceText } from "../packages/agent-context/src/repository-safe-read.js";
-import { safeAutomaticFileName } from "../packages/agent-context/src/repository-path-safety.js";
+import {
+  safeAutomaticDirectoryName,
+  safeAutomaticDirectoryPath,
+  safeAutomaticFileName,
+  safeAutomaticFilePath
+} from "../packages/agent-context/src/repository-path-safety.js";
 import type {
   ModelCapabilities,
   ModelGateway,
@@ -93,6 +98,45 @@ describe("host repository context", () => {
   it("does not reinterpret a host filename separator as repository structure", () => {
     expect(safeAutomaticFileName("literal\\nested.ts")).toBe(false);
     expect(safeAutomaticFileName("literal/nested.ts")).toBe(false);
+    expect(safeAutomaticFilePath("literal\\nested.ts")).toBe(false);
+    expect(safeAutomaticDirectoryName("literal\\nested")).toBe(false);
+    expect(safeAutomaticDirectoryPath("literal\\nested")).toBe(false);
+  });
+
+  it("does not reinterpret a POSIX directory backslash as a path separator", async () => {
+    if (process.platform === "win32") return;
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-host-directory-separator-"));
+    try {
+      const literalDirectory = path.join(workspace, "literal\\nested");
+      await mkdir(literalDirectory);
+      await writeFile(path.join(literalDirectory, "value.ts"), "x\n", "utf8");
+
+      const snapshot = await hostRepositorySnapshot(
+        workspace, new AbortController().signal
+      );
+
+      expect(snapshot.files).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns host snapshot paths in deterministic lexical order", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-host-snapshot-order-"));
+    try {
+      await writeFile(path.join(workspace, "z.ts"), "z\n", "utf8");
+      await writeFile(path.join(workspace, "a.ts"), "a\n", "utf8");
+      await mkdir(path.join(workspace, "middle"), { recursive: true });
+      await writeFile(path.join(workspace, "middle", "value.ts"), "middle\n", "utf8");
+
+      const snapshot = await hostRepositorySnapshot(
+        workspace, new AbortController().signal
+      );
+
+      expect(snapshot.files).toEqual(["a.ts", "middle/value.ts", "z.ts"]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it("counts source lines with stable reads and reports ignored or rejected coverage", async () => {
@@ -142,11 +186,17 @@ describe("host repository context", () => {
         mkdir(path.join(workspace, "src2"), { recursive: true }),
         mkdir(path.join(workspace, "ignored"), { recursive: true }),
         mkdir(path.join(workspace, ".hidden"), { recursive: true }),
+        mkdir(path.join(workspace, "generated"), { recursive: true }),
         mkdir(path.join(workspace, "secrets"), { recursive: true }),
         mkdir(path.join(workspace, "vendor"), { recursive: true })
       ]);
       await Promise.all([
-        writeFile(path.join(workspace, ".gitignore"), "ignored/\n", "utf8"),
+        writeFile(path.join(workspace, ".gitignore"), [
+          "ignored/",
+          "!generated/",
+          "!vendor/",
+          "!.hidden/"
+        ].join("\n"), "utf8"),
         writeFile(path.join(workspace, "src", ".gitignore"), "*.ts\n!keep.ts\n", "utf8"),
         writeFile(path.join(workspace, "root.ts"), "root\n", "utf8"),
         writeFile(path.join(workspace, "src", "keep.ts"), "keep\n", "utf8"),
@@ -154,11 +204,17 @@ describe("host repository context", () => {
         writeFile(path.join(workspace, "src2", "other.ts"), "other\n", "utf8"),
         writeFile(path.join(workspace, "ignored", "ignored.ts"), "ignored\n", "utf8"),
         writeFile(path.join(workspace, ".hidden", "hidden.ts"), "hidden\n", "utf8"),
+        writeFile(path.join(workspace, "generated", "generated.ts"), "generated\n", "utf8"),
         writeFile(path.join(workspace, "secrets", "secret.ts"), "secret\n", "utf8"),
         writeFile(path.join(workspace, "vendor", "vendored.ts"), "vendor\n", "utf8"),
         writeFile(path.join(workspace, ".env"), "TOKEN=secret\n", "utf8"),
         writeFile(path.join(workspace, "AGENTS.md"), "control\n", "utf8")
       ]);
+      await symlink(
+        path.join(workspace, "src"),
+        path.join(workspace, "src-link"),
+        process.platform === "win32" ? "junction" : "dir"
+      );
 
       const root = await listRepositoryFiles(workspace, new AbortController().signal, {
         glob: "**/*.ts"
@@ -181,6 +237,9 @@ describe("host repository context", () => {
       })).rejects.toThrow(/does not exist/u);
       await expect(listRepositoryFiles(workspace, new AbortController().signal, {
         path: "secrets"
+      })).rejects.toThrow(/not an allowed/u);
+      await expect(listRepositoryFiles(workspace, new AbortController().signal, {
+        path: "src-link"
       })).rejects.toThrow(/not an allowed/u);
 
       await Promise.all(Array.from({ length: 50 }, (_, index) => writeFile(
@@ -394,6 +453,31 @@ describe("host repository context", () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a repository read through an internal directory link", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-stable-read-link-"));
+    try {
+      const source = path.join(workspace, "source");
+      await mkdir(source, { recursive: true });
+      await writeFile(path.join(source, "value.ts"), "internal target\n", "utf8");
+      await symlink(
+        source,
+        path.join(workspace, "linked"),
+        process.platform === "win32" ? "junction" : "dir"
+      );
+
+      const loaded = await readStableWorkspaceText(
+        workspace,
+        "linked/value.ts",
+        1_000,
+        new AbortController().signal
+      );
+
+      expect(loaded).toEqual({ content: null, rejected: true });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 
@@ -749,34 +833,116 @@ describe("host repository context", () => {
     expect(content).not.toContain("STRUCTURE_CONTENT_SECRET");
   });
 
-  it("builds bounded end-to-end context for a synthetic 100k path snapshot", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-context-100k-"));
-    await mkdir(path.join(workspace, ".git"), { recursive: true });
-    const files = Array.from(
-      { length: 100_000 },
-      (_, index) => `files/module-${String(index).padStart(6, "0")}.ts`
-    );
-    const listing = files.join("\0");
-    const execution: ProcessExecutionPort = {
-      async execute(request) {
-        const args = request.command.args ?? [];
-        if (args[0] === "rev-parse") return exited(workspace);
-        if (args[0] === "status") return exited("## main");
-        if (args[0] === "ls-files") return exited(listing);
-        if (args[0] === "diff") return exited("");
-        throw new Error(`Unexpected synthetic Git command: ${args.join(" ")}`);
-      }
-    };
-    const started = performance.now();
-    const items = await new RepositoryContextProvider(execution).collect(
-      workspace, "", new AbortController().signal
-    );
-    const durationMs = performance.now() - started;
-    const content = items.find((item) => item.provenance === "incremental repository index")!.content;
+  it("applies the automatic path policy to Git-backed repository snapshots", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-context-policy-"));
+    try {
+      await Promise.all([
+        mkdir(path.join(workspace, ".git"), { recursive: true }),
+        mkdir(path.join(workspace, ".hidden"), { recursive: true }),
+        mkdir(path.join(workspace, "dist"), { recursive: true }),
+        mkdir(path.join(workspace, "generated"), { recursive: true }),
+        mkdir(path.join(workspace, "src"), { recursive: true }),
+        mkdir(path.join(workspace, "vendor"), { recursive: true })
+      ]);
+      await Promise.all([
+        writeFile(path.join(workspace, "src", ".gitignore"), "ignored.ts\n", "utf8"),
+        writeFile(path.join(workspace, "src", "safe.ts"), "safe\n", "utf8"),
+        writeFile(path.join(workspace, "src", "ignored.ts"), "ignored\n", "utf8"),
+        writeFile(path.join(workspace, ".hidden", "private.ts"), "private\n", "utf8"),
+        writeFile(path.join(workspace, "generated", "client.ts"), "generated\n", "utf8"),
+        writeFile(path.join(workspace, "dist", "bundle.ts"), "dist\n", "utf8"),
+        writeFile(path.join(workspace, "vendor", "library.ts"), "vendor\n", "utf8"),
+        writeFile(path.join(workspace, "AGENTS.md"), "control\n", "utf8")
+      ]);
+      const execution: ProcessExecutionPort = {
+        async execute(request) {
+          const args = request.command.args ?? [];
+          if (args[0] === "rev-parse") return exited(workspace);
+          if (args[0] === "status") return exited("## main");
+          if (args[0] === "diff") {
+            throw new Error("Automatic repository context must not request Git diff content.");
+          }
+          throw new Error(`Unexpected synthetic Git command: ${args.join(" ")}`);
+        }
+      };
 
-    expect(content).toContain("Repository files (100000):");
-    expect(content).toContain('".ts" (TypeScript): 100000 files');
-    expect(durationMs).toBeLessThan(2_000);
+      const items = await new RepositoryContextProvider(execution).collect(
+        workspace, "", new AbortController().signal
+      );
+      const content = items.find(
+        (item) => item.provenance === "incremental repository index"
+      )!.content;
+
+      expect(content).toContain("Repository files (1):");
+      expect(content).toContain('"src/safe.ts"');
+      expect(content).not.toMatch(
+        /vendor\/library|src\/ignored|\.hidden\/private|generated\/client|dist\/bundle|AGENTS\.md|literal\\\\nested/u
+      );
+      expect(items.some((item) => item.provenance === "current Git diff")).toBe(false);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the host snapshot when Git status is truncated", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-status-truncated-"));
+    try {
+      await mkdir(path.join(workspace, ".git"), { recursive: true });
+      await mkdir(path.join(workspace, "src"), { recursive: true });
+      await writeFile(path.join(workspace, "src", "safe.ts"), "safe\n", "utf8");
+      const execution: ProcessExecutionPort = {
+        async execute(request) {
+          const args = request.command.args ?? [];
+          if (args[0] === "rev-parse") return exited(workspace);
+          if (args[0] === "status") {
+            return { ...exited("## main\n?? partial"), outputTruncated: true };
+          }
+          throw new Error(`Unexpected command after truncated Git status: ${args.join(" ")}`);
+        }
+      };
+
+      const items = await new RepositoryContextProvider(execution).collect(
+        workspace, "", new AbortController().signal
+      );
+      const content = items.find(
+        (item) => item.provenance === "incremental repository index"
+      )!.content;
+
+      expect(content).toContain('"src/safe.ts"');
+      expect(content).toContain("Indexed file contents were not read or excerpted");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes the safe snapshot immediately when Git-visible ignore rules change", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-git-ignore-refresh-"));
+    try {
+      await mkdir(path.join(workspace, ".git"), { recursive: true });
+      await mkdir(path.join(workspace, "src"), { recursive: true });
+      await writeFile(path.join(workspace, "src", "value.ts"), "value\n", "utf8");
+      let status = "## main";
+      const execution: ProcessExecutionPort = {
+        async execute(request) {
+          const args = request.command.args ?? [];
+          if (args[0] === "rev-parse") return exited(workspace);
+          if (args[0] === "status") return exited(status);
+          throw new Error(`Unexpected synthetic Git command: ${args.join(" ")}`);
+        }
+      };
+      const provider = new RepositoryContextProvider(execution);
+
+      const before = await provider.collect(workspace, "", new AbortController().signal);
+      expect(before[0]!.content).toContain('"src/value.ts"');
+
+      await writeFile(path.join(workspace, "src", ".gitignore"), "value.ts\n", "utf8");
+      status = "## main\n M src/.gitignore";
+      const after = await provider.collect(workspace, "", new AbortController().signal);
+
+      expect(after[0]!.content).not.toContain('"src/value.ts"');
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it("stops host traversal at a generic depth safety limit", async () => {

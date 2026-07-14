@@ -9,6 +9,31 @@ const DEFAULT_ENTRY_LIMIT = 2_000;
 export const MAX_REPOSITORY_LIST_ENTRIES = 20_000;
 export const MAX_REPOSITORY_LIST_OUTPUT_BYTES = 64 * 1024;
 const MAX_GLOB_CHARACTERS = 512;
+const SUPPORTED_GLOB_SYNTAX = "literals, '/', '*', '?', and '**'";
+
+type UnsupportedGlobConstruct =
+  | "backslash separators"
+  | "brace expansion"
+  | "character classes"
+  | "extended globs"
+  | "leading negation";
+
+function unsupportedGlobConstruct(pattern: string): UnsupportedGlobConstruct | undefined {
+  if (pattern.includes("\\")) return "backslash separators";
+  if (/[{}]/u.test(pattern)) return "brace expansion";
+  if (/[[\]]/u.test(pattern)) return "character classes";
+  if (/[@+!*?]\(/u.test(pattern)) return "extended globs";
+  if (pattern.startsWith("!")) return "leading negation";
+  return undefined;
+}
+
+function assertSupportedGlob(pattern: string): void {
+  const construct = unsupportedGlobConstruct(pattern);
+  if (!construct) return;
+  throw Object.assign(new Error(
+    `Unsupported list glob syntax: ${construct}; use ${SUPPORTED_GLOB_SYNTAX}.`
+  ), { code: "unsupported_repository_glob_syntax" });
+}
 
 export interface RepositoryListOptions {
   path?: string;
@@ -71,6 +96,7 @@ function resolvedOptions(options: RepositoryListOptions, started: number): Resol
   if (glob.length > MAX_GLOB_CHARACTERS) {
     throw new Error(`List glob exceeds the ${MAX_GLOB_CHARACTERS}-character safety limit.`);
   }
+  assertSupportedGlob(glob);
   return {
     path: options.path ?? ".",
     glob,
@@ -144,7 +170,7 @@ function listSnapshot(
     scope: {
       path: options.path,
       glob: options.glob,
-      exclusions: "Nested .gitignore rules plus hidden, generated, vendor, agent-control, sensitive, and symbolic-linked paths.",
+      exclusions: "Nested .gitignore rules plus hidden, generated, vendor, agent-control, sensitive, symbolic-link, and directory reparse-point paths.",
       limits: {
         maxEntries: options.limit,
         maxOutputBytes: options.maxOutputBytes,

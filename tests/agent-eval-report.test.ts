@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   buildEvalRunReport,
   renderHumanAuditMarkdown,
   renderEvalReportMarkdown,
+  runReportCli,
   wilsonPassRate,
   writeEvalReport
 } from "../scripts/eval/report.mjs";
@@ -322,12 +323,15 @@ describe("agent evaluation report", () => {
     });
   });
 
-  it("writes only the V2 run, human report, and latest pointer with secrets redacted", async () => {
+  it("writes a labelled human-only review bundle from the same redacted snapshot", async () => {
     const root = path.join(os.tmpdir(), `sigma-eval-report-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const runDir = path.join(root, "run-current");
     const input = run([
       {
-        ...attempt({ artifacts: { verifierLog: "attempts/small-edit-1/verifier.log" } }),
+        ...attempt({ artifacts: {
+          verifierLog: "attempts/small-edit-1/verifier.log",
+          stdoutLog: "attempts/small-edit-1/sk-path-secret-value-12345.log"
+        } }),
         apiKey: "sk-this-value-must-never-be-written"
       },
       attempt({ repetition: 2 }),
@@ -337,19 +341,150 @@ describe("agent evaluation report", () => {
     const result = await writeEvalReport({ run: input, runDir, evalRootDir: root });
     const persisted = await readFile(result.runPath, "utf8");
     const markdown = await readFile(result.reportPath, "utf8");
+    const humanAudit = JSON.parse(await readFile(result.humanAuditJsonPath, "utf8"));
+    const humanAuditMarkdown = await readFile(result.humanAuditMarkdownPath, "utf8");
+    const published = await Promise.all([
+      readFile(result.publishedRunPath, "utf8"),
+      readFile(result.publishedReportPath, "utf8"),
+      readFile(result.publishedHumanAuditJsonPath, "utf8"),
+      readFile(result.publishedHumanAuditMarkdownPath, "utf8")
+    ]);
     const latest = JSON.parse(await readFile(result.latestPath, "utf8"));
 
     expect(persisted).not.toContain("sk-this-value-must-never-be-written");
     expect(persisted).toContain("[REDACTED]");
     expect(markdown).toContain("# Sigma Agent Experience Evaluation");
+    expect(JSON.stringify(humanAudit)).not.toContain("sk-this-value-must-never-be-written");
+    expect([persisted, markdown, humanAuditMarkdown, ...published].join("\n"))
+      .not.toContain("sk-path-secret-value-12345");
+    expect(humanAudit).toMatchObject({
+      schemaVersion: 2,
+      kind: "human_audit_pack",
+      audience: "human_only",
+      feedbackPolicy: "never_supply_to_solving_or_optimization_agents",
+      runId: "run-current"
+    });
+    expect(humanAuditMarkdown).toContain("must never be supplied to a solving or optimization agent");
     expect(result).not.toHaveProperty("codexReviewPath");
+    expect(result).not.toHaveProperty("humanAuditPack");
     expect(latest).toEqual(expect.objectContaining({
       schemaVersion: 2,
       kind: "eval_latest",
       runId: "run-current",
       runDir: "run-current",
-      files: { run: "run-current/run.json", report: "run-current/report.md" }
+      bundleDigest: result.bundleDigest,
+      files: {
+        run: `run-current/run.${result.bundleDigest}.json`,
+        report: `run-current/report.${result.bundleDigest}.md`
+      },
+      humanReview: {
+        schemaVersion: 2,
+        kind: "human_audit_pack",
+        audience: "human_only",
+        feedbackPolicy: "never_supply_to_solving_or_optimization_agents",
+        files: {
+          audit: `run-current/human-audit.${result.bundleDigest}.json`,
+          report: `run-current/human-audit.${result.bundleDigest}.md`
+        }
+      }
     }));
+  });
+
+  it("produces byte-identical human review files across attempt ordering and repeated writes", async () => {
+    const root = path.join(os.tmpdir(), `sigma-eval-audit-determinism-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const attempts = [
+      attempt({ passing: false, repetition: 1 }),
+      attempt({ passing: false, repetition: 2 }),
+      attempt({ passing: false, repetition: 3 })
+    ];
+    const first = await writeEvalReport({
+      run: run(attempts), runDir: path.join(root, "first"), evalRootDir: root
+    });
+    const expectedJson = await readFile(first.humanAuditJsonPath, "utf8");
+    const expectedMarkdown = await readFile(first.humanAuditMarkdownPath, "utf8");
+
+    await writeEvalReport({ run: run(attempts), runDir: path.join(root, "first"), evalRootDir: root });
+    const reordered = await writeEvalReport({
+      run: run([...attempts].reverse()), runDir: path.join(root, "second"), evalRootDir: root
+    });
+
+    expect(await readFile(first.humanAuditJsonPath, "utf8")).toBe(expectedJson);
+    expect(await readFile(first.humanAuditMarkdownPath, "utf8")).toBe(expectedMarkdown);
+    expect(await readFile(reordered.humanAuditJsonPath, "utf8")).toBe(expectedJson);
+    expect(await readFile(reordered.humanAuditMarkdownPath, "utf8")).toBe(expectedMarkdown);
+    expect(reordered.bundleDigest).toBe(first.bundleDigest);
+    expect(path.basename(reordered.publishedHumanAuditJsonPath))
+      .toBe(path.basename(first.publishedHumanAuditJsonPath));
+  });
+
+  it("exposes the human review bundle through the report-only CLI", async () => {
+    const root = path.join(os.tmpdir(), `sigma-eval-report-cli-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const inputPath = path.join(root, "input.json");
+    const outputDir = path.join(root, "reviewed-run");
+    await mkdir(root, { recursive: true });
+    await writeFile(inputPath, JSON.stringify(run([
+      attempt({ repetition: 1 }), attempt({ repetition: 2 }), attempt({ repetition: 3 })
+    ])), "utf8");
+
+    const result = await runReportCli([
+      "--input", inputPath, "--output-dir", outputDir, "--eval-root", root
+    ]);
+
+    expect(result.humanAuditJsonPath).toBe(path.join(outputDir, "human-audit.json"));
+    expect(result.humanAuditMarkdownPath).toBe(path.join(outputDir, "human-audit.md"));
+    await expect(readFile(result.humanAuditJsonPath, "utf8")).resolves.toContain('"audience": "human_only"');
+    expect(result.publishedHumanAuditJsonPath)
+      .toBe(path.join(outputDir, `human-audit.${result.bundleDigest}.json`));
+  });
+
+  it("keeps the default report destination inside the configured results root", async () => {
+    const root = path.join(os.tmpdir(), `sigma-eval-report-root-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const escaping = run([
+      attempt({ repetition: 1 }), attempt({ repetition: 2 }), attempt({ repetition: 3 })
+    ], { runId: "../../outside-results" });
+
+    await expect(writeEvalReport({ run: escaping, evalRootDir: root }))
+      .rejects.toThrow("inside its results root");
+  });
+
+  it("does not publish through a linked directory inside the results root", async () => {
+    const root = path.join(os.tmpdir(), `sigma-eval-report-linked-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const outside = path.join(os.tmpdir(), `sigma-eval-report-outside-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const linked = path.join(root, "linked-run");
+    await Promise.all([mkdir(root, { recursive: true }), mkdir(outside, { recursive: true })]);
+    await symlink(outside, linked, process.platform === "win32" ? "junction" : "dir");
+    const input = run([
+      attempt({ repetition: 1 }), attempt({ repetition: 2 }), attempt({ repetition: 3 })
+    ]);
+
+    await expect(writeEvalReport({ run: input, runDir: linked, evalRootDir: root }))
+      .rejects.toThrow(/symbolic link|reparse point/iu);
+    await expect(readFile(path.join(outside, "run.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("publishes one coherent content-addressed bundle under concurrent rewrites", async () => {
+    const root = path.join(os.tmpdir(), `sigma-eval-report-concurrent-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const runDir = path.join(root, "run-current");
+    const passing = run([1, 2, 3].map((repetition) => attempt({ repetition })));
+    const failing = run([1, 2, 3].map((repetition) => attempt({ repetition, passing: false })));
+
+    const results = await Promise.all([
+      writeEvalReport({ run: passing, runDir, evalRootDir: root }),
+      writeEvalReport({ run: failing, runDir, evalRootDir: root })
+    ]);
+    const latest = JSON.parse(await readFile(results[0].latestPath, "utf8"));
+    const publishedRun = JSON.parse(await readFile(path.join(root, latest.files.run), "utf8"));
+    const publishedAudit = JSON.parse(await readFile(
+      path.join(root, latest.humanReview.files.audit), "utf8"
+    ));
+
+    expect(latest.files.run).toContain(latest.bundleDigest);
+    expect(latest.files.report).toContain(latest.bundleDigest);
+    expect(latest.humanReview.files.audit).toContain(latest.bundleDigest);
+    expect(latest.humanReview.files.report).toContain(latest.bundleDigest);
+    expect(publishedRun.status).toBe(latest.status);
+    expect(publishedAudit.runStatus).toBe(latest.status);
   });
 
   it("keeps the deterministic detailed audit as an explicit human-only API", () => {

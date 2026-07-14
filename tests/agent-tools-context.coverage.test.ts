@@ -258,7 +258,9 @@ describe("context, platform, and repository tool capabilities", () => {
     const first = await provider.collect(workspace, "核心代理阻塞", signal);
     const second = await provider.collect(workspace, "核心代理阻塞", signal);
     expect(first.find((item) => item.provenance === "incremental repository index")?.content).toContain("src/nested/agent.ts");
-    expect(first.find((item) => item.provenance === "current Git diff")?.content).toContain("agent = false");
+    expect(first.some((item) => item.provenance === "current Git diff")).toBe(false);
+    expect(first.find((item) => item.provenance === "incremental repository index")?.content)
+      .toContain("agent = false");
     expect(second.map((item) => item.id)).toEqual(first.map((item) => item.id));
 
     const nongit = await mkdtemp(path.join(os.tmpdir(), "sigma-context-nongit-"));

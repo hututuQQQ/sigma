@@ -1,7 +1,7 @@
 import path from "node:path";
 import {
   isInside,
-  pinWorkspaceTransactionDirectories,
+  pinWorkspaceTransactionPaths,
   resolveWorkspacePath,
   type WorkspaceTransactionDirectoryLease
 } from "agent-platform";
@@ -64,6 +64,19 @@ async function requiredExpectedState(target: string, relative: string, maxBytes:
   return state;
 }
 
+async function resolveUnlinkedRepositoryTarget(root: string, relative: string): Promise<string> {
+  const lexicalTarget = path.resolve(root, relative);
+  if (!isInside(root, lexicalTarget)) {
+    throw new Error(`Repository file escapes workspace: ${relative}`);
+  }
+  const target = await resolveWorkspacePath(root, relative);
+  if (!isInside(root, target)) throw new Error(`Repository file escapes workspace: ${relative}`);
+  if (pathIdentity(lexicalTarget) !== pathIdentity(target)) {
+    throw new Error(`Repository file traverses a linked path: ${relative}`);
+  }
+  return target;
+}
+
 /**
  * Reads one automatically selected repository file while pinning its complete
  * canonical parent chain. The path and directory identities are checked both
@@ -83,11 +96,16 @@ export async function readStableWorkspaceText(
   let operationFailure: unknown;
   try {
     const root = await resolveWorkspacePath(workspace, ".");
-    const target = await resolveWorkspacePath(root, relative);
-    if (!isInside(root, target)) throw new Error(`Repository file escapes workspace: ${relative}`);
+    const target = await resolveUnlinkedRepositoryTarget(root, relative);
     const expectedState = await requiredExpectedState(target, relative, maxBytes);
     await options.afterTargetResolved?.(target);
-    lease = await pinWorkspaceTransactionDirectories(parentDirectoryChain(root, target));
+    lease = await pinWorkspaceTransactionPaths([
+      ...parentDirectoryChain(root, target).map((directory) => ({
+        path: directory,
+        kind: "directory" as const
+      })),
+      { path: target, kind: "file" }
+    ]);
     await verifyBoundPath(root, relative, target, lease, signal);
     await options.beforeStableRead?.();
     loaded = await readStableBoundedText(target, maxBytes, signal, expectedState);

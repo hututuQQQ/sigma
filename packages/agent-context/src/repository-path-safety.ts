@@ -4,7 +4,7 @@ const ignoredDirectories = new Set([
   ".agent", ".agents", ".artifacts", ".cache", ".codex", ".cursor", ".git", ".github",
   ".hg", ".gradle", ".mypy_cache", ".next", ".nuxt", ".openai", ".pytest_cache",
   ".ruff_cache", ".svn", ".turbo", ".venv", ".yarn", "__pycache__", "build", "coverage",
-  "dist", "node_modules", "obj", "out", "target", "vendor", "venv"
+  "dist", "generated", "node_modules", "obj", "out", "target", "vendor", "venv"
 ]);
 const agentControlFiles = new Set([
   "agents.md", "claude.md", "copilot-instructions.md", "gemini.md"
@@ -52,6 +52,11 @@ export function ignoredDirectory(name: string): boolean {
     || matchesSensitiveName(normalized, agentControlFiles) || sensitivePathName(normalized);
 }
 
+export function safeAutomaticDirectoryName(name: string): boolean {
+  return Boolean(name) && !name.includes("/") && !name.includes("\\")
+    && !ignoredDirectory(name);
+}
+
 export function safeAutomaticFileName(name: string): boolean {
   if (!name || name.includes("/") || name.includes("\\")) return false;
   const normalized = name.toLowerCase();
@@ -60,8 +65,8 @@ export function safeAutomaticFileName(name: string): boolean {
 }
 
 export function safeAutomaticFilePath(file: string): boolean {
-  if (!file || path.isAbsolute(file) || /^[a-z]:/iu.test(file)) return false;
-  const segments = file.replaceAll("\\", "/").split("/");
+  if (!file || file.includes("\\") || path.isAbsolute(file) || /^[a-z]:/iu.test(file)) return false;
+  const segments = file.split("/");
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) return false;
   const basename = segments.at(-1);
   return basename !== undefined
@@ -71,8 +76,9 @@ export function safeAutomaticFilePath(file: string): boolean {
 
 export function safeAutomaticDirectoryPath(directory: string): boolean {
   if (directory === ".") return true;
-  if (!directory || path.isAbsolute(directory) || /^[a-z]:/iu.test(directory)) return false;
-  const segments = directory.replaceAll("\\", "/").split("/");
+  if (!directory || directory.includes("\\")
+    || path.isAbsolute(directory) || /^[a-z]:/iu.test(directory)) return false;
+  const segments = directory.split("/");
   return segments.every((segment) => segment && segment !== "." && segment !== ".."
-    && !ignoredDirectory(segment));
+    && safeAutomaticDirectoryName(segment));
 }

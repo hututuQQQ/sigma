@@ -325,7 +325,7 @@ function completedSearchResult(
     scope: {
       path: searchPath,
       glob,
-      exclusions: "Nested .gitignore rules plus hidden, generated, vendor, agent-control, sensitive, linked, hard-linked, oversized, and NUL-containing files.",
+      exclusions: "Nested .gitignore rules plus hidden, generated, vendor, agent-control, sensitive, symbolic-link, directory reparse-point, hard-linked, oversized, and NUL-containing files.",
       limits: {
         maxFileBytes: options.maxFileBytes,
         maxTotalBytes: options.maxTotalBytes,

@@ -45,6 +45,7 @@
     "smoke:tui-product": "pnpm build && node --experimental-ffi --disable-warning=ExperimentalWarning scripts/smoke-tui-product.mjs",
     "smoke:provider": "pnpm build && node scripts/smoke-provider.mjs",
     "eval:agent": "pnpm build && node scripts/eval/agent-eval.mjs",
+    "eval:report": "node scripts/eval/report.mjs",
     "eval:session": "node scripts/eval/session-audit.mjs",
     "eval:compare": "node scripts/eval/compare.mjs",
     "eval:observe": "node scripts/eval/optimizer-observe.mjs",

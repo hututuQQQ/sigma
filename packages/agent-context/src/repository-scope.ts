@@ -6,6 +6,11 @@ import {
   safeAutomaticFilePath
 } from "./repository-path-safety.js";
 
+function pathIdentity(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
 export async function normalizedSafeRepositoryPath(
   workspace: string,
   requested: string,
@@ -14,9 +19,16 @@ export async function normalizedSafeRepositoryPath(
 ): Promise<string> {
   signal.throwIfAborted();
   const root = await resolveWorkspacePath(workspace, ".");
+  const lexicalTarget = path.resolve(root, requested || ".");
+  if (!isInside(root, lexicalTarget)) {
+    throw new Error(`Repository ${operation} path escapes workspace: ${requested}`);
+  }
   const target = await resolveWorkspacePath(root, requested || ".");
   if (!isInside(root, target)) {
     throw new Error(`Repository ${operation} path escapes workspace: ${requested}`);
+  }
+  if (pathIdentity(lexicalTarget) !== pathIdentity(target)) {
+    throw new Error(`Repository ${operation} path is not an allowed file or directory: ${requested}`);
   }
   const state = await lstat(target).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT" || error.code === "ENOTDIR") {

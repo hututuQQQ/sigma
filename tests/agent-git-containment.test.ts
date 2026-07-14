@@ -122,8 +122,12 @@ describe("Git workspace containment", () => {
     const signal = new AbortController().signal;
     const broker = execution();
     await expect(selfContainedGitRoot(workspace, signal, broker)).resolves.toBe(await realpath(workspace));
-    const contextItems = await new RepositoryContextProvider(broker).collect(workspace, "tracked", signal);
-    expect(contextItems.find((item) => item.provenance === "current Git diff")?.content).toContain("SELF_CONTAINED_CHANGE");
+    const contextItems = await new RepositoryContextProvider(broker).collect(
+      workspace, "SELF_CONTAINED_CHANGE", signal
+    );
+    expect(contextItems.some((item) => item.provenance === "current Git diff")).toBe(false);
+    expect(contextItems.find((item) => item.provenance === "incremental repository index")?.content)
+      .toContain("SELF_CONTAINED_CHANGE");
     const tools = registerBuiltinTools(new EffectToolRegistry(), { broker });
     await expect(tools.execute(request("status", "git_status"), toolContext(workspace))).resolves.toMatchObject({ ok: true });
     await expect(tools.execute(request("diff", "git_diff"), toolContext(workspace))).resolves.toMatchObject({ ok: true });

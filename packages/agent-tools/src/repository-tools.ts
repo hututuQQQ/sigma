@@ -89,7 +89,7 @@ function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
   return {
     descriptor: schema({
       name: "list",
-      description: "List repository files recursively as bounded JSONL paths with optional glob filtering. Nested ignore rules and hidden, generated, vendor, control, sensitive, and symbolic-linked paths are excluded; diagnostics state completeness.",
+      description: "List repository files recursively as bounded JSONL paths with optional glob filtering. Glob syntax supports literals, /, *, ?, and **. Nested ignore rules and hidden, generated, vendor, control, sensitive, symbolic-link, and directory reparse-point paths are excluded; diagnostics state completeness.",
       properties: {
         path: { type: "string" }, glob: { type: "string" },
         limit: { type: "integer", minimum: 1, maximum: maximumListEntries }
@@ -106,11 +106,27 @@ function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
       if (pattern.length > listGlobCharacterLimit) {
         throw new Error(`List glob exceeds the ${listGlobCharacterLimit}-character safety limit.`);
       }
-      const listing = await listProvider(
-        context.workspacePath,
-        context.signal,
-        { path: searchPath, glob: pattern, limit }
-      );
+      let listing: RepositoryProviderResult;
+      try {
+        listing = await listProvider(
+          context.workspacePath,
+          context.signal,
+          { path: searchPath, glob: pattern, limit }
+        );
+      } catch (error) {
+        if (error instanceof Error
+          && "code" in error
+          && error.code === "unsupported_repository_glob_syntax") {
+          return result(
+            request,
+            startedAt,
+            error.message,
+            false,
+            ["unsupported_repository_glob_syntax"]
+          );
+        }
+        throw error;
+      }
       return result(request, startedAt, listing.output, true, listing.diagnostics ?? []);
     }
   };
@@ -120,7 +136,7 @@ function repositoryStatsTool(statisticsProvider: RepositoryStatisticsProvider): 
   return {
     descriptor: schema({
       name: "repository_stats",
-      description: "Count source files and physical/non-blank text lines by language without starting a process; returns the exact scope and completeness limits.",
+      description: "Count accepted source files and physical/non-blank text lines from one repository snapshot by language and bounded top-level directory groups without starting a process; returns scope, read limits, and completeness, and exposes no partial aggregates when its deadline is reached.",
       properties: {}, possibleEffects: ["filesystem.read"], executionMode: "parallel",
       resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
     }),
@@ -136,7 +152,7 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
   return {
     descriptor: schema({
       name: "grep",
-      description: "Search bounded safe repository text without spawning a process. Hidden, ignored, generated, linked, and sensitive paths are excluded. Matching is literal unless regex=true; results are JSONL.",
+      description: "Search bounded safe repository text without spawning a process. Hidden, ignored, generated, symbolic-link, directory reparse-point, hard-linked, and sensitive paths are excluded. Matching is literal unless regex=true; results are JSONL.",
       properties: {
         query: { type: "string" }, path: { type: "string" }, glob: { type: "string" },
         regex: { type: "boolean" },
