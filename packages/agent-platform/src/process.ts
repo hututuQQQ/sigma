@@ -3,6 +3,7 @@ import type {
   BrokerRequestOptions,
   ExecutionRequest,
   ExecutionResult,
+  ProcessLaunchFailureV1,
   ProcessHandle,
   ProcessPollResult
 } from "agent-execution";
@@ -43,6 +44,8 @@ export interface ProcessResult {
   durationMs: number;
   stdoutLimitReached: boolean;
   outputTruncated: boolean;
+  /** Authenticated sandbox launch failure when the user process never started. */
+  failure?: ProcessLaunchFailureV1;
 }
 
 export class ProcessExecutionUnavailableError extends Error {
@@ -129,7 +132,8 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
     cancelled: result.cancelled,
     durationMs: result.durationMs,
     stdoutLimitReached: stdout.limited,
-    outputTruncated: result.outputTruncated || stdout.limited
+    outputTruncated: result.outputTruncated || stdout.limited,
+    ...(result.failure ? { failure: result.failure } : {})
   };
 }
 

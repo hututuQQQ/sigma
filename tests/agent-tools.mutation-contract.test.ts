@@ -272,9 +272,13 @@ describe("typed workspace mutation contracts", () => {
     for (const item of fixture.executions) {
       expect(item.policy.readRoots).toEqual(expected);
       expect(item.policy.readRoots).not.toContain(workspace);
+      expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
+      expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     }
     expect(fixture.spawns).toHaveLength(1);
     expect(fixture.spawns[0]?.policy.readRoots).toEqual(expected);
+    expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
+    expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     for (const name of ["exec", "shell", "validate", "process_spawn"]) {
       expect(tools.descriptor(name)?.inputSchema).toMatchObject({
         properties: { readRoots: { type: "array", minItems: 1, uniqueItems: true } }

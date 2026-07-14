@@ -115,6 +115,25 @@ describe("agent-platform execution boundary", () => {
     });
   });
 
+  it("preserves authenticated sandbox launch failures", async () => {
+    const failure = {
+      phase: "sandbox_launch" as const,
+      code: "sandbox_acl_plan_limit",
+      message: "sandbox ACL plan exceeds durable recovery limits"
+    };
+    const execution: ProcessExecutionPort = {
+      execute: async () => executionResult({ exitCode: null, failure })
+    };
+    await expect(runProcess({
+      execution,
+      executable: "tool",
+      args: [],
+      cwd: process.cwd(),
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })).resolves.toMatchObject({ exitCode: null, failure });
+  });
+
   it.skipIf(process.platform !== "win32")(
     "holds Windows directories without delete sharing until the lock is released",
     async () => {

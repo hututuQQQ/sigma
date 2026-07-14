@@ -965,7 +965,9 @@ fn check_acl_tree_limits(scanned: &mut usize, depth: usize, context: &str) -> Re
     if *scanned > MAX_RECOVERY_ENTRIES || depth > MAX_RECOVERY_SCAN_DEPTH {
         return Err(RpcError::new(
             "policy_denied",
-            format!("{context} exceeds sandbox ACL traversal limits"),
+            format!(
+                "{context} exceeds sandbox ACL traversal limits (maximum {MAX_RECOVERY_ENTRIES} objects; declare narrower read roots)"
+            ),
         ));
     }
     Ok(())
@@ -983,7 +985,9 @@ fn check_acl_plan_limits(
     {
         return Err(RpcError::new(
             "policy_denied",
-            "sandbox ACL plan exceeds durable recovery limits",
+            format!(
+                "sandbox ACL plan exceeds durable recovery limits (maximum {MAX_RECOVERY_ENTRIES} objects; declare narrower read roots)"
+            ),
         ));
     }
     Ok(())

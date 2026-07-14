@@ -270,9 +270,10 @@ export function executionPolicy(
       ...(skillRoot ? [skillRoot] : [])
     ])],
     writeRoots: context.runMode === "change" ? writeRoots : [],
+    // The broker derives metadata guards from the minimal declared roots.
+    // Adding workspace-root metadata here would make a narrow cwd/read scope
+    // fail native root validation before the command can start.
     protectedPaths: [
-      path.join(context.workspacePath, ".git"),
-      path.join(context.workspacePath, ".agent"),
       ...(skillResource ? [path.resolve(skillResource.readRoot)] : [])
     ],
     unsafeHostExecApproved: !required && context.approval?.unsafeHostExecApproved === true

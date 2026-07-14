@@ -146,7 +146,7 @@ describe("sandboxed skill resource execution", () => {
           network: "none",
           readRoots: [workspace, skillRoot],
           writeRoots: [],
-          protectedPaths: [path.join(workspace, ".git"), path.join(workspace, ".agent"), skillRoot],
+          protectedPaths: [skillRoot],
           unsafeHostExecApproved: false
         })
       })]);

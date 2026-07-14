@@ -3,9 +3,14 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import os from "node:os";
 import path from "node:path";
 import type { ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
+import type { ExecutionResult } from "../packages/agent-execution/src/index.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { RepositoryContextProvider } from "../packages/agent-context/src/index.js";
-import { gitPorcelain, selfContainedGitRoot } from "../packages/agent-platform/src/index.js";
+import {
+  gitPorcelain,
+  selfContainedGitRoot,
+  type ProcessExecutionPort
+} from "../packages/agent-platform/src/index.js";
 import { WorkspaceIsolationManager } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createHostExecutionBroker, type HostExecutionBroker } from "./helpers/host-execution-broker.js";
@@ -144,6 +149,39 @@ describe("Git workspace containment", () => {
     expect(allocation.isolation.kind).toBe("git_worktree");
     expect(allocation.workspacePath).not.toBe(workspace);
     await allocation.release();
+  });
+
+  it("does not misreport a sandbox launch failure as a non-Git workspace", async () => {
+    const workspace = await fixture("launch-failure");
+    initializeRepository(workspace);
+    const failure: ExecutionResult = {
+      state: "exited",
+      exitCode: null,
+      signal: null,
+      durationMs: 0,
+      timedOut: false,
+      idleTimedOut: false,
+      cancelled: false,
+      stdout: "",
+      stderr: "",
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+      outputTruncated: false,
+      outputArtifacts: [],
+      failure: {
+        phase: "sandbox_launch",
+        code: "policy_denied",
+        message: "sandbox ACL plan exceeds durable recovery limits"
+      }
+    };
+    const broker: ProcessExecutionPort = { execute: async () => failure };
+
+    await expect(selfContainedGitRoot(workspace, new AbortController().signal, broker))
+      .rejects.toMatchObject({
+        code: "policy_denied",
+        message: expect.stringContaining("sandbox ACL plan exceeds durable recovery limits"),
+        cause: failure.failure
+      });
   });
 
   it("returns a bounded head/tail preview and stores the complete large diff as an artifact", async () => {
