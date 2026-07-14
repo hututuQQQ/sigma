@@ -380,20 +380,52 @@ describe("independent reviewer budget accounting", () => {
       sessionId: "session", runId: "run", goal: "Review safely",
       workspaceDeltas: [delta()], validations: [validation()]
     };
-    const decorated = await new ModelReviewer(new ReviewerGateway(
+    const decoratedGateway = new ReviewerGateway(
       undefined,
       'Here is the result: {"verdict":"approved","findings":[]}'
-    )).review(input, new AbortController().signal);
+    );
+    const decorated = await new ModelReviewer(decoratedGateway).review(input, new AbortController().signal);
     expect(decorated).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(decoratedGateway.calls).toBe(1);
 
     const truncatedDelta = delta();
     truncatedDelta.data.reviewDiff += "\n[review diff truncated]";
-    const truncated = await new ModelReviewer(new ReviewerGateway()).review({
+    const truncatedGateway = new ReviewerGateway();
+    const truncated = await new ModelReviewer(truncatedGateway).review({
       ...input, workspaceDeltas: [truncatedDelta]
     }, new AbortController().signal);
     expect(truncated).toMatchObject({
       status: "failed",
       data: { verdict: "changes_requested", findings: [expect.stringContaining("truncated")] }
     });
+    expect(truncatedGateway.calls).toBe(0);
+
+    const binaryDelta = delta();
+    binaryDelta.data.delta.modified = ["bin/tool"];
+    binaryDelta.data.reviewDiff = [
+      "--- a/bin/tool",
+      "+++ b/bin/tool",
+      "[metadata before=file:33188 after=file:33188]",
+      "[before]",
+      "[binary sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef size=4]",
+      "[after]",
+      "[binary sha256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 size=8]"
+    ].join("\n");
+    const binaryGateway = new ReviewerGateway();
+    const binary = await new ModelReviewer(binaryGateway).review({
+      ...input, workspaceDeltas: [binaryDelta]
+    }, new AbortController().signal);
+    expect(binary).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(binaryGateway.calls).toBe(1);
+
+    const unvalidatedGateway = new ReviewerGateway();
+    const unvalidated = await new ModelReviewer(unvalidatedGateway).review({
+      ...input, workspaceDeltas: [binaryDelta], validations: []
+    }, new AbortController().signal);
+    expect(unvalidated).toMatchObject({
+      status: "failed",
+      data: { verdict: "changes_requested", findings: [expect.stringContaining("passed validation")] }
+    });
+    expect(unvalidatedGateway.calls).toBe(0);
   });
 });

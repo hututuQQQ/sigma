@@ -27,6 +27,14 @@ import {
   v3PortablePackages,
   workspaceRuntimePackages
 } from "./package-agent-cli.mjs";
+import { compareGlibcVersions, inspectLinuxElf } from "./linux-elf.mjs";
+import {
+  assertLinuxRuntimeLibraryInventory,
+  linuxCompatibilityImage,
+  linuxMinimumGlibc,
+  linuxNodeRpath,
+  linuxRuntimeLibraryNames
+} from "./linux-portable-runtime-config.mjs";
 
 const portableLanguageAssets = Object.freeze({
   typescriptServer: "node_modules/agent-code-intel/dist/typescript-server.mjs",
@@ -382,6 +390,85 @@ function runWslTargetWrapperVersion(bundleDir, targetArch, options) {
   };
 }
 
+function dockerMount(source, target, readonly = false) {
+  return `type=bind,source=${path.resolve(source)},target=${target}${readonly ? ",readonly" : ""}`;
+}
+
+function runDockerTargetWrapperVersion(bundleDir, targetArch, options) {
+  const spawn = options.spawnSync ?? spawnSync;
+  if (targetArch !== "x64") {
+    return {
+      ok: false,
+      status: "skipped",
+      transport: "docker",
+      reason: `target wrapper Docker smoke supports x64; requested ${targetArch}`
+    };
+  }
+
+  const server = spawn("docker", ["version", "--format", "{{.Server.Version}}"], {
+    encoding: "utf8"
+  });
+  if (server.error || server.status !== 0) {
+    return {
+      ok: false,
+      status: "skipped",
+      transport: "docker",
+      reason: "target wrapper smoke requires an available Docker server on Windows",
+      stdout: server.stdout,
+      stderr: server.stderr ?? server.error?.message ?? ""
+    };
+  }
+
+  const command = "cd /opt/sigma && NO_COLOR=1 SIGMA_NO_COLOR=1 ./bin/agent version --json";
+  const result = spawn("docker", [
+    "run", "--rm", "--platform", "linux/amd64",
+    "--mount", dockerMount(bundleDir, "/opt/sigma", true),
+    linuxCompatibilityImage, "sh", "-lc", command
+  ], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    return {
+      ok: false,
+      status: "failed",
+      transport: "docker",
+      image: linuxCompatibilityImage,
+      exitCode: result.status,
+      reason: result.error?.message,
+      stdout: result.stdout,
+      stderr: result.stderr
+    };
+  }
+
+  const validated = validateTargetWrapperPayload(result.stdout, "Docker target wrapper smoke");
+  if (!validated.ok) {
+    return {
+      ok: false,
+      status: "failed",
+      transport: "docker",
+      image: linuxCompatibilityImage,
+      reason: validated.reason,
+      stdout: result.stdout,
+      stderr: result.stderr
+    };
+  }
+  return {
+    ok: true,
+    status: "passed",
+    transport: "docker",
+    image: linuxCompatibilityImage,
+    dockerVersion: server.stdout.trim(),
+    version: validated.version
+  };
+}
+
+function windowsLinuxTargetTransport(options) {
+  const value = options.linuxTargetTransport ?? options.env?.AGENT_LINUX_TARGET_TRANSPORT ?? "docker";
+  if (value === "docker" || value === "wsl") return value;
+  throw new Error(`AGENT_LINUX_TARGET_TRANSPORT must be docker or wsl; received ${String(value)}`);
+}
+
 export function runTargetWrapperVersion(bundleDir, targetPlatformOrArch, targetArchOrOptions = {}, maybeOptions = {}) {
   let targetPlatform = "linux";
   let targetArch = targetPlatformOrArch;
@@ -395,16 +482,25 @@ export function runTargetWrapperVersion(bundleDir, targetPlatformOrArch, targetA
   if (targetPlatform === "win32") return runWindowsTargetWrapperVersion(bundleDir, targetArch, options);
   const platform = options.platform ?? process.platform;
   if (platform === "linux") return runNativeTargetWrapperVersion(bundleDir, targetArch, options);
-  if (platform === "win32") return runWslTargetWrapperVersion(bundleDir, targetArch, options);
+  if (platform === "win32") {
+    return windowsLinuxTargetTransport(options) === "wsl"
+      ? runWslTargetWrapperVersion(bundleDir, targetArch, options)
+      : runDockerTargetWrapperVersion(bundleDir, targetArch, options);
+  }
   return {
     ok: false,
     status: "skipped",
-    reason: `target wrapper smoke requires Linux or Windows+WSL; current platform is ${platform}`
+    reason: `target wrapper smoke requires Linux or Windows+Docker; current platform is ${platform}`
   };
 }
 
 function requireTargetWrapperSmoke(options, env) {
   const value = options.requireTargetWrapperSmoke ?? env.AGENT_REQUIRE_TARGET_WRAPPER;
+  return value === true || value === "1" || value === "true";
+}
+
+function requireLinuxCompatibility(options, env) {
+  const value = options.requireLinuxCompatibility ?? env.AGENT_REQUIRE_LINUX_COMPATIBILITY;
   return value === true || value === "1" || value === "true";
 }
 
@@ -491,7 +587,96 @@ function safeBundlePath(bundleDir, relativePath) {
   return absolute;
 }
 
-async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targetArch) {
+const glibcSystemLibraries = new Set([
+  "ld-linux-x86-64.so.2", "libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0",
+  "libresolv.so.2", "librt.so.1", "libutil.so.1"
+]);
+
+async function verifyLinuxCompatibility(bundleDir, metadata, manifest, entries, required) {
+  const record = metadata.linuxCompatibility;
+  if (!record) {
+    if (required) throw new Error("Linux compatibility evidence is required but missing from package metadata.");
+    if (manifest.linuxCompatibility !== undefined) {
+      throw new Error("Integrity manifest has Linux compatibility evidence missing from package metadata.");
+    }
+    return false;
+  }
+  assertExactJson(manifest.linuxCompatibility, record, "Integrity Linux compatibility evidence");
+  if (record.minimumGlibc !== linuxMinimumGlibc || record.validated !== true) {
+    throw new Error(`Linux compatibility must be validated for GLIBC_${linuxMinimumGlibc}.`);
+  }
+  if (record.broker?.linkage !== "static-musl" || record.broker?.interpreter !== null
+    || !Array.isArray(record.broker?.needed) || record.broker.needed.length > 0) {
+    throw new Error("Linux compatibility metadata must declare a static-musl broker without dynamic dependencies.");
+  }
+  const broker = await inspectLinuxElf(path.join(bundleDir, "bin", "sigma-exec"));
+  if (broker.interpreters.length > 0 || broker.needed.length > 0) {
+    throw new Error("Bundled Linux sigma-exec has a dynamic interpreter or DT_NEEDED entry.");
+  }
+
+  const libraries = assertLinuxRuntimeLibraryInventory(
+    record.runtimeLibraries,
+    "Linux compatibility"
+  );
+  const bundledSonames = new Set();
+  for (const library of libraries) {
+    const expectedPath = `lib/${library.name}`;
+    if (library.path !== expectedPath || !entries.has(expectedPath)) {
+      throw new Error(`Integrity manifest does not cover Linux runtime library ${expectedPath}.`);
+    }
+    if (entries.get(expectedPath).sha256 !== library.sha256) {
+      throw new Error(`Linux runtime library ${library.name} digest does not match compatibility metadata.`);
+    }
+    const elf = await inspectLinuxElf(path.join(bundleDir, "lib", library.name));
+    if ((elf.soname ?? library.name) !== library.soname) {
+      throw new Error(`Linux runtime library ${library.name} SONAME does not match compatibility metadata.`);
+    }
+    if (elf.maxGlibc && compareGlibcVersions(elf.maxGlibc, linuxMinimumGlibc) > 0) {
+      throw new Error(`${library.name} exceeds the GLIBC_${linuxMinimumGlibc} compatibility ceiling.`);
+    }
+    bundledSonames.add(library.soname);
+  }
+  for (const library of libraries) {
+    const unresolved = (library.needed ?? []).filter(
+      (soname) => !glibcSystemLibraries.has(soname) && !bundledSonames.has(soname)
+    );
+    if (unresolved.length > 0) {
+      throw new Error(`${library.name} has unresolved runtime dependencies: ${unresolved.join(", ")}.`);
+    }
+  }
+
+  const node = await inspectLinuxElf(path.join(bundleDir, "bin", "node"));
+  const effectiveRpath = node.runpath ?? node.rpath;
+  if (effectiveRpath !== linuxNodeRpath || record.node?.rpath !== linuxNodeRpath) {
+    throw new Error(`Bundled Linux Node must use relative RUNPATH ${linuxNodeRpath}.`);
+  }
+  if (node.maxGlibc && compareGlibcVersions(node.maxGlibc, linuxMinimumGlibc) > 0) {
+    throw new Error(`Bundled Node exceeds the GLIBC_${linuxMinimumGlibc} compatibility ceiling.`);
+  }
+  const unresolved = node.needed.filter((soname) => !glibcSystemLibraries.has(soname) && !bundledSonames.has(soname));
+  if (unresolved.length > 0) throw new Error(`Bundled Node has unresolved runtime dependencies: ${unresolved.join(", ")}.`);
+  if (JSON.stringify(node.needed) !== JSON.stringify(record.node?.needed)
+    || record.node?.maxGlibc !== node.maxGlibc || record.node?.dependenciesResolved !== true) {
+    throw new Error("Bundled Node ELF requirements do not match Linux compatibility metadata.");
+  }
+  if (record.sandbox?.path !== "bin/bwrap" || !entries.has("bin/bwrap")
+    || entries.get("bin/bwrap").sha256 !== record.sandbox.sha256) {
+    throw new Error("Bundled bubblewrap is missing or does not match Linux compatibility metadata.");
+  }
+  const sandbox = await inspectLinuxElf(path.join(bundleDir, "bin", "bwrap"));
+  const sandboxRpath = sandbox.runpath ?? sandbox.rpath;
+  const unresolvedSandbox = sandbox.needed.filter(
+    (soname) => !glibcSystemLibraries.has(soname) && !bundledSonames.has(soname)
+  );
+  if (sandboxRpath !== linuxNodeRpath || record.sandbox.rpath !== linuxNodeRpath
+    || unresolvedSandbox.length > 0 || record.sandbox.dependenciesResolved !== true
+    || (sandbox.maxGlibc && compareGlibcVersions(sandbox.maxGlibc, linuxMinimumGlibc) > 0)) {
+    throw new Error("Bundled bubblewrap is not portable across the declared Linux compatibility range.");
+  }
+  return true;
+}
+
+async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targetArch, linuxCompatibilityRequired = false) {
   const descriptor = metadata.integrity;
   if (descriptor?.algorithm !== "sha256" || descriptor?.manifest !== "integrity-manifest.json") {
     throw new Error("V3 package metadata must reference the SHA-256 integrity-manifest.json.");
@@ -537,6 +722,10 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     "assets/tokenizers/sigma-cjk-byte-v1.json",
     "sbom.cdx.json"
   ];
+  if (metadata.linuxCompatibility) {
+    requiredFiles.push(...linuxRuntimeLibraryNames.map((name) => `lib/${name}`));
+    requiredFiles.push("bin/bwrap");
+  }
   for (const required of requiredFiles) {
     if (!entries.has(required)) throw new Error(`Integrity manifest does not cover required portable asset: ${required}`);
   }
@@ -574,6 +763,12 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     targetArch
   );
   if (metadata.sigmaExec?.sha256 !== entries.get(brokerPath).sha256) throw new Error("sigma-exec digest metadata does not match the manifest.");
+  const linuxCompatibilityVerified = targetPlatform === "linux"
+    ? await verifyLinuxCompatibility(bundleDir, metadata, manifest, entries, linuxCompatibilityRequired)
+    : false;
+  if (targetPlatform !== "linux" && (metadata.linuxCompatibility !== undefined || manifest.linuxCompatibility !== undefined)) {
+    throw new Error("Linux compatibility evidence must not appear on another target.");
+  }
   const metadataAssets = [
     [metadata.assets?.languageServers, "typescript", portableLanguageAssets.typescriptServer],
     [metadata.assets?.languageServiceEngines, "typescript", portableLanguageAssets.typescriptEngine],
@@ -593,8 +788,13 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     brokerPath,
     node: entries.get(nodePath),
     sigmaExec: entries.get(brokerPath),
+    sandbox: metadata.linuxCompatibility ? entries.get("bin/bwrap") : undefined,
+    runtimeLibraries: Object.fromEntries(
+      (metadata.linuxCompatibility?.runtimeLibraries ?? []).map((entry) => [entry.soname, entries.get(entry.path)])
+    ),
     languageServerAssetsVerified: true,
     nodeCompatibilityVerified,
+    linuxCompatibilityVerified,
     languageServerAssetPaths: portableLanguageAssets
   };
 }
@@ -648,6 +848,11 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
   const requiredAssets = [
     { path: nodePath, kind: "node-runtime", metadataSha256: metadata.node?.sha256 },
     { path: brokerPath, kind: "native-broker", metadataSha256: metadata.sigmaExec?.sha256 },
+    ...(metadata.linuxCompatibility?.sandbox ? [{
+      path: metadata.linuxCompatibility.sandbox.path,
+      kind: "sandbox-runtime",
+      metadataSha256: metadata.linuxCompatibility.sandbox.sha256
+    }] : []),
     {
       path: portableLanguageAssets.typescriptServer,
       kind: "language-server",
@@ -663,7 +868,10 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
       kind: "language-server",
       metadataSha256: metadata.assets?.languageServers?.find((item) => item?.id === "python")?.sha256
     },
-    ...tokenizerEntries.map((entry) => ({ path: entry.path, kind: "tokenizer", metadataSha256: entry.sha256 }))
+    ...tokenizerEntries.map((entry) => ({ path: entry.path, kind: "tokenizer", metadataSha256: entry.sha256 })),
+    ...(metadata.linuxCompatibility?.runtimeLibraries ?? []).map((entry) => ({
+      path: entry.path, kind: "runtime-library", metadataSha256: entry.sha256
+    }))
   ];
   for (const asset of requiredAssets) {
     const integrityEntry = integrityEntries.get(asset.path);
@@ -719,6 +927,19 @@ export function verifyPortableSbomComponents(sbom, integrityManifest, metadata, 
     || broker.properties.get("sigma:machine") !== metadata.sigmaExec?.machine) {
     throw new Error("CycloneDX sigma-exec component does not match binary target metadata.");
   }
+  if (targetPlatform === "linux" && metadata.linuxCompatibility) {
+    if (node.properties.get("sigma:minimum-glibc") !== metadata.linuxCompatibility.minimumGlibc
+      || node.properties.get("sigma:rpath") !== metadata.linuxCompatibility.node.rpath
+      || broker.properties.get("sigma:linkage") !== metadata.linuxCompatibility.broker.linkage) {
+      throw new Error("CycloneDX Linux compatibility properties do not match package metadata.");
+    }
+    for (const library of metadata.linuxCompatibility.runtimeLibraries) {
+      const component = componentsByPath.get(library.path);
+      if (component?.properties.get("sigma:soname") !== library.soname) {
+        throw new Error(`CycloneDX runtime library ${library.path} has an invalid SONAME.`);
+      }
+    }
+  }
   return { portableAssets: requiredAssets.length, tokenizerAssets: tokenizerEntries.length };
 }
 
@@ -769,6 +990,15 @@ function verifyPortableProvenance(
       buildDefinition.internalParameters?.nodeCompatibility,
       "Portable provenance"
     );
+  } else if (targetPlatform === "linux" && metadata.linuxCompatibility) {
+    assertExactJson(
+      buildDefinition.internalParameters?.linuxCompatibility,
+      metadata.linuxCompatibility,
+      "Portable provenance Linux compatibility evidence"
+    );
+    if (Object.keys(buildDefinition.internalParameters ?? {}).length !== 1) {
+      throw new Error("Portable provenance has unexpected Linux internal parameters.");
+    }
   } else if (buildDefinition.internalParameters !== undefined) {
     throw new Error("Portable provenance has unexpected internal parameters for a non-Windows target.");
   }
@@ -789,7 +1019,14 @@ function verifyPortableProvenance(
     ["pkg:generic/node-runtime-archive", metadata.node.archiveSha256],
     [`file:${nodePath}`, integrity.node.sha256],
     ["pkg:generic/sigma-exec", integrity.sigmaExec.sha256],
+    ...(targetPlatform === "linux" && metadata.linuxCompatibility?.sandbox ? [[
+      `pkg:generic/bubblewrap@${metadata.linuxCompatibility.sandbox.version}`,
+      integrity.sandbox.sha256
+    ]] : []),
     ["file:integrity-manifest.json", integrity.manifestDigest],
+    ...(targetPlatform === "linux" ? Object.entries(integrity.runtimeLibraries ?? {}).map(([soname, entry]) => [
+      `pkg:generic/${soname}`, entry.sha256
+    ]) : []),
     ...(windowsTarget ? [[
       `pkg:generic/node-runtime-source@${pinnedNodeVersion}`,
       windowsAppContainerNodeCompatibility.sourceSha256
@@ -916,6 +1153,8 @@ function parseVerifyArgs(argv) {
       index += 1;
     } else if (arg === "--require-target-wrapper") {
       options.requireTargetWrapperSmoke = true;
+    } else if (arg === "--require-linux-compatibility") {
+      options.requireLinuxCompatibility = true;
     }
   }
   return options;
@@ -1039,7 +1278,10 @@ export async function verifyAgentCliPackage(options = {}) {
       throw new Error("V3 package metadata is missing the verified Node runtime archive SHA-256.");
     }
     const verifiedIntegrity = isV3
-      ? await verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targetArch)
+      ? await verifyIntegrityManifest(
+          bundleDir, metadata, targetPlatform, targetArch,
+          requireLinuxCompatibility(options, env)
+        )
       : null;
     const binaryTarget = isV3
       ? await inspectSigmaExecBinary(path.join(bundleDir, verifiedIntegrity.brokerPath))
@@ -1133,6 +1375,9 @@ export async function verifyAgentCliPackage(options = {}) {
         provenance: isV3 ? sidecars !== null : null,
         provenanceSignature: isV3 ? sidecars?.provenanceSignature.verified === true : null,
         archiveChecksum: isV3 ? sidecars !== null : null,
+        linuxCompatibility: isV3 && targetPlatform === "linux"
+          ? integrity?.linuxCompatibilityVerified === true
+          : null,
         windowsSignerPolicy: isV3
           ? targetPlatform !== "win32" || observedSigning?.policyVerified === true
           : null,

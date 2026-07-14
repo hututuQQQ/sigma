@@ -1,0 +1,13 @@
+services:
+  main:
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+
+networks:
+  default:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"

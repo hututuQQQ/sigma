@@ -32,7 +32,7 @@ async function sandboxCheck(broker: ExecutionBroker): Promise<DoctorCheck> {
 function languageServerChecks(presets: LanguageServerPreset[]): DoctorCheck[] {
   return presets.map((preset) => ({
     name: `lsp_${preset.id}`,
-    status: preset.available ? "ok" : preset.id === "typescript" || preset.id === "python" ? "error" : "warning",
+    status: preset.available ? "ok" : preset.id === "typescript" || preset.id === "python" ? "error" : "skipped",
     message: preset.available
       ? `${preset.source}: ${preset.executable}`
       : preset.unavailableReason ?? "language server unavailable"

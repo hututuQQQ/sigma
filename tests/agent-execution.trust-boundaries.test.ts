@@ -85,6 +85,39 @@ describe("trusted toolchain boundaries", () => {
     expect(applyTrustedToolchains({ PATH: "inherited-path" }, toolchains).PATH).toBe("inherited-path");
   });
 
+  it("mounts exact-entry runtime dependencies read-only without authorizing sibling executables", async () => {
+    const root = await temporaryRoot("sigma-toolchain-runtime-roots-");
+    const workspace = path.join(root, "workspace");
+    const runtimeRoot = path.join(root, "lib");
+    const executable = path.join(root, "bin", portableExecutableName());
+    const sibling = path.join(runtimeRoot, process.platform === "win32" ? "helper.exe" : "helper");
+    await mkdir(workspace);
+    await mkdir(runtimeRoot);
+    await mkdir(path.dirname(executable));
+    await writeFile(executable, "runtime\n");
+    await writeFile(sibling, "helper\n");
+    const toolchains = normalizeTrustedToolchains([{
+      id: "runtime-node",
+      runtime: "node",
+      executable,
+      aliases: ["node"],
+      executionRoots: [executable],
+      runtimeRoots: [runtimeRoot]
+    }]);
+
+    const wired = requestParams(request("node", workspace), clientOptions("unsafe"), toolchains, []);
+    expect(wired).toMatchObject({
+      policy: {
+        readRoots: [workspace, runtimeRoot],
+        writeRoots: [],
+        executionRoots: [executable]
+      }
+    });
+    expect(() => requestParams(
+      request(sibling, workspace), clientOptions("unsafe"), toolchains, []
+    )).toThrow(BrokerExecutableUnavailableError);
+  });
+
   it("does not let a broad descendant root establish a sibling as the primary executable", async () => {
     const root = await temporaryRoot("sigma-toolchain-primary-");
     const entryPoint = path.join(root, process.platform === "win32" ? "compiler.exe" : "compiler");

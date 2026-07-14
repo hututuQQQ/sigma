@@ -170,6 +170,9 @@ export interface TrustedToolchainManifestEntry {
   aliases?: string[];
   /** Read/execute roots; defaults to the exact executable. */
   executionRoots?: string[];
+  /** Read-only runtime dependency roots mounted only when this exact entry
+   * point is invoked. These roots never authorize another executable. */
+  runtimeRoots?: string[];
   /** Directories prepended to PATH; defaults to none. */
   pathEntries?: string[];
   /** Immutable environment required by this runtime and inherited by descendants. */

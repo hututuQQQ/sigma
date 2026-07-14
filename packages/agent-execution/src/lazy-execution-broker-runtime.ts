@@ -131,6 +131,13 @@ export function runtimeTrustedToolchainsForBinding(
   platform: NodeJS.Platform,
   sandboxMode: "required" | "unsafe"
 ): TrustedToolchainManifestEntry[] {
+  if (binding.source === "portable" && platform === "linux") {
+    const toolchains = runtimeTrustedToolchains(binding.executable, platform, sandboxMode);
+    const runtimeRoot = path.resolve(path.dirname(binding.executable), "..", "lib");
+    return existsSync(runtimeRoot)
+      ? toolchains.map((toolchain) => ({ ...toolchain, runtimeRoots: [runtimeRoot] }))
+      : toolchains;
+  }
   if (binding.source === "current-runtime" || platform !== "win32" || sandboxMode !== "required") {
     return runtimeTrustedToolchains(binding.executable, platform, sandboxMode);
   }

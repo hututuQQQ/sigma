@@ -19,6 +19,14 @@ import {
   runWindowsSigningStage
 } from "./windows-release-signing.mjs";
 import { sigmaManifest } from "./lib/sigma-manifest.mjs";
+import { compareGlibcVersions, inspectLinuxElf } from "./linux-elf.mjs";
+import {
+  assertLinuxRuntimeLibraryInventory,
+  linuxMinimumGlibc,
+  linuxNodeRpath,
+  linuxRuntimeLibraryNames,
+  linuxSysrootImage
+} from "./linux-portable-runtime-config.mjs";
 
 export const defaultRootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const pinnedNodeVersion = `v${sigmaManifest.toolchains.node}`;
@@ -384,17 +392,6 @@ async function deployRuntimeDependencies(rootDir, packageNames, targetNodeModule
   }
 }
 
-function runTar(args, errorMessage, cwd) {
-  const result = spawnSync("tar", args, {
-    cwd,
-    stdio: "inherit"
-  });
-
-  if (result.status !== 0) {
-    throw new Error(errorMessage);
-  }
-}
-
 function psQuote(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
@@ -666,6 +663,9 @@ function sigmaExecFileName(targetPlatform) {
 }
 
 function defaultSigmaExecPath(rootDir, targetPlatform) {
+  if (targetPlatform === "linux") {
+    return path.join(rootDir, ".artifacts", "linux-portable-runtime", "bin", "sigma-exec");
+  }
   return path.join(rootDir, "native", "sigma-exec", "target", "release", sigmaExecFileName(targetPlatform));
 }
 
@@ -770,7 +770,204 @@ async function copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env
     ].join(" "));
   }
   if (targetPlatform !== "win32") await chmod(destination, 0o755).catch(() => undefined);
-  return { source, sourceKind: configured ? "env" : "workspace-build", destination, binaryTarget };
+  let elfCompatibility = null;
+  if (targetPlatform === "linux") {
+    elfCompatibility = await inspectLinuxElf(destination);
+    if (elfCompatibility.interpreters.length > 0 || elfCompatibility.needed.length > 0) {
+      await rm(destination, { force: true });
+      throw new Error([
+        "Linux sigma-exec must be a static ELF without a dynamic interpreter or DT_NEEDED entries.",
+        `interpreters=${elfCompatibility.interpreters.join(",") || "none"}`,
+        `needed=${elfCompatibility.needed.join(",") || "none"}`
+      ].join(" "));
+    }
+  }
+  return { source, sourceKind: configured ? "env" : "workspace-build", destination, binaryTarget, elfCompatibility };
+}
+
+function linuxRuntimeRoot(rootDir, env) {
+  return env.SIGMA_LINUX_RUNTIME_DIR
+    ? path.resolve(rootDir, env.SIGMA_LINUX_RUNTIME_DIR)
+    : path.join(rootDir, ".artifacts", "linux-portable-runtime");
+}
+
+function dockerMount(source, target, readOnly = false) {
+  return `type=bind,source=${path.resolve(source)},target=${target}${readOnly ? ",readonly" : ""}`;
+}
+
+async function patchLinuxNodeRpath(bundleDir, runtimeRoot, options) {
+  if (options.linuxNodeRpathPatcher) {
+    await options.linuxNodeRpathPatcher(path.join(bundleDir, "bin", "node"), linuxNodeRpath);
+    return;
+  }
+  const toolPath = path.join(runtimeRoot, "tools", "patchelf");
+  if (!existsSync(toolPath)) throw new Error(`Pinned patchelf tool is missing: ${toolPath}`);
+  const result = spawnSync("docker", [
+    "run", "--rm", "--platform", "linux/amd64",
+    "--mount", dockerMount(bundleDir, "/bundle"),
+    "--mount", dockerMount(runtimeRoot, "/runtime", true),
+    linuxSysrootImage,
+    "/runtime/tools/patchelf", "--set-rpath", linuxNodeRpath, "/bundle/bin/node"
+  ], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new Error([
+      `Failed to set the bundled Linux Node RUNPATH (exit=${String(result.status)}).`,
+      result.stdout || "",
+      result.stderr || result.error?.message || ""
+    ].filter(Boolean).join("\n"));
+  }
+}
+
+const glibcSystemLibraries = new Set([
+  "ld-linux-x86-64.so.2", "libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0",
+  "libresolv.so.2", "librt.so.1", "libutil.so.1"
+]);
+
+function assertLinuxGlibcCeiling(label, elf) {
+  if (elf.maxGlibc && compareGlibcVersions(elf.maxGlibc, linuxMinimumGlibc) > 0) {
+    throw new Error(`${label} requires GLIBC_${elf.maxGlibc}, above the supported GLIBC_${linuxMinimumGlibc} ceiling.`);
+  }
+}
+
+function assertLinuxDependenciesResolved(label, needed, bundledSonames) {
+  const unresolved = needed.filter(
+    (soname) => !glibcSystemLibraries.has(soname) && !bundledSonames.has(soname)
+  );
+  if (unresolved.length > 0) {
+    throw new Error(`${label} has unresolved runtime dependencies: ${unresolved.join(", ")}.`);
+  }
+}
+
+async function inspectPackagedLinuxNode(context, nodeRuntime) {
+  try {
+    return await inspectLinuxElf(nodeRuntime.bundledNodePath);
+  } catch (error) {
+    if (context.options.allowNonElfLinuxNodeFixture === true
+      && String(error?.message ?? error).includes("is not an ELF binary")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function loadLinuxRuntimeMetadata(context) {
+  const runtimeRoot = linuxRuntimeRoot(context.rootDir, context.env);
+  const buildMetadataPath = path.join(runtimeRoot, "build-metadata.json");
+  if (!existsSync(buildMetadataPath)) {
+    throw new Error(`Linux portable runtime metadata is missing: ${buildMetadataPath}. Run pnpm build:native:sigma-exec:linux first.`);
+  }
+  const buildMetadata = JSON.parse(await readFile(buildMetadataPath, "utf8"));
+  if (buildMetadata.targetPlatform !== "linux" || buildMetadata.targetArch !== "x64"
+    || buildMetadata.minimumGlibc !== linuxMinimumGlibc) {
+    throw new Error("Linux portable runtime metadata does not describe the pinned linux-x64 glibc 2.28 runtime.");
+  }
+  const declaredLibraries = new Map(
+    assertLinuxRuntimeLibraryInventory(
+      buildMetadata.runtimeLibraries,
+      "Linux portable runtime metadata"
+    ).map((entry) => [entry.name, entry])
+  );
+  return { runtimeRoot, buildMetadata, declaredLibraries };
+}
+
+async function stageLinuxRuntimeLibraries(context, runtimeRoot, declaredLibraries) {
+  await mkdir(path.join(context.bundleDir, "lib"), { recursive: true });
+  const runtimeLibraries = [];
+  for (const name of linuxRuntimeLibraryNames) {
+    const declared = declaredLibraries.get(name);
+    const source = path.join(runtimeRoot, "lib", name);
+    const destination = path.join(context.bundleDir, "lib", name);
+    if (!existsSync(source)) throw new Error(`Required Linux runtime library is missing: ${source}`);
+    const sourceSha256 = await sha256File(source);
+    if (sourceSha256 !== declared.sha256) {
+      throw new Error(`Linux runtime library digest mismatch for ${name}: expected ${declared.sha256}, received ${sourceSha256}.`);
+    }
+    await cp(source, destination);
+    const elf = await inspectLinuxElf(destination);
+    assertLinuxGlibcCeiling(name, elf);
+    const soname = elf.soname ?? name;
+    if (declared.soname !== soname) throw new Error(`Linux runtime library SONAME mismatch for ${name}: ${soname}.`);
+    runtimeLibraries.push({
+      name, soname, path: `lib/${name}`, sha256: sourceSha256,
+      needed: elf.needed, maxGlibc: elf.maxGlibc
+    });
+  }
+  const runtimeSonames = new Set(runtimeLibraries.map((entry) => entry.soname));
+  for (const library of runtimeLibraries) {
+    assertLinuxDependenciesResolved(library.name, library.needed, runtimeSonames);
+  }
+  return { runtimeLibraries, runtimeSonames };
+}
+
+async function stageLinuxSandbox(context, runtimeRoot, buildMetadata, runtimeSonames) {
+  const declaredSandbox = buildMetadata.sandbox;
+  const sandboxSource = path.join(runtimeRoot, "bin", "bwrap");
+  const sandboxDestination = path.join(context.bundleDir, "bin", "bwrap");
+  if (declaredSandbox?.path !== "bin/bwrap" || !existsSync(sandboxSource)) {
+    throw new Error("Pinned Linux bubblewrap runtime is missing from the portable runtime artifact.");
+  }
+  const sandboxSha256 = await sha256File(sandboxSource);
+  if (sandboxSha256 !== declaredSandbox.sha256) {
+    throw new Error(`Linux bubblewrap digest mismatch: expected ${declaredSandbox.sha256}, received ${sandboxSha256}.`);
+  }
+  await cp(sandboxSource, sandboxDestination);
+  await chmod(sandboxDestination, 0o755).catch(() => undefined);
+  const sandboxElf = await inspectLinuxElf(sandboxDestination);
+  const sandboxRpath = sandboxElf.runpath ?? sandboxElf.rpath;
+  if (sandboxRpath !== linuxNodeRpath) {
+    throw new Error(`Bundled bubblewrap RUNPATH must be ${linuxNodeRpath}; received ${String(sandboxRpath)}.`);
+  }
+  assertLinuxGlibcCeiling("Bundled bubblewrap", sandboxElf);
+  assertLinuxDependenciesResolved("Bundled bubblewrap", sandboxElf.needed, runtimeSonames);
+  return {
+    name: "bubblewrap",
+    version: declaredSandbox.version,
+    path: "bin/bwrap",
+    sha256: sandboxSha256,
+    rpath: sandboxRpath,
+    needed: sandboxElf.needed,
+    maxGlibc: sandboxElf.maxGlibc,
+    dependenciesResolved: true
+  };
+}
+
+async function stageLinuxNode(context, nodeRuntime, runtimeRoot, runtimeSonames) {
+  await patchLinuxNodeRpath(context.bundleDir, runtimeRoot, context.options);
+  const elf = await inspectLinuxElf(nodeRuntime.bundledNodePath);
+  const effectiveRpath = elf.runpath ?? elf.rpath;
+  if (effectiveRpath !== linuxNodeRpath) {
+    throw new Error(`Bundled Linux Node RUNPATH must be ${linuxNodeRpath}; received ${String(effectiveRpath)}.`);
+  }
+  assertLinuxGlibcCeiling("Bundled Node", elf);
+  assertLinuxDependenciesResolved("Bundled Node", elf.needed, runtimeSonames);
+  return {
+    path: "bin/node", rpath: effectiveRpath, needed: elf.needed,
+    maxGlibc: elf.maxGlibc, dependenciesResolved: true
+  };
+}
+
+async function stageLinuxCompatibility(context, nodeRuntime, sigmaExec) {
+  if (context.targetPlatform !== "linux" || !context.release.isV3) return null;
+  if (await inspectPackagedLinuxNode(context, nodeRuntime) === null) return null;
+  const { runtimeRoot, buildMetadata, declaredLibraries } = await loadLinuxRuntimeMetadata(context);
+  const { runtimeLibraries, runtimeSonames } = await stageLinuxRuntimeLibraries(
+    context, runtimeRoot, declaredLibraries
+  );
+  const sandbox = await stageLinuxSandbox(context, runtimeRoot, buildMetadata, runtimeSonames);
+  const node = await stageLinuxNode(context, nodeRuntime, runtimeRoot, runtimeSonames);
+
+  return {
+    minimumGlibc: linuxMinimumGlibc,
+    broker: {
+      linkage: "static-musl", interpreter: null,
+      needed: sigmaExec.elfCompatibility?.needed ?? []
+    },
+    sandbox,
+    node,
+    runtimeLibraries,
+    builders: buildMetadata.builders ?? null,
+    validated: true
+  };
 }
 
 async function copyTokenizerAssets(rootDir, bundleDir) {
@@ -858,7 +1055,7 @@ async function addPackageComponents(rootDir, packageNames, targetPlatform, targe
 }
 
 function addRuntimeComponents(components, context) {
-  const { assetsByPath, targetPlatform, targetArch, nodeArchiveIntegrity, nodeRuntime } = context;
+  const { assetsByPath, targetPlatform, targetArch, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = context;
   const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
   components.set("sigma:bundled-node", portableAssetComponent(assetsByPath.get(nodePath), targetPlatform, targetArch, {
@@ -867,6 +1064,11 @@ function addRuntimeComponents(components, context) {
     version: pinnedNodeVersion,
     properties: [
       { name: "sigma:archive-sha256", value: nodeArchiveIntegrity.sha256 },
+      ...(linuxCompatibility ? [
+        { name: "sigma:minimum-glibc", value: linuxCompatibility.minimumGlibc },
+        { name: "sigma:rpath", value: String(linuxCompatibility.node.rpath ?? "") },
+        { name: "sigma:max-glibc", value: String(linuxCompatibility.node.maxGlibc ?? "") }
+      ] : []),
       ...nodeCompatibilityProperties(nodeRuntime.compatibility)
     ]
   }));
@@ -876,9 +1078,34 @@ function addRuntimeComponents(components, context) {
     version: context.releaseVersion,
     properties: [
       { name: "sigma:binary-format", value: context.sigmaExec.binaryTarget.format },
-      { name: "sigma:machine", value: context.sigmaExec.binaryTarget.machine }
+      { name: "sigma:machine", value: context.sigmaExec.binaryTarget.machine },
+      ...(linuxCompatibility ? [{ name: "sigma:linkage", value: linuxCompatibility.broker.linkage }] : [])
     ]
   }));
+  if (linuxCompatibility?.sandbox) {
+    components.set("sigma:bubblewrap", portableAssetComponent(
+      assetsByPath.get(linuxCompatibility.sandbox.path), targetPlatform, targetArch,
+      {
+        kind: "sandbox-runtime", name: "bubblewrap", version: linuxCompatibility.sandbox.version,
+        properties: [
+          { name: "sigma:rpath", value: linuxCompatibility.sandbox.rpath },
+          { name: "sigma:max-glibc", value: String(linuxCompatibility.sandbox.maxGlibc ?? "") }
+        ]
+      }
+    ));
+  }
+  for (const library of linuxCompatibility?.runtimeLibraries ?? []) {
+    components.set(`sigma:runtime-library:${library.soname}`, portableAssetComponent(
+      assetsByPath.get(library.path), targetPlatform, targetArch,
+      {
+        kind: "runtime-library", name: library.name,
+        properties: [
+          { name: "sigma:soname", value: library.soname },
+          { name: "sigma:max-glibc", value: String(library.maxGlibc ?? "") }
+        ]
+      }
+    ));
+  }
 }
 
 function nodeCompatibilityProperties(compatibility) {
@@ -951,7 +1178,7 @@ function portableSbomDocument(components, releaseVersion, targetPlatform, target
 
 async function writePortableSbom(
   rootDir, bundleDir, packageNames, targetPlatform, targetArch,
-  sigmaExec, nodeArchiveIntegrity, nodeRuntime
+  sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
 ) {
   const components = await addPackageComponents(
     rootDir, packageNames, targetPlatform, targetArch
@@ -962,13 +1189,15 @@ async function writePortableSbom(
   const assetEntries = await integrityEntries(bundleDir, [
     nodePath,
     brokerPath,
+    ...(linuxCompatibility?.sandbox ? [linuxCompatibility.sandbox.path] : []),
+    ...(linuxCompatibility?.runtimeLibraries ?? []).map((entry) => entry.path),
     ...Object.values(portableLanguageAssets),
     "assets/tokenizers"
   ]);
   const assetsByPath = new Map(assetEntries.map((entry) => [entry.path, entry]));
   const context = {
     rootDir, assetsByPath, assetEntries, targetPlatform, targetArch,
-    releaseVersion, sigmaExec, nodeArchiveIntegrity, nodeRuntime
+    releaseVersion, sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
   };
   addRuntimeComponents(components, context);
   await addLanguageComponents(components, context);
@@ -979,7 +1208,7 @@ async function writePortableSbom(
   return sbomPath;
 }
 
-async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime) {
+async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility) {
   const nodePath = `bin/${targetPlatform === "win32" ? "node.exe" : "node"}`;
   const brokerPath = `bin/${sigmaExecFileName(targetPlatform)}`;
   const manifest = {
@@ -988,6 +1217,7 @@ async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nod
     targetPlatform,
     targetArch,
     ...(nodeRuntime.compatibility ? { nodeCompatibility: nodeRuntime.compatibility } : {}),
+    ...(linuxCompatibility ? { linuxCompatibility } : {}),
     // At this point the only files not yet present are this self-referential
     // manifest and package-metadata.json, which references its digest. Cover
     // every other file in the portable bundle rather than a list of roots.
@@ -1002,6 +1232,10 @@ async function writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nod
     manifestSha256: await sha256File(manifestPath),
     node: byPath.get(nodePath),
     sigmaExec: byPath.get(brokerPath),
+    sandbox: linuxCompatibility?.sandbox ? byPath.get(linuxCompatibility.sandbox.path) : undefined,
+    runtimeLibraries: Object.fromEntries(
+      (linuxCompatibility?.runtimeLibraries ?? []).map((entry) => [entry.soname, byPath.get(entry.path)])
+    ),
     languageServerAssets: Object.fromEntries(
       Object.entries(portableLanguageAssets).map(([name, assetPath]) => [name, byPath.get(assetPath)])
     )
@@ -1113,6 +1347,7 @@ async function writeReleaseSidecars(
   signing,
   nodeArchiveIntegrity,
   nodeRuntime,
+  linuxCompatibility,
   releaseSigningPrivateKey
 ) {
   const archiveSha256 = await sha256File(outputPath);
@@ -1129,8 +1364,11 @@ async function writeReleaseSidecars(
       buildDefinition: {
         buildType: "https://sigma-code.dev/build-types/portable-cli/v3",
         externalParameters: { version: release.version, targetPlatform, targetArch },
-        ...(nodeRuntime.compatibility ? {
-          internalParameters: { nodeCompatibility: nodeRuntime.compatibility }
+        ...((nodeRuntime.compatibility || linuxCompatibility) ? {
+          internalParameters: {
+            ...(nodeRuntime.compatibility ? { nodeCompatibility: nodeRuntime.compatibility } : {}),
+            ...(linuxCompatibility ? { linuxCompatibility } : {})
+          }
         } : {}),
         resolvedDependencies: [
           { uri: "pkg:generic/node-runtime-archive", digest: { sha256: nodeArchiveIntegrity.sha256 } },
@@ -1140,6 +1378,14 @@ async function writeReleaseSidecars(
           }] : []),
           { uri: `file:bin/${targetPlatform === "win32" ? "node.exe" : "node"}`, digest: { sha256: integrity.node.sha256 } },
           { uri: "pkg:generic/sigma-exec", digest: { sha256: integrity.sigmaExec.sha256 } },
+          ...(linuxCompatibility?.sandbox ? [{
+            uri: `pkg:generic/bubblewrap@${linuxCompatibility.sandbox.version}`,
+            digest: { sha256: integrity.sandbox.sha256 }
+          }] : []),
+          ...Object.entries(integrity.runtimeLibraries ?? {}).map(([soname, entry]) => ({
+            uri: `pkg:generic/${soname}`,
+            digest: { sha256: entry.sha256 }
+          })),
           { uri: "file:integrity-manifest.json", digest: { sha256: integrity.manifestSha256 } }
         ]
       },
@@ -1265,9 +1511,53 @@ function archivePathForTarget(artifactsDir, bundleName, targetPlatform) {
   return path.join(artifactsDir, targetPlatform === "win32" ? `${bundleName}.zip` : `${bundleName}.tgz`);
 }
 
+function assertDockerCommand(result, label) {
+  if (!result.error && result.status === 0) return;
+  throw new Error([
+    `${label} (exit=${String(result.status)})`,
+    result.stdout || "",
+    result.stderr || result.error?.message || ""
+  ].filter(Boolean).join("\n"));
+}
+
+function normalizedLinuxArchiveCommand(bundleName) {
+  return [
+    "set -eu",
+    "rm -rf /tmp/sigma-bundle",
+    "mkdir -p /tmp/sigma-bundle",
+    `cp -a /artifacts/${bundleName} /tmp/sigma-bundle/${bundleName}`,
+    `find /tmp/sigma-bundle/${bundleName} -type d -exec chmod 0755 {} +`,
+    `find /tmp/sigma-bundle/${bundleName} -type f -exec chmod 0644 {} +`,
+    `for file in agent node sigma-exec bwrap; do test ! -e /tmp/sigma-bundle/${bundleName}/bin/$file || chmod 0755 /tmp/sigma-bundle/${bundleName}/bin/$file; done`,
+    `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -czf /tmp/agent-cli.tgz -C /tmp/sigma-bundle ${bundleName}`
+  ].join(" && ");
+}
+
+function createNormalizedLinuxArchive(outputPath, artifactsDir, bundleName, rootDir) {
+  const create = spawnSync("docker", [
+    "create", "--platform", "linux/amd64",
+    "--mount", dockerMount(artifactsDir, "/artifacts", true),
+    linuxSysrootImage, "sh", "-c", normalizedLinuxArchiveCommand(bundleName)
+  ], { cwd: rootDir, encoding: "utf8" });
+  assertDockerCommand(create, "failed to create Linux archive container");
+  const containerId = create.stdout.trim();
+  try {
+    const start = spawnSync("docker", ["start", "--attach", containerId], {
+      cwd: rootDir, encoding: "utf8"
+    });
+    assertDockerCommand(start, "failed to create normalized agent-cli Linux tarball");
+    const copy = spawnSync("docker", ["cp", `${containerId}:/tmp/agent-cli.tgz`, outputPath], {
+      cwd: rootDir, encoding: "utf8"
+    });
+    assertDockerCommand(copy, "failed to copy normalized agent-cli Linux tarball");
+  } finally {
+    spawnSync("docker", ["rm", "--force", containerId], { cwd: rootDir, encoding: "utf8" });
+  }
+}
+
 function createBundleArchive(outputPath, artifactsDir, bundleName, targetPlatform, rootDir) {
   if (targetPlatform === "linux") {
-    runTar(["-czf", outputPath, "-C", artifactsDir, bundleName], "failed to create agent-cli Linux tarball with tar", rootDir);
+    createNormalizedLinuxArchive(outputPath, artifactsDir, bundleName, rootDir);
     return;
   }
 
@@ -1409,6 +1699,9 @@ async function stagePortableRuntime(context) {
   const sigmaExec = release.isV3
     ? await copySigmaExec(rootDir, bundleDir, targetPlatform, targetArch, env)
     : null;
+  const linuxCompatibility = release.isV3
+    ? await stageLinuxCompatibility(context, nodeRuntime, sigmaExec)
+    : null;
   const brokerContentIdentity = await preSigningBrokerIdentity(targetPlatform, sigmaExec);
   const windowsSigningStage = release.isV3
     ? await runWindowsSigningStage({
@@ -1422,7 +1715,7 @@ async function stagePortableRuntime(context) {
       })
     : null;
   await verifyWindowsSignedContent(nodeRuntime, sigmaExec, brokerContentIdentity, targetPlatform);
-  return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, windowsSigningStage };
+  return { nodeArchiveIntegrity, nodeRuntime, sigmaExec, linuxCompatibility, windowsSigningStage };
 }
 
 async function writeBundleEntrypoints(context, nodeRuntime) {
@@ -1463,13 +1756,15 @@ async function writeV3BundleEvidence(context, runtime) {
     return { tokenizerAssets: null, sbomPath: null, integrity: null, signing: null };
   }
   const { rootDir, bundleDir, packages, targetPlatform, targetArch, options, env } = context;
-  const { sigmaExec, nodeArchiveIntegrity, nodeRuntime } = runtime;
+  const { sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility } = runtime;
   const tokenizerAssets = await copyTokenizerAssets(rootDir, bundleDir);
   const sbomPath = await writePortableSbom(
     rootDir, bundleDir, packages, targetPlatform, targetArch,
-    sigmaExec, nodeArchiveIntegrity, nodeRuntime
+    sigmaExec, nodeArchiveIntegrity, nodeRuntime, linuxCompatibility
   );
-  const integrity = await writeIntegrityManifest(bundleDir, targetPlatform, targetArch, nodeRuntime);
+  const integrity = await writeIntegrityManifest(
+    bundleDir, targetPlatform, targetArch, nodeRuntime, linuxCompatibility
+  );
   const allowedSigners = options.allowedWindowsSignerCertificateSha256
     ?? loadAllowedWindowsSignerCertificateSha256(env);
   const signing = inspectWindowsAuthenticode(
@@ -1528,6 +1823,7 @@ function v3PackageMetadata(context, runtime, evidence) {
   const { integrity, signing, tokenizerAssets } = evidence;
   return {
     sigmaExec: sigmaExecPackageMetadata(context, runtime, integrity),
+    ...(runtime.linuxCompatibility ? { linuxCompatibility: runtime.linuxCompatibility } : {}),
     assets: bundleAssetMetadata(integrity, tokenizerAssets),
     integrity: {
       algorithm: "sha256", manifest: "integrity-manifest.json",
@@ -1569,6 +1865,7 @@ async function finalizePackage(context, runtime, evidence) {
   return writeReleaseSidecars(
     outputPath, evidence.sbomPath, release, targetPlatform, context.targetArch,
     evidence.integrity, evidence.signing, runtime.nodeArchiveIntegrity, runtime.nodeRuntime,
+    runtime.linuxCompatibility,
     options.releaseSigningPrivateKey ?? loadReleaseProvenancePrivateKey(env)
   );
 }

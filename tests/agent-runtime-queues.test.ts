@@ -1604,6 +1604,56 @@ describe("runtime queues and non-blocking instruction steering", () => {
       && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("nested_instructions_require_replan"))).toHaveLength(2);
   });
 
+  it("returns a path failure receipt and continues after an instruction preload escape", async () => {
+    const container = await mkdtemp(path.join(os.tmpdir(), "sigma-path-recovery-"));
+    const workspace = path.join(container, "workspace");
+    const outside = path.join(container, "outside");
+    await mkdir(workspace);
+    await mkdir(outside);
+    await writeFile(path.join(workspace, "inside.txt"), "inside\n", "utf8");
+    await writeFile(path.join(outside, "secret.txt"), "outside\n", "utf8");
+
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "escape-read", name: "read", arguments: { path: path.join(outside, "secret.txt") } }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "valid-read", name: "read", arguments: { path: "inside.txt" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      completion("path recovery completed")
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+
+    await expect(runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect the workspace" }))
+      .resolves.toBeUndefined();
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "tool.failed"
+      && (event.payload as { callId?: string; diagnostics?: string[] }).callId === "escape-read"
+      && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("path_escape"))).toBe(true);
+    expect(events.some((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: string }).callId === "valid-read")).toBe(true);
+    await rm(container, { recursive: true, force: true });
+  });
+
   it("persists each parallel receipt without waiting for the rest of its batch", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-receipt-window-"));
     const calls = [

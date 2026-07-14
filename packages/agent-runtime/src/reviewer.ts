@@ -80,22 +80,76 @@ function responseObject(content: string): Record<string, unknown> | null {
   }
 }
 
-function incompleteReviewInput(input: ReviewerInput): string | undefined {
+function binaryReviewEvidenceFailure(
+  delta: WorkspaceDeltaEvidence,
+  diff: string,
+  validations: readonly ValidationEvidence[]
+): string | undefined {
+  if (!diff.includes("[binary sha256=")) return undefined;
+  const markers = [...diff.matchAll(/^\[binary sha256=([a-f0-9]{64}) size=(\d+)\]$/gmu)];
+  if (markers.length === 0) return `Delta ${delta.evidenceId} has an invalid opaque artifact digest or size.`;
+  if (markers.some((match) => !Number.isSafeInteger(Number(match[2])))) {
+    return `Delta ${delta.evidenceId} has an opaque artifact size outside the supported range.`;
+  }
+  const sections = [...diff.matchAll(/^--- (?:a\/([^\s]+)|\/dev\/null)\n\+\+\+ (?:b\/([^\s]+)|\/dev\/null)$/gmu)]
+    .map((match) => (match[2] ?? match[1] ?? "").replaceAll("\\", "/"));
+  const changedPaths = new Set([
+    ...delta.data.delta.added,
+    ...delta.data.delta.modified,
+    ...delta.data.delta.deleted
+  ].map((item) => item.replaceAll("\\", "/")));
+  if (sections.length === 0 || sections.some((section) => section && !changedPaths.has(section))) {
+    return `Delta ${delta.evidenceId} is missing an opaque artifact path bound to its workspace delta.`;
+  }
+  const validated = validations.some((item) => item.status === "passed"
+    && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+  if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
+  return undefined;
+}
+
+export function reviewInputFailure(input: ReviewerInput): string | undefined {
   for (const delta of input.workspaceDeltas) {
     const diff = delta.data.reviewDiff;
     if (typeof diff !== "string") return `Delta ${delta.evidenceId} has no reviewable diff.`;
     if (diff.includes("[review diff truncated]") || diff.includes("[file diff truncated]")) {
       return `Delta ${delta.evidenceId} has a truncated diff.`;
     }
-    if (diff.includes("[binary sha256=")) return `Delta ${delta.evidenceId} contains binary content.`;
+    const binaryFailure = binaryReviewEvidenceFailure(delta, diff, input.validations);
+    if (binaryFailure) return binaryFailure;
   }
   return undefined;
+}
+
+export function reviewInputFailureEvidence(
+  input: ReviewerInput,
+  reviewerId: string,
+  message: string
+): ReviewEvidence {
+  return {
+    evidenceId: randomUUID(),
+    sessionId: input.sessionId,
+    runId: input.runId,
+    kind: "review",
+    status: "failed",
+    createdAt: new Date().toISOString(),
+    producer: { authority: "runtime", id: reviewerId },
+    summary: message,
+    data: {
+      reviewerId,
+      verdict: "changes_requested",
+      findings: [message],
+      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+    }
+  };
 }
 
 export class ModelReviewer implements ReviewerPort {
   constructor(private readonly gateway: ModelGateway, readonly reviewerId = "builtin-reviewer") {}
 
   async review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence> {
+    const inputProblem = reviewInputFailure(input);
+    if (inputProblem) return reviewInputFailureEvidence(input, this.reviewerId, inputProblem);
     const prepared = await this.prepareReview(input, Number.MAX_SAFE_INTEGER);
     return (await this.reviewPrepared(input, randomUUID(), prepared, signal)).evidence;
   }
@@ -186,7 +240,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. Complete opaque artifacts are reviewable by their workspace path, SHA-256, size, checkpoint-bound delta, and passed validation; do not require textual source for a binary file. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -208,7 +262,7 @@ function reviewEvidence(
   response: ModelResponse
 ): ReviewEvidence {
     const parsed = responseObject(response.message.content);
-    const inputProblem = incompleteReviewInput(input);
+    const inputProblem = reviewInputFailure(input);
     const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
     const validFindings = rawFindings !== undefined;
     const verdict = !inputProblem && validFindings && parsed?.verdict === "approved" ? "approved" : "changes_requested";

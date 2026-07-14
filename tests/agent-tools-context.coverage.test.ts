@@ -1,4 +1,4 @@
-import { link, mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
+import { link, mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -232,6 +232,19 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(JSON.parse(completed.output)).toMatchObject({
       criteria: [{ claim: "acceptance_met" }]
     });
+  });
+
+  it("loads instructions for an existing extensionless file from its parent directory", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "agent-instructions-extensionless-"));
+    await mkdir(path.join(workspace, "src"), { recursive: true });
+    await writeFile(path.join(workspace, "AGENTS.md"), "root rule", "utf8");
+    await writeFile(path.join(workspace, "src", "AGENTS.md"), "source rule", "utf8");
+    await writeFile(path.join(workspace, "src", "NOTICE"), "ordinary file", "utf8");
+
+    const instructions = await loadNestedInstructions({ workspacePath: workspace, targetPath: "src/NOTICE" });
+
+    expect(instructions.map((item) => item.provenance)).toEqual(["AGENTS.md", "src/AGENTS.md"]);
+    await rm(workspace, { recursive: true, force: true });
   });
 
   it("loads nested instructions and retrieves Unicode repository context incrementally", async () => {

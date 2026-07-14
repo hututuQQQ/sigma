@@ -13,6 +13,8 @@ import type { RuntimeSession } from "./types.js";
 import {
   documentationOnly,
   isAccountableReviewer,
+  reviewInputFailure,
+  reviewInputFailureEvidence,
   type AccountableReviewerPort,
   type ReviewerInput,
   type ReviewerPort
@@ -210,6 +212,16 @@ export class ReviewCoordinator {
       workspaceDeltas: eligible,
       validations: relevantValidations
     };
+    const inputProblem = reviewInputFailure(input);
+    if (inputProblem) {
+      await this.emit(session, "review.completed", "runtime", normalizeReview(
+        session,
+        reviewInputFailureEvidence(input, reviewerId, inputProblem),
+        eligible,
+        relevantValidations
+      ));
+      return;
+    }
     if (this.budgets && isAccountableReviewer(reviewer)) {
       await this.reviewAccounted(session, reviewer, reviewerId, input, evidence, signal);
       return;

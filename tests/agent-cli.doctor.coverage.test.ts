@@ -99,12 +99,18 @@ describe("doctor command branch coverage", () => {
         "--json"
       ], { stdout, executionBroker: healthyBroker() })).resolves.toBe(0);
       const report = JSON.parse(stdout.text()) as { status: string; checks: Array<{ name: string; status: string; message: string }> };
-      expect(report.status).toBe("warning");
+      expect(report.status).toBe("ok");
       expect(report.checks).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "node", status: "ok" }),
         expect.objectContaining({ name: "provider_key", status: "ok" }),
+        expect.objectContaining({ name: "lsp_rust" }),
+        expect.objectContaining({ name: "lsp_go" }),
         expect.objectContaining({ name: "api", status: "ok", message: "ok" })
       ]));
+      expect(report.checks
+        .filter((check) => ["lsp_rust", "lsp_go"].includes(check.name))
+        .every((check) => ["ok", "skipped"].includes(check.status)))
+        .toBe(true);
     } finally {
       if (originalNode) Object.defineProperty(process.versions, "node", originalNode);
     }

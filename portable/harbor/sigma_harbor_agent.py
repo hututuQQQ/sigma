@@ -140,6 +140,7 @@ class SigmaCliHarborAgent(BaseAgent):
         self.model = resolved_model
         self.max_wall_time_sec = max_wall_time_sec
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
+        self._workspace: str | None = None
 
     @staticmethod
     def name() -> str:
@@ -149,6 +150,7 @@ class SigmaCliHarborAgent(BaseAgent):
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
@@ -161,11 +163,13 @@ class SigmaCliHarborAgent(BaseAgent):
             await self._verify_agent_ready(environment)
             return
 
-        raise RuntimeError(
-            "agent CLI is not installed in the task container. Pass "
+        message = (
+            "agent_setup_failed: agent CLI is not installed in the task container. Pass "
             "agent_cli_tarball in the Harbor JobConfig, set AGENT_CLI_TARBALL, or bake "
             "/usr/local/bin/agent into the Harbor task image."
         )
+        self._write_setup_checks([], "agent_setup_failed")
+        raise RuntimeError(message)
 
     async def run(
         self,
@@ -177,26 +181,61 @@ class SigmaCliHarborAgent(BaseAgent):
         env_vars = self._agent_env()
         result: Any | None = None
         error_message: str | None = None
+        failure_kind: str | None = None
+        artifact_warnings: list[str] = []
+        summary_path: pathlib.Path | None = None
+        trace_path: pathlib.Path | None = None
         try:
             await self._upload_instruction(environment, instruction)
             result = await self._run_agent_once(environment, env_vars, context)
             if _return_code(result) != 0:
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
+                failure_kind = "agent_failure"
         except Exception as exc:
             error_message = str(exc)
+            failure_kind = "agent_crash"
         finally:
-            pass
+            for remote_path, filename in (
+                ("/tmp/agent/summary.json", "summary.json"),
+                ("/tmp/agent/trace.jsonl", "trace.jsonl"),
+            ):
+                try:
+                    downloaded = await self._download_if_present(environment, remote_path, filename)
+                    if filename == "summary.json":
+                        summary_path = downloaded
+                    else:
+                        trace_path = downloaded
+                except Exception as exc:
+                    artifact_warnings.append(f"{filename}: {exc}")
+            try:
+                artifact_warnings.extend(await self._download_attempt_artifacts(environment))
+            except Exception as exc:
+                artifact_warnings.append(f"attempts: {exc}")
+            summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
+            trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
 
         summary = self._read_result(result)
+        downloaded_summary = self._read_summary(summary_path)
+        if downloaded_summary:
+            summary = {**summary, **downloaded_summary}
         self._populate_context(context, result, summary, error_message)
-        self._mirror_bench_artifacts(context, result, None, None, summary)
+        self._set_context_value(context, "failure_kind", failure_kind)
+        self._set_context_value(context, "artifact_warnings", artifact_warnings)
+        self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
+
+        if failure_kind == "agent_crash":
+            raise RuntimeError(f"agent_crash: {error_message or 'agent execution raised an exception.'}")
+        if failure_kind == "agent_failure":
+            raise RuntimeError(f"agent_failure: {error_message or 'agent exited unsuccessfully.'}")
 
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
+        if self._workspace is None:
+            raise RuntimeError("agent_setup_failed: workspace was not resolved")
         command = [
             "/usr/local/bin/agent",
             "run",
             "--workspace",
-            "/app",
+            self._workspace,
             "--prompt-file",
             "/tmp/agent/instruction.md",
             "--provider",
@@ -211,6 +250,22 @@ class SigmaCliHarborAgent(BaseAgent):
             "json",
         ]
         return command
+
+    async def _resolve_workspace(self, environment: BaseEnvironment) -> str:
+        result = await environment.exec("pwd -P", timeout_sec=30)
+        stdout = _stdout_text(result).strip()
+        workspace = stdout.splitlines()[-1].strip() if stdout else ""
+        if _return_code(result) != 0 or not workspace.startswith("/"):
+            raise RuntimeError(self._setup_failure_message("workspace_discovery", result))
+
+        accessible = await environment.exec(
+            f"test -d {shlex.quote(workspace)} && test -r {shlex.quote(workspace)} && test -x {shlex.quote(workspace)}",
+            cwd="/",
+            timeout_sec=30,
+        )
+        if _return_code(accessible) != 0:
+            raise RuntimeError(self._setup_failure_message("workspace_access", accessible))
+        return workspace
 
     async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str], context: AgentContext) -> Any:
         command = self._agent_command(context)
@@ -236,25 +291,86 @@ mkdir -p /opt/agent-cli
 mkdir -p /usr/local/bin
 tar -xzf /tmp/agent/agent-cli.tgz -C /opt/agent-cli --strip-components=1
 test -f /opt/agent-cli/bin/agent
-chmod +x /opt/agent-cli/bin/agent
-if [ -f /opt/agent-cli/bin/node ]; then
-  chmod +x /opt/agent-cli/bin/node
-fi
+chmod 0755 /opt/agent-cli/bin/agent /opt/agent-cli/bin/node /opt/agent-cli/bin/sigma-exec
+test -f /opt/agent-cli/bin/bwrap
+chmod 0755 /opt/agent-cli/bin/bwrap
+ln -sf /opt/agent-cli/bin/bwrap /usr/local/bin/bwrap
 ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
 """.strip(),
             timeout_sec=180,
         )
 
     async def _verify_agent_ready(self, environment: BaseEnvironment) -> None:
+        if self._workspace is None:
+            raise RuntimeError("agent_setup_failed: workspace was not resolved")
+        checks: list[dict[str, Any]] = []
         help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
+        checks.append(self._setup_check_record("help", help_check))
+        self._write_setup_checks(checks, "running")
         if _return_code(help_check) != 0:
-            stdout = _stdout_text(help_check).strip()
-            stderr = _stderr_text(help_check).strip()
-            raise RuntimeError(
-                "agent CLI was installed, but /usr/local/bin/agent --help failed."
-                f"\nstdout:\n{stdout or '<empty>'}"
-                f"\nstderr:\n{stderr or '<empty>'}"
-            )
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("help", help_check))
+
+        doctor_check = await environment.exec(
+            " ".join([
+                "/usr/local/bin/agent doctor --workspace",
+                shlex.quote(self._workspace),
+                "--json --strict",
+            ]),
+            env=self._agent_env() or None,
+            timeout_sec=60,
+        )
+        doctor_record = self._setup_check_record("strict_doctor", doctor_check)
+        doctor_record["doctor_json"] = self._parse_doctor_json(_stdout_text(doctor_check))
+        checks.append(doctor_record)
+        if _return_code(doctor_check) != 0:
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("strict_doctor", doctor_check, doctor_record["doctor_json"]))
+        self._write_setup_checks(checks, "passed")
+
+    def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
+        return {
+            "stage": stage,
+            "exit_code": _return_code(result),
+            "stdout": _stdout_text(result),
+            "stderr": _stderr_text(result),
+        }
+
+    def _parse_doctor_json(self, stdout: str) -> Any:
+        text = stdout.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            for line in reversed(text.splitlines()):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return {"parse_error": "doctor stdout did not contain JSON", "raw_stdout": stdout}
+
+    def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "classification": status,
+            "checks": checks,
+        }
+        (self.logs_dir / "setup-check.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _setup_failure_message(self, stage: str, result: Any, doctor_json: Any = None) -> str:
+        details = [
+            f"agent_setup_failed: stage={stage} exit_code={_return_code(result)}",
+            f"stdout:\n{_stdout_text(result) or '<empty>'}",
+            f"stderr:\n{_stderr_text(result) or '<empty>'}",
+        ]
+        if doctor_json is not None:
+            details.append(f"doctor_json:\n{json.dumps(doctor_json, ensure_ascii=False, indent=2)}")
+        return "\n".join(details)
 
     async def _upload_instruction(self, environment: BaseEnvironment, instruction: str) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -284,13 +400,14 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         await environment.download_file(remote_path, target_path)
         return target_path
 
-    async def _download_attempt_artifacts(self, environment: BaseEnvironment) -> None:
+    async def _download_attempt_artifacts(self, environment: BaseEnvironment) -> list[str]:
+        warnings: list[str] = []
         exists = await environment.exec("test -d /tmp/agent/attempts", timeout_sec=30)
         if _return_code(exists) != 0:
-            return
+            return warnings
         listing = await environment.exec("find /tmp/agent/attempts -type f 2>/dev/null", timeout_sec=30)
         if _return_code(listing) != 0:
-            return
+            return warnings
         for raw_path in _stdout_text(listing).splitlines():
             remote_path = raw_path.strip()
             if not remote_path.startswith("/tmp/agent/attempts/"):
@@ -298,7 +415,15 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             relative = pathlib.PurePosixPath(remote_path.removeprefix("/tmp/agent/"))
             target_path = self.logs_dir / pathlib.Path(*relative.parts)
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            await environment.download_file(remote_path, target_path)
+            try:
+                await environment.download_file(remote_path, target_path)
+            except Exception as exc:
+                warnings.append(f"{relative.as_posix()}: {exc}")
+        return warnings
+
+    def _latest_downloaded_artifact(self, filename: str) -> pathlib.Path | None:
+        candidates = [path for path in self.logs_dir.rglob(filename) if path.is_file()]
+        return max(candidates, key=lambda path: path.stat().st_mtime_ns, default=None)
 
     def _read_summary(self, summary_path: pathlib.Path | None) -> dict[str, Any]:
         if summary_path is None or not summary_path.is_file():
@@ -339,6 +464,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         values = {
             "exit_code": exit_code,
             "error_message": error_message,
+            "agent_stdout": _stdout_text(result),
+            "agent_stderr": _stderr_text(result),
             "commands_executed": _json_number(summary, "commands_executed"),
             "n_input_tokens": _json_number(summary, "input_tokens"),
             "n_output_tokens": _json_number(summary, "output_tokens"),
@@ -401,6 +528,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "agent_setup_ok": True,
             "exit_code": getattr(context, "exit_code", None),
             "error_message": getattr(context, "error_message", None),
+            "failure_kind": getattr(context, "failure_kind", None),
+            "artifact_warnings": getattr(context, "artifact_warnings", []),
             "commands_executed": getattr(context, "commands_executed", 0),
             "n_input_tokens": getattr(context, "n_input_tokens", 0),
             "n_output_tokens": getattr(context, "n_output_tokens", 0),

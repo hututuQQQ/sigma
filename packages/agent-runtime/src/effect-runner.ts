@@ -164,9 +164,17 @@ export class EffectRunner {
     if (steeringRestart(turnSignal)) return;
     try {
       let loadedInstructions = false;
+      const instructionFailures = new Set<string>();
       for (const { call } of attempts) {
         const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
-        if (descriptor && await this.loadInstructions(session, call, descriptor)) loadedInstructions = true;
+        if (!descriptor) continue;
+        const instructionResult = await this.loadInstructions(session, call, descriptor);
+        if (instructionResult.failure) {
+          instructionFailures.add(call.id);
+          await this.emitReceipt(session, instructionResult.failure, attempts.find((item) => item.call.id === call.id)!.modelTurn);
+        } else if (instructionResult.loaded) {
+          loadedInstructions = true;
+        }
       }
       const isCompletion = ({ call }: ToolAttempt): boolean => Boolean(
         this.options.runtime.tools.descriptors().find((item) => item.name === call.name)
@@ -176,6 +184,7 @@ export class EffectRunner {
       const completions = attempts.filter(isCompletion);
       const executeAttempt = async (attempt: ToolAttempt): Promise<void> => {
         const { call, modelTurn } = attempt;
+        if (instructionFailures.has(call.id)) return;
         const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
         if (loadedInstructions && descriptor && requiresInstructionReplan(descriptor)) {
           const startedAt = new Date().toISOString();
@@ -222,15 +231,29 @@ export class EffectRunner {
     session: RuntimeSession,
     call: ModelToolCall,
     descriptor: ToolDescriptor
-  ): Promise<boolean> {
-    const discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) =>
-      await loadNestedInstructions({ workspacePath: session.identity.workspacePath, targetPath })));
+  ): Promise<{ loaded: boolean; failure?: ToolReceipt }> {
+    let discovered;
+    try {
+      discovered = await Promise.all(requestTargets(call, descriptor).map(async (targetPath) =>
+        await loadNestedInstructions({ workspacePath: session.identity.workspacePath, targetPath })));
+    } catch (error) {
+      if ((error as { code?: unknown })?.code !== "path_escape") throw error;
+      return {
+        loaded: false,
+        failure: failed(
+          call,
+          new Date().toISOString(),
+          error instanceof Error ? error.message : String(error),
+          "path_escape"
+        )
+      };
+    }
     const unseen = discovered.flat().filter((item) => !session.interaction.loadedContextIds.has(item.id));
     for (const item of unseen) {
       session.interaction.loadedContextIds.add(item.id);
       session.interaction.contextItems.push(item);
     }
-    if (unseen.length === 0) return false;
+    if (unseen.length === 0) return { loaded: false };
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "nested_instructions_loaded",
       callId: call.id,
@@ -238,7 +261,7 @@ export class EffectRunner {
       items: unseen,
       affectsMutation: descriptor.possibleEffects.includes("filesystem.write")
     });
-    return true;
+    return { loaded: true };
   }
 
   private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {

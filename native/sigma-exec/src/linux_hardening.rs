@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const INTERNAL_HARDENED_LAUNCHER: &str = "--internal-linux-hardened-launcher";
-pub(crate) const INTERNAL_CWD_PIN_MOUNT: &str = "/.sigma-exec-cwd";
+pub(crate) const INTERNAL_CWD_PIN_MOUNT: &str = "/tmp/.sigma-exec-cwd";
 const INTERNAL_HARDENING_PROBE: &str = "--internal-linux-hardening-probe";
 const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
 const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
@@ -673,6 +673,8 @@ fn self_test_arguments(
         OsString::from("--ro-bind"),
         OsString::from("/"),
         OsString::from("/"),
+        OsString::from("--tmpfs"),
+        OsString::from("/tmp"),
         OsString::from("--bind"),
         allowed.as_os_str().to_owned(),
         allowed.as_os_str().to_owned(),

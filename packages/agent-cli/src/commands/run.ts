@@ -182,7 +182,23 @@ function writeNeedsInput(
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (!(error instanceof Error)) return String(error);
+  const lines: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current instanceof Error && !seen.has(current) && lines.length < 8) {
+    seen.add(current);
+    const details = current as Error & { code?: unknown; errno?: unknown; syscall?: unknown; path?: unknown };
+    const fields = [
+      typeof details.code === "string" ? `code=${details.code}` : null,
+      typeof details.errno === "number" || typeof details.errno === "string" ? `errno=${String(details.errno)}` : null,
+      typeof details.syscall === "string" ? `syscall=${details.syscall}` : null,
+      typeof details.path === "string" ? `path=${details.path}` : null
+    ].filter((value): value is string => value !== null);
+    lines.push(`${lines.length === 0 ? "" : "caused by: "}${current.message}${fields.length > 0 ? ` (${fields.join(", ")})` : ""}`);
+    current = current.cause;
+  }
+  return lines.join("\n");
 }
 
 function writeRunError(
