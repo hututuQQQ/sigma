@@ -70,6 +70,7 @@ export const workspaceDeltaEvidenceSchema = z.object({
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional(),
     reviewDiff: z.string().optional(),
+    reviewDiffPaths: z.array(nonEmptyStringSchema).optional(),
     opaqueArtifacts: z.array(opaqueArtifactEvidenceSchema).optional()
   }).strict()
 }).strict();

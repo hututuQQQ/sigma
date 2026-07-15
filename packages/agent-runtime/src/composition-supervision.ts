@@ -130,6 +130,7 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
     const child = await runtime.createChildSession(context.parentId, {
       workspacePath: context.workspacePath,
       mode,
+      goal: context.instruction,
       title: context.instruction.slice(0, 80),
       writeScope: context.writeScope,
       strictWriteScope: mode === "change" && context.isolation.kind === "exclusive_workspace"

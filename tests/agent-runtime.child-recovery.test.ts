@@ -117,12 +117,13 @@ afterEach(async () => {
   for (const root of fixtures.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlStore): Promise<{
+async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlStore, mixed = false): Promise<{
   parentSessionId: string;
   childSessionId: string;
   childId: string;
   checkpointId: string;
   file: string;
+  binary?: string;
 }> {
   const runtime = createRuntime({
     gateway: new IdleGateway(), tools: new EffectToolRegistry(), store, storeRootDir: root
@@ -131,7 +132,7 @@ async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlSto
   const child = await runtime.createChildSession(parent.sessionId, {
     workspacePath: root,
     mode: "change",
-    writeScope: ["changed.ts"],
+    writeScope: ["changed.ts", ...(mixed ? ["payload.bin"] : [])],
     strictWriteScope: true
   }, undefined, undefined, true);
   const childId = "77777777-7777-4777-8777-777777777777";
@@ -148,15 +149,18 @@ async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlSto
   });
   const file = path.join(root, "changed.ts");
   await writeFile(file, "export const value = 1;\n", "utf8");
+  const binary = mixed ? path.join(root, "payload.bin") : undefined;
+  if (binary) await writeFile(binary, Buffer.from([0, 1, 2]));
   const checkpoints = new CheckpointManager({ rootDir: root });
   const checkpoint = await checkpoints.create({
     sessionId: child.sessionId,
     runId: child.runId,
     workspacePath: root,
-    scopePaths: ["changed.ts"],
+    scopePaths: ["changed.ts", ...(mixed ? ["payload.bin"] : [])],
     baseSeq: 1
   });
   await writeFile(file, "export const value = 2;\n", "utf8");
+  if (binary) await writeFile(binary, Buffer.from([0, 3, 4, 5]));
   await runtime.releaseSession(child.sessionId);
   await runtime.releaseSession(parent.sessionId);
   return {
@@ -164,7 +168,8 @@ async function interruptedExclusiveWriter(root: string, store: SegmentedJsonlSto
     childSessionId: child.sessionId,
     childId,
     checkpointId: checkpoint.checkpointId,
-    file
+    file,
+    ...(binary ? { binary } : {})
   };
 }
 
@@ -511,7 +516,7 @@ describe("durable child identity and crash recovery", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-workspace-keep-"));
     fixtures.push(root);
     const store = new SegmentedJsonlStore({ rootDir: root });
-    const fixture = await interruptedExclusiveWriter(root, store);
+    const fixture = await interruptedExclusiveWriter(root, store, true);
     await new CheckpointManager({ rootDir: root }).seal(fixture.childSessionId, fixture.checkpointId);
     const runtime = createRuntime({
       gateway: new IdleGateway(), tools: new EffectToolRegistry(), store, storeRootDir: root
@@ -556,7 +561,13 @@ describe("durable child identity and crash recovery", () => {
       data: {
         checkpointId: fixture.checkpointId,
         sourceSessionId: fixture.childSessionId,
-        childId: fixture.childId
+        childId: fixture.childId,
+        reviewDiffPaths: ["changed.ts"],
+        opaqueArtifacts: [expect.objectContaining({
+          path: "payload.bin",
+          before: expect.objectContaining({ sizeBytes: 3 }),
+          after: expect.objectContaining({ sizeBytes: 4 })
+        })]
       }
     });
     const importedValidation = events.find((event) => event.type === "evidence.recorded"

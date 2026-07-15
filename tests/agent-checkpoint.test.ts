@@ -314,6 +314,59 @@ describe("CheckpointManager", () => {
     if (hasSymlink) expect(await readlink(link)).toBe("tool.sh");
   });
 
+  it("builds complete review material for mixed text, links, directories, and opaque files", async () => {
+    const { workspace, manager } = await fixture();
+    await writeFile(path.join(workspace, "mixed.dat"), Buffer.from([0, 1, 2, 3]));
+    const checkpoint = await manager.create({
+      sessionId: "session-review-material", runId: "run-review-material", workspacePath: workspace,
+      scopePaths: ["."], baseSeq: 0
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "after text", "utf8");
+    await writeFile(path.join(workspace, "mixed.dat"), "now readable", "utf8");
+    await writeFile(path.join(workspace, "large.bin"), Buffer.alloc(512 * 1024, 0));
+    await mkdir(path.join(workspace, "empty-directory"));
+    const linkCreated = await symlink("existing.txt", path.join(workspace, "text-link"), "file")
+      .then(() => true, () => false);
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+
+    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 2_048);
+
+    expect(material.reviewDiff).not.toContain("[review diff truncated]");
+    expect(material.reviewDiff).not.toContain("large.bin");
+    expect(material.reviewDiffPaths).toEqual(expect.arrayContaining([
+      "empty-directory", "existing.txt", "mixed.dat",
+      ...(linkCreated ? ["text-link"] : [])
+    ]));
+    expect(material.opaqueArtifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "large.bin",
+        after: expect.objectContaining({ sizeBytes: 512 * 1024 })
+      }),
+      expect.objectContaining({
+        path: "mixed.dat",
+        before: expect.objectContaining({ sizeBytes: 4 })
+      })
+    ]));
+    expect(material.reviewDiff).toContain("now readable");
+    expect(material.reviewDiff).toContain("[binary sha256=");
+  });
+
+  it("omits a truncated text section from review diff coverage", async () => {
+    const { workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-text-coverage", runId: "run-text-coverage", workspacePath: workspace,
+      scopePaths: ["existing.txt"], baseSeq: 0
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "long text ".repeat(1_024), "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+
+    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 191);
+
+    expect(material.reviewDiff).toContain("[review diff truncated]");
+    expect(material.reviewDiffPaths).not.toContain("existing.txt");
+    expect(material.opaqueArtifacts).toEqual([]);
+  });
+
   it("rejects an explicit scope whose parent link escapes the workspace", async () => {
     const { root, workspace, manager } = await fixture();
     const outside = path.join(root, "outside");
@@ -949,5 +1002,26 @@ describe("CheckpointManager", () => {
       sessionId: "session-reuse-corrupt", runId: "run-reuse-corrupt", workspacePath: workspace,
       scopePaths: ["existing.txt"], baseSeq: 0
     })).rejects.toBeInstanceOf(CheckpointConflictError);
+  });
+
+  it("fails review material generation when an opaque CAS object is damaged", async () => {
+    const { root, workspace, manager } = await fixture();
+    const target = path.join(workspace, "payload.bin");
+    await writeFile(target, Buffer.from([0, 1, 2]));
+    const checkpoint = await manager.create({
+      sessionId: "session-opaque-corrupt", runId: "run-opaque-corrupt", workspacePath: workspace,
+      scopePaths: ["payload.bin"], baseSeq: 0
+    });
+    await writeFile(target, Buffer.from([0, 3, 4]));
+    const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const post = JSON.parse(await readFile(
+      path.join(root, "state", "checkpoints", "cas", sealed.postManifestDigest!),
+      "utf8"
+    )) as { entries: Array<{ path: string; digest?: string }> };
+    const digest = post.entries.find((entry) => entry.path === "payload.bin")!.digest!;
+    await writeFile(path.join(root, "state", "checkpoints", "cas", digest), Buffer.from([0, 9, 9]));
+
+    await expect(manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId))
+      .rejects.toBeInstanceOf(CheckpointConflictError);
   });
 });

@@ -44,6 +44,12 @@ export interface CheckpointOpaqueArtifact {
   after?: { digest: string; sizeBytes: number };
 }
 
+export interface CheckpointReviewMaterial {
+  reviewDiff: string;
+  reviewDiffPaths: string[];
+  opaqueArtifacts: CheckpointOpaqueArtifact[];
+}
+
 export interface CheckpointRecord {
   schemaVersion: 1;
   checkpointId: string;

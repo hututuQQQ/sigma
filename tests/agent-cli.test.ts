@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -156,6 +156,42 @@ describe("Sigma CLI", () => {
     });
     expect(code).toBe(0);
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "completed", finalMessage: "analysis" });
+  });
+
+  it("keeps the complete CLI instruction as the semantic goal while shortening only the title", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-goal-"));
+    const workspace = path.join(root, "workspace");
+    const stateRootDir = path.join(root, "state");
+    await mkdir(workspace);
+    const instruction = `${"Inspect the repository using general evidence. ".repeat(3)}Retain this trailing requirement.`;
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+
+    await expect(runCommand([
+      instruction, "--workspace", workspace, "--output-format", "json", "--permission-mode", "auto"
+    ], {
+      mode: "analyze",
+      stdin,
+      stdout,
+      stderr,
+      stateRootDir,
+      gatewayFactory: () => new FakeGateway([
+        { message: { role: "assistant", content: "analysis" }, finishReason: "stop" }
+      ]),
+      executionBroker: createHostExecutionBroker()
+    })).resolves.toBe(0);
+
+    const store = new SegmentedJsonlStore({ rootDir: stateRootDir });
+    const session = (await store.listSessions())[0];
+    if (!session) throw new Error("Expected a durable CLI session.");
+    const events = [];
+    for await (const event of store.events(session.sessionId)) events.push(event);
+    const initialPlan = events.find((event) => event.type === "plan.updated")?.payload as {
+      plan?: { goal?: string; nodes?: Array<{ title?: string }> };
+    } | undefined;
+    expect(initialPlan?.plan?.goal).toBe(instruction);
+    expect(initialPlan?.plan?.nodes?.[0]?.title).toBe(instruction.slice(0, 80));
   });
 
   it("lists, shows, and replays sessions through RuntimeClient", async () => {

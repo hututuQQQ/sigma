@@ -9,6 +9,7 @@ import type {
   CheckpointOpaqueArtifact,
   CheckpointManifest,
   CheckpointRecord,
+  CheckpointReviewMaterial,
   CreateCheckpointInput,
   OpenCheckpointInspection,
   SealedCheckpointInspection
@@ -20,7 +21,8 @@ import { restoreCheckpointTransaction } from "./restore-transaction.js";
 import { recoverCheckpointTransactions } from "./restore-recovery.js";
 import { captureCheckpointManifest } from "./safe-capture.js";
 import { CheckpointCasStore } from "./cas-store.js";
-import { buildCheckpointReview } from "./checkpoint-review.js";
+import { buildCheckpointReviewMaterial } from "./checkpoint-review.js";
+import { checkpointOpaqueArtifacts } from "./opaque-artifacts.js";
 import type { CheckpointRestoreFaultInjector } from "./fault-injection.js";
 
 export { checkpointDelta } from "./manifest.js";
@@ -133,47 +135,32 @@ export class CheckpointManager {
     };
   }
   async reviewDiff(sessionId: string, checkpointId: string, maxBytes = 256 * 1024): Promise<string> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
-    await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
-    if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
-      throw new Error(`Checkpoint ${checkpointId} is not sealed for review.`);
-    }
-    const before = await this.getManifest(checkpoint.preManifestDigest);
-    const after = await this.getManifest(checkpoint.postManifestDigest);
-    return await buildCheckpointReview(checkpoint, before, after, this.cas, maxBytes);
+    return (await this.reviewMaterial(sessionId, checkpointId, maxBytes)).reviewDiff;
+  }
+
+  async reviewMaterial(
+    sessionId: string,
+    checkpointId: string,
+    maxBytes = 256 * 1024
+  ): Promise<CheckpointReviewMaterial> {
+    const { checkpoint, before, after } = await this.sealedReviewState(sessionId, checkpointId);
+    const opaqueArtifacts = await checkpointOpaqueArtifacts(checkpoint, before, after, this.cas);
+    return await buildCheckpointReviewMaterial(
+      checkpoint,
+      before,
+      after,
+      this.cas,
+      maxBytes,
+      opaqueArtifacts
+    );
   }
 
   /** Returns content-addressed identities for changed files whose bytes are
    * not safe to represent as text. This is independent of the bounded review
    * preview, so a truncated preview cannot invalidate binary evidence. */
   async opaqueArtifacts(sessionId: string, checkpointId: string): Promise<CheckpointOpaqueArtifact[]> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
-    await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
-    if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
-      throw new Error(`Checkpoint ${checkpointId} is not sealed for opaque artifact inspection.`);
-    }
-    const before = await this.getManifest(checkpoint.preManifestDigest);
-    const after = await this.getManifest(checkpoint.postManifestDigest);
-    const beforeByPath = new Map(before.entries.map((entry) => [entry.path, entry]));
-    const afterByPath = new Map(after.entries.map((entry) => [entry.path, entry]));
-    const result: CheckpointOpaqueArtifact[] = [];
-    for (const file of [...new Set([
-      ...checkpoint.delta.added, ...checkpoint.delta.modified, ...checkpoint.delta.deleted
-    ])].sort()) {
-      const left = beforeByPath.get(file);
-      const right = afterByPath.get(file);
-      const fileEntries = [left, right].filter((entry) => entry?.kind === "file");
-      const opaque = await Promise.all(fileEntries.map((entry) => this.isOpaque(entry!)));
-      if (fileEntries.length === 0 || !opaque.some(Boolean)) continue;
-      result.push({
-        path: file,
-        ...(left?.kind === "file" && left.digest ? { before: { digest: left.digest, sizeBytes: left.size } } : {}),
-        ...(right?.kind === "file" && right.digest ? { after: { digest: right.digest, sizeBytes: right.size } } : {})
-      });
-    }
-    return result;
+    const { checkpoint, before, after } = await this.sealedReviewState(sessionId, checkpointId);
+    return await checkpointOpaqueArtifacts(checkpoint, before, after, this.cas);
   }
 
   async undoLatest(sessionId: string): Promise<CheckpointRecord> {
@@ -278,19 +265,21 @@ export class CheckpointManager {
     });
   }
 
-  private async isOpaque(entry: { digest?: string }): Promise<boolean> {
-    if (!entry.digest) return false;
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    try {
-      for await (const chunk of this.cas.stream(entry.digest)) {
-        if (chunk.includes(0)) return true;
-        decoder.decode(chunk, { stream: true });
-      }
-      decoder.decode();
-      return false;
-    } catch {
-      return true;
+  private async sealedReviewState(
+    sessionId: string,
+    checkpointId: string
+  ): Promise<{ checkpoint: CheckpointRecord; before: CheckpointManifest; after: CheckpointManifest }> {
+    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    await this.recover(checkpoint.workspacePath);
+    checkpoint = await this.readRecord(sessionId, checkpointId);
+    if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
+      throw new Error(`Checkpoint ${checkpointId} is not sealed for review.`);
     }
+    return {
+      checkpoint,
+      before: await this.getManifest(checkpoint.preManifestDigest),
+      after: await this.getManifest(checkpoint.postManifestDigest)
+    };
   }
 
   private async restore(

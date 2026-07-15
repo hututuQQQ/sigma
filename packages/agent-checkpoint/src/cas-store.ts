@@ -164,21 +164,31 @@ export class CheckpointCasStore {
     }
   }
 
-  async *stream(digest: string, maxBytes = Number.POSITIVE_INFINITY): AsyncGenerator<Buffer> {
+  async *stream(
+    digest: string,
+    maxBytes = Number.POSITIVE_INFINITY,
+    expectedIdentity?: CheckpointCasIdentity
+  ): AsyncGenerator<Buffer> {
     validateReadLimit(maxBytes);
     const handle = await this.openRead(digest);
+    const hash = createHash("sha256");
     let before: { identity: CheckpointCasIdentity; size: number } | undefined;
+    let position = 0;
     let changed: boolean;
     try {
       before = await statIdentity(handle, digest);
-      let position = 0;
+      if (expectedIdentity && !sameIdentity(before.identity, expectedIdentity)) {
+        throw new CheckpointConflictError(`Checkpoint CAS identity no longer matches its manifest: ${digest}`);
+      }
       while (position < before.size && position < maxBytes) {
         const length = Math.min(CAS_CHUNK_BYTES, before.size - position, maxBytes - position);
         const buffer = Buffer.allocUnsafe(length);
         const { bytesRead } = await handle.read(buffer, 0, length, position);
         if (bytesRead <= 0) break;
         position += bytesRead;
-        yield bytesRead === buffer.byteLength ? buffer : buffer.subarray(0, bytesRead);
+        const chunk = bytesRead === buffer.byteLength ? buffer : buffer.subarray(0, bytesRead);
+        hash.update(chunk);
+        yield chunk;
       }
     } finally {
       const after = await statIdentity(handle, digest).catch(() => undefined);
@@ -187,6 +197,10 @@ export class CheckpointCasStore {
     }
     if (changed) {
       throw new CheckpointConflictError(`Checkpoint CAS object changed while reading: ${digest}`);
+    }
+    if (before && maxBytes >= before.size
+      && (position !== before.size || hash.digest("hex") !== digest)) {
+      throw new CheckpointConflictError(`Checkpoint CAS content is corrupt: ${digest}`);
     }
   }
 

@@ -169,6 +169,7 @@ async function executeRun(
   const session = await runtime.createSession({
     workspacePath: workspace,
     mode,
+    goal: instruction,
     title: instruction.slice(0, 80),
     ...(config.reviewerWaiver ? { reviewerWaiverReason: "Explicit --waive-reviewer CLI flag." } : {})
   });
