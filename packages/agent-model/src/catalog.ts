@@ -35,6 +35,8 @@ export interface ModelFailureDiagnostics {
   sseFrames?: number;
   ssePayloads?: number;
   sseTrailingBytes?: number;
+  abortReason?: string;
+  timeoutReason?: string;
 }
 
 export class ModelGatewayError extends Error {

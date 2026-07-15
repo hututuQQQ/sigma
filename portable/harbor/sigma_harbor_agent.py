@@ -694,7 +694,14 @@ class SigmaCliHarborAgent(BaseAgent):
         return command
 
     def _agent_command_with_process_record(self, command: list[str]) -> str:
-        """Start only this agent in a private process group when setsid exists."""
+        """Start only this agent in a private process group and wait for it.
+
+        util-linux ``setsid`` forks when its caller is already a process-group
+        leader. Without ``--wait`` that parent reports exit code zero while the
+        actual agent is still running, truncating the runtime protocol. A
+        setsid implementation without wait support is therefore less safe than
+        the pid-only fallback.
+        """
         process_file = "/tmp/agent/agent-process.json"
         command_text = shlex.join(command)
         group_body = (
@@ -709,8 +716,8 @@ class SigmaCliHarborAgent(BaseAgent):
             f"printf '{{\"pid\":%s,\"pgid\":0}}\\n' \"$pid\" > {shlex.quote(process_file)}; "
             f"exec {command_text}"
         )
-        return "if command -v setsid >/dev/null 2>&1; then " + (
-            f"exec setsid /bin/sh -c {shlex.quote(group_body)}; "
+        return "if command -v setsid >/dev/null 2>&1 && setsid --help 2>&1 | grep -q -- '--wait'; then " + (
+            f"exec setsid --wait /bin/sh -c {shlex.quote(group_body)}; "
             f"else exec /bin/sh -c {shlex.quote(pid_only_body)}; fi"
         )
 
@@ -873,6 +880,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         events: list[dict[str, Any]],
         output_result: dict[str, Any],
     ) -> str | None:
+        # A durable run terminal is the Agent/runtime outcome. Earlier model or
+        # tool failures remain diagnostic causes, but must not override the
+        # completed runtime lifecycle classification.
+        if any(event.get("type") in {"run.failed", "run.cancelled"} for event in events):
+            return "agent_failure"
         finish_reason = output_result.get("finishReason") or output_result.get("finish_reason")
         if finish_reason in {"timeout", "timed_out", "max_wall_time"}:
             return "timeout"
@@ -1159,6 +1171,18 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             for item in usage
         )
         cost_micro_usd = sum(_as_int(item.get("costMicroUsd"), 0) for item in usage)
+        model_failure_event = next(
+            (event for event in reversed(events) if event.get("type") == "model.failed"),
+            None,
+        )
+        model_failure_payload = _event_payload(model_failure_event) if model_failure_event is not None else {}
+        model_diagnostics = model_failure_payload.get("diagnostics")
+        model_failure = None
+        if model_failure_event is not None:
+            model_failure = {
+                "code": model_failure_payload.get("code"),
+                "diagnostics": model_diagnostics if isinstance(model_diagnostics, dict) else {},
+            }
         return {
             "schema_version": 1,
             "status": output_result.get("status"),
@@ -1177,6 +1201,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 or "retry" in str(_event_payload(event).get("status", "")).lower()
                 for event in events
             ),
+            "model_failure": model_failure,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
         }

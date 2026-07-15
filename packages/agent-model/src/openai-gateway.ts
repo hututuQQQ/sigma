@@ -90,8 +90,8 @@ async function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function timeoutError(message: string): ModelGatewayError {
-  const error = new ModelGatewayError(message, "timeout");
+function timeoutError(message: string, options?: ErrorOptions): ModelGatewayError {
+  const error = new ModelGatewayError(message, "timeout", false, undefined, options);
   error.name = "TimeoutError";
   return error;
 }
@@ -104,7 +104,7 @@ function errorSummary(error: unknown): string {
 function normalizeGatewayError(provider: string, error: unknown): ModelGatewayError {
   if (error instanceof ModelGatewayError) return error;
   if (error instanceof Error && error.name === "TimeoutError") {
-    return timeoutError(errorSummary(error));
+    return timeoutError(errorSummary(error), { cause: error });
   }
   return Object.assign(
     new ModelGatewayError(`${provider} network request failed: ${errorSummary(error)}`, "network", false, undefined, {
@@ -135,17 +135,40 @@ type DecodedStreamEvent =
   | Exclude<ModelStreamEvent, { type: "done" }>
   | { type: "done"; response: UnnormalizedModelResponse; rawUsage: RawUsage };
 
+function failureReasonDiagnostics(
+  error: unknown,
+  signal?: AbortSignal
+): Pick<ModelFailureDiagnostics, "abortReason" | "timeoutReason"> {
+  const reason = signal?.aborted ? signal.reason : error;
+  const summary = errorSummary(reason).slice(0, 800);
+  if (reason instanceof Error && reason.name === "TimeoutError") return { timeoutReason: summary };
+  if (error instanceof Error && error.name === "TimeoutError") return { timeoutReason: errorSummary(error) };
+  return signal?.aborted ? { abortReason: summary } : {};
+}
+
+function addSseState(total: SseStreamState, attempt: SseStreamState): void {
+  total.chunksRead += attempt.chunksRead;
+  total.bytesRead += attempt.bytesRead;
+  total.framesRead += attempt.framesRead;
+  total.dataPayloads += attempt.dataPayloads;
+  total.transportEnded ||= attempt.transportEnded;
+  total.trailingBytes += attempt.trailingBytes;
+}
+
 function streamDiagnostics(
   provider: string,
   model: string,
   status: StreamAttemptStatus,
   sse: SseStreamState,
-  retryAttempts: number
+  retryAttempts: number,
+  category: ModelFailureCategory = "protocol",
+  error?: unknown,
+  signal?: AbortSignal
 ): ModelFailureDiagnostics {
   return {
     provider,
     model,
-    category: "protocol",
+    category,
     ...(status.httpStatus === undefined ? {} : { httpStatus: status.httpStatus }),
     doneReceived: status.doneReceived,
     transportEnded: sse.transportEnded,
@@ -158,8 +181,35 @@ function streamDiagnostics(
     sseBytes: sse.bytesRead,
     sseFrames: sse.framesRead,
     ssePayloads: sse.dataPayloads,
-    sseTrailingBytes: sse.trailingBytes
+    sseTrailingBytes: sse.trailingBytes,
+    ...failureReasonDiagnostics(error, signal)
   };
+}
+
+function withStreamDiagnostics(
+  provider: string,
+  model: string,
+  error: unknown,
+  status: StreamAttemptStatus,
+  sse: SseStreamState,
+  retryAttempts: number,
+  signal: AbortSignal
+): ModelGatewayError {
+  const normalized = normalizeGatewayError(provider, error);
+  const diagnostics = {
+    ...normalized.diagnostics,
+    ...streamDiagnostics(
+      provider,
+      model,
+      status,
+      sse,
+      retryAttempts,
+      normalized.category,
+      error,
+      signal
+    )
+  };
+  return Object.assign(normalized, { diagnostics });
 }
 
 function streamProtocolError(
@@ -255,6 +305,8 @@ export class OpenAIModelGateway implements ModelGateway {
     const scope = deadline(request.signal, this.requestTimeoutMs);
     const progress: StreamProgress = { deliveredContent: "", deliveredReasoning: "" };
     const retries: StreamRetryCounts = { infrastructure: 0, partial: 0 };
+    const transport = createSseStreamState();
+    let lastEventType = "none";
     try {
       for (let attempt = 0; ; attempt += 1) {
         const status: StreamAttemptStatus = {
@@ -262,13 +314,16 @@ export class OpenAIModelGateway implements ModelGateway {
           retryAllowed: true,
           retryAfter: null,
           doneReceived: false,
-          lastEventType: "none",
+          lastEventType,
           hasContent: progress.deliveredContent.length > 0,
           hasReasoning: progress.deliveredReasoning.length > 0,
           hasToolCall: false
         };
+        const sse = createSseStreamState();
         try {
-          for await (const event of this.streamAttempt(request, scope.signal, progress, status, attempt + 1)) {
+          for await (const event of this.streamAttempt(
+            request, scope.signal, progress, status, sse, attempt + 1
+          )) {
             if (event.type === "done") {
               yield { type: "done", response: normalizeModelResponse({
                 spec: { pricing: this.pricing },
@@ -282,7 +337,11 @@ export class OpenAIModelGateway implements ModelGateway {
           }
           return;
         } catch (error) {
-          await this.retryStream(error, attempt, scope.signal, progress, status, retries);
+          lastEventType = status.lastEventType;
+          addSseState(transport, sse);
+          await this.retryStream(
+            error, attempt, scope.signal, progress, status, retries, transport, attempt + 1
+          );
         }
       }
     } finally {
@@ -295,11 +354,11 @@ export class OpenAIModelGateway implements ModelGateway {
     signal: AbortSignal,
     progress: StreamProgress,
     status: StreamAttemptStatus,
+    sse: SseStreamState,
     retryAttempts: number
   ): AsyncIterable<DecodedStreamEvent> {
     const body = await this.openStreamBody(request, signal, status);
     const decoder = new StreamDecoder(this.provider, progress, status, this.retryableFinishReasons);
-    const sse = createSseStreamState();
     for await (const payload of ssePayloads(body, signal, this.idleTimeoutMs, sse)) {
       if (payload === "[DONE]") {
         status.doneReceived = true;
@@ -377,7 +436,7 @@ export class OpenAIModelGateway implements ModelGateway {
       const detail = await abortable(response.text(), signal);
       throw httpError(this.provider, response.status, detail.slice(0, 800), "stream ");
     }
-    if (!response.body) throw new Error(`${this.provider} stream has no body.`);
+    if (!response.body) throw new ModelGatewayError(`${this.provider} stream has no body.`, "protocol");
     return response.body;
   }
 
@@ -387,15 +446,26 @@ export class OpenAIModelGateway implements ModelGateway {
     signal: AbortSignal,
     progress: StreamProgress,
     status: StreamAttemptStatus,
-    retries: StreamRetryCounts
+    retries: StreamRetryCounts,
+    sse: SseStreamState,
+    retryAttempts: number
   ): Promise<void> {
-    if (signal.aborted) throw signal.reason;
     const rawCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
       ? (error as { code: string }).code
       : "";
-    const normalized = rawCode.startsWith("provider_")
-      ? error as Error
+    const base = rawCode.startsWith("provider_")
+      ? Object.assign(new ModelGatewayError(
+          errorSummary(error),
+          rawCode === "provider_resource_exhausted" ? "capacity" : "protocol",
+          status.semantic,
+          status.httpStatus,
+          { cause: error }
+        ), { code: rawCode })
       : normalizeGatewayError(this.provider, error);
+    const normalized = withStreamDiagnostics(
+      this.provider, this.model, base, status, sse, retryAttempts, signal
+    );
+    if (signal.aborted) throw normalized;
     if (!status.retryAllowed) throw normalized;
     const partial = status.semantic || progress.deliveredContent.length > 0 || progress.deliveredReasoning.length > 0;
     if (partial) {

@@ -637,8 +637,125 @@ describe("OpenAI-compatible model gateway", () => {
     const consume = async (): Promise<void> => {
       for await (const _event of gateway.stream(request())) { /* wait for terminal failure */ }
     };
-    await expect(consume()).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(consume()).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        doneReceived: false,
+        transportEnded: false,
+        retryAttempts: 1,
+        timeoutReason: "Model stream idle for 25ms."
+      }
+    });
     expect(cancelled).toBeGreaterThan(0);
+  });
+
+  it("reports protocol metadata when the transport ends before [DONE]", async () => {
+    const gateway = createGateway((async () => streamResponse([
+      { choices: [{ delta: { content: "partial" }, finish_reason: null }] }
+    ], false)) as typeof fetch, { maxRetries: 0 });
+
+    let failure: unknown;
+    try {
+      await collectStream(gateway);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "model_stream_protocol_error",
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "content",
+        hasContent: true,
+        hasReasoning: false,
+        hasToolCall: false,
+        retryAttempts: 1,
+        sseFrames: 1,
+        ssePayloads: 1,
+        sseTrailingBytes: 0
+      }
+    });
+    const diagnostics = (failure as { diagnostics?: { sseChunks?: number; sseBytes?: number } })?.diagnostics;
+    expect(diagnostics?.sseChunks).toBeGreaterThan(0);
+    expect(diagnostics?.sseBytes).toBeGreaterThan(0);
+  });
+
+  it("carries an HTTP-stage abort reason into stream diagnostics", async () => {
+    const controller = new AbortController();
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 1_000
+    });
+    const pending = collectStream(gateway, { ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(new Error("parent request aborted")), 20);
+
+    await expect(pending).rejects.toMatchObject({
+      diagnostics: {
+        doneReceived: false,
+        lastEventType: "none",
+        retryAttempts: 1,
+        sseChunks: 0,
+        sseBytes: 0,
+        sseFrames: 0,
+        ssePayloads: 0,
+        sseTrailingBytes: 0,
+        abortReason: "parent request aborted"
+      }
+    });
+  });
+
+  it("reports trailing bytes for an incomplete final SSE frame", async () => {
+    const trailing = `data: ${JSON.stringify({
+      choices: [{ delta: { content: "unterminated" }, finish_reason: null }]
+    })}`;
+    const gateway = createGateway((async () => new Response(trailing, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    })) as typeof fetch, { maxRetries: 0 });
+
+    let failure: unknown;
+    try {
+      await collectStream(gateway);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "content",
+        hasContent: true,
+        sseFrames: 1,
+        ssePayloads: 1
+      }
+    });
+    expect((failure as { diagnostics?: { sseTrailingBytes?: number } }).diagnostics?.sseTrailingBytes)
+      .toBe(new TextEncoder().encode(trailing).byteLength);
+  });
+
+  it("completes a reasoning-and-tool stream only after [DONE]", async () => {
+    const gateway = createGateway((async () => streamResponse([
+      { choices: [{ delta: { reasoning_content: "inspect" }, finish_reason: null }] },
+      { choices: [{ delta: { tool_calls: [{
+        index: 0,
+        id: "call_1",
+        function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" }
+      }] }, finish_reason: "tool_calls" }] }
+    ], true)) as typeof fetch, { maxRetries: 0 });
+
+    await expect(collectStream(gateway)).resolves.toEqual([
+      { type: "reasoning", delta: "inspect" },
+      { type: "tool_call", index: 0, call: {
+        id: "call_1", name: "read_file", arguments: { path: "a.ts" }
+      } },
+      expect.objectContaining({
+        type: "done",
+        response: expect.objectContaining({ finishReason: "tool_calls" })
+      })
+    ]);
   });
 
   it("restarts a partial stream at a stable prefix without duplicate deltas", async () => {
@@ -689,7 +806,11 @@ describe("OpenAI-compatible model gateway", () => {
         hasContent: false,
         hasReasoning: true,
         hasToolCall: false,
-        retryAttempts: 2
+        retryAttempts: 2,
+        sseChunks: 2,
+        sseFrames: 2,
+        ssePayloads: 2,
+        sseTrailingBytes: 0
       }
     });
     expect((failure as Error).message).toContain("ended before [DONE]");

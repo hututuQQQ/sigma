@@ -473,7 +473,10 @@ export class ModelEffectRunner {
     const usage = failedModelUsage(
       session, session.services.gateway, requestId, turn.budget, performance.now() - startedAt, session.services.modelRole, attempts
     );
-    await this.options.budgets.commit(session, reservationId, consumedBudget(usage, turn.budget));
+    // Failed attempts are measured after the provider lifecycle ends. Settle
+    // them through the measured path so an unexpectedly high attempt count is
+    // recorded as an overrun instead of leaving the durable reservation open.
+    await this.options.budgets.commitMeasured(session, reservationId, consumedBudget(usage, turn.budget));
     await this.options.emit(session, "usage.recorded", "runtime", usage);
   }
 
@@ -504,14 +507,22 @@ export class ModelEffectRunner {
     const stream = routeConstraints && gateway.streamWithConstraints
       ? gateway.streamWithConstraints(request, routeConstraints)
       : gateway.stream(request);
-    for await (const event of stream) {
-      if (signal.aborted) throw signal.reason;
-      observeModelStreamEvent(
-        streamState, event, session.services.gateway.provider, session.services.gateway.model
-      );
-      if (Date.now() - streamState.lastFlush >= 33) {
-        await flushModelStreamDeltas(this.options, session, turnId, streamState);
+    try {
+      for await (const event of stream) {
+        if (signal.aborted) throw signal.reason;
+        observeModelStreamEvent(
+          streamState, event, session.services.gateway.provider, session.services.gateway.model
+        );
+        if (Date.now() - streamState.lastFlush >= 33) {
+          await flushModelStreamDeltas(this.options, session, turnId, streamState);
+        }
       }
+    } catch (error) {
+      // A provider can end immediately after a short final chunk. Persist the
+      // already-observed semantic metadata before propagating the transport or
+      // protocol failure so the durable trace does not stop at reservation.
+      await flushModelStreamDeltas(this.options, session, turnId, streamState);
+      throw error;
     }
     if (!streamState.response) signal.throwIfAborted();
     await flushModelStreamDeltas(this.options, session, turnId, streamState);

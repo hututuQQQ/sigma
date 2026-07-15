@@ -386,6 +386,106 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.failure_kind, "needs_input")
             self.assertIn("external input required", context.error_message)
 
+    def test_agent_process_group_wrapper_waits_for_the_real_agent(self):
+        module = import_portable_agent_module()
+        agent = module.SigmaCliHarborAgent()
+        wrapped = agent._agent_command_with_process_record(["/usr/local/bin/agent", "run"])
+
+        self.assertIn("setsid --wait /bin/sh", wrapped)
+        self.assertIn("setsid --help", wrapped)
+        self.assertIn("grep -q -- '--wait'", wrapped)
+        self.assertIn("else exec /bin/sh", wrapped)
+
+    async def test_durable_run_failure_is_agent_failure_and_keeps_model_diagnostics(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            diagnostics = {
+                "provider": "provider-a",
+                "model": "model-a",
+                "category": "protocol",
+                "httpStatus": 200,
+                "doneReceived": False,
+                "transportEnded": True,
+                "lastEventType": "reasoning",
+                "hasContent": False,
+                "hasReasoning": True,
+                "hasToolCall": False,
+                "retryAttempts": 1,
+                "sseChunks": 1,
+                "sseBytes": 64,
+                "sseFrames": 1,
+                "ssePayloads": 1,
+                "sseTrailingBytes": 0,
+            }
+            events = [
+                {"kind": "event", "event": {
+                    "eventId": "model-failure",
+                    "sessionId": "failure-session",
+                    "runId": "failure-run",
+                    "seq": 1,
+                    "type": "model.failed",
+                    "payload": {
+                        "turnId": 1,
+                        "effectRevision": 1,
+                        "code": "model_stream_protocol_error",
+                        "message": "stream ended before terminal marker",
+                        "diagnostics": diagnostics,
+                    },
+                }},
+                {"kind": "event", "event": {
+                    "eventId": "run-failure",
+                    "sessionId": "failure-session",
+                    "runId": "failure-run",
+                    "seq": 2,
+                    "type": "run.failed",
+                    "payload": {
+                        "kind": "recoverable_failure",
+                        "code": "model_stream_protocol_error",
+                        "message": "stream ended before terminal marker",
+                    },
+                }},
+            ]
+            stdout = "\n".join([
+                *(json.dumps(event) for event in events),
+                json.dumps({"kind": "result", "result": {
+                    "status": "error",
+                    "finishReason": "recoverable_failure",
+                    "sessionId": "failure-session",
+                    "finalMessage": "stream ended before terminal marker",
+                }}),
+            ]) + "\n"
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(return_code=1, stdout=stdout, stderr="")
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="durable-failure")
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "^agent_failure:"):
+                await agent.run("run", env, context)
+
+            self.assertEqual(context.failure_kind, "agent_failure")
+            summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["model_failure"]["code"], "model_stream_protocol_error")
+            self.assertEqual(summary["model_failure"]["diagnostics"], diagnostics)
+            trace = [
+                json.loads(line)
+                for line in (logs_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["type"] for record in trace], ["model_end", "run_end"])
+            self.assertEqual(trace[0]["metadata"]["diagnostics"], diagnostics)
+
     async def test_terminal_model_and_tool_errors_keep_distinct_categories(self):
         module = import_portable_agent_module()
         for event_type, expected in (("model.failed", "api_error"), ("tool.failed", "tool_error")):

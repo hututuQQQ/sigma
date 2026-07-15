@@ -72,7 +72,9 @@ const modelFailureDiagnosticsSchema = z.object({
   sseBytes: z.number().int().nonnegative().optional(),
   sseFrames: z.number().int().nonnegative().optional(),
   ssePayloads: z.number().int().nonnegative().optional(),
-  sseTrailingBytes: z.number().int().nonnegative().optional()
+  sseTrailingBytes: z.number().int().nonnegative().optional(),
+  abortReason: z.string().min(1).max(800).optional(),
+  timeoutReason: z.string().min(1).max(800).optional()
 }).strict();
 
 const diagnosticSchema = z.discriminatedUnion("kind", [
