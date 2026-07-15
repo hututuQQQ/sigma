@@ -13,6 +13,12 @@ export interface StreamAttemptStatus {
   semantic: boolean;
   retryAllowed: boolean;
   retryAfter: string | null;
+  httpStatus?: number;
+  doneReceived: boolean;
+  lastEventType: string;
+  hasContent: boolean;
+  hasReasoning: boolean;
+  hasToolCall: boolean;
 }
 
 interface StreamCallParts {
@@ -123,6 +129,7 @@ export class StreamDecoder {
   private consumeText(kind: "content" | "reasoning", value: unknown): ModelStreamEvent[] {
     if (kind === "reasoning" && typeof value === "string") this.reasoningObserved = true;
     if (typeof value !== "string" || !value) return [];
+    this.status.lastEventType = kind;
     const current = kind === "content" ? this.content + value : this.reasoningContent + value;
     const delivered = kind === "content" ? this.progress.deliveredContent : this.progress.deliveredReasoning;
     if (!delivered.startsWith(current) && !current.startsWith(delivered)) {
@@ -131,6 +138,7 @@ export class StreamDecoder {
       throw new Error(`${this.provider} restarted${label} stream diverged before the prior stable boundary.`);
     }
     if (kind === "content") this.content = current; else this.reasoningContent = current;
+    if (kind === "content") this.status.hasContent = true; else this.status.hasReasoning = true;
     if (current.length <= delivered.length) return [];
     const delta = current.slice(delivered.length);
     if (kind === "content") this.progress.deliveredContent = current; else this.progress.deliveredReasoning = current;
@@ -151,6 +159,10 @@ export class StreamDecoder {
       this.calls.set(index, current);
       if (!current.name) continue;
       this.status.semantic = true;
+      this.status.hasToolCall = true;
+      // Tool-call deltas do not have the stable-prefix replay contract used for
+      // text, so replaying them could execute a duplicated or partial call.
+      this.status.retryAllowed = false;
       events.push({ type: "tool_call", index, call: {
         id: current.id ?? `call_${index}`,
         name: current.name,

@@ -1,7 +1,7 @@
 import type { RunOutcome } from "agent-protocol";
 import { beginNextRun } from "./run-transitions.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
-import { settleIdleWaiters } from "./runtime-waiters.js";
+import { rejectOutcomeWaiters, settleIdleWaiters } from "./runtime-waiters.js";
 import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 
@@ -60,6 +60,7 @@ export class RuntimeRunScheduler {
     await this.options.waitForQuiescence(session.identity.sessionId).catch(() => undefined);
     if (session.execution.running !== task) return;
     session.execution.running = null;
+    if (error !== undefined) rejectOutcomeWaiters(session, session.durable.runId, error);
     settleIdleWaiters(session, error);
   }
 }

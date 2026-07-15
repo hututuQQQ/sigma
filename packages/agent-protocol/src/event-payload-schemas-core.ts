@@ -53,6 +53,28 @@ const approvalResolvedSchema = z.object({
   effectRevision: z.number().int().nonnegative().optional()
 }).strict();
 
+const modelFailureDiagnosticsSchema = z.object({
+  provider: nonEmptyStringSchema.optional(),
+  model: nonEmptyStringSchema.optional(),
+  category: z.enum([
+    "rate_limit", "capacity", "network", "server", "timeout",
+    "auth", "configuration", "content_filter", "protocol"
+  ]).optional(),
+  httpStatus: z.number().int().min(100).max(599).optional(),
+  doneReceived: z.boolean().optional(),
+  transportEnded: z.boolean().optional(),
+  lastEventType: nonEmptyStringSchema.optional(),
+  hasContent: z.boolean().optional(),
+  hasReasoning: z.boolean().optional(),
+  hasToolCall: z.boolean().optional(),
+  retryAttempts: z.number().int().positive().optional(),
+  sseChunks: z.number().int().nonnegative().optional(),
+  sseBytes: z.number().int().nonnegative().optional(),
+  sseFrames: z.number().int().nonnegative().optional(),
+  ssePayloads: z.number().int().nonnegative().optional(),
+  sseTrailingBytes: z.number().int().nonnegative().optional()
+}).strict();
+
 const diagnosticSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("steering.restart"), ...turnSchema }).strict(),
   z.object({
@@ -137,7 +159,12 @@ export const coreEventPayloadSchemas = {
     toolCalls: z.array(modelToolCallSchema),
     usage: sharedSchemas.usageRecordSchema
   }).strict(),
-  "model.failed": z.object({ ...turnSchema, code: nonEmptyStringSchema, message: z.string() }).strict(),
+  "model.failed": z.object({
+    ...turnSchema,
+    code: nonEmptyStringSchema,
+    message: z.string(),
+    diagnostics: modelFailureDiagnosticsSchema.optional()
+  }).strict(),
   "tool.requested": z.object({
     callId: nonEmptyStringSchema, name: nonEmptyStringSchema, arguments: sharedSchemas.jsonValueSchema, ...turnSchema
   }).strict(),

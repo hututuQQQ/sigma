@@ -18,8 +18,13 @@ import {
   resolveWireProfile,
   type OpenAIWireProfile
 } from "./openai-wire.js";
-import { ssePayloads } from "./sse.js";
-import { ModelGatewayError, type ModelFailureCategory, type ModelPricing } from "./catalog.js";
+import { createSseStreamState, ssePayloads, type SseStreamState } from "./sse.js";
+import {
+  ModelGatewayError,
+  type ModelFailureCategory,
+  type ModelFailureDiagnostics,
+  type ModelPricing
+} from "./catalog.js";
 import {
   approximateTokenCount,
   normalizeModelResponse,
@@ -130,6 +135,56 @@ type DecodedStreamEvent =
   | Exclude<ModelStreamEvent, { type: "done" }>
   | { type: "done"; response: UnnormalizedModelResponse; rawUsage: RawUsage };
 
+function streamDiagnostics(
+  provider: string,
+  model: string,
+  status: StreamAttemptStatus,
+  sse: SseStreamState,
+  retryAttempts: number
+): ModelFailureDiagnostics {
+  return {
+    provider,
+    model,
+    category: "protocol",
+    ...(status.httpStatus === undefined ? {} : { httpStatus: status.httpStatus }),
+    doneReceived: status.doneReceived,
+    transportEnded: sse.transportEnded,
+    lastEventType: status.lastEventType,
+    hasContent: status.hasContent,
+    hasReasoning: status.hasReasoning,
+    hasToolCall: status.hasToolCall,
+    retryAttempts,
+    sseChunks: sse.chunksRead,
+    sseBytes: sse.bytesRead,
+    sseFrames: sse.framesRead,
+    ssePayloads: sse.dataPayloads,
+    sseTrailingBytes: sse.trailingBytes
+  };
+}
+
+function streamProtocolError(
+  provider: string,
+  model: string,
+  message: string,
+  status: StreamAttemptStatus,
+  sse: SseStreamState,
+  retryAttempts: number,
+  cause?: unknown
+): ModelGatewayError {
+  const detail = cause === undefined ? "" : ` Cause: ${errorSummary(cause)}`;
+  return Object.assign(
+    new ModelGatewayError(
+      `${message}${detail}`,
+      "protocol",
+      status.semantic || status.hasContent || status.hasReasoning || status.hasToolCall,
+      status.httpStatus,
+      cause === undefined ? undefined : { cause },
+      streamDiagnostics(provider, model, status, sse, retryAttempts)
+    ),
+    { code: "model_stream_protocol_error" }
+  );
+}
+
 export class OpenAIModelGateway implements ModelGateway {
   readonly provider: string;
   readonly model: string;
@@ -202,9 +257,18 @@ export class OpenAIModelGateway implements ModelGateway {
     const retries: StreamRetryCounts = { infrastructure: 0, partial: 0 };
     try {
       for (let attempt = 0; ; attempt += 1) {
-        const status: StreamAttemptStatus = { semantic: false, retryAllowed: true, retryAfter: null };
+        const status: StreamAttemptStatus = {
+          semantic: false,
+          retryAllowed: true,
+          retryAfter: null,
+          doneReceived: false,
+          lastEventType: "none",
+          hasContent: progress.deliveredContent.length > 0,
+          hasReasoning: progress.deliveredReasoning.length > 0,
+          hasToolCall: false
+        };
         try {
-          for await (const event of this.streamAttempt(request, scope.signal, progress, status)) {
+          for await (const event of this.streamAttempt(request, scope.signal, progress, status, attempt + 1)) {
             if (event.type === "done") {
               yield { type: "done", response: normalizeModelResponse({
                 spec: { pricing: this.pricing },
@@ -230,23 +294,68 @@ export class OpenAIModelGateway implements ModelGateway {
     request: ModelRequest,
     signal: AbortSignal,
     progress: StreamProgress,
-    status: StreamAttemptStatus
+    status: StreamAttemptStatus,
+    retryAttempts: number
   ): AsyncIterable<DecodedStreamEvent> {
     const body = await this.openStreamBody(request, signal, status);
     const decoder = new StreamDecoder(this.provider, progress, status, this.retryableFinishReasons);
-    for await (const payload of ssePayloads(body, signal, this.idleTimeoutMs)) {
+    const sse = createSseStreamState();
+    for await (const payload of ssePayloads(body, signal, this.idleTimeoutMs, sse)) {
       if (payload === "[DONE]") {
-        const done = decoder.done();
+        status.doneReceived = true;
+        status.lastEventType = "[DONE]";
+        let done: ReturnType<StreamDecoder["done"]>;
+        try {
+          done = decoder.done();
+        } catch (error) {
+          if ((error as { code?: unknown })?.code === "provider_resource_exhausted") {
+            throw Object.assign(error as Error, {
+              diagnostics: streamDiagnostics(this.provider, this.model, status, sse, retryAttempts)
+            });
+          }
+          throw streamProtocolError(
+            this.provider,
+            this.model,
+            `${this.provider} stream terminal payload could not be finalized.`,
+            status,
+            sse,
+            retryAttempts,
+            error
+          );
+        }
         if (done.type !== "done") throw new Error("Stream decoder returned a non-terminal done event.");
         yield { ...done, rawUsage: decoder.rawUsage() };
         return;
       }
-      for (const event of decoder.consume(payload)) {
+      status.lastEventType = "sse.data";
+      let decoded: ModelStreamEvent[];
+      try {
+        decoded = decoder.consume(payload);
+      } catch (error) {
+        throw streamProtocolError(
+          this.provider,
+          this.model,
+          `${this.provider} stream contained an invalid SSE data payload.`,
+          status,
+          sse,
+          retryAttempts,
+          error
+        );
+      }
+      for (const event of decoded) {
         if (event.type === "done") throw new Error("Stream decoder emitted an early terminal event.");
+        status.lastEventType = event.type;
         yield event;
       }
     }
-    throw new Error(`${this.provider} stream ended before [DONE].`);
+    throw streamProtocolError(
+      this.provider,
+      this.model,
+      `${this.provider} stream ended before [DONE] (transportEnded=${sse.transportEnded}, lastEventType=${status.lastEventType}, hasContent=${status.hasContent}, hasToolCall=${status.hasToolCall}, attempts=${retryAttempts}).`,
+      status,
+      sse,
+      retryAttempts
+    );
   }
 
   private async openStreamBody(
@@ -262,6 +371,7 @@ export class OpenAIModelGateway implements ModelGateway {
       signal
     );
     status.retryAfter = response.headers.get("retry-after");
+    status.httpStatus = response.status;
     if (!response.ok) {
       status.retryAllowed = response.status === 429 || response.status >= 500;
       const detail = await abortable(response.text(), signal);

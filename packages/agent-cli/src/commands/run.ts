@@ -102,12 +102,29 @@ async function streamSession(
   stdout: NodeJS.WritableStream,
   stderr: NodeJS.WritableStream,
   signal: AbortSignal
-): Promise<void> {
+): Promise<"run.completed" | "run.cancelled" | "run.failed" | "run.suspended"> {
+  let lastEventType = "none";
   for await (const event of runtime.subscribe(sessionId, signal)) {
+    lastEventType = event.type;
     writeEvent(event, config, stderr, stdout);
     if (event.type === "tool.approval_requested") await promptApproval(event, runtime, stdin, stderr);
-    if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") break;
+    if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") {
+      return event.type;
+    }
+    if (event.type === "run.suspended" && event.payload && typeof event.payload === "object"
+      && !Array.isArray(event.payload)
+      && (event.payload as Record<string, unknown>).kind === "needs_input") return event.type;
   }
+  throw Object.assign(new Error(
+    `CLI session event stream ended without a terminal event (session=${sessionId}, lastEventType=${lastEventType}).`
+  ), { code: "cli_terminal_event_missing" });
+}
+
+function expectedTerminalEvent(outcome: RunOutcome): "run.completed" | "run.cancelled" | "run.failed" | "run.suspended" {
+  if (outcome.kind === "completed") return "run.completed";
+  if (outcome.kind === "cancelled") return "run.cancelled";
+  if (outcome.kind === "needs_input") return "run.suspended";
+  return "run.failed";
 }
 
 function writeResult(
@@ -148,9 +165,16 @@ async function executeRun(
   const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr, streamAbort.signal);
   try {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: instruction, mode });
-    const outcome = await runtime.waitForOutcome(session.sessionId);
-    streamAbort.abort();
-    await stream;
+    const [outcome, terminalEvent] = await Promise.all([
+      runtime.waitForOutcome(session.sessionId),
+      stream
+    ]);
+    const expected = expectedTerminalEvent(outcome);
+    if (terminalEvent !== expected) {
+      throw Object.assign(new Error(
+        `CLI terminal event '${terminalEvent}' does not match outcome '${outcome.kind}' (expected '${expected}').`
+      ), { code: "cli_terminal_result_mismatch" });
+    }
     writeResult(outcome, session.sessionId, config, stdout);
     return exitCode(outcome);
   } finally {

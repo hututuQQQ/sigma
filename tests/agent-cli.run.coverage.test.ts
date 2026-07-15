@@ -82,6 +82,33 @@ class ScriptedGateway implements ModelGateway {
   }
 }
 
+class IncompleteStreamGateway implements ModelGateway {
+  readonly provider = "incomplete";
+  readonly model = "incomplete";
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 16_000,
+    maxOutputTokens: 2_000,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: false,
+    tokenizer: "approximate"
+  };
+
+  async complete(_request: ModelRequest): Promise<ModelResponse> {
+    throw new Error("not used");
+  }
+
+  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { type: "reasoning", delta: "unfinished" };
+  }
+
+  async countTokens(messages: ModelMessage[], tools: ModelToolDefinition[] = []): Promise<number> {
+    return JSON.stringify({ messages, tools }).length / 4;
+  }
+}
+
 function complete(summary: string): (request: ModelRequest) => ModelResponse {
   return (request) => typedCompletion(request, {
     id: `complete-${summary}`,
@@ -194,6 +221,7 @@ describe("run command branch coverage", () => {
     expect(code).toBe(0);
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
     expect(records.some((record) => record.type === "model.started")).toBe(true);
+    expect(records.some((record) => record.type === "run.completed")).toBe(true);
     expect(records.at(-1)?.type).toBe("result");
   });
 
@@ -297,8 +325,42 @@ describe("run command branch coverage", () => {
     expect(code).toBe(1);
     expect(JSON.parse(stdout.text())).toMatchObject({
       status: "error",
-      finalMessage: "Model route 'default' failed on 'deepseek/deepseek-v4-pro' (protocol)."
+      finalMessage: expect.stringContaining(
+        "Model route 'default' failed on 'deepseek/deepseek-v4-pro' (protocol)."
+      )
     });
+    expect(JSON.parse(stdout.text()).finalMessage).toContain("provider unavailable");
+  });
+
+  it("does not exit successfully when a model stream ends without a final response", async () => {
+    const root = await workspace("sigma-run-incomplete-stream-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true });
+    stdout.isTTY = true;
+    const code = await runCommand([
+      "fail an incomplete stream safely",
+      "--workspace", root,
+      "--permission-mode", "auto",
+      "--output-format", "stream-json"
+    ], {
+      stdin,
+      stdout,
+      stderr,
+      gatewayFactory: () => new IncompleteStreamGateway(),
+      executionBroker: createHostExecutionBroker()
+    });
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      status?: string;
+      payload?: { code?: string };
+    });
+
+    expect(code).toBe(1);
+    expect(records.find((record) => record.type === "model.failed")?.payload?.code)
+      .toBe("model_stream_incomplete");
+    expect(records.some((record) => record.type === "run.failed")).toBe(true);
+    expect(records.at(-1)).toMatchObject({ type: "result", status: "error" });
   });
 
   it("reports prompt-file read failures through stderr", async () => {

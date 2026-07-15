@@ -4,6 +4,58 @@ function timeoutError(message: string): Error {
   return error;
 }
 
+export interface SseStreamState {
+  chunksRead: number;
+  bytesRead: number;
+  framesRead: number;
+  dataPayloads: number;
+  transportEnded: boolean;
+  trailingBytes: number;
+}
+
+export function createSseStreamState(): SseStreamState {
+  return {
+    chunksRead: 0,
+    bytesRead: 0,
+    framesRead: 0,
+    dataPayloads: 0,
+    transportEnded: false,
+    trailingBytes: 0
+  };
+}
+
+interface FrameBoundary { index: number; length: number }
+
+function lineEndingLength(value: string, index: number): number {
+  if (value[index] === "\r") return value[index + 1] === "\n" ? 2 : 1;
+  if (value[index] === "\n" && value[index - 1] !== "\r") return 1;
+  return 0;
+}
+
+function nextFrameBoundary(value: string): FrameBoundary | undefined {
+  for (let index = 0; index < value.length; index += 1) {
+    const first = lineEndingLength(value, index);
+    if (first === 0) continue;
+    const second = lineEndingLength(value, index + first);
+    if (second > 0) return { index, length: first + second };
+    index += first - 1;
+  }
+  return undefined;
+}
+
+function payloadFromFrame(frame: string, state: SseStreamState): string | undefined {
+  state.framesRead += 1;
+  const data: string[] = [];
+  for (const line of frame.split(/\r\n|\r|\n/u)) {
+    if (!line.startsWith("data:")) continue;
+    const value = line.slice(5);
+    data.push(value.startsWith(" ") ? value.slice(1) : value);
+  }
+  if (data.length === 0) return undefined;
+  state.dataPayloads += 1;
+  return data.join("\n");
+}
+
 async function readChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   signal: AbortSignal,
@@ -35,7 +87,8 @@ async function readChunk(
 export async function *ssePayloads(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
-  idleTimeoutMs: number
+  idleTimeoutMs: number,
+  state: SseStreamState = createSseStreamState()
 ): AsyncIterable<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -46,24 +99,26 @@ export async function *ssePayloads(
       const { done, value } = await readChunk(reader, signal, idleTimeoutMs);
       if (done) {
         exhausted = true;
+        state.transportEnded = true;
         break;
       }
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        for (const line of frame.split("\n")) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data:")) yield trimmed.slice(5).trim();
-        }
-        boundary = buffer.indexOf("\n\n");
+      state.chunksRead += 1;
+      state.bytesRead += value.byteLength;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = nextFrameBoundary(buffer);
+      while (boundary) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        const payload = payloadFromFrame(frame, state);
+        if (payload !== undefined) yield payload;
+        boundary = nextFrameBoundary(buffer);
       }
     }
     buffer += decoder.decode();
-    for (const line of buffer.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("data:")) yield trimmed.slice(5).trim();
+    state.trailingBytes = new TextEncoder().encode(buffer).byteLength;
+    if (buffer.length > 0) {
+      const payload = payloadFromFrame(buffer, state);
+      if (payload !== undefined) yield payload;
     }
   } finally {
     if (!exhausted) await reader.cancel(signal.reason).catch(() => undefined);

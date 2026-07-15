@@ -34,7 +34,9 @@ CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
-FAILURE_KINDS = {"needs_input", "timeout", "tool_error", "api_error", "verifier_failure"}
+FAILURE_KINDS = {
+    "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure"
+}
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
 SUPPORTED_NETWORK_MODES = {"none", "full"}
@@ -494,6 +496,7 @@ class SigmaCliHarborAgent(BaseAgent):
         output_result: dict[str, Any] = {}
         summary_path: pathlib.Path | None = None
         trace_path: pathlib.Path | None = None
+        protocol_failure: dict[str, Any] | None = None
         try:
             await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
             await self._upload_instruction(environment, instruction)
@@ -517,9 +520,13 @@ class SigmaCliHarborAgent(BaseAgent):
             if reported_failure not in FAILURE_KINDS:
                 reported_failure = None
             event_failure = self._failure_kind_from_events(events, output_result)
+            protocol_failure = self._incomplete_terminal_protocol(result, events, output_result)
             # needs_input is a terminal protocol state, even when the CLI uses
             # a non-zero status to make Harbor stop waiting for user input.
-            if output_result.get("status") == "needs_input":
+            if protocol_failure is not None:
+                error_message = self._protocol_failure_message(protocol_failure)
+                failure_kind = "agent_failure"
+            elif output_result.get("status") == "needs_input":
                 error_message = str(output_result.get("finalMessage") or output_result.get("message") or "agent requires external input")
                 failure_kind = "needs_input"
             elif reported_failure is not None:
@@ -530,6 +537,13 @@ class SigmaCliHarborAgent(BaseAgent):
             ):
                 error_message = str(output_result.get("message") or output_result.get("finalMessage") or event_failure)
                 failure_kind = event_failure
+            elif output_result.get("status") in {"error", "failed", "cancelled"}:
+                error_message = str(
+                    output_result.get("finalMessage")
+                    or output_result.get("message")
+                    or f"agent returned terminal status {output_result.get('status')}"
+                )
+                failure_kind = "agent_failure"
             elif _return_code(result) != 0 and failure_kind is None:
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
                 failure_kind = "agent_failure"
@@ -614,6 +628,14 @@ class SigmaCliHarborAgent(BaseAgent):
         downloaded_summary = self._read_summary(summary_path)
         if downloaded_summary:
             summary = {**summary, **downloaded_summary}
+        if protocol_failure is not None:
+            summary.update({
+                "status": "error",
+                "finish_reason": "agent_protocol_incomplete",
+                "failure_kind": "agent_failure",
+                "last_error": error_message,
+                "protocol_failure": protocol_failure,
+            })
         if failure_kind is None and summary.get("failure_kind") in FAILURE_KINDS:
             failure_kind = summary["failure_kind"]
         if failure_kind is not None:
@@ -623,10 +645,15 @@ class SigmaCliHarborAgent(BaseAgent):
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
         self._populate_context(context, result, summary, error_message)
-        if timed_out:
+        if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
+        if protocol_failure is not None and summary_path is not None:
+            summary_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
 
         if cancelled_error is not None:
@@ -834,6 +861,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     **({"failureKind": failure} if failure else {}),
                 }
                 continue
+            if isinstance(value.get("status"), str):
+                output_result = dict(value)
+                continue
             if isinstance(value.get("type"), str) and value.get("payload") is not None:
                 events.append(value)
         return events, output_result
@@ -863,7 +893,81 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return "api_error"
             if event_type == "tool.failed":
                 return "tool_error"
+            if event_type in {"run.failed", "run.cancelled"}:
+                return "agent_failure"
         return None
+
+    def _incomplete_terminal_protocol(
+        self,
+        result: Any,
+        events: list[dict[str, Any]],
+        output_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if _return_code(result) != 0:
+            return None
+        terminal_event = next(
+            (event for event in reversed(events) if event.get("type") in TERMINAL_EVENT_TYPES),
+            None,
+        )
+        result_status = output_result.get("status")
+        has_result_status = isinstance(result_status, str) and result_status in {
+            "completed", "needs_input", "cancelled", "error", "failed"
+        }
+        if terminal_event is not None or has_result_status:
+            return None
+
+        model_start = next(
+            (event for event in reversed(events) if event.get("type") == "model.started"),
+            None,
+        )
+        model_payload = _event_payload(model_start) if model_start is not None else {}
+        model_failure = next(
+            (event for event in reversed(events) if event.get("type") == "model.failed"),
+            None,
+        )
+        failure_diagnostics = _event_payload(model_failure).get("diagnostics") \
+            if model_failure is not None else None
+        diagnostics = failure_diagnostics if isinstance(failure_diagnostics, dict) else {}
+        return {
+            "process_exit_code": 0,
+            "terminal_event_received": False,
+            "result_status_received": False,
+            "result_finish_reason": output_result.get("finishReason") or output_result.get("finish_reason"),
+            "last_event_type": events[-1].get("type") if events else None,
+            "provider": diagnostics.get("provider") or model_payload.get("provider"),
+            "model": diagnostics.get("model") or model_payload.get("model"),
+            "http_status": diagnostics.get("httpStatus"),
+            "done_received": diagnostics.get("doneReceived"),
+            "has_content": diagnostics.get("hasContent", any(
+                event.get("type") == "model.delta" for event in events
+            )),
+            "has_reasoning": diagnostics.get("hasReasoning", any(
+                event.get("type") == "model.reasoning_delta" for event in events
+            )),
+            "has_tool_call": diagnostics.get("hasToolCall", any(
+                event.get("type") == "tool.requested" for event in events
+            )),
+            "retry_attempts": diagnostics.get("retryAttempts"),
+            "retry_count": sum(
+                "retry" in str(event.get("type", "")).lower()
+                or "retry" in str(_event_payload(event).get("status", "")).lower()
+                for event in events
+            ),
+        }
+
+    def _protocol_failure_message(self, diagnostics: dict[str, Any]) -> str:
+        return "agent protocol incomplete: " + ", ".join([
+            f"exit_code={diagnostics.get('process_exit_code')}",
+            f"terminal_event_received={diagnostics.get('terminal_event_received')}",
+            f"result_status_received={diagnostics.get('result_status_received')}",
+            f"last_event_type={diagnostics.get('last_event_type')}",
+            f"provider={diagnostics.get('provider')}",
+            f"model={diagnostics.get('model')}",
+            f"done_received={diagnostics.get('done_received')}",
+            f"has_content={diagnostics.get('has_content')}",
+            f"has_tool_call={diagnostics.get('has_tool_call')}",
+            f"retry_attempts={diagnostics.get('retry_attempts')}",
+        ])
 
     def _session_id(self, events: list[dict[str, Any]], output_result: dict[str, Any]) -> str | None:
         value = output_result.get("sessionId")

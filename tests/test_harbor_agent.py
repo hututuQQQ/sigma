@@ -269,6 +269,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             async def exec_side_effect(command, **kwargs):
                 exec_commands.append((command, kwargs))
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stderr="",
+                    )
                 if command.startswith("test -f "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 if command.startswith("test -d "):
@@ -313,6 +319,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             async def exec_side_effect(command, **kwargs):
                 exec_commands.append((command, kwargs))
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stderr="",
+                    )
                 if command.startswith("test -f ") or command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
@@ -457,6 +469,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             async def exec_side_effect(command, **kwargs):
                 exec_commands.append((command, kwargs))
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stderr="",
+                    )
                 if command.startswith("test -f ") or command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
@@ -595,6 +613,63 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("tool_end", trace_types)
             self.assertIn("run_end", trace_types)
 
+    async def test_zero_exit_without_terminal_event_or_result_is_agent_protocol_failure(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            event = lambda seq, event_type, payload: {
+                "kind": "event",
+                "event": {
+                    "eventId": f"event-{seq}",
+                    "sessionId": "incomplete-session",
+                    "runId": "incomplete-run",
+                    "seq": seq,
+                    "type": event_type,
+                    "payload": payload,
+                },
+            }
+            stdout = "\n".join([
+                json.dumps(event(1, "model.started", {
+                    "provider": "provider-a", "model": "model-a", "turnId": 1
+                })),
+                json.dumps(event(2, "model.reasoning_delta", {
+                    "turnId": 1, "delta": "partial reasoning"
+                })),
+            ])
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(return_code=0, stdout=stdout, stderr="")
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="incomplete-protocol")
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "agent_failure: agent protocol incomplete"):
+                await agent.run("run", env, context)
+
+            self.assertEqual(context.exit_code, 1)
+            self.assertEqual(context.failure_kind, "agent_failure")
+            self.assertIn("last_event_type=model.reasoning_delta", context.error_message)
+            summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "error")
+            self.assertEqual(summary["finish_reason"], "agent_protocol_incomplete")
+            self.assertEqual(summary["failure_kind"], "agent_failure")
+            self.assertEqual(summary["protocol_failure"]["provider"], "provider-a")
+            self.assertEqual(summary["protocol_failure"]["model"], "model-a")
+            self.assertFalse(summary["protocol_failure"]["has_content"])
+            self.assertTrue(summary["protocol_failure"]["has_reasoning"])
+            self.assertFalse(summary["protocol_failure"]["has_tool_call"])
+
     async def test_run_resolves_checkpoint_recovery_without_interactive_input(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
@@ -676,6 +751,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             async def exec_side_effect(command, **kwargs):
                 commands.append(command)
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stderr="",
+                    )
                 if command.startswith("test -f ") or command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")

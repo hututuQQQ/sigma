@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelGateway, ModelRequest, ModelStreamEvent } from "../packages/agent-protocol/src/index.js";
-import { checkProviderHealth, createModelGateway, OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
+import {
+  checkProviderHealth,
+  createModelGateway,
+  createSseStreamState,
+  OpenAIModelGateway,
+  ssePayloads,
+  type OpenAIModelGatewayOptions
+} from "../packages/agent-model/src/index.js";
 
 function request(): ModelRequest {
   return { messages: [{ role: "user", content: "hello" }], signal: new AbortController().signal };
@@ -43,6 +50,36 @@ afterEach(() => {
 });
 
 describe("OpenAI-compatible model gateway", () => {
+  it("parses split CRLF and multi-line SSE frames without losing the terminal payload", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      "data: first\r",
+      "\ndata: second\r\n\r",
+      "\ndata: [DO",
+      "NE]"
+    ].map((value) => encoder.encode(value));
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      }
+    });
+    const state = createSseStreamState();
+    const payloads: string[] = [];
+    for await (const payload of ssePayloads(body, new AbortController().signal, 1_000, state)) {
+      payloads.push(payload);
+    }
+
+    expect(payloads).toEqual(["first\nsecond", "[DONE]"]);
+    expect(state).toMatchObject({
+      chunksRead: 4,
+      framesRead: 2,
+      dataPayloads: 2,
+      transportEnded: true
+    });
+  });
+
   it("retries transport failures for non-streaming requests", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     let attempts = 0;
@@ -620,6 +657,42 @@ describe("OpenAI-compatible model gateway", () => {
     expect(events.filter((event) => event.type === "content").map((event) => event.type === "content" ? event.delta : "")).toEqual(["hel", "lo"]);
     expect(events.at(-1)).toMatchObject({ type: "done", response: { message: { content: "hello" } } });
     expect(attempts).toBe(2);
+  });
+
+  it("classifies a reasoning-only stream that ends without [DONE] as an observable protocol failure", async () => {
+    let attempts = 0;
+    const gateway = createGateway((async () => {
+      attempts += 1;
+      return streamResponse([{ choices: [{ delta: { reasoning_content: "thinking" }, finish_reason: null }] }], false);
+    }) as typeof fetch, { maxRetries: 1 });
+    const events: ModelStreamEvent[] = [];
+    let failure: unknown;
+    try {
+      for await (const event of gateway.stream(request())) events.push(event);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(events).toEqual([{ type: "reasoning", delta: "thinking" }]);
+    expect(attempts).toBe(2);
+    expect(failure).toMatchObject({
+      code: "model_stream_protocol_error",
+      category: "protocol",
+      semanticDelta: true,
+      diagnostics: {
+        provider: "fake",
+        model: "fake",
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "reasoning",
+        hasContent: false,
+        hasReasoning: true,
+        hasToolCall: false,
+        retryAttempts: 2
+      }
+    });
+    expect((failure as Error).message).toContain("ended before [DONE]");
   });
 
   it("emits reasoning and usage while treating an unknown streamed finish reason as a protocol error", async () => {

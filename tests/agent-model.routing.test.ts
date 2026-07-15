@@ -348,7 +348,7 @@ describe("capability-aware model routing", () => {
     expect(afterDoneSecond).not.toHaveBeenCalled();
   });
 
-  it("falls back after an empty stream ends without a terminal response", async () => {
+  it("treats an empty stream without a terminal response as a protocol failure", async () => {
     const calls: string[] = [];
     const empty: ModelGateway = {
       ...gateway("deepseek/a", async () => response("unused")),
@@ -357,24 +357,21 @@ describe("capability-aware model routing", () => {
         yield* [] as ModelStreamEvent[];
       }
     };
-    const recovered: ModelGateway = {
-      ...gateway("glm/b", async () => response("recovered")),
-      async *stream() {
-        calls.push("glm/b");
-        yield { type: "done", response: response("recovered") };
-      }
-    };
     const router = new ModelRouter(
       [spec("deepseek/a"), spec("glm/b")],
       [route()],
-      (item) => item.id === "deepseek/a" ? empty : recovered
+      (item) => item.id === "deepseek/a" ? empty : gateway(item.id, async () => response("must-not-run"))
     );
-    const events: ModelStreamEvent[] = [];
-    for await (const event of router.stream("orchestrator", "main", request())) events.push(event);
-    expect(calls).toEqual(["deepseek/a", "glm/b"]);
-    expect(events.at(-1)).toMatchObject({
-      type: "done", response: { message: { content: "recovered" }, modelSpecId: "glm/b", attempt: 1 }
+    const consume = async (): Promise<void> => {
+      for await (const _event of router.stream("orchestrator", "main", request())) { /* consume */ }
+    };
+    await expect(consume()).rejects.toMatchObject({
+      category: "protocol",
+      semanticDelta: false,
+      attempts: 1,
+      diagnostics: { doneReceived: false, lastEventType: "none" }
     });
+    expect(calls).toEqual(["deepseek/a"]);
   });
 
   it("does not replay a stream that ends after semantic output", async () => {
@@ -394,7 +391,7 @@ describe("capability-aware model routing", () => {
       for await (const _event of router.stream("orchestrator", "main", request())) { /* consume */ }
     };
     await expect(consume()).rejects.toMatchObject({
-      category: "network", semanticDelta: true, attempts: 1
+      category: "protocol", semanticDelta: true, attempts: 1
     });
     expect(fallback).not.toHaveBeenCalled();
   });

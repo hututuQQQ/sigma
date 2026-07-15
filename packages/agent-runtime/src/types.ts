@@ -101,6 +101,7 @@ export interface QueuedFollowUp {
 export interface OutcomeWaiter {
   runId: string;
   resolve(outcome: RunOutcome): void;
+  reject(error: unknown): void;
 }
 
 export interface IdleWaiter {
