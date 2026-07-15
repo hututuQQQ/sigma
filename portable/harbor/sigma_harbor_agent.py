@@ -40,6 +40,9 @@ BROKER_PROTOCOL_VERSION = 1
 SUPPORTED_NETWORK_MODES = {"none", "full"}
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
+MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
+PROCESS_CLEANUP_TIMEOUT_SEC = 8
+PROCESS_TERM_GRACE_SEC = 1
 
 
 def _default_model(provider: str) -> str:
@@ -101,9 +104,11 @@ def _is_timeout_error(error: BaseException) -> bool:
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
         return True
     code = getattr(error, "code", None)
-    return isinstance(code, str) and code.lower() in {
+    if isinstance(code, str) and code.lower() in {
         "timeout", "timed_out", "process_timed_out", "broker_timeout", "process_deadline"
-    }
+    }:
+        return True
+    return "timed out" in str(error).lower() or "timeout" in str(error).lower()
 
 
 def _bounded_text(value: str, maximum: int = MAX_CONTEXT_TEXT_CHARS) -> str:
@@ -115,6 +120,57 @@ def _bounded_text(value: str, maximum: int = MAX_CONTEXT_TEXT_CHARS) -> str:
     head = available // 2
     tail = available - head
     return f"{value[:head]}{marker}{value[-tail:] if tail else ''}"
+
+
+def _bounded_utf8_text(value: str, maximum: int) -> str:
+    """Bound an artifact by encoded bytes while preserving valid UTF-8."""
+    if maximum <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()
+    marker = f"\n...[truncated original_chars={len(value)} original_bytes={len(encoded)}; sha256={digest}]...\n"
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= maximum:
+        return marker_bytes[:maximum].decode("utf-8", errors="ignore")
+    payload_budget = maximum - len(marker_bytes)
+    head_budget = payload_budget // 2
+    tail_budget = payload_budget - head_budget
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore") if tail_budget else ""
+    return f"{head}{marker}{tail}"
+
+
+def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
+    """Write an artifact without platform newline expansion."""
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(value)
+
+
+def _append_bounded_jsonl(path: pathlib.Path, record: dict[str, Any], maximum: int) -> None:
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    existing_size = path.stat().st_size if path.is_file() else 0
+    if existing_size + len(line) <= maximum:
+        with path.open("ab") as handle:
+            handle.write(line)
+        return
+    existing = path.read_bytes() if path.is_file() else b""
+    content = existing + line
+    digest = hashlib.sha256(content).hexdigest()
+    marker = (json.dumps({
+        "type": "trace_truncated",
+        "omitted_bytes_sha256": digest,
+    }, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(marker) >= maximum:
+        bounded = marker[:maximum]
+    else:
+        tail = content[-(maximum - len(marker)):].decode("utf-8", errors="ignore").encode("utf-8")
+        bounded = marker + tail
+        if len(bounded) > maximum:
+            bounded = bounded[:maximum]
+    with path.open("wb") as handle:
+        handle.write(bounded)
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -178,6 +234,152 @@ def _event_identity(event: dict[str, Any]) -> tuple[str, ...]:
     return ("raw", json.dumps(event, sort_keys=True, ensure_ascii=False))
 
 
+def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, Any]:
+    raw = json.dumps(event, ensure_ascii=False, sort_keys=True)
+    if len(raw) <= maximum:
+        return event
+    return {
+        "type": event.get("type"),
+        "eventId": event.get("eventId"),
+        "sessionId": event.get("sessionId"),
+        "seq": event.get("seq"),
+        "payload_summary": _text_artifact_summary(raw),
+        "truncated": True,
+    }
+
+
+class _OutputRecorder:
+    """Bounded, callback-driven accounting for a streaming agent command."""
+
+    def __init__(self, logs_dir: pathlib.Path) -> None:
+        self.logs_dir = logs_dir
+        self.stdout_path = logs_dir / "stdout.partial.log"
+        self.stderr_path = logs_dir / "stderr.partial.log"
+        self.trace_path = logs_dir / "trace.jsonl"
+        self.state_path = logs_dir / "runtime.partial.json"
+        self._buffers = {"stdout": "", "stderr": ""}
+        self._pending_stdout = ""
+        self._seen: set[tuple[str, ...]] = set()
+        self.events: list[dict[str, Any]] = []
+        self.output_result: dict[str, Any] = {}
+        self.last_event: dict[str, Any] | None = None
+        self.model_turns = 0
+        self.tool_calls = 0
+        self.usage: dict[str, Any] = {}
+        self.retry_count = 0
+        self.last_retry: dict[str, Any] | None = None
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        for path in (self.stdout_path, self.stderr_path, self.trace_path):
+            path.write_text("", encoding="utf-8")
+        self._write_state()
+
+    async def callback(self, text: str, stream: str) -> None:
+        self.record(text, stream)
+
+    def record(self, text: str, stream: str) -> None:
+        if stream not in self._buffers:
+            stream = "stdout"
+        self._buffers[stream] = _bounded_utf8_text(
+            self._buffers[stream] + (text or ""), MAX_PARTIAL_ARTIFACT_CHARS
+        )
+        path = self.stdout_path if stream == "stdout" else self.stderr_path
+        _write_utf8_artifact(path, self._buffers[stream])
+        if stream == "stdout" and text:
+            self._pending_stdout = _bounded_text(
+                self._pending_stdout + text, MAX_CONTEXT_TEXT_CHARS * 2
+            )
+            lines = self._pending_stdout.splitlines(keepends=True)
+            self._pending_stdout = ""
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                self._pending_stdout = lines.pop()
+            for line in lines:
+                self._consume_line(line)
+
+    def _consume_line(self, line: str) -> None:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(value, dict):
+            return
+        if value.get("kind") == "event" and isinstance(value.get("event"), dict):
+            event = value["event"]
+        elif isinstance(value.get("type"), str) and value.get("payload") is not None:
+            event = value
+        else:
+            event = None
+        if isinstance(event, dict) and isinstance(event.get("type"), str):
+            identity = _event_identity(event)
+            if identity in self._seen:
+                return
+            self._seen.add(identity)
+            self.events.append(event)
+            self.last_event = event
+            event_type = str(event.get("type"))
+            if event_type == "model.started":
+                self.model_turns += 1
+            if event_type in {"tool.requested", "tool.started"}:
+                self.tool_calls += 1
+            payload = _event_payload(event)
+            if event_type == "usage.recorded":
+                self.usage = {
+                    **self.usage,
+                    **payload,
+                    "cacheTokens": payload.get(
+                        "cacheTokens",
+                        _as_int(payload.get("cacheReadTokens"), 0)
+                        + _as_int(payload.get("cacheWriteTokens"), 0),
+                    ),
+                }
+            if "retry" in event_type.lower() or "retry" in str(payload.get("status", "")).lower():
+                self.retry_count += 1
+                self.last_retry = _bounded_event(event)
+            _append_bounded_jsonl(self.trace_path, {
+                "type": "event",
+                "seq": event.get("seq"),
+                "occurredAt": event.get("occurredAt"),
+                "metadata": {"event_type": event_type},
+                "sigma_event": _bounded_event(event),
+            }, MAX_TRACE_ARTIFACT_BYTES)
+            self._write_state()
+            return
+        if value.get("kind") == "result" or value.get("type") == "result":
+            candidate = value.get("result")
+            self.output_result = dict(candidate) if isinstance(candidate, dict) else dict(value)
+            self._write_state()
+            return
+        if value.get("kind") == "error":
+            error = value.get("error")
+            error_record = error if isinstance(error, dict) else value
+            code = error_record.get("code")
+            normalized = code.lower() if isinstance(code, str) else ""
+            failure = (
+                "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
+                else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
+                else None
+            )
+            self.output_result = {
+                "status": "error",
+                "message": str(error_record.get("message") or "agent CLI returned an error"),
+                **({"failureKind": failure} if failure else {}),
+            }
+            self._write_state()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "last_event": _bounded_event(self.last_event) if self.last_event else None,
+            "model_turns": self.model_turns,
+            "tool_calls": self.tool_calls,
+            "usage": dict(self.usage),
+            "retry_count": self.retry_count,
+            "last_retry": self.last_retry,
+        }
+
+    def _write_state(self) -> None:
+        state = self.snapshot()
+        self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 class SigmaCliHarborAgent(BaseAgent):
     """Run Sigma's packaged Node CLI as a Harbor external agent."""
 
@@ -193,6 +395,8 @@ class SigmaCliHarborAgent(BaseAgent):
         network_mode: str = "none",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
+        outer_trial_deadline_sec: int | float | None = None,
+        check_api: bool = True,
         **kwargs: Any,
     ) -> None:
         resolved_logs_dir = pathlib.Path(logs_dir) if logs_dir is not None else pathlib.Path.cwd() / ".agent" / "harbor"
@@ -219,8 +423,23 @@ class SigmaCliHarborAgent(BaseAgent):
         self.network_mode = network_mode
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
-        self.max_wall_time_sec = max_wall_time_sec
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
+        env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
+        parsed_outer_deadline = _as_int(
+            outer_trial_deadline_sec if outer_trial_deadline_sec is not None else env_outer_deadline,
+            0,
+        )
+        self.outer_trial_deadline_sec = parsed_outer_deadline if parsed_outer_deadline > 0 else None
+        requested_wall_time = max(1, _as_int(max_wall_time_sec, 7200))
+        if self.outer_trial_deadline_sec is not None:
+            requested_wall_time = min(
+                requested_wall_time,
+                max(1, self.outer_trial_deadline_sec - self.agent_timeout_grace_sec),
+            )
+        self.max_wall_time_sec = requested_wall_time
+        self.check_api = bool(check_api)
+        self._output_recorder: _OutputRecorder | None = None
+        self._process_cleanup: dict[str, Any] | None = None
         self.checkpoint_recovery = recovery_policy
         self.reviewer_waiver_reason = (
             str(reviewer_waiver_reason).strip() if reviewer_waiver_reason else None
@@ -262,21 +481,24 @@ class SigmaCliHarborAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
+        recorder = _OutputRecorder(self.logs_dir)
+        self._output_recorder = recorder
         env_vars = self._agent_env()
         result: Any | None = None
         error_message: str | None = None
         failure_kind: str | None = None
         timed_out = False
+        cancelled_error: asyncio.CancelledError | None = None
         artifact_warnings: list[str] = []
         events: list[dict[str, Any]] = []
         output_result: dict[str, Any] = {}
         summary_path: pathlib.Path | None = None
         trace_path: pathlib.Path | None = None
         try:
+            await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
             await self._upload_instruction(environment, instruction)
-            result = await self._run_agent_once(environment, env_vars, context)
-            events, output_result = self._parse_stream_output(result)
+            result = await self._run_agent_once(environment, env_vars, context, recorder)
+            events, output_result = self._merge_recorded_output(result, recorder)
             session_id = self._session_id(events, output_result)
             if session_id:
                 recovery = await self._recover_external_checkpoint(
@@ -311,44 +533,72 @@ class SigmaCliHarborAgent(BaseAgent):
             elif _return_code(result) != 0 and failure_kind is None:
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
                 failure_kind = "agent_failure"
+        except asyncio.CancelledError as exc:
+            cancelled_error = exc
+            timed_out = True
+            failure_kind = "timeout"
+            error_message = "agent execution cancelled by the Harbor outer trial deadline"
+            events, output_result = self._merge_recorded_output(result, recorder)
+            self._process_cleanup = await self._cleanup_remote_process(environment)
+            if self._process_cleanup.get("error"):
+                artifact_warnings.append(str(self._process_cleanup["error"]))
+            summary_path, trace_path = self._persist_timeout_artifacts(
+                result,
+                events,
+                None,
+                recorder.trace_path,
+                error_message,
+                recorder=recorder,
+                process_cleanup=self._process_cleanup,
+            )
         except Exception as exc:
             partial = getattr(exc, "result", None)
             if partial is None and (_stdout_text(exc) or _stderr_text(exc)):
                 partial = exc
             if partial is not None:
                 result = partial
-                events, output_result = self._parse_stream_output(partial)
+            events, output_result = self._merge_recorded_output(result, recorder)
             if _is_timeout_error(exc):
                 timed_out = True
                 error_message = str(exc) or "agent execution timed out"
                 failure_kind = "timeout"
+                self._process_cleanup = await self._cleanup_remote_process(environment)
+                if self._process_cleanup.get("error"):
+                    artifact_warnings.append(str(self._process_cleanup["error"]))
+                summary_path, trace_path = self._persist_timeout_artifacts(
+                    result,
+                    events,
+                    None,
+                    recorder.trace_path,
+                    error_message,
+                    recorder=recorder,
+                    process_cleanup=self._process_cleanup,
+                )
             else:
                 error_message = str(exc)
                 failure_kind = "agent_crash"
         finally:
-            for remote_path, filename in (
-                ("/tmp/agent/summary.json", "summary.json"),
-                ("/tmp/agent/trace.jsonl", "trace.jsonl"),
-            ):
+            if cancelled_error is None and not timed_out:
+                for remote_path, filename in (
+                    ("/tmp/agent/summary.json", "summary.json"),
+                    ("/tmp/agent/trace.jsonl", "trace.jsonl"),
+                ):
+                    try:
+                        downloaded = await self._download_if_present(environment, remote_path, filename)
+                        if filename == "summary.json":
+                            summary_path = downloaded
+                        else:
+                            trace_path = downloaded
+                    except Exception as exc:
+                        artifact_warnings.append(f"{filename}: {exc}")
                 try:
-                    downloaded = await self._download_if_present(environment, remote_path, filename)
-                    if filename == "summary.json":
-                        summary_path = downloaded
-                    else:
-                        trace_path = downloaded
+                    artifact_warnings.extend(await self._download_attempt_artifacts(environment))
                 except Exception as exc:
-                    artifact_warnings.append(f"{filename}: {exc}")
-            try:
-                artifact_warnings.extend(await self._download_attempt_artifacts(environment))
-            except Exception as exc:
-                artifact_warnings.append(f"attempts: {exc}")
-            summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
-            trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
-
-        if timed_out:
-            summary_path, trace_path = self._persist_timeout_artifacts(
-                result, events, summary_path, trace_path, error_message
-            )
+                    artifact_warnings.append(f"attempts: {exc}")
+                summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
+                trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
+                if trace_path == recorder.trace_path:
+                    trace_path = None
 
         derived_summary = self._summary_from_events(events, output_result)
         if events and (summary_path is None or trace_path is None):
@@ -370,12 +620,17 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["failure_kind"] = failure_kind
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
+        if self._process_cleanup is not None:
+            summary["process_cleanup"] = self._process_cleanup
         self._populate_context(context, result, summary, error_message)
         if timed_out:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
         self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
+
+        if cancelled_error is not None:
+            raise cancelled_error
 
         if failure_kind == "agent_crash":
             raise RuntimeError(f"agent_crash: {error_message or 'agent execution raised an exception.'}")
@@ -411,6 +666,94 @@ class SigmaCliHarborAgent(BaseAgent):
             command.append("--waive-reviewer")
         return command
 
+    def _agent_command_with_process_record(self, command: list[str]) -> str:
+        """Start only this agent in a private process group when setsid exists."""
+        process_file = "/tmp/agent/agent-process.json"
+        command_text = shlex.join(command)
+        group_body = (
+            "pid=$$; "
+            "pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' '); "
+            "case \"$pgid\" in ''|*[!0-9]*) pgid=0;; esac; "
+            f"printf '{{\"pid\":%s,\"pgid\":%s}}\\n' \"$pid\" \"$pgid\" > {shlex.quote(process_file)}; "
+            f"exec {command_text}"
+        )
+        pid_only_body = (
+            "pid=$$; "
+            f"printf '{{\"pid\":%s,\"pgid\":0}}\\n' \"$pid\" > {shlex.quote(process_file)}; "
+            f"exec {command_text}"
+        )
+        return "if command -v setsid >/dev/null 2>&1; then " + (
+            f"exec setsid /bin/sh -c {shlex.quote(group_body)}; "
+            f"else exec /bin/sh -c {shlex.quote(pid_only_body)}; fi"
+        )
+
+    async def _cleanup_remote_process(self, environment: BaseEnvironment) -> dict[str, Any]:
+        """Terminate the recorded agent process/group without touching the container."""
+        command = f"""
+set +e
+pid_file=/tmp/agent/agent-process.json
+if test ! -f "$pid_file"; then
+  printf '%s\n' '{{"pid_recorded":false,"status":"missing"}}'
+  exit 0
+fi
+pid=$(sed -n 's/.*\"pid\":\\([0-9][0-9]*\\).*/\\1/p' "$pid_file")
+pgid=$(sed -n 's/.*\"pgid\":\\([0-9][0-9]*\\).*/\\1/p' "$pid_file")
+term_target=pid
+if test -n "$pgid" && test "$pgid" -gt 1; then
+  kill -TERM -- -"$pgid" 2>/dev/null
+  term_target=group
+else
+  kill -TERM "$pid" 2>/dev/null
+fi
+term_status=$?
+sleep {PROCESS_TERM_GRACE_SEC}
+if test "$term_target" = group; then
+  kill -0 -- -"$pgid" 2>/dev/null
+  alive=$?
+  if test "$alive" -eq 0; then kill -KILL -- -"$pgid" 2>/dev/null; fi
+else
+  kill -0 "$pid" 2>/dev/null
+  alive=$?
+  if test "$alive" -eq 0; then kill -KILL "$pid" 2>/dev/null; fi
+fi
+kill_status=$?
+if test "$term_status" -ne 0 && test "$alive" -ne 0; then status=already_exited; else status=terminated; fi
+printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,"kill_status":%s,"alive_after_grace":%s,"status":"%s"}}\n' "$pid" "${{pgid:-0}}" "$term_target" "$term_status" "$kill_status" "$alive" "$status"
+""".strip()
+        try:
+            result = await asyncio.wait_for(
+                environment.exec(command, timeout_sec=PROCESS_CLEANUP_TIMEOUT_SEC),
+                timeout=PROCESS_CLEANUP_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            return {
+                "status": "cleanup_cancelled",
+                "error": "remote process cleanup was cancelled",
+                "command": _bounded_text(command),
+            }
+        except Exception as exc:
+            return {
+                "status": "cleanup_failed",
+                "error": _bounded_text(str(exc)),
+                "command": _bounded_text(command),
+            }
+        output = _stdout_text(result).strip()
+        if output:
+            try:
+                value = json.loads(output.splitlines()[-1])
+                if isinstance(value, dict):
+                    value.setdefault("command", _bounded_text(command))
+                    return value
+            except json.JSONDecodeError:
+                pass
+        return {
+            "status": "cleanup_failed",
+            "return_code": _return_code(result),
+            "command": _bounded_text(command),
+            "stdout": _bounded_text(output),
+            "stderr": _bounded_text(_stderr_text(result)),
+        }
+
     async def _resolve_workspace(self, environment: BaseEnvironment) -> str:
         result = await environment.exec("pwd -P", timeout_sec=30)
         stdout = _stdout_text(result).strip()
@@ -427,13 +770,34 @@ class SigmaCliHarborAgent(BaseAgent):
             raise RuntimeError(self._setup_failure_message("workspace_access", accessible))
         return workspace
 
-    async def _run_agent_once(self, environment: BaseEnvironment, env_vars: dict[str, str], context: AgentContext) -> Any:
+    def _merge_recorded_output(
+        self,
+        result: Any | None,
+        recorder: _OutputRecorder,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        parsed_events, parsed_result = self._parse_stream_output(result)
+        events = self._merge_events(recorder.events, parsed_events)
+        output_result = {**recorder.output_result, **parsed_result}
+        return events, output_result
+
+    async def _run_agent_once(
+        self,
+        environment: BaseEnvironment,
+        env_vars: dict[str, str],
+        context: AgentContext,
+        recorder: _OutputRecorder | None = None,
+    ) -> Any:
         command = self._agent_command(context)
-        return await environment.exec(
-            " ".join(shlex.quote(part) for part in command),
-            env=env_vars or None,
-            timeout_sec=self.max_wall_time_sec + self.agent_timeout_grace_sec,
-        )
+        command_text = self._agent_command_with_process_record(command)
+        kwargs = {
+            "env": env_vars or None,
+            "timeout_sec": self.max_wall_time_sec + self.agent_timeout_grace_sec,
+        }
+        callback_scope = getattr(environment, "scoped_output_callback", None)
+        if recorder is not None and callable(callback_scope):
+            with callback_scope(recorder.callback):
+                return await environment.exec(command_text, **kwargs)
+        return await environment.exec(command_text, **kwargs)
 
     def _parse_stream_output(self, result: Any | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -703,6 +1067,12 @@ class SigmaCliHarborAgent(BaseAgent):
             "output_tokens": output_tokens,
             "cache_tokens": cache_tokens,
             "cost_usd": cost_micro_usd / 1_000_000,
+            "last_event": _bounded_event(events[-1]) if events else None,
+            "retry_count": sum(
+                "retry" in str(event.get("type", "")).lower()
+                or "retry" in str(_event_payload(event).get("status", "")).lower()
+                for event in events
+            ),
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
         }
@@ -714,17 +1084,21 @@ class SigmaCliHarborAgent(BaseAgent):
         summary_path: pathlib.Path | None,
         trace_path: pathlib.Path | None,
         error_message: str | None,
+        recorder: _OutputRecorder | None = None,
+        process_cleanup: dict[str, Any] | None = None,
     ) -> tuple[pathlib.Path, pathlib.Path]:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        stdout = _stdout_text(result)
-        stderr = _stderr_text(result)
-        (self.logs_dir / "stdout.partial.log").write_text(
-            _bounded_text(stdout, MAX_PARTIAL_ARTIFACT_CHARS), encoding="utf-8"
-        )
-        (self.logs_dir / "stderr.partial.log").write_text(
-            _bounded_text(stderr, MAX_PARTIAL_ARTIFACT_CHARS), encoding="utf-8"
-        )
-        last_event = events[-1] if events else self._last_trace_event(trace_path)
+        stdout = _bounded_utf8_text(_stdout_text(result), MAX_PARTIAL_ARTIFACT_CHARS)
+        stderr = _bounded_utf8_text(_stderr_text(result), MAX_PARTIAL_ARTIFACT_CHARS)
+        if recorder is not None:
+            if not stdout and recorder.stdout_path.is_file():
+                stdout = _bounded_utf8_text(recorder.stdout_path.read_text(encoding="utf-8"), MAX_PARTIAL_ARTIFACT_CHARS)
+            if not stderr and recorder.stderr_path.is_file():
+                stderr = _bounded_utf8_text(recorder.stderr_path.read_text(encoding="utf-8"), MAX_PARTIAL_ARTIFACT_CHARS)
+        _write_utf8_artifact(self.logs_dir / "stdout.partial.log", stdout)
+        _write_utf8_artifact(self.logs_dir / "stderr.partial.log", stderr)
+        live_state = recorder.snapshot() if recorder is not None else {}
+        last_event = live_state.get("last_event") or (events[-1] if events else self._last_trace_event(trace_path))
         state = {
             "status": "timeout",
             "timed_out": True,
@@ -733,8 +1107,14 @@ class SigmaCliHarborAgent(BaseAgent):
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "last_event": last_event,
+            "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
+            "tool_calls": live_state.get("tool_calls", sum(event.get("type") in {"tool.requested", "tool.started"} for event in events)),
+            "usage": live_state.get("usage", {}),
+            "retry_count": live_state.get("retry_count", 0),
+            "last_retry": live_state.get("last_retry"),
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
+            "process_cleanup": process_cleanup,
             "recorded_at": time.time(),
         }
         (self.logs_dir / "timeout.json").write_text(
@@ -749,6 +1129,13 @@ class SigmaCliHarborAgent(BaseAgent):
             "failure_kind": "timeout",
             "last_error": error_message or "agent execution timed out",
             "timeout": state,
+            "last_event": last_event,
+            "model_turns": state["model_turns"],
+            "tool_calls": state["tool_calls"],
+            "usage": state["usage"],
+            "retry_count": state["retry_count"],
+            "last_retry": state["last_retry"],
+            "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
         })
@@ -757,13 +1144,12 @@ class SigmaCliHarborAgent(BaseAgent):
         trace_target = trace_path or (self.logs_dir / "trace.jsonl")
         existing = trace_target.read_text(encoding="utf-8") if trace_target.is_file() else ""
         if '"type": "run_timeout"' not in existing:
-            with trace_target.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({
-                    "type": "run_timeout",
-                    "occurredAt": time.time(),
-                    "metadata": {"timeout": state},
-                    "sigma_event": last_event,
-                }, ensure_ascii=False) + "\n")
+            _append_bounded_jsonl(trace_target, {
+                "type": "run_timeout",
+                "occurredAt": time.time(),
+                "metadata": {"timeout": state},
+                "sigma_event": last_event,
+            }, MAX_TRACE_ARTIFACT_BYTES)
         return summary_target, trace_target
 
     def _trace_records(
@@ -882,6 +1268,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 "/usr/local/bin/agent doctor --workspace",
                 shlex.quote(self._workspace),
                 "--json --strict",
+                *( ["--check-api"] if self.check_api else [] ),
             ]),
             env=self._agent_env() or None,
             timeout_sec=60,
@@ -915,8 +1302,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         return {
             "stage": stage,
             "exit_code": _return_code(result),
-            "stdout": _stdout_text(result),
-            "stderr": _stderr_text(result),
+            "stdout": _bounded_text(_stdout_text(result)),
+            "stderr": _bounded_text(_stderr_text(result)),
         }
 
     def _parse_doctor_json(self, stdout: str) -> Any:

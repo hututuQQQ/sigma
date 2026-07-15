@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -156,7 +158,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "mkdir -p /tmp/agent",
                     "command -v /usr/local/bin/agent >/dev/null 2>&1",
                     "/usr/local/bin/agent --help",
-                    "/usr/local/bin/agent doctor --workspace /app --json --strict",
+                    "/usr/local/bin/agent doctor --workspace /app --json --strict --check-api",
                 ],
             )
 
@@ -757,6 +759,144 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     os.environ.pop("SIGMA_BENCH_RUN_DIR", None)
                 else:
                     os.environ["SIGMA_BENCH_RUN_DIR"] = old_run_dir
+
+    async def test_streamed_output_callback_persists_incremental_accounting(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            active_callback = None
+            event = {
+                "kind": "event",
+                "event": {
+                    "eventId": "callback-event",
+                    "sessionId": "callback-session",
+                    "seq": 1,
+                    "type": "model.started",
+                    "payload": {"turnId": 1},
+                },
+            }
+            result = {"kind": "result", "result": {"status": "completed", "sessionId": "callback-session"}}
+
+            @contextlib.contextmanager
+            def scoped_output_callback(callback):
+                nonlocal active_callback
+                previous = active_callback
+                active_callback = callback
+                try:
+                    yield
+                finally:
+                    active_callback = previous
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    await active_callback(json.dumps(event)[:25], "stdout")
+                    await active_callback(json.dumps(event)[25:] + "\n", "stdout")
+                    await active_callback(json.dumps({
+                        "kind": "event",
+                        "event": {
+                            **event["event"],
+                            "eventId": "callback-usage",
+                            "seq": 2,
+                            "type": "usage.recorded",
+                            "payload": {"inputTokens": 3, "outputTokens": 2},
+                        },
+                    }) + "\n", "stdout")
+                    await active_callback(json.dumps(result) + "\n", "stdout")
+                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                scoped_output_callback=scoped_output_callback,
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="callback")
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
+            agent._workspace = "/app"
+
+            await agent.run("run", env, context)
+
+            self.assertEqual(context.model_turns, 1)
+            self.assertEqual(context.n_input_tokens, 3)
+            self.assertEqual(context.n_output_tokens, 2)
+            self.assertIn("model_start", (logs_dir / "trace.jsonl").read_text(encoding="utf-8"))
+            self.assertTrue((logs_dir / "stdout.partial.log").is_file())
+
+    async def test_cancelled_run_persists_timeout_artifacts_before_reraising(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            commands = []
+
+            async def exec_side_effect(command, **kwargs):
+                commands.append(command)
+                if "/usr/local/bin/agent run" in command:
+                    raise asyncio.CancelledError()
+                if "agent-process.json" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout='{"pid_recorded":true,"pid":42,"pgid":42,"status":"terminated"}\n',
+                        stderr="",
+                    )
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="cancelled")
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=logs_dir,
+                max_wall_time_sec=200,
+                agent_timeout_grace_sec=30,
+                outer_trial_deadline_sec=100,
+            )
+            agent._workspace = "/app"
+
+            with self.assertRaises(asyncio.CancelledError):
+                await agent.run("run", env, context)
+
+            self.assertEqual(agent.max_wall_time_sec, 70)
+            self.assertEqual(context.failure_kind, "timeout")
+            for filename in ("timeout.json", "summary.json", "trace.jsonl", "stdout.partial.log", "stderr.partial.log"):
+                self.assertTrue((logs_dir / filename).is_file(), filename)
+            timeout_state = json.loads((logs_dir / "timeout.json").read_text(encoding="utf-8"))
+            self.assertEqual(timeout_state["process_cleanup"]["pid"], 42)
+            self.assertIn("kill -TERM", "\n".join(commands))
+            self.assertIn("kill -KILL", "\n".join(commands))
+            self.assertNotIn("pkill", "\n".join(commands))
+
+    async def test_partial_logs_are_bounded(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            recorder.record("x" * (module.MAX_PARTIAL_ARTIFACT_CHARS + 100), "stdout")
+            recorder.record("y" * (module.MAX_PARTIAL_ARTIFACT_CHARS + 100), "stderr")
+            self.assertLessEqual(
+                (recorder.stdout_path).stat().st_size,
+                module.MAX_PARTIAL_ARTIFACT_CHARS,
+            )
+            self.assertLessEqual(
+                (recorder.stderr_path).stat().st_size,
+                module.MAX_PARTIAL_ARTIFACT_CHARS,
+            )
+
+    async def test_incremental_trace_is_bounded_and_keeps_tail(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.jsonl"
+            for index in range(20):
+                module._append_bounded_jsonl(trace_path, {"type": "event", "seq": index, "payload": "z" * 40}, 256)
+            self.assertLessEqual(trace_path.stat().st_size, 256)
+            trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
+            self.assertEqual(json.loads(trace_lines[-1]).get("seq"), 19)
 
 
 if __name__ == "__main__":

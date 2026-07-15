@@ -463,9 +463,27 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
+  const taskAgentTimeouts = (Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [])
+    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec))
+    .filter((value) => value !== null);
+  const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
+  const minimumOuterTrialDeadlineSec = taskAgentTimeouts.length > 0
+    ? Math.min(...taskAgentTimeouts) * appliedAgentTimeoutMultiplier
+    : null;
+  const safeChildDeadlineSec = minimumOuterTrialDeadlineSec === null
+    ? agentWallTimeSec
+    : Math.max(1, Math.floor(minimumOuterTrialDeadlineSec - cleanupGraceSec));
+  const effectiveAgentWallTimeSec = Math.min(agentWallTimeSec, safeChildDeadlineSec);
 
   return {
-    agent_wall_time_sec: agentWallTimeSec,
+    requested_agent_wall_time_sec: agentWallTimeSec,
+    agent_wall_time_sec: effectiveAgentWallTimeSec,
+    child_deadline_sec: effectiveAgentWallTimeSec,
+    outer_trial_deadline_sec: minimumOuterTrialDeadlineSec === null
+      ? null
+      : Math.floor(minimumOuterTrialDeadlineSec),
+    deadline_cleanup_grace_sec: cleanupGraceSec,
+    deadline_clamped: effectiveAgentWallTimeSec < agentWallTimeSec,
     agent_timeout_grace_sec: graceSec,
     cleanup_grace_sec: cleanupGraceSec,
     harness_timeout_sec: harnessTimeoutSec,
@@ -525,6 +543,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
 
   if (timeoutPlan?.agent_wall_time_sec) {
     agentKwargs.max_wall_time_sec = timeoutPlan.agent_wall_time_sec;
+  }
+  if (timeoutPlan?.outer_trial_deadline_sec) {
+    agentKwargs.outer_trial_deadline_sec = timeoutPlan.outer_trial_deadline_sec;
   }
   if (timeoutPlan?.cleanup_grace_sec !== undefined) {
     agentKwargs.agent_timeout_grace_sec = timeoutPlan.cleanup_grace_sec;
@@ -686,6 +707,9 @@ export function buildHarborArgs(options) {
   args.push("--ak", formatAgentKwarg("max_turns", "int", options.maxTurns, capabilities));
   args.push("--ak", formatAgentKwarg("command_timeout_sec", "int", options.commandTimeoutSec, capabilities));
   args.push("--ak", formatAgentKwarg("max_wall_time_sec", "int", timeoutPlan.agent_wall_time_sec, capabilities));
+  if (timeoutPlan.outer_trial_deadline_sec) {
+    args.push("--ak", formatAgentKwarg("outer_trial_deadline_sec", "int", timeoutPlan.outer_trial_deadline_sec, capabilities));
+  }
   args.push("--ak", formatAgentKwarg("harness_timeout_sec", "int", timeoutPlan.effective_harness_timeout_sec, capabilities));
   return args;
 }

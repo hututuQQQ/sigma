@@ -38,6 +38,7 @@ export interface CliConfig {
   runDeadlineSec: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
+  maxModelRetries: number;
   maxParallelTools: number;
   maxParallelAgents: number;
   budget: {
@@ -232,6 +233,7 @@ function cliConfig(
     runDeadlineSec: Number(values.runDeadlineSec),
     modelDeadlineSec: Number(values.modelDeadlineSec),
     streamIdleSec: Number(values.streamIdleSec),
+    maxModelRetries: Number(values.maxModelRetries),
     maxParallelTools: Number(values.maxParallelTools),
     maxParallelAgents: Number(values.maxParallelAgents),
     budget: {

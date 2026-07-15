@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelGateway, ModelRequest, ModelStreamEvent } from "../packages/agent-protocol/src/index.js";
-import { createModelGateway, OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
+import { checkProviderHealth, createModelGateway, OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
 
 function request(): ModelRequest {
   return { messages: [{ role: "user", content: "hello" }], signal: new AbortController().signal };
@@ -38,6 +38,7 @@ async function collectStream(model: ModelGateway, input: ModelRequest = request(
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -484,6 +485,51 @@ describe("OpenAI-compatible model gateway", () => {
       })
     }) as Response) as typeof fetch, { maxRetries: 0, requestTimeoutMs: 25 });
     await expect(gateway.complete(request())).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("bounds a fetch implementation that never resolves", async () => {
+    const startedAt = performance.now();
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      maxRetries: 3,
+      requestTimeoutMs: 25
+    });
+    await expect(gateway.complete(request())).rejects.toMatchObject({
+      name: "TimeoutError",
+      category: "timeout"
+    });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("honors a parent run abort before the model deadline", async () => {
+    const controller = new AbortController();
+    const reason = new Error("parent run deadline");
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      requestTimeoutMs: 1_000,
+      maxRetries: 3
+    });
+    const pending = gateway.complete({ ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(reason), 20);
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("returns structured provider health without exposing credentials", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "auto",
+      signal: new AbortController().signal,
+      requestTimeoutMs: 25,
+      fetchImpl: (async () => await new Promise<Response>(() => undefined)) as typeof fetch
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      endpointHost: "api.deepseek.com",
+      failureKind: "network_error",
+      errorCategory: "timeout"
+    });
+    expect(JSON.stringify(result)).not.toContain("health-secret");
   });
 
   it("cancels a pending stream read when the idle timeout expires", async () => {

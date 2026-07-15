@@ -185,8 +185,9 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
   { key: "allowUnsafeHostExec", flag: "allow-unsafe-host-exec", kind: "boolean", toml: "security.allow_unsafe_host_exec", description: "Home-only opt-in for unsafe host execution", defaultValue: false, parse: (raw) => booleanValue(raw, "allowUnsafeHostExec"), hidden: true },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
-  { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model request deadline in seconds", defaultValue: 300, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
-  { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 60, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
+  { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
+  { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 45, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
+  { key: "maxModelRetries", flag: "max-model-retries", env: "SIGMA_MAX_MODEL_RETRIES", toml: "runtime.max_model_retries", description: "Maximum model request retries", defaultValue: 2, parse: (raw) => numberValue(raw, "maxModelRetries", 0, 10) },
   { key: "maxParallelTools", flag: "max-parallel-tools", env: "SIGMA_MAX_PARALLEL_TOOLS", toml: "tools.max_parallel", description: "Maximum parallel tool calls", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelTools", 1, 32) },
   { key: "maxParallelAgents", flag: "max-parallel-agents", env: "SIGMA_MAX_PARALLEL_AGENTS", toml: "agents.max_parallel", description: "Maximum parallel child agents", defaultValue: 4, parse: (raw) => numberValue(raw, "maxParallelAgents", 1, 32) },
   { key: "maxInputTokens", flag: "max-input-tokens", env: "SIGMA_MAX_INPUT_TOKENS", toml: "budget.max_input_tokens", description: "Session-tree input token budget", defaultValue: 8_000_000, parse: (raw) => numberValue(raw, "maxInputTokens", 1) },
@@ -265,7 +266,7 @@ function validateTomlKeys(source: Record<string, unknown> | undefined, schema: r
 }
 
 const WORKSPACE_NUMERIC_CAPS = new Set([
-  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "maxParallelTools", "maxParallelAgents",
+  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "maxModelRetries", "maxParallelTools", "maxParallelAgents",
   "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls",
   "maxChildren", "maxDepth", "checkpointMaxFiles", "checkpointMaxBytes"
 ]);

@@ -61,8 +61,7 @@ function deadline(parent: AbortSignal, timeoutMs: number): { signal: AbortSignal
   const onAbort = (): void => controller.abort(parent.reason ?? new Error("Model request aborted."));
   if (parent.aborted) onAbort(); else parent.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => {
-    const error = new Error(`Model request exceeded ${timeoutMs}ms.`);
-    error.name = "TimeoutError";
+    const error = timeoutError(`Model request exceeded ${timeoutMs}ms.`);
     controller.abort(error);
   }, timeoutMs);
   return { signal: controller.signal, close: () => { clearTimeout(timer); parent.removeEventListener("abort", onAbort); } };
@@ -83,6 +82,46 @@ async function wait(ms: number, signal: AbortSignal): Promise<void> {
     const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
     if (signal.aborted) return onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function timeoutError(message: string): ModelGatewayError {
+  const error = new ModelGatewayError(message, "timeout");
+  error.name = "TimeoutError";
+  return error;
+}
+
+function errorSummary(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/Bearer\s+[^\s]+/giu, "Bearer [redacted]").slice(0, 800);
+}
+
+function normalizeGatewayError(provider: string, error: unknown): ModelGatewayError {
+  if (error instanceof ModelGatewayError) return error;
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return timeoutError(errorSummary(error));
+  }
+  return Object.assign(
+    new ModelGatewayError(`${provider} network request failed: ${errorSummary(error)}`, "network", false, undefined, {
+      cause: error
+    }),
+    { retryable: true }
+  );
+}
+
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason ?? new Error("Operation aborted.");
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      cleanup();
+      reject(signal.reason ?? new Error("Operation aborted."));
+    };
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); }
+    );
   });
 }
 
@@ -113,9 +152,9 @@ export class OpenAIModelGateway implements ModelGateway {
     this.apiKey = options.apiKey;
     this.apiKeyName = options.apiKeyName;
     this.capabilities = { ...defaultCapabilities, ...options.capabilities };
-    this.maxRetries = options.maxRetries ?? 3;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 300_000;
-    this.idleTimeoutMs = options.idleTimeoutMs ?? 60_000;
+    this.maxRetries = Math.max(0, Math.trunc(options.maxRetries ?? 2));
+    this.requestTimeoutMs = Math.max(1, Math.trunc(options.requestTimeoutMs ?? 120_000));
+    this.idleTimeoutMs = Math.max(1, Math.trunc(options.idleTimeoutMs ?? 45_000));
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.wireProfile = resolveWireProfile(options.wireProfile);
     this.retryableFinishReasons = new Set(this.wireProfile.retryableFinishReasons);
@@ -217,14 +256,18 @@ export class OpenAIModelGateway implements ModelGateway {
     signal: AbortSignal,
     status: StreamAttemptStatus
   ): Promise<ReadableStream<Uint8Array>> {
-    const response = await this.fetchImpl(
-      `${this.baseUrl}/chat/completions`,
-      this.fetchInit(bodyFor(request, this.model, true, this.wireProfile), signal)
+    const response = await abortable(
+      this.fetchImpl(
+        `${this.baseUrl}/chat/completions`,
+        this.fetchInit(bodyFor(request, this.model, true, this.wireProfile), signal)
+      ),
+      signal
     );
     status.retryAfter = response.headers.get("retry-after");
     if (!response.ok) {
       status.retryAllowed = response.status === 429 || response.status >= 500;
-      throw httpError(this.provider, response.status, (await response.text()).slice(0, 800), "stream ");
+      const detail = await abortable(response.text(), signal);
+      throw httpError(this.provider, response.status, detail.slice(0, 800), "stream ");
     }
     if (!response.body) throw new Error(`${this.provider} stream has no body.`);
     return response.body;
@@ -239,14 +282,20 @@ export class OpenAIModelGateway implements ModelGateway {
     retries: StreamRetryCounts
   ): Promise<void> {
     if (signal.aborted) throw signal.reason;
-    if (!status.retryAllowed) throw error;
+    const rawCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : "";
+    const normalized = rawCode.startsWith("provider_")
+      ? error as Error
+      : normalizeGatewayError(this.provider, error);
+    if (!status.retryAllowed) throw normalized;
     const partial = status.semantic || progress.deliveredContent.length > 0 || progress.deliveredReasoning.length > 0;
     if (partial) {
       retries.partial += 1;
-      if (retries.partial > 2) throw error;
+      if (retries.partial > this.maxRetries) throw normalized;
     } else {
       retries.infrastructure += 1;
-      if (retries.infrastructure > this.maxRetries) throw error;
+      if (retries.infrastructure > this.maxRetries) throw normalized;
     }
     await wait(retryDelay(attempt, status.retryAfter), signal);
   }
@@ -261,15 +310,19 @@ export class OpenAIModelGateway implements ModelGateway {
       for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
         let retryAfter: string | null = null;
         try {
-          const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, this.fetchInit(body, scope.signal));
+          const response = await abortable(
+            this.fetchImpl(`${this.baseUrl}/chat/completions`, this.fetchInit(body, scope.signal)),
+            scope.signal
+          );
           retryAfter = response.headers.get("retry-after");
           if (!response.ok) {
             const retryable = response.status === 429 || response.status >= 500;
-            const failure = httpError(this.provider, response.status, (await response.text()).slice(0, 800));
+            const detail = await abortable(response.text(), scope.signal);
+            const failure = httpError(this.provider, response.status, detail.slice(0, 800));
             if (!retryable) throw Object.assign(failure, { retryable: false });
             throw failure;
           }
-          const raw = await response.json() as Record<string, unknown>;
+          const raw = await abortable(response.json() as Promise<Record<string, unknown>>, scope.signal);
           const choice = Array.isArray(raw.choices) && raw.choices[0] && typeof raw.choices[0] === "object"
             ? raw.choices[0] as Record<string, unknown>
             : {};
@@ -279,7 +332,10 @@ export class OpenAIModelGateway implements ModelGateway {
           return { raw, attempt };
         } catch (error) {
           if (scope.signal.aborted) throw scope.signal.reason;
-          if ((error as { retryable?: unknown }).retryable === false || attempt === this.maxRetries) throw error;
+          const normalized = normalizeGatewayError(this.provider, error);
+          if ((normalized as { retryable?: unknown }).retryable === false || attempt === this.maxRetries) {
+            throw normalized;
+          }
           await wait(retryDelay(attempt, retryAfter), scope.signal);
         }
       }
@@ -326,5 +382,8 @@ function httpError(provider: string, status: number, detail: string, prefix = ""
   if (status === 401 || status === 403) category = "auth";
   else if (status === 429) category = "rate_limit";
   else if (status >= 500) category = "server";
-  return new ModelGatewayError(`${provider} ${prefix}HTTP ${status}: ${detail}`, category, false, status);
+  return Object.assign(
+    new ModelGatewayError(`${provider} ${prefix}HTTP ${status}: ${detail}`, category, false, status),
+    { retryable: status === 429 || status >= 500 }
+  );
 }

@@ -241,6 +241,35 @@ describe("Terminal-Bench command construction", () => {
     ).toContain("max_wall_time_sec=2700");
   });
 
+  it("caps a run-wide child deadline below the smallest Harbor outer deadline", () => {
+    const timeoutProbe = {
+      tasks: [
+        { agent_timeout_sec: 900 },
+        { agent_timeout_sec: 1200 }
+      ],
+      max_agent_timeout_sec: 1200
+    };
+    const plan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
+
+    expect(plan).toMatchObject({
+      requested_agent_wall_time_sec: 1800,
+      agent_wall_time_sec: 1320,
+      child_deadline_sec: 1320,
+      outer_trial_deadline_sec: 1440,
+      deadline_cleanup_grace_sec: 120,
+      deadline_clamped: true
+    });
+    expect(plan.agent_wall_time_sec).toBeLessThanOrEqual(
+      plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec
+    );
+    expect(buildHarborJobConfig({
+      mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
+    }, "jobs", plan, timeoutProbe).agents[0].kwargs).toMatchObject({
+      max_wall_time_sec: 1320,
+      outer_trial_deadline_sec: 1440
+    });
+  });
+
   it("gives long MVP tasks lenient wall time by default", () => {
     const timeoutPlan = computeHarborTimeoutPlan(
       {

@@ -34,6 +34,7 @@ function overrides(config: CliConfig): Partial<Record<string, ConfigValue>> {
     runDeadlineSec: config.runDeadlineSec,
     modelDeadlineSec: config.modelDeadlineSec,
     streamIdleSec: config.streamIdleSec,
+    maxModelRetries: config.maxModelRetries,
     maxParallelTools: config.maxParallelTools,
     maxParallelAgents: config.maxParallelAgents,
     maxInputTokens: config.budget.maxInputTokens,
