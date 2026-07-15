@@ -88,6 +88,35 @@ function validationFailureReport(request: ModelRequest): ModelResponse {
   };
 }
 
+function changedWorkspaceValidationFailureReport(request: ModelRequest): ModelResponse {
+  const evidence = currentRunEvidence(request);
+  const delta = evidence.find((item) => item.kind === "workspace_delta");
+  const validation = evidence.find((item) => item.kind === "validation");
+  if (!delta || !validation) throw new Error("The changed workspace and failed validation must both be in the ledger.");
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "complete-changed-validation-failure",
+        name: "complete_task",
+        arguments: {
+          summary: "The documentation change is applied and the failed validation is reported.",
+          criteria: [{
+            criterion: "The requested change was applied and its validation result was reported honestly.",
+            status: "met",
+            evidence: [
+              { ...delta, claim: "acceptance_met" },
+              { ...validation, claim: "validation_executed" }
+            ]
+          }]
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 class ScriptedGateway implements ModelGateway {
   readonly provider = "test";
   readonly model = "scripted";
@@ -448,7 +477,61 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[1]?.toolChoice).toBe("required");
     expect(gateway.requests[2]?.toolChoice).toBe("required");
     expect(gateway.requests[2]?.tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+      .toEqual(["complete_task"]);
+  }, 30_000);
+
+  it("completes a changed workspace after failed validation is typed and reported", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-change-failed-validation-"));
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "write-readme",
+            name: "write",
+            arguments: { path: "README.md", content: "# Updated\n" }
+          }]
+        },
+        finishReason: "tool_calls"
+      },
+      validationTurn("validate-readme-failure", [{ path: "README.md", expected: "# Different\n" }]),
+      {
+        message: {
+          role: "assistant",
+          content: "The documentation change is applied; validation ran and failed, and that failure is reported."
+        },
+        finishReason: "stop"
+      },
+      changedWorkspaceValidationFailureReport
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
+      permissionMode: "auto",
+      runDeadlineMs: 30_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Update README and validate it." });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "The documentation change is applied; validation ran and failed, and that failure is reported.",
+      evidence: expect.arrayContaining([
+        expect.objectContaining({ kind: "workspace_delta", status: "passed" }),
+        expect.objectContaining({ kind: "validation", status: "failed" })
+      ])
+    });
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[3]?.toolChoice).toBe("required");
+    expect(gateway.requests[3]?.tools?.map((tool) => tool.name)).toEqual(["complete_task"]);
+    expect(gateway.requests[3]?.messages.at(-1)?.content).toContain("no validation waiver exists");
+    const restored = await restoreStoredSession(store, session.sessionId, 30_000);
+    expect(restored.state.budget.reservations.filter((reservation) => reservation.status === "reserved"))
+      .toEqual([]);
   }, 30_000);
 
   it("bounds a malformed complete_task during terminal repair", async () => {

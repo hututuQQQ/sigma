@@ -230,7 +230,7 @@ export function incompleteModelCompletion(
       ...state,
       messages: [...messages, {
         role: "developer",
-        content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain successful durable evidence, or call request_user_input if a concrete user decision is required. Do not repeat the natural-language response and do not call complete_task before evidence exists."
+        content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain referenceable durable evidence, or call request_user_input if a concrete user decision with a supported follow-up operation is required. If validation executes and fails, the next terminal action must report it with complete_task and validation_executed; no validation-waiver input exists. Do not repeat the natural-language response and do not call complete_task before evidence exists."
       }],
       completionRepairAttempts: state.completionRepairAttempts + 1,
       completionRepair: { kind: "evidence_acquisition" },
@@ -251,7 +251,7 @@ export function incompleteModelCompletion(
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidence IDs when the task is finished, or call request_user_input with one concrete question when a user decision would materially change the result. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
+      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidenceId/kind/claim references when the task is finished, or call request_user_input with one concrete question only when a supported user decision would materially change the result. Evidence references within one criterion may use different claims. An exited failed validation must be reported as validation_executed and never as validation_passed or acceptance_met; no validation waiver exists. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
     completionRepair: {

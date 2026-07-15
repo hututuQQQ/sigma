@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import type {
-  BudgetReservation,
-  EvidenceRecord,
-  ReviewEvidence,
-  UsageRecord,
-  ValidationEvidence,
-  WorkspaceDeltaEvidence
+import {
+  evidenceSupportsClaim,
+  type BudgetReservation,
+  type EvidenceRecord,
+  type ReviewEvidence,
+  type UsageRecord,
+  type ValidationEvidence,
+  type WorkspaceDeltaEvidence
 } from "agent-protocol";
 import type { BudgetController } from "./budget-controller.js";
 import { consumedBudget } from "./model-accounting.js";
@@ -19,7 +20,10 @@ import {
   type ReviewerInput,
   type ReviewerPort
 } from "./reviewer.js";
-import { validationCoversDelta } from "./validation-policy.js";
+import {
+  latestValidationExecutionForDelta,
+  validationExecutionCoversDelta
+} from "./validation-policy.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { sessionMutationEvidence } from "./mutation-evidence.js";
@@ -151,16 +155,22 @@ export interface ReviewReadiness {
 export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
   const evidence = sessionMutationEvidence(session);
   const waivedIds = reviewerWaivedDeltaIds(evidence);
-  const reviewedIds = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
-    && item.data.verdict === "approved"
-    ? item.data.workspaceDeltaEvidenceIds : []));
+  const validations = evidence.filter((item): item is ValidationEvidence =>
+    item.kind === "validation" && evidenceSupportsClaim(item, "validation_executed"));
+  const reviewedIds = new Set(evidence.flatMap((item) => {
+    if (item.kind !== "review" || item.status !== "passed" || item.data.verdict !== "approved") return [];
+    return item.data.workspaceDeltaEvidenceIds.filter((deltaId) => {
+      const delta = evidence.find((candidate): candidate is WorkspaceDeltaEvidence =>
+        candidate.kind === "workspace_delta" && candidate.evidenceId === deltaId);
+      const latest = delta ? latestValidationExecutionForDelta(validations, delta) : undefined;
+      return latest?.status !== "failed" || item.data.validationEvidenceIds?.includes(latest.evidenceId);
+    });
+  }));
   const pending = evidence.filter((item): item is WorkspaceDeltaEvidence =>
     item.kind === "workspace_delta" && item.status === "passed"
     && !documentationOnly(item) && !reviewedIds.has(item.evidenceId) && !waivedIds.has(item.evidenceId));
-  const validations = evidence.filter((item): item is ValidationEvidence =>
-    item.kind === "validation" && item.status === "passed");
   const eligible = pending.filter((delta) => validations.some((validation) =>
-    validationCoversDelta(validation, delta)));
+    validationExecutionCoversDelta(validation, delta)));
   const eligibleIds = new Set(eligible.map((item) => item.evidenceId));
   const relevantValidations = validations.filter((item) =>
     item.data.workspaceDeltaEvidenceIds.some((evidenceId) => eligibleIds.has(evidenceId)));

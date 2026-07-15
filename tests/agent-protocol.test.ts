@@ -209,6 +209,18 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
       }
     };
     expect(evidenceSupportsClaim(passed)).toBe(true);
+    expect(evidenceSupportsClaim(passed, "validation_executed")).toBe(true);
+
+    const inconsistentPass: ValidationEvidence = {
+      ...passed,
+      evidenceId: "inconsistent-pass",
+      data: {
+        ...passed.data,
+        exitCode: 1,
+        termination: { ...passed.data.termination!, exitCode: 1 }
+      }
+    };
+    expect(evidenceSupportsClaim(inconsistentPass, "validation_passed")).toBe(false);
 
     const launchFailure: ValidationEvidence = {
       ...failed,

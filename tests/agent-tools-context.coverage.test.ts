@@ -129,10 +129,10 @@ describe("context, platform, and repository tool capabilities", () => {
         evidence: [{ evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_passed" }]
       }]
     }, new Map([[failed.evidenceId, failed]]))).toContain("failed-validation");
-    expect(parseCompletionProposal({
+    const independentlyTyped = parseCompletionProposal({
       summary: "invalid claim mix",
       criteria: [{
-        criterion: "Validation passed.",
+        criterion: "Validation was attempted after the requested work.",
         status: "met",
         claim: "validation_passed",
         evidence: [{
@@ -141,7 +141,76 @@ describe("context, platform, and repository tool capabilities", () => {
           claim: "validation_executed"
         }]
       }]
-    })).toBeNull();
+    });
+    expect(independentlyTyped).toMatchObject({
+      criteria: [{
+        claim: "validation_executed",
+        evidence: [{ claim: "validation_executed" }]
+      }]
+    });
+    expect(completionEvidenceError(independentlyTyped!, new Map([[failed.evidenceId, failed]])))
+      .toBeNull();
+  });
+
+  it("accepts mixed workspace and passed-validation references and diagnoses malformed evidence", () => {
+    const changed = {
+      evidenceId: "workspace-delta",
+      sessionId: "session",
+      runId: "run",
+      kind: "workspace_delta" as const,
+      status: "passed" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" as const, id: "checkpoint" },
+      summary: "changed",
+      data: {
+        checkpointId: "checkpoint",
+        delta: { added: [], modified: ["src/code.ts"], deleted: [] }
+      }
+    };
+    const passed: ValidationEvidence = {
+      evidenceId: "passed-validation",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool", id: "validate" },
+      summary: "passed",
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        exitCode: 0,
+        workspaceDeltaEvidenceIds: [changed.evidenceId]
+      }
+    };
+    const mixed = parseCompletionProposal({
+      summary: "changed and validated",
+      criteria: [{
+        criterion: "The change was applied and validation passed.",
+        status: "met",
+        evidence: [
+          { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
+          { evidenceId: passed.evidenceId, kind: passed.kind, claim: "validation_passed" }
+        ]
+      }]
+    });
+    expect(mixed).not.toBeNull();
+    expect(mixed?.criteria[0]?.claim).toBeUndefined();
+    expect(completionEvidenceError(mixed!, new Map([
+      [changed.evidenceId, changed],
+      [passed.evidenceId, passed]
+    ]))).toBeNull();
+
+    const malformed = parseCompletionProposal({
+      summary: "bad evidence",
+      criteria: [{
+        criterion: "Malformed reference is rejected.",
+        status: "met",
+        evidence: [{ evidenceId: "missing", kind: "validation", claim: "validation_passed" }]
+      }]
+    });
+    expect(completionEvidenceError(malformed!, new Map([[passed.evidenceId, passed]])))
+      .toMatch(/missing:validation:validation_passed[\s\S]*different references in one criterion may use different claims/u);
   });
 
   it("exposes an ID-free internal review request without asking the user to re-authorize code", async () => {

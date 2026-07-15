@@ -12,14 +12,21 @@ import {
   type ValidationEvidence,
   type WorkspaceDeltaEvidence
 } from "agent-protocol";
-import { completionEvidenceError, parseCompletionProposal } from "agent-tools";
+import {
+  completionEvidenceError,
+  parseCompletionProposal,
+  type CompletionProposal
+} from "agent-tools";
 import { sessionMutationEvidence } from "./mutation-evidence.js";
 import { reviewReadiness } from "./review-coordinator.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import { documentationOnly } from "./reviewer.js";
 import { failed } from "./tool-receipt.js";
 import type { RuntimeSession } from "./types.js";
-import { validationCoversDelta } from "./validation-policy.js";
+import {
+  latestValidationExecutionForDelta,
+  validationCoversDelta
+} from "./validation-policy.js";
 
 export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
   return session.durable.state.evidence.filter((item) =>
@@ -46,7 +53,7 @@ function availableEvidenceResult(session: RuntimeSession): JsonValue[] {
 }
 
 interface CompletionChangeFailure {
-  code: "validation_evidence_required" | "review_evidence_required";
+  code: "validation_evidence_required" | "validation_result_reporting_required" | "review_evidence_required";
   message: string;
   missing: JsonValue[];
   nextActions: JsonValue[];
@@ -54,29 +61,76 @@ interface CompletionChangeFailure {
 
 function validationChangeEvidenceFailure(
   evidence: readonly EvidenceRecord[],
-  deltas: readonly WorkspaceDeltaEvidence[]
+  deltas: readonly WorkspaceDeltaEvidence[],
+  proposal: CompletionProposal,
+  currentRunId: string
 ): CompletionChangeFailure | null {
-  const validations = evidence.filter((item): item is ValidationEvidence =>
-    item.kind === "validation" && item.status === "passed");
-  const unvalidated = deltas.filter((delta) => !validations.some((validation) =>
-    validationCoversDelta(validation, delta)));
-  if (unvalidated.length === 0) return null;
-  const ids = unvalidated.map((item) => item.evidenceId);
+  const validations = evidence.filter((item): item is ValidationEvidence => item.kind === "validation");
+  const latest = new Map(deltas.map((delta) => [
+    delta.evidenceId,
+    latestValidationExecutionForDelta(validations, delta)
+  ]));
+  const missing = deltas.filter((delta) => {
+    const validation = latest.get(delta.evidenceId);
+    if (!validation) return true;
+    if (validationCoversDelta(validation, delta)) return false;
+    return validation.status !== "failed" || validation.runId !== currentRunId;
+  });
+  if (missing.length > 0) {
+    const ids = missing.map((item) => item.evidenceId);
+    return {
+      code: "validation_evidence_required",
+      message: `Workspace deltas require a corresponding executed semantic validation: ${ids.join(", ")}.`,
+      missing: missing.map((item) => ({
+        requirement: "validation_executed",
+        workspaceDeltaEvidenceId: item.evidenceId,
+        checkpointId: item.data.checkpointId,
+        expectedEvidence: {
+          kind: "validation",
+          status: ["passed", "failed"],
+          claim: "validation_executed",
+          workspaceDeltaEvidenceIds: [item.evidenceId]
+        }
+      })),
+      nextActions: [{ tool: "validate", arguments: { workspaceDeltaEvidenceIds: ids } }]
+    };
+  }
+  const cited = new Set(proposal.criteria.flatMap((criterion) => criterion.evidence
+    .filter((reference) => reference.claim === "validation_executed")
+    .map((reference) => reference.evidenceId)));
+  const unreported = deltas.flatMap((delta) => {
+    const validation = latest.get(delta.evidenceId);
+    if (!validation || validationCoversDelta(validation, delta)) return [];
+    return validation.status === "failed" && cited.has(validation.evidenceId)
+      ? [] : [{ delta, validation }];
+  });
+  if (unreported.length === 0) return null;
+  const validationIds = [...new Set(unreported.map(({ validation }) => validation.evidenceId))];
   return {
-    code: "validation_evidence_required",
-    message: `Workspace deltas require corresponding passed validation evidence: ${ids.join(", ")}.`,
-    missing: unvalidated.map((item) => ({
-      requirement: "validation_passed",
-      workspaceDeltaEvidenceId: item.evidenceId,
-      checkpointId: item.data.checkpointId,
+    code: "validation_result_reporting_required",
+    message: "The latest validation result failed or was internally inconsistent and must be reported with its narrow validation_executed claim.",
+    missing: unreported.map(({ delta, validation }) => ({
+      requirement: "failed_validation_reported",
+      workspaceDeltaEvidenceId: delta.evidenceId,
+      checkpointId: delta.data.checkpointId,
       expectedEvidence: {
+        evidenceId: validation.evidenceId,
         kind: "validation",
-        status: "passed",
-        claim: "validation_passed",
-        workspaceDeltaEvidenceIds: [item.evidenceId]
+        status: validation.status,
+        claim: "validation_executed",
+        workspaceDeltaEvidenceIds: [delta.evidenceId]
       }
     })),
-    nextActions: [{ tool: "validate", arguments: { workspaceDeltaEvidenceIds: ids } }]
+    nextActions: [{
+      tool: "complete_task",
+      action: "cite_failed_validation_result",
+      evidenceReferences: validationIds.map((evidenceId) => ({
+        evidenceId,
+        kind: "validation",
+        claim: "validation_executed"
+      })),
+      note: "Keep acceptance/workspace evidence on acceptance_met. A failed validation never supports acceptance_met or validation_passed."
+    }]
   };
 }
 
@@ -86,9 +140,15 @@ function reviewChangeEvidenceFailure(
   deltas: readonly WorkspaceDeltaEvidence[]
 ): CompletionChangeFailure | null {
   const waivedIds = reviewerWaivedDeltaIds(evidence);
-  const reviewedIds = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
-    && item.data.verdict === "approved"
-    ? item.data.workspaceDeltaEvidenceIds : []));
+  const validations = evidence.filter((item): item is ValidationEvidence => item.kind === "validation");
+  const reviewedIds = new Set(evidence.flatMap((item) => {
+    if (item.kind !== "review" || item.status !== "passed" || item.data.verdict !== "approved") return [];
+    return item.data.workspaceDeltaEvidenceIds.filter((deltaId) => {
+      const delta = deltas.find((candidate) => candidate.evidenceId === deltaId);
+      const latest = delta ? latestValidationExecutionForDelta(validations, delta) : undefined;
+      return latest?.status !== "failed" || item.data.validationEvidenceIds?.includes(latest.evidenceId);
+    });
+  }));
   const unreviewed = deltas.filter((item) => !documentationOnly(item)
     && !reviewedIds.has(item.evidenceId) && !waivedIds.has(item.evidenceId));
   if (unreviewed.length === 0) return null;
@@ -150,12 +210,15 @@ function reviewChangeEvidenceFailure(
   };
 }
 
-function completionChangeEvidenceFailure(session: RuntimeSession): CompletionChangeFailure | null {
+function completionChangeEvidenceFailure(
+  session: RuntimeSession,
+  proposal: CompletionProposal
+): CompletionChangeFailure | null {
   const evidence = sessionMutationEvidence(session);
   const deltas = evidence.filter((item): item is WorkspaceDeltaEvidence =>
     item.kind === "workspace_delta" && item.status === "passed");
   if (deltas.length === 0) return null;
-  return validationChangeEvidenceFailure(evidence, deltas)
+  return validationChangeEvidenceFailure(evidence, deltas, proposal, session.durable.runId)
     ?? reviewChangeEvidenceFailure(session, evidence, deltas);
 }
 
@@ -194,7 +257,7 @@ export function completionFailure(
     .map((item) => [item.evidenceId, item] as const));
   const evidenceError = completionEvidenceError(proposal, availableEvidence);
   if (!evidenceError) {
-    const changeFailure = completionChangeEvidenceFailure(session);
+    const changeFailure = completionChangeEvidenceFailure(session, proposal);
     if (!changeFailure) return null;
     return failed(call, startedAt, changeFailure.message, changeFailure.code, {
       status: "rejected",
@@ -212,7 +275,12 @@ export function completionFailure(
   return failed(call, startedAt, `${evidenceError}\n${guidance}`, "invalid_completion_evidence", {
     status: "rejected",
     code: "invalid_completion_evidence",
-    availableEvidence: availableEvidenceResult(session)
+    availableEvidence: availableEvidenceResult(session),
+    nextActions: [{
+      tool: "complete_task",
+      action: "replace_invalid_evidence_references",
+      rule: "Copy evidenceId and kind exactly; put an independently allowed claim on each reference. Mixed reference claims within one criterion are valid."
+    }]
   });
 }
 
