@@ -45,6 +45,7 @@ export interface OpenAIModelGatewayOptions {
   maxRetries?: number;
   requestTimeoutMs?: number;
   idleTimeoutMs?: number;
+  activeStreamTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   wireProfile?: Partial<OpenAIWireProfile>;
   pricing?: ModelPricing;
@@ -61,12 +62,16 @@ const defaultCapabilities: ModelCapabilities = {
   tokenizer: "approximate"
 };
 
-function deadline(parent: AbortSignal, timeoutMs: number): { signal: AbortSignal; close: () => void } {
+function deadline(
+  parent: AbortSignal,
+  timeoutMs: number,
+  message = `Model request exceeded ${timeoutMs}ms.`
+): { signal: AbortSignal; close: () => void } {
   const controller = new AbortController();
   const onAbort = (): void => controller.abort(parent.reason ?? new Error("Model request aborted."));
   if (parent.aborted) onAbort(); else parent.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => {
-    const error = timeoutError(`Model request exceeded ${timeoutMs}ms.`);
+    const error = timeoutError(message);
     controller.abort(error);
   }, timeoutMs);
   return { signal: controller.signal, close: () => { clearTimeout(timer); parent.removeEventListener("abort", onAbort); } };
@@ -151,8 +156,11 @@ function addSseState(total: SseStreamState, attempt: SseStreamState): void {
   total.bytesRead += attempt.bytesRead;
   total.framesRead += attempt.framesRead;
   total.dataPayloads += attempt.dataPayloads;
-  total.transportEnded ||= attempt.transportEnded;
+  total.transportEnded = attempt.transportEnded;
   total.trailingBytes += attempt.trailingBytes;
+  total.firstByteAtMs ??= attempt.firstByteAtMs;
+  if (attempt.lastFrameAtMs !== undefined) total.lastFrameAtMs = attempt.lastFrameAtMs;
+  if (attempt.lastActivityAtMs !== undefined) total.lastActivityAtMs = attempt.lastActivityAtMs;
 }
 
 function streamDiagnostics(
@@ -165,11 +173,21 @@ function streamDiagnostics(
   error?: unknown,
   signal?: AbortSignal
 ): ModelFailureDiagnostics {
+  const observedAt = performance.now();
+  const elapsed = (at: number | undefined): number | undefined => at === undefined
+    ? undefined : Math.max(0, Math.round(at - sse.startedAtMs));
+  const firstByteMs = elapsed(sse.firstByteAtMs);
+  const lastFrameMs = elapsed(sse.lastFrameAtMs);
+  const idleSince = sse.lastActivityAtMs ?? sse.firstByteAtMs ?? sse.startedAtMs;
   return {
     provider,
     model,
     category,
     ...(status.httpStatus === undefined ? {} : { httpStatus: status.httpStatus }),
+    ...(firstByteMs === undefined ? {} : { firstByteMs }),
+    ...(lastFrameMs === undefined ? {} : { lastFrameMs }),
+    idleDurationMs: Math.max(0, Math.round(observedAt - idleSince)),
+    totalDurationMs: Math.max(0, Math.round(observedAt - sse.startedAtMs)),
     doneReceived: status.doneReceived,
     transportEnded: sse.transportEnded,
     lastEventType: status.lastEventType,
@@ -245,6 +263,7 @@ export class OpenAIModelGateway implements ModelGateway {
   private readonly maxRetries: number;
   private readonly requestTimeoutMs: number;
   private readonly idleTimeoutMs: number;
+  private readonly activeStreamTimeoutMs?: number;
   private readonly fetchImpl: typeof fetch;
   private readonly wireProfile: OpenAIWireProfile;
   private readonly retryableFinishReasons: ReadonlySet<string>;
@@ -260,6 +279,8 @@ export class OpenAIModelGateway implements ModelGateway {
     this.maxRetries = Math.max(0, Math.trunc(options.maxRetries ?? 2));
     this.requestTimeoutMs = Math.max(1, Math.trunc(options.requestTimeoutMs ?? 120_000));
     this.idleTimeoutMs = Math.max(1, Math.trunc(options.idleTimeoutMs ?? 45_000));
+    this.activeStreamTimeoutMs = options.activeStreamTimeoutMs === undefined
+      ? undefined : Math.max(1, Math.trunc(options.activeStreamTimeoutMs));
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.wireProfile = resolveWireProfile(options.wireProfile);
     this.retryableFinishReasons = new Set(this.wireProfile.retryableFinishReasons);
@@ -302,13 +323,11 @@ export class OpenAIModelGateway implements ModelGateway {
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     if (!this.apiKey) throw missingKeyError(this.provider, this.apiKeyName);
     const startedAt = performance.now();
-    const scope = deadline(request.signal, this.requestTimeoutMs);
     const progress: StreamProgress = { deliveredContent: "", deliveredReasoning: "" };
     const retries: StreamRetryCounts = { infrastructure: 0, partial: 0 };
     const transport = createSseStreamState();
     let lastEventType = "none";
-    try {
-      for (let attempt = 0; ; attempt += 1) {
+    for (let attempt = 0; ; attempt += 1) {
         const status: StreamAttemptStatus = {
           semantic: false,
           retryAllowed: true,
@@ -322,7 +341,7 @@ export class OpenAIModelGateway implements ModelGateway {
         const sse = createSseStreamState();
         try {
           for await (const event of this.streamAttempt(
-            request, scope.signal, progress, status, sse, attempt + 1
+            request, request.signal, progress, status, sse, attempt + 1
           )) {
             if (event.type === "done") {
               yield { type: "done", response: normalizeModelResponse({
@@ -340,12 +359,9 @@ export class OpenAIModelGateway implements ModelGateway {
           lastEventType = status.lastEventType;
           addSseState(transport, sse);
           await this.retryStream(
-            error, attempt, scope.signal, progress, status, retries, transport, attempt + 1
+            error, attempt, request.signal, progress, status, retries, transport, attempt + 1
           );
         }
-      }
-    } finally {
-      scope.close();
     }
   }
 
@@ -357,9 +373,13 @@ export class OpenAIModelGateway implements ModelGateway {
     sse: SseStreamState,
     retryAttempts: number
   ): AsyncIterable<DecodedStreamEvent> {
-    const body = await this.openStreamBody(request, signal, status);
+    const body = await this.openFirstByteBody(request, signal, status, sse.startedAtMs);
     const decoder = new StreamDecoder(this.provider, progress, status, this.retryableFinishReasons);
-    for await (const payload of ssePayloads(body, signal, this.idleTimeoutMs, sse)) {
+    for await (const payload of ssePayloads(body, signal, {
+      firstByteTimeoutMs: this.requestTimeoutMs,
+      idleTimeoutMs: this.idleTimeoutMs,
+      ...(this.activeStreamTimeoutMs === undefined ? {} : { activeTimeoutMs: this.activeStreamTimeoutMs })
+    }, sse)) {
       if (payload === "[DONE]") {
         status.doneReceived = true;
         status.lastEventType = "[DONE]";
@@ -415,6 +435,25 @@ export class OpenAIModelGateway implements ModelGateway {
       sse,
       retryAttempts
     );
+  }
+
+  private async openFirstByteBody(
+    request: ModelRequest,
+    signal: AbortSignal,
+    status: StreamAttemptStatus,
+    startedAtMs: number
+  ): Promise<ReadableStream<Uint8Array>> {
+    const firstByteRemainingMs = Math.max(1, this.requestTimeoutMs - (performance.now() - startedAtMs));
+    const firstByteScope = deadline(
+      signal,
+      firstByteRemainingMs,
+      `Model stream first byte exceeded ${this.requestTimeoutMs}ms.`
+    );
+    try {
+      return await this.openStreamBody(request, firstByteScope.signal, status);
+    } finally {
+      firstByteScope.close();
+    }
   }
 
   private async openStreamBody(

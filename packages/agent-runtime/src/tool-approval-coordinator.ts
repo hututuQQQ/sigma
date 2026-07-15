@@ -72,7 +72,8 @@ function immediateApprovalDecision(
   if (mandatory) return mandatory;
   const perCall = effects.some((effect) => effect === "network" || effect === "open_world");
   const effectGrant = effects.slice().sort().join("\0");
-  return !perCall && (descriptor.approval === "auto" || permissionMode === "auto"
+  if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
+  return !perCall && (descriptor.approval === "auto"
     || session.interaction.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
 }
 
@@ -87,7 +88,7 @@ function validApprovalGrant(
   return Boolean(grant
     && sameApprovalBinding(grant, expectedBinding)
     && grant.callId === expectedBinding.callId
-    && grant.authority === "user"
+    && (grant.authority === "user" || grant.authority === "runtime")
     && networkApproved
     && unsafeApproved);
 }
@@ -128,7 +129,7 @@ async function cleanUpFailedApprovalRequest(
 }
 
 export class ToolApprovalCoordinator {
-  constructor(private readonly options: Pick<EffectRunnerOptions, "runtime" | "emit">) {}
+  constructor(private readonly options: Pick<EffectRunnerOptions, "runtime" | "emit" | "finish">) {}
 
   async decision(
     session: RuntimeSession,
@@ -203,7 +204,16 @@ export class ToolApprovalCoordinator {
     const immediate = forcePrompt
       ? undefined
       : immediateApprovalDecision(session, descriptor, effects, permissionMode);
-    if (immediate) return immediate;
+    if (immediate) {
+      return requiresPerCallApproval(plan)
+        ? await this.resolveAutomatically(session, descriptor, effects, request, modelTurn, plan)
+        : immediate;
+    }
+    if (this.options.runtime.interactiveApprovals === false) {
+      return await this.suspendWithoutInteractiveApproval(
+        session, descriptor, effects, request, modelTurn, plan
+      );
+    }
     let resolve!: (value: "allow" | "deny" | "always_allow") => void;
     const pending = new Promise<"allow" | "deny" | "always_allow">((accept) => { resolve = accept; });
     if (session.interaction.approvals.has(requestId)) throw new Error(`Duplicate approval '${requestId}'.`);
@@ -221,6 +231,7 @@ export class ToolApprovalCoordinator {
         requestId, callId: requestId, toolName: descriptor.name, arguments: request.arguments,
         effects,
         plan,
+        approvalMode: "human",
         reason: `Effects: ${effects.join(", ")}; writes: ${plan.writePaths.join(", ") || "none"}; rollback scope: ${plan.checkpointScope.join(", ") || "none"}${plan.checkpointAction ? `; checkpoint: ${plan.checkpointAction.checkpointId}` : ""}`,
         ...turnPayload(modelTurn)
       });
@@ -239,6 +250,71 @@ export class ToolApprovalCoordinator {
           this.options, session, requestId, modelTurn, waiter, requestWasDurable, signal
         );
       }
+    }
+  }
+
+  private async resolveAutomatically(
+    session: RuntimeSession,
+    descriptor: ToolDescriptor,
+    effects: ToolDescriptor["possibleEffects"],
+    request: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    plan: ToolCallPlan
+  ): Promise<"allow"> {
+    const binding = createApprovalBinding(
+      session.identity.sessionId, session.durable.runId, request, plan, effects
+    );
+    await this.options.emit(session, "tool.approval_requested", "runtime", {
+      requestId: request.id, callId: request.id, toolName: descriptor.name, arguments: request.arguments,
+      effects, plan, approvalMode: "automatic",
+      reason: `Permission mode auto authorized the planned effects: ${effects.join(", ")}.`,
+      ...turnPayload(modelTurn)
+    });
+    await this.options.emit(session, "tool.approval_resolved", "runtime", {
+      requestId: request.id, callId: request.id, decision: "allow", ...turnPayload(modelTurn)
+    });
+    session.interaction.callApprovals.set(request.id, {
+      ...binding,
+      authority: "runtime",
+      networkApproved: plan.network === "full",
+      unsafeHostExecApproved: false
+    });
+    return "allow";
+  }
+
+  private async suspendWithoutInteractiveApproval(
+    session: RuntimeSession,
+    descriptor: ToolDescriptor,
+    effects: ToolDescriptor["possibleEffects"],
+    request: ModelToolCall,
+    modelTurn: ActiveModelTurn,
+    plan: ToolCallPlan
+  ): Promise<never> {
+    const remainingDeadlineMs = pauseRunDeadline(session);
+    let suspended = false;
+    try {
+      await this.options.emit(session, "tool.approval_requested", "runtime", {
+        requestId: request.id, callId: request.id, toolName: descriptor.name, arguments: request.arguments,
+        effects, plan, approvalMode: "human",
+        reason: `Human approval is required for effects: ${effects.join(", ")}.`,
+        ...turnPayload(modelTurn)
+      });
+      await this.options.emit(session, "tool.approval_resolved", "runtime", {
+        requestId: request.id, callId: request.id, decision: "cancelled", ...turnPayload(modelTurn)
+      });
+      const message = `Tool '${descriptor.name}' requires human approval, but this runtime surface is non-interactive.`;
+      const committed = await this.options.finish(session, {
+        kind: "needs_input", requestId: request.id, message
+      }, undefined, { remainingDeadlineMs });
+      if (!committed) {
+        throw Object.assign(new Error("Runtime could not commit a non-interactive approval suspension."), {
+          code: "approval_suspension_failed"
+        });
+      }
+      suspended = true;
+      throw Object.assign(new Error(message), { code: "approval_needs_input" });
+    } finally {
+      if (!suspended) armRunDeadline(session);
     }
   }
 }

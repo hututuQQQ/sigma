@@ -95,7 +95,12 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
       });
     }
   } catch (error) {
-    await finishOrThrow(options, session, runtimeFailureOutcome(error, controller.signal));
+    // Raw approval suspension populates durable state while an interactive
+    // waiter is still live. Only finish() records recovery.lastOutcome, which
+    // distinguishes a headless terminal NeedsInput from that transient pause.
+    if (!session.recovery.lastOutcome) {
+      await finishOrThrow(options, session, runtimeFailureOutcome(error, controller.signal));
+    }
   } finally {
     if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
     session.execution.deadlineTimer = null;

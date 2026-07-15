@@ -47,6 +47,7 @@ export interface RuntimeCompositionConfig {
   runDeadlineSec: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
+  streamActiveSec?: number;
   maxModelRetries?: number;
   maxParallelTools: number;
   maxParallelAgents: number;
@@ -71,7 +72,8 @@ export interface RuntimeCompositionConfig {
 }
 
 export interface RuntimeFactoryDeps {
-  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
+  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string; maxRetries: number;
+    requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;
   hookDefinitions?: readonly HookDefinition[];
@@ -90,7 +92,7 @@ export interface ConfiguredRuntime {
   close(): Promise<void>;
 }
 
-export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; }
+export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; interactiveApprovals?: boolean; }
 
 interface PreparedComposition {
   workspace: string;
@@ -155,6 +157,7 @@ export async function createConfiguredRuntime(
       storeRootDir,
       tools,
       permissionMode: customization.permissionMode,
+      interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
       runDeadlineMs: config.runDeadlineSec * 1_000,
       maxParallelTools: config.maxParallelTools,
       budgetLimits: customization.budgetLimits,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -43,6 +44,8 @@ SUPPORTED_NETWORK_MODES = {"none", "full"}
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
+MAX_STREAM_LINE_CHARS = 65_536
+MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
 PROCESS_TERM_GRACE_SEC = 1
 
@@ -250,6 +253,51 @@ def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, An
     }
 
 
+def _decode_stream_line(
+    line: str,
+    chunks: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, dict) or value.get("kind") != "chunk":
+        return [value] if isinstance(value, dict) else []
+    if value.get("encoding") != "base64-json-utf8":
+        return []
+    record_id = value.get("recordId")
+    index = value.get("index")
+    total = value.get("total")
+    data = value.get("data")
+    if (
+        not isinstance(record_id, str)
+        or not isinstance(index, int)
+        or not isinstance(total, int)
+        or not isinstance(data, str)
+        or total < 1
+        or total > 100_000
+        or index < 0
+        or index >= total
+    ):
+        return []
+    state = chunks.setdefault(record_id, {"total": total, "parts": {}})
+    if state["total"] != total:
+        chunks.pop(record_id, None)
+        return []
+    state["parts"][index] = data
+    if len(state["parts"]) != total:
+        return []
+    encoded = "".join(state["parts"][part] for part in range(total))
+    chunks.pop(record_id, None)
+    if len(encoded) > MAX_STREAM_RECORD_BYTES * 2:
+        raise ValueError("chunked stream record exceeds the adapter size limit")
+    decoded = base64.b64decode(encoded, validate=True)
+    if len(decoded) > MAX_STREAM_RECORD_BYTES:
+        raise ValueError("chunked stream record exceeds the adapter size limit")
+    restored = json.loads(decoded.decode("utf-8"))
+    return [restored] if isinstance(restored, dict) else []
+
+
 class _OutputRecorder:
     """Bounded, callback-driven accounting for a streaming agent command."""
 
@@ -261,6 +309,7 @@ class _OutputRecorder:
         self.state_path = logs_dir / "runtime.partial.json"
         self._buffers = {"stdout": "", "stderr": ""}
         self._pending_stdout = ""
+        self._stream_chunks: dict[str, dict[str, Any]] = {}
         self._seen: set[tuple[str, ...]] = set()
         self.events: list[dict[str, Any]] = []
         self.output_result: dict[str, Any] = {}
@@ -287,23 +336,18 @@ class _OutputRecorder:
         path = self.stdout_path if stream == "stdout" else self.stderr_path
         _write_utf8_artifact(path, self._buffers[stream])
         if stream == "stdout" and text:
-            self._pending_stdout = _bounded_text(
-                self._pending_stdout + text, MAX_CONTEXT_TEXT_CHARS * 2
-            )
-            lines = self._pending_stdout.splitlines(keepends=True)
+            lines = (self._pending_stdout + text).splitlines(keepends=True)
             self._pending_stdout = ""
             if lines and not lines[-1].endswith(("\n", "\r")):
-                self._pending_stdout = lines.pop()
+                self._pending_stdout = _bounded_text(lines.pop(), MAX_STREAM_LINE_CHARS)
             for line in lines:
                 self._consume_line(line)
 
     def _consume_line(self, line: str) -> None:
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(value, dict):
-            return
+        for value in _decode_stream_line(line, self._stream_chunks):
+            self._consume_value(value)
+
+    def _consume_value(self, value: dict[str, Any]) -> None:
         if value.get("kind") == "event" and isinstance(value.get("event"), dict):
             event = value["event"]
         elif isinstance(value.get("type"), str) and value.get("payload") is not None:
@@ -688,6 +732,8 @@ class SigmaCliHarborAgent(BaseAgent):
             "stream-json",
             "--output-schema",
             "3",
+            "--stream-json-max-line-bytes",
+            "49152",
         ]
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
@@ -836,43 +882,39 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     def _parse_stream_output(self, result: Any | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         events: list[dict[str, Any]] = []
         output_result: dict[str, Any] = {}
+        chunks: dict[str, dict[str, Any]] = {}
         for line in _stdout_text(result).splitlines() if result is not None else []:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            if value.get("kind") == "event" and isinstance(value.get("event"), dict):
-                event = value["event"]
-                if isinstance(event.get("type"), str):
-                    events.append(event)
-                continue
-            if value.get("kind") == "result" or value.get("type") == "result":
-                candidate = value.get("result")
-                output_result = dict(candidate) if isinstance(candidate, dict) else dict(value)
-                continue
-            if value.get("kind") == "error":
-                error = value.get("error")
-                error_record = error if isinstance(error, dict) else value
-                code = error_record.get("code")
-                normalized = code.lower() if isinstance(code, str) else ""
-                failure = (
-                    "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
-                    else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
-                    else None
-                )
-                output_result = {
-                    "status": "error",
-                    "message": str(error_record.get("message") or "agent CLI returned an error"),
-                    **({"failureKind": failure} if failure else {}),
-                }
-                continue
-            if isinstance(value.get("status"), str):
-                output_result = dict(value)
-                continue
-            if isinstance(value.get("type"), str) and value.get("payload") is not None:
-                events.append(value)
+            for value in _decode_stream_line(line, chunks):
+                if value.get("kind") == "event" and isinstance(value.get("event"), dict):
+                    event = value["event"]
+                    if isinstance(event.get("type"), str):
+                        events.append(event)
+                    continue
+                if value.get("kind") == "result" or value.get("type") == "result":
+                    candidate = value.get("result")
+                    output_result = dict(candidate) if isinstance(candidate, dict) else dict(value)
+                    continue
+                if value.get("kind") == "error":
+                    error = value.get("error")
+                    error_record = error if isinstance(error, dict) else value
+                    code = error_record.get("code")
+                    normalized = code.lower() if isinstance(code, str) else ""
+                    failure = (
+                        "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
+                        else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
+                        else None
+                    )
+                    output_result = {
+                        "status": "error",
+                        "message": str(error_record.get("message") or "agent CLI returned an error"),
+                        **({"failureKind": failure} if failure else {}),
+                    }
+                    continue
+                if isinstance(value.get("status"), str):
+                    output_result = dict(value)
+                    continue
+                if isinstance(value.get("type"), str) and value.get("payload") is not None:
+                    events.append(value)
         return events, output_result
 
     def _failure_kind_from_events(

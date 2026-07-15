@@ -10,7 +10,7 @@ import {
 import {
   loadCliConfig, parseArgs, workspaceCustomizationTrustMessage, workspaceMcpTrustMessage, type CliConfig
 } from "../config.js";
-import { outputError, outputEvent, outputResult } from "../output-schema.js";
+import { outputError, outputEvent, outputJsonLines, outputResult } from "../output-schema.js";
 
 export interface RunCommandDeps extends RuntimeFactoryDeps {
   stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
@@ -77,10 +77,17 @@ async function promptApproval(
   }
 }
 
+function approvalRequiresPrompt(event: AgentEventEnvelope): boolean {
+  if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return false;
+  return (event.payload as Record<string, unknown>).approvalMode !== "automatic";
+}
+
 function writeEvent(event: AgentEventEnvelope, config: CliConfig, stderr: NodeJS.WritableStream, stdout: NodeJS.WritableStream): void {
   const format = config.outputFormat;
   if (format === "stream-json") {
-    stdout.write(`${JSON.stringify(outputEvent(event, config.outputSchema))}\n`);
+    for (const line of outputJsonLines(
+      outputEvent(event, config.outputSchema), event.eventId, config.streamJsonMaxLineBytes
+    )) stdout.write(`${line}\n`);
     return;
   }
   if (format === "json") return;
@@ -107,7 +114,9 @@ async function streamSession(
   for await (const event of runtime.subscribe(sessionId, signal)) {
     lastEventType = event.type;
     writeEvent(event, config, stderr, stdout);
-    if (event.type === "tool.approval_requested") await promptApproval(event, runtime, stdin, stderr);
+    if (event.type === "tool.approval_requested" && approvalRequiresPrompt(event) && stdin.isTTY === true) {
+      await promptApproval(event, runtime, stdin, stderr);
+    }
     if (event.type === "run.completed" || event.type === "run.cancelled" || event.type === "run.failed") {
       return event.type;
     }
@@ -139,9 +148,11 @@ function writeResult(
     sessionId,
     finalMessage: outcomeMessage(outcome)
   };
-  if (config.outputFormat === "json" || config.outputFormat === "stream-json") {
-    stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
-  }
+  if (config.outputFormat === "stream-json") {
+    for (const line of outputJsonLines(
+      outputResult(result, config.outputSchema), `result:${sessionId}`, config.streamJsonMaxLineBytes
+    )) stdout.write(`${line}\n`);
+  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
   else stdout.write(`\n${result.finalMessage}\n`);
 }
 
@@ -180,11 +191,19 @@ async function executeRun(
   } finally {
     streamAbort.abort();
     await stream.catch(() => undefined);
+    await runtime.releaseSession?.(session.sessionId);
   }
 }
 
 function nonInteractiveAsk(config: CliConfig, stdinTty: boolean, stdoutTty: boolean): boolean {
   return config.permissionMode === "ask" && (!stdinTty || !stdoutTty);
+}
+
+function interactiveApprovalSurface(
+  stdin: NodeJS.ReadableStream & { isTTY?: boolean },
+  stdout: NodeJS.WritableStream & { isTTY?: boolean }
+): boolean {
+  return stdin.isTTY === true && stdout.isTTY === true;
 }
 
 function writeNeedsInput(
@@ -199,9 +218,11 @@ function writeNeedsInput(
     finishReason,
     message
   };
-  if (config.outputFormat === "json" || config.outputFormat === "stream-json") {
-    stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
-  }
+  if (config.outputFormat === "stream-json") {
+    for (const line of outputJsonLines(
+      outputResult(result, config.outputSchema), "result:needs-input", config.streamJsonMaxLineBytes
+    )) stdout.write(`${line}\n`);
+  } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
   else stderr.write(`${result.message}\n`);
 }
 
@@ -227,7 +248,7 @@ function errorMessage(error: unknown): string {
 
 function writeRunError(
   error: unknown,
-  output: Pick<CliConfig, "outputFormat" | "outputSchema"> | undefined,
+  output: Pick<CliConfig, "outputFormat" | "outputSchema" | "streamJsonMaxLineBytes"> | undefined,
   stdout: NodeJS.WritableStream,
   stderr: NodeJS.WritableStream
 ): void {
@@ -238,14 +259,16 @@ function writeRunError(
   }
   const code = typeof (error as { code?: unknown })?.code === "string"
     ? (error as { code: string }).code : "cli_error";
-  stdout.write(`${JSON.stringify(outputError({ code, message }, output.outputSchema))}\n`);
+  for (const line of outputJsonLines(
+    outputError({ code, message }, output.outputSchema), `error:${code}`, output.streamJsonMaxLineBytes
+  )) stdout.write(`${line}\n`);
 }
 
 export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Promise<number> {
   const stdin = deps.stdin ?? processStdin;
   const stdout = deps.stdout ?? processStdout;
   const stderr = deps.stderr ?? processStderr;
-  let errorOutput: Pick<CliConfig, "outputFormat" | "outputSchema"> | undefined;
+  let errorOutput: Pick<CliConfig, "outputFormat" | "outputSchema" | "streamJsonMaxLineBytes"> | undefined;
   try {
     if (argv.includes("--help") || argv.includes("-h")) {
       stdout.write(`Usage: agent ${deps.mode === "analyze" ? "inspect" : "run"} [instruction] [--workspace <path>] [--permission-mode ask|auto|deny] [--output-format text|json|stream-json]\n`);
@@ -274,7 +297,10 @@ export async function runCommand(argv: string[], deps: RunCommandDeps = {}): Pro
       writeNeedsInput(config, stdout, stderr);
       return 2;
     }
-    const configured = await createConfiguredRuntime(config, deps, { surface: "cli" });
+    const configured = await createConfiguredRuntime(config, deps, {
+      surface: "cli",
+      interactiveApprovals: interactiveApprovalSurface(stdin, stdout)
+    });
     try {
       return await executeRun(configured, config, instruction, mode, stdin, stdout, stderr);
     } finally {

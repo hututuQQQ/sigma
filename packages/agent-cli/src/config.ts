@@ -38,6 +38,7 @@ export interface CliConfig {
   runDeadlineSec: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
+  streamActiveSec: number;
   maxModelRetries: number;
   maxParallelTools: number;
   maxParallelAgents: number;
@@ -53,6 +54,7 @@ export interface CliConfig {
   checkpoint: { maxFiles: number; maxBytes: number };
   outputFormat: "text" | "json" | "stream-json";
   outputSchema: 2 | 3;
+  streamJsonMaxLineBytes: number;
   tuiFps: number;
   mcpServers: McpServerConfigValue[];
   mcpSource: McpConfigSource;
@@ -233,6 +235,7 @@ function cliConfig(
     runDeadlineSec: Number(values.runDeadlineSec),
     modelDeadlineSec: Number(values.modelDeadlineSec),
     streamIdleSec: Number(values.streamIdleSec),
+    streamActiveSec: Number(values.streamActiveSec),
     maxModelRetries: Number(values.maxModelRetries),
     maxParallelTools: Number(values.maxParallelTools),
     maxParallelAgents: Number(values.maxParallelAgents),
@@ -244,6 +247,7 @@ function cliConfig(
     checkpoint: { maxFiles: Number(values.checkpointMaxFiles), maxBytes: Number(values.checkpointMaxBytes) },
     outputFormat: values.outputFormat as CliConfig["outputFormat"],
     outputSchema: Number(values.outputSchema) as 2 | 3,
+    streamJsonMaxLineBytes: Number(values.streamJsonMaxLineBytes),
     tuiFps: Number(values.tuiFps),
     mcpServers,
     mcpSource: source,

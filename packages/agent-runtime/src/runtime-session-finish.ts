@@ -7,7 +7,8 @@ import type { SessionCommandBus } from "./session-command-bus.js";
 
 export type RunSuspensionContext =
   | { processIds: string[] }
-  | { checkpointId: string; choices: ["restore", "keep"] };
+  | { checkpointId: string; choices: ["restore", "keep"] }
+  | { remainingDeadlineMs: number };
 
 export interface RuntimeSessionFinishOptions {
   hooks: RuntimeHookCoordinator;

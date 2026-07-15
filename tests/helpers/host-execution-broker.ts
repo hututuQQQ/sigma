@@ -243,7 +243,14 @@ export class HostExecutionBroker implements ExecutionBroker {
       platform: process.platform,
       architecture: process.arch,
       sandbox: { available: true, backend: "test-only-host", selfTestPassed: true, setupRequired: false },
-      capabilities: { foreground: true, background: true, stdin: true, pty: false, networkModes: ["none", "full"] }
+      capabilities: {
+        foreground: true,
+        background: true,
+        stdin: true,
+        pty: false,
+        networkModes: ["none", "full"],
+        runtimeCommands: ["node"]
+      }
     };
   }
 }

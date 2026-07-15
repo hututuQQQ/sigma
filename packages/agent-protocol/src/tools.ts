@@ -159,7 +159,7 @@ export interface ToolExecutionContext {
   /** Immutable runtime-approved plan for this exact call. Mutating tools must
    * fail closed when it is unavailable. */
   callPlan?: ToolCallPlan;
-  /** Ephemeral, call-bound human authorization. Never persisted or restored. */
+  /** Ephemeral, call-bound authorization. Never persisted or restored. */
   approval?: ToolCallApproval;
   signal: AbortSignal;
   heartbeat(): void;
@@ -170,7 +170,8 @@ export interface ToolExecutionContext {
 
 export interface ToolCallApproval {
   callId: string;
-  authority: "user";
+  /** Runtime authority is valid only for an auditable permission-mode=auto decision. */
+  authority: "user" | "runtime";
   networkApproved: boolean;
   unsafeHostExecApproved: boolean;
 }

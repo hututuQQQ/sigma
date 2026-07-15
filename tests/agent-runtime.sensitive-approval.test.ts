@@ -232,10 +232,8 @@ describe("sensitive per-call approvals", () => {
     }
   });
 
-  it.each(["ask", "auto"] as const)(
-    "prompts for every full-network call in %s mode and never persists always_allow",
-    async (permissionMode) => {
-      const root = await mkdtemp(path.join(os.tmpdir(), `sigma-network-${permissionMode}-`));
+  it("prompts for every full-network call in ask mode and never persists always_allow", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "sigma-network-ask-"));
       fixtures.push(root);
       const requests: ExecutionRequest[] = [];
       const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
@@ -247,7 +245,7 @@ describe("sensitive per-call approvals", () => {
         }),
         store,
         storeRootDir: path.join(root, "state"),
-        permissionMode,
+        permissionMode: "ask",
         runDeadlineMs: 10_000
       });
       const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
@@ -262,8 +260,40 @@ describe("sensitive per-call approvals", () => {
       expect(stored.filter((event) => event.type === "tool.approval_requested")).toHaveLength(2);
       expect(stored.filter((event) => event.type === "tool.approval_resolved")
         .every((event) => (event.payload as { decision?: string }).decision === "allow")).toBe(true);
-    }
-  );
+  });
+
+  it("auto-resolves each full-network call with a fresh runtime-bound grant", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-network-auto-"));
+    fixtures.push(root);
+    const requests: ExecutionRequest[] = [];
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([networkTurn("network-one"), networkTurn("network-two"), fakeFinalTurn()]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), sandboxMode: "required", networkMode: "none",
+        runtimeCommands: fixtureRuntimeCommands
+      }),
+      store,
+      storeRootDir: path.join(root, "state"),
+      permissionMode: "auto",
+      runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Run two network checks." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.policy.network === "full"
+      && request.policy.networkApproved === true)).toBe(true);
+    const stored = await events(store, session.sessionId);
+    expect(stored.filter((event) => event.type === "tool.approval_requested"))
+      .toHaveLength(2);
+    expect(stored.filter((event) => event.type === "tool.approval_requested")
+      .every((event) => (event.payload as { approvalMode?: string }).approvalMode === "automatic")).toBe(true);
+    expect(stored.filter((event) => event.type === "tool.approval_resolved")
+      .every((event) => event.authority === "runtime"
+        && (event.payload as { decision?: string }).decision === "allow")).toBe(true);
+    expect(stored.some((event) => event.type === "run.suspended")).toBe(false);
+  });
 
   it("does not charge explicit human approval wait time to the active run deadline", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-deadline-"));
@@ -360,6 +390,47 @@ describe("sensitive per-call approvals", () => {
       network: "none",
       networkApproved: false
     });
+  });
+
+  it("terminates with NeedsInput when human approval is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-host-headless-"));
+    fixtures.push(root);
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const requests: ExecutionRequest[] = [];
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([
+        fakeToolTurn([fakeToolCall("host-headless", "exec", { executable: "host-fixture", args: [] })])
+      ]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
+        runtimeCommands: fixtureRuntimeCommands
+      }),
+      store,
+      storeRootDir: path.join(root, "state"),
+      permissionMode: "auto",
+      interactiveApprovals: false,
+      runDeadlineMs: 10_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({
+      type: "submit", sessionId: session.sessionId, text: "Request a human-only host command."
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "needs_input",
+      requestId: "host-headless",
+      message: expect.stringContaining("non-interactive")
+    });
+    expect(requests).toHaveLength(0);
+    const stored = await events(store, session.sessionId);
+    expect(stored.filter((event) => event.type === "tool.approval_requested")).toHaveLength(1);
+    expect(stored.find((event) => event.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ requestId: "host-headless", approvalMode: "human" });
+    expect(stored.find((event) => event.type === "tool.approval_resolved")?.payload)
+      .toMatchObject({ requestId: "host-headless", decision: "cancelled" });
+    expect(stored.at(-1)?.type).toBe("run.suspended");
+    await expect(runtime.releaseSession(session.sessionId)).resolves.toBeUndefined();
   });
 
   it.each([
@@ -519,7 +590,7 @@ describe("sensitive per-call approvals", () => {
     }
   });
 
-  it("does not reuse an allowed sensitive approval after resume", async () => {
+  it("re-authorizes a recovered network call with a fresh auto binding", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-network-resume-"));
     fixtures.push(root);
     const storeRootDir = path.join(root, "state");
@@ -576,14 +647,15 @@ describe("sensitive per-call approvals", () => {
       runDeadlineMs: 10_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
-    const reprompt = (async () => {
+    const automaticRequest = (async () => {
       for await (const event of runtime.subscribe("sensitive-session")) {
         if (event.type === "tool.approval_requested" && event.seq > 11) return event;
       }
-      throw new Error("missing re-prompt");
+      throw new Error("missing automatic approval request");
     })();
-    const approval = await reprompt;
+    const approval = await automaticRequest;
     expect(approval.payload).toMatchObject({
+      approvalMode: "automatic",
       arguments: call.arguments,
       effects: ["process.spawn.readonly", "network"],
       plan: {
@@ -594,13 +666,6 @@ describe("sensitive per-call approvals", () => {
         network: "full",
         processMode: "pipe"
       }
-    });
-    expect(requests).toHaveLength(0);
-    await runtime.command({
-      type: "approve",
-      sessionId: "sensitive-session",
-      requestId: (approval.payload as { requestId: string }).requestId,
-      decision: "allow"
     });
     await runtime.waitForOutcome("sensitive-session");
     expect(requests).toHaveLength(1);
@@ -730,35 +795,23 @@ describe("sensitive per-call approvals", () => {
       && (event.payload as { delegated?: boolean }).delegated === true)).toHaveLength(2);
   });
 
-  it("does not treat a spawn delegation as approval for a child network call", async () => {
+  it("uses a fresh child auto grant instead of treating spawn delegation as approval", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-network-call-"));
     fixtures.push(root);
     const requests: ExecutionRequest[] = [];
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
     const runtime = createRuntime({
       gateway: new SmokeFakeGateway([networkTurn("child-network"), fakeFinalTurn()]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker: broker(requests), runtimeCommands: fixtureRuntimeCommands
       }),
-      store: new SegmentedJsonlStore({ rootDir: path.join(root, "state") }),
+      store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",
       runDeadlineMs: 10_000
     });
     const parent = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     const supervisor = new AgentSupervisor(createChildAgentFactory(() => runtime), 1);
-    const parentApproval = (async () => {
-      for await (const event of runtime.subscribe(parent.sessionId)) {
-        if (event.type !== "tool.approval_requested"
-          || (event.payload as { delegated?: boolean }).delegated !== true) continue;
-        const requestId = (event.payload as { requestId: string }).requestId;
-        expect(requests).toHaveLength(0);
-        await runtime.command({
-          type: "approve", sessionId: parent.sessionId, requestId, decision: "allow"
-        });
-        return requestId;
-      }
-      throw new Error("parent approval was not raised");
-    })();
     const child = supervisor.spawn({
       parentId: parent.sessionId,
       instruction: "Run one network check.",
@@ -770,9 +823,11 @@ describe("sensitive per-call approvals", () => {
     await expect(supervisor.join(child.id)).resolves.toMatchObject({
       status: "completed", result: { outcome: { kind: "completed" } }
     });
-    await expect(parentApproval).resolves.toBe(`child:${child.id}:child-network`);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.policy.networkApproved).toBe(true);
+    const parentEvents = await events(store, parent.sessionId);
+    expect(parentEvents.some((event) => event.type === "tool.approval_requested"
+      && (event.payload as { delegated?: boolean }).delegated === true)).toBe(false);
   });
 });
 

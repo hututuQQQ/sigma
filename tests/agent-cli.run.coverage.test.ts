@@ -117,6 +117,26 @@ function writeRequest(): ModelResponse {
   };
 }
 
+function networkExecutionRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "network-exec",
+        name: "exec",
+        arguments: {
+          executable: "node",
+          args: ["-e", "process.stdout.write('network-auto-ok')"],
+          network: "full",
+          readRoots: ["."]
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function userInputRequest(): ModelResponse {
   return {
     message: {
@@ -197,6 +217,35 @@ describe("run command branch coverage", () => {
     expect(records.some((record) => record.type === "model.started")).toBe(true);
     expect(records.some((record) => record.type === "run.completed")).toBe(true);
     expect(records.at(-1)?.type).toBe("result");
+  });
+
+  it("runs a non-interactive auto-approved network call without opening readline", async () => {
+    const root = await workspace("sigma-run-network-auto-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+    const code = await runCommand([
+      "run a network-enabled process",
+      "--workspace", root,
+      "--network", "full",
+      "--permission-mode", "auto",
+      "--output-format", "stream-json"
+    ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
+      networkExecutionRequest(), evidenceRequest("network-evidence"), complete("network complete")
+    ]) });
+
+    expect(code).toBe(0);
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      payload?: { approvalMode?: string; decision?: string };
+    });
+    expect(records.find((record) => record.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ approvalMode: "automatic" });
+    expect(records.find((record) => record.type === "tool.approval_resolved")?.payload)
+      .toMatchObject({ decision: "allow" });
+    expect(records.some((record) => record.type === "tool.completed")).toBe(true);
+    expect(records.some((record) => record.type === "run.completed")).toBe(true);
+    expect(stderr.text()).not.toContain("Allow exec");
   });
 
   it.each([true, false])("reads instructions from stdin (explicit=%s)", async (explicit) => {

@@ -13,6 +13,7 @@ export interface CreateGatewayOptions {
   maxRetries?: number;
   requestTimeoutMs?: number;
   idleTimeoutMs?: number;
+  activeStreamTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   wireProfile?: Partial<OpenAIWireProfile>;
 }
@@ -83,6 +84,7 @@ function commonGatewayOptions(options: CreateGatewayOptions) {
     maxRetries: options.maxRetries,
     requestTimeoutMs: options.requestTimeoutMs,
     idleTimeoutMs: options.idleTimeoutMs,
+    activeStreamTimeoutMs: options.activeStreamTimeoutMs,
     fetchImpl: options.fetchImpl
   };
 }

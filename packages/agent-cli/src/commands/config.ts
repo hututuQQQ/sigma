@@ -34,6 +34,7 @@ function overrides(config: CliConfig): Partial<Record<string, ConfigValue>> {
     runDeadlineSec: config.runDeadlineSec,
     modelDeadlineSec: config.modelDeadlineSec,
     streamIdleSec: config.streamIdleSec,
+    streamActiveSec: config.streamActiveSec,
     maxModelRetries: config.maxModelRetries,
     maxParallelTools: config.maxParallelTools,
     maxParallelAgents: config.maxParallelAgents,
@@ -48,6 +49,7 @@ function overrides(config: CliConfig): Partial<Record<string, ConfigValue>> {
     checkpointMaxBytes: config.checkpoint.maxBytes,
     outputFormat: config.outputFormat,
     outputSchema: config.outputSchema,
+    streamJsonMaxLineBytes: config.streamJsonMaxLineBytes,
     tuiFps: config.tuiFps,
     mcpServers: config.mcpServers
   };

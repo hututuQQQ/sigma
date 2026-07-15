@@ -19,6 +19,7 @@ export interface ModelCompositionConfig {
   model: string;
   modelDeadlineSec: number;
   streamIdleSec: number;
+  streamActiveSec?: number;
   maxModelRetries?: number;
   legacySingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
@@ -33,6 +34,7 @@ export interface ModelCompositionDeps {
     maxRetries: number;
     requestTimeoutMs: number;
     idleTimeoutMs: number;
+    activeStreamTimeoutMs?: number;
   }) => ModelGateway;
 }
 
@@ -179,7 +181,9 @@ export function createRoleGateways(
   const gatewayOptions = {
     maxRetries: config.maxModelRetries ?? 2,
     requestTimeoutMs: config.modelDeadlineSec * 1_000,
-    idleTimeoutMs: config.streamIdleSec * 1_000
+    idleTimeoutMs: config.streamIdleSec * 1_000,
+    ...(config.streamActiveSec && config.streamActiveSec > 0
+      ? { activeStreamTimeoutMs: config.streamActiveSec * 1_000 } : {})
   };
   const primaryGateway = deps.gatewayFactory?.({ provider: config.provider, model, ...gatewayOptions })
     ?? createModelGatewayForSpec(knownPrimary as ModelSpec, {

@@ -158,12 +158,17 @@ describe("capability-aware model routing", () => {
       availableProfiles: [{ profile: frozen, source: "home" }]
     } as unknown as RuntimeCustomization;
     const calls: string[] = [];
+    const timeoutPolicies: Array<{
+      requestTimeoutMs: number;
+      idleTimeoutMs: number;
+      activeStreamTimeoutMs?: number;
+    }> = [];
     const configuredSpecs = [
       specConfig("deepseek/approx", "approx", "approximate", 100),
       specConfig("deepseek/exact", "exact", "exact", 300)
     ];
     const gateways = createRoleGateways({
-      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5,
+      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5, streamActiveSec: 7,
       modelSpecs: configuredSpecs,
       modelRoutes: [
         {
@@ -177,14 +182,20 @@ describe("capability-aware model routing", () => {
         }
       ]
     }, {
-      gatewayFactory: ({ model }) => gateway(model, async () => {
+      gatewayFactory: (options) => {
+        const { model } = options;
+        timeoutPolicies.push(options);
+        return gateway(model, async () => {
         calls.push(model);
         return response(model);
-      })
+        });
+      }
     }, customization, {});
     await gateways.orchestrator.complete(request());
     await gateways.reviewer.complete(request());
     expect(calls).toEqual(["exact", "approx"]);
+    expect(timeoutPolicies.every((policy) => policy.requestTimeoutMs === 10_000
+      && policy.idleTimeoutMs === 5_000 && policy.activeStreamTimeoutMs === 7_000)).toBe(true);
     expect(gateways.orchestrator.routingIdentity()).toEqual({ role: "orchestrator", routeId: "exact-tools" });
     expect(gateways.reviewer.routingIdentity()).toEqual({ role: "reviewer", routeId: "cheap-review" });
   });

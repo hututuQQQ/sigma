@@ -305,12 +305,57 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--permission-mode auto", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)
+            self.assertIn("--stream-json-max-line-bytes 49152", command)
             self.assertNotIn("--validation", command)
             self.assertNotIn("--retry", command)
             self.assertNotIn("--attempts-dir", command)
             self.assertEqual(kwargs["timeout_sec"], 615)
             self.assertFalse(any("sigma-precheck" in command for command, _kwargs in exec_commands))
             self.assertFalse(any("sigma-validation" in command for command, _kwargs in exec_commands))
+
+    async def test_reassembles_bounded_stream_json_chunks(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            wrapped = {
+                "schemaVersion": 3,
+                "kind": "event",
+                "type": "run.completed",
+                "event": {
+                    "eventId": "event-large",
+                    "type": "run.completed",
+                    "payload": {"kind": "completed", "message": "好" * 20_000},
+                },
+            }
+            encoded = module.base64.b64encode(
+                json.dumps(wrapped, ensure_ascii=False).encode("utf-8")
+            ).decode("ascii")
+            width = 4_000
+            parts = [encoded[index:index + width] for index in range(0, len(encoded), width)]
+            lines = [json.dumps({
+                "schemaVersion": 3,
+                "kind": "chunk",
+                "recordId": "event-large",
+                "index": index,
+                "total": len(parts),
+                "encoding": "base64-json-utf8",
+                "data": part,
+            }) for index, part in enumerate(parts)]
+            lines.append(json.dumps({
+                "schemaVersion": 3,
+                "kind": "result",
+                "type": "result",
+                "result": {"status": "completed", "finishReason": "completed"},
+            }))
+
+            events, result = agent._parse_stream_output(SimpleNamespace(stdout="\n".join(lines)))
+
+            self.assertEqual(events[0]["payload"]["message"], "好" * 20_000)
+            self.assertEqual(result["status"], "completed")
+            recorder = module._OutputRecorder(Path(tmp) / "recorder")
+            recorder.record("\n".join(lines) + "\n", "stdout")
+            self.assertEqual(recorder.events[0]["payload"]["message"], "好" * 20_000)
+            self.assertEqual(recorder.output_result["status"], "completed")
 
     async def test_run_forwards_provider_model_and_deadline(self):
         module = import_portable_agent_module()

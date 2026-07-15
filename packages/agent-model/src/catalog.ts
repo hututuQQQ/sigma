@@ -23,6 +23,10 @@ export interface ModelFailureDiagnostics {
   model?: string;
   category?: ModelFailureCategory;
   httpStatus?: number;
+  firstByteMs?: number;
+  lastFrameMs?: number;
+  idleDurationMs?: number;
+  totalDurationMs?: number;
   doneReceived?: boolean;
   transportEnded?: boolean;
   lastEventType?: string;

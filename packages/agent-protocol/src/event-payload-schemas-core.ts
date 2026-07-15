@@ -38,6 +38,7 @@ const approvalRequestedSchema = z.object({
   plan: toolCallPlanSchema.optional(),
   reason: nonEmptyStringSchema,
   delegated: z.literal(true).optional(),
+  approvalMode: z.enum(["human", "automatic"]).optional(),
   turnId: z.number().int().positive().optional(),
   effectRevision: z.number().int().nonnegative().optional()
 }).strict();
@@ -61,6 +62,10 @@ const modelFailureDiagnosticsSchema = z.object({
     "auth", "configuration", "content_filter", "protocol"
   ]).optional(),
   httpStatus: z.number().int().min(100).max(599).optional(),
+  firstByteMs: z.number().int().nonnegative().optional(),
+  lastFrameMs: z.number().int().nonnegative().optional(),
+  idleDurationMs: z.number().int().nonnegative().optional(),
+  totalDurationMs: z.number().int().nonnegative().optional(),
   doneReceived: z.boolean().optional(),
   transportEnded: z.boolean().optional(),
   lastEventType: nonEmptyStringSchema.optional(),

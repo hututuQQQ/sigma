@@ -625,9 +625,14 @@ describe("OpenAI-compatible model gateway", () => {
     });
   });
 
-  it("cancels a pending stream read when the idle timeout expires", async () => {
+  it("cancels a pending stream read when valid SSE payloads become idle", async () => {
     let cancelled = 0;
     const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "started" }, finish_reason: null }]
+        })}\n\n`));
+      },
       cancel() { cancelled += 1; }
     }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
       maxRetries: 0,
@@ -642,11 +647,133 @@ describe("OpenAI-compatible model gateway", () => {
       diagnostics: {
         doneReceived: false,
         transportEnded: false,
+        lastEventType: "reasoning",
+        hasReasoning: true,
         retryAttempts: 1,
-        timeoutReason: "Model stream idle for 25ms."
+        timeoutReason: "Model stream idle for 25ms without an SSE data payload.",
+        firstByteMs: expect.any(Number),
+        lastFrameMs: expect.any(Number),
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
       }
     });
     expect(cancelled).toBeGreaterThan(0);
+  });
+
+  it("times out a stream that never produces its first body byte", async () => {
+    let cancelled = 0;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      cancel() { cancelled += 1; }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 25,
+      idleTimeoutMs: 1_000
+    });
+
+    await expect(collectStream(gateway)).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: false,
+        retryAttempts: 1,
+        sseChunks: 0,
+        timeoutReason: "Model stream first byte exceeded 25ms.",
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
+      }
+    });
+    expect(cancelled).toBeGreaterThan(0);
+  });
+
+  it("allows an active reasoning stream to outlive the first-byte deadline", async () => {
+    const encoder = new TextEncoder();
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        let index = 0;
+        const timer = setInterval(() => {
+          if (index < 7) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              choices: [{ delta: { reasoning_content: String(index) }, finish_reason: null }]
+            })}\n\n`));
+            index += 1;
+            return;
+          }
+          clearInterval(timer);
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        }, 10);
+      }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 25,
+      idleTimeoutMs: 50
+    });
+
+    const startedAt = performance.now();
+    const events = await collectStream(gateway);
+    expect(performance.now() - startedAt).toBeGreaterThan(50);
+    expect(events.filter((event) => event.type === "reasoning")).toHaveLength(7);
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
+  it("enforces an explicit active-stream deadline independently of idle traffic", async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        timer = setInterval(() => controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "active" }, finish_reason: null }]
+        })}\n\n`)), 5);
+      },
+      cancel() { if (timer) clearInterval(timer); }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 100,
+      idleTimeoutMs: 25,
+      activeStreamTimeoutMs: 40
+    });
+
+    await expect(collectStream(gateway)).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        lastEventType: "reasoning",
+        hasReasoning: true,
+        timeoutReason: "Model active stream exceeded 40ms.",
+        firstByteMs: expect.any(Number),
+        lastFrameMs: expect.any(Number),
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
+      }
+    });
+  });
+
+  it("lets the parent Agent/session deadline abort an otherwise active stream", async () => {
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(stream) {
+        timer = setInterval(() => stream.enqueue(encoder.encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "active" }, finish_reason: null }]
+        })}\n\n`)), 5);
+      },
+      cancel() { if (timer) clearInterval(timer); }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 100,
+      idleTimeoutMs: 25
+    });
+    const pending = collectStream(gateway, { ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(new Error("Agent session deadline elapsed")), 35);
+
+    await expect(pending).rejects.toMatchObject({
+      diagnostics: {
+        lastEventType: "reasoning",
+        hasReasoning: true,
+        abortReason: "Agent session deadline elapsed"
+      }
+    });
   });
 
   it("reports protocol metadata when the transport ends before [DONE]", async () => {
