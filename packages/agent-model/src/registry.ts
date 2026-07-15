@@ -1,5 +1,6 @@
 import type { ModelGateway } from "agent-protocol";
 import { OpenAIModelGateway } from "./openai-gateway.js";
+import type { OpenAIWireProfile } from "./openai-wire.js";
 import { builtinModelSpec, type ModelSpec } from "./catalog.js";
 
 export type SupportedProvider = "deepseek" | "glm";
@@ -13,6 +14,7 @@ export interface CreateGatewayOptions {
   requestTimeoutMs?: number;
   idleTimeoutMs?: number;
   fetchImpl?: typeof fetch;
+  wireProfile?: Partial<OpenAIWireProfile>;
 }
 
 export type CreateCatalogGatewayOptions = Omit<CreateGatewayOptions, "provider" | "model">;
@@ -54,7 +56,8 @@ function deepseekGateway(options: CreateGatewayOptions, model: string, spec?: Mo
       developerRole: "system",
       toolChoicePolicy: "non_thinking_only",
       thinking: "enabled",
-      retryableFinishReasons: ["insufficient_system_resource"]
+      retryableFinishReasons: ["insufficient_system_resource"],
+      ...options.wireProfile
     },
     capabilities: spec?.capabilities ?? { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true },
     pricing: spec?.pricing
@@ -69,7 +72,7 @@ function glmGateway(options: CreateGatewayOptions, model: string, spec?: ModelSp
     baseUrl: options.baseUrl ?? process.env.GLM_BASE_URL ?? process.env.ZAI_BASE_URL ?? "https://open.bigmodel.cn/api/paas/v4",
     apiKey: options.apiKey ?? process.env.GLM_API_KEY ?? process.env.ZAI_API_KEY ?? process.env.BIGMODEL_API_KEY,
     apiKeyName: "GLM_API_KEY, ZAI_API_KEY, or BIGMODEL_API_KEY",
-    wireProfile: { developerRole: "system" },
+    wireProfile: { developerRole: "system", ...options.wireProfile },
     capabilities: spec?.capabilities ?? { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true },
     pricing: spec?.pricing
   });

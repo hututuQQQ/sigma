@@ -532,6 +532,62 @@ describe("OpenAI-compatible model gateway", () => {
     expect(JSON.stringify(result)).not.toContain("health-secret");
   });
 
+  it("uses a non-thinking health probe with a bounded text budget", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    let body: Record<string, unknown> | undefined;
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse("OK");
+      }) as typeof fetch
+    });
+
+    expect(result).toMatchObject({ ok: true, provider: "deepseek", model: "deepseek-v4-pro", message: "OK" });
+    expect(body).toMatchObject({
+      thinking: { type: "disabled" },
+      max_tokens: 32,
+      temperature: 0,
+      messages: [{ role: "user", content: "Return exactly the text OK." }]
+    });
+  });
+
+  it("accepts explicit reasoning text without treating empty content as universal success", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async () => new Response(JSON.stringify({
+        choices: [{ message: { content: null, reasoning_content: "OK" }, finish_reason: "stop" }]
+      }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch
+    });
+
+    expect(result).toMatchObject({ ok: true, message: "OK" });
+  });
+
+  it("reports malformed completion shapes as protocol errors", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async () => new Response(JSON.stringify({ choices: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as typeof fetch
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      failureKind: "api_error",
+      errorCategory: "protocol",
+      message: expect.stringContaining("choices must be a non-empty array")
+    });
+  });
+
   it("cancels a pending stream read when the idle timeout expires", async () => {
     let cancelled = 0;
     const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({

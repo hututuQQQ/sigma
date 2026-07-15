@@ -169,9 +169,7 @@ export class OpenAIModelGateway implements ModelGateway {
     const startedAt = performance.now();
     const result = await this.fetchJsonWithRetry(bodyFor(request, this.model, false, this.wireProfile), request.signal);
     const raw = result.raw;
-    const choice = Array.isArray(raw.choices) && raw.choices[0] && typeof raw.choices[0] === "object"
-      ? raw.choices[0] as Record<string, unknown> : {};
-    const message = choice.message && typeof choice.message === "object" ? choice.message as Record<string, unknown> : {};
+    const { choice, message } = completeChoice(raw, this.provider);
     const calls = this.parseCompleteCalls(message.tool_calls);
     const usage = raw.usage && typeof raw.usage === "object" ? raw.usage as Record<string, unknown> : {};
     const response: UnnormalizedModelResponse = {
@@ -358,6 +356,36 @@ export class OpenAIModelGateway implements ModelGateway {
     });
   }
 
+}
+
+function completeChoice(
+  raw: Record<string, unknown>,
+  provider: string
+): { choice: Record<string, unknown>; message: Record<string, unknown> } {
+  if (!Array.isArray(raw.choices) || raw.choices.length === 0) {
+    throw new ModelGatewayError(
+      `${provider} response is malformed: choices must be a non-empty array.`,
+      "protocol"
+    );
+  }
+  const choice = raw.choices[0];
+  if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+    throw new ModelGatewayError(
+      `${provider} response is malformed: choices[0] must be an object.`,
+      "protocol"
+    );
+  }
+  const message = (choice as Record<string, unknown>).message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    throw new ModelGatewayError(
+      `${provider} response is malformed: choices[0].message must be an object.`,
+      "protocol"
+    );
+  }
+  return {
+    choice: choice as Record<string, unknown>,
+    message: message as Record<string, unknown>
+  };
 }
 
 function rawUsage(usage: Record<string, unknown>): RawUsage {
