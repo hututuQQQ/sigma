@@ -6,6 +6,7 @@ import path from "node:path";
 import { durableReplaceFile, workspaceTransactionRoot } from "agent-platform";
 import type {
   CheckpointManagerOptions,
+  CheckpointOpaqueArtifact,
   CheckpointManifest,
   CheckpointRecord,
   CreateCheckpointInput,
@@ -143,6 +144,38 @@ export class CheckpointManager {
     return await buildCheckpointReview(checkpoint, before, after, this.cas, maxBytes);
   }
 
+  /** Returns content-addressed identities for changed files whose bytes are
+   * not safe to represent as text. This is independent of the bounded review
+   * preview, so a truncated preview cannot invalidate binary evidence. */
+  async opaqueArtifacts(sessionId: string, checkpointId: string): Promise<CheckpointOpaqueArtifact[]> {
+    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    await this.recover(checkpoint.workspacePath);
+    checkpoint = await this.readRecord(sessionId, checkpointId);
+    if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
+      throw new Error(`Checkpoint ${checkpointId} is not sealed for opaque artifact inspection.`);
+    }
+    const before = await this.getManifest(checkpoint.preManifestDigest);
+    const after = await this.getManifest(checkpoint.postManifestDigest);
+    const beforeByPath = new Map(before.entries.map((entry) => [entry.path, entry]));
+    const afterByPath = new Map(after.entries.map((entry) => [entry.path, entry]));
+    const result: CheckpointOpaqueArtifact[] = [];
+    for (const file of [...new Set([
+      ...checkpoint.delta.added, ...checkpoint.delta.modified, ...checkpoint.delta.deleted
+    ])].sort()) {
+      const left = beforeByPath.get(file);
+      const right = afterByPath.get(file);
+      const fileEntries = [left, right].filter((entry) => entry?.kind === "file");
+      const opaque = await Promise.all(fileEntries.map((entry) => this.isOpaque(entry!)));
+      if (fileEntries.length === 0 || !opaque.some(Boolean)) continue;
+      result.push({
+        path: file,
+        ...(left?.kind === "file" && left.digest ? { before: { digest: left.digest, sizeBytes: left.size } } : {}),
+        ...(right?.kind === "file" && right.digest ? { after: { digest: right.digest, sizeBytes: right.size } } : {})
+      });
+    }
+    return result;
+  }
+
   async undoLatest(sessionId: string): Promise<CheckpointRecord> {
     let records = await this.list(sessionId);
     let latest = [...records].reverse().find((item) => item.status !== "restored");
@@ -243,6 +276,21 @@ export class CheckpointManager {
       ...(ignoredRootName ? { ignoredRootName } : {}),
       putCas: async (content) => await this.cas.putStream(content)
     });
+  }
+
+  private async isOpaque(entry: { digest?: string }): Promise<boolean> {
+    if (!entry.digest) return false;
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    try {
+      for await (const chunk of this.cas.stream(entry.digest)) {
+        if (chunk.includes(0)) return true;
+        decoder.decode(chunk, { stream: true });
+      }
+      decoder.decode();
+      return false;
+    } catch {
+      return true;
+    }
   }
 
   private async restore(

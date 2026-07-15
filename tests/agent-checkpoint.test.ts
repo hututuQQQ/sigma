@@ -299,6 +299,14 @@ describe("CheckpointManager", () => {
       await symlink("data.bin", link, "file");
     }
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const opaqueArtifacts = await manager.opaqueArtifacts(checkpoint.sessionId, checkpoint.checkpointId);
+    expect(opaqueArtifacts).toEqual([
+      expect.objectContaining({
+        path: "data.bin",
+        before: expect.objectContaining({ digest: expect.stringMatching(/^[a-f0-9]{64}$/u), sizeBytes: 4 }),
+        after: expect.objectContaining({ digest: expect.stringMatching(/^[a-f0-9]{64}$/u), sizeBytes: 3 })
+      })
+    ]);
     await manager.undoLatest(checkpoint.sessionId);
 
     expect(await readFile(binary)).toEqual(Buffer.from([0, 1, 2, 255]));

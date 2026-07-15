@@ -164,6 +164,9 @@ export class CheckpointEvidenceRecorder {
       item.kind === "workspace_delta" && item.data.checkpointId === checkpointId);
     if (existing) return existing;
     const reviewDiff = await this.checkpoints.reviewDiff(session.identity.sessionId, checkpointId);
+    const opaqueArtifacts = await this.checkpoints.opaqueArtifacts?.(
+      session.identity.sessionId, checkpointId
+    );
     const evidence: WorkspaceDeltaEvidence = {
       evidenceId: `workspace-delta:${checkpointId}`,
       sessionId: session.identity.sessionId,
@@ -180,7 +183,8 @@ export class CheckpointEvidenceRecorder {
           modified: [...sealed.delta!.modified],
           deleted: [...sealed.delta!.deleted]
         },
-        reviewDiff
+        reviewDiff,
+        ...(opaqueArtifacts && opaqueArtifacts.length > 0 ? { opaqueArtifacts } : {})
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);

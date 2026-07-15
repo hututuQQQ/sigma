@@ -215,7 +215,11 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (command.type === "checkpoint_recovery") {
       await this.checkpoints.resolveOpen(session, command.checkpointId, command.decision);
       session.recovery.lastOutcome = undefined;
-      await this.recoverSession(session);
+      // Recovery is deliberately two-phase. The durable decision moves the
+      // session out of NeedsInput; an external controller can then issue the
+      // normal resume command after it has observed the decision. This keeps
+      // a checkpoint operation from starting a model turn while workspace
+      // control callers are still finishing their safety checks.
       return;
     }
     if (command.type === "budget_increase") {

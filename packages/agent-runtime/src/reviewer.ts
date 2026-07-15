@@ -6,6 +6,7 @@ import type {
   ModelMessage,
   ModelRequest,
   ModelResponse,
+  OpaqueArtifactEvidence,
   ReviewEvidence,
   UsageRecord,
   ValidationEvidence,
@@ -107,9 +108,50 @@ function binaryReviewEvidenceFailure(
   return undefined;
 }
 
+function opaqueArtifactReviewEvidenceFailure(
+  delta: WorkspaceDeltaEvidence,
+  validations: readonly ValidationEvidence[]
+): string | undefined {
+  const artifacts = delta.data.opaqueArtifacts;
+  if (!artifacts || artifacts.length === 0) return undefined;
+  const changedPaths = new Set([
+    ...delta.data.delta.added,
+    ...delta.data.delta.modified,
+    ...delta.data.delta.deleted
+  ].map((item) => item.replaceAll("\\", "/")));
+  const seen = new Set<string>();
+  for (const artifact of artifacts as OpaqueArtifactEvidence[]) {
+    const normalized = typeof artifact.path === "string" ? artifact.path.replaceAll("\\", "/") : "";
+    const identities = [artifact.before, artifact.after].filter((item) => item !== undefined);
+    if (!changedPaths.has(normalized) || seen.has(normalized)
+      || identities.length === 0
+      || identities.some((identity) => !/^[a-f0-9]{64}$/u.test(identity.digest)
+        || !Number.isSafeInteger(identity.sizeBytes) || identity.sizeBytes < 0)) {
+      return `Delta ${delta.evidenceId} has invalid opaque artifact evidence.`;
+    }
+    seen.add(normalized);
+  }
+  if (![...changedPaths].every((item) => seen.has(item))) {
+    return `Delta ${delta.evidenceId} has incomplete opaque artifact evidence.`;
+  }
+  const validated = validations.some((item) => item.status === "passed"
+    && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+  if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
+  return undefined;
+}
+
 export function reviewInputFailure(input: ReviewerInput): string | undefined {
   for (const delta of input.workspaceDeltas) {
     const diff = delta.data.reviewDiff;
+    const opaqueFailure = opaqueArtifactReviewEvidenceFailure(delta, input.validations);
+    if (opaqueFailure) return opaqueFailure;
+    if (delta.data.opaqueArtifacts?.length
+      && [...new Set([
+        ...delta.data.delta.added,
+        ...delta.data.delta.modified,
+        ...delta.data.delta.deleted
+      ].map((item) => item.replaceAll("\\", "/")))].every((item) => delta.data.opaqueArtifacts!
+        .some((artifact) => artifact.path.replaceAll("\\", "/") === item))) continue;
     if (typeof diff !== "string") return `Delta ${delta.evidenceId} has no reviewable diff.`;
     if (diff.includes("[review diff truncated]") || diff.includes("[file diff truncated]")) {
       return `Delta ${delta.evidenceId} has a truncated diff.`;
@@ -249,7 +291,8 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
         evidenceId: item.evidenceId,
         checkpointId: item.data.checkpointId,
         delta: item.data.delta,
-        diff: item.data.reviewDiff ?? "[diff artifact unavailable]"
+        diff: item.data.reviewDiff ?? "[diff artifact unavailable]",
+        opaqueArtifacts: item.data.opaqueArtifacts ?? []
       })),
       validations: input.validations.map((item) => ({ status: item.status, summary: item.summary, data: item.data }))
     })

@@ -162,6 +162,20 @@ export class RuntimeCheckpointControl {
     });
   }
 
+  async recordChildDecisionApplied(
+    session: RuntimeSession,
+    recovery: ChildCheckpointRecovery,
+    decision: "restore" | "keep"
+  ): Promise<void> {
+    await this.options.emit(session, "checkpoint.recovery_resolved", "user", {
+      checkpointId: recovery.checkpointId,
+      decision,
+      sourceSessionId: recovery.sourceSessionId,
+      childId: recovery.childId,
+      applied: true
+    });
+  }
+
   async applyChildDecision(
     session: RuntimeSession,
     recovery: ChildCheckpointRecovery,

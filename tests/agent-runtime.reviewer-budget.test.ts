@@ -418,6 +418,21 @@ describe("independent reviewer budget accounting", () => {
     expect(binary).toMatchObject({ status: "passed", data: { verdict: "approved" } });
     expect(binaryGateway.calls).toBe(1);
 
+    const opaqueDelta = delta();
+    opaqueDelta.data.delta.modified = ["bin/tool"];
+    opaqueDelta.data.reviewDiff = "[review diff truncated]";
+    opaqueDelta.data.opaqueArtifacts = [{
+      path: "bin/tool",
+      before: { digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", sizeBytes: 4 },
+      after: { digest: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", sizeBytes: 8 }
+    }];
+    const opaqueGateway = new ReviewerGateway();
+    const opaque = await new ModelReviewer(opaqueGateway).review({
+      ...input, workspaceDeltas: [opaqueDelta]
+    }, new AbortController().signal);
+    expect(opaque).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(opaqueGateway.calls).toBe(1);
+
     const unvalidatedGateway = new ReviewerGateway();
     const unvalidated = await new ModelReviewer(unvalidatedGateway).review({
       ...input, workspaceDeltas: [binaryDelta], validations: []

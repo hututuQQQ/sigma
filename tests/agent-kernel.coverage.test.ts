@@ -866,6 +866,26 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
+  it("advances a user-resolved checkpoint recovery out of NeedsInput", () => {
+    const suspended = apply(initial(), "run.suspended", {
+      requestId: "checkpoint:checkpoint-one",
+      checkpointId: "checkpoint-one",
+      choices: ["restore", "keep"]
+    });
+    expect(suspended.phase).toBe("needs_input");
+
+    const resolved = evolve(suspended, {
+      ...envelope(suspended, "checkpoint.recovery_resolved", {
+        checkpointId: "checkpoint-one",
+        decision: "restore"
+      }),
+      authority: "user"
+    });
+    expect(resolved.phase).toBe("ready_model");
+    expect(resolved.outcome).toBeUndefined();
+    expect(resolved.proposedOutcome).toBeUndefined();
+  });
+
   it("reduces V3 evidence, usage, plan, budget, checkpoint, and review authorities", () => {
     let state = apply(initial(), "evidence.recorded", diagnosticEvidence("direct"));
     state = apply(state, "evidence.recorded", diagnosticEvidence("direct"));

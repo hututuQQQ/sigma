@@ -12,6 +12,7 @@ import {
   type JsonValue
 } from "agent-protocol";
 import type { KernelState } from "./state.js";
+import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 
 export type KernelEventReducer = (
@@ -168,6 +169,17 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
   });
 };
 
+const checkpointRecoveryResolved: KernelEventReducer = (state, event) => {
+  if (event.authority !== "user" || state.phase !== "needs_input") return state;
+  const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown> : {};
+  // Child decisions are recorded before applying a foreign checkpoint so a
+  // crash can replay them. They only unblock the parent after the apply step
+  // has durably completed.
+  if (payload.sourceSessionId !== undefined && payload.applied !== true) return state;
+  return { ...state, phase: nextPhase(state.pendingTools), outcome: undefined, proposedOutcome: undefined };
+};
+
 const reviewEvidence: KernelEventReducer = (state, event, payload) => evidenceRecorded(state, event, payload);
 
 const profileResolved: KernelEventReducer = (state, event, payload) => {
@@ -244,6 +256,7 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "checkpoint.created": checkpointUpdated,
   "checkpoint.sealed": checkpointUpdated,
   "checkpoint.restored": checkpointUpdated,
+  "checkpoint.recovery_resolved": checkpointRecoveryResolved,
   "review.completed": reviewEvidence,
   "review.waived": reviewEvidence,
   "profile.resolved": profileResolved,
