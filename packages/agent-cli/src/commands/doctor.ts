@@ -5,6 +5,8 @@ import { LazyExecutionBroker, type ExecutionBroker } from "agent-execution";
 import { checkProviderHealth } from "agent-model";
 import { loadCliConfig, parseArgs } from "../config.js";
 
+export const DOCTOR_REPORT_SCHEMA_VERSION = 1 as const;
+
 interface DoctorDeps {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
@@ -13,19 +15,24 @@ interface DoctorDeps {
   languageServers?: LanguageServerPreset[];
 }
 
-async function sandboxCheck(broker: ExecutionBroker): Promise<DoctorCheck> {
+async function sandboxCheck(broker: ExecutionBroker): Promise<SandboxProbe> {
   try {
     const report = await broker.doctor();
     const ready = report.sandbox.available && report.sandbox.selfTestPassed;
     return {
-      name: "sandbox",
-      status: ready ? "ok" : "warning",
-      message: ready
-        ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; pty=${String(report.capabilities.pty)}`
-        : `${report.sandbox.backend} unavailable: ${report.sandbox.reason ?? "self-test failed"}`
+      report,
+      check: {
+        name: "sandbox",
+        status: ready ? "ok" : "warning",
+        message: ready
+          ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; pty=${String(report.capabilities.pty)}`
+          : `${report.sandbox.backend} unavailable: ${report.sandbox.reason ?? "self-test failed"}`
+      }
     };
   } catch (error) {
-    return { name: "sandbox", status: "warning", message: error instanceof Error ? error.message : String(error) };
+    return {
+      check: { name: "sandbox", status: "warning", message: error instanceof Error ? error.message : String(error) }
+    };
   }
 }
 
@@ -43,6 +50,13 @@ interface DoctorCheck {
   name: string;
   status: "ok" | "warning" | "error" | "skipped";
   message: string;
+}
+
+type BrokerDoctorReport = Awaited<ReturnType<ExecutionBroker["doctor"]>>;
+
+interface SandboxProbe {
+  check: DoctorCheck;
+  report?: BrokerDoctorReport;
 }
 
 function configuredKey(provider: "deepseek" | "glm"): boolean {
@@ -116,12 +130,26 @@ async function executeDoctor(
   try {
     const broker = deps.executionBroker ?? ownedBroker!;
     const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
-    checks.push(await sandboxCheck(broker));
+    const sandbox = await sandboxCheck(broker);
+    checks.push(sandbox.check);
     checks.push(...languageServerChecks(deps.languageServers ?? discoverLanguageServers()));
     checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
     const strict = flags.strict === true;
     const outcome = reportStatus(checks, strict);
-    const report = { status: outcome.status, strict, checks };
+    const report = {
+      doctorSchemaVersion: DOCTOR_REPORT_SCHEMA_VERSION,
+      status: outcome.status,
+      strict,
+      ...(sandbox.report ? {
+        protocolVersion: sandbox.report.protocolVersion,
+        brokerVersion: sandbox.report.brokerVersion,
+        platform: sandbox.report.platform,
+        architecture: sandbox.report.architecture,
+        sandbox: sandbox.report.sandbox,
+        capabilities: sandbox.report.capabilities
+      } : {}),
+      checks
+    };
     writeReport(stdout, report, checks, flags.json === true);
     return outcome.failed ? 1 : 0;
   } finally {

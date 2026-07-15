@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import pathlib
@@ -33,6 +34,12 @@ CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
+FAILURE_KINDS = {"needs_input", "timeout", "tool_error", "api_error", "verifier_failure"}
+DOCTOR_REPORT_SCHEMA_VERSION = 1
+BROKER_PROTOCOL_VERSION = 1
+SUPPORTED_NETWORK_MODES = {"none", "full"}
+MAX_CONTEXT_TEXT_CHARS = 8_192
+MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 
 
 def _default_model(provider: str) -> str:
@@ -88,6 +95,38 @@ def _stderr_text(result: Any) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    code = getattr(error, "code", None)
+    return isinstance(code, str) and code.lower() in {
+        "timeout", "timed_out", "process_timed_out", "broker_timeout", "process_deadline"
+    }
+
+
+def _bounded_text(value: str, maximum: int = MAX_CONTEXT_TEXT_CHARS) -> str:
+    if len(value) <= maximum:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    marker = f"\n...[omitted {len(value) - maximum} chars; sha256={digest}]...\n"
+    available = max(0, maximum - len(marker))
+    head = available // 2
+    tail = available - head
+    return f"{value[:head]}{marker}{value[-tail:] if tail else ''}"
+
+
+def _text_artifact_summary(value: str) -> dict[str, Any]:
+    encoded = value.encode("utf-8")
+    return {
+        "chars": len(value),
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "head": value[:512],
+        "tail": value[-512:] if value else "",
+        "truncated": len(value) > 1_024,
+    }
 
 
 def _json_number(data: dict[str, Any], key: str) -> int:
@@ -151,6 +190,7 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
+        network_mode: str = "none",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         **kwargs: Any,
@@ -174,6 +214,11 @@ class SigmaCliHarborAgent(BaseAgent):
         self.agent_cli_tarball = pathlib.Path(agent_cli_tarball) if agent_cli_tarball is not None else None
         self.provider = provider
         self.model = resolved_model
+        if network_mode not in {"none", "full"}:
+            raise ValueError("network_mode must be one of: none, full")
+        self.network_mode = network_mode
+        self.effective_network_mode: str | None = network_mode
+        self.available_network_modes: list[str] = []
         self.max_wall_time_sec = max_wall_time_sec
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         self.checkpoint_recovery = recovery_policy
@@ -222,6 +267,7 @@ class SigmaCliHarborAgent(BaseAgent):
         result: Any | None = None
         error_message: str | None = None
         failure_kind: str | None = None
+        timed_out = False
         artifact_warnings: list[str] = []
         events: list[dict[str, Any]] = []
         output_result: dict[str, Any] = {}
@@ -245,15 +291,40 @@ class SigmaCliHarborAgent(BaseAgent):
                 if recovery[2]:
                     error_message = recovery[2]
                     failure_kind = "checkpoint_recovery_required"
-            if _return_code(result) != 0 and failure_kind is None:
-                error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
-                failure_kind = "agent_failure"
-            if output_result.get("status") == "needs_input" and failure_kind is None:
+            reported_failure = output_result.get("failureKind") or output_result.get("failure_kind")
+            if reported_failure not in FAILURE_KINDS:
+                reported_failure = None
+            event_failure = self._failure_kind_from_events(events, output_result)
+            # needs_input is a terminal protocol state, even when the CLI uses
+            # a non-zero status to make Harbor stop waiting for user input.
+            if output_result.get("status") == "needs_input":
                 error_message = str(output_result.get("finalMessage") or output_result.get("message") or "agent requires external input")
                 failure_kind = "needs_input"
+            elif reported_failure is not None:
+                error_message = str(output_result.get("message") or output_result.get("finalMessage") or reported_failure)
+                failure_kind = reported_failure
+            elif event_failure is not None and (
+                output_result.get("status") not in {None, "completed"} or _return_code(result) != 0
+            ):
+                error_message = str(output_result.get("message") or output_result.get("finalMessage") or event_failure)
+                failure_kind = event_failure
+            elif _return_code(result) != 0 and failure_kind is None:
+                error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
+                failure_kind = "agent_failure"
         except Exception as exc:
-            error_message = str(exc)
-            failure_kind = "agent_crash"
+            partial = getattr(exc, "result", None)
+            if partial is None and (_stdout_text(exc) or _stderr_text(exc)):
+                partial = exc
+            if partial is not None:
+                result = partial
+                events, output_result = self._parse_stream_output(partial)
+            if _is_timeout_error(exc):
+                timed_out = True
+                error_message = str(exc) or "agent execution timed out"
+                failure_kind = "timeout"
+            else:
+                error_message = str(exc)
+                failure_kind = "agent_crash"
         finally:
             for remote_path, filename in (
                 ("/tmp/agent/summary.json", "summary.json"),
@@ -274,6 +345,11 @@ class SigmaCliHarborAgent(BaseAgent):
             summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
             trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
 
+        if timed_out:
+            summary_path, trace_path = self._persist_timeout_artifacts(
+                result, events, summary_path, trace_path, error_message
+            )
+
         derived_summary = self._summary_from_events(events, output_result)
         if events and (summary_path is None or trace_path is None):
             derived_summary_path, derived_trace_path = self._write_accounting_artifacts(
@@ -288,15 +364,23 @@ class SigmaCliHarborAgent(BaseAgent):
         downloaded_summary = self._read_summary(summary_path)
         if downloaded_summary:
             summary = {**summary, **downloaded_summary}
+        if failure_kind is None and summary.get("failure_kind") in FAILURE_KINDS:
+            failure_kind = summary["failure_kind"]
+        if failure_kind is not None:
+            summary["failure_kind"] = failure_kind
+        summary["network_mode_requested"] = self.network_mode
+        summary["network_mode_effective"] = self.effective_network_mode
         self._populate_context(context, result, summary, error_message)
+        if timed_out:
+            self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
         self._mirror_bench_artifacts(context, result, summary_path, trace_path, summary)
 
         if failure_kind == "agent_crash":
             raise RuntimeError(f"agent_crash: {error_message or 'agent execution raised an exception.'}")
-        if failure_kind in {"agent_failure", "checkpoint_recovery_required", "needs_input"}:
-            raise RuntimeError(f"agent_failure: {error_message or 'agent exited unsuccessfully.'}")
+        if failure_kind in {"agent_failure", "checkpoint_recovery_required", *FAILURE_KINDS}:
+            raise RuntimeError(f"{failure_kind}: {error_message or 'agent exited unsuccessfully.'}")
 
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
@@ -314,6 +398,8 @@ class SigmaCliHarborAgent(BaseAgent):
             self.model,
             "--run-deadline-sec",
             str(self.max_wall_time_sec),
+            "--network",
+            self.network_mode,
             "--permission-mode",
             "auto",
             "--output-format",
@@ -368,9 +454,52 @@ class SigmaCliHarborAgent(BaseAgent):
                 candidate = value.get("result")
                 output_result = dict(candidate) if isinstance(candidate, dict) else dict(value)
                 continue
+            if value.get("kind") == "error":
+                error = value.get("error")
+                error_record = error if isinstance(error, dict) else value
+                code = error_record.get("code")
+                normalized = code.lower() if isinstance(code, str) else ""
+                failure = (
+                    "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
+                    else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
+                    else None
+                )
+                output_result = {
+                    "status": "error",
+                    "message": str(error_record.get("message") or "agent CLI returned an error"),
+                    **({"failureKind": failure} if failure else {}),
+                }
+                continue
             if isinstance(value.get("type"), str) and value.get("payload") is not None:
                 events.append(value)
         return events, output_result
+
+    def _failure_kind_from_events(
+        self,
+        events: list[dict[str, Any]],
+        output_result: dict[str, Any],
+    ) -> str | None:
+        finish_reason = output_result.get("finishReason") or output_result.get("finish_reason")
+        if finish_reason in {"timeout", "timed_out", "max_wall_time"}:
+            return "timeout"
+        for event in reversed(events):
+            event_type = event.get("type")
+            payload = _event_payload(event)
+            explicit = payload.get("failureKind") or payload.get("failure_kind")
+            if explicit in FAILURE_KINDS:
+                return explicit
+            code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
+            if isinstance(code, str):
+                normalized = code.lower()
+                if normalized.startswith(("api_", "provider_", "model_")):
+                    return "api_error"
+                if normalized.startswith(("tool_", "execution_", "process_")):
+                    return "tool_error"
+            if event_type == "model.failed":
+                return "api_error"
+            if event_type == "tool.failed":
+                return "tool_error"
+        return None
 
     def _session_id(self, events: list[dict[str, Any]], output_result: dict[str, Any]) -> str | None:
         value = output_result.get("sessionId")
@@ -574,7 +703,68 @@ class SigmaCliHarborAgent(BaseAgent):
             "output_tokens": output_tokens,
             "cache_tokens": cache_tokens,
             "cost_usd": cost_micro_usd / 1_000_000,
+            "network_mode_requested": self.network_mode,
+            "network_mode_effective": self.effective_network_mode,
         }
+
+    def _persist_timeout_artifacts(
+        self,
+        result: Any | None,
+        events: list[dict[str, Any]],
+        summary_path: pathlib.Path | None,
+        trace_path: pathlib.Path | None,
+        error_message: str | None,
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        stdout = _stdout_text(result)
+        stderr = _stderr_text(result)
+        (self.logs_dir / "stdout.partial.log").write_text(
+            _bounded_text(stdout, MAX_PARTIAL_ARTIFACT_CHARS), encoding="utf-8"
+        )
+        (self.logs_dir / "stderr.partial.log").write_text(
+            _bounded_text(stderr, MAX_PARTIAL_ARTIFACT_CHARS), encoding="utf-8"
+        )
+        last_event = events[-1] if events else self._last_trace_event(trace_path)
+        state = {
+            "status": "timeout",
+            "timed_out": True,
+            "failure_kind": "timeout",
+            "message": error_message or "agent execution timed out",
+            "network_mode_requested": self.network_mode,
+            "network_mode_effective": self.effective_network_mode,
+            "last_event": last_event,
+            "stdout": _text_artifact_summary(stdout),
+            "stderr": _text_artifact_summary(stderr),
+            "recorded_at": time.time(),
+        }
+        (self.logs_dir / "timeout.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+        summary_target = summary_path or (self.logs_dir / "summary.json")
+        summary = self._read_summary(summary_target)
+        summary.update({
+            "schema_version": max(1, _as_int(summary.get("schema_version"), 1)),
+            "status": "timeout",
+            "failure_kind": "timeout",
+            "last_error": error_message or "agent execution timed out",
+            "timeout": state,
+            "network_mode_requested": self.network_mode,
+            "network_mode_effective": self.effective_network_mode,
+        })
+        summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        trace_target = trace_path or (self.logs_dir / "trace.jsonl")
+        existing = trace_target.read_text(encoding="utf-8") if trace_target.is_file() else ""
+        if '"type": "run_timeout"' not in existing:
+            with trace_target.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "run_timeout",
+                    "occurredAt": time.time(),
+                    "metadata": {"timeout": state},
+                    "sigma_event": last_event,
+                }, ensure_ascii=False) + "\n")
+        return summary_target, trace_target
 
     def _trace_records(
         self,
@@ -702,6 +892,23 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if _return_code(doctor_check) != 0:
             self._write_setup_checks(checks, "agent_setup_failed")
             raise RuntimeError(self._setup_failure_message("strict_doctor", doctor_check, doctor_record["doctor_json"]))
+        doctor_json = doctor_record["doctor_json"]
+        contract_error = self._doctor_contract_error(doctor_json)
+        if contract_error is not None:
+            doctor_record["doctor_contract_error"] = contract_error
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(
+                self._setup_failure_message("strict_doctor_contract", doctor_check, doctor_json, contract_error)
+            )
+        capabilities = doctor_json["capabilities"]
+        modes = capabilities["networkModes"]
+        self.available_network_modes = list(modes)
+        if self.network_mode not in self.available_network_modes:
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(
+                f"agent_setup_failed: requested network_mode={self.network_mode} is not supported by the broker"
+            )
+        self.effective_network_mode = self.network_mode
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -726,11 +933,36 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                     continue
         return {"parse_error": "doctor stdout did not contain JSON", "raw_stdout": stdout}
 
+    def _doctor_contract_error(self, doctor_json: Any) -> str | None:
+        if not isinstance(doctor_json, dict):
+            return "doctor response is not a JSON object"
+        if doctor_json.get("doctorSchemaVersion") != DOCTOR_REPORT_SCHEMA_VERSION:
+            return "doctorSchemaVersion is missing or unsupported"
+        if doctor_json.get("protocolVersion") != BROKER_PROTOCOL_VERSION:
+            return "protocolVersion is missing or unsupported"
+        if doctor_json.get("strict") is not True:
+            return "doctor strict mode was not confirmed"
+        if doctor_json.get("status") != "ok":
+            return "doctor status is not ok"
+        broker_version = doctor_json.get("brokerVersion")
+        if not isinstance(broker_version, str) or not broker_version:
+            return "brokerVersion is missing"
+        capabilities = doctor_json.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return "capabilities are missing"
+        modes = capabilities.get("networkModes")
+        if not isinstance(modes, list) or any(mode not in SUPPORTED_NETWORK_MODES for mode in modes):
+            return "capabilities.networkModes are missing or invalid"
+        return None
+
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": 1,
             "classification": status,
+            "network_mode_requested": self.network_mode,
+            "network_mode_effective": self.effective_network_mode,
+            "available_network_modes": list(self.available_network_modes),
             "checks": checks,
         }
         (self.logs_dir / "setup-check.json").write_text(
@@ -738,12 +970,20 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             encoding="utf-8",
         )
 
-    def _setup_failure_message(self, stage: str, result: Any, doctor_json: Any = None) -> str:
+    def _setup_failure_message(
+        self,
+        stage: str,
+        result: Any,
+        doctor_json: Any = None,
+        reason: str | None = None,
+    ) -> str:
         details = [
             f"agent_setup_failed: stage={stage} exit_code={_return_code(result)}",
             f"stdout:\n{_stdout_text(result) or '<empty>'}",
             f"stderr:\n{_stderr_text(result) or '<empty>'}",
         ]
+        if reason is not None:
+            details.append(f"reason: {reason}")
         if doctor_json is not None:
             details.append(f"doctor_json:\n{json.dumps(doctor_json, ensure_ascii=False, indent=2)}")
         return "\n".join(details)
@@ -810,6 +1050,24 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _last_trace_event(self, trace_path: pathlib.Path | None) -> dict[str, Any] | None:
+        if trace_path is None or not trace_path.is_file():
+            return None
+        try:
+            lines = trace_path.read_text(encoding="utf-8")[-65_536:].splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            event = value.get("sigma_event")
+            return event if isinstance(event, dict) else value
+        return None
+
     def _read_result(self, result: Any | None) -> dict[str, Any]:
         if result is None:
             return {}
@@ -836,12 +1094,16 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 error_message = last_error
         if not error_message and exit_code != 0 and result is not None:
             error_message = _output_text(result).strip() or f"agent exited with code {exit_code}"
+        if error_message:
+            error_message = _bounded_text(error_message)
 
         values = {
             "exit_code": exit_code,
             "error_message": error_message,
-            "agent_stdout": _stdout_text(result),
-            "agent_stderr": _stderr_text(result),
+            "agent_stdout": _bounded_text(_stdout_text(result)),
+            "agent_stderr": _bounded_text(_stderr_text(result)),
+            "agent_stdout_summary": _text_artifact_summary(_stdout_text(result)),
+            "agent_stderr_summary": _text_artifact_summary(_stderr_text(result)),
             "commands_executed": _json_number(summary, "commands_executed"),
             "tool_calls": _json_number(summary, "tool_calls"),
             "model_turns": _json_number(summary, "model_turns"),
@@ -851,6 +1113,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_output_tokens": _json_number(summary, "output_tokens"),
             "n_cache_tokens": _json_number(summary, "cache_tokens"),
             "cost_usd": summary.get("cost_usd"),
+            "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
+            "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
         }
         for key, value in values.items():
             self._set_context_value(context, key, value)
@@ -898,7 +1162,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if trace_path is not None and trace_path.is_file():
             shutil.copy2(trace_path, task_dir / "trace.jsonl")
 
-        output = _output_text(result).strip() if result is not None else ""
+        output = _bounded_text(_output_text(result).strip()) if result is not None else ""
         if output:
             (task_dir / "agent.log").write_text(f"{output}\n", encoding="utf-8")
 
@@ -909,6 +1173,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "exit_code": getattr(context, "exit_code", None),
             "error_message": getattr(context, "error_message", None),
             "failure_kind": getattr(context, "failure_kind", None),
+            "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
+            "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
             "artifact_warnings": getattr(context, "artifact_warnings", []),
             "commands_executed": getattr(context, "commands_executed", 0),
             "tool_calls": getattr(context, "tool_calls", 0),
@@ -948,6 +1214,11 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 signals.append(signal)
 
         add("agent_setup_ok")
+        failure_kind = summary.get("failure_kind")
+        if isinstance(failure_kind, str) and failure_kind in FAILURE_KINDS:
+            add(failure_kind)
+        if isinstance(summary.get("timeout"), dict):
+            add("partial_trace_saved")
         result_text = _output_text(result) if result is not None else ""
         if re.search(r"finish[_ ]?reason\"?\s*[:=]\s*\"?max_wall_time", result_text, flags=re.IGNORECASE) or re.search(
             r"agent execution timed out|timed out after|max wall time",

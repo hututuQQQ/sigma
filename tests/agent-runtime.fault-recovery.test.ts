@@ -429,7 +429,11 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     createdAt: now,
     producer: { authority: "runtime", id: "checkpoint-manager" },
     summary: "Workspace delta sealed.",
-    data: { checkpointId: checkpoint.checkpointId, delta: checkpoint.delta! }
+    data: {
+      checkpointId: checkpoint.checkpointId,
+      delta: checkpoint.delta!,
+      reviewDiff: "--- a/target.ts\n+++ b/target.ts\n@@\n-before\n+executed-1"
+    }
   });
   await append("execution.completed", {
     executionId: "mutation-call",
@@ -762,6 +766,7 @@ describe("durable transaction fault-injection recovery", () => {
       checkpointId: fixture.checkpoint!.checkpointId,
       decision: "keep"
     });
+    await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(executions.count).toBe(0);
     expect(reviewer.calls).toBe(0);
@@ -783,6 +788,7 @@ describe("durable transaction fault-injection recovery", () => {
       checkpointId: fixture.checkpoint!.checkpointId,
       decision: "restore"
     });
+    await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(executions.count).toBe(0);
     expect(reviewer.calls).toBe(0);

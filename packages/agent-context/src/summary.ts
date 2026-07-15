@@ -7,8 +7,9 @@ const MAXIMUM_SUMMARY_LINES = 128;
 
 function sampled(value: string): string {
   if (value.length <= MAXIMUM_SOURCE_CHARACTERS) return value;
+  const digest = createHash("sha256").update(value, "utf8").digest("hex");
   const half = Math.floor(MAXIMUM_SOURCE_CHARACTERS / 2);
-  return `${value.slice(0, half)} ...[large output omitted]... ${value.slice(-half)}`;
+  return `${value.slice(0, half)} ...[large output omitted; chars=${value.length}; sha256=${digest}]... ${value.slice(-half)}`;
 }
 
 function line(message: ModelMessage): string {

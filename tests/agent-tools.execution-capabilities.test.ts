@@ -174,4 +174,27 @@ describe("execution tool capability closure", () => {
       "exec", "shell", "validate", "process_spawn", "process_poll", "process_write", "process_terminate"
     ]) expect(tools.descriptor(name)).toBeUndefined();
   });
+
+  it("keeps the shell schema aligned with verified capabilities and rejects unsupported arguments", async () => {
+    const root = await workspace();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      foreground: true,
+      background: false,
+      networkMode: "none",
+      networkModes: ["none"],
+      shells: ["bash"]
+    });
+
+    expect(tools.descriptor("shell")?.inputSchema).toMatchObject({
+      properties: { shell: { enum: ["bash"] }, timeoutMs: { maximum: 600000 } }
+    });
+    await expect(tools.prepare(
+      request("shell", { shell: "bash", command: "printf ok", unsupported: true }),
+      preparation(root)
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+    await expect(tools.prepare(
+      request("shell", { shell: "bash", command: "printf ok", timeoutMs: "fast" }),
+      preparation(root)
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+  });
 });

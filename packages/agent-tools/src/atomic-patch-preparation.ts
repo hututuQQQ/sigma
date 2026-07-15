@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { readPatchFile } from "./atomic-patch-file-state.js";
 import {
@@ -9,6 +9,7 @@ import {
   type PatchHunk
 } from "./atomic-patch-parser.js";
 import type { PatchOriginalFile, PreparedPatchChange } from "./atomic-patch-types.js";
+import { resolveWorkspacePath } from "agent-platform";
 
 const PROTECTED_SEGMENTS = new Set([".git", ".agent"]);
 const WINDOWS_ILLEGAL = /[<>:"|?*]/u;
@@ -30,6 +31,21 @@ export function safePatchRelative(raw: string): string {
     || /[. ]$/u.test(part) || WINDOWS_RESERVED.test(part));
   if (unsafe) throw new AtomicPatchError(`Protected or unsafe patch path '${raw}'.`);
   return parts.join("/");
+}
+
+/**
+ * Resolve a patch path against the canonical workspace and only then expose a
+ * relative path to the mutation machinery.  This deliberately keeps
+ * safePatchRelative as the final lexical guard: absolute paths are accepted
+ * only when they resolve inside this workspace, while traversal and link
+ * escapes remain rejected.
+ */
+export async function normalizePatchRelative(workspace: string, raw: string): Promise<string> {
+  const root = await realpath(path.resolve(workspace));
+  const target = await resolveWorkspacePath(root, raw);
+  const relative = path.relative(root, target).split(path.sep).join("/");
+  if (!relative) throw new AtomicPatchError(`Patch cannot replace the workspace root: '${raw}'.`);
+  return safePatchRelative(relative);
 }
 
 function rangeStart(start: number, count: number): number {
@@ -212,8 +228,8 @@ export async function preparePatchChange(
   patch: FilePatch,
   expected: Record<string, string>
 ): Promise<PreparedPatchChange> {
-  const source = patch.oldPath ? safePatchRelative(patch.oldPath) : undefined;
-  const target = patch.newPath ? safePatchRelative(patch.newPath) : undefined;
+  const source = patch.oldPath ? await normalizePatchRelative(workspace, patch.oldPath) : undefined;
+  const target = patch.newPath ? await normalizePatchRelative(workspace, patch.newPath) : undefined;
   if (source) await verifyPatchParentContainment(workspace, source);
   if (target) await verifyPatchParentContainment(workspace, target);
   const original = await readPatchFile(workspace, source);

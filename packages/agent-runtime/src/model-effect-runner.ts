@@ -158,9 +158,12 @@ export class ModelEffectRunner {
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const plan = await providerSizedPlan(session.services.gateway, {
-      system: ledger ? [...session.interaction.contextItems, ...hookContext, ledger] : [...session.interaction.contextItems, ...hookContext],
+      system: [...session.interaction.contextItems, ...hookContext],
       history: session.durable.state.messages,
-      dynamic,
+      // Keep the stable system prefix cacheable. The evidence ledger is
+      // current-run state and belongs in the dynamic suffix, where changes do
+      // not invalidate static policy/context cache entries.
+      dynamic: ledger ? [...dynamic, ledger] : dynamic,
       tools,
       outputReserveTokens: this.options.outputReserveTokens
     });

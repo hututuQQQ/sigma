@@ -29,7 +29,7 @@ export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 export const defaultConcurrentTrials = 5;
 
-const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "unknown"];
+const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "needs_input", "tool_error", "verifier_failure", "unknown"];
 const FAILURE_COUNT_BUCKETS = new Map([
   ["host_proxy_error", "infra_failed"],
   ["host_encoding_error", "infra_failed"],
@@ -37,6 +37,10 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["node_missing", "infra_failed"],
   ["agent_setup_failed", "infra_failed"],
   ["api_error", "api_error"],
+  ["needs_input", "needs_input"],
+  ["timeout", "timeout"],
+  ["tool_error", "tool_error"],
+  ["verifier_failure", "verifier_failure"],
   ["agent_timeout", "timeout"],
   ["max_turns", "timeout"],
   ["tool_timeout", "timeout"],
@@ -51,6 +55,10 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["node_missing", "package-agent-cli"],
   ["agent_setup_failed", "portable/harbor"],
   ["api_error", "agent-model"],
+  ["needs_input", "agent-runtime"],
+  ["timeout", "agent-runtime"],
+  ["tool_error", "agent-tools"],
+  ["verifier_failure", "agent-runtime"],
   ["agent_timeout", "agent-runtime"],
   ["max_turns", "agent-runtime"],
   ["tool_timeout", "agent-tools"],
@@ -217,6 +225,12 @@ function asNonNegativeInt(value, fallback, name) {
   return parsed;
 }
 
+function networkMode(value, fallback = "none") {
+  const mode = asString(value, fallback);
+  if (mode !== "none" && mode !== "full") throw new Error("network mode must be none or full.");
+  return mode;
+}
+
 function normalizedSha256(value, name) {
   if (value === undefined || value === null || value === "") return null;
   const text = String(value).trim().toLowerCase();
@@ -286,6 +300,7 @@ export function resolveRunOptions(argv, env = process.env) {
     mode,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
+    networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
     runLabel: asString(flags["run-label"]),
     k: asPositiveInt(flags.k, 1, "--k"),
     nConcurrentTrials: asPositiveInt(
@@ -501,7 +516,8 @@ function harborTaskRecord(task) {
 function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
-    provider: options.provider
+    provider: options.provider,
+    network_mode: options.networkMode ?? "none"
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -661,6 +677,9 @@ export function buildHarborArgs(options) {
 
   args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
+  if (options.networkMode !== undefined) {
+    args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
+  }
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
   }
@@ -859,6 +878,13 @@ export function classifyFailure(input = {}) {
   const summary = input.summary ?? {};
   const logText = String(input.logText ?? "");
   const events = input.traceEvents ?? [];
+
+  const declared = input.failureKind
+    ?? input.metadata?.failure_kind
+    ?? summary.failure_kind;
+  if (["needs_input", "timeout", "tool_error", "api_error", "verifier_failure"].includes(declared)) {
+    return declared;
+  }
 
   if (/unknown scheme for proxy url/i.test(logText) || /\bhtpp:\/\//i.test(logText)) return "host_proxy_error";
   if (/unicodeencodeerror/i.test(logText) || /codec can't encode character/i.test(logText) || /illegal multibyte sequence/i.test(logText)) {
@@ -1427,7 +1453,8 @@ function mergeHarborTrialResult(task, trialResult) {
       summary: traceSummary,
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: exceptionMessage,
-      exitCode: 1
+      exitCode: 1,
+      failureKind: agentMetadata.failure_kind
     });
     next.last_error = exceptionMessage;
     next.failure_signals = collectFailureSignals({
@@ -1456,7 +1483,8 @@ function mergeHarborTrialResult(task, trialResult) {
       summary: traceSummary,
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: trialLogText,
-      exitCode: agentExitCode ?? 1
+      exitCode: agentExitCode ?? 1,
+      failureKind: agentMetadata.failure_kind
     });
     next.last_error = agentErrorMessage ?? `agent exited with code ${agentExitCode}`;
     next.failure_signals = collectFailureSignals({
@@ -1533,6 +1561,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
   const classifyExitCode = summary.status === "completed" ? 0 : metadata.exit_code ?? config.exit_code;
   let failureCategory = status === "passed" ? null : classifyFailure({
     summary,
+    metadata,
+    failureKind: metadata.failure_kind,
     traceEvents,
     logText: combinedLogText,
     exitCode: classifyExitCode
@@ -1548,9 +1578,9 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
         summary,
         traceEvents,
         logText: combinedLogText,
-        verifierFailed: status === "failed" && failureCategory === "verifier_failed"
+        verifierFailed: status === "failed" && ["verifier_failed", "verifier_failure"].includes(failureCategory)
       });
-  if (status === "failed" && failureCategory === "verifier_failed" && summary.status === "completed") {
+  if (status === "failed" && ["verifier_failed", "verifier_failure"].includes(failureCategory) && summary.status === "completed") {
     addSignal(failureSignals, "agent_completed_but_verifier_failed");
   }
 
@@ -1677,9 +1707,9 @@ export function formatMarkdownReport(report) {
     "",
     "## Counts",
     "",
-    "| passed | failed | infra_failed | timeout | api_error | unknown |",
-    "| ---: | ---: | ---: | ---: | ---: | ---: |",
-    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.unknown} |`,
+    "| passed | failed | infra_failed | timeout | api_error | needs_input | tool_error | verifier_failure | unknown |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.needs_input} | ${report.counts.tool_error} | ${report.counts.verifier_failure} | ${report.counts.unknown} |`,
     "",
     "## Tasks",
     "",
@@ -1839,7 +1869,8 @@ export async function generateBenchReport(runDir) {
     notes.push("Harbor did not expose per-task trace/summary files in a predictable place for this run; inspect harbor.stdout.log and harbor.stderr.log.");
   }
 
-  const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error + counts.unknown;
+  const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error
+    + counts.needs_input + counts.tool_error + counts.verifier_failure + counts.unknown;
   const exitCode = Number(config.exit_code ?? 1);
   const scoreStatus = incompleteReason.length > 0
     ? "incomplete"

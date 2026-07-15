@@ -98,7 +98,16 @@ describe("doctor command branch coverage", () => {
         "--check-api",
         "--json"
       ], { stdout, executionBroker: healthyBroker() })).resolves.toBe(0);
-      const report = JSON.parse(stdout.text()) as { status: string; checks: Array<{ name: string; status: string; message: string }> };
+      const report = JSON.parse(stdout.text()) as {
+        doctorSchemaVersion: number;
+        protocolVersion: number;
+        capabilities: { networkModes: string[] };
+        status: string;
+        checks: Array<{ name: string; status: string; message: string }>;
+      };
+      expect(report.doctorSchemaVersion).toBe(1);
+      expect(report.protocolVersion).toBe(1);
+      expect(report.capabilities.networkModes).toEqual(["none"]);
       expect(report.status).toBe("ok");
       expect(report.checks).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "node", status: "ok" }),

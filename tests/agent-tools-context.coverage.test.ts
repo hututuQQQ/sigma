@@ -311,7 +311,8 @@ describe("context, platform, and repository tool capabilities", () => {
       ],
       tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
     });
-    expect(withReasoning.budget.historyTokens).toBeGreaterThan(withoutReasoning.budget.historyTokens);
+    expect(withReasoning.budget.historyTokens).toBe(withoutReasoning.budget.historyTokens);
+    expect(withReasoning.messages.at(-1)?.reasoningContent).toBeUndefined();
     expect(() => planContext({
       system: [], dynamic: [], history: [{ role: "user", content: "x".repeat(1_000) }], tools: [],
       contextWindowTokens: 10, outputReserveTokens: 0

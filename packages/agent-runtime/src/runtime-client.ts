@@ -246,6 +246,15 @@ export class InProcessRuntimeClient implements RuntimeClient {
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
     await assertSessionStorageSupported(this.options.storeRootDir, command.sessionId);
+    const existing = this.sessions.get(command.sessionId);
+    if (existing) {
+      // A checkpoint decision is intentionally two-phase. The runtime that
+      // owns the hydrated session may resume it after the durable decision
+      // without trying to reacquire its own command-bus lease.
+      if (existing.recovery.openCheckpointRecovery || existing.execution.running) return;
+      await this.recoverSession(existing);
+      return;
+    }
     await this.commandBus.claim(command.sessionId);
     try {
       await this.resume(command.sessionId);

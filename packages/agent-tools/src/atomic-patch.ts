@@ -12,8 +12,8 @@ import { recoverAtomicPatchTransactions } from "./atomic-patch-journal.js";
 import { AtomicPatchError, parseUnifiedPatch } from "./atomic-patch-parser.js";
 import {
   patchFileHash,
+  normalizePatchRelative,
   preparePatchChange,
-  safePatchRelative,
   verifyPatchParentContainment
 } from "./atomic-patch-preparation.js";
 import { commitPreparedPatch, type AtomicPatchCleanupWarning } from "./atomic-patch-transaction.js";
@@ -236,7 +236,7 @@ export async function replaceWorkspaceTextFile(
 ): Promise<AtomicPatchResult> {
   const workspace = await realpath(path.resolve(workspacePath));
   await recoverAtomicPatchTransactions(workspace, options.stateRootDir);
-  const relative = safePatchRelative(requestedPath);
+  const relative = await normalizePatchRelative(workspace, requestedPath);
   await verifyPatchParentContainment(workspace, relative);
   const original = await readPatchFile(workspace, relative);
   if (options.requireExisting && !original.exists) {

@@ -17,7 +17,7 @@ import {
   SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
-import { toolReceipt } from "../packages/agent-kernel/src/receipt-parsing.js";
+import { receiptContent, toolReceipt } from "../packages/agent-kernel/src/receipt-parsing.js";
 
 function initial(): KernelState {
   return createKernelState({
@@ -210,6 +210,30 @@ describe("semantic execution failure convergence", () => {
     expect(state.receipts[0]).toMatchObject({
       outcome: { status: "failed", diagnosticCodes: ["executable_not_found"] }
     });
+  });
+
+  it("clips large receipt output while retaining artifact and digest summaries", () => {
+    const receipt = toolReceipt({
+      callId: "large-receipt",
+      ok: true,
+      output: "head\n" + "payload ".repeat(20_000) + "\ntail",
+      outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      artifacts: ["artifact-1"],
+      artifactRefs: [{
+        artifactId: "artifact-1", name: "stdout.log", digest: "a".repeat(64), sizeBytes: 123_456
+      }],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(receipt).not.toBeNull();
+    const content = receiptContent(receipt!);
+    expect(content.length).toBeLessThan(20_000);
+    expect(content).toContain("receipt output omitted");
+    expect(content).toContain("artifact-1");
+    expect(content).toContain("sha256=");
+    expect(content).toContain("tail");
   });
 
   it("clusters equivalent infrastructure diagnostics across different tools and stops after three attempts", () => {

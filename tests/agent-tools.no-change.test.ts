@@ -66,6 +66,43 @@ describe("exact text no-change writes", () => {
     await expect(readFile(target, "utf8")).resolves.toBe("same\r\n");
   });
 
+  it("normalizes an in-workspace absolute mutation path and rejects traversal", async () => {
+    const root = await temporaryRoot();
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const target = path.join(workspace, "absolute.txt");
+    await writeFile(target, "before\n", "utf8");
+
+    const result = await replaceWorkspaceTextFile(workspace, target, {
+      stateRootDir: path.join(root, "state"),
+      transform: () => "after\n"
+    });
+    expect(result.files).toEqual(["absolute.txt"]);
+    await expect(readFile(target, "utf8")).resolves.toBe("after\n");
+
+    await expect(replaceWorkspaceTextFile(workspace, path.join(workspace, "..", "escape.txt"), {
+      stateRootDir: path.join(root, "state"),
+      transform: () => "escape\n"
+    })).rejects.toMatchObject({ code: "path_escape" });
+  });
+
+  it("reports workspace-relative paths from the write tool for absolute requests", async () => {
+    const root = await temporaryRoot();
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const target = path.join(workspace, "tool.txt");
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      atomicPatchStateRootDir: path.join(root, "state")
+    });
+
+    const result = await tools.execute(
+      request("absolute-write", "write", { path: target, content: "created\n" }),
+      context(workspace)
+    );
+    expect(result.result).toMatchObject({ status: "changed", path: "tool.txt" });
+    await expect(readFile(target, "utf8")).resolves.toBe("created\n");
+  });
+
   it.each([
     ["write", { path: "same.txt", content: "same\n" }],
     ["edit", { path: "same.txt", oldText: "same", newText: "same" }]

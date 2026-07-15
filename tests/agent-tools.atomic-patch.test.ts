@@ -12,6 +12,10 @@ import {
   AtomicPatchRollbackError,
   type AtomicPatchOptions
 } from "../packages/agent-tools/src/atomic-patch.js";
+import {
+  directoryIdentity,
+  sameDirectoryIdentity
+} from "../packages/agent-tools/src/atomic-patch-path-safety.js";
 
 const temporaryRoots = new Set<string>();
 
@@ -55,6 +59,15 @@ afterEach(async () => {
 });
 
 describe("applyUnifiedPatch", () => {
+  it("treats overlayfs birthtime variation as stable but detects parent replacement", () => {
+    const first = directoryIdentity({ dev: 7, ino: 11, mode: 0o40755, birthtimeMs: 10 } as never);
+    const projected = directoryIdentity({ dev: 7, ino: 11, mode: 0o40755, birthtimeMs: 99 } as never);
+    const replaced = directoryIdentity({ dev: 7, ino: 12, mode: 0o40755, birthtimeMs: 99 } as never);
+
+    expect(sameDirectoryIdentity(first, projected)).toBe(true);
+    expect(sameDirectoryIdentity(first, replaced)).toBe(false);
+  });
+
   it("applies a CRLF modification atomically and reports hashes", async () => {
     const root = await workspace();
     await writeFile(path.join(root, "one.txt"), "alpha\r\nbeta\r\n", "utf8");

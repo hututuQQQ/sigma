@@ -58,6 +58,21 @@ def import_portable_agent_module():
     return importlib.import_module("portable.harbor.sigma_harbor_agent")
 
 
+def current_doctor_payload(network_modes: list[str] | None = None) -> str:
+    return json.dumps({
+        "doctorSchemaVersion": 1,
+        "status": "ok",
+        "strict": True,
+        "protocolVersion": 1,
+        "brokerVersion": "fixture",
+        "platform": "linux",
+        "architecture": "x86_64",
+        "sandbox": {"available": True, "backend": "fixture", "selfTestPassed": True},
+        "capabilities": {"networkModes": network_modes or ["none", "full"]},
+        "checks": [],
+    })
+
+
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
@@ -87,7 +102,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                             SimpleNamespace(return_code=1),
                             SimpleNamespace(return_code=0),
                             SimpleNamespace(return_code=0, stdout="usage", stderr=""),
-                            SimpleNamespace(return_code=0, stdout='{"status":"ok"}', stderr=""),
+                            SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
                         ]
                     ),
                     upload_file=AsyncMock(),
@@ -121,7 +136,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                         SimpleNamespace(return_code=0),
                         SimpleNamespace(return_code=0),
                         SimpleNamespace(return_code=0, stdout="usage", stderr=""),
-                        SimpleNamespace(return_code=0, stdout='{"status":"ok"}', stderr=""),
+                        SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
                     ]
                 ),
                 upload_file=AsyncMock(),
@@ -180,6 +195,46 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             record = json.loads((logs_dir / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "agent_setup_failed")
             self.assertEqual(record["checks"][1]["exit_code"], 3)
+
+    async def test_setup_rejects_legacy_doctor_payload(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=[
+                    SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                    SimpleNamespace(return_code=0, stdout='{"status":"ok"}', stderr=""),
+                ])
+            )
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "strict_doctor_contract") as raised:
+                await agent._verify_agent_ready(env)
+
+            self.assertIn("doctorSchemaVersion is missing or unsupported", str(raised.exception))
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["classification"], "agent_setup_failed")
+            self.assertEqual(record["checks"][1]["doctor_contract_error"], "doctorSchemaVersion is missing or unsupported")
+
+    async def test_setup_accepts_current_doctor_contract_and_records_network_mode(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=[
+                    SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                    SimpleNamespace(return_code=0, stdout=current_doctor_payload(["none", "full"]), stderr=""),
+                ])
+            )
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs", network_mode="full")
+            agent._workspace = "/app"
+
+            await agent._verify_agent_ready(env)
+
+            self.assertEqual(agent.available_network_modes, ["none", "full"])
+            self.assertEqual(agent.effective_network_mode, "full")
+            record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["classification"], "passed")
+            self.assertEqual(record["network_mode_effective"], "full")
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
         module = import_portable_agent_module()
@@ -271,6 +326,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 logs_dir=Path(tmp) / "logs",
                 provider="glm",
                 model="glm-test",
+                network_mode="full",
                 max_wall_time_sec=700,
                 agent_timeout_grace_sec=20,
             )
@@ -281,8 +337,116 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]][0]
             self.assertIn("--provider glm", command)
             self.assertIn("--model glm-test", command)
+            self.assertIn("--network full", command)
             self.assertIn("--run-deadline-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)
+
+    async def test_needs_input_is_not_collapsed_into_agent_failure(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=2,
+                        stdout=json.dumps({"kind": "result", "result": {
+                            "status": "needs_input", "message": "external input required"
+                        }}) + "\n",
+                        stderr=""
+                    )
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="needs-input")
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "^needs_input:"):
+                await agent.run("run", env, context)
+            self.assertEqual(context.failure_kind, "needs_input")
+            self.assertIn("external input required", context.error_message)
+
+    async def test_terminal_model_and_tool_errors_keep_distinct_categories(self):
+        module = import_portable_agent_module()
+        for event_type, expected in (("model.failed", "api_error"), ("tool.failed", "tool_error")):
+            with self.subTest(event_type=event_type), TemporaryDirectory() as tmp:
+                event = {"kind": "event", "event": {
+                    "eventId": event_type,
+                    "sessionId": "failure-session",
+                    "seq": 1,
+                    "type": event_type,
+                    "payload": {"message": "failure"},
+                }}
+
+                async def exec_side_effect(command, **kwargs):
+                    if "/usr/local/bin/agent run" in command:
+                        return SimpleNamespace(
+                            return_code=1,
+                            stdout="\n".join([
+                                json.dumps(event),
+                                json.dumps({"kind": "result", "result": {"status": "failed", "message": "failure"}}),
+                            ]) + "\n",
+                            stderr="",
+                        )
+                    if command.startswith("test -f ") or command.startswith("test -d "):
+                        return SimpleNamespace(return_code=1, stdout="", stderr="")
+                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+                env = SimpleNamespace(
+                    exec=AsyncMock(side_effect=exec_side_effect),
+                    upload_file=AsyncMock(),
+                    upload_dir=AsyncMock(),
+                    download_file=AsyncMock(),
+                )
+                context = SimpleNamespace(task_id="failure-category")
+                agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+                agent._workspace = "/app"
+                with self.assertRaisesRegex(RuntimeError, f"^{expected}:"):
+                    await agent.run("run", env, context)
+                self.assertEqual(context.failure_kind, expected)
+
+    async def test_timeout_persists_bounded_partial_outputs_and_trace_state(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            class TimeoutWithOutput(TimeoutError):
+                stdout = '{"kind":"event","event":{"type":"tool.started"}}\n'
+                stderr = "partial broker stderr"
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    raise TimeoutWithOutput("deadline exceeded")
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                upload_file=AsyncMock(),
+                upload_dir=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            logs_dir = Path(tmp) / "logs"
+            context = SimpleNamespace(task_id="timeout")
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir, network_mode="none")
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "^timeout:"):
+                await agent.run("run", env, context)
+
+            summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
+            timeout_state = json.loads((logs_dir / "timeout.json").read_text(encoding="utf-8"))
+            trace = (logs_dir / "trace.jsonl").read_text(encoding="utf-8")
+            self.assertEqual(context.failure_kind, "timeout")
+            self.assertEqual(summary["failure_kind"], "timeout")
+            self.assertTrue(timeout_state["timed_out"])
+            self.assertIn("run_timeout", trace)
+            self.assertIn("partial broker stderr", (logs_dir / "stderr.partial.log").read_text(encoding="utf-8"))
 
     async def test_run_has_no_legacy_controller_flags_by_default(self):
         module = import_portable_agent_module()

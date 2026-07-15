@@ -375,6 +375,43 @@ describe("independent reviewer budget accounting", () => {
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
+  it("deduplicates repeated review requests when no new evidence exists", async () => {
+    const target = runtimeSession();
+    let calls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "dedupe-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        calls += 1;
+        return {
+          evidenceId: `failed-review-${calls}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "failed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "dedupe-reviewer" },
+          summary: "reviewer unavailable",
+          data: {
+            reviewerId: "dedupe-reviewer",
+            verdict: "changes_requested",
+            findings: ["reviewer unavailable"],
+            workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+            failureKind: "infrastructure"
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+    const coordinator = new ReviewCoordinator(reviewer, emit);
+
+    await coordinator.maybeReview(target, new AbortController().signal);
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+
+    expect(calls).toBe(2);
+  });
+
   it("fails closed for non-strict JSON and incomplete review material", async () => {
     const input = {
       sessionId: "session", runId: "run", goal: "Review safely",

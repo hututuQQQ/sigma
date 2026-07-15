@@ -30,9 +30,14 @@ const TOOL_ARGUMENT_TOKEN_LIMIT = 128;
 
 function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
-    + approximateTokens(message.reasoningContent ?? "")
     + approximateTokens(JSON.stringify(message.toolCalls ?? []))
     + 6;
+}
+
+function withoutHistoricalReasoning(message: ModelMessage): ModelMessage {
+  if (message.reasoningContent === undefined) return message;
+  const { reasoningContent: _reasoningContent, ...wireMessage } = message;
+  return wireMessage;
 }
 
 function blockTokens(block: readonly ModelMessage[]): number {
@@ -273,7 +278,10 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     throw overflow(`Mandatory system and project context requires ${mandatoryTokens} tokens but only ${available} context tokens are available.`);
   }
 
-  const blocks = historyBlocks(options.history);
+  // Provider-private reasoning is durable audit data, but replaying old
+  // reasoning into a new request both wastes budget and destabilizes prompt
+  // cache prefixes. It is intentionally removed from all historical turns.
+  const blocks = historyBlocks(options.history.map(withoutHistoricalReasoning));
   const selection = selectMandatoryHistory(blocks, available, mandatoryTokens);
   const included: ContextItem[] = [...mandatory];
   const omitted: ContextItem[] = [];

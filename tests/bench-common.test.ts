@@ -59,8 +59,7 @@ describe("Terminal-Bench command construction", () => {
       {
         path: "tasks/one",
         git_url: "https://example.test/tasks.git",
-        git_commit_id: "a".repeat(40),
-        source: "external-plan"
+        git_commit_id: "a".repeat(40)
       },
       { name: "registry/task-two" }
     ]);
@@ -74,6 +73,17 @@ describe("Terminal-Bench command construction", () => {
     expect(() => resolveRunOptions([
       "--mode", "task", "--task-id", "one", "--reuse-package"
     ])).toThrow("--reuse-package requires --expected-archive-sha256");
+  });
+
+  it("propagates the run-level network mode into Harbor agent configuration", () => {
+    const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task", "--network", "full"]);
+    expect(options.networkMode).toBe("full");
+    expect(buildHarborArgs({
+      ...options,
+      taskSelectionFlag: "--task-id",
+      timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180, agent_timeout_multiplier: "1" }
+    })).toContain("network_mode:str=full");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({ network_mode: "full" });
   });
 
   it("can bind formal agent wall time exactly to task metadata", () => {
@@ -573,6 +583,14 @@ describe("failure classifier", () => {
     expect(classifyFailure({ logText: '{"max_wall_time_sec":2700}', exitCode: 1 })).toBe("agent_crashed");
     expect(classifyFailure({ logText: '{"finish_reason":"max_wall_time"}' })).toBe("agent_timeout");
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
+  });
+
+  it("honors explicit runtime failure kinds without conflating their owners", () => {
+    expect(classifyFailure({ failureKind: "needs_input" })).toBe("needs_input");
+    expect(classifyFailure({ failureKind: "timeout" })).toBe("timeout");
+    expect(classifyFailure({ failureKind: "tool_error" })).toBe("tool_error");
+    expect(classifyFailure({ failureKind: "api_error" })).toBe("api_error");
+    expect(classifyFailure({ failureKind: "verifier_failure" })).toBe("verifier_failure");
   });
 
   it("maps failure categories to suggested owners", () => {

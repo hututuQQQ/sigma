@@ -125,6 +125,18 @@ function activeReservation(session: RuntimeSession, ownerId: string): BudgetRese
     item.ownerId === ownerId && item.status !== "released");
 }
 
+function suppressDuplicateReview(
+  evidence: readonly EvidenceRecord[],
+  deltaIds: readonly string[],
+  validationIds: readonly string[],
+  retryableReview: ReviewEvidence | undefined,
+  explicitlyRequested: boolean
+): boolean {
+  const matchingReviews = evidence.filter((item) => sameReviewInput(item, deltaIds, validationIds));
+  const allowedRetryCount = explicitlyRequested && retryableReview ? 1 : 0;
+  return matchingReviews.length > allowedRetryCount;
+}
+
 export interface ReviewReadiness {
   pending: WorkspaceDeltaEvidence[];
   eligible: WorkspaceDeltaEvidence[];
@@ -212,6 +224,11 @@ export class ReviewCoordinator {
       workspaceDeltas: eligible,
       validations: relevantValidations
     };
+    // An interrupted accountable review has a durable reservation that must
+    // be recovered before input validation or duplicate suppression.
+    if (await this.recoverActiveAccountableReview(
+      session, reviewer, reviewerId, input, evidence, signal
+    )) return;
     const inputProblem = reviewInputFailure(input);
     if (inputProblem) {
       await this.emit(session, "review.completed", "runtime", normalizeReview(
@@ -222,6 +239,21 @@ export class ReviewCoordinator {
       ));
       return;
     }
+    // A review is keyed by the exact workspace-delta and validation evidence
+    // it consumed. Re-requesting the same input cannot add information and
+    // only creates duplicate reviewer calls; any new evidence ID naturally
+    // produces a different input and remains eligible.
+    // Preserve the established explicit one-time retry for a retryable
+    // infrastructure review. Once that retry is recorded, further requests
+    // with the same evidence are duplicates until a new delta/validation ID
+    // appears.
+    if (suppressDuplicateReview(
+      evidence,
+      [...eligibleIds],
+      relevantValidations.map((validation) => validation.evidenceId),
+      retryableReview,
+      explicitlyRequested
+    )) return;
     if (this.budgets && isAccountableReviewer(reviewer)) {
       await this.reviewAccounted(session, reviewer, reviewerId, input, evidence, signal);
       return;
@@ -246,6 +278,26 @@ export class ReviewCoordinator {
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session, rawReview, eligible, relevantValidations
     ));
+  }
+
+  private async recoverActiveAccountableReview(
+    session: RuntimeSession,
+    reviewer: ReviewerPort,
+    reviewerId: string,
+    input: ReviewerInput,
+    evidence: readonly EvidenceRecord[],
+    signal: AbortSignal
+  ): Promise<boolean> {
+    if (!this.budgets || !isAccountableReviewer(reviewer)) return false;
+    const requestId = requestIdentity(
+      session,
+      reviewerId,
+      input.workspaceDeltas.map((item) => item.evidenceId),
+      evidence
+    );
+    if (!activeReservation(session, `reviewer:${requestId}`)) return false;
+    await this.reviewAccounted(session, reviewer, reviewerId, input, evidence, signal);
+    return true;
   }
 
   private async reviewAccounted(
