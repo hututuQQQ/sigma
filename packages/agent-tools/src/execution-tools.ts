@@ -218,12 +218,6 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
     timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   };
-  if (validation) {
-    properties.workspaceDeltaEvidenceIds = {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Exact unresolved workspace-delta evidence IDs genuinely exercised by this command. Omission is inferred only when exactly one unresolved delta exists; with multiple deltas, supply the exact subset and never attach unrelated files to a narrow check."
-    };
-  }
   const required = kind === "shell" ? ["shell", "command"] : ["executable"];
   const effects: ToolDescriptor["possibleEffects"] = validation
     ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.write", "validation", "network", "open_world"]
@@ -231,7 +225,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   return {
     descriptor: {
       ...executionToolSchema(kind, validation
-        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. A non-zero exited command is referenceable only as validation_executed, never validation_passed. Scope the command only to workspace deltas it genuinely exercises; omission is inferred only for one unresolved delta. Passed validation automatically triggers eligible internal review. With skill and skillScript, the frozen script is prepended to interpreter args."
+        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. The runtime binds it to the current mutation frontier and derives path coverage from cwd and readRoots; never supply evidence IDs. With skill and skillScript, the frozen script is prepended to interpreter args."
         : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`, properties, required, effects),
       prepare(value, context) {
         if (kind === "shell") assertAvailableShell(executionArgs(value), options);

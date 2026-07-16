@@ -15,3 +15,8 @@ export {
   type SubjectAttestationV1,
   type SubjectProductAttestationV1
 } from "./subject-attestation.js";
+export {
+  recoverInterruptedRepositoryTransactions,
+  repositoryTransactionTool,
+  type RepositoryCheckpointLimits
+} from "./repository-transaction-tool.js";

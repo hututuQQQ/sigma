@@ -19,6 +19,7 @@ import {
 import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
+import { frontierValidationReadiness } from "./mutation-evidence.js";
 
 export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
@@ -57,24 +58,21 @@ export class RuntimeControlService {
 
   private requestReview(session: RuntimeSession): ReviewRequestResult {
     const readiness = reviewReadiness(session);
-    const eligible = new Set(readiness.eligible.map((item) => item.evidenceId));
-    const missingValidationWorkspaceDeltaEvidenceIds = readiness.pending
-      .filter((item) => !eligible.has(item.evidenceId))
-      .map((item) => item.evidenceId);
+    const validation = frontierValidationReadiness(session);
+    const frontier = session.durable.state.mutationFrontier;
     return {
       status: readiness.pending.length === 0
         ? "not_required"
         : readiness.eligible.length === 0 ? "validation_required"
           : readiness.blockedReview ? "changes_required" : "review_requested",
-      workspaceDeltaEvidenceIds: readiness.eligible.map((item) => item.evidenceId),
-      validationEvidenceIds: readiness.relevantValidations.map((item) => item.evidenceId),
-      missingValidationWorkspaceDeltaEvidenceIds,
+      frontierRevision: frontier.revision,
+      stateDigest: frontier.currentStateDigest,
+      changedPaths: [...frontier.changedPaths],
+      missingValidationPaths: validation.missingPaths,
       ...(readiness.blockedReview ? {
-        reviewEvidenceId: readiness.blockedReview.evidenceId,
         findings: [...readiness.blockedReview.data.findings]
       } : {}),
       ...(readiness.retryableReview ? {
-        retryOfReviewEvidenceId: readiness.retryableReview.evidenceId,
         findings: [...readiness.retryableReview.data.findings]
       } : {})
     };

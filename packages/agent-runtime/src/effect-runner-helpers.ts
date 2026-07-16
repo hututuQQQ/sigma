@@ -38,7 +38,7 @@ export function childOutcomeEvidence(
 
 export function mutatingPlan(plan: ToolCallPlan): boolean {
   return plan.exactEffects.some((effect) =>
-    ["filesystem.write", "process.spawn", "destructive", "open_world"].includes(effect));
+    ["filesystem.write", "repository.write", "process.spawn", "destructive", "open_world"].includes(effect));
 }
 
 export function planAllowsMutation(session: RuntimeSession): boolean {

@@ -30,7 +30,10 @@ function invalidOptional(type: string, field: string, value: unknown): Record<st
   const base = kind === "review" ? evidenceFixture("review") : {
     ...evidenceFixture(), kind, data: kind === "command"
       ? { command: "pnpm test", exitCode: 0 }
-      : { validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [], workspaceDeltaEvidenceIds: [] }
+      : {
+          validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
+          frontierRevision: 1, stateDigest: "a".repeat(64), coveredPaths: []
+        }
   };
   return {
     ...validAgentEventFixture(type === "review.completed" ? type : "evidence.recorded"),

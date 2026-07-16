@@ -68,8 +68,8 @@ function qualifyProfileSkills(
 }
 
 function assertMandatoryMutationPolicy(profile: ResolvedAgentProfile): void {
-  const disabled = Object.entries(profile.mutationPolicy)
-    .find(([, enabled]) => enabled !== true)?.[0];
+  const disabled = (["requirePlanBeforeMutation", "checkpointBeforeMutation"] as const)
+    .find((key) => profile.mutationPolicy[key] !== true);
   if (disabled) {
     throw new Error(`Agent Profile '${profile.id}' cannot disable mandatory mutation policy '${disabled}'.`);
   }
@@ -82,11 +82,14 @@ function configuredBudget(config: CustomizationConfig): ResolvedAgentProfile["bu
 function builtinProfile(
   config: CustomizationConfig,
   skills: SkillCatalog,
-  injectedHooks: readonly HookDefinition[]
+  injectedHooks: readonly HookDefinition[],
+  mode: "standard" | "strict" = "standard"
 ): ResolvedAgentProfile {
   return {
-    id: "standard",
-    description: "Sigma Code V3 strict local coding profile",
+    id: mode,
+    description: mode === "strict"
+      ? "Sigma Code V4 local coding profile with required review"
+      : "Sigma Code V4 local coding profile with advisory review",
     roleRoutes: {
       orchestrator: "default", planner: "default", reviewer: "default",
       child_analyze: "default", child_write: "default", summarizer: "default"
@@ -100,9 +103,9 @@ function builtinProfile(
     mutationPolicy: {
       requirePlanBeforeMutation: true,
       checkpointBeforeMutation: true,
-      reviewNonDocumentationChanges: true
+      reviewMode: mode === "strict" ? "required" : "advisory"
     },
-    allowedChildProfiles: ["standard"]
+    allowedChildProfiles: mode === "strict" ? ["strict"] : ["standard", "strict"]
   };
 }
 
@@ -153,13 +156,17 @@ export async function resolveRuntimeCustomization(
   for (const item of profiles) assertMandatoryMutationPolicy(item.profile);
   const hookCatalog = new HookCatalog(discoveredHooks, injectedHooks);
   const builtin = builtinProfile(config, skills, injectedHooks);
-  if (profiles.some((item) => item.profile.id === builtin.id)) {
-    throw new Error(`Agent Profile id '${builtin.id}' is reserved by the built-in profile.`);
+  const strictBuiltin = builtinProfile(config, skills, injectedHooks, "strict");
+  const reserved = profiles.find((item) => item.profile.id === builtin.id || item.profile.id === strictBuiltin.id);
+  if (reserved) {
+    throw new Error(`Agent Profile id '${reserved.profile.id}' is reserved by the built-in profile.`);
   }
   const selectedId = config.agentProfile?.trim() || "standard";
   let selected = builtin;
   let profileSource: RuntimeCustomization["profileSource"] = "builtin";
-  if (selectedId !== "standard") {
+  if (selectedId === "strict") {
+    selected = strictBuiltin;
+  } else if (selectedId !== "standard") {
     const found = profiles.find((item) => item.profile.id === selectedId);
     if (!found) throw new Error(`Unknown Agent Profile '${selectedId}'.`);
     selected = found.source === "workspace" ? narrowAgentProfile(builtin, found.profile) : found.profile;
@@ -182,6 +189,7 @@ export async function resolveRuntimeCustomization(
     profileSource,
     availableProfiles: [
       { profile: freezeAgentProfile(builtin), source: "builtin" },
+      { profile: freezeAgentProfile(strictBuiltin), source: "builtin" },
       ...profiles.map((item) => ({ profile: freezeAgentProfile(item.profile), source: item.source }))
     ],
     skills,

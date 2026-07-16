@@ -93,7 +93,7 @@ function profile(hookId: string): ResolvedAgentProfile {
     mutationPolicy: {
       requirePlanBeforeMutation: true,
       checkpointBeforeMutation: true,
-      reviewNonDocumentationChanges: true
+      reviewMode: "advisory"
     },
     allowedChildProfiles: []
   };

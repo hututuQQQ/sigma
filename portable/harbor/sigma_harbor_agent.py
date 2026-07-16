@@ -36,7 +36,8 @@ MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
 FAILURE_KINDS = {
-    "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure"
+    "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
+    "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
 }
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
@@ -48,6 +49,32 @@ MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
 PROCESS_TERM_GRACE_SEC = 1
+
+
+def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> str | None:
+    normalized = code.lower() if isinstance(code, str) else ""
+    if not normalized:
+        return None
+    diagnostics = (payload or {}).get("diagnostics")
+    category = diagnostics.get("category") if isinstance(diagnostics, dict) else None
+    if normalized == "convergence_no_progress":
+        return "convergence_no_progress"
+    if normalized.startswith("validation_"):
+        return "validation_blocked"
+    if normalized.startswith("runtime_") or normalized in {
+        "effect_plan_violation", "tool_receipt_identity_mismatch", "validation_frontier_missing"
+    }:
+        return "runtime_invariant_failure"
+    # Model protocol/convergence failures are agent outcomes, not provider API
+    # failures. A provider category or an unambiguous transport/API prefix is
+    # required before Harbor reports api_error.
+    if category in {"network", "timeout", "authentication", "rate_limit", "server"}:
+        return "api_error"
+    if normalized.startswith(("api_", "provider_", "network_")):
+        return "api_error"
+    if normalized.startswith(("tool_", "execution_", "process_")):
+        return "tool_error"
+    return None
 
 
 def _default_model(provider: str) -> str:
@@ -398,12 +425,7 @@ class _OutputRecorder:
             error = value.get("error")
             error_record = error if isinstance(error, dict) else value
             code = error_record.get("code")
-            normalized = code.lower() if isinstance(code, str) else ""
-            failure = (
-                "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
-                else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
-                else None
-            )
+            failure = _failure_kind_for_code(code, error_record)
             self.output_result = {
                 "status": "error",
                 "message": str(error_record.get("message") or "agent CLI returned an error"),
@@ -898,12 +920,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     error = value.get("error")
                     error_record = error if isinstance(error, dict) else value
                     code = error_record.get("code")
-                    normalized = code.lower() if isinstance(code, str) else ""
-                    failure = (
-                        "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
-                        else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
-                        else None
-                    )
+                    failure = _failure_kind_for_code(code, error_record)
                     output_result = {
                         "status": "error",
                         "message": str(error_record.get("message") or "agent CLI returned an error"),
@@ -925,8 +942,18 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         # A durable run terminal is the Agent/runtime outcome. Earlier model or
         # tool failures remain diagnostic causes, but must not override the
         # completed runtime lifecycle classification.
-        if any(event.get("type") in {"run.failed", "run.cancelled"} for event in events):
-            return "agent_failure"
+        terminal = next((event for event in reversed(events)
+                         if event.get("type") in {"run.failed", "run.cancelled"}), None)
+        if terminal is not None:
+            payload = _event_payload(terminal)
+            explicit = payload.get("failureKind") or payload.get("failure_kind")
+            if explicit in FAILURE_KINDS:
+                return explicit
+            classified = _failure_kind_for_code(
+                payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode"),
+                payload,
+            )
+            return classified or "agent_failure"
         finish_reason = output_result.get("finishReason") or output_result.get("finish_reason")
         if finish_reason in {"timeout", "timed_out", "max_wall_time"}:
             return "timeout"
@@ -938,11 +965,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return explicit
             code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
             if isinstance(code, str):
-                normalized = code.lower()
-                if normalized.startswith(("api_", "provider_", "model_")):
-                    return "api_error"
-                if normalized.startswith(("tool_", "execution_", "process_")):
-                    return "tool_error"
+                classified = _failure_kind_for_code(code, payload)
+                if classified:
+                    return classified
             if event_type == "model.failed":
                 return "api_error"
             if event_type == "tool.failed":

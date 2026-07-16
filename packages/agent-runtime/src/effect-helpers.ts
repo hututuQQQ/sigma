@@ -168,7 +168,7 @@ export function mergeDelta(left: WorkspaceDelta | undefined, right: WorkspaceDel
   return { added: merge("added"), modified: merge("modified"), deleted: merge("deleted") };
 }
 
-const scopedMutationEffects = new Set(["filesystem.write", "process.spawn", "destructive", "open_world"]);
+const scopedMutationEffects = new Set(["filesystem.write", "repository.write", "process.spawn", "destructive", "open_world"]);
 
 function needsWriteScope(plan: ToolCallPlan | undefined, descriptor: ToolDescriptor): boolean {
   return (plan?.exactEffects ?? descriptor.possibleEffects).some((effect) => scopedMutationEffects.has(effect));
@@ -260,7 +260,7 @@ function workspaceLockScope(session: RuntimeSession): string {
 }
 
 export function requiresInstructionReplan(descriptor: ToolDescriptor): boolean {
-  const risky = new Set(["filesystem.write", "process.spawn", "agent.spawn", "network", "validation", "outcome.propose", "outcome.request_input", "destructive", "open_world"]);
+  const risky = new Set(["filesystem.write", "repository.write", "process.spawn", "agent.spawn", "network", "validation", "outcome.propose", "outcome.report_blocked", "outcome.request_input", "destructive", "open_world"]);
   return descriptor.possibleEffects.some((effect) => risky.has(effect));
 }
 

@@ -352,7 +352,9 @@ export async function buildProductReadinessReport(options = {}) {
   // those gates, while an unknown major remains unsupported until its package
   // schema is reviewed explicitly.
   const expectedV3 = expectedProductMajor !== null && expectedProductMajor >= 3;
-  const supportedProductMajor = expectedProductMajor === 2 || expectedProductMajor === 3;
+  const supportedProductMajor = expectedProductMajor === 2
+    || expectedProductMajor === 3
+    || expectedProductMajor === 4;
   checks.push(check(
     "productVersion:supportedMajor",
     supportedProductMajor,

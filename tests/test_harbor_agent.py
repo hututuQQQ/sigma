@@ -570,6 +570,25 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     await agent.run("run", env, context)
                 self.assertEqual(context.failure_kind, expected)
 
+    async def test_runtime_terminal_failures_keep_v4_categories(self):
+        module = import_portable_agent_module()
+        agent = module.SigmaCliHarborAgent(logs_dir=Path("unused"))
+        cases = (
+            ("convergence_no_progress", {}, "convergence_no_progress"),
+            ("validation_failed", {}, "validation_blocked"),
+            ("runtime_terminal_missing", {}, "runtime_invariant_failure"),
+            ("model_stream_protocol_error", {"diagnostics": {"category": "protocol"}}, "agent_failure"),
+            ("model_route_failed", {"diagnostics": {"category": "rate_limit"}}, "api_error"),
+        )
+        for code, extra, expected in cases:
+            with self.subTest(code=code):
+                payload = {"code": code, **extra}
+                actual = agent._failure_kind_from_events(
+                    [{"type": "run.failed", "payload": payload}],
+                    {"status": "failed"},
+                )
+                self.assertEqual(actual, expected)
+
     async def test_timeout_persists_bounded_partial_outputs_and_trace_state(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:

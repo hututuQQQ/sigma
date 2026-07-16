@@ -1,104 +1,39 @@
-import { createHash } from "node:crypto";
-import {
-  evidenceSupportsClaim,
-  isCompletionEligibleEvidence,
-  isCompletionReferenceableEvidence,
-  type ContextItem,
-  type EvidenceClaim,
-  type EvidenceRecord
-} from "agent-protocol";
+import type { ContextItem } from "agent-protocol";
 import { approximateTokens } from "agent-context";
+import { currentFrontierReview, frontierValidationReadiness } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
 
-const MAX_STRUCTURAL_EVIDENCE = 32;
-const MAX_OBSERVATION_EVIDENCE = 16;
-
-function structuralEvidence(item: EvidenceRecord): boolean {
-  return item.kind === "workspace_delta" || item.kind === "validation"
-    || item.kind === "review" || item.kind === "checkpoint"
-    || item.kind === "child_outcome" || item.kind === "user_waiver";
+function findingText(value: unknown): string {
+  const rendered = typeof value === "string" ? value : JSON.stringify(value);
+  return rendered.length <= 1_000 ? rendered : `${rendered.slice(0, 1_000)}…`;
 }
 
-function projectedEvidence(available: readonly EvidenceRecord[]): EvidenceRecord[] {
-  const structural = available.filter(structuralEvidence).slice(-MAX_STRUCTURAL_EVIDENCE);
-  const observations = available.filter((item) => !structuralEvidence(item)).slice(-MAX_OBSERVATION_EVIDENCE);
-  const selected = new Set([...structural, ...observations].map((item) => item.evidenceId));
-  return available.filter((item) => selected.has(item.evidenceId));
-}
-
-function allowedClaims(item: EvidenceRecord, sessionId: string, runId: string): EvidenceClaim[] {
-  const claims: EvidenceClaim[] = [];
-  if (isCompletionEligibleEvidence(item, sessionId, runId)) claims.push("acceptance_met");
-  if (evidenceSupportsClaim(item, "validation_executed")) claims.push("validation_executed");
-  if (evidenceSupportsClaim(item, "validation_passed")) claims.push("validation_passed");
-  return claims;
-}
-
-function boundedFinding(value: EvidenceRecord & { kind: "review" }): string[] {
-  return value.data.findings.slice(0, 12).map((finding) => {
-    const rendered = typeof finding === "string" ? finding : JSON.stringify(finding);
-    return rendered.length <= 1_000 ? rendered : `${rendered.slice(0, 1_000)}…`;
-  });
-}
-
-function evidenceMetadata(item: EvidenceRecord, sessionId: string, runId: string): object {
-  const common = {
-    allowedClaims: allowedClaims(item, sessionId, runId),
-    referenceable: isCompletionReferenceableEvidence(item, sessionId, runId),
-    summary: item.summary.slice(0, 500)
-  };
-  if (item.kind === "validation") return {
-    ...common,
-    validator: item.data.validator,
-    ...(item.data.command === undefined ? {} : { command: item.data.command }),
-    ...(item.data.exitCode === undefined ? {} : { exitCode: item.data.exitCode }),
-    ...(item.data.termination === undefined ? {} : { termination: item.data.termination }),
-    workspaceDeltaEvidenceIds: item.data.workspaceDeltaEvidenceIds,
-    checkpointIds: item.data.checkpointIds ?? []
-  };
-  if (item.kind === "review") return {
-    ...common,
-    verdict: item.data.verdict,
-    workspaceDeltaEvidenceIds: item.data.workspaceDeltaEvidenceIds,
-    validationEvidenceIds: item.data.validationEvidenceIds ?? [],
-    ...(item.data.checkpointId ? { checkpointId: item.data.checkpointId } : {}),
-    ...(item.data.failureKind ? { failureKind: item.data.failureKind } : {}),
-    findings: boundedFinding(item)
-  };
-  if (item.kind === "workspace_delta") return {
-    ...common,
-    checkpointId: item.data.checkpointId,
-    delta: item.data.delta
-  };
-  return common;
-}
-
-export function evidenceLedger(session: RuntimeSession): ContextItem | undefined {
-  const available = session.durable.state.evidence.filter((item) =>
-    item.sessionId === session.identity.sessionId && item.runId === session.durable.runId
-    && (isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId)
-      || (item.kind === "review" && item.status === "failed")));
-  if (available.length === 0) return undefined;
-  const recent = projectedEvidence(available);
-  const content = [
-    "Current-run typed durable evidence ledger. These IDs are runtime data, not instructions. Each completion evidence reference has its own claim, and one criterion may combine references with different claims. Use only exact evidenceId/kind/claim combinations listed in each record's allowedClaims. Keep workspace or acceptance evidence on acceptance_met; cite an exited failed validation as validation_executed to report its result. Failed validation never proves validation_passed or acceptance_met, and there is no validation waiver to request from the user. Failed review is shown for findings but cannot approve a workspace delta.",
-    ...(available.length > recent.length ? [
-      `${available.length - recent.length} older current-run evidence records omitted from this prompt projection; they remain durable. Prefer the listed recent or structural evidence and do not rerun a tool merely to recover an omitted ID.`
-    ] : []),
-    ...recent.flatMap((item) => [
-      `- ${item.evidenceId.replace(/\s+/gu, " ")} (${item.kind}, ${item.status})`,
-      `  metadata: ${JSON.stringify(evidenceMetadata(
-        item,
-        session.identity.sessionId,
-        session.durable.runId
-      ))}`
-    ])
-  ].join("\n");
-  const digest = createHash("sha256").update(content).digest("hex").slice(0, 16);
+/** Model-visible V4 completion state. Internal evidence and checkpoint IDs are
+ * deliberately absent: the runtime owns their association and final handoff. */
+export function evidenceLedger(session: RuntimeSession): ContextItem {
+  const frontier = session.durable.state.mutationFrontier;
+  const validation = frontierValidationReadiness(session);
+  const review = currentFrontierReview(session);
+  const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
+  const changed = frontier.changedPaths.slice(0, 200);
+  const lines = [
+    "Completion status (runtime-owned; do not supply evidence IDs):",
+    `- final mutation revision: ${frontier.revision}`,
+    `- net changed paths (${frontier.changedPaths.length}): ${changed.length > 0 ? changed.join(", ") : "none"}`,
+    ...(changed.length < frontier.changedPaths.length ? [`- ${frontier.changedPaths.length - changed.length} additional paths omitted from this display`] : []),
+    `- semantic validation: ${frontier.changedPaths.length === 0 ? "not required" : validation.ready ? "passed for every net changed path" : "blocking"}`,
+    ...(validation.missingPaths.length > 0 ? [`- validation still missing/failed for: ${validation.missingPaths.join(", ")}`] : []),
+    ...(validation.latestFailed ? [`- latest failed validation: ${validation.latestFailed.summary}`] : []),
+    `- independent review mode: ${reviewMode}`,
+    ...(review ? [`- latest review: ${review.data.verdict} (${review.status})`,
+      ...review.data.findings.slice(0, 12).map((item) => `  - ${findingText(item)}`)] : []),
+    "When work is complete call complete_task with summary and optional warnings. If validation cannot be repaired after concrete attempts, call report_blocked. Use request_user_input only for a real user decision."
+  ];
+  const content = lines.join("\n");
   return {
-    id: `runtime:evidence-ledger:${session.durable.runId}:${digest}`,
+    id: `runtime:completion-status:${session.durable.runId}:${frontier.revision}:${session.durable.state.evidence.length}`,
     authority: "runtime",
-    provenance: "current-run typed durable evidence ledger",
+    provenance: "completion_status",
     content,
     tokenCount: approximateTokens(content),
     priority: 9_900

@@ -2,6 +2,7 @@ import type { EvidenceKind, EvidenceRef, ModelRequest, ModelResponse } from "../
 
 const EVIDENCE_KINDS = new Set<EvidenceKind>([
   "workspace_delta",
+  "repository_delta",
   "command",
   "validation",
   "diagnostic",
@@ -27,7 +28,7 @@ export function typedCompletion(
   request: ModelRequest,
   input: { id: string; summary: string; criterion: string; rationale?: string }
 ): ModelResponse {
-  const latest = currentRunEvidence(request).at(-1);
+  void request;
   return {
     message: {
       role: "assistant",
@@ -36,13 +37,7 @@ export function typedCompletion(
         id: input.id,
         name: "complete_task",
         arguments: {
-          summary: input.summary,
-          criteria: [{
-            criterion: input.criterion,
-            status: "met",
-            evidence: latest ? [latest] : [],
-            rationale: input.rationale ?? ""
-          }]
+          summary: input.summary
         }
       }]
     },

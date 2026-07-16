@@ -13,12 +13,14 @@ import type { RunMode } from "./outcomes.js";
 export type ToolEffect =
   | "filesystem.read"
   | "filesystem.write"
+  | "repository.write"
   | "process.spawn"
   | "process.spawn.readonly"
   | "agent.spawn"
   | "network"
   | "validation"
   | "outcome.propose"
+  | "outcome.report_blocked"
   | "outcome.request_input"
   | "runtime.control"
   | "checkpoint.restore"
@@ -135,11 +137,10 @@ export interface RuntimeControlPort {
 
 export interface ReviewRequestResult {
   status: "review_requested" | "validation_required" | "changes_required" | "not_required";
-  workspaceDeltaEvidenceIds: string[];
-  validationEvidenceIds: string[];
-  missingValidationWorkspaceDeltaEvidenceIds: string[];
-  reviewEvidenceId?: string;
-  retryOfReviewEvidenceId?: string;
+  frontierRevision: number;
+  stateDigest: string;
+  changedPaths: string[];
+  missingValidationPaths: string[];
   findings?: JsonValue[];
 }
 

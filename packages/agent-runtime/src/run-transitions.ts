@@ -29,6 +29,10 @@ export function beginNextRun(
     frozenCustomization: session.durable.state.frozenCustomization,
     frozenSkills: session.durable.state.frozenSkills,
     activeProcessIds: session.durable.state.activeProcessIds,
+    // A completed run has already accepted this frontier as the new baseline;
+    // a paused/recoverable run still owns its unresolved frontier. Neither may
+    // be reconstructed from the session's full historical evidence list.
+    mutationFrontier: session.durable.state.mutationFrontier,
     mutationEvidence: session.durable.state.mutationEvidence,
     // Evidence and waivers are run-scoped. Durable history remains in the
     // event log, but a follow-up must earn fresh evidence.

@@ -18,16 +18,12 @@ export function fakeValidationTurn(id, checks) {
 }
 
 export function fakeProcessValidationTurn(id, relativePath, expected) {
-  return (request) => {
-    const delta = currentRunEvidence(request).findLast((item) => item.kind === "workspace_delta");
-    if (!delta) throw new Error("The smoke validator requires current-run workspace delta evidence.");
-    return fakeToolTurn([fakeToolCall(id, "validate", {
+  return () => fakeToolTurn([fakeToolCall(id, "validate", {
       executable: "./sigma-smoke-validate",
       args: [relativePath, expected],
       access: "readonly",
-      workspaceDeltaEvidenceIds: [delta.evidenceId]
+      readRoots: ["."]
     })]);
-  };
 }
 
 export function fakeReviewerTurn() {
@@ -165,42 +161,28 @@ export function createSmokeReviewer() {
           reviewerId: "smoke-independent-reviewer",
           verdict: "approved",
           findings: [],
-          workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
+          frontierRevision: input.frontierRevision,
+          stateDigest: input.stateDigest,
+          validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       };
     }
   };
 }
 
-function currentRunEvidence(request) {
-  const ledger = [...request.messages].reverse().find((message) =>
-    message.content.includes("Current-run typed durable evidence ledger."))?.content ?? "";
-  return [...ledger.matchAll(/^- (.+?) \(([^,]+), [^)]+\)$/gmu)]
-    .map((match) => ({ evidenceId: match[1], kind: match[2] }));
-}
-
 export function fakeFinalTurn(content = "done") {
-  return (request) => {
-    const latest = currentRunEvidence(request).at(-1);
-    return {
+  return () => ({
     message: {
       role: "assistant",
       content: "",
       toolCalls: [fakeToolCall("complete-smoke", "complete_task", {
-        summary: content,
-        criteria: [{
-          criterion: "The requested smoke workflow completed.",
-          status: "met",
-          evidence: latest ? [latest] : [],
-          rationale: "Cited current-run durable evidence demonstrates the result."
-        }]
+        summary: content
       })]
     },
     finishReason: "tool_calls",
     inputTokens: 1,
     outputTokens: 1
-    };
-  };
+    });
 }
 
 export class SmokeFakeGateway {

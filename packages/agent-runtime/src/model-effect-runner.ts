@@ -172,7 +172,7 @@ export class ModelEffectRunner {
       // Keep the stable system prefix cacheable. The evidence ledger is
       // current-run state and belongs in the dynamic suffix, where changes do
       // not invalidate static policy/context cache entries.
-      dynamic: ledger ? [...dynamic, ledger] : dynamic,
+      dynamic: [...dynamic, ledger],
       tools,
       outputReserveTokens: this.options.outputReserveTokens
     });

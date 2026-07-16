@@ -39,8 +39,8 @@ export const modelMessageSchema = z.object({
 }).strict();
 
 export const toolEffectSchema = z.enum([
-  "filesystem.read", "filesystem.write", "process.spawn", "process.spawn.readonly",
-  "agent.spawn", "network", "validation", "outcome.propose", "outcome.request_input",
+  "filesystem.read", "filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly",
+  "agent.spawn", "network", "validation", "outcome.propose", "outcome.report_blocked", "outcome.request_input",
   "runtime.control", "checkpoint.restore", "destructive", "open_world"
 ]);
 

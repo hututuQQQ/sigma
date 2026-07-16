@@ -6,6 +6,7 @@ import {
   isCheckpointRef,
   isEvidenceRecord,
   isJsonValue,
+  isMutationFrontier,
   isPlanGraph,
   isUsageRecord,
   type BudgetLedgerState,
@@ -14,6 +15,7 @@ import {
   type FrozenArtifactRef,
   type FrozenCustomizationRef,
   type ModelMessage,
+  type MutationFrontier,
   type PlanGraph,
   type RunMode,
   type RunOutcome,
@@ -21,6 +23,7 @@ import {
   type ToolReceipt,
   type UsageRecord
 } from "agent-protocol";
+import { emptyMutationFrontier } from "./mutation-frontier.js";
 
 export type KernelPhase =
   | "idle"
@@ -103,6 +106,8 @@ export interface KernelState {
   /** Session-scoped mutation evidence retained across follow-up runs so
    * validation/review obligations cannot be erased by a run boundary. */
   mutationEvidence: EvidenceRecord[];
+  /** Runtime-owned identity of the unresolved baseline-to-current mutation. */
+  mutationFrontier: MutationFrontier;
   evidence: EvidenceRecord[];
   usage: UsageRecord[];
   plan: PlanGraph;
@@ -155,6 +160,7 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     toolCallIds: [],
     receipts: [],
     mutationEvidence: [],
+    mutationFrontier: emptyMutationFrontier(),
     evidence: [],
     usage: [],
     plan: createEmptyPlan(),
@@ -260,6 +266,7 @@ export function isKernelState(value: unknown): value is KernelState {
     Array.isArray(state.toolCallIds),
     Array.isArray(state.receipts),
     Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord),
+    isMutationFrontier(state.mutationFrontier),
     Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord),
     Array.isArray(state.usage) && state.usage.every(isUsageRecord),
     isPlanGraph(state.plan),

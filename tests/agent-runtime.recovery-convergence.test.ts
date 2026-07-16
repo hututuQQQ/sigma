@@ -156,8 +156,9 @@ describe("runtime recovery convergence", () => {
           cancelled: false
         },
         artifactIds: ["stderr"],
-        workspaceDeltaEvidenceIds: ["delta"],
-        checkpointIds: ["checkpoint"]
+        frontierRevision: 0,
+        stateDigest: "0".repeat(64),
+        coveredPaths: ["delta"]
       }
     };
     current.evidence = [failed];

@@ -24,7 +24,8 @@ export function evidenceFixture(
   };
   if (kind === "review") return {
     ...base, kind, producer: { authority: "runtime" }, data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: ["delta"]
+      reviewerId: "reviewer", verdict: "approved", findings: [],
+      frontierRevision: 1, stateDigest: "a".repeat(64)
     }
   };
   if (kind === "user_waiver") return {
@@ -190,6 +191,14 @@ export function completeAgentEventPayload(type: AgentEventType, payload: unknown
   });
   if (type === "run.started") baseline.deadlineAt = new Date(Date.now() + 60_000).toISOString();
   const completed = { ...baseline, ...supplied };
+  if (type === "review.completed" && completed.data && typeof completed.data === "object") {
+    completed.data = {
+      ...(completed.data as Record<string, unknown>),
+      frontierRevision: (completed.data as Record<string, unknown>).frontierRevision ?? 1,
+      stateDigest: (completed.data as Record<string, unknown>).stateDigest ?? "a".repeat(64)
+    };
+    delete (completed.data as Record<string, unknown>).workspaceDeltaEvidenceIds;
+  }
   if (type === "tool.completed" || type === "tool.failed") {
     for (const field of ["startedAt", "completedAt"] as const) {
       if (typeof completed[field] !== "string" || !Number.isFinite(Date.parse(completed[field]))) {

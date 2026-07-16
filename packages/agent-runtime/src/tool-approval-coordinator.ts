@@ -20,6 +20,7 @@ import {
 
 const internalTerminalEffects: ReadonlySet<ToolEffect> = new Set([
   "outcome.propose",
+  "outcome.report_blocked",
   "outcome.request_input"
 ]);
 
@@ -38,7 +39,7 @@ function requiresPerCallApproval(plan: ToolCallPlan): boolean {
 
 function requiresFreshRecoveredApproval(plan: ToolCallPlan): boolean {
   return plan.exactEffects.some((effect) =>
-    ["filesystem.write", "destructive", "checkpoint.restore", "open_world"].includes(effect));
+    ["filesystem.write", "repository.write", "destructive", "checkpoint.restore", "open_world"].includes(effect));
 }
 
 function containsOnlyInternalTerminalEffects(

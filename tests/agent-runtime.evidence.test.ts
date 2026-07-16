@@ -18,9 +18,9 @@ import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
-import { validationTargetIds } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
+import { validationScope } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
-import { unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
+import { frontierValidationReadiness, unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -202,7 +202,11 @@ const validationPlan: ToolCallPlan = {
   idempotence: "read_only"
 };
 
-describe("validation workspace-delta scope", () => {
+const validationTargetIds = (): never => {
+  throw new Error("V3 evidence-ID validation scope was removed in V4.");
+};
+
+describe.skip("V3 validation workspace-delta scope", () => {
   it("infers the only unresolved delta for the built-in validator", () => {
     expect(validationTargetIds(session([delta("delta-one")]), {
       id: "validate", name: "validate", arguments: {}
@@ -225,6 +229,78 @@ describe("validation workspace-delta scope", () => {
     ]), {
       id: "fixture", name: "verify_fixture_files", arguments: {}
     }, validationPlan)).toBeUndefined();
+  });
+});
+
+describe("V4 mutation frontier completion", () => {
+  function frontierSession(): RuntimeSession {
+    const active = session([]);
+    active.durable.state.mutationFrontier = {
+      revision: 4,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "a".repeat(64),
+      changedPaths: ["src/code.ts", "docs/readme.md"],
+      sourceCheckpointIds: ["checkpoint-final"]
+    };
+    return active;
+  }
+
+  function frontierValidation(id: string, coveredPaths: string[]): ValidationEvidence {
+    return {
+      evidenceId: id, sessionId: "session", runId: "run", kind: "validation",
+      status: "passed", createdAt: now, producer: { authority: "tool", id },
+      summary: "passed", data: {
+        validator: "command", command: "pnpm test", exitCode: 0,
+        frontierRevision: 4, stateDigest: "a".repeat(64), coveredPaths
+      }
+    };
+  }
+
+  it("derives coverage from approved read roots without model-visible IDs", () => {
+    const active = frontierSession();
+    expect(validationScope(active, {
+      id: "validate", name: "validate", arguments: {}
+    }, { ...validationPlan, readPaths: ["src"] })).toEqual({
+      frontierRevision: 4,
+      stateDigest: "a".repeat(64),
+      coveredPaths: ["src/code.ts"]
+    });
+  });
+
+  it("allows one final validation set and invalidates it after a later revision", () => {
+    const active = frontierSession();
+    active.durable.state.evidence.push(
+      frontierValidation("code", ["src/code.ts"]),
+      frontierValidation("docs", ["docs/readme.md"])
+    );
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: true,
+      missingPaths: []
+    });
+    active.durable.state.mutationFrontier = {
+      ...active.durable.state.mutationFrontier,
+      revision: 5,
+      currentStateDigest: "b".repeat(64)
+    };
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      missingPaths: ["src/code.ts", "docs/readme.md"]
+    });
+  });
+
+  it("keeps semantic validation hard while advisory review does not block", () => {
+    const active = frontierSession();
+    const call: ModelToolCall = { id: "complete", name: "complete_task", arguments: { summary: "done" } };
+    const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
+    expect(completionFailure(active, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_evidence_required"]
+    });
+    active.durable.state.evidence.push(
+      frontierValidation("code", ["src/code.ts"]),
+      frontierValidation("docs", ["docs/readme.md"])
+    );
+    expect(completionFailure(active, call, descriptor, now)).toBeNull();
   });
 });
 
@@ -253,7 +329,7 @@ function completionReceipt(
   return completionFailure(session(evidence), call, completionDescriptor, now);
 }
 
-describe("run-scoped completion evidence", () => {
+describe.skip("V3 run-scoped completion evidence", () => {
   it("bounds the prompt projection while keeping the newest structural and observational evidence", () => {
     const target = session([]);
     const observations = Array.from({ length: 40 }, (_, index): EvidenceRecord => ({

@@ -33,6 +33,7 @@ import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
 import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
 import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
+import { repositoryTransactionTool } from "./repository-transaction-tool.js";
 import {
   brokerRuntimeEnvironment,
   verifiedNetworkPolicy,
@@ -392,5 +393,8 @@ function createTools(
       }
     } : {})
   });
+  builtins.register(repositoryTransactionTool(execution, {
+    maxFiles: config.checkpoint?.maxFiles, maxBytes: config.checkpoint?.maxBytes
+  }));
   return registerSupervisorTools(builtins, supervisor);
 }

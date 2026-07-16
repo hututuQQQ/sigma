@@ -576,7 +576,9 @@ describe("durable child identity and crash recovery", () => {
       kind: "validation",
       data: {
         validator: "checkpoint_postimage_integrity",
-        workspaceDeltaEvidenceIds: [(importedDelta?.payload as { evidenceId: string }).evidenceId]
+        frontierRevision: expect.any(Number),
+        stateDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        coveredPaths: []
       }
     });
     expect(validationCoversDelta(

@@ -305,7 +305,9 @@ describe("execution output artifact receipts", () => {
           idleTimedOut: false,
           cancelled: false
         },
-        workspaceDeltaEvidenceIds: []
+        frontierRevision: 0,
+        stateDigest: "0".repeat(64),
+        coveredPaths: []
       })
     })]);
   });

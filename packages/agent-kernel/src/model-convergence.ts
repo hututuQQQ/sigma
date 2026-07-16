@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
 import { isCompletionReferenceableEvidence, type JsonValue, type ModelMessage, type ModelToolCall, type RunOutcome, type ToolReceipt } from "agent-protocol";
 import type { KernelState } from "./state.js";
 
 const TERMINAL_PROTOCOL_FAILURE_CODES = new Set([
   "invalid_completion_proposal",
+  "invalid_blocked_report",
   "invalid_user_input_request",
   "mode_denied",
   "profile_denied",
@@ -53,32 +53,6 @@ export function currentRunReferenceableEvidenceCount(state: KernelState): number
     isCompletionReferenceableEvidence(item, state.sessionId, state.runId)).length;
 }
 
-export function queueCompletionPrerequisiteRetry(state: KernelState): KernelState {
-  const repair = state.completionRepair;
-  if (repair?.kind !== "completion_prerequisite" || state.phase !== "ready_model"
-    || state.pendingTools.length > 0
-    || currentRunReferenceableEvidenceCount(state) <= repair.evidenceCount) return state;
-  const digest = createHash("sha256").update(repair.originalCallId).digest("hex").slice(0, 16);
-  const call = {
-    id: `completion_retry_${repair.retryCount + 1}_${digest}`,
-    name: "complete_task",
-    arguments: repair.arguments
-  };
-  if (state.toolCallIds.includes(call.id)) return state;
-  return {
-    ...state,
-    phase: "tool_pending",
-    messages: [...state.messages, { role: "assistant", content: "", toolCalls: [call] }],
-    pendingTools: [{
-      request: { callId: call.id, name: call.name, arguments: call.arguments },
-      modelTurn: repair.modelTurn,
-      approval: "not_required",
-      started: false
-    }],
-    toolCallIds: [...state.toolCallIds, call.id]
-  };
-}
-
 export function completionRepairFailureMessage(state: KernelState, detail: string): string {
   const answer = protectedCompletionAnswer(state);
   if (!answer || detail.startsWith(answer)) return detail;
@@ -89,8 +63,13 @@ export function completionSummary(receipt: ToolReceipt): string | null {
   if (!receipt.ok || !receipt.observedEffects.includes("outcome.propose")) return null;
   try {
     const value = JSON.parse(receipt.output) as unknown;
-    return value && typeof value === "object" && typeof (value as { summary?: unknown }).summary === "string"
-      ? (value as { summary: string }).summary : null;
+    if (!value || typeof value !== "object" || typeof (value as { summary?: unknown }).summary !== "string") return null;
+    const proposal = value as { summary: string; warnings?: unknown };
+    const warnings = Array.isArray(proposal.warnings)
+      ? proposal.warnings.filter((item): item is string => typeof item === "string") : [];
+    return warnings.length > 0
+      ? `${proposal.summary}\n\nWarnings:\n${warnings.map((item) => `- ${item}`).join("\n")}`
+      : proposal.summary;
   } catch {
     return null;
   }
@@ -105,6 +84,17 @@ export function requestedInput(receipt: ToolReceipt): string | null {
   } catch {
     return null;
   }
+}
+
+export function blockedReport(receipt: ToolReceipt): { code: string; message: string } | null {
+  if (!receipt.ok || !receipt.observedEffects.includes("outcome.report_blocked")) return null;
+  try {
+    const value = JSON.parse(receipt.output) as { code?: unknown; summary?: unknown; recoveryAttempted?: unknown };
+    if (typeof value.code !== "string" || typeof value.summary !== "string") return null;
+    const attempted = typeof value.recoveryAttempted === "string" && value.recoveryAttempted
+      ? `\n\nRecovery attempted: ${value.recoveryAttempted}` : "";
+    return { code: value.code, message: `${value.summary}${attempted}` };
+  } catch { return null; }
 }
 
 export function failedTerminalRepairState(
@@ -127,12 +117,23 @@ export function failedTerminalRepairState(
   }
   if (protocolCodes.length === 0 && !terminalRepairPending) return null;
   const detail = protocolCodes.length > 0 ? protocolCodes.join(", ") : "terminal_action_missing";
+  if (state.completionRepairAttempts < 2) {
+    return {
+      ...state,
+      phase: "ready_model",
+      completionRepairAttempts: state.completionRepairAttempts + 1,
+      messages: [...state.messages, {
+        role: "developer",
+        content: `The terminal action was invalid (${detail}). Correct the arguments or continue repairing the reported blocker; all normal tools remain available.`
+      }]
+    };
+  }
   return propose(state, {
     kind: "recoverable_failure",
-    code: "terminal_protocol_invalid",
+    code: "convergence_no_progress",
     message: completionRepairFailureMessage(
       state,
-      `The model's protocol-repair action failed (${detail}).`
+      `The terminal action remained invalid after two correction turns (${detail}).`
     )
   });
 }
@@ -142,8 +143,9 @@ export function conflictingTerminalBatch(
   repairPending: boolean
 ): boolean {
   const completionCount = calls.filter((call) => call.name === "complete_task").length;
+  const blockedCount = calls.filter((call) => call.name === "report_blocked").length;
   const inputRequestCount = calls.filter((call) => call.name === "request_user_input").length;
-  const terminalCount = completionCount + inputRequestCount;
+  const terminalCount = completionCount + blockedCount + inputRequestCount;
   if (terminalCount === 0) return false;
   if (repairPending) return calls.length > 1 || terminalCount > 1;
   return inputRequestCount > 0 ? calls.length > 1 : terminalCount > 1;
@@ -163,19 +165,14 @@ export function repairConflictingTerminalBatch(
       )
     });
   }
-  const evidenceAvailable = hasCurrentRunEvidence(state);
   return {
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: evidenceAvailable
-        ? "A terminal protocol action must be the only call in its tool batch. On this repair turn, call exactly one allowed terminal action."
-        : "A terminal protocol action must be the only call in its tool batch. Completion is unavailable until current-run evidence exists; use only non-terminal evidence tools, or request user input alone when a concrete decision is required."
+      content: "A terminal protocol action must be the only call in its tool batch. Correct the call or continue ordinary repair work; all tools remain available."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
-    completionRepair: evidenceAvailable
-      ? { kind: "terminal_action" }
-      : { kind: "evidence_acquisition" },
+    completionRepair: { kind: "terminal_action" },
     continuationAttempts: 0,
     phase: "ready_model"
   };
@@ -254,46 +251,25 @@ export function incompleteModelCompletion(
       )
     });
   }
-  if (!hasCurrentRunEvidence(state)) {
-    if (state.completionRepairAttempts >= 1) {
-      return propose({ ...state, messages }, {
-        kind: "recoverable_failure",
-        code: "terminal_protocol_missing",
-        message: "The model repeatedly stopped without obtaining current-run evidence or requesting user input."
-      });
-    }
-    return {
-      ...state,
-      messages: [...messages, {
-        role: "developer",
-        content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain referenceable durable evidence, or call request_user_input if a concrete user decision with a supported follow-up operation is required. If validation executes and fails, the next terminal action must report it with complete_task and validation_executed; no validation-waiver input exists. Do not repeat the natural-language response and do not call complete_task before evidence exists."
-      }],
-      completionRepairAttempts: state.completionRepairAttempts + 1,
-      completionRepair: { kind: "evidence_acquisition" },
-      phase: "ready_model"
-    };
-  }
-  if (state.completionRepairAttempts >= 1) {
-    return propose({ ...state, messages }, {
-      kind: "recoverable_failure",
-      code: "terminal_protocol_missing",
-      message: completionRepairFailureMessage(
-        state,
-        "The model repeatedly stopped without choosing the required terminal protocol action."
-      )
-    });
-  }
+  const turnId = typeof payload.turnId === "number" ? payload.turnId : 0;
+  const effectRevision = typeof payload.effectRevision === "number" ? payload.effectRevision : state.revision;
+  const call = {
+    id: `runtime_completion_intent_${turnId}_${effectRevision}`,
+    name: "complete_task",
+    arguments: { summary: response }
+  };
+  const projectedMessages = messages.map((message, index) => index === messages.length - 1
+    && message.role === "assistant" ? { ...message, toolCalls: [call] } : message);
   return {
     ...state,
-    messages: [...messages, {
-      role: "developer",
-      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidenceId/kind/claim references when the task is finished, or call request_user_input with one concrete question only when a supported user decision would materially change the result. Evidence references within one criterion may use different claims. An exited failed validation must be reported as validation_executed and never as validation_passed or acceptance_met; no validation waiver exists. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
+    messages: projectedMessages,
+    pendingTools: [{
+      request: { callId: call.id, name: call.name, arguments: call.arguments },
+      modelTurn: { turnId, effectRevision },
+      approval: "not_required",
+      started: false
     }],
-    completionRepairAttempts: state.completionRepairAttempts + 1,
-    completionRepair: {
-      kind: "protected_completion",
-      answer: protectedCompletionAnswer(state) ?? response
-    },
-    phase: "ready_model"
+    toolCallIds: [...state.toolCallIds, call.id],
+    phase: "tool_pending"
   };
 }

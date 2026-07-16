@@ -33,7 +33,7 @@ import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
-import { currentRunEvidence, typedCompletion } from "./helpers/typed-evidence.js";
+import { typedCompletion } from "./helpers/typed-evidence.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
@@ -63,24 +63,18 @@ function completion(summary: string): (request: ModelRequest) => ModelResponse {
   });
 }
 
-function validationFailureReport(request: ModelRequest): ModelResponse {
-  const validation = currentRunEvidence(request).find((item) => item.kind === "validation");
-  if (!validation) throw new Error("The validation failure was not exposed in the evidence ledger.");
+function validationFailureReport(_request: ModelRequest): ModelResponse {
   return {
     message: {
       role: "assistant",
       content: "The validation was executed and failed; that result is reported honestly.",
       toolCalls: [{
         id: "report-validation-failure",
-        name: "complete_task",
+        name: "report_blocked",
         arguments: {
-          summary: "short fallback summary",
-          criteria: [{
-            criterion: "The validation was executed and its failure was reported.",
-            status: "met",
-            claim: "validation_executed",
-            evidence: [{ ...validation, claim: "validation_executed" }]
-          }]
+          code: "validation_failed",
+          summary: "The validation was executed and failed; that result is reported honestly.",
+          recoveryAttempted: "The requested validation was run once."
         }
       }]
     },
@@ -88,28 +82,18 @@ function validationFailureReport(request: ModelRequest): ModelResponse {
   };
 }
 
-function changedWorkspaceValidationFailureReport(request: ModelRequest): ModelResponse {
-  const evidence = currentRunEvidence(request);
-  const delta = evidence.find((item) => item.kind === "workspace_delta");
-  const validation = evidence.find((item) => item.kind === "validation");
-  if (!delta || !validation) throw new Error("The changed workspace and failed validation must both be in the ledger.");
+function changedWorkspaceValidationFailureReport(_request: ModelRequest): ModelResponse {
   return {
     message: {
       role: "assistant",
       content: "",
       toolCalls: [{
         id: "complete-changed-validation-failure",
-        name: "complete_task",
+        name: "report_blocked",
         arguments: {
+          code: "validation_failed",
           summary: "The documentation change is applied and the failed validation is reported.",
-          criteria: [{
-            criterion: "The requested change was applied and its validation result was reported honestly.",
-            status: "met",
-            evidence: [
-              { ...delta, claim: "acceptance_met" },
-              { ...validation, claim: "validation_executed" }
-            ]
-          }]
+          recoveryAttempted: "The changed file was validated against the requested expectation."
         }
       }]
     },
@@ -229,19 +213,12 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
-  it("repairs a conversational natural stop through an explicit typed input request", async () => {
+  it("treats a conversational natural stop as completion intent", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
     const gateway = new ScriptedGateway([
       {
         message: { role: "assistant", content: "Hello. What would you like me to work on?" },
         finishReason: "stop"
-      },
-      {
-        message: {
-          role: "assistant", content: "",
-          toolCalls: [{ id: "need-task", name: "request_user_input", arguments: { message: "What should I work on?" } }]
-        },
-        finishReason: "tool_calls"
       }
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
@@ -252,33 +229,21 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "hi" });
 
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
-      kind: "needs_input",
-      requestId: "need-task",
-      message: "What should I work on?"
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "Hello. What would you like me to work on?"
     });
-    expect(gateway.requests).toHaveLength(2);
-    expect(gateway.requests[1].toolChoice).toBe("required");
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+    expect(gateway.requests).toHaveLength(1);
     const events = await storedEvents(store, session.sessionId);
-    expect(events.filter((event) => event.type === "model.started")).toHaveLength(2);
-    expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);
   });
 
-  it("requires current-run evidence after a natural stop before allowing completion", async () => {
+  it("allows a no-change analysis to complete from ordinary text", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidence-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
-      { message: { role: "assistant", content: "The file is empty." }, finishReason: "stop" },
-      {
-        message: {
-          role: "assistant", content: "",
-          toolCalls: [{ id: "read-evidence", name: "read", arguments: { path: "seed.txt" } }]
-        },
-        finishReason: "tool_calls"
-      },
-      completion("evidence-backed read completed")
+      { message: { role: "assistant", content: "The file is empty." }, finishReason: "stop" }
     ]);
     const runtime = createRuntime({
       gateway,
@@ -290,17 +255,12 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed", message: "evidence-backed read completed"
+      kind: "completed", message: "The file is empty."
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[1].toolChoice).toBe("required");
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("complete_task");
-    expect(gateway.requests[2].toolChoice).toBeUndefined();
-    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("complete_task");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("request_user_input");
+    expect(gateway.requests).toHaveLength(1);
   }, 30_000);
 
-  it("repairs an evidence-backed natural stop through strict typed completion", async () => {
+  it("completes an evidence-backed ordinary text response without a repair turn", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -311,8 +271,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
-      completion("typed terminal repair completed")
+      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" }
     ]);
     const runtime = createRuntime({
       gateway,
@@ -326,18 +285,12 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "completed", message: "The file contains seed."
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("substantive response is now protected");
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("complete_task");
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("request_user_input");
-    expect(gateway.requests[2].messages.at(-1)?.content).toContain("Non-terminal tools are unavailable");
-    expect(gateway.requests[2].toolChoice).toBe("required");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
   }, 30_000);
 
-  it("repairs an evidence-backed natural question into durable NeedsInput", async () => {
+  it("supports a typed input request after evidence without hiding ordinary tools", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-protected-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -349,7 +302,6 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      { message: { role: "assistant", content: "Which target should I change?" }, finishReason: "stop" },
       {
         message: {
           role: "assistant",
@@ -382,10 +334,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
       requestId: "typed-protected-input",
       message: "Which target should I change?"
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].toolChoice).toBe("required");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].toolChoice).toBeUndefined();
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
     expect(events.filter((event) => event.type === "run.completed" || event.type === "run.failed"))
@@ -408,10 +360,9 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.evidence.length).toBeGreaterThan(0);
   }, 30_000);
 
-  it("keeps a failed receipt in evidence repair until non-failed durable evidence exists", async () => {
+  it("keeps all tools visible after a failed receipt so the model can request input", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-evidence-repair-"));
     const gateway = new ScriptedGateway([
-      { message: { role: "assistant", content: "I could not inspect the missing file." }, finishReason: "stop" },
       {
         message: {
           role: "assistant", content: "",
@@ -443,16 +394,16 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "needs_input", requestId: "need-existing-path", message: "Which existing path should I inspect?"
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].toolChoice).toBe("required");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name)).toContain("request_user_input");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name)).not.toContain("complete_task");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].toolChoice).toBeUndefined();
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
   }, 30_000);
 
   it("terminates honestly after failed validation without rerunning evidence repair", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-failed-validation-terminal-repair-"));
     const gateway = new ScriptedGateway([
-      { message: { role: "assistant", content: "The requested validation failed." }, finishReason: "stop" },
       validationTurn("failed-validation", [{ path: "missing.txt", expected: "present" }]),
       validationFailureReport
     ]);
@@ -469,15 +420,12 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "run the validation and report its result" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
-      kind: "completed",
-      message: "The validation was executed and failed; that result is reported honestly.\n\nResult: short fallback summary",
-      evidence: expect.arrayContaining([expect.objectContaining({ kind: "validation", status: "failed" })])
+      kind: "recoverable_failure",
+      code: "validation_failed",
+      message: "The validation was executed and failed; that result is reported honestly.\n\nRecovery attempted: The requested validation was run once."
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[1]?.toolChoice).toBe("required");
-    expect(gateway.requests[2]?.toolChoice).toBe("required");
-    expect(gateway.requests[2]?.tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task"]);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]?.tools?.map((tool) => tool.name)).toContain("report_blocked");
   }, 30_000);
 
   it("completes a changed workspace after failed validation is typed and reported", async () => {
@@ -518,41 +466,31 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Update README and validate it." });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
-      message: "The documentation change is applied; validation ran and failed, and that failure is reported.",
-      evidence: expect.arrayContaining([
-        expect.objectContaining({ kind: "workspace_delta", status: "passed" }),
-        expect.objectContaining({ kind: "validation", status: "failed" })
-      ])
+      kind: "recoverable_failure",
+      code: "validation_failed",
+      message: expect.stringContaining("failed validation is reported")
     });
     expect(gateway.requests).toHaveLength(4);
-    expect(gateway.requests[3]?.toolChoice).toBe("required");
-    expect(gateway.requests[3]?.tools?.map((tool) => tool.name)).toEqual(["complete_task"]);
-    expect(gateway.requests[3]?.messages.at(-1)?.content).toContain("no validation waiver exists");
+    expect(gateway.requests[3]?.toolChoice).toBeUndefined();
+    expect(gateway.requests[3]?.tools?.map((tool) => tool.name)).toContain("report_blocked");
+    expect(gateway.requests[3]?.messages.at(-1)?.content).toContain("validation");
     const restored = await restoreStoredSession(store, session.sessionId, 30_000);
     expect(restored.state.budget.reservations.filter((reservation) => reservation.status === "reserved"))
       .toEqual([]);
   }, 30_000);
 
-  it("bounds a malformed complete_task during terminal repair", async () => {
+  it("returns convergence_no_progress after three malformed completion calls", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
-      {
+      ...[1, 2, 3].map((attempt) => ({
         message: {
-          role: "assistant", content: "",
-          toolCalls: [{ id: "read-before-malformed-complete", name: "read", arguments: { path: "seed.txt" } }]
+          role: "assistant" as const,
+          content: "",
+          toolCalls: [{ id: `malformed-complete-${attempt}`, name: "complete_task", arguments: {} }]
         },
-        finishReason: "tool_calls"
-      },
-      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
-      {
-        message: {
-          role: "assistant", content: "",
-          toolCalls: [{ id: "malformed-complete", name: "complete_task", arguments: {} }]
-        },
-        finishReason: "tool_calls"
-      }
+        finishReason: "tool_calls" as const
+      }))
     ]);
     const runtime = createRuntime({
       gateway,
@@ -565,39 +503,31 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "terminal_protocol_invalid",
-      message: expect.stringMatching(/The file contains seed[\s\S]*tool_arguments_invalid/u)
+      code: "convergence_no_progress"
     });
     expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+    for (const request of gateway.requests) {
+      expect(request.tools?.map((tool) => tool.name)).toContain("complete_task");
+      expect(request.tools?.map((tool) => tool.name)).toContain("read");
+    }
   }, 30_000);
 
-  it("preserves a concrete question when a malformed input repair fails once", async () => {
+  it("returns convergence_no_progress after three malformed input requests", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-input-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
-      {
+      ...[1, 2, 3].map((attempt) => ({
         message: {
-          role: "assistant",
-          content: "",
-          toolCalls: [{ id: "read-before-malformed-input", name: "read", arguments: { path: "seed.txt" } }]
-        },
-        finishReason: "tool_calls"
-      },
-      { message: { role: "assistant", content: "Which target should I change?" }, finishReason: "stop" },
-      {
-        message: {
-          role: "assistant",
+          role: "assistant" as const,
           content: "",
           toolCalls: [{
-            id: "malformed-input",
+            id: `malformed-input-${attempt}`,
             name: "request_user_input",
             arguments: { message: "" }
           }]
         },
-        finishReason: "tool_calls"
-      }
+        finishReason: "tool_calls" as const
+      }))
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -611,35 +541,34 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "terminal_protocol_invalid",
-      message: expect.stringMatching(/Which target should I change\?[\s\S]*invalid_user_input_request/u)
+      code: "convergence_no_progress"
     });
     expect(gateway.requests).toHaveLength(3);
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.failed"
-      && (event.payload as { callId?: string }).callId === "malformed-input")).toHaveLength(1);
+      && String((event.payload as { callId?: string }).callId).startsWith("malformed-input-"))).toHaveLength(2);
     expect(events.some((event) => event.type === "run.suspended")).toBe(false);
   }, 30_000);
 
-  it("does not execute a tool that was not offered during terminal repair", async () => {
+  it("keeps ordinary tools executable while correcting an invalid terminal call", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-policy-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
       {
         message: {
           role: "assistant", content: "",
-          toolCalls: [{ id: "initial-policy-read", name: "read", arguments: { path: "seed.txt" } }]
+          toolCalls: [{ id: "invalid-before-read", name: "complete_task", arguments: {} }]
         },
         finishReason: "tool_calls"
       },
-      { message: { role: "assistant", content: "The file contains seed." }, finishReason: "stop" },
       {
         message: {
           role: "assistant", content: "",
-          toolCalls: [{ id: "hidden-repair-read", name: "read", arguments: { path: "seed.txt" } }]
+          toolCalls: [{ id: "repair-read", name: "read", arguments: { path: "seed.txt" } }]
         },
         finishReason: "tool_calls"
-      }
+      },
+      completion("read after terminal correction")
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -650,18 +579,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure",
-      code: "terminal_protocol_invalid",
-      message: expect.stringMatching(/The file contains seed[\s\S]*exactly one complete_task or request_user_input/u)
+      kind: "completed",
+      message: "read after terminal correction"
     });
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "initial-policy-read")).toHaveLength(1);
-    expect(events.filter((event) => (event.type === "tool.requested"
-      || event.type === "tool.completed" || event.type === "tool.failed")
-      && (event.payload as { callId?: string }).callId === "hidden-repair-read")).toHaveLength(0);
-    expect(events.filter((event) => event.type === "execution.planned"
-      && (event.payload as { executionId?: string }).executionId === "hidden-repair-read")).toHaveLength(0);
+      && (event.payload as { callId?: string }).callId === "repair-read")).toHaveLength(1);
   }, 30_000);
 
   it("supports an explicit typed request for user input", async () => {
@@ -728,7 +652,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
   });
 
-  it("bounds completion repair when a model keeps returning plain text", async () => {
+  it("treats plain text after tool progress as completion intent", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-bounded-completion-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -736,8 +660,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "read-progress", name: "read", arguments: { path: "seed.txt" } }] },
         finishReason: "tool_calls"
       },
-      { message: { role: "assistant", content: "I am done." }, finishReason: "stop" },
-      { message: { role: "assistant", content: "I am still done." }, finishReason: "stop" }
+      { message: { role: "assistant", content: "I am done." }, finishReason: "stop" }
     ]);
     const runtime = createRuntime({
       gateway,
@@ -748,13 +671,9 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure", code: "terminal_protocol_missing"
+      kind: "completed", message: "I am done."
     });
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].messages.at(-1)).toMatchObject({ role: "developer" });
-    expect(gateway.requests[2].toolChoice).toBe("required");
-    expect(gateway.requests[2].tools?.map((tool) => tool.name).sort())
-      .toEqual(["complete_task", "request_user_input"]);
+    expect(gateway.requests).toHaveLength(2);
   }, 30_000);
 
   it("rejects a reused tool call id across model turns instead of replaying an idempotent receipt", async () => {
@@ -799,7 +718,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect without looping" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure", code: "agent_no_progress"
+      kind: "recoverable_failure", code: "convergence_no_progress"
     });
     const events = await storedEvents(store, session.sessionId);
     const receipts = events.filter((event) => event.type === "tool.completed");
@@ -1130,7 +1049,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.completionRepairAttempts).toBe(1);
   });
 
-  it("rejects an ambiguous legacy repair snapshot and replays its protected answer", async () => {
+  it("does not synthesize a V3 completion-repair state while rebuilding V4 events", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-completion-repair-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const sessionId = "legacy-completion-session";
@@ -1190,11 +1109,12 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await store.writeSnapshot({ ...rebuilt, state: legacyState });
 
     const restored = await restoreStoredSession(store, sessionId, 30_000);
-    expect(restored.state.completionRepair).toEqual({
-      kind: "protected_completion",
-      answer: "Legacy protected answer."
+    expect(restored.state.completionRepair).toBeUndefined();
+    expect(restored.state.completionRepairAttempts).toBe(0);
+    expect(restored.state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "Legacy protected answer."
     });
-    expect(restored.state.completionRepairAttempts).toBe(1);
   });
 
   it.each([

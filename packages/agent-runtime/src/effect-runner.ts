@@ -115,7 +115,8 @@ export class EffectRunner {
     const descriptors = this.options.runtime.tools.descriptors();
     const terminalOnly = effects.every((effect) => descriptors
       .find((item) => item.name === effect.request.name)
-      ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.request_input") === true);
+          ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.report_blocked"
+            || item === "outcome.request_input") === true);
     const failure = convergenceAdmissionFailure(session, {
       kind: "tool", count: effects.length, terminalOnly
     });

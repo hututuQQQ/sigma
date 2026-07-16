@@ -26,6 +26,8 @@ export interface ReviewerInput {
   sessionId: string;
   runId: string;
   goal: string;
+  frontierRevision: number;
+  stateDigest: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
 }
@@ -101,7 +103,8 @@ export function reviewInputFailureEvidence(
       reviewerId,
       verdict: "changes_requested",
       findings: [message],
-      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+      frontierRevision: input.frontierRevision,
+      stateDigest: input.stateDigest,
       validationEvidenceIds: input.validations.map((item) => item.evidenceId)
     }
   };
@@ -208,6 +211,8 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
     role: "user",
     content: JSON.stringify({
       goal: input.goal,
+      frontierRevision: input.frontierRevision,
+      stateDigest: input.stateDigest,
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
         checkpointId: item.data.checkpointId,
@@ -248,10 +253,9 @@ function reviewEvidence(
         reviewerId,
         verdict,
         findings,
-        workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
-        ...(input.workspaceDeltas.at(-1)?.data.checkpointId
-          ? { checkpointId: input.workspaceDeltas.at(-1)!.data.checkpointId } : {})
+        frontierRevision: input.frontierRevision,
+        stateDigest: input.stateDigest,
+        validationEvidenceIds: input.validations.map((item) => item.evidenceId)
       }
     };
 }

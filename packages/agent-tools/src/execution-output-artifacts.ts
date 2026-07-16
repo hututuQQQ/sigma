@@ -123,7 +123,12 @@ function commandEvidence(
         cancelled: result.cancelled,
         ...(result.failure ? { failureCode: result.failure.code } : {})
       },
-      artifactIds: imported.ids, workspaceDeltaEvidenceIds: []
+      artifactIds: imported.ids,
+      // The runtime replaces this preparation-time placeholder with the
+      // frozen mutation-frontier identity before evidence is emitted.
+      frontierRevision: 0,
+      stateDigest: "0".repeat(64),
+      coveredPaths: []
     }
   };
   return {

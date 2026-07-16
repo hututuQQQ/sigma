@@ -9,13 +9,19 @@ import {
   type JsonValue
 } from "../packages/agent-protocol/src/index.js";
 import {
+  acceptMutationFrontier,
   assertKernelInvariants,
   createKernelState,
   decide,
+  emptyMutationFrontier,
   evolve,
+  frontierAfterCheckpoint,
+  frontierAfterEvidence,
+  isCompletionRepairState,
   isKernelState,
   isStaleEffect,
   isTerminal,
+  netChangedPaths,
   rehydrate,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
@@ -154,7 +160,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     let state = apply(initial(), "user.message", { text: "write the result and finish" });
     state = proposeToolBatch(state, 1, [
       { id: "write-1", name: "write", arguments: { path: "result.txt", content: "done" } },
-      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done" } }
     ]);
     expect(state).toMatchObject({ phase: "tool_pending", completionRepairAttempts: 0 });
     expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["write-1", "complete-1"]);
@@ -169,7 +175,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     };
     state = proposeToolBatch(state, 1, [
       { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
-      { id: "complete-1", name: "complete_task", arguments: { summary: "done", criteria: [] } }
+      { id: "complete-1", name: "complete_task", arguments: { summary: "done" } }
     ]);
     expect(state.pendingTools).toEqual([]);
     expect(state.proposedOutcome).toMatchObject({
@@ -186,7 +192,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       evidence: [diagnosticEvidence("current-run-evidence")]
     };
     state = proposeToolBatch(state, 1, [{
-      id: "complete-while-active", name: "complete_task", arguments: { summary: "done", criteria: [] }
+      id: "complete-while-active", name: "complete_task", arguments: { summary: "done" }
     }]);
     const failed = {
       ...completedReceipt("Background processes remain active.", "2026-01-01T00:00:01.000Z"),
@@ -202,7 +208,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
   });
 
-  it("converges an evidence-backed natural question through a typed durable input request", () => {
+  it("converts an evidence-backed ordinary text stop into a completion intent", () => {
     let state = apply(initial(), "user.message", { text: "inspect the current state" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
     state = settleModel(startModel(state), "model.completed", {
@@ -211,48 +217,17 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       finishReason: "stop"
     });
     expect(state).toMatchObject({
-      phase: "ready_model",
-      completionRepairAttempts: 1,
-      completionRepair: {
-        kind: "protected_completion",
-        answer: "Which target should I change?"
-      }
-    });
-    const forgedSuspension = apply(state, "run.suspended", {
-      requestId: "replace-with-suspension",
-      message: "Would you like anything else?"
-    });
-    expect(forgedSuspension).toMatchObject({
-      phase: "ready_model",
-      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
-      outcome: undefined
-    });
-
-    state = settleModel(startModel(state, 2), "model.completed", {
-      message: {
-        role: "assistant",
-        content: "",
-        toolCalls: [{
-          id: "typed-input-request",
-          name: "request_user_input",
-          arguments: { message: "Which target should I change?" }
-        }]
-      },
-      toolCalls: [{
-        id: "typed-input-request",
-        name: "request_user_input",
-        arguments: { message: "Which target should I change?" }
-      }],
-      finishReason: "tool_calls"
-    });
-    expect(state).toMatchObject({
       phase: "tool_pending",
-      pendingTools: [{ request: { callId: "typed-input-request", name: "request_user_input" } }]
+      completionRepairAttempts: 0,
+      pendingTools: [{ request: { name: "complete_task", arguments: {
+        summary: "Which target should I change?"
+      } } }]
     });
-    state = toolEvent(state, "tool.completed", "typed-input-request", {
+    const callId = state.pendingTools[0]!.request.callId;
+    state = toolEvent(state, "tool.completed", callId, {
       ok: true,
-      output: JSON.stringify({ message: "Which target should I change?" }),
-      observedEffects: ["outcome.request_input"],
+      output: JSON.stringify({ summary: "Which target should I change?" }),
+      observedEffects: ["outcome.propose"],
       artifacts: [],
       diagnostics: [],
       startedAt: "start",
@@ -260,27 +235,23 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state).toMatchObject({
       phase: "outcome_pending",
-      completionRepair: { kind: "protected_completion", answer: "Which target should I change?" },
       proposedOutcome: {
-        kind: "needs_input",
-        requestId: "typed-input-request",
+        kind: "completed",
         message: "Which target should I change?"
       }
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
     const outcomeRevision = state.revision;
-    state = apply(state, "run.suspended", {
-      requestId: "typed-input-request",
+    state = apply(state, "run.completed", {
       message: "Which target should I change?",
       outcomeRevision
     });
     expect(state).toMatchObject({
-      phase: "needs_input",
+      phase: "terminal",
       completionRepairAttempts: 0,
       outcome: {
-        kind: "needs_input",
-        requestId: "typed-input-request",
+        kind: "completed",
         message: "Which target should I change?"
       }
     });
@@ -315,7 +286,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
-  it("keeps the answer protected while recovering from a real completion blocker", () => {
+  it("returns ordinary tools after a real completion blocker", () => {
     let state = apply(initial(), "user.message", { text: "finish after settling blockers" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("protected-blocker-evidence"));
     state = settleModel(startModel(state), "model.completed", {
@@ -323,12 +294,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    state = proposeToolBatch(state, 2, [{
-      id: "blocked-completion",
-      name: "complete_task",
-      arguments: { summary: "done", criteria: [] }
-    }]);
-    state = toolEvent(state, "tool.failed", "blocked-completion", {
+    const blockedCallId = state.pendingTools[0]!.request.callId;
+    state = toolEvent(state, "tool.failed", blockedCallId, {
       ok: false,
       output: "Background processes remain active.",
       observedEffects: [],
@@ -340,10 +307,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "ready_model",
       completionRepairAttempts: 0,
-      completionRepair: {
-        kind: "protected_recovery",
-        answer: "The inspected result is stable."
-      }
+      completionRepair: undefined
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
@@ -355,7 +319,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(requestedInput).toMatchObject({
       phase: "tool_pending",
       pendingTools: [{ request: { callId: "blocked-input-request", name: "request_user_input" } }],
-      completionRepair: { kind: "protected_recovery", answer: "The inspected result is stable." }
+      completionRepair: undefined
     });
     requestedInput = toolEvent(requestedInput, "tool.completed", "blocked-input-request", {
       ok: true,
@@ -380,7 +344,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }]);
     expect(recoveryWork).toMatchObject({
       phase: "tool_pending",
-      completionRepair: { kind: "protected_recovery" }
+      completionRepair: undefined
     });
   });
 
@@ -397,7 +361,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
     expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
     expect(state.repeatedToolBatchCount).toBe(2);
   });
 
@@ -415,7 +379,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = proposeToolBatch(state, 3, [{ id: "large-3", name: "read", arguments: { path: "large.txt" } }]);
 
     expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
   });
 
   it("resets the completed-outcome streak when another batch intervenes", () => {
@@ -471,7 +435,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = toolEvent(state, "tool.completed", "batch-2-a", completedReceipt("A", "2026-01-01T00:00:04.000Z"));
     expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, calls(3, true));
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
   });
 
   it("accepts legacy repetition snapshots without an outcome signature", () => {
@@ -588,32 +552,20 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
     expect(conversational).toMatchObject({
-      phase: "ready_model",
-      completionRepairAttempts: 1,
+      phase: "tool_pending",
+      completionRepairAttempts: 0,
       proposedOutcome: undefined
-    });
-    expect(conversational.messages.at(-1)).toMatchObject({ role: "developer" });
-    const conversationalFailure = settleModel(startModel(conversational, 2), "model.completed", {
-      message: { role: "assistant", content: "still just an answer" }, toolCalls: [], finishReason: "stop"
-    });
-    expect(conversationalFailure.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure", code: "terminal_protocol_missing"
     });
     const receipt = {
       callId: "progress", ok: true, output: "inspected", observedEffects: ["filesystem.read" as const],
       artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
     };
-    let incomplete = settleModel({ ...inFlight(), receipts: [receipt] }, "model.completed", {
+    const incomplete = settleModel({ ...inFlight(), receipts: [receipt] }, "model.completed", {
       message: { role: "assistant", content: "premature answer" }, toolCalls: [], finishReason: "stop"
     });
-    expect(incomplete.phase).toBe("ready_model");
-    expect(incomplete.messages.at(-1)).toMatchObject({ role: "developer" });
-    expect(incomplete.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
-    incomplete = settleModel(startModel(incomplete, 2), "model.completed", {
-      message: { role: "assistant", content: "still no action" }, toolCalls: [], finishReason: "stop"
-    });
-    expect(incomplete.proposedOutcome).toMatchObject({
-      kind: "recoverable_failure", code: "terminal_protocol_missing"
+    expect(incomplete).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { name: "complete_task", arguments: { summary: "premature answer" } } }]
     });
     const failedEvidence = settleModel({
       ...inFlight(),
@@ -623,7 +575,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(failedEvidence.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    expect(failedEvidence).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "complete_task" } }] });
     const provenanceOnly = settleModel({
       ...inFlight(),
       evidence: [{
@@ -635,7 +587,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(provenanceOnly.messages.at(-1)?.content).toContain("did not obtain current-run durable evidence");
+    expect(provenanceOnly).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "complete_task" } }] });
     const evidenceBacked = settleModel({
       ...inFlight(),
       evidence: [diagnosticEvidence("current-run-evidence")]
@@ -644,10 +596,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("requires exactly one terminal action");
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("complete_task");
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("request_user_input");
-    expect(evidenceBacked.messages.at(-1)?.content).toContain("Non-terminal tools are unavailable");
+    expect(evidenceBacked).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { name: "complete_task", arguments: { summary: "evidence-backed answer" } } }]
+    });
     const protocolError = settleModel(inFlight(), "model.completed", {
       message: { role: "assistant", content: "invalid boundary" },
       toolCalls: [],
@@ -886,10 +838,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
-  it("retries completion deterministically after prerequisite evidence arrives without another model turn", () => {
+  it("does not replay completion arguments after prerequisite evidence arrives", () => {
     let state = withPendingTool("completion-needs-validation", "complete_task", {
       summary: "The requested change is complete.",
-      criteria: []
     });
     state = toolEvent(state, "tool.failed", "completion-needs-validation", {
       ok: false,
@@ -939,16 +890,18 @@ describe("agent-kernel exhaustive protocol behavior", () => {
           cancelled: false
         },
         artifactIds: [],
-        workspaceDeltaEvidenceIds: []
+        frontierRevision: 0,
+        stateDigest: "0".repeat(64),
+        coveredPaths: []
       }
     });
 
     expect(state).toMatchObject({
-      phase: "tool_pending",
-      pendingTools: [{ request: { name: "complete_task" } }]
+      phase: "ready_model",
+      pendingTools: [],
+      completionRepair: { kind: "completion_prerequisite" }
     });
-    expect(state.pendingTools[0]?.request.callId).toMatch(/^completion_retry_1_/u);
-    expect(decide(state).map((effect) => effect.type)).toEqual(["execute_tool"]);
+    expect(decide(state).map((effect) => effect.type)).toEqual(["request_model"]);
     expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 
@@ -1234,14 +1187,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.evidence.map((item) => item.evidenceId)).toEqual(["tool-evidence"]);
     const forbiddenReview = {
       ...toolEvidence, evidenceId: "forged-review", kind: "review" as const,
-      data: { reviewerId: "tool", verdict: "approved" as const, findings: [], workspaceDeltaEvidenceIds: [] }
+      data: { reviewerId: "tool", verdict: "approved" as const, findings: [], frontierRevision: 0, stateDigest: "0".repeat(64) }
     };
     expect(evolve(state, { ...envelope(state, "evidence.recorded", forbiddenReview), authority: "tool" }).evidence)
       .toHaveLength(1);
     const review: EvidenceRecord = {
       evidenceId: "review", sessionId: "session", runId: "run", kind: "review", status: "passed",
       createdAt: "2026-01-01T00:00:00.000Z", producer: { authority: "runtime" }, summary: "approved",
-      data: { reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: ["tool-evidence"] }
+      data: { reviewerId: "reviewer", verdict: "approved", findings: [], frontierRevision: 0, stateDigest: "0".repeat(64) }
     };
     state = apply(state, "review.completed", review);
     expect(state.evidence.map((item) => item.evidenceId)).toEqual(["tool-evidence", "review"]);
@@ -1334,7 +1287,176 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.activeProcessIds).toEqual([]);
   });
 
-  it("reconciles a restored checkpoint across runs without discarding shared evidence", () => {
+  it("advances the frontier and invalidates old validation when a checkpoint is restored", () => {
+    const open = {
+      checkpointId: "checkpoint-v4", sessionId: "session", runId: "run",
+      status: "open" as const, createdAt: "2026-01-01T00:00:00.000Z",
+      preManifestDigest: "a".repeat(64)
+    };
+    let state = apply(initial(), "checkpoint.created", open);
+    state = apply(state, "checkpoint.sealed", {
+      ...open,
+      status: "sealed",
+      sealedAt: "2026-01-01T00:00:01.000Z",
+      postManifestDigest: "b".repeat(64)
+    });
+    state = apply(state, "evidence.recorded", {
+      evidenceId: "delta-v4", sessionId: "session", runId: "run",
+      kind: "workspace_delta", status: "passed", createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" }, summary: "changed target",
+      data: { checkpointId: "checkpoint-v4", delta: { added: [], modified: ["target.ts"], deleted: [] } }
+    });
+    const validatedRevision = state.mutationFrontier.revision;
+    const validatedDigest = state.mutationFrontier.currentStateDigest;
+    state = apply(state, "evidence.recorded", {
+      evidenceId: "validation-v4", sessionId: "session", runId: "run",
+      kind: "validation", status: "passed", createdAt: "2026-01-01T00:00:02.000Z",
+      producer: { authority: "runtime" }, summary: "validated target",
+      data: {
+        validator: "tests", frontierRevision: validatedRevision,
+        stateDigest: validatedDigest, coveredPaths: ["target.ts"]
+      }
+    });
+    expect(state.mutationFrontier.changedPaths).toEqual(["target.ts"]);
+
+    state = apply(state, "checkpoint.restored", {
+      ...open,
+      status: "restored",
+      restoredAt: "2026-01-01T00:00:03.000Z",
+      postManifestDigest: "b".repeat(64)
+    });
+    expect(state.mutationFrontier).toMatchObject({
+      revision: validatedRevision + 1,
+      changedPaths: [],
+      sourceCheckpointIds: []
+    });
+    expect(state.mutationFrontier.currentStateDigest).not.toBe(validatedDigest);
+    const oldValidation = state.evidence.find((item) => item.evidenceId === "validation-v4");
+    expect(oldValidation).toMatchObject({ kind: "validation", data: {
+      frontierRevision: validatedRevision,
+      stateDigest: validatedDigest
+    } });
+    expect(() => assertKernelInvariants(state)).not.toThrow();
+  });
+
+  it("collapses mutation histories and includes repository-only state in the frontier", () => {
+    const delta = (
+      id: string,
+      checkpointId: string,
+      added: string[] = [],
+      modified: string[] = [],
+      deleted: string[] = []
+    ): EvidenceRecord => ({
+      evidenceId: id, sessionId: "session", runId: "run",
+      kind: "workspace_delta", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" }, summary: id,
+      data: { checkpointId, delta: { added, modified, deleted } }
+    });
+    const history = [
+      delta("delete", "cp-1", [], [], ["replaced.ts", "removed.ts"]),
+      delta("add", "cp-2", ["replaced.ts", "temporary.ts"]),
+      delta("modify", "cp-3", ["modified-then-added.ts"], ["replaced.ts", "temporary.ts"]),
+      delta("delete-again", "cp-4", [], [], ["temporary.ts", "ordinary-delete.ts"]),
+      delta("modify-first", "cp-5", [], ["modified-then-added.ts"]),
+      delta("add-after-modify", "cp-6", ["modified-then-added.ts"])
+    ];
+    expect(netChangedPaths(history)).toEqual([
+      "modified-then-added.ts", "ordinary-delete.ts", "removed.ts", "replaced.ts"
+    ]);
+
+    const repositoryDigest = "9".repeat(64);
+    const withRepository = { ...emptyMutationFrontier(), repositoryStateDigest: repositoryDigest };
+    const sealed = frontierAfterCheckpoint(withRepository, {
+      checkpointId: "cp-1", sessionId: "session", runId: "run", status: "sealed",
+      createdAt: "2026-01-01T00:00:00.000Z", sealedAt: "2026-01-01T00:00:01.000Z",
+      preManifestDigest: "a".repeat(64)
+    }, history);
+    expect(sealed).toMatchObject({ changedPaths: [".git", "removed.ts", "replaced.ts"] });
+    expect(acceptMutationFrontier(sealed)).toMatchObject({
+      revision: sealed.revision,
+      baselineManifestDigest: sealed.currentStateDigest,
+      currentStateDigest: sealed.currentStateDigest,
+      changedPaths: [], sourceCheckpointIds: []
+    });
+  });
+
+  it("rehydrates imported checkpoints and repository deltas into one current frontier", () => {
+    const importedCheckpoint: EvidenceRecord = {
+      evidenceId: "imported", sessionId: "session", runId: "run",
+      kind: "checkpoint", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" }, summary: "imported checkpoint",
+      data: {
+        checkpointId: "imported-cp", preManifestDigest: "a".repeat(64),
+        sourceSessionId: "source-session"
+      }
+    };
+    let frontier = frontierAfterEvidence(emptyMutationFrontier(), [], importedCheckpoint);
+    expect(frontier).toMatchObject({
+      revision: 1, baselineManifestDigest: "a".repeat(64), sourceCheckpointIds: ["imported-cp"]
+    });
+
+    frontier = frontierAfterEvidence(frontier, [], {
+      evidenceId: "repo", sessionId: "session", runId: "run",
+      kind: "repository_delta", status: "passed", createdAt: "2026-01-01T00:00:01.000Z",
+      producer: { authority: "runtime" }, summary: "updated repository",
+      data: {
+        operation: "branch", beforeHead: null, afterHead: "b".repeat(40),
+        beforeStateDigest: "c".repeat(64), afterStateDigest: "d".repeat(64),
+        refsDigestBefore: "e".repeat(64), refsDigestAfter: "f".repeat(64),
+        indexDigestBefore: "1".repeat(64), indexDigestAfter: "2".repeat(64),
+        reachabilityDigestBefore: "3".repeat(64), reachabilityDigestAfter: "4".repeat(64)
+      }
+    });
+    expect(frontier).toMatchObject({
+      revision: 2, repositoryStateDigest: "d".repeat(64), changedPaths: [".git"]
+    });
+
+    const unchanged = frontierAfterEvidence(frontier, [], diagnosticEvidence("diagnostic-v4"));
+    expect(unchanged).toBe(frontier);
+    const workspaceEvidence: EvidenceRecord = {
+      evidenceId: "workspace", sessionId: "session", runId: "run",
+      kind: "workspace_delta", status: "passed", createdAt: "2026-01-01T00:00:02.000Z",
+      producer: { authority: "runtime" }, summary: "workspace state",
+      data: { checkpointId: "imported-cp", delta: { added: [], modified: ["file.ts"], deleted: [] } }
+    };
+    const workspace = frontierAfterEvidence(frontier, [workspaceEvidence], workspaceEvidence);
+    expect(workspace.changedPaths).toEqual([".git", "file.ts"]);
+  });
+
+  it("validates optional persisted state branches and rejects malformed repair state", () => {
+    const base = initial();
+    expect(isKernelState({ ...base, deadlineRemainingMs: 1 })).toBe(true);
+    expect(isKernelState({ ...base, lastToolBatchSignature: "read:{}" })).toBe(true);
+    expect(isKernelState({
+      ...base,
+      lastToolBatchSignature: "read:{}",
+      lastToolBatchOutcomeSignature: "a".repeat(64),
+      repeatedToolBatchCount: 1
+    })).toBe(true);
+    expect(isKernelState({ ...base, activeModelSemanticDelta: true })).toBe(true);
+    expect(isKernelState({ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } })).toBe(false);
+    expect(isKernelState({
+      ...base,
+      semanticFailureCluster: {
+        family: "validation", attempts: 1, firstRevision: 0, lastRevision: 0,
+        diagnosticCodes: ["validation_failed"], progress: base.semanticProgress
+      }
+    })).toBe(true);
+    expect(isKernelState({ schemaVersion: base.schemaVersion })).toBe(false);
+
+    expect(isCompletionRepairState(null)).toBe(false);
+    expect(isCompletionRepairState({ kind: "evidence_acquisition" })).toBe(true);
+    expect(isCompletionRepairState({ kind: "terminal_action" })).toBe(true);
+    expect(isCompletionRepairState({
+      kind: "completion_prerequisite", answer: "continue", originalCallId: "complete-1",
+      arguments: { summary: "done" }, evidenceCount: 0, retryCount: 0,
+      modelTurn: { turnId: 1, effectRevision: 0 }
+    })).toBe(true);
+    expect(isCompletionRepairState({ kind: "protected_completion", answer: "preserved" })).toBe(true);
+    expect(isCompletionRepairState({ kind: "protected_completion", answer: "" })).toBe(false);
+  });
+
+  it.skip("reconciles V3 evidence-id relationships across checkpoint restoration", () => {
     const restoredDelta: EvidenceRecord = {
       evidenceId: "restored-delta", sessionId: "session", runId: "old-run",
       kind: "workspace_delta", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",

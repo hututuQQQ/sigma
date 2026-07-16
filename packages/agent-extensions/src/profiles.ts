@@ -5,6 +5,7 @@ import type { ModelRole } from "agent-model";
 import { parse as parseToml } from "smol-toml";
 
 export type ProfilePermissionMode = "deny" | "ask" | "auto";
+export type ProfileReviewMode = "off" | "advisory" | "required";
 export type ProfileSource = "home" | "workspace";
 
 export interface ProfileBudget {
@@ -20,7 +21,7 @@ export interface ProfileBudget {
 export interface ProfileMutationPolicy {
   requirePlanBeforeMutation: boolean;
   checkpointBeforeMutation: boolean;
-  reviewNonDocumentationChanges: boolean;
+  reviewMode: ProfileReviewMode;
 }
 
 export interface ResolvedAgentProfile {
@@ -76,7 +77,7 @@ const BUDGET_KEYS = new Set([
   "max_tool_calls", "max_children", "max_depth"
 ]);
 const MUTATION_KEYS = new Set([
-  "require_plan_before_mutation", "checkpoint_before_mutation", "review_non_documentation_changes"
+  "require_plan_before_mutation", "checkpoint_before_mutation", "review_mode"
 ]);
 
 export function parseAgentProfileToml(source: string, filePath = "<profile>"): ResolvedAgentProfile {
@@ -184,13 +185,14 @@ function parseBudget(value: unknown, label: string): ProfileBudget {
 function parseMutationPolicy(value: unknown, label: string): ProfileMutationPolicy {
   if (value === undefined) return defaultMutationPolicy();
   const policy = objectValue(value, label);
+  if (Object.hasOwn(policy, "review_non_documentation_changes")) {
+    throw new Error(`${label}.review_non_documentation_changes was removed in V4; use review_mode = "off", "advisory", or "required".`);
+  }
   rejectUnknown(policy, MUTATION_KEYS, label);
   return {
     requirePlanBeforeMutation: booleanValue(policy.require_plan_before_mutation, true, `${label}.require_plan_before_mutation`),
     checkpointBeforeMutation: booleanValue(policy.checkpoint_before_mutation, true, `${label}.checkpoint_before_mutation`),
-    reviewNonDocumentationChanges: booleanValue(
-      policy.review_non_documentation_changes, true, `${label}.review_non_documentation_changes`
-    )
+    reviewMode: enumValue(policy.review_mode ?? "advisory", ["off", "advisory", "required"], `${label}.review_mode`)
   };
 }
 
@@ -198,7 +200,7 @@ function defaultMutationPolicy(): ProfileMutationPolicy {
   return {
     requirePlanBeforeMutation: true,
     checkpointBeforeMutation: true,
-    reviewNonDocumentationChanges: true
+    reviewMode: "advisory"
   };
 }
 
@@ -307,8 +309,15 @@ function assertSuperset(child: readonly string[], parent: readonly string[], lab
 }
 
 function assertMutationNarrower(parent: ProfileMutationPolicy, child: ProfileMutationPolicy): void {
-  for (const key of Object.keys(parent) as Array<keyof ProfileMutationPolicy>) {
-    if (parent[key] && !child[key]) throw new Error(`Child profile cannot disable mutation policy '${key}'.`);
+  if (parent.requirePlanBeforeMutation && !child.requirePlanBeforeMutation) {
+    throw new Error("Child profile cannot disable mutation policy 'requirePlanBeforeMutation'.");
+  }
+  if (parent.checkpointBeforeMutation && !child.checkpointBeforeMutation) {
+    throw new Error("Child profile cannot disable mutation policy 'checkpointBeforeMutation'.");
+  }
+  const rank: Record<ProfileReviewMode, number> = { off: 0, advisory: 1, required: 2 };
+  if (rank[child.reviewMode] < rank[parent.reviewMode]) {
+    throw new Error("Child profile cannot weaken mutation policy 'reviewMode'.");
   }
 }
 

@@ -10,6 +10,23 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 - Nothing yet.
 
+## [4.0.0-rc.1] - 2026-07-17
+
+### Changed
+
+- Completion and validation now converge on a runtime-owned mutation frontier instead of model-selected evidence IDs.
+- Review policy is now `off`, `advisory`, or `required`; the standard profile uses advisory review and the strict profile requires it.
+- Oversized tool exchanges are retained losslessly or replaced atomically by plain text during context compaction.
+
+### Added
+
+- A structured, local-only `git_transaction` tool with CAS-backed repository metadata rollback.
+- Typed `report_blocked` recovery outcomes and `repository_delta` evidence.
+
+### Removed
+
+- V3 completion criteria arguments and `review_non_documentation_changes` profile configuration.
+
 ## [3.0.0-rc.2] - 2026-07-16
 
 ### Added
@@ -53,6 +70,7 @@ trusted Windows code-signing gate is not yet configured. Windows x64 remains the
 first intended end-user binary target; Linux x64 packaging remains a technical
 preview and CI validation target.
 
-[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v3.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v4.0.0-rc.1...HEAD
+[4.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v4.0.0-rc.1
 [3.0.0-rc.2]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.2
 [3.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.1

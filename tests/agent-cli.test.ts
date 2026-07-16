@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { currentRunEvidence } from "./helpers/typed-evidence.js";
 import type { ModelCapabilities, ModelGateway, ModelMessage, ModelRequest, ModelResponse, ModelStreamEvent, ModelToolDefinition } from "../packages/agent-protocol/src/index.js";
 import { runAgentCommand } from "../packages/agent-cli/src/index.js";
 import { runDoctorCommand } from "../packages/agent-cli/src/commands/doctor.js";
@@ -53,41 +52,9 @@ class FakeGateway implements ModelGateway {
   };
   constructor(private readonly responses: ModelResponse[]) {}
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    void request;
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response.");
-    if (response.finishReason === "stop") {
-      const evidence = currentRunEvidence(request);
-      if (evidence.length === 0) {
-        this.responses.unshift(response);
-        return withFixtureUsage({
-          message: {
-            role: "assistant",
-            content: "",
-            toolCalls: [{ id: `inspect-cli-${request.messages.length}`, name: "list", arguments: { path: ".", limit: 20 } }]
-          },
-          finishReason: "tool_calls"
-        } as ModelResponse);
-      }
-      return withFixtureUsage({
-        message: {
-          role: "assistant",
-          content: "",
-          toolCalls: [{
-            id: "complete-cli",
-            name: "complete_task",
-            arguments: {
-              summary: response.message.content,
-              criteria: [{
-                criterion: "The CLI protocol workflow completed.",
-                status: "met",
-                evidence: [evidence.at(-1)!]
-              }]
-            }
-          }]
-        },
-        finishReason: "tool_calls"
-      } as ModelResponse);
-    }
     return withFixtureUsage(response);
   }
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {

@@ -12,7 +12,7 @@ import {
   type JsonValue
 } from "agent-protocol";
 import type { KernelState } from "./state.js";
-import { queueCompletionPrerequisiteRetry } from "./model-convergence.js";
+import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
 import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 
@@ -22,8 +22,8 @@ export type KernelEventReducer = (
   payload: Record<string, JsonValue>
 ) => KernelState;
 
-const TOOL_EVIDENCE_KINDS = new Set(["workspace_delta", "command", "validation", "diagnostic"]);
-const MUTATION_EVIDENCE_KINDS = new Set(["workspace_delta", "validation", "review", "user_waiver"]);
+const TOOL_EVIDENCE_KINDS = new Set(["workspace_delta", "repository_delta", "command", "validation", "diagnostic"]);
+const MUTATION_EVIDENCE_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
 
 function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {
   if (event.type === "review.completed") {
@@ -55,20 +55,22 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
   const firstCompletionEvidence = isEvidenceAcquisitionRepair(state)
     && isCompletionReferenceableEvidence(evidence, state.sessionId, state.runId)
     && !state.evidence.some((item) => isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
+  const mutationEvidence = MUTATION_EVIDENCE_KINDS.has(evidence.kind)
+    && !state.mutationEvidence.some((item) => item.evidenceId === evidence.evidenceId)
+    ? [...state.mutationEvidence, evidence]
+    : state.mutationEvidence;
   const progressed = recordSemanticEvidenceProgress({
     ...state,
     evidence: [...state.evidence, evidence],
-    mutationEvidence: MUTATION_EVIDENCE_KINDS.has(evidence.kind)
-      && !state.mutationEvidence.some((item) => item.evidenceId === evidence.evidenceId)
-      ? [...state.mutationEvidence, evidence]
-      : state.mutationEvidence
+    mutationEvidence,
+    mutationFrontier: frontierAfterEvidence(state.mutationFrontier, mutationEvidence, evidence)
   }, evidence);
   const repaired: KernelState = firstCompletionEvidence
     ? isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
       ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
       : { ...progressed, completionRepairAttempts: Math.max(1, state.completionRepairAttempts), completionRepair: { kind: "terminal_action" } }
     : progressed;
-  return queueCompletionPrerequisiteRetry(repaired);
+  return repaired;
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {
@@ -102,24 +104,6 @@ function pruneRestoredCheckpointEvidence(
     && item.data.checkpointId === checkpointId ? [item.evidenceId] : []));
   const prune = (items: readonly EvidenceRecord[]): EvidenceRecord[] => items.flatMap((item) => {
     if (item.kind === "workspace_delta" && restoredDeltaIds.has(item.evidenceId)) return [];
-    if (item.kind === "validation"
-      && item.data.workspaceDeltaEvidenceIds.some((id) => restoredDeltaIds.has(id))) {
-      const workspaceDeltaEvidenceIds = item.data.workspaceDeltaEvidenceIds
-        .filter((id) => !restoredDeltaIds.has(id));
-      return workspaceDeltaEvidenceIds.length === 0 ? [] : [{
-        ...item,
-        data: { ...item.data, workspaceDeltaEvidenceIds }
-      }];
-    }
-    if (item.kind === "review"
-      && item.data.workspaceDeltaEvidenceIds.some((id) => restoredDeltaIds.has(id))) {
-      const workspaceDeltaEvidenceIds = item.data.workspaceDeltaEvidenceIds
-        .filter((id) => !restoredDeltaIds.has(id));
-      return workspaceDeltaEvidenceIds.length === 0 ? [] : [{
-        ...item,
-        data: { ...item.data, workspaceDeltaEvidenceIds }
-      }];
-    }
     if (item.kind === "user_waiver" && item.data.checkpointId === checkpointId) return [];
     return [item];
   });
@@ -156,8 +140,18 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
     : event.type === "checkpoint.sealed" ? "sealed" : "restored";
   if (event.payload.status !== requiredStatus) return state;
   if (requiredStatus !== "restored") {
-    return event.authority === "runtime" && event.payload.runId === state.runId
-      ? { ...state, checkpointHead: event.payload } : state;
+    if (event.authority !== "runtime" || event.payload.runId !== state.runId) return state;
+    return {
+      ...state,
+      checkpointHead: event.payload,
+      ...(requiredStatus === "sealed" ? {
+        mutationFrontier: frontierAfterCheckpoint(
+          state.mutationFrontier,
+          event.payload,
+          state.mutationEvidence
+        )
+      } : {})
+    };
   }
   if (event.authority !== "runtime" && event.authority !== "user") return state;
   const checkpointHead = event.payload.runId === state.runId
@@ -167,7 +161,12 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
     ...state,
     ...pruned,
     ...checkpointRepairUpdate(state, pruned.evidence),
-    checkpointHead
+    checkpointHead,
+    mutationFrontier: frontierAfterCheckpoint(
+      state.mutationFrontier,
+      checkpointHead,
+      pruned.mutationEvidence
+    )
   });
 };
 

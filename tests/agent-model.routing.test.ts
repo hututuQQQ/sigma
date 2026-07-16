@@ -147,7 +147,7 @@ describe("capability-aware model routing", () => {
       budget: { ...DEFAULT_PROFILE_BUDGET },
       mutationPolicy: {
         requirePlanBeforeMutation: true, checkpointBeforeMutation: true,
-        reviewNonDocumentationChanges: true
+        reviewMode: "advisory"
       },
       allowedChildProfiles: []
     };
@@ -212,7 +212,7 @@ describe("capability-aware model routing", () => {
       budget: { ...DEFAULT_PROFILE_BUDGET },
       mutationPolicy: {
         requirePlanBeforeMutation: true, checkpointBeforeMutation: true,
-        reviewNonDocumentationChanges: true
+        reviewMode: "advisory"
       },
       allowedChildProfiles: []
     });

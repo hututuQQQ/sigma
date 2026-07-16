@@ -1,4 +1,4 @@
-import type { ContextBudget, ContextItem, JsonValue, ModelMessage, ModelToolDefinition } from "agent-protocol";
+import type { ContextBudget, ContextItem, ModelMessage, ModelToolDefinition } from "agent-protocol";
 import { approximateTokens } from "./unicode.js";
 import { summarizeHistory } from "./summary.js";
 
@@ -25,8 +25,7 @@ interface HistoryBlock {
   wireSafe: boolean;
 }
 
-const LATEST_BLOCK_TOKEN_LIMIT = 8_192;
-const TOOL_ARGUMENT_TOKEN_LIMIT = 128;
+const RECENT_RAW_BLOCK_TOKEN_LIMIT = 8_192;
 /**
  * Replaying every tool turn that still fits the provider window makes the
  * cumulative request cost quadratic in long sessions. Keep a generous raw
@@ -116,30 +115,6 @@ function fitText(value: string, maximumTokens: number): string {
   return `${value.slice(0, low)}${marker}${suffix}`.trimEnd();
 }
 
-function boundedArguments(value: JsonValue): JsonValue {
-  const serialized = JSON.stringify(value);
-  const tokens = approximateTokens(serialized);
-  return tokens <= TOOL_ARGUMENT_TOKEN_LIMIT
-    ? value
-    : { _contextCompacted: true, originalTokens: tokens };
-}
-
-function hasOversizedToolArguments(block: HistoryBlock): boolean {
-  return block.messages.some((message) => message.toolCalls?.some((call) =>
-    approximateTokens(JSON.stringify(call.arguments)) > TOOL_ARGUMENT_TOKEN_LIMIT));
-}
-
-function compactSkeleton(block: HistoryBlock): ModelMessage[] {
-  return block.messages.map((message) => ({
-    role: message.role,
-    content: "",
-    ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
-    ...(message.toolCalls?.length ? {
-      toolCalls: message.toolCalls.map((call) => ({ ...call, arguments: boundedArguments(call.arguments) }))
-    } : {})
-  }));
-}
-
 function compactFallback(block: HistoryBlock, maximumTokens: number): ModelMessage[] | undefined {
   const empty: ModelMessage = { role: "assistant", content: "" };
   const contentOverhead = messageTokens(empty) - approximateTokens(empty.content);
@@ -156,20 +131,18 @@ function compactFallback(block: HistoryBlock, maximumTokens: number): ModelMessa
 
 function compactBlock(block: HistoryBlock, maximumTokens: number): ModelMessage[] | undefined {
   if (!block.wireSafe) return compactFallback(block, maximumTokens);
-  const skeleton = compactSkeleton(block);
-  const fixedTokens = blockTokens(skeleton);
-  if (fixedTokens > maximumTokens) return compactFallback(block, maximumTokens);
-  let remaining = maximumTokens - fixedTokens;
-  let remainingMessages = block.messages.filter((message) => message.content.length > 0).length;
-  const compacted = skeleton.map((message, index) => {
-    const source = block.messages[index];
-    if (!source.content || remainingMessages === 0) return message;
-    const quota = Math.floor(remaining / remainingMessages);
-    const content = fitText(source.content, quota);
-    remaining -= approximateTokens(content);
-    remainingMessages -= 1;
-    return { ...message, content };
-  });
+  // A historical tool call is executable-looking protocol. Never manufacture
+  // replacement arguments or a partial call/result skeleton: models have been
+  // observed copying those placeholders into a later real invocation. Tool
+  // exchanges are therefore retained losslessly or replaced as one
+  // low-authority text summary.
+  if (block.messages.some((message) => (message.toolCalls?.length ?? 0) > 0 || message.role === "tool")) {
+    return compactFallback(block, maximumTokens);
+  }
+  const compacted = block.messages.map((message) => ({
+    ...message,
+    content: fitText(message.content, Math.max(0, maximumTokens - 6))
+  }));
   return blockTokens(compacted) <= maximumTokens ? compacted : compactFallback(block, maximumTokens);
 }
 
@@ -227,8 +200,8 @@ function selectMandatoryHistory(
   if (!requiresLatest) return { selected, used, fitLimit };
   const block = blocks[newest];
   const rawTokens = blockTokens(block.messages);
-  const limit = Math.min(LATEST_BLOCK_TOKEN_LIMIT, fitLimit - used);
-  const messages = block.wireSafe && rawTokens <= limit && !hasOversizedToolArguments(block)
+  const limit = fitLimit - used;
+  const messages = block.wireSafe && rawTokens <= limit
     ? block.messages
     : compactBlock(block, limit);
   if (!messages) {
@@ -270,11 +243,9 @@ function includeRecentHistory(
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
     const block = blocks[index];
-    const messages = block.wireSafe && hasOversizedToolArguments(block)
-      ? compactBlock(block, LATEST_BLOCK_TOKEN_LIMIT)
-      : block.messages;
+    const messages = block.messages;
     const tokens = messages ? blockTokens(messages) : Number.POSITIVE_INFINITY;
-    if (reachedBoundary || !block.wireSafe || !messages || tokens > LATEST_BLOCK_TOKEN_LIMIT
+    if (reachedBoundary || !block.wireSafe || !messages || tokens > RECENT_RAW_BLOCK_TOKEN_LIMIT
       || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;

@@ -8,6 +8,7 @@ import {
   EVENT_SCHEMA_VERSION,
   createBudgetLedger,
   type BudgetAmounts,
+  type CheckpointRef,
   type AgentEventEnvelope,
   type AgentEventType,
   type ContextAuthority,
@@ -22,6 +23,7 @@ import {
   type ReviewEvidence,
   type UsageRecord
 } from "../packages/agent-protocol/src/index.js";
+import { emptyMutationFrontier, frontierAfterCheckpoint } from "../packages/agent-kernel/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import type {
   AccountableReviewerPort,
@@ -86,10 +88,7 @@ class RecoveryGateway implements ModelGateway {
   private turn = 0;
   calls = 0;
 
-  constructor(
-    private readonly tryCompletion: boolean,
-    private readonly completionEvidence: Array<{ evidenceId: string; kind: "validation" }> = []
-  ) {}
+  constructor(private readonly tryCompletion: boolean) {}
 
   async complete(_request: ModelRequest): Promise<ModelResponse> {
     this.calls += 1;
@@ -103,12 +102,7 @@ class RecoveryGateway implements ModelGateway {
             id: "recovered-completion",
             name: "complete_task",
             arguments: {
-              summary: "Recovered mutation is complete.",
-              criteria: [{
-              criterion: "The durable mutation was recovered safely.",
-              status: "met",
-              evidence: this.completionEvidence
-              }]
+              summary: "Recovered mutation is complete."
             }
           }]
         },
@@ -205,7 +199,9 @@ class CountingReviewer implements AccountableReviewerPort {
         reviewerId: this.reviewerId,
         verdict: "approved",
         findings: [],
-        workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
+        frontierRevision: input.frontierRevision,
+        stateDigest: input.stateDigest,
+        validationEvidenceIds: input.validations.map((item) => item.evidenceId)
       }
     };
   }
@@ -397,6 +393,11 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   if (!reached(boundary, "seal_record")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   checkpoint = await manager.seal(sessionId, checkpoint.checkpointId);
+  const sealedFrontier = frontierAfterCheckpoint(
+    emptyMutationFrontier(),
+    checkpointPayload(checkpoint) as unknown as CheckpointRef,
+    []
+  );
   if (!reached(boundary, "checkpoint_event")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
   await append("checkpoint.sealed", checkpointPayload(checkpoint));
   if (!reached(boundary, "checkpoint_evidence")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
@@ -462,8 +463,27 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     createdAt: now,
     producer: { authority: "runtime", id: "command-validator" },
     summary: "Project validation command passed.",
-    data: { validator: "command", artifactIds: [], workspaceDeltaEvidenceIds: [deltaId] }
+    data: {
+      validator: "command",
+      artifactIds: [],
+      frontierRevision: sealedFrontier.revision,
+      stateDigest: sealedFrontier.currentStateDigest,
+      coveredPaths: ["target.ts"]
+    }
   });
+
+  // V4 releases the mutation reservation as soon as semantic validation has
+  // passed; optional review must not retain mutation capacity.
+  const mutationCommitted = structuredClone(ledger);
+  mutationCommitted.reserved.toolCalls = 0;
+  mutationCommitted.consumed.toolCalls = 1;
+  mutationCommitted.reservations[0] = {
+    ...mutationCommitted.reservations[0]!,
+    status: "committed",
+    consumed: { ...amount },
+    settledAt: now
+  };
+  await append("budget.committed", { reservationId, ledger: mutationCommitted });
   if (!reached(boundary, "review_started")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const reviewerId = "fault-injection-reviewer";
@@ -471,8 +491,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     sessionId,
     runId,
     reviewerId,
-    ids: [deltaId],
-    attempt: 1
+    revision: sealedFrontier.revision,
+    stateDigest: sealedFrontier.currentStateDigest
   })).digest("hex")}`;
   const reviewerAmount = {
     inputTokens: 1,
@@ -483,8 +503,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     children: 0
   };
   const reviewerReservationId = `reservation-${randomUUID()}`;
-  const reviewReserved = structuredClone(ledger);
-  reviewReserved.reserved = { ...reviewerAmount, toolCalls: 1 };
+  const reviewReserved = structuredClone(mutationCommitted);
+  reviewReserved.reserved = { ...reviewerAmount };
   reviewReserved.reservations.push({
     reservationId: reviewerReservationId,
     ownerId: `reviewer:${reviewRequestId}`,
@@ -502,10 +522,10 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   if (!reached(boundary, "review_completed")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
   const reviewCommitted = structuredClone(reviewReserved);
   reviewCommitted.reserved = {
-    inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 1, children: 0
+    inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0, toolCalls: 0, children: 0
   };
   reviewCommitted.consumed = {
-    ...ledger.consumed,
+    ...mutationCommitted.consumed,
     inputTokens: 1,
     outputTokens: 1,
     modelTurns: 1
@@ -552,19 +572,12 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       reviewerId: "fault-injection-reviewer",
       verdict: "approved",
       findings: [],
-      workspaceDeltaEvidenceIds: [deltaId]
+      frontierRevision: sealedFrontier.revision,
+      stateDigest: sealedFrontier.currentStateDigest,
+      validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
+      checkpointId: checkpoint.checkpointId
     }
   });
-  const mutationCommitted = structuredClone(reviewCommitted);
-  mutationCommitted.reserved.toolCalls = 0;
-  mutationCommitted.consumed.toolCalls = 1;
-  mutationCommitted.reservations[0] = {
-    ...mutationCommitted.reservations[0]!,
-    status: "committed",
-    consumed: { ...amount },
-    settledAt: now
-  };
-  await append("budget.committed", { reservationId, ledger: mutationCommitted });
   if (!reached(boundary, "completion")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const completionTurn = { turnId: 2, effectRevision: seq };
@@ -572,17 +585,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   const completionCall = {
     id: "durable-completion",
     name: "complete_task",
-    arguments: {
-      summary: "Durable recovery completed.",
-      criteria: [{
-        criterion: "The recovered change is evidence-backed.",
-        status: "met",
-        evidence: [{
-          evidenceId: `command-validation:${checkpoint.checkpointId}`,
-          kind: "validation"
-        }]
-      }]
-    }
+    arguments: { summary: "Durable recovery completed." }
   };
   await append("model.completed", {
     ...completionTurn,
@@ -611,7 +614,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     }
   });
   const completionReservationId = `reservation-${randomUUID()}`;
-  const completionReserved = structuredClone(mutationCommitted);
+  const completionReserved = structuredClone(reviewCommitted);
   completionReserved.reserved.toolCalls = 1;
   completionReserved.reservations.push({
     reservationId: completionReservationId,
@@ -684,10 +687,7 @@ function recoveryRuntime(
 } {
   const executions = { count: 0 };
   const reviewer = new CountingReviewer();
-  const gateway = new RecoveryGateway(tryCompletion, fixture.checkpoint ? [{
-    evidenceId: `command-validation:${fixture.checkpoint.checkpointId}`,
-    kind: "validation"
-  }] : []);
+  const gateway = new RecoveryGateway(tryCompletion);
   const tools = registerBuiltinTools(new EffectToolRegistry());
   tools.register({
     descriptor: {
@@ -810,7 +810,8 @@ describe("durable transaction fault-injection recovery", () => {
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
       expect(reviewer.calls).toBe(boundary === "validation_evidence" ? 1 : 0);
-      const convergedCompletion = boundary === "validation_evidence" || boundary === "review_completed";
+      const convergedCompletion = boundary === "validation_evidence"
+        || boundary === "review_started" || boundary === "review_completed";
       expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
       if (convergedCompletion) expect(gateway.calls).toBe(1);
 
@@ -823,14 +824,15 @@ describe("durable transaction fault-injection recovery", () => {
         expect(stored.filter((item) => item.type === "evidence.recorded"
           && (item.payload as { evidenceId?: string }).evidenceId === evidenceId)).toHaveLength(1);
       }
-      const mutationCommitted = boundary === "validation_evidence" || boundary === "review_completed";
+      const mutationCommitted = boundary === "validation_evidence"
+        || boundary === "review_started" || boundary === "review_completed";
       expect(settledMutationReservations(stored, "budget.committed")).toBe(mutationCommitted ? 1 : 0);
       if (mutationCommitted) {
         const reservationIds = mutationReservationIds(stored);
         const reviewIndex = stored.findIndex((item) => item.type === "review.completed");
         const commitIndex = stored.findIndex((item) => item.type === "budget.committed"
           && reservationIds.has((item.payload as { reservationId?: string }).reservationId ?? ""));
-        expect(commitIndex).toBeGreaterThan(reviewIndex);
+        expect(commitIndex).toBeLessThan(reviewIndex);
       }
       expect(stored.filter((item) => item.type === "tool.approval_requested"
         && JSON.stringify(item.payload).includes("mutation-call"))).toHaveLength(0);

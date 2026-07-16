@@ -13,7 +13,7 @@ const BUDGET_KEYS = new Set<keyof ProfileBudget>([
   "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls", "maxChildren", "maxDepth"
 ]);
 const MUTATION_KEYS = new Set<keyof ProfileMutationPolicy>([
-  "requirePlanBeforeMutation", "checkpointBeforeMutation", "reviewNonDocumentationChanges"
+  "requirePlanBeforeMutation", "checkpointBeforeMutation", "reviewMode"
 ]);
 
 /** Restores only the canonical, digest-bound profile artifact emitted at session creation. */
@@ -73,7 +73,7 @@ function mutationValue(value: unknown): ProfileMutationPolicy {
   return {
     requirePlanBeforeMutation: bool(mutation.requirePlanBeforeMutation, "mutationPolicy.requirePlanBeforeMutation"),
     checkpointBeforeMutation: bool(mutation.checkpointBeforeMutation, "mutationPolicy.checkpointBeforeMutation"),
-    reviewNonDocumentationChanges: bool(mutation.reviewNonDocumentationChanges, "mutationPolicy.reviewNonDocumentationChanges")
+    reviewMode: oneOf(mutation.reviewMode, ["off", "advisory", "required"], "mutationPolicy.reviewMode")
   };
 }
 

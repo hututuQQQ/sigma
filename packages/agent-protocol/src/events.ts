@@ -86,7 +86,7 @@ const eventMetadataSchema = z.object({
 }).strict();
 
 const TOOL_EVIDENCE_KINDS: ReadonlySet<EvidenceRecord["kind"]> = new Set([
-  "workspace_delta", "command", "validation", "diagnostic"
+  "workspace_delta", "repository_delta", "command", "validation", "diagnostic"
 ]);
 
 function validEvidenceAuthority(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {

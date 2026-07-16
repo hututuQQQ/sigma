@@ -246,12 +246,12 @@ async function workspaceRelease(rootDir) {
     if (!version) continue;
     const majorMatch = version.match(/^([1-9][0-9]*)\./u);
     const major = majorMatch ? Number(majorMatch[1]) : null;
-    if (major !== 2 && major !== 3) {
+    if (major !== 2 && major !== 3 && major !== 4) {
       throw new Error(
-        `Unsupported Sigma Code release version '${version}'. Portable packaging supports major versions 2 and 3; a new major requires an explicit schema review.`
+        `Unsupported Sigma Code release version '${version}'. Portable packaging supports major versions 2, 3, and 4; a new major requires an explicit schema review.`
       );
     }
-    return { version, isV3: major >= 3 };
+    return { version, isV3: major >= 3, packageSchemaVersion: major };
   }
   throw new Error(`Could not determine the Sigma Code release version below ${rootDir}.`);
 }
@@ -1854,7 +1854,7 @@ function v3PackageMetadata(context, runtime, evidence) {
 async function writePackageMetadata(context, runtime, evidence) {
   const { release, targetPlatform, targetArch, bundleDir } = context;
   const metadata = {
-    schemaVersion: release.isV3 ? 3 : 2,
+    schemaVersion: release.packageSchemaVersion,
     productVersion: release.version,
     releaseChannel: release.version.includes("-") ? release.version.split("-")[1].split(".")[0] : "stable",
     tier: "tier1",

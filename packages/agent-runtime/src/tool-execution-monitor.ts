@@ -93,7 +93,7 @@ export class ToolExecutionMonitor {
     heartbeat();
     try {
       const requiresSettlement = plan.exactEffects.some((effect) =>
-        ["filesystem.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
+        ["filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
           .includes(effect));
       const observesWorkspace = plan.exactEffects.some((effect) =>
         ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));

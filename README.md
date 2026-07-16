@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: Release candidate" src="https://img.shields.io/badge/status-v3.0.0--rc.2-f59e0b">
+  <img alt="Status: Release candidate" src="https://img.shields.io/badge/status-v4.0.0--rc.1-f59e0b">
   <img alt="First binary target: Windows x64" src="https://img.shields.io/badge/first%20binary%20target-Windows%20x64-0078d4">
   <img alt="Formal evaluation: DeepSeek only" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
 </p>
@@ -25,7 +25,7 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`v3.0.0-rc.2` is an unsigned Windows x64 preview release candidate. It is suitable
+`v4.0.0-rc.1` is an unsigned Windows x64 preview release candidate. It is suitable
 for evaluation and feedback, but it is not yet the stable `3.0.0` release. See the
 [changelog](CHANGELOG.md), [security policy](SECURITY.md), and
 [contribution guide](CONTRIBUTING.md) before reporting or proposing changes.
@@ -33,7 +33,7 @@ for evaluation and feedback, but it is not yet the stable `3.0.0` release. See t
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **The first signed binary release target is Windows x64.** `v3.0.0-rc.2` includes a directly usable but unsigned Windows x64 preview archive because trusted Windows code signing is not configured. Windows may show a SmartScreen warning. The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
+> - **The first signed binary release target is Windows x64.** `v4.0.0-rc.1` includes a directly usable but unsigned Windows x64 preview archive because trusted Windows code signing is not configured. Windows may show a SmartScreen warning. The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
 > - **Formal evaluation and benchmark runs are currently DeepSeek-only.** Sigma's evaluator, Harbor adapter, and Terminal-Bench harness are maintained around DeepSeek; results from other providers are not used for formal claims.
 > - The runtime contains DeepSeek and GLM/Z.ai gateway support, but the GLM path does not have the same formal evaluation coverage.
 > - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
@@ -44,14 +44,14 @@ for evaluation and feedback, but it is not yet the stable `3.0.0` release. See t
 | --- | --- |
 | Durable by default | Commands, model turns, tool receipts, approvals, plans, evidence, and outcomes are stored as checksummed events and can be replayed. |
 | Effects before execution | Every tool declares its possible effects; each call is narrowed to an exact plan before policy, approval, locking, checkpointing, and execution. |
-| Evidence before “done” | A natural-language answer cannot finish a run. Completion must cite typed evidence for explicit acceptance criteria. |
+| Current-state validation before “done” | The runtime completes only when semantic validation covers every net change on the current mutation frontier. |
 | Fail-closed containment | Process execution defaults to a native sandbox with no network. If the required sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
 ## Quick start on Windows
 
 > [!NOTE]
-> `v3.0.0-rc.2` includes an unsigned Windows x64 preview archive. Verify its SHA-256
+> `v4.0.0-rc.1` includes an unsigned Windows x64 preview archive. Verify its SHA-256
 > sidecar before extraction. Windows may show a SmartScreen warning because the
 > executables do not yet have a trusted Authenticode signature.
 
@@ -192,9 +192,9 @@ Event records have checksums and monotonic sequence numbers. Segments rotate at 
 
 ### Completion is a protocol action
 
-A provider `stop` or a confident final paragraph is not completion. The model must call `complete_task` with a non-empty summary, explicit acceptance criteria, and exact references from the current run's evidence ledger. Unknown, failed, stale, or semantically incompatible evidence is rejected and the run continues with a structured repair diagnostic.
+A provider `stop` with substantive text is treated as completion intent, and `complete_task` accepts only a summary plus optional warnings. The runtime—not the model—derives plan completion and evidence from the current mutation frontier. Failed, stale, or incomplete semantic validation keeps the run open with a structured repair diagnostic.
 
-For non-documentation changes, completion requires passed semantic validation and approved independent review evidence. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
+All net changes require passed semantic validation on the current state. The standard profile runs independent review as advisory and records findings as warnings; the strict profile requires approval. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
 
 ## Commands
 

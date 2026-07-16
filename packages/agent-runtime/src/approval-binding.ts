@@ -13,6 +13,7 @@ const toolEffects = new Set<ToolEffect>([
   "outcome.request_input",
   "runtime.control",
   "checkpoint.restore",
+  "repository.write",
   "destructive",
   "open_world"
 ]);

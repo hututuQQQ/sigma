@@ -166,7 +166,7 @@ function delta(): WorkspaceDeltaEvidence {
   };
 }
 
-function validation(): ValidationEvidence {
+function validation(coveredPaths = ["src/code.ts"]): ValidationEvidence {
   return {
     evidenceId: "validation",
     sessionId: "session",
@@ -180,7 +180,9 @@ function validation(): ValidationEvidence {
       validator: "command",
       exitCode: 0,
       artifactIds: [],
-      workspaceDeltaEvidenceIds: ["delta"]
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      coveredPaths
     }
   };
 }
@@ -222,6 +224,13 @@ function runtimeSession(budgetLimits = limits()): RuntimeSession {
   });
   state.budget.limits = budgetLimits;
   state.evidence = [delta(), validation()];
+  state.mutationFrontier = {
+    revision: 1,
+    baselineManifestDigest: "0".repeat(64),
+    currentStateDigest: "a".repeat(64),
+    changedPaths: ["src/code.ts"],
+    sourceCheckpointIds: ["checkpoint"]
+  };
   state.plan = { revision: 1, goal: "Review the change", nodes: [] };
   return runtimeSessionFixture({ state, services: { gateway: new ReviewerGateway() } });
 }
@@ -391,7 +400,9 @@ describe("independent reviewer budget accounting", () => {
           reviewerId: "fake-port",
           verdict: "approved",
           findings: [],
-          workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
+          frontierRevision: input.frontierRevision,
+          stateDigest: input.stateDigest,
+          validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       })
     };
@@ -421,7 +432,9 @@ describe("independent reviewer budget accounting", () => {
           reviewerId: "contradictory-port",
           verdict: "approved",
           findings: ["An unresolved correctness issue remains."],
-          workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
+          frontierRevision: input.frontierRevision,
+          stateDigest: input.stateDigest,
+          validationEvidenceIds: input.validations.map((item) => item.evidenceId)
         }
       })
     };
@@ -459,7 +472,8 @@ describe("independent reviewer budget accounting", () => {
             reviewerId: "dedupe-reviewer",
             verdict: "changes_requested",
             findings: ["reviewer unavailable"],
-            workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
             validationEvidenceIds: input.validations.map((item) => item.evidenceId),
             failureKind: "infrastructure"
           }
@@ -479,6 +493,7 @@ describe("independent reviewer budget accounting", () => {
   it("fails closed for non-strict JSON and incomplete review material", async () => {
     const input = {
       sessionId: "session", runId: "run", goal: "Review safely",
+      frontierRevision: 1, stateDigest: "a".repeat(64),
       workspaceDeltas: [delta()], validations: [validation()]
     };
     const decoratedGateway = new ReviewerGateway(
@@ -528,7 +543,7 @@ describe("independent reviewer budget accounting", () => {
     ].join("\n");
     const binaryGateway = new ReviewerGateway();
     const binary = await new ModelReviewer(binaryGateway).review({
-      ...input, workspaceDeltas: [binaryDelta]
+      ...input, workspaceDeltas: [binaryDelta], validations: [validation(["bin/tool"])]
     }, new AbortController().signal);
     expect(binary).toMatchObject({ status: "passed", data: { verdict: "approved" } });
     expect(binaryGateway.calls).toBe(1);
@@ -543,7 +558,7 @@ describe("independent reviewer budget accounting", () => {
     }];
     const opaqueGateway = new ReviewerGateway();
     const opaque = await new ModelReviewer(opaqueGateway).review({
-      ...input, workspaceDeltas: [opaqueDelta]
+      ...input, workspaceDeltas: [opaqueDelta], validations: [validation(["bin/tool"])]
     }, new AbortController().signal);
     expect(opaque).toMatchObject({ status: "passed", data: { verdict: "approved" } });
     expect(opaqueGateway.calls).toBe(1);
@@ -602,7 +617,8 @@ describe("independent reviewer budget accounting", () => {
 
     const result = await new ModelReviewer(gateway).review({
       sessionId: "session", runId: "run", goal: "Review safely",
-      workspaceDeltas: [item], validations: [validation()]
+      frontierRevision: 1, stateDigest: "a".repeat(64),
+      workspaceDeltas: [item], validations: [validation(Object.values(changed).flat())]
     }, new AbortController().signal);
 
     expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
@@ -646,8 +662,10 @@ describe("independent reviewer budget accounting", () => {
       sessionId: "session",
       runId: "run",
       goal: "Review safely",
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
       workspaceDeltas: [item],
-      validations: includeValidation ? [validation()] : []
+      validations: includeValidation ? [validation(["src/code.ts", "assets/blob.bin"])] : []
     }, new AbortController().signal);
 
     expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
@@ -667,7 +685,8 @@ describe("independent reviewer budget accounting", () => {
 
     const result = await new ModelReviewer(gateway).review({
       sessionId: "session", runId: "run", goal: "Review safely",
-      workspaceDeltas: [item], validations: [validation()]
+      frontierRevision: 1, stateDigest: "a".repeat(64),
+      workspaceDeltas: [item], validations: [validation(["assets/blob.bin"])]
     }, new AbortController().signal);
 
     expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
@@ -681,7 +700,11 @@ describe("independent reviewer budget accounting", () => {
 
     const result = await new ModelReviewer(gateway).review({
       sessionId: "session", runId: "run", goal: "Review safely",
-      workspaceDeltas: [completeMixedDelta()], validations: [failedValidation]
+      frontierRevision: 1, stateDigest: "a".repeat(64),
+      workspaceDeltas: [completeMixedDelta()],
+      validations: [{ ...failedValidation, data: {
+        ...failedValidation.data, coveredPaths: ["src/code.ts", "assets/blob.bin"]
+      } }]
     }, new AbortController().signal);
 
     expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
@@ -695,6 +718,7 @@ describe("independent reviewer budget accounting", () => {
 
     const result = await new ModelReviewer(gateway).review({
       sessionId: "session", runId: "run", goal: "Review safely",
+      frontierRevision: 1, stateDigest: "a".repeat(64),
       workspaceDeltas: [item], validations: []
     }, new AbortController().signal);
 
