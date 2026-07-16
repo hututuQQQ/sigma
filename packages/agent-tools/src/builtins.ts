@@ -136,6 +136,8 @@ export function registerBuiltinTools(
     broker: options.broker ?? unavailableExecutionBroker(),
     sandboxMode: options.sandboxMode ?? "required",
     networkMode: options.networkMode ?? "none",
+    // The platform-selected shell is a verified local runtime capability;
+    // an explicitly connected broker may narrow it with options.shells.
     shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell]),
     runtimeCommands: options.runtimeCommands ?? [],
     foreground: options.foreground ?? true,

@@ -7,6 +7,7 @@ import {
   buildHarborJobConfig,
   defaultAgentCliTarballForEnv,
   harborRuntimeDir as defaultHarborRuntimeDir,
+  harborSandboxComposePath as defaultHarborSandboxComposePath,
   portableAgentImportPath,
   removedHarborDirectoryName,
   removedHarborPackageName,
@@ -94,16 +95,26 @@ export async function packageHarborRuntime(options = {}) {
   const sourcePath = options.sourcePath
     ? path.resolve(options.sourcePath)
     : path.join(rootDir, "portable", "harbor", "sigma_harbor_agent.py");
+  const sandboxComposeSourcePath = options.sandboxComposeSourcePath
+    ? path.resolve(options.sandboxComposeSourcePath)
+    : path.join(rootDir, "portable", "harbor", "docker-compose-sigma-sandbox.yaml");
+  const sandboxComposePath = options.harborRuntimeDir || options.artifactsDir
+    ? path.join(harborRuntimeDir, "docker-compose-sigma-sandbox.yaml")
+    : defaultHarborSandboxComposePath;
   const agentCliTarball = resolveAgentCliTarball(rootDir, artifactsDir, env, options);
 
   if (!existsSync(sourcePath)) {
     throw new Error(`Portable Harbor runtime source is missing: ${sourcePath}`);
+  }
+  if (!existsSync(sandboxComposeSourcePath)) {
+    throw new Error(`Portable Harbor sandbox Compose overlay is missing: ${sandboxComposeSourcePath}`);
   }
   if (!existsSync(agentCliTarball)) {
     throw new Error(`Packaged agent CLI is missing: ${agentCliTarball}. Run pnpm package:agent-cli first.`);
   }
 
   const sourceText = await readFile(sourcePath, "utf8");
+  const sandboxComposeText = await readFile(sandboxComposeSourcePath, "utf8");
   assertNoRemovedHarborAdapter(sourceText, "Portable Harbor runtime source");
 
   await rm(harborRuntimeDir, { recursive: true, force: true });
@@ -111,12 +122,14 @@ export async function packageHarborRuntime(options = {}) {
 
   const runtimePath = path.join(harborRuntimeDir, "sigma_harbor_agent.py");
   await writeFile(runtimePath, sourceText, "utf8");
+  await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
 
   const k5Config = buildHarborJobConfig(
     {
       ...baseBenchmarkOptions(agentCliTarball),
       mode: "k",
-      k: 5
+      k: 5,
+      harborSandboxComposePath: sandboxComposePath
     },
     path.join(harborRuntimeDir, "jobs", "deepseek-k5")
   );
@@ -133,6 +146,7 @@ export async function packageHarborRuntime(options = {}) {
     artifactsDir,
     harborRuntimeDir,
     runtimePath,
+    sandboxComposePath,
     agentCliTarball,
     k5ConfigPath: path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json")
   };

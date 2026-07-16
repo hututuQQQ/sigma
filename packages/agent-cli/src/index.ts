@@ -116,8 +116,10 @@ export async function runAgentCommand(args = process.argv.slice(2), options: Age
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runAgentCommand().then((code) => { process.exitCode = code; }).catch((error) => {
+  try {
+    process.exitCode = await runAgentCommand();
+  } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
-  });
+  }
 }

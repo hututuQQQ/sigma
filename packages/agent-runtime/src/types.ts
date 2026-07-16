@@ -44,6 +44,8 @@ export interface RuntimeOptions {
    * Set false to disable it, or a positive number for an explicit timeout. */
   toolIdleWatchdogMs?: number | false;
   permissionMode?: "ask" | "auto" | "deny";
+  /** Whether this runtime surface can answer a human approval prompt. */
+  interactiveApprovals?: boolean;
   outputReserveTokens?: number;
   budgetLimits?: BudgetLimits;
   checkpointMaxFiles?: number;
@@ -101,6 +103,7 @@ export interface QueuedFollowUp {
 export interface OutcomeWaiter {
   runId: string;
   resolve(outcome: RunOutcome): void;
+  reject(error: unknown): void;
 }
 
 export interface IdleWaiter {
@@ -153,7 +156,7 @@ export interface RuntimeSessionExecutionState {
 export interface RuntimeSessionInteractionState {
   subscribers: Set<AsyncQueue<AgentEventEnvelope>>;
   approvals: Map<string, ApprovalWaiter>;
-  /** One-shot human grants, bound to a call and intentionally not restored. */
+  /** One-shot grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
   steeringPending: number;

@@ -66,6 +66,12 @@ describe("agent-config single-source schema", () => {
       workspace: { permissions: { mode: "deny" }, security: { network: "none" }, budget: { max_input_tokens: 1_000 } }
     });
     expect(explicit).toMatchObject({ permissionMode: "auto", networkMode: "full", maxInputTokens: 3_000 });
+
+    expect(resolveConfig({ workspace: { runtime: { stream_active_sec: 60 } } }).streamActiveSec).toBe(60);
+    expect(resolveConfig({
+      home: { runtime: { stream_active_sec: 30 } },
+      workspace: { runtime: { stream_active_sec: 0 } }
+    }).streamActiveSec).toBe(30);
   });
 
   it("validates every scalar boundary", () => {
@@ -75,6 +81,11 @@ describe("agent-config single-source schema", () => {
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");
     expect(() => field("runDeadlineSec").parse("nan")).toThrow("number");
+    expect(field("streamActiveSec").parse(0)).toBe(0);
+    expect(() => field("streamActiveSec").parse(-1)).toThrow("number");
+    expect(field("streamJsonMaxLineBytes").parse(49_152)).toBe(49_152);
+    expect(() => field("streamJsonMaxLineBytes").parse(4_095)).toThrow("integer");
+    expect(() => field("streamJsonMaxLineBytes").parse(4_096.5)).toThrow("integer");
     expect(() => field("maxParallelTools").parse(0)).toThrow("number");
     expect(() => field("maxParallelTools").parse(33)).toThrow("number");
     expect(() => field("stdin").parse("maybe")).toThrow("true or false");

@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelGateway, ModelRequest, ModelStreamEvent } from "../packages/agent-protocol/src/index.js";
-import { createModelGateway, OpenAIModelGateway, type OpenAIModelGatewayOptions } from "../packages/agent-model/src/index.js";
+import {
+  checkProviderHealth,
+  createModelGateway,
+  createSseStreamState,
+  OpenAIModelGateway,
+  ssePayloads,
+  type OpenAIModelGatewayOptions
+} from "../packages/agent-model/src/index.js";
 
 function request(): ModelRequest {
   return { messages: [{ role: "user", content: "hello" }], signal: new AbortController().signal };
@@ -38,10 +45,41 @@ async function collectStream(model: ModelGateway, input: ModelRequest = request(
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
 describe("OpenAI-compatible model gateway", () => {
+  it("parses split CRLF and multi-line SSE frames without losing the terminal payload", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      "data: first\r",
+      "\ndata: second\r\n\r",
+      "\ndata: [DO",
+      "NE]"
+    ].map((value) => encoder.encode(value));
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      }
+    });
+    const state = createSseStreamState();
+    const payloads: string[] = [];
+    for await (const payload of ssePayloads(body, new AbortController().signal, 1_000, state)) {
+      payloads.push(payload);
+    }
+
+    expect(payloads).toEqual(["first\nsecond", "[DONE]"]);
+    expect(state).toMatchObject({
+      chunksRead: 4,
+      framesRead: 2,
+      dataPayloads: 2,
+      transportEnded: true
+    });
+  });
+
   it("retries transport failures for non-streaming requests", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     let attempts = 0;
@@ -486,9 +524,115 @@ describe("OpenAI-compatible model gateway", () => {
     await expect(gateway.complete(request())).rejects.toMatchObject({ name: "TimeoutError" });
   });
 
-  it("cancels a pending stream read when the idle timeout expires", async () => {
+  it("bounds a fetch implementation that never resolves", async () => {
+    const startedAt = performance.now();
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      maxRetries: 3,
+      requestTimeoutMs: 25
+    });
+    await expect(gateway.complete(request())).rejects.toMatchObject({
+      name: "TimeoutError",
+      category: "timeout"
+    });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("honors a parent run abort before the model deadline", async () => {
+    const controller = new AbortController();
+    const reason = new Error("parent run deadline");
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      requestTimeoutMs: 1_000,
+      maxRetries: 3
+    });
+    const pending = gateway.complete({ ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(reason), 20);
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("returns structured provider health without exposing credentials", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "auto",
+      signal: new AbortController().signal,
+      requestTimeoutMs: 25,
+      fetchImpl: (async () => await new Promise<Response>(() => undefined)) as typeof fetch
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      endpointHost: "api.deepseek.com",
+      failureKind: "network_error",
+      errorCategory: "timeout"
+    });
+    expect(JSON.stringify(result)).not.toContain("health-secret");
+  });
+
+  it("uses a non-thinking health probe with a bounded text budget", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    let body: Record<string, unknown> | undefined;
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse("OK");
+      }) as typeof fetch
+    });
+
+    expect(result).toMatchObject({ ok: true, provider: "deepseek", model: "deepseek-v4-pro", message: "OK" });
+    expect(body).toMatchObject({
+      thinking: { type: "disabled" },
+      max_tokens: 32,
+      temperature: 0,
+      messages: [{ role: "user", content: "Return exactly the text OK." }]
+    });
+  });
+
+  it("accepts explicit reasoning text without treating empty content as universal success", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async () => new Response(JSON.stringify({
+        choices: [{ message: { content: null, reasoning_content: "OK" }, finish_reason: "stop" }]
+      }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch
+    });
+
+    expect(result).toMatchObject({ ok: true, message: "OK" });
+  });
+
+  it("reports malformed completion shapes as protocol errors", async () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "health-secret");
+    const result = await checkProviderHealth({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      signal: new AbortController().signal,
+      fetchImpl: (async () => new Response(JSON.stringify({ choices: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as typeof fetch
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      failureKind: "api_error",
+      errorCategory: "protocol",
+      message: expect.stringContaining("choices must be a non-empty array")
+    });
+  });
+
+  it("cancels a pending stream read when valid SSE payloads become idle", async () => {
     let cancelled = 0;
     const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "started" }, finish_reason: null }]
+        })}\n\n`));
+      },
       cancel() { cancelled += 1; }
     }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
       maxRetries: 0,
@@ -498,8 +642,247 @@ describe("OpenAI-compatible model gateway", () => {
     const consume = async (): Promise<void> => {
       for await (const _event of gateway.stream(request())) { /* wait for terminal failure */ }
     };
-    await expect(consume()).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(consume()).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        doneReceived: false,
+        transportEnded: false,
+        lastEventType: "reasoning",
+        hasReasoning: true,
+        retryAttempts: 1,
+        timeoutReason: "Model stream idle for 25ms without an SSE data payload.",
+        firstByteMs: expect.any(Number),
+        lastFrameMs: expect.any(Number),
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
+      }
+    });
     expect(cancelled).toBeGreaterThan(0);
+  });
+
+  it("times out a stream that never produces its first body byte", async () => {
+    let cancelled = 0;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      cancel() { cancelled += 1; }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 25,
+      idleTimeoutMs: 1_000
+    });
+
+    await expect(collectStream(gateway)).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: false,
+        retryAttempts: 1,
+        sseChunks: 0,
+        timeoutReason: "Model stream first byte exceeded 25ms.",
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
+      }
+    });
+    expect(cancelled).toBeGreaterThan(0);
+  });
+
+  it("allows an active reasoning stream to outlive the first-byte deadline", async () => {
+    const encoder = new TextEncoder();
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        let index = 0;
+        const timer = setInterval(() => {
+          if (index < 7) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              choices: [{ delta: { reasoning_content: String(index) }, finish_reason: null }]
+            })}\n\n`));
+            index += 1;
+            return;
+          }
+          clearInterval(timer);
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        }, 10);
+      }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 25,
+      idleTimeoutMs: 50
+    });
+
+    const startedAt = performance.now();
+    const events = await collectStream(gateway);
+    expect(performance.now() - startedAt).toBeGreaterThan(50);
+    expect(events.filter((event) => event.type === "reasoning")).toHaveLength(7);
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
+  it("enforces an explicit active-stream deadline independently of idle traffic", async () => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        timer = setInterval(() => controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "active" }, finish_reason: null }]
+        })}\n\n`)), 5);
+      },
+      cancel() { if (timer) clearInterval(timer); }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 100,
+      idleTimeoutMs: 25,
+      activeStreamTimeoutMs: 40
+    });
+
+    await expect(collectStream(gateway)).rejects.toMatchObject({
+      name: "TimeoutError",
+      diagnostics: {
+        lastEventType: "reasoning",
+        hasReasoning: true,
+        timeoutReason: "Model active stream exceeded 40ms.",
+        firstByteMs: expect.any(Number),
+        lastFrameMs: expect.any(Number),
+        idleDurationMs: expect.any(Number),
+        totalDurationMs: expect.any(Number)
+      }
+    });
+  });
+
+  it("lets the parent Agent/session deadline abort an otherwise active stream", async () => {
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const gateway = createGateway((async () => new Response(new ReadableStream<Uint8Array>({
+      start(stream) {
+        timer = setInterval(() => stream.enqueue(encoder.encode(`data: ${JSON.stringify({
+          choices: [{ delta: { reasoning_content: "active" }, finish_reason: null }]
+        })}\n\n`)), 5);
+      },
+      cancel() { if (timer) clearInterval(timer); }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 100,
+      idleTimeoutMs: 25
+    });
+    const pending = collectStream(gateway, { ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(new Error("Agent session deadline elapsed")), 35);
+
+    await expect(pending).rejects.toMatchObject({
+      diagnostics: {
+        lastEventType: "reasoning",
+        hasReasoning: true,
+        abortReason: "Agent session deadline elapsed"
+      }
+    });
+  });
+
+  it("reports protocol metadata when the transport ends before [DONE]", async () => {
+    const gateway = createGateway((async () => streamResponse([
+      { choices: [{ delta: { content: "partial" }, finish_reason: null }] }
+    ], false)) as typeof fetch, { maxRetries: 0 });
+
+    let failure: unknown;
+    try {
+      await collectStream(gateway);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "model_stream_protocol_error",
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "content",
+        hasContent: true,
+        hasReasoning: false,
+        hasToolCall: false,
+        retryAttempts: 1,
+        sseFrames: 1,
+        ssePayloads: 1,
+        sseTrailingBytes: 0
+      }
+    });
+    const diagnostics = (failure as { diagnostics?: { sseChunks?: number; sseBytes?: number } })?.diagnostics;
+    expect(diagnostics?.sseChunks).toBeGreaterThan(0);
+    expect(diagnostics?.sseBytes).toBeGreaterThan(0);
+  });
+
+  it("carries an HTTP-stage abort reason into stream diagnostics", async () => {
+    const controller = new AbortController();
+    const gateway = createGateway((async () => await new Promise<Response>(() => undefined)) as typeof fetch, {
+      maxRetries: 0,
+      requestTimeoutMs: 1_000
+    });
+    const pending = collectStream(gateway, { ...request(), signal: controller.signal });
+    setTimeout(() => controller.abort(new Error("parent request aborted")), 20);
+
+    await expect(pending).rejects.toMatchObject({
+      diagnostics: {
+        doneReceived: false,
+        lastEventType: "none",
+        retryAttempts: 1,
+        sseChunks: 0,
+        sseBytes: 0,
+        sseFrames: 0,
+        ssePayloads: 0,
+        sseTrailingBytes: 0,
+        abortReason: "parent request aborted"
+      }
+    });
+  });
+
+  it("reports trailing bytes for an incomplete final SSE frame", async () => {
+    const trailing = `data: ${JSON.stringify({
+      choices: [{ delta: { content: "unterminated" }, finish_reason: null }]
+    })}`;
+    const gateway = createGateway((async () => new Response(trailing, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    })) as typeof fetch, { maxRetries: 0 });
+
+    let failure: unknown;
+    try {
+      await collectStream(gateway);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      diagnostics: {
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "content",
+        hasContent: true,
+        sseFrames: 1,
+        ssePayloads: 1
+      }
+    });
+    expect((failure as { diagnostics?: { sseTrailingBytes?: number } }).diagnostics?.sseTrailingBytes)
+      .toBe(new TextEncoder().encode(trailing).byteLength);
+  });
+
+  it("completes a reasoning-and-tool stream only after [DONE]", async () => {
+    const gateway = createGateway((async () => streamResponse([
+      { choices: [{ delta: { reasoning_content: "inspect" }, finish_reason: null }] },
+      { choices: [{ delta: { tool_calls: [{
+        index: 0,
+        id: "call_1",
+        function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" }
+      }] }, finish_reason: "tool_calls" }] }
+    ], true)) as typeof fetch, { maxRetries: 0 });
+
+    await expect(collectStream(gateway)).resolves.toEqual([
+      { type: "reasoning", delta: "inspect" },
+      { type: "tool_call", index: 0, call: {
+        id: "call_1", name: "read_file", arguments: { path: "a.ts" }
+      } },
+      expect.objectContaining({
+        type: "done",
+        response: expect.objectContaining({ finishReason: "tool_calls" })
+      })
+    ]);
   });
 
   it("restarts a partial stream at a stable prefix without duplicate deltas", async () => {
@@ -518,6 +901,46 @@ describe("OpenAI-compatible model gateway", () => {
     expect(events.filter((event) => event.type === "content").map((event) => event.type === "content" ? event.delta : "")).toEqual(["hel", "lo"]);
     expect(events.at(-1)).toMatchObject({ type: "done", response: { message: { content: "hello" } } });
     expect(attempts).toBe(2);
+  });
+
+  it("classifies a reasoning-only stream that ends without [DONE] as an observable protocol failure", async () => {
+    let attempts = 0;
+    const gateway = createGateway((async () => {
+      attempts += 1;
+      return streamResponse([{ choices: [{ delta: { reasoning_content: "thinking" }, finish_reason: null }] }], false);
+    }) as typeof fetch, { maxRetries: 1 });
+    const events: ModelStreamEvent[] = [];
+    let failure: unknown;
+    try {
+      for await (const event of gateway.stream(request())) events.push(event);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(events).toEqual([{ type: "reasoning", delta: "thinking" }]);
+    expect(attempts).toBe(2);
+    expect(failure).toMatchObject({
+      code: "model_stream_protocol_error",
+      category: "protocol",
+      semanticDelta: true,
+      diagnostics: {
+        provider: "fake",
+        model: "fake",
+        httpStatus: 200,
+        doneReceived: false,
+        transportEnded: true,
+        lastEventType: "reasoning",
+        hasContent: false,
+        hasReasoning: true,
+        hasToolCall: false,
+        retryAttempts: 2,
+        sseChunks: 2,
+        sseFrames: 2,
+        ssePayloads: 2,
+        sseTrailingBytes: 0
+      }
+    });
+    expect((failure as Error).message).toContain("ended before [DONE]");
   });
 
   it("emits reasoning and usage while treating an unknown streamed finish reason as a protocol error", async () => {

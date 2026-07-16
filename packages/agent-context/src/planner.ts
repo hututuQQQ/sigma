@@ -27,12 +27,24 @@ interface HistoryBlock {
 
 const LATEST_BLOCK_TOKEN_LIMIT = 8_192;
 const TOOL_ARGUMENT_TOKEN_LIMIT = 128;
+/**
+ * Replaying every tool turn that still fits the provider window makes the
+ * cumulative request cost quadratic in long sessions. Keep a generous raw
+ * working set and summarize the older blocks even when the provider could
+ * technically accept them. Small-context models still use their whole window.
+ */
+const PROACTIVE_HISTORY_TOKEN_LIMIT = 24_000;
 
 function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
-    + approximateTokens(message.reasoningContent ?? "")
     + approximateTokens(JSON.stringify(message.toolCalls ?? []))
     + 6;
+}
+
+function withoutHistoricalReasoning(message: ModelMessage): ModelMessage {
+  if (message.reasoningContent === undefined) return message;
+  const { reasoningContent: _reasoningContent, ...wireMessage } = message;
+  return wireMessage;
 }
 
 function blockTokens(block: readonly ModelMessage[]): number {
@@ -244,20 +256,24 @@ function includeRecentHistory(
   blocks: readonly HistoryBlock[],
   selected: Map<number, ModelMessage[]>,
   initialUsed: number,
-  fitLimit: number
+  fitLimit: number,
+  historyTokenLimit: number
 ): number {
   let used = initialUsed;
+  let historyUsed = [...selected.values()].reduce((total, messages) => total + blockTokens(messages), 0);
   let reachedBoundary = false;
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
     const block = blocks[index];
     const tokens = blockTokens(block.messages);
-    if (reachedBoundary || !block.wireSafe || tokens > LATEST_BLOCK_TOKEN_LIMIT || used + tokens > fitLimit) {
+    if (reachedBoundary || !block.wireSafe || tokens > LATEST_BLOCK_TOKEN_LIMIT
+      || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;
     }
     selected.set(index, block.messages);
     used += tokens;
+    historyUsed += tokens;
   }
   return used;
 }
@@ -273,12 +289,25 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     throw overflow(`Mandatory system and project context requires ${mandatoryTokens} tokens but only ${available} context tokens are available.`);
   }
 
-  const blocks = historyBlocks(options.history);
+  // Provider-private reasoning is durable audit data, but replaying old
+  // reasoning into a new request both wastes budget and destabilizes prompt
+  // cache prefixes. It is intentionally removed from all historical turns.
+  const blocks = historyBlocks(options.history.map(withoutHistoricalReasoning));
   const selection = selectMandatoryHistory(blocks, available, mandatoryTokens);
   const included: ContextItem[] = [...mandatory];
   const omitted: ContextItem[] = [];
   let used = includeDynamicContext(candidates, included, omitted, selection.used, selection.fitLimit);
-  used = includeRecentHistory(blocks, selection.selected, used, selection.fitLimit);
+  const historyTokenLimit = available <= PROACTIVE_HISTORY_TOKEN_LIMIT
+    ? available
+    : PROACTIVE_HISTORY_TOKEN_LIMIT;
+  used = includeRecentHistory(
+    blocks,
+    selection.selected,
+    used,
+    selection.fitLimit,
+    Math.max(historyTokenLimit, [...selection.selected.values()]
+      .reduce((total, messages) => total + blockTokens(messages), 0))
+  );
 
   const omittedBlocks = blocks
     .filter((_block, index) => !selection.selected.has(index))

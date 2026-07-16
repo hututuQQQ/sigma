@@ -58,33 +58,9 @@ export class CheckpointEvidenceRecorder {
       };
       await this.emit(session, "evidence.recorded", "runtime", checkpoint);
     }
-    const deltaEvidenceId = `workspace-delta:${sourceSessionId}:${sealed.checkpointId}`;
-    let delta = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
-      item.kind === "workspace_delta" && item.evidenceId === deltaEvidenceId);
-    if (!delta) {
-      delta = {
-        evidenceId: deltaEvidenceId,
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        kind: "workspace_delta",
-        status: "passed",
-        createdAt: new Date().toISOString(),
-        producer: { authority: "runtime", id: "checkpoint-manager" },
-        summary: `Kept interrupted child '${childId}' workspace changes from checkpoint '${sealed.checkpointId}'.`,
-        data: {
-          checkpointId: sealed.checkpointId,
-          sourceSessionId,
-          childId,
-          delta: {
-            added: [...sealed.delta.added],
-            modified: [...sealed.delta.modified],
-            deleted: [...sealed.delta.deleted]
-          },
-          reviewDiff: await this.checkpoints.reviewDiff(sourceSessionId, sealed.checkpointId)
-        }
-      };
-      await this.emit(session, "evidence.recorded", "runtime", delta);
-    }
+    const delta = await this.existingOrRecordImportedDelta(
+      session, sealed, sealed.delta, sourceSessionId, childId
+    );
     const validationId = `checkpoint-validation:${sourceSessionId}:${sealed.checkpointId}`;
     if (!session.durable.state.evidence.some((item) => item.evidenceId === validationId)) {
       const validation: EvidenceRecord = {
@@ -106,6 +82,45 @@ export class CheckpointEvidenceRecorder {
       };
       await this.emit(session, "evidence.recorded", "runtime", validation);
     }
+  }
+
+  private async existingOrRecordImportedDelta(
+    session: RuntimeSession,
+    sealed: CheckpointRef,
+    checkpointDelta: NonNullable<CheckpointRef["delta"]>,
+    sourceSessionId: string,
+    childId: string
+  ): Promise<WorkspaceDeltaEvidence> {
+    const evidenceId = `workspace-delta:${sourceSessionId}:${sealed.checkpointId}`;
+    const existing = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
+      item.kind === "workspace_delta" && item.evidenceId === evidenceId);
+    if (existing) return existing;
+    const material = await this.checkpoints.reviewMaterial(sourceSessionId, sealed.checkpointId);
+    const evidence: WorkspaceDeltaEvidence = {
+      evidenceId,
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      kind: "workspace_delta",
+      status: "passed",
+      createdAt: new Date().toISOString(),
+      producer: { authority: "runtime", id: "checkpoint-manager" },
+      summary: `Kept interrupted child '${childId}' workspace changes from checkpoint '${sealed.checkpointId}'.`,
+      data: {
+        checkpointId: sealed.checkpointId,
+        sourceSessionId,
+        childId,
+        delta: {
+          added: [...checkpointDelta.added],
+          modified: [...checkpointDelta.modified],
+          deleted: [...checkpointDelta.deleted]
+        },
+        reviewDiff: material.reviewDiff,
+        reviewDiffPaths: material.reviewDiffPaths,
+        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {})
+      }
+    };
+    await this.emit(session, "evidence.recorded", "runtime", evidence);
+    return evidence;
   }
 
   private async recordCheckpoint(session: RuntimeSession, sealed: CheckpointRef): Promise<void> {
@@ -163,7 +178,7 @@ export class CheckpointEvidenceRecorder {
     const existing = session.durable.state.evidence.find((item): item is WorkspaceDeltaEvidence =>
       item.kind === "workspace_delta" && item.data.checkpointId === checkpointId);
     if (existing) return existing;
-    const reviewDiff = await this.checkpoints.reviewDiff(session.identity.sessionId, checkpointId);
+    const material = await this.checkpoints.reviewMaterial(session.identity.sessionId, checkpointId);
     const evidence: WorkspaceDeltaEvidence = {
       evidenceId: `workspace-delta:${checkpointId}`,
       sessionId: session.identity.sessionId,
@@ -180,7 +195,9 @@ export class CheckpointEvidenceRecorder {
           modified: [...sealed.delta!.modified],
           deleted: [...sealed.delta!.deleted]
         },
-        reviewDiff
+        reviewDiff: material.reviewDiff,
+        reviewDiffPaths: material.reviewDiffPaths,
+        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {})
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);

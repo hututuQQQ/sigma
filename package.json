@@ -10,6 +10,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "build:native:sigma-exec": "cargo build --release --locked --manifest-path native/sigma-exec/Cargo.toml",
+    "build:native:sigma-exec:linux": "node scripts/build-linux-portable-runtime.mjs",
     "test": "cross-env NODE_OPTIONS=--experimental-ffi node ./node_modules/vitest/vitest.mjs run",
     "test:coverage": "cross-env NODE_OPTIONS=--experimental-ffi node ./node_modules/vitest/vitest.mjs run --coverage",
     "test:coverage:native-protocol": "node -e \"require('node:fs').mkdirSync('.artifacts',{recursive:true})\" && cargo +nightly-2026-07-01 llvm-cov --locked --manifest-path native/sigma-exec/Cargo.toml --branch --json --output-path .artifacts/sigma-exec-branch-coverage.json && node scripts/check-native-protocol-coverage.mjs",
@@ -36,6 +37,7 @@
     "package:agent-cli:linux": "node scripts/release/run-stage-graph.ts package-linux",
     "package:agent-cli:windows": "node scripts/release/run-stage-graph.ts package-windows",
     "verify:package:agent-cli:linux": "node scripts/release/run-stage-graph.ts verify-package-linux",
+    "verify:package:agent-cli:linux:matrix": "node scripts/ci/linux-package-compatibility-matrix.mjs",
     "verify:package:agent-cli:windows:structure": "node scripts/release/run-stage-graph.ts verify-package-windows-structure",
     "verify:package:agent-cli:windows": "node scripts/release/run-stage-graph.ts verify-package-windows",
     "package:harbor-runtime": "node scripts/package-harbor-runtime.mjs",
@@ -69,7 +71,8 @@
     "bench:tb:deepseek:task": "node scripts/bench-terminal-bench.mjs --mode task --provider deepseek --model deepseek-v4-pro",
     "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
     "bench:tb:report": "node scripts/bench-report.mjs",
-    "bench:tb:report:all": "node scripts/bench-report.mjs --all"
+    "bench:tb:report:all": "node scripts/bench-report.mjs --all",
+    "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs"
   },
   "devDependencies": {
     "@opentui/core": "0.4.3",

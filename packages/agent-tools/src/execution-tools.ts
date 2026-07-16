@@ -200,6 +200,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   const properties: Record<string, JsonValue> = kind === "shell" ? {
     shell: { type: "string", enum: availableShells(options) }, command: { type: "string" }, cwd: { type: "string" },
     network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
+    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   } : {
     executable: executableCapabilitySchema(options),

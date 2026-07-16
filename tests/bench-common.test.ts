@@ -21,11 +21,84 @@ import {
   removedHarborAdapterErrorMessage,
   removedHarborPackageName,
   resolveHarborCommand,
+  resolveRunOptions,
   suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
+async function writeHarborJobResult(jobDir: string, total: number, errored = 0, retries = 0) {
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(path.join(jobDir, "result.json"), `${JSON.stringify({
+    n_total_trials: total,
+    stats: {
+      n_completed_trials: total,
+      n_errored_trials: errored,
+      n_retries: retries
+    }
+  })}\n`, "utf8");
+}
+
 describe("Terminal-Bench command construction", () => {
+  it("loads an exact pinned external task batch without losing Git provenance", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-batch-tasks-"));
+    const tasksFile = path.join(directory, "tasks.json");
+    await writeFile(tasksFile, `${JSON.stringify([
+      {
+        path: "tasks/one",
+        git_url: "https://example.test/tasks.git",
+        git_commit_id: "a".repeat(40)
+      },
+      { name: "registry/task-two" }
+    ])}\n`, "utf8");
+
+    const options = resolveRunOptions(["--mode", "batch", "--tasks-file", tasksFile]);
+    const config = buildHarborJobConfig(options, "jobs");
+
+    expect(options.tasksFileSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(config.tasks).toEqual([
+      {
+        path: "tasks/one",
+        git_url: "https://example.test/tasks.git",
+        git_commit_id: "a".repeat(40)
+      },
+      { name: "registry/task-two" }
+    ]);
+    expect(config.environment).toMatchObject({
+      type: "docker",
+      extra_docker_compose: [expect.stringMatching(/docker-compose-sigma-sandbox\.yaml$/u)]
+    });
+  });
+
+  it("requires a frozen archive digest when reusing a package", () => {
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "one", "--reuse-package"
+    ])).toThrow("--reuse-package requires --expected-archive-sha256");
+  });
+
+  it("propagates the run-level network mode into Harbor agent configuration", () => {
+    const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task", "--network", "full"]);
+    expect(options.networkMode).toBe("full");
+    expect(buildHarborArgs({
+      ...options,
+      taskSelectionFlag: "--task-id",
+      timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180, agent_timeout_multiplier: "1" }
+    })).toContain("network_mode:str=full");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({ network_mode: "full" });
+  });
+
+  it("can bind formal agent wall time exactly to task metadata", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "one",
+      "--timeout-leniency-multiplier", "1", "--timeout-leniency-min-extra-sec", "0"
+    ]);
+    expect(computeHarborTimeoutPlan(options, { max_agent_timeout_sec: 900 })).toMatchObject({
+      recommended_agent_timeout_sec: 900,
+      agent_wall_time_sec: 900,
+      leniency_multiplier: 1,
+      leniency_min_extra_sec: 0
+    });
+  });
+
   it("builds the oracle smoke command", () => {
     expect(buildHarborArgs({ mode: "smoke" })).toEqual([
       "run",
@@ -166,6 +239,35 @@ describe("Terminal-Bench command construction", () => {
         timeoutPlan
       })
     ).toContain("max_wall_time_sec=2700");
+  });
+
+  it("caps a run-wide child deadline below the smallest Harbor outer deadline", () => {
+    const timeoutProbe = {
+      tasks: [
+        { agent_timeout_sec: 900 },
+        { agent_timeout_sec: 1200 }
+      ],
+      max_agent_timeout_sec: 1200
+    };
+    const plan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
+
+    expect(plan).toMatchObject({
+      requested_agent_wall_time_sec: 1800,
+      agent_wall_time_sec: 1320,
+      child_deadline_sec: 1320,
+      outer_trial_deadline_sec: 1440,
+      deadline_cleanup_grace_sec: 120,
+      deadline_clamped: true
+    });
+    expect(plan.agent_wall_time_sec).toBeLessThanOrEqual(
+      plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec
+    );
+    expect(buildHarborJobConfig({
+      mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
+    }, "jobs", plan, timeoutProbe).agents[0].kwargs).toMatchObject({
+      max_wall_time_sec: 1320,
+      outer_trial_deadline_sec: 1440
+    });
   });
 
   it("gives long MVP tasks lenient wall time by default", () => {
@@ -512,6 +614,14 @@ describe("failure classifier", () => {
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
   });
 
+  it("honors explicit runtime failure kinds without conflating their owners", () => {
+    expect(classifyFailure({ failureKind: "needs_input" })).toBe("needs_input");
+    expect(classifyFailure({ failureKind: "timeout" })).toBe("timeout");
+    expect(classifyFailure({ failureKind: "tool_error" })).toBe("tool_error");
+    expect(classifyFailure({ failureKind: "api_error" })).toBe("api_error");
+    expect(classifyFailure({ failureKind: "verifier_failure" })).toBe("verifier_failure");
+  });
+
   it("maps failure categories to suggested owners", () => {
     expect(suggestedOwnerForFailureCategory("host_proxy_error")).toBe("environment");
     expect(suggestedOwnerForFailureCategory("host_encoding_error")).toBe("environment");
@@ -666,16 +776,18 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 0\n", "utf8");
 
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     const taskDir = path.join(runDir, "tasks", "task-a");
     await mkdir(taskDir, { recursive: true });
-    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"task-a","status":"passed"}\n', "utf8");
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "task-a", status: "passed", source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
       '{"status":"completed","finish_reason":"assistant_stop","commands_executed":2,"input_tokens":3,"output_tokens":4,"duration_ms":5,"last_error":null}\n',
       "utf8"
     );
 
-    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     await mkdir(trialDir, { recursive: true });
     await writeFile(
       path.join(trialDir, "result.json"),
@@ -687,6 +799,7 @@ describe("benchmark report generation", () => {
       })}\n`,
       "utf8"
     );
+    await writeHarborJobResult(path.dirname(trialDir), 1);
     const verifierDir = path.join(trialDir, "verifier");
     await mkdir(verifierDir, { recursive: true });
     await writeFile(path.join(verifierDir, "test-stdout.txt"), "FAILED test_outputs.py::test_vm_execution - nope\n", "utf8");
@@ -743,16 +856,18 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     const taskDir = path.join(runDir, "tasks", "task-a");
     await mkdir(taskDir, { recursive: true });
-    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"task-a","status":"failed"}\n', "utf8");
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "task-a", status: "failed", source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
       '{"status":"completed","finish_reason":"assistant_stop","commands_executed":2,"input_tokens":3,"output_tokens":4,"duration_ms":5,"last_error":null}\n',
       "utf8"
     );
 
-    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     await mkdir(trialDir, { recursive: true });
     await writeFile(
       path.join(trialDir, "result.json"),
@@ -764,6 +879,7 @@ describe("benchmark report generation", () => {
       })}\n`,
       "utf8"
     );
+    await writeHarborJobResult(path.dirname(trialDir), 1, 1);
 
     const report = await generateBenchReport(runDir);
 
@@ -786,7 +902,7 @@ describe("benchmark report generation", () => {
     expect(markdown).toContain("## Infra Warnings");
   });
 
-  it("matches Harbor trial results by task name instead of sorted order", async () => {
+  it("uses Harbor trial results as authority independent of mirrored artifact order", async () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harbor-match-"));
     await writeFile(
       path.join(runDir, "config.json"),
@@ -922,6 +1038,7 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     const taskDir = path.join(runDir, "tasks", "artifact-task");
     await mkdir(taskDir, { recursive: true });
     await writeFile(
@@ -929,6 +1046,7 @@ describe("benchmark report generation", () => {
       `${JSON.stringify({
         task_id: "terminal-bench/artifact-task",
         status: "failed",
+        source_logs_dir: path.join(trialDir, "agent"),
         failure_signals: ["precheck_failed"],
         precheck_results: [{ exit_code: 1, message: "File /tmp/output.dat does not exist" }]
       })}\n`,
@@ -940,7 +1058,6 @@ describe("benchmark report generation", () => {
       "utf8"
     );
 
-    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     await mkdir(trialDir, { recursive: true });
     await writeFile(
       path.join(trialDir, "result.json"),
@@ -1062,9 +1179,12 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     const taskDir = path.join(runDir, "tasks", "service-task");
     await mkdir(taskDir, { recursive: true });
-    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"terminal-bench/service-task"}\n', "utf8");
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "terminal-bench/service-task", source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
       `${JSON.stringify({
@@ -1083,7 +1203,6 @@ describe("benchmark report generation", () => {
     );
     await writeFile(path.join(taskDir, "verifier.log"), "verifier failed: connection refused on 127.0.0.1:5328\n", "utf8");
 
-    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     await mkdir(path.join(trialDir, "agent"), { recursive: true });
     await mkdir(path.join(trialDir, "verifier"), { recursive: true });
     await writeFile(
@@ -1169,11 +1288,13 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(runDir, "harbor.stderr.log"), "", "utf8");
     await writeFile(path.join(runDir, "result.raw.log"), "exit_code: 1\n", "utf8");
 
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     const taskDir = path.join(runDir, "tasks", "run");
     await mkdir(taskDir, { recursive: true });
-    await writeFile(path.join(taskDir, "metadata.json"), '{"task_id":"run","status":"failed","exit_code":1}\n', "utf8");
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "run", status: "failed", exit_code: 1, source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
 
-    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
     await mkdir(path.join(trialDir, "agent"), { recursive: true });
     await writeFile(
       path.join(trialDir, "result.json"),
@@ -1219,5 +1340,119 @@ describe("benchmark report generation", () => {
       duration_ms: 1234,
       failure_category: "agent_timeout"
     });
+  });
+
+  it("accounts for every Harbor trial and keeps UUID mirror orphans out of scoring", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-five-trials-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "five-trials",
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      dataset: terminalBenchDataset,
+      k: 5,
+      command_text: "harbor run --config resolved-job.config.json",
+      resolved_job_config_path: "resolved-job.config.json",
+      finished_at: "2026-07-15T00:00:00.000Z",
+      exit_code: 0,
+      status: "passed"
+    })}\n`, "utf8");
+    await writeFile(path.join(runDir, "resolved-job.config.json"), `${JSON.stringify({
+      n_concurrent_trials: 5,
+      tasks: Array.from({ length: 5 }, (_value, index) => ({ name: `terminal-bench/task-${index + 1}` }))
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const jobDir = path.join(runDir, "harbor-jobs", "job-1");
+    await writeHarborJobResult(jobDir, 5, 3);
+
+    const trialDirs = Array.from({ length: 5 }, (_value, index) => path.join(jobDir, `trial-${index + 1}`));
+    for (let index = 0; index < trialDirs.length; index += 1) {
+      const trialDir = trialDirs[index];
+      await mkdir(trialDir, { recursive: true });
+      const setupError = index >= 2;
+      await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+        trial_name: `trial-${index + 1}`,
+        task_name: `terminal-bench/task-${index + 1}`,
+        agent_result: setupError ? null : { metadata: { exit_code: 0 }, n_input_tokens: 10, n_output_tokens: 2 },
+        verifier_result: setupError ? null : { rewards: { reward: 0 } },
+        exception_info: setupError ? {
+          exception_type: "RuntimeError",
+          exception_message: `agent_setup_failed: stage=strict_doctor exit_code=${index + 1}`
+        } : null
+      })}\n`, "utf8");
+    }
+
+    for (let index = 0; index < 2; index += 1) {
+      const artifactDir = path.join(runDir, "tasks", `00000000-0000-0000-0000-00000000000${index}`);
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(path.join(artifactDir, "metadata.json"), `${JSON.stringify({
+        task_id: `uuid-${index}`,
+        source_logs_dir: path.join(trialDirs[index], "agent"),
+        exit_code: 0
+      })}\n`, "utf8");
+    }
+    const orphanDir = path.join(runDir, "tasks", "ffffffff-ffff-ffff-ffff-ffffffffffff");
+    await mkdir(orphanDir, { recursive: true });
+    await writeFile(path.join(orphanDir, "metadata.json"), `${JSON.stringify({
+      task_id: "orphan-uuid",
+      source_logs_dir: path.join(jobDir, "not-a-trial", "agent"),
+      exit_code: 1
+    })}\n`, "utf8");
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.status).toBe("failed");
+    expect(report.incomplete_reason).toBeNull();
+    expect(report.tasks).toHaveLength(5);
+    expect(report.tasks.every((task) => task.status === "failed")).toBe(true);
+    expect(report.counts.failed).toBe(2);
+    expect(report.counts.infra_failed).toBe(3);
+    expect(report.tasks.filter((task) => task.failure_category === "agent_setup_failed")).toHaveLength(3);
+    expect(report.trial_accounting).toEqual({
+      expected: 5,
+      observed: 5,
+      scored: 2,
+      errored: 3,
+      missing: 0,
+      meanReward: 0
+    });
+    expect(report.n_concurrent_trials).toBe(5);
+    expect(report.orphan_artifacts).toHaveLength(1);
+    expect(report.orphan_artifacts[0].artifact_task_id).toBe("orphan-uuid");
+  });
+
+  it("marks a missing Harbor trial incomplete even when the Harbor process exited zero", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-missing-trial-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "missing-trial",
+      provider: "deepseek",
+      k: 2,
+      resolved_job_config_path: "resolved-job.config.json",
+      finished_at: "2026-07-15T00:00:00.000Z",
+      exit_code: 0,
+      status: "passed"
+    })}\n`, "utf8");
+    await writeFile(path.join(runDir, "resolved-job.config.json"), `${JSON.stringify({
+      tasks: [{ name: "terminal-bench/a" }, { name: "terminal-bench/b" }]
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const jobDir = path.join(runDir, "harbor-jobs", "job-1");
+    await mkdir(path.join(jobDir, "trial-1"), { recursive: true });
+    await writeHarborJobResult(jobDir, 2);
+    await writeFile(path.join(jobDir, "trial-1", "result.json"), `${JSON.stringify({
+      trial_name: "trial-1",
+      task_name: "terminal-bench/a",
+      verifier_result: { rewards: { reward: 1 } },
+      exception_info: null
+    })}\n`, "utf8");
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.status).toBe("incomplete");
+    expect(report.trial_accounting.missing).toBe(1);
+    expect(report.incomplete_reason?.join("\n")).toContain("trial result count 1 does not match expected 2");
   });
 });

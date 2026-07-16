@@ -3,6 +3,7 @@ import {
   completionRepairFailureMessage,
   completionSummary,
   failedTerminalRepairState,
+  currentRunReferenceableEvidenceCount,
   protectedCompletionAnswer,
   requestedInput
 } from "./model-convergence.js";
@@ -124,6 +125,55 @@ function assistantBodyForToolCall(state: KernelState, callId: string): string | 
   return message.content;
 }
 
+const COMPLETION_PREREQUISITE_CODES = new Set([
+  "validation_evidence_required",
+  "validation_result_reporting_required",
+  "review_evidence_required"
+]);
+
+function isCompletionPrerequisiteFailure(input: TerminalReceiptTransition): boolean {
+  if (input.toolName !== "complete_task" || input.receipt.ok || input.remainingTools !== 0) return false;
+  return input.receipt.diagnostics.some((code) => COMPLETION_PREREQUISITE_CODES.has(code));
+}
+
+function completionPrerequisiteRepair(input: TerminalReceiptTransition): KernelState | null {
+  if (!isCompletionPrerequisiteFailure(input)) return null;
+  const pending = input.state.pendingTools.find((item) => item.request.callId === input.receipt.callId);
+  if (!pending) return null;
+  const previous = input.state.completionRepair?.kind === "completion_prerequisite"
+    ? input.state.completionRepair : undefined;
+  const retryCount = previous ? previous.retryCount + 1 : 0;
+  if (retryCount >= 3) {
+    return proposedOutcomeState(input.progressed, {
+      kind: "recoverable_failure",
+      code: "completion_prerequisite_unresolved",
+      message: completionRepairFailureMessage(
+        input.state,
+        "Completion prerequisites remained unresolved after bounded automatic retries."
+      )
+    });
+  }
+  const raw = pending.request.arguments;
+  const summary = raw && typeof raw === "object" && !Array.isArray(raw)
+    && typeof raw.summary === "string" ? raw.summary : "Task completion is awaiting required evidence.";
+  return {
+    ...input.progressed,
+    phase: "ready_model",
+    completionRepairAttempts: Math.max(1, input.state.completionRepairAttempts),
+    completionRepair: {
+      kind: "completion_prerequisite",
+      answer: protectedCompletionAnswer(input.state)
+        || assistantBodyForToolCall(input.state, input.receipt.callId)
+        || summary,
+      arguments: pending.request.arguments,
+      originalCallId: previous?.originalCallId ?? input.receipt.callId,
+      evidenceCount: currentRunReferenceableEvidenceCount(input.progressed),
+      retryCount,
+      modelTurn: pending.modelTurn
+    }
+  };
+}
+
 export interface TerminalReceiptTransition {
   state: KernelState;
   progressed: KernelState;
@@ -161,6 +211,8 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
       evidence: input.progressed.evidence
     });
   }
+  const prerequisiteRepair = completionPrerequisiteRepair(input);
+  if (prerequisiteRepair) return prerequisiteRepair;
   const failedRepair = failedTerminalRepairState(
     input.progressed,
     input.repairPending,

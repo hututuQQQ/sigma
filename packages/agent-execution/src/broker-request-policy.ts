@@ -108,11 +108,19 @@ function wirePolicy(
   assertAbsoluteRoots(policy.writeRoots, "writeRoots");
   assertAbsoluteRoots(policy.protectedPaths ?? [], "protectedPaths");
   const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables);
+  const runtimeRoots = toolchains
+    .filter((toolchain) => samePath(toolchain.executable, command.executable))
+    .flatMap((toolchain) => toolchain.runtimeRoots);
   const resolvedWriteRoots = policy.writeRoots.map((root) => path.resolve(root));
   if (resolvedExecutionRoots.some((executionRoot) => resolvedWriteRoots.some((writeRoot) =>
     pathWithin(executionRoot, writeRoot) || pathWithin(writeRoot, executionRoot)
   ))) {
     throw new BrokerPolicyError("executionRoots must not overlap writeRoots.");
+  }
+  if (runtimeRoots.some((runtimeRoot) => resolvedWriteRoots.some((writeRoot) =>
+    pathWithin(runtimeRoot, writeRoot) || pathWithin(writeRoot, runtimeRoot)
+  ))) {
+    throw new BrokerPolicyError("trusted runtimeRoots must not overlap writeRoots.");
   }
   if (policy.network === "full" && policy.networkApproved !== true) {
     throw new BrokerPolicyError("Full network access requires an explicit per-call approval.");
@@ -124,7 +132,10 @@ function wirePolicy(
     sandbox: policy.sandbox,
     network: policy.network,
     networkApproved: policy.networkApproved === true,
-    readRoots: policy.readRoots.map((root) => path.resolve(root)),
+    readRoots: uniquePaths([
+      ...policy.readRoots.map((root) => path.resolve(root)),
+      ...runtimeRoots
+    ]),
     writeRoots: resolvedWriteRoots,
     executionRoots: resolvedExecutionRoots,
     ...(executableSha256 ? { executableSha256 } : {}),

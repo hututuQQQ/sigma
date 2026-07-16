@@ -41,6 +41,7 @@ class ReviewerGateway implements ModelGateway {
     tokenizer: "approximate"
   };
   calls = 0;
+  readonly requests: ModelRequest[] = [];
 
   constructor(
     private readonly failure?: Error,
@@ -48,8 +49,9 @@ class ReviewerGateway implements ModelGateway {
     private readonly reportedInputTokens = 80
   ) {}
 
-  async complete(_request: ModelRequest): Promise<ModelResponse> {
+  async complete(request: ModelRequest): Promise<ModelResponse> {
     this.calls += 1;
+    this.requests.push(request);
     if (this.failure) throw this.failure;
     return {
       message: { role: "assistant", content: this.content },
@@ -179,6 +181,33 @@ function validation(): ValidationEvidence {
       exitCode: 0,
       artifactIds: [],
       workspaceDeltaEvidenceIds: ["delta"]
+    }
+  };
+}
+
+const beforeDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const afterDigest = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+function completeMixedDelta(): WorkspaceDeltaEvidence {
+  return {
+    ...delta(),
+    data: {
+      checkpointId: "checkpoint",
+      delta: { added: ["assets/blob.bin"], modified: ["src/code.ts"], deleted: [] },
+      reviewDiff: [
+        "--- a/src/code.ts",
+        "+++ b/src/code.ts",
+        "[metadata before=file:33188 after=file:33188]",
+        "[before]",
+        "export const value = 1;",
+        "[after]",
+        "export const value = 2;"
+      ].join("\n"),
+      reviewDiffPaths: ["src/code.ts"],
+      opaqueArtifacts: [{
+        path: "assets/blob.bin",
+        after: { digest: afterDigest, sizeBytes: 512 * 1024 }
+      }]
     }
   };
 }
@@ -375,25 +404,255 @@ describe("independent reviewer budget accounting", () => {
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
+  it("deduplicates repeated review requests when no new evidence exists", async () => {
+    const target = runtimeSession();
+    let calls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "dedupe-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        calls += 1;
+        return {
+          evidenceId: `failed-review-${calls}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "failed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "dedupe-reviewer" },
+          summary: "reviewer unavailable",
+          data: {
+            reviewerId: "dedupe-reviewer",
+            verdict: "changes_requested",
+            findings: ["reviewer unavailable"],
+            workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+            failureKind: "infrastructure"
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+    const coordinator = new ReviewCoordinator(reviewer, emit);
+
+    await coordinator.maybeReview(target, new AbortController().signal);
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+
+    expect(calls).toBe(2);
+  });
+
   it("fails closed for non-strict JSON and incomplete review material", async () => {
     const input = {
       sessionId: "session", runId: "run", goal: "Review safely",
       workspaceDeltas: [delta()], validations: [validation()]
     };
-    const decorated = await new ModelReviewer(new ReviewerGateway(
+    const decoratedGateway = new ReviewerGateway(
       undefined,
       'Here is the result: {"verdict":"approved","findings":[]}'
-    )).review(input, new AbortController().signal);
+    );
+    const decorated = await new ModelReviewer(decoratedGateway).review(input, new AbortController().signal);
     expect(decorated).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(decoratedGateway.calls).toBe(1);
 
     const truncatedDelta = delta();
     truncatedDelta.data.reviewDiff += "\n[review diff truncated]";
-    const truncated = await new ModelReviewer(new ReviewerGateway()).review({
+    const truncatedGateway = new ReviewerGateway();
+    const truncated = await new ModelReviewer(truncatedGateway).review({
       ...input, workspaceDeltas: [truncatedDelta]
     }, new AbortController().signal);
     expect(truncated).toMatchObject({
       status: "failed",
       data: { verdict: "changes_requested", findings: [expect.stringContaining("truncated")] }
     });
+    expect(truncatedGateway.calls).toBe(0);
+
+    const binaryDelta = delta();
+    binaryDelta.data.delta.modified = ["bin/tool"];
+    binaryDelta.data.reviewDiff = [
+      "--- a/bin/tool",
+      "+++ b/bin/tool",
+      "[metadata before=file:33188 after=file:33188]",
+      "[before]",
+      "[binary sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef size=4]",
+      "[after]",
+      "[binary sha256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 size=8]"
+    ].join("\n");
+    const binaryGateway = new ReviewerGateway();
+    const binary = await new ModelReviewer(binaryGateway).review({
+      ...input, workspaceDeltas: [binaryDelta]
+    }, new AbortController().signal);
+    expect(binary).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(binaryGateway.calls).toBe(1);
+
+    const opaqueDelta = delta();
+    opaqueDelta.data.delta.modified = ["bin/tool"];
+    opaqueDelta.data.reviewDiff = "[review diff truncated]";
+    opaqueDelta.data.opaqueArtifacts = [{
+      path: "bin/tool",
+      before: { digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", sizeBytes: 4 },
+      after: { digest: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", sizeBytes: 8 }
+    }];
+    const opaqueGateway = new ReviewerGateway();
+    const opaque = await new ModelReviewer(opaqueGateway).review({
+      ...input, workspaceDeltas: [opaqueDelta]
+    }, new AbortController().signal);
+    expect(opaque).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(opaqueGateway.calls).toBe(1);
+
+    const unvalidatedGateway = new ReviewerGateway();
+    const unvalidated = await new ModelReviewer(unvalidatedGateway).review({
+      ...input, workspaceDeltas: [binaryDelta], validations: []
+    }, new AbortController().signal);
+    expect(unvalidated).toMatchObject({
+      status: "failed",
+      data: { verdict: "changes_requested", findings: [expect.stringContaining("passed validation")] }
+    });
+    expect(unvalidatedGateway.calls).toBe(0);
+  });
+
+  it("reviews complete mixed evidence and preserves the full semantic goal", async () => {
+    const gateway = new ReviewerGateway();
+    const goal = `${"Explain the general change clearly. ".repeat(4)}Keep the final compatibility constraint.`;
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal,
+      workspaceDeltas: [completeMixedDelta()],
+      validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(gateway.calls).toBe(1);
+    const reviewerInput = JSON.parse(gateway.requests[0]!.messages[1]!.content) as { goal: string };
+    expect(reviewerInput.goal).toBe(goal);
+  });
+
+  it.each([
+    ["added", { added: ["assets/blob.bin"], modified: [], deleted: [] }, {
+      path: "assets/blob.bin", after: { digest: afterDigest, sizeBytes: 8 }
+    }],
+    ["deleted", { added: [], modified: [], deleted: ["assets/blob.bin"] }, {
+      path: "assets/blob.bin", before: { digest: beforeDigest, sizeBytes: 4 }
+    }],
+    ["modified", { added: [], modified: ["assets/blob.bin"], deleted: [] }, {
+      path: "assets/blob.bin",
+      before: { digest: beforeDigest, sizeBytes: 4 },
+      after: { digest: afterDigest, sizeBytes: 8 }
+    }]
+  ])("accepts fully opaque %s evidence with the required directional identity", async (
+    _kind,
+    changed,
+    artifact
+  ) => {
+    const item = delta();
+    item.data.delta = changed;
+    item.data.reviewDiff = "";
+    item.data.reviewDiffPaths = [];
+    item.data.opaqueArtifacts = [artifact];
+    const gateway = new ReviewerGateway();
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      workspaceDeltas: [item], validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+    expect(gateway.calls).toBe(1);
+  });
+
+  it.each([
+    ["missing text coverage", (item: WorkspaceDeltaEvidence) => { item.data.reviewDiffPaths = []; }, true],
+    ["duplicate text coverage", (item: WorkspaceDeltaEvidence) => {
+      item.data.reviewDiffPaths = ["src/code.ts", "src\\code.ts"];
+    }, true],
+    ["opaque path falsely declared as textual coverage", (item: WorkspaceDeltaEvidence) => {
+      item.data.reviewDiffPaths = ["src/code.ts", "assets/blob.bin"];
+    }, true],
+    ["wrong added direction", (item: WorkspaceDeltaEvidence) => {
+      item.data.opaqueArtifacts = [{ path: "assets/blob.bin", before: { digest: beforeDigest, sizeBytes: 1 } }];
+    }, true],
+    ["duplicate opaque path", (item: WorkspaceDeltaEvidence) => {
+      item.data.opaqueArtifacts = [item.data.opaqueArtifacts![0]!, item.data.opaqueArtifacts![0]!];
+    }, true],
+    ["opaque path outside the delta", (item: WorkspaceDeltaEvidence) => {
+      item.data.opaqueArtifacts = [{ path: "assets/other.bin", after: { digest: afterDigest, sizeBytes: 1 } }];
+    }, true],
+    ["invalid opaque digest", (item: WorkspaceDeltaEvidence) => {
+      item.data.opaqueArtifacts = [{ path: "assets/blob.bin", after: { digest: "invalid", sizeBytes: 1 } }];
+    }, true],
+    ["invalid opaque size", (item: WorkspaceDeltaEvidence) => {
+      item.data.opaqueArtifacts = [{ path: "assets/blob.bin", after: { digest: afterDigest, sizeBytes: -1 } }];
+    }, true],
+    ["missing validation", (_item: WorkspaceDeltaEvidence) => undefined, false]
+  ])("fails closed for %s", async (
+    _label,
+    mutate: (item: WorkspaceDeltaEvidence) => void,
+    includeValidation: boolean
+  ) => {
+    const item = completeMixedDelta();
+    mutate(item);
+    const gateway = new ReviewerGateway();
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Review safely",
+      workspaceDeltas: [item],
+      validations: includeValidation ? [validation()] : []
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(gateway.calls).toBe(0);
+  });
+
+  it("requires both identities before treating a modified opaque path as fully covered", async () => {
+    const item = completeMixedDelta();
+    item.data.delta = { added: [], modified: ["assets/blob.bin"], deleted: [] };
+    item.data.reviewDiff = "";
+    item.data.reviewDiffPaths = [];
+    item.data.opaqueArtifacts = [{
+      path: "assets/blob.bin",
+      before: { digest: beforeDigest, sizeBytes: 4 }
+    }];
+    const gateway = new ReviewerGateway();
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      workspaceDeltas: [item], validations: [validation()]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(gateway.calls).toBe(0);
+  });
+
+  it("does not accept failed validation as the opaque evidence binding", async () => {
+    const failedValidation = validation();
+    failedValidation.status = "failed";
+    const gateway = new ReviewerGateway();
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      workspaceDeltas: [completeMixedDelta()], validations: [failedValidation]
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
+    expect(gateway.calls).toBe(0);
+  });
+
+  it("requires passed validation for complete text-only review material", async () => {
+    const item = delta();
+    item.data.reviewDiffPaths = ["src/code.ts"];
+    const gateway = new ReviewerGateway();
+
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      workspaceDeltas: [item], validations: []
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      data: { verdict: "changes_requested", findings: [expect.stringContaining("passed validation")] }
+    });
+    expect(gateway.calls).toBe(0);
   });
 });

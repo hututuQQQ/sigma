@@ -10,6 +10,27 @@ export interface RuntimeRunOptions {
   finish(session: RuntimeSession, outcome: RunOutcome): Promise<boolean>;
 }
 
+function hasRunOutcome(session: RuntimeSession): boolean {
+  return Boolean(session.recovery.lastOutcome ?? session.durable.state.outcome);
+}
+
+function runtimeLifecycleError(session: RuntimeSession, message: string): Error {
+  return Object.assign(new Error(
+    `${message} session=${session.identity.sessionId}, run=${session.durable.runId}, phase=${session.durable.state.phase}, seq=${session.durable.seq}.`
+  ), { code: "runtime_terminal_missing" });
+}
+
+async function finishOrThrow(
+  options: RuntimeRunOptions,
+  session: RuntimeSession,
+  outcome: RunOutcome
+): Promise<void> {
+  const committed = await options.finish(session, outcome);
+  if (!committed && !hasRunOutcome(session)) {
+    throw runtimeLifecycleError(session, "Runtime could not commit a terminal outcome");
+  }
+}
+
 function errorCode(error: unknown, fallback: string): string {
   return typeof (error as { code?: unknown })?.code === "string"
     ? (error as { code: string }).code
@@ -46,7 +67,7 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
   session.execution.controller = controller;
   const remainingMs = Date.parse(session.durable.state.deadlineAt) - Date.now();
   if (remainingMs <= 0) {
-    await options.finish(session, {
+    await finishOrThrow(options, session, {
       kind: "recoverable_failure",
       code: "budget_exhausted",
       message: `Run deadline ${session.durable.state.deadlineAt} has already elapsed.`
@@ -63,8 +84,23 @@ export async function runRuntimeSession(options: RuntimeRunOptions, session: Run
       deadlineAt: session.durable.state.deadlineAt
     }, controller.signal);
     await options.effects.run(session, controller.signal);
+    if (!hasRunOutcome(session) && session.durable.state.phase !== "needs_input") {
+      await finishOrThrow(options, session, {
+        kind: "recoverable_failure",
+        code: "runtime_terminal_missing",
+        message: runtimeLifecycleError(
+          session,
+          "Runtime effect processing became idle without a terminal outcome"
+        ).message
+      });
+    }
   } catch (error) {
-    await options.finish(session, runtimeFailureOutcome(error, controller.signal));
+    // Raw approval suspension populates durable state while an interactive
+    // waiter is still live. Only finish() records recovery.lastOutcome, which
+    // distinguishes a headless terminal NeedsInput from that transient pause.
+    if (!session.recovery.lastOutcome) {
+      await finishOrThrow(options, session, runtimeFailureOutcome(error, controller.signal));
+    }
   } finally {
     if (session.execution.deadlineTimer) clearTimeout(session.execution.deadlineTimer);
     session.execution.deadlineTimer = null;

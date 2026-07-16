@@ -81,6 +81,10 @@ async function forwardChildEvents(
   for await (const event of runtime.subscribe(sessionId, signal)) {
     if (event.type !== "tool.approval_requested" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) continue;
     const payload = event.payload as Record<string, JsonValue>;
+    // permission-mode=auto decisions are already call-bound and durably
+    // resolved by the child runtime. Only human approvals cross the parent
+    // supervision boundary.
+    if (payload.approvalMode === "automatic") continue;
     if (typeof payload.requestId !== "string") continue;
     const effects = Array.isArray(payload.effects)
       ? payload.effects.filter((effect): effect is ToolEffect => typeof effect === "string") : [];
@@ -126,6 +130,7 @@ export function createChildAgentFactory(runtimeProvider: () => InProcessRuntimeC
     const child = await runtime.createChildSession(context.parentId, {
       workspacePath: context.workspacePath,
       mode,
+      goal: context.instruction,
       title: context.instruction.slice(0, 80),
       writeScope: context.writeScope,
       strictWriteScope: mode === "change" && context.isolation.kind === "exclusive_workspace"

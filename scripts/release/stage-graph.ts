@@ -74,7 +74,7 @@ export const releaseStageGraphs = Object.freeze({
   "release-linux": linuxRelease,
   "release-windows": windowsRelease,
   "package-linux": [
-    stage("build", "pnpm", "build"), stage("native-build", "pnpm", "build:native:sigma-exec"),
+    stage("build", "pnpm", "build"), stage("native-build", "pnpm", "build:native:sigma-exec:linux"),
     stage("package", "node", "scripts/package-agent-cli.mjs", "--target-platform", "linux", "--target-arch", "x64")
   ],
   "package-windows": [
@@ -84,7 +84,7 @@ export const releaseStageGraphs = Object.freeze({
   "verify-package-linux": [
     stage("package", "pnpm", "package:agent-cli:linux"),
     stage("verify", "node", "scripts/verify-agent-cli-package.mjs", "--target-platform", "linux",
-      "--target-arch", "x64", "--require-target-wrapper")
+      "--target-arch", "x64", "--require-target-wrapper", "--require-linux-compatibility")
   ],
   "verify-package-windows-structure": [
     stage("package", "pnpm", "package:agent-cli:windows"),

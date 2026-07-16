@@ -2,6 +2,7 @@ import { SyntaxStyle } from "@opentui/core";
 
 export interface TuiTheme {
   noColor: boolean;
+  surface?: string;
   brand?: string;
   prompt?: string;
   accent?: string;
@@ -14,7 +15,8 @@ export interface TuiTheme {
 }
 
 export function createTuiTheme(noColor: boolean): TuiTheme {
-  const colors = noColor ? {} : {
+  const colors = noColor ? { surface: "#000000" } : {
+    surface: "#101010",
     brand: "#52c7c4",
     prompt: "#ff7a83",
     accent: "#52c7c4",

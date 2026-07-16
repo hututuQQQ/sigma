@@ -13,6 +13,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
@@ -93,7 +94,12 @@ function checkpointValidation(id: string, deltaIds: string[]): ValidationEvidenc
   };
 }
 
-function review(id: string, deltaIds: string[], runId = "run"): EvidenceRecord {
+function review(
+  id: string,
+  deltaIds: string[],
+  runId = "run",
+  validationIds?: string[]
+): EvidenceRecord {
   return {
     evidenceId: id,
     sessionId: "session",
@@ -103,7 +109,13 @@ function review(id: string, deltaIds: string[], runId = "run"): EvidenceRecord {
     createdAt: now,
     producer: { authority: "runtime", id: "reviewer" },
     summary: "approved",
-    data: { reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: deltaIds }
+    data: {
+      reviewerId: "reviewer",
+      verdict: "approved",
+      findings: [],
+      workspaceDeltaEvidenceIds: deltaIds,
+      ...(validationIds ? { validationEvidenceIds: validationIds } : {})
+    }
   };
 }
 
@@ -205,6 +217,28 @@ function completionReceipt(
 }
 
 describe("run-scoped completion evidence", () => {
+  it("bounds the prompt projection while keeping the newest structural and observational evidence", () => {
+    const target = session([]);
+    const observations = Array.from({ length: 40 }, (_, index): EvidenceRecord => ({
+      ...proofEvidence(),
+      evidenceId: `observation-${index}`,
+      status: "passed",
+      summary: `observation ${index}`
+    }));
+    const validations = Array.from({ length: 40 }, (_, index) => validation(`validation-${index}`, []));
+    target.durable.state.evidence = [...observations, ...validations];
+
+    const ledger = evidenceLedger(target)!;
+    const projectedRecords = ledger.content.match(/^- /gmu) ?? [];
+    expect(projectedRecords).toHaveLength(48);
+    expect(ledger.content).toContain("32 older current-run evidence records omitted");
+    expect(ledger.content).not.toContain("- observation-0 ");
+    expect(ledger.content).toContain("- observation-39 ");
+    expect(ledger.content).not.toContain("- validation-0 ");
+    expect(ledger.content).toContain("- validation-39 ");
+    expect(ledger.id).toMatch(/^runtime:evidence-ledger:run:[a-f0-9]{16}$/u);
+  });
+
   it("requires exact validation and review links for every current-run delta", () => {
     expect(completionDiagnostic([])).toBeUndefined();
     const first = delta("delta-1");
@@ -249,32 +283,142 @@ describe("run-scoped completion evidence", () => {
           evidenceId: failed.evidenceId,
           status: "failed",
           claims: ["validation_executed"]
-        })])
+        })]),
+        nextActions: [{
+          tool: "complete_task",
+          action: "replace_invalid_evidence_references",
+          rule: expect.stringContaining("Mixed reference claims within one criterion are valid")
+        }]
       }
     });
     expect(completionReceipt([failed], call("acceptance_met"))?.diagnostics)
       .toEqual(["invalid_completion_evidence"]);
   });
 
-  it("does not let a failed validation discharge a delta's passed-validation obligation", () => {
+  it("requires an exited failed validation to be cited instead of pretending it passed", () => {
     const changed = delta("delta");
     const failed = failedValidation("failed-validation", [changed.evidenceId]);
     expect(completionReceipt([changed, failed])).toMatchObject({
       ok: false,
-      diagnostics: ["validation_evidence_required"],
+      diagnostics: ["validation_result_reporting_required"],
       result: {
         status: "rejected",
-        code: "validation_evidence_required",
+        code: "validation_result_reporting_required",
         missing: [{
-          requirement: "validation_passed",
+          requirement: "failed_validation_reported",
           workspaceDeltaEvidenceId: changed.evidenceId,
           checkpointId: changed.data.checkpointId,
           expectedEvidence: {
+            evidenceId: failed.evidenceId,
             kind: "validation",
-            status: "passed",
-            claim: "validation_passed"
+            status: "failed",
+            claim: "validation_executed"
           }
         }],
+        nextActions: [{
+          tool: "complete_task",
+          action: "cite_failed_validation_result",
+          evidenceReferences: [{
+            evidenceId: failed.evidenceId,
+            kind: "validation",
+            claim: "validation_executed"
+          }]
+        }]
+      }
+    });
+  });
+
+  it("completes a reviewed change with independent workspace and failed-validation claims", () => {
+    const changed = delta("delta");
+    const failed = failedValidation("failed-validation", [changed.evidenceId]);
+    const approved = review("review", [changed.evidenceId], "run", [failed.evidenceId]);
+    const call: ModelToolCall = {
+      id: "complete-failed-validation",
+      name: "complete_task",
+      arguments: {
+        summary: "change applied; failed validation reported",
+        criteria: [{
+          criterion: "The change was applied and its failed validation was reported.",
+          status: "met",
+          evidence: [
+            { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
+            { evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_executed" },
+            { evidenceId: approved.evidenceId, kind: approved.kind, claim: "acceptance_met" }
+          ]
+        }]
+      }
+    };
+    expect(reviewReadiness(session([changed, failed])).eligible.map((item) => item.evidenceId))
+      .toEqual([changed.evidenceId]);
+    expect(completionReceipt([changed, failed, approved], call)).toBeNull();
+  });
+
+  it("accepts workspace and passed-validation claims in the same criterion", () => {
+    const changed = delta("delta");
+    const passed = validation("validation", [changed.evidenceId]);
+    const approved = review("review", [changed.evidenceId], "run", [passed.evidenceId]);
+    const call: ModelToolCall = {
+      id: "complete-passed-validation",
+      name: "complete_task",
+      arguments: {
+        summary: "change applied and validation passed",
+        criteria: [{
+          criterion: "The change was applied and validated.",
+          status: "met",
+          evidence: [
+            { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
+            { evidenceId: passed.evidenceId, kind: passed.kind, claim: "validation_passed" },
+            { evidenceId: approved.evidenceId, kind: approved.kind, claim: "acceptance_met" }
+          ]
+        }]
+      }
+    };
+    expect(completionReceipt([changed, passed, approved], call)).toBeNull();
+  });
+
+  it("does not hide a later failed validation behind an earlier pass or stale review", () => {
+    const changed = delta("delta");
+    const passed = validation("passed-validation", [changed.evidenceId]);
+    const staleReview = review("stale-review", [changed.evidenceId], "run", [passed.evidenceId]);
+    const failed = failedValidation("later-failed-validation", [changed.evidenceId]);
+    const call = (reviewEvidence: EvidenceRecord, includeFailure: boolean): ModelToolCall => ({
+      id: `complete-latest-${includeFailure}`,
+      name: "complete_task",
+      arguments: {
+        summary: "latest validation outcome reported",
+        criteria: [{
+          criterion: "The latest validation result is represented without changing its meaning.",
+          status: "met",
+          evidence: [
+            { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
+            ...(includeFailure
+              ? [{ evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_executed" }]
+              : [{ evidenceId: passed.evidenceId, kind: passed.kind, claim: "validation_passed" }]),
+            { evidenceId: reviewEvidence.evidenceId, kind: reviewEvidence.kind, claim: "acceptance_met" }
+          ]
+        }]
+      }
+    });
+
+    expect(completionReceipt([changed, passed, staleReview, failed], call(staleReview, false)))
+      .toMatchObject({ diagnostics: ["validation_result_reporting_required"] });
+    expect(completionReceipt([changed, passed, staleReview, failed], call(staleReview, true)))
+      .toMatchObject({ diagnostics: ["review_evidence_required"] });
+
+    const currentReview = review("current-review", [changed.evidenceId], "run", [passed.evidenceId, failed.evidenceId]);
+    expect(completionReceipt(
+      [changed, passed, staleReview, failed, currentReview],
+      call(currentReview, true)
+    )).toBeNull();
+  });
+
+  it("requests a current executable validation instead of citing an older-run failure", () => {
+    const changed = delta("delta");
+    const oldFailure = failedValidation("old-failure", [changed.evidenceId], "old-run");
+    expect(completionReceipt([changed, oldFailure])).toMatchObject({
+      diagnostics: ["validation_evidence_required"],
+      result: {
+        missing: [{ requirement: "validation_executed", workspaceDeltaEvidenceId: changed.evidenceId }],
         nextActions: [{
           tool: "validate",
           arguments: { workspaceDeltaEvidenceIds: [changed.evidenceId] }

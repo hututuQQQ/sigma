@@ -112,7 +112,7 @@ static STATUS: OnceLock<Mutex<Option<SandboxStatus>>> = OnceLock::new();
 #[cfg(target_os = "linux")]
 static VERIFIED_BASH: OnceLock<Option<PathBuf>> = OnceLock::new();
 #[cfg(target_os = "linux")]
-const INTERNAL_HELPER_MOUNT: &str = "/.sigma-exec";
+const INTERNAL_HELPER_MOUNT: &str = "/tmp/.sigma-exec";
 static PROTECTED_GUARD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROTECTED_GUARD_MARKER: &str = ".sigma-exec-protected";
 
@@ -883,7 +883,10 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     // verifies the resulting inode against that descriptor. Keep this pair
     // after all policy mounts so no later layer can replace it.
     append_pinned_executable_bind(&mut command, &executable.source)?;
-    command.arg("--clearenv");
+    // configure_common() clears the bwrap process environment before spawn,
+    // so only this request's reconstructed allowlisted environment can be
+    // inherited. Avoid bwrap's newer --clearenv flag to retain compatibility
+    // with the glibc 2.28 baseline's bubblewrap 0.4 runtime.
     for (key, value) in &params.command.env {
         command.args(["--setenv", key, value]);
     }
@@ -1480,6 +1483,8 @@ fn linux_pty_self_test(bwrap: &Path) -> bool {
             "--ro-bind",
             "/",
             "/",
+            "--tmpfs",
+            "/tmp",
             "--ro-bind",
             "/",
             crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT,
@@ -1489,8 +1494,6 @@ fn linux_pty_self_test(bwrap: &Path) -> bool {
             "/proc",
             "--dev",
             "/dev",
-            "--tmpfs",
-            "/tmp",
             "--",
         ])
         .arg(&helper)

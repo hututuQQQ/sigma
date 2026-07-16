@@ -3,7 +3,9 @@ import {
   CheckpointConflictError,
   type CheckpointEntry,
   type CheckpointManifest,
-  type CheckpointRecord
+  type CheckpointOpaqueArtifact,
+  type CheckpointRecord,
+  type CheckpointReviewMaterial
 } from "./types.js";
 
 const TRUNCATION_MARKER = "[review diff truncated]";
@@ -30,12 +32,12 @@ class ReviewBudget {
     return this.readRemaining;
   }
 
-  append(value: string): void {
+  append(value: string): boolean {
     const bytes = Buffer.from(value, "utf8");
     if (bytes.byteLength <= this.outputRemaining) {
       this.parts.push(value);
       this.outputRemaining -= bytes.byteLength;
-      return;
+      return true;
     }
     if (this.outputRemaining > 0) {
       const decoder = new TextDecoder("utf-8");
@@ -43,6 +45,7 @@ class ReviewBudget {
     }
     this.outputRemaining = 0;
     this.truncated = true;
+    return false;
   }
 
   recordRead(bytes: number): void {
@@ -63,12 +66,15 @@ class ReviewBudget {
   }
 }
 
+type OpaqueIdentity = { digest: string; sizeBytes: number };
+
 function metadata(entry: CheckpointEntry | undefined): string {
   return entry ? `${entry.kind}:${entry.mode}` : "absent";
 }
 
 function decodeText(content: Buffer): string | null {
-  if (content.includes(0)) return null;
+  if (content.some((byte) => byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d)
+    || content.includes(0x7f)) return null;
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(content);
   } catch {
@@ -79,24 +85,17 @@ function decodeText(content: Buffer): string | null {
 async function appendContent(
   budget: ReviewBudget,
   entry: CheckpointEntry | undefined,
+  opaque: OpaqueIdentity | undefined,
   cas: CheckpointCasStore
-): Promise<void> {
-  if (!entry) {
-    budget.append("[absent]");
-    return;
-  }
-  if (entry.kind === "directory") {
-    budget.append("[directory]");
-    return;
-  }
-  if (entry.kind === "symlink") {
-    budget.append(`[symlink -> ${entry.linkTarget ?? ""}]`);
-    return;
-  }
+): Promise<boolean> {
+  if (!entry) return budget.append("[absent]");
+  if (entry.kind === "directory") return budget.append("[directory]");
+  if (entry.kind === "symlink") return budget.append(`[symlink -> ${entry.linkTarget ?? ""}]`);
+  if (opaque) return budget.append(`[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`);
   const limit = Math.min(budget.availableOutput, budget.availableRead);
   if (limit <= 0) {
     budget.markTruncated();
-    return;
+    return false;
   }
   if (!entry.casIdentity) {
     throw new CheckpointConflictError(`Checkpoint manifest lacks a trusted CAS identity: ${entry.path}`);
@@ -104,15 +103,15 @@ async function appendContent(
   const prefix = await cas.readPrefix(entry.digest!, limit, entry.casIdentity);
   budget.recordRead(prefix.content.byteLength);
   const text = decodeText(prefix.content);
-  if (text === null) {
-    budget.append(`[binary sha256=${entry.digest} size=${entry.size}]`);
-  } else {
-    budget.append(text);
-  }
+  const appended = budget.append(text === null
+    ? `[binary sha256=${entry.digest} size=${entry.size}]`
+    : text);
   if (prefix.truncated) {
     budget.markTruncated();
     budget.append("\n[content truncated]");
+    return false;
   }
+  return appended;
 }
 
 async function appendSection(
@@ -120,24 +119,38 @@ async function appendSection(
   file: string,
   before: CheckpointEntry | undefined,
   after: CheckpointEntry | undefined,
+  opaque: CheckpointOpaqueArtifact | undefined,
   cas: CheckpointCasStore
-): Promise<void> {
-  budget.append(`--- ${before ? `a/${file}` : "/dev/null"}\n+++ ${after ? `b/${file}` : "/dev/null"}\n`);
-  budget.append(`[metadata before=${metadata(before)} after=${metadata(after)}]\n`);
-  budget.append("[before]\n");
-  await appendContent(budget, before, cas);
-  budget.append("\n[after]\n");
-  await appendContent(budget, after, cas);
-  budget.append("\n");
+): Promise<boolean> {
+  let complete = budget.append(`--- ${before ? `a/${file}` : "/dev/null"}\n+++ ${after ? `b/${file}` : "/dev/null"}\n`);
+  complete = budget.append(`[metadata before=${metadata(before)} after=${metadata(after)}]\n`) && complete;
+  complete = budget.append("[before]\n") && complete;
+  complete = await appendContent(budget, before, opaque?.before, cas) && complete;
+  complete = budget.append("\n[after]\n") && complete;
+  complete = await appendContent(budget, after, opaque?.after, cas) && complete;
+  complete = budget.append("\n") && complete;
+  return complete && !budget.truncated;
 }
 
-export async function buildCheckpointReview(
+function fullyOpaque(
+  checkpoint: CheckpointRecord,
+  file: string,
+  artifact: CheckpointOpaqueArtifact | undefined
+): boolean {
+  if (!artifact) return false;
+  if (checkpoint.delta!.added.includes(file)) return artifact.after !== undefined;
+  if (checkpoint.delta!.deleted.includes(file)) return artifact.before !== undefined;
+  return artifact.before !== undefined && artifact.after !== undefined;
+}
+
+export async function buildCheckpointReviewMaterial(
   checkpoint: CheckpointRecord,
   before: CheckpointManifest,
   after: CheckpointManifest,
   cas: CheckpointCasStore,
-  maxBytes: number
-): Promise<string> {
+  maxBytes: number,
+  opaqueArtifacts: CheckpointOpaqueArtifact[]
+): Promise<CheckpointReviewMaterial> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw new RangeError("Checkpoint review maxBytes must be a non-negative safe integer.");
   }
@@ -147,17 +160,40 @@ export async function buildCheckpointReview(
   const budget = new ReviewBudget(maxBytes);
   const beforeByPath = new Map(before.entries.map((entry) => [entry.path, entry]));
   const afterByPath = new Map(after.entries.map((entry) => [entry.path, entry]));
+  const opaqueByPath = new Map(opaqueArtifacts.map((artifact) => [artifact.path, artifact]));
+  const reviewDiffPaths: string[] = [];
   const changed = [...new Set([
     ...checkpoint.delta!.added,
     ...checkpoint.delta!.modified,
     ...checkpoint.delta!.deleted
   ])].sort();
   for (const file of changed) {
-    if (budget.availableOutput <= 0) {
+    const opaque = opaqueByPath.get(file);
+    if (fullyOpaque(checkpoint, file, opaque)) continue;
+    if (budget.availableOutput <= 0 || budget.truncated) {
       budget.markTruncated();
       break;
     }
-    await appendSection(budget, file, beforeByPath.get(file), afterByPath.get(file), cas);
+    const complete = await appendSection(
+      budget,
+      file,
+      beforeByPath.get(file),
+      afterByPath.get(file),
+      opaque,
+      cas
+    );
+    if (complete) reviewDiffPaths.push(file);
+    if (budget.truncated) break;
   }
-  return budget.value();
+  return { reviewDiff: budget.value(), reviewDiffPaths, opaqueArtifacts };
+}
+
+export async function buildCheckpointReview(
+  checkpoint: CheckpointRecord,
+  before: CheckpointManifest,
+  after: CheckpointManifest,
+  cas: CheckpointCasStore,
+  maxBytes: number
+): Promise<string> {
+  return (await buildCheckpointReviewMaterial(checkpoint, before, after, cas, maxBytes, [])).reviewDiff;
 }

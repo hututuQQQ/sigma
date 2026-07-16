@@ -21,6 +21,7 @@ export interface NormalizedTrustedToolchain {
   executable: string;
   aliases: string[];
   executionRoots: string[];
+  runtimeRoots: string[];
   pathEntries: string[];
   environment: Record<string, string>;
   nodeRuntime: boolean;
@@ -156,11 +157,16 @@ function normalizeTrustedToolchain(
     || ["node", "node.exe"].includes(executableName);
   const executable = comparablePath(entry.executable);
   const roots = normalizeToolchainRoots(entry, executable, nodeRuntime);
+  const runtimeRoots = normalizedAbsolutePaths(
+    entry.runtimeRoots ?? [],
+    `trustedToolchains.${entry.id}.runtimeRoots`
+  );
   return {
     id: entry.id,
     executable,
     aliases,
     ...roots,
+    runtimeRoots,
     environment: createMinimalEnvironment({ overrides: entry.environment ?? {} }, {}, process.platform),
     nodeRuntime,
     compatibility: entry.compatibility
@@ -198,6 +204,11 @@ export function assertTrustedToolchainsAvailable(
         throw new Error("the configured executable is not a regular file");
       }
       if (process.platform !== "win32") accessSync(toolchain.executable, constants.X_OK);
+      for (const runtimeRoot of toolchain.runtimeRoots) {
+        if (!statSync(runtimeRoot).isDirectory()) {
+          throw new Error(`runtime dependency root is not a directory: ${runtimeRoot}`);
+        }
+      }
     } catch (error) {
       throw new BrokerToolchainUnavailableError(
         toolchain.id,

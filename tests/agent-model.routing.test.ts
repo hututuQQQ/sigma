@@ -158,12 +158,17 @@ describe("capability-aware model routing", () => {
       availableProfiles: [{ profile: frozen, source: "home" }]
     } as unknown as RuntimeCustomization;
     const calls: string[] = [];
+    const timeoutPolicies: Array<{
+      requestTimeoutMs: number;
+      idleTimeoutMs: number;
+      activeStreamTimeoutMs?: number;
+    }> = [];
     const configuredSpecs = [
       specConfig("deepseek/approx", "approx", "approximate", 100),
       specConfig("deepseek/exact", "exact", "exact", 300)
     ];
     const gateways = createRoleGateways({
-      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5,
+      provider: "deepseek", model: "approx", modelDeadlineSec: 10, streamIdleSec: 5, streamActiveSec: 7,
       modelSpecs: configuredSpecs,
       modelRoutes: [
         {
@@ -177,14 +182,20 @@ describe("capability-aware model routing", () => {
         }
       ]
     }, {
-      gatewayFactory: ({ model }) => gateway(model, async () => {
+      gatewayFactory: (options) => {
+        const { model } = options;
+        timeoutPolicies.push(options);
+        return gateway(model, async () => {
         calls.push(model);
         return response(model);
-      })
+        });
+      }
     }, customization, {});
     await gateways.orchestrator.complete(request());
     await gateways.reviewer.complete(request());
     expect(calls).toEqual(["exact", "approx"]);
+    expect(timeoutPolicies.every((policy) => policy.requestTimeoutMs === 10_000
+      && policy.idleTimeoutMs === 5_000 && policy.activeStreamTimeoutMs === 7_000)).toBe(true);
     expect(gateways.orchestrator.routingIdentity()).toEqual({ role: "orchestrator", routeId: "exact-tools" });
     expect(gateways.reviewer.routingIdentity()).toEqual({ role: "reviewer", routeId: "cheap-review" });
   });
@@ -348,7 +359,7 @@ describe("capability-aware model routing", () => {
     expect(afterDoneSecond).not.toHaveBeenCalled();
   });
 
-  it("falls back after an empty stream ends without a terminal response", async () => {
+  it("treats an empty stream without a terminal response as a protocol failure", async () => {
     const calls: string[] = [];
     const empty: ModelGateway = {
       ...gateway("deepseek/a", async () => response("unused")),
@@ -357,24 +368,21 @@ describe("capability-aware model routing", () => {
         yield* [] as ModelStreamEvent[];
       }
     };
-    const recovered: ModelGateway = {
-      ...gateway("glm/b", async () => response("recovered")),
-      async *stream() {
-        calls.push("glm/b");
-        yield { type: "done", response: response("recovered") };
-      }
-    };
     const router = new ModelRouter(
       [spec("deepseek/a"), spec("glm/b")],
       [route()],
-      (item) => item.id === "deepseek/a" ? empty : recovered
+      (item) => item.id === "deepseek/a" ? empty : gateway(item.id, async () => response("must-not-run"))
     );
-    const events: ModelStreamEvent[] = [];
-    for await (const event of router.stream("orchestrator", "main", request())) events.push(event);
-    expect(calls).toEqual(["deepseek/a", "glm/b"]);
-    expect(events.at(-1)).toMatchObject({
-      type: "done", response: { message: { content: "recovered" }, modelSpecId: "glm/b", attempt: 1 }
+    const consume = async (): Promise<void> => {
+      for await (const _event of router.stream("orchestrator", "main", request())) { /* consume */ }
+    };
+    await expect(consume()).rejects.toMatchObject({
+      category: "protocol",
+      semanticDelta: false,
+      attempts: 1,
+      diagnostics: { doneReceived: false, lastEventType: "none" }
     });
+    expect(calls).toEqual(["deepseek/a"]);
   });
 
   it("does not replay a stream that ends after semantic output", async () => {
@@ -394,7 +402,7 @@ describe("capability-aware model routing", () => {
       for await (const _event of router.stream("orchestrator", "main", request())) { /* consume */ }
     };
     await expect(consume()).rejects.toMatchObject({
-      category: "network", semanticDelta: true, attempts: 1
+      category: "protocol", semanticDelta: true, attempts: 1
     });
     expect(fallback).not.toHaveBeenCalled();
   });

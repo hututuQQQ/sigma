@@ -17,7 +17,7 @@ import {
   SEMANTIC_INFRASTRUCTURE_FAILURE_CODE,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
-import { toolReceipt } from "../packages/agent-kernel/src/receipt-parsing.js";
+import { receiptContent, toolReceipt } from "../packages/agent-kernel/src/receipt-parsing.js";
 
 function initial(): KernelState {
   return createKernelState({
@@ -173,6 +173,29 @@ function failAlternative(
 }
 
 describe("semantic execution failure convergence", () => {
+  it("bounds missing-dependency recovery even when diagnostic commands succeed between attempts", () => {
+    let state = failAlternative(initial(), "missing-one", "exec", "dependency_missing");
+    state = successfulReceipt(state, "diagnostic-one", "shell", {
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    });
+    state = failAlternative(state, "missing-two", "shell", "dependency_missing");
+    state = successfulReceipt(state, "diagnostic-two", "exec", {
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    });
+    state = failAlternative(state, "missing-three", "exec", "dependency_missing");
+
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
+    });
+    expect(state.semanticFailureCluster).toMatchObject({
+      family: "execution_dependency",
+      attempts: 3
+    });
+  });
+
   it("puts structured outcome, diagnostics, and evidence summaries in modern tool history", () => {
     const evidence: EvidenceRecord = {
       evidenceId: "diagnostic-proof",
@@ -210,6 +233,30 @@ describe("semantic execution failure convergence", () => {
     expect(state.receipts[0]).toMatchObject({
       outcome: { status: "failed", diagnosticCodes: ["executable_not_found"] }
     });
+  });
+
+  it("clips large receipt output while retaining artifact and digest summaries", () => {
+    const receipt = toolReceipt({
+      callId: "large-receipt",
+      ok: true,
+      output: "head\n" + "payload ".repeat(20_000) + "\ntail",
+      outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      artifacts: ["artifact-1"],
+      artifactRefs: [{
+        artifactId: "artifact-1", name: "stdout.log", digest: "a".repeat(64), sizeBytes: 123_456
+      }],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(receipt).not.toBeNull();
+    const content = receiptContent(receipt!);
+    expect(content.length).toBeLessThan(20_000);
+    expect(content).toContain("receipt output omitted");
+    expect(content).toContain("artifact-1");
+    expect(content).toContain("sha256=");
+    expect(content).toContain("tail");
   });
 
   it("clusters equivalent infrastructure diagnostics across different tools and stops after three attempts", () => {

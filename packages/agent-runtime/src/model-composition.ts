@@ -19,6 +19,8 @@ export interface ModelCompositionConfig {
   model: string;
   modelDeadlineSec: number;
   streamIdleSec: number;
+  streamActiveSec?: number;
+  maxModelRetries?: number;
   legacySingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
   modelRoutes?: readonly ModelRouteConfigValue[];
@@ -26,7 +28,14 @@ export interface ModelCompositionConfig {
 }
 
 export interface ModelCompositionDeps {
-  gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string }) => ModelGateway;
+  gatewayFactory?: (options: {
+    provider: "deepseek" | "glm";
+    model: string;
+    maxRetries: number;
+    requestTimeoutMs: number;
+    idleTimeoutMs: number;
+    activeStreamTimeoutMs?: number;
+  }) => ModelGateway;
 }
 
 export interface ModelGateways {
@@ -169,10 +178,16 @@ export function createRoleGateways(
   if (!knownPrimary && !deps.gatewayFactory) {
     throw new Error(`Custom model '${config.provider}/${model}' requires explicit capabilities, tokenizer, and pricing.`);
   }
-  const primaryGateway = deps.gatewayFactory?.({ provider: config.provider, model })
+  const gatewayOptions = {
+    maxRetries: config.maxModelRetries ?? 2,
+    requestTimeoutMs: config.modelDeadlineSec * 1_000,
+    idleTimeoutMs: config.streamIdleSec * 1_000,
+    ...(config.streamActiveSec && config.streamActiveSec > 0
+      ? { activeStreamTimeoutMs: config.streamActiveSec * 1_000 } : {})
+  };
+  const primaryGateway = deps.gatewayFactory?.({ provider: config.provider, model, ...gatewayOptions })
     ?? createModelGatewayForSpec(knownPrimary as ModelSpec, {
-      requestTimeoutMs: config.modelDeadlineSec * 1_000,
-      idleTimeoutMs: config.streamIdleSec * 1_000
+      ...gatewayOptions
     });
   const injected = knownPrimary ? undefined : injectedModelSpec(config.provider, model, primaryGateway);
   const resolved = catalog(config, env, custom, injected);
@@ -180,10 +195,9 @@ export function createRoleGateways(
   for (const spec of resolved.specs) {
     const gateway = spec.id === resolved.primary.id
       ? primaryGateway
-      : deps.gatewayFactory?.({ provider: spec.providerId, model: spec.upstreamModel })
+      : deps.gatewayFactory?.({ provider: spec.providerId, model: spec.upstreamModel, ...gatewayOptions })
         ?? createModelGatewayForSpec(spec, {
-          requestTimeoutMs: config.modelDeadlineSec * 1_000,
-          idleTimeoutMs: config.streamIdleSec * 1_000
+          ...gatewayOptions
         });
     gateways.set(spec.id, gateway);
   }

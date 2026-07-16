@@ -42,7 +42,8 @@ const checkpointRecoverySchema = z.object({
   checkpointId: nonEmptyStringSchema,
   decision: z.enum(["restore", "keep"]),
   sourceSessionId: nonEmptyStringSchema.optional(),
-  childId: nonEmptyStringSchema.optional()
+  childId: nonEmptyStringSchema.optional(),
+  applied: z.boolean().optional()
 }).strict();
 
 export const durableEventPayloadSchemas = {

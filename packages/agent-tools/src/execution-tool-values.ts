@@ -1,7 +1,6 @@
 import type { JsonValue, ToolDescriptor } from "agent-protocol";
 import {
   normalizeWindowsShellInvocation,
-  runtimeEnvironment,
   shellInvocation as platformShellInvocation,
   type ShellKind
 } from "agent-platform";
@@ -42,8 +41,7 @@ export function executionEnvironment(
 }
 
 export function availableShells(options: ExecutionToolOptions): ShellKind[] {
-  const fallback = runtimeEnvironment().defaultShell;
-  return [...new Set(options.shells ?? (fallback === "none" ? [] : [fallback]))];
+  return [...new Set(options.shells ?? [])];
 }
 
 export function availableRuntimeCommands(options: ExecutionToolOptions): string[] {
@@ -92,7 +90,7 @@ export function assertAvailableExecutable(
 }
 
 export function availableNetworkModes(options: ExecutionToolOptions): Array<"none" | "full"> {
-  return [...new Set((options.networkModes ?? ["none", "full"])
+  return [...new Set((options.networkModes ?? ["none"])
     .filter((mode): mode is "none" | "full" => mode === "none" || mode === "full"))];
 }
 

@@ -11,10 +11,29 @@ vi.mock("../packages/agent-model/dist/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("agent-model")>();
   return {
     ...actual,
-    checkProviderHealth: async () => {
+    checkProviderHealth: async (input: { provider: "deepseek" | "glm"; model: string }) => {
       if (api.mode === "error") throw new Error("mock API failure");
       if (api.mode === "raw_error") throw "raw API failure";
-      return api.mode === "empty" ? "Provider returned an empty response." : "ok";
+      if (api.mode === "empty") {
+        return {
+          ok: false,
+          provider: input.provider,
+          model: input.model,
+          endpointHost: "api.example.test",
+          latencyMs: 12,
+          message: "Provider returned no textual output.",
+          failureKind: "api_error" as const,
+          errorCategory: "protocol"
+        };
+      }
+      return {
+        ok: true,
+        provider: input.provider,
+        model: input.model,
+        endpointHost: "api.example.test",
+        latencyMs: 12,
+        message: "ok"
+      };
     }
   };
 });
@@ -98,13 +117,32 @@ describe("doctor command branch coverage", () => {
         "--check-api",
         "--json"
       ], { stdout, executionBroker: healthyBroker() })).resolves.toBe(0);
-      const report = JSON.parse(stdout.text()) as { status: string; checks: Array<{ name: string; status: string; message: string }> };
-      expect(report.status).toBe("warning");
+      const report = JSON.parse(stdout.text()) as {
+        doctorSchemaVersion: number;
+        protocolVersion: number;
+        capabilities: { networkModes: string[] };
+        status: string;
+        checks: Array<{ name: string; status: string; message: string }>;
+      };
+      expect(report.doctorSchemaVersion).toBe(1);
+      expect(report.protocolVersion).toBe(1);
+      expect(report.capabilities.networkModes).toEqual(["none"]);
+      expect(report.status).toBe("ok");
       expect(report.checks).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "node", status: "ok" }),
         expect.objectContaining({ name: "provider_key", status: "ok" }),
-        expect.objectContaining({ name: "api", status: "ok", message: "ok" })
+        expect.objectContaining({ name: "lsp_rust" }),
+        expect.objectContaining({ name: "lsp_go" }),
+        expect.objectContaining({
+          name: "api",
+          status: "ok",
+          message: expect.stringContaining("provider=deepseek model=doctor-model endpoint=api.example.test elapsed_ms=12")
+        })
       ]));
+      expect(report.checks
+        .filter((check) => ["lsp_rust", "lsp_go"].includes(check.name))
+        .every((check) => ["ok", "skipped"].includes(check.status)))
+        .toBe(true);
     } finally {
       if (originalNode) Object.defineProperty(process.versions, "node", originalNode);
     }
@@ -130,7 +168,13 @@ describe("doctor command branch coverage", () => {
     ], { stdout: strict, executionBroker: healthyBroker() })).resolves.toBe(1);
     const report = JSON.parse(strict.text()) as { status: string; checks: Array<{ name: string; message: string }> };
     expect(report.status).toBe("error");
-    expect(report.checks.find((check) => check.name === "api")?.message).toContain("empty response");
+    expect(report.checks.find((check) => check.name === "api")).toMatchObject({
+      status: "error",
+      failure_kind: "api_error",
+      error_category: "protocol",
+      endpoint_host: "api.example.test",
+      elapsed_ms: 12
+    });
   });
 
   it.each(["GLM_API_KEY", "ZAI_API_KEY", "BIGMODEL_API_KEY"])("recognizes %s", async (key) => {

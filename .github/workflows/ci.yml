@@ -114,15 +114,6 @@ jobs:
         run: >-
           python3 scripts/ci/linux-hardening-self-test.py
           --broker native/sigma-exec/target/debug/sigma-exec
-      - name: Prepare package Node runtime
-        run: |
-          NODE_DIR="node-$(node --version)-linux-x64"
-          mkdir -p ".artifacts/ci-node-runtime/${NODE_DIR}/bin"
-          cp "$(command -v node)" ".artifacts/ci-node-runtime/${NODE_DIR}/bin/node"
-          chmod +x ".artifacts/ci-node-runtime/${NODE_DIR}/bin/node"
-          tar -cJf ".artifacts/ci-node-runtime.tar.xz" -C ".artifacts/ci-node-runtime" "${NODE_DIR}"
-          echo "NODE_RUNTIME_TARBALL=${GITHUB_WORKSPACE}/.artifacts/ci-node-runtime.tar.xz" >> "$GITHUB_ENV"
-          echo "NODE_RUNTIME_SHA256=$(sha256sum .artifacts/ci-node-runtime.tar.xz | awk '{print $1}')" >> "$GITHUB_ENV"
       - name: Build
         run: pnpm build
       - name: Lint
@@ -141,6 +132,8 @@ jobs:
         env:
           AGENT_REQUIRE_TARGET_WRAPPER: "1"
         run: pnpm verify:package:agent-cli:linux
+      - name: Portable Linux glibc compatibility matrix
+        run: pnpm verify:package:agent-cli:linux:matrix
       - name: Required Linux namespace, Landlock, seccomp, and PTY security test
         run: >-
           python3 scripts/ci/linux-sandbox-smoke.py
@@ -178,6 +171,7 @@ jobs:
             .artifacts/agent-cli-linux-x64.sbom.cdx.json
             .artifacts/agent-cli-linux-x64.provenance.json
             .artifacts/agent-cli-package-verify-linux-x64.json
+            .artifacts/linux-package-compatibility-matrix.json
             .artifacts/sandbox-smoke-linux-x64.json
             .artifacts/lsp-sandbox-smoke-linux-x64.json
             .artifacts/sigma-exec-branch-coverage.json

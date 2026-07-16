@@ -41,6 +41,23 @@ export function isCompletionEligibleEvidence(
   return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
 }
 
+function passedValidationSupportsClaim(evidence: Extract<EvidenceRecord, { kind: "validation" }>): boolean {
+  if (evidence.status !== "passed") return false;
+  const termination = evidence.data.termination;
+  return termination === undefined || (termination.processStarted
+    && termination.state === "exited"
+    && termination.exitCode === 0
+    && !termination.timedOut
+    && !termination.idleTimedOut
+    && !termination.cancelled);
+}
+
+function executedValidationSupportsClaim(evidence: Extract<EvidenceRecord, { kind: "validation" }>): boolean {
+  if (evidence.status === "passed") return true;
+  return evidence.data.termination?.processStarted === true
+    && evidence.data.termination.state === "exited";
+}
+
 /** Returns whether an evidence record proves the typed claim attached to a
  * completion reference. An omitted claim is the legacy acceptance_met claim. */
 export function evidenceSupportsClaim(
@@ -52,9 +69,9 @@ export function evidenceSupportsClaim(
       && (evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source));
   }
   if (evidence.kind !== "validation") return false;
-  if (claim === "validation_passed") return evidence.status === "passed";
-  return evidence.data.termination?.processStarted === true
-    && evidence.data.termination.state === "exited";
+  return claim === "validation_passed"
+    ? passedValidationSupportsClaim(evidence)
+    : executedValidationSupportsClaim(evidence);
 }
 
 /** Failed validation is referenceable only for the narrow

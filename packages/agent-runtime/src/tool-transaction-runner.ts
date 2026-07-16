@@ -58,7 +58,6 @@ import {
   isToolReceipt,
   settleNoChangeProbe
 } from "./tool-transaction-support.js";
-
 interface PreparedTool extends ToolAttempt {
   descriptor: ToolDescriptor;
   plan: ToolCallPlan;
@@ -79,7 +78,7 @@ export class ToolTransactionRunner {
   constructor(
     private readonly options: Pick<
       EffectRunnerOptions,
-      "runtime" | "permissionMode" | "emit" | "control" | "budgets" | "hooks"
+      "runtime" | "permissionMode" | "emit" | "finish" | "control" | "budgets" | "hooks"
     >,
     private readonly execution: ToolExecutionMonitor
   ) {
@@ -93,6 +92,7 @@ export class ToolTransactionRunner {
       if (isToolReceipt(prepared)) return prepared;
       return await this.executePrepared(session, prepared, signal);
     } catch (error) {
+      if ((error as { code?: unknown })?.code === "approval_needs_input") throw error;
       return failed(
         attempt.call,
         startedAt,

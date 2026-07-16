@@ -5,11 +5,14 @@ import type {
   ModelResponse,
   ModelStreamEvent
 } from "agent-protocol";
-import type {
-  ModelFailureCategory,
-  ModelRoute,
-  ModelRole,
-  ModelSpec
+import {
+  failureDiagnostics,
+  ModelGatewayError,
+  type ModelFailureDiagnostics,
+  type ModelFailureCategory,
+  type ModelRoute,
+  type ModelRole,
+  type ModelSpec
 } from "./catalog.js";
 import {
   estimatedRequestTokens,
@@ -64,6 +67,75 @@ export type RoutedModelStreamEvent =
 
 export type ModelGatewayFactory = (spec: ModelSpec) => ModelGateway;
 
+interface RoutedStreamLifecycle {
+  semanticDelta: boolean;
+  completed: boolean;
+  lastEventType: string;
+  hasContent: boolean;
+  hasReasoning: boolean;
+  hasToolCall: boolean;
+}
+
+function observeRoutedStreamEvent(lifecycle: RoutedStreamLifecycle, event: ModelStreamEvent): void {
+  lifecycle.lastEventType = event.type;
+  if (event.type === "content") lifecycle.hasContent = true;
+  if (event.type === "reasoning") lifecycle.hasReasoning = true;
+  if (event.type === "tool_call") lifecycle.hasToolCall = true;
+  if (event.type === "content" || event.type === "reasoning" || event.type === "tool_call") {
+    lifecycle.semanticDelta = true;
+  }
+  if (event.type === "done") {
+    lifecycle.semanticDelta = true;
+    lifecycle.completed = true;
+  }
+}
+
+function routedStreamEvent(
+  event: ModelStreamEvent,
+  role: ModelRole,
+  routeId: string,
+  spec: ModelSpec,
+  request: ModelRequest,
+  attempt: number,
+  startedAt: number
+): RoutedModelStreamEvent {
+  if (event.type === "done") {
+    return { type: "done", response: routedResponse(
+      role, routeId, spec, event.response, request, attempt, performance.now() - startedAt
+    ) };
+  }
+  if (event.type === "usage") return { ...event, routeId, modelSpecId: spec.id, attempt };
+  return event;
+}
+
+function incompleteRoutedStreamError(
+  spec: ModelSpec,
+  lifecycle: RoutedStreamLifecycle,
+  attempts: number
+): ModelGatewayError {
+  return Object.assign(
+    new ModelGatewayError(
+      `Model stream for '${spec.id}' ended without a terminal response (lastEventType=${lifecycle.lastEventType}, hasContent=${lifecycle.hasContent}, hasToolCall=${lifecycle.hasToolCall}).`,
+      "protocol",
+      lifecycle.semanticDelta,
+      undefined,
+      undefined,
+      {
+        provider: spec.providerId,
+        model: spec.upstreamModel,
+        category: "protocol",
+        doneReceived: false,
+        lastEventType: lifecycle.lastEventType,
+        hasContent: lifecycle.hasContent,
+        hasReasoning: lifecycle.hasReasoning,
+        hasToolCall: lifecycle.hasToolCall,
+        retryAttempts: attempts
+      }
+    ),
+    { code: "model_stream_incomplete" }
+  );
+}
+
 export class ModelRoutingError extends Error {
   readonly code = "model_route_unavailable";
   constructor(readonly routeId: string, readonly rejected: readonly ModelRejection[]) {
@@ -74,6 +146,7 @@ export class ModelRoutingError extends Error {
 
 export class ModelRouteExecutionError extends Error {
   readonly code = "model_route_failed";
+  readonly diagnostics?: ModelFailureDiagnostics;
   constructor(
     readonly routeId: string,
     readonly modelSpecId: string,
@@ -84,6 +157,12 @@ export class ModelRouteExecutionError extends Error {
   ) {
     super(`Model route '${routeId}' failed on '${modelSpecId}' (${category}).`, options);
     this.name = "ModelRouteExecutionError";
+    const causeDiagnostics = failureDiagnostics(options?.cause);
+    this.diagnostics = {
+      ...causeDiagnostics,
+      category,
+      retryAttempts: causeDiagnostics?.retryAttempts ?? attempts
+    };
   }
 }
 
@@ -288,35 +367,32 @@ export class ModelRouter {
       request.signal.throwIfAborted();
       const spec = resolution.candidates[index] as ModelSpec;
       const startedAt = performance.now();
-      let semanticDelta = false;
-      let completed = false;
+      const lifecycle: RoutedStreamLifecycle = {
+        semanticDelta: false,
+        completed: false,
+        lastEventType: "none",
+        hasContent: false,
+        hasReasoning: false,
+        hasToolCall: false
+      };
       try {
         for await (const event of this.gateways(spec).stream(request)) {
-          if (event.type === "content" || event.type === "reasoning" || event.type === "tool_call") semanticDelta = true;
-          if (event.type === "done") {
-            semanticDelta = true;
-            completed = true;
-            yield { type: "done", response: routedResponse(
-              role, routeId, spec, event.response, request, index, performance.now() - startedAt
-            ) };
-          } else if (event.type === "usage") {
-            yield { ...event, routeId, modelSpecId: spec.id, attempt: index };
-          } else yield event;
+          observeRoutedStreamEvent(lifecycle, event);
+          yield routedStreamEvent(event, role, routeId, spec, request, index, startedAt);
         }
-        if (!completed) {
+        if (!lifecycle.completed) {
           request.signal.throwIfAborted();
-          throw Object.assign(
-            new Error(`Model stream for '${spec.id}' ended without a terminal response.`),
-            { category: "network", semanticDelta }
-          );
+          throw incompleteRoutedStreamError(spec, lifecycle, index + 1);
         }
         return;
       } catch (error) {
         request.signal.throwIfAborted();
         const category = classifyModelFailure(error);
-        semanticDelta ||= errorSemanticDelta(error);
-        if (!canFallback(resolution.route, category, semanticDelta) || index + 1 >= attempts) {
-          throw new ModelRouteExecutionError(routeId, spec.id, category, semanticDelta, index + 1, { cause: error });
+        lifecycle.semanticDelta ||= errorSemanticDelta(error);
+        if (!canFallback(resolution.route, category, lifecycle.semanticDelta) || index + 1 >= attempts) {
+          throw new ModelRouteExecutionError(
+            routeId, spec.id, category, lifecycle.semanticDelta, index + 1, { cause: error }
+          );
         }
       }
     }

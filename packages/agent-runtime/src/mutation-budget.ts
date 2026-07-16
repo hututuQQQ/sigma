@@ -4,7 +4,7 @@ import { sessionMutationEvidence } from "./mutation-evidence.js";
 import { documentationOnly } from "./reviewer.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import type { RuntimeSession } from "./types.js";
-import { validationCoversDelta } from "./validation-policy.js";
+import { validationExecutionCoversDelta } from "./validation-policy.js";
 
 const PREFIX = "mutation-tool:";
 
@@ -64,8 +64,8 @@ function mutationReservationSatisfied(
   }
   const evidence = sessionMutationEvidence(session);
   const validations = evidence.filter((item): item is ValidationEvidence =>
-    item.kind === "validation" && item.status === "passed");
-  if (deltas.some((delta) => !validations.some((item) => validationCoversDelta(item, delta)))) return false;
+    item.kind === "validation");
+  if (deltas.some((delta) => !validations.some((item) => validationExecutionCoversDelta(item, delta)))) return false;
   const waived = reviewerWaivedDeltaIds(evidence);
   const reviewed = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
     ? item.data.workspaceDeltaEvidenceIds : []));

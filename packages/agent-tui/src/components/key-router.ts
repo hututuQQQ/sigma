@@ -32,13 +32,34 @@ function isHelpKey(key: KeyEvent): boolean {
 
 export function routeKey(host: KeyRouterHost, key: KeyEvent): void {
   if (key.eventType === "release") return;
-  if (routeGlobal(host, key) || routeOverlay(host, key) || routeComposer(host, key)) consume(key);
+  if (routeInterrupt(host, key) || routeFullOverlay(host, key)
+    || routeGlobal(host, key) || routeOverlay(host, key) || routeComposer(host, key)) consume(key);
+}
+
+function routeInterrupt(host: KeyRouterHost, key: KeyEvent): boolean {
+  if (key.ctrl && key.name === "c") {
+    if (!key.repeated) host.interrupt();
+    return true;
+  }
+  return false;
+}
+
+function routeFullOverlay(host: KeyRouterHost, key: KeyEvent): boolean {
+  const mode = host.overlayMode();
+  if (mode !== "approval" && mode !== "help") return false;
+  if (key.name === "pageup" || key.name === "pagedown") {
+    host.scroll(key.name === "pageup" ? -8 : 8);
+  } else if (key.ctrl && (key.name === "u" || key.name === "d")) {
+    host.scroll(key.name === "u" ? -6 : 6);
+  } else if (mode === "approval") {
+    host.approvalKey(key);
+  } else if (key.name === "escape") {
+    host.closeOverlay();
+  }
+  return true;
 }
 
 function routeGlobal(host: KeyRouterHost, key: KeyEvent): boolean {
-  if (key.ctrl && key.name === "c") {
-    host.interrupt(); return true;
-  }
   if (key.ctrl && key.name === "o") { host.toggleActivity(); return true; }
   if (key.name === "pageup" || key.name === "pagedown") {
     host.scroll(key.name === "pageup" ? -8 : 8); return true;
@@ -50,17 +71,6 @@ function routeGlobal(host: KeyRouterHost, key: KeyEvent): boolean {
 }
 
 function routeOverlay(host: KeyRouterHost, key: KeyEvent): boolean {
-  if (host.overlayMode() === "approval") {
-    host.approvalKey(key);
-    return true;
-  }
-  if (host.overlayMode() === "help") {
-    if (key.name === "escape") { host.closeOverlay(); return true; }
-    else if (key.name === "pageup" || key.name === "pagedown") {
-      host.scroll(key.name === "pageup" ? -8 : 8); return true;
-    }
-    return true;
-  }
   if (host.overlayMode() === "commands" && host.commandKey(key)) {
     return true;
   }

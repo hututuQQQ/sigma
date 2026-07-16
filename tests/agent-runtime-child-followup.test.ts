@@ -137,9 +137,10 @@ describe("child follow-up lifecycle", () => {
     ]);
     const execution = createHostExecutionBroker();
     const storeRootDir = path.join(repository, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway,
-      store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+      store,
       storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry(), { broker: execution })),
       reviewer: createApprovingReviewer(),
@@ -153,9 +154,10 @@ describe("child follow-up lifecycle", () => {
       1,
       new WorkspaceIsolationManager(path.join(root, "worktrees"), { execution })
     );
+    const instruction = `${"Write first.txt and retain the general requirements. ".repeat(3)}Preserve this trailing constraint.`;
     const child = supervisor.spawn({
       parentId: parent.sessionId,
-      instruction: "write first.txt",
+      instruction,
       workspacePath: repository,
       intent: "write",
       writeScope: ["first.txt", "second.txt"],
@@ -181,6 +183,15 @@ describe("child follow-up lifecycle", () => {
     await expect(supervisor.integrate(child.id)).resolves.toMatchObject({ isolation: { cleanup: "integrated" } });
     await expect(readFile(path.join(repository, "first.txt"), "utf8")).resolves.toBe("first");
     await expect(readFile(path.join(repository, "second.txt"), "utf8")).resolves.toBe("second");
+    const childSession = (await store.listSessions()).find((item) => item.sessionId !== parent.sessionId);
+    if (!childSession) throw new Error("Expected a durable child session.");
+    const childEvents = [];
+    for await (const event of store.events(childSession.sessionId)) childEvents.push(event);
+    const initialPlan = childEvents.find((event) => event.type === "plan.updated")?.payload as {
+      plan?: { goal?: string; nodes?: Array<{ title?: string }> };
+    } | undefined;
+    expect(initialPlan?.plan?.goal).toBe(instruction);
+    expect(initialPlan?.plan?.nodes?.[0]?.title).toBe(instruction.slice(0, 80).trim());
     await execution.close();
   });
 });

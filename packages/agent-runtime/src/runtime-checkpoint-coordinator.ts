@@ -19,7 +19,7 @@ export class RuntimeCheckpointCoordinator {
         code: "checkpoint_recovery_required"
       });
     }
-    if (session.durable.state.phase !== "terminal" && session.durable.state.phase !== "needs_input") {
+    if (!new Set(["terminal", "needs_input", "ready_model"]).has(session.durable.state.phase)) {
       throw new Error(`Checkpoint undo is unavailable while session phase is '${session.durable.state.phase}'.`);
     }
     const restored = await this.withWorkspaceLock(session, async () =>
@@ -56,7 +56,9 @@ export class RuntimeCheckpointCoordinator {
         // checkpoint, so a crash can finish the same decision without asking
         // the model or user to choose again.
         await this.control.recordChildCheckpointDecision(session, recovery, decision);
-        return await this.control.applyChildCheckpointDecision(session, recovery, decision);
+        const applied = await this.control.applyChildCheckpointDecision(session, recovery, decision);
+        await this.control.recordChildCheckpointDecisionApplied(session, recovery, decision);
+        return applied;
       }, true);
       session.recovery.openCheckpointRecovery = undefined;
       await this.effects.settleMutationBudgets(session);
@@ -84,8 +86,11 @@ export class RuntimeCheckpointCoordinator {
     if (!isChildCheckpointRecovery(recovery) || !recovery.recordedDecision) {
       throw new Error("No durable child checkpoint recovery decision is pending replay.");
     }
-    const resolved = await this.withWorkspaceLock(session, async () =>
-      await this.control.applyChildCheckpointDecision(session, recovery, recovery.recordedDecision!), true);
+    const resolved = await this.withWorkspaceLock(session, async () => {
+      const applied = await this.control.applyChildCheckpointDecision(session, recovery, recovery.recordedDecision!);
+      await this.control.recordChildCheckpointDecisionApplied(session, recovery, recovery.recordedDecision!);
+      return applied;
+    }, true);
     session.recovery.openCheckpointRecovery = undefined;
     await this.effects.settleMutationBudgets(session);
     return resolved;

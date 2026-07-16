@@ -37,6 +37,20 @@ export const checkpointDeltaSchema = z.object({
   deleted: z.array(z.string())
 }).strict();
 
+const opaqueArtifactIdentitySchema = z.object({
+  digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  sizeBytes: nonNegativeIntegerSchema
+}).strict();
+
+export const opaqueArtifactEvidenceSchema = z.object({
+  path: nonEmptyStringSchema,
+  before: opaqueArtifactIdentitySchema.optional(),
+  after: opaqueArtifactIdentitySchema.optional()
+}).strict().refine(
+  (value) => value.before !== undefined || value.after !== undefined,
+  "Opaque artifact evidence must contain a before or after identity"
+);
+
 const evidenceBaseShape = {
   evidenceId: nonEmptyStringSchema,
   sessionId: nonEmptyStringSchema,
@@ -55,7 +69,9 @@ export const workspaceDeltaEvidenceSchema = z.object({
     checkpointId: nonEmptyStringSchema,
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional(),
-    reviewDiff: z.string().optional()
+    reviewDiff: z.string().optional(),
+    reviewDiffPaths: z.array(nonEmptyStringSchema).optional(),
+    opaqueArtifacts: z.array(opaqueArtifactEvidenceSchema).optional()
   }).strict()
 }).strict();
 

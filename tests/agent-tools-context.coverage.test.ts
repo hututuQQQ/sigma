@@ -1,4 +1,4 @@
-import { link, mkdtemp, writeFile, mkdir, symlink } from "node:fs/promises";
+import { link, mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -129,10 +129,10 @@ describe("context, platform, and repository tool capabilities", () => {
         evidence: [{ evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_passed" }]
       }]
     }, new Map([[failed.evidenceId, failed]]))).toContain("failed-validation");
-    expect(parseCompletionProposal({
+    const independentlyTyped = parseCompletionProposal({
       summary: "invalid claim mix",
       criteria: [{
-        criterion: "Validation passed.",
+        criterion: "Validation was attempted after the requested work.",
         status: "met",
         claim: "validation_passed",
         evidence: [{
@@ -141,7 +141,76 @@ describe("context, platform, and repository tool capabilities", () => {
           claim: "validation_executed"
         }]
       }]
-    })).toBeNull();
+    });
+    expect(independentlyTyped).toMatchObject({
+      criteria: [{
+        claim: "validation_executed",
+        evidence: [{ claim: "validation_executed" }]
+      }]
+    });
+    expect(completionEvidenceError(independentlyTyped!, new Map([[failed.evidenceId, failed]])))
+      .toBeNull();
+  });
+
+  it("accepts mixed workspace and passed-validation references and diagnoses malformed evidence", () => {
+    const changed = {
+      evidenceId: "workspace-delta",
+      sessionId: "session",
+      runId: "run",
+      kind: "workspace_delta" as const,
+      status: "passed" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" as const, id: "checkpoint" },
+      summary: "changed",
+      data: {
+        checkpointId: "checkpoint",
+        delta: { added: [], modified: ["src/code.ts"], deleted: [] }
+      }
+    };
+    const passed: ValidationEvidence = {
+      evidenceId: "passed-validation",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool", id: "validate" },
+      summary: "passed",
+      data: {
+        validator: "command",
+        command: "pnpm test",
+        exitCode: 0,
+        workspaceDeltaEvidenceIds: [changed.evidenceId]
+      }
+    };
+    const mixed = parseCompletionProposal({
+      summary: "changed and validated",
+      criteria: [{
+        criterion: "The change was applied and validation passed.",
+        status: "met",
+        evidence: [
+          { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
+          { evidenceId: passed.evidenceId, kind: passed.kind, claim: "validation_passed" }
+        ]
+      }]
+    });
+    expect(mixed).not.toBeNull();
+    expect(mixed?.criteria[0]?.claim).toBeUndefined();
+    expect(completionEvidenceError(mixed!, new Map([
+      [changed.evidenceId, changed],
+      [passed.evidenceId, passed]
+    ]))).toBeNull();
+
+    const malformed = parseCompletionProposal({
+      summary: "bad evidence",
+      criteria: [{
+        criterion: "Malformed reference is rejected.",
+        status: "met",
+        evidence: [{ evidenceId: "missing", kind: "validation", claim: "validation_passed" }]
+      }]
+    });
+    expect(completionEvidenceError(malformed!, new Map([[passed.evidenceId, passed]])))
+      .toMatch(/missing:validation:validation_passed[\s\S]*different references in one criterion may use different claims/u);
   });
 
   it("exposes an ID-free internal review request without asking the user to re-authorize code", async () => {
@@ -234,6 +303,19 @@ describe("context, platform, and repository tool capabilities", () => {
     });
   });
 
+  it("loads instructions for an existing extensionless file from its parent directory", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "agent-instructions-extensionless-"));
+    await mkdir(path.join(workspace, "src"), { recursive: true });
+    await writeFile(path.join(workspace, "AGENTS.md"), "root rule", "utf8");
+    await writeFile(path.join(workspace, "src", "AGENTS.md"), "source rule", "utf8");
+    await writeFile(path.join(workspace, "src", "NOTICE"), "ordinary file", "utf8");
+
+    const instructions = await loadNestedInstructions({ workspacePath: workspace, targetPath: "src/NOTICE" });
+
+    expect(instructions.map((item) => item.provenance)).toEqual(["AGENTS.md", "src/AGENTS.md"]);
+    await rm(workspace, { recursive: true, force: true });
+  });
+
   it("loads nested instructions and retrieves Unicode repository context incrementally", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-context-"));
     await mkdir(path.join(workspace, "src", "nested"), { recursive: true });
@@ -298,7 +380,8 @@ describe("context, platform, and repository tool capabilities", () => {
       ],
       tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
     });
-    expect(withReasoning.budget.historyTokens).toBeGreaterThan(withoutReasoning.budget.historyTokens);
+    expect(withReasoning.budget.historyTokens).toBe(withoutReasoning.budget.historyTokens);
+    expect(withReasoning.messages.at(-1)?.reasoningContent).toBeUndefined();
     expect(() => planContext({
       system: [], dynamic: [], history: [{ role: "user", content: "x".repeat(1_000) }], tools: [],
       contextWindowTokens: 10, outputReserveTokens: 0

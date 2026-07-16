@@ -18,6 +18,9 @@ import {
   successfulModelUsage,
   type PreparedModelBudget
 } from "./model-accounting.js";
+import { reviewInputFailure } from "./review-evidence-preflight.js";
+
+export { reviewInputFailure } from "./review-evidence-preflight.js";
 
 export interface ReviewerInput {
   sessionId: string;
@@ -80,22 +83,36 @@ function responseObject(content: string): Record<string, unknown> | null {
   }
 }
 
-function incompleteReviewInput(input: ReviewerInput): string | undefined {
-  for (const delta of input.workspaceDeltas) {
-    const diff = delta.data.reviewDiff;
-    if (typeof diff !== "string") return `Delta ${delta.evidenceId} has no reviewable diff.`;
-    if (diff.includes("[review diff truncated]") || diff.includes("[file diff truncated]")) {
-      return `Delta ${delta.evidenceId} has a truncated diff.`;
+export function reviewInputFailureEvidence(
+  input: ReviewerInput,
+  reviewerId: string,
+  message: string
+): ReviewEvidence {
+  return {
+    evidenceId: randomUUID(),
+    sessionId: input.sessionId,
+    runId: input.runId,
+    kind: "review",
+    status: "failed",
+    createdAt: new Date().toISOString(),
+    producer: { authority: "runtime", id: reviewerId },
+    summary: message,
+    data: {
+      reviewerId,
+      verdict: "changes_requested",
+      findings: [message],
+      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
     }
-    if (diff.includes("[binary sha256=")) return `Delta ${delta.evidenceId} contains binary content.`;
-  }
-  return undefined;
+  };
 }
 
 export class ModelReviewer implements ReviewerPort {
   constructor(private readonly gateway: ModelGateway, readonly reviewerId = "builtin-reviewer") {}
 
   async review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence> {
+    const inputProblem = reviewInputFailure(input);
+    if (inputProblem) return reviewInputFailureEvidence(input, this.reviewerId, inputProblem);
     const prepared = await this.prepareReview(input, Number.MAX_SAFE_INTEGER);
     return (await this.reviewPrepared(input, randomUUID(), prepared, signal)).evidence;
   }
@@ -186,7 +203,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Approve only if the supplied evidence supports the code review verdict despite that reported failure; otherwise request changes with the failure in findings. Complete opaque artifacts are reviewable by their workspace path, SHA-256, size, checkpoint-bound delta, and passed validation; do not require textual source for a binary file. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -195,7 +212,9 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
         evidenceId: item.evidenceId,
         checkpointId: item.data.checkpointId,
         delta: item.data.delta,
-        diff: item.data.reviewDiff ?? "[diff artifact unavailable]"
+        diff: item.data.reviewDiff ?? "[diff artifact unavailable]",
+        reviewDiffPaths: item.data.reviewDiffPaths ?? [],
+        opaqueArtifacts: item.data.opaqueArtifacts ?? []
       })),
       validations: input.validations.map((item) => ({ status: item.status, summary: item.summary, data: item.data }))
     })
@@ -208,7 +227,7 @@ function reviewEvidence(
   response: ModelResponse
 ): ReviewEvidence {
     const parsed = responseObject(response.message.content);
-    const inputProblem = incompleteReviewInput(input);
+    const inputProblem = reviewInputFailure(input);
     const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
     const validFindings = rawFindings !== undefined;
     const verdict = !inputProblem && validFindings && parsed?.verdict === "approved" ? "approved" : "changes_requested";

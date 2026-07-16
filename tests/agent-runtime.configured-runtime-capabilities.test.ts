@@ -61,8 +61,10 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
   fixtures.push(root);
   const modulePath = path.join(root, "packages", "agent-runtime", "dist", "execution-composition.js");
   const executable = path.join(root, "bin", "node");
+  const runtimeRoot = path.join(root, "lib");
   await mkdir(path.dirname(modulePath), { recursive: true });
   await mkdir(path.dirname(executable), { recursive: true });
+  await mkdir(runtimeRoot, { recursive: true });
   await writeFile(modulePath, "export {};\n", "utf8");
   await writeFile(executable, "portable node", "utf8");
   const configured = path.join(root, "configured", "node");
@@ -77,6 +79,7 @@ it("binds a host-loaded portable runtime to its canonical bundled Node file", as
     executable: path.resolve(executable),
     aliases: ["node"],
     executionRoots: [path.resolve(executable)],
+    runtimeRoots: [path.resolve(runtimeRoot)],
     pathEntries: []
   }]);
 });

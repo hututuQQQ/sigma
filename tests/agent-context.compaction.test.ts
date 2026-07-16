@@ -80,6 +80,23 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expectWireSafe(retained);
   });
 
+  it("proactively compacts old tool results before a large provider window fills", () => {
+    const history: ModelMessage[] = [{ role: "user", content: "Keep working from the durable evidence." }];
+    for (let index = 0; index < 96; index += 1) {
+      history.push(...toolLoop(index, `observation-${index} ${"large output ".repeat(500)}`));
+    }
+
+    const result = plan(history, 128_000, 8_000);
+    const retained = retainedHistory(result);
+
+    expect(result.omittedHistoryTurns).toBeGreaterThan(0);
+    expect(result.budget.historyTokens).toBeLessThanOrEqual(24_000);
+    expect(result.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
+    expect(retained.some((message) => message.role === "tool" && message.toolCallId === "call-0")).toBe(false);
+    expect(retained.some((message) => message.role === "tool" && message.toolCallId === "call-95")).toBe(true);
+    expectWireSafe(retained);
+  });
+
   it("retains raw blocks as a contiguous newest-first suffix around the latest user", () => {
     const history: ModelMessage[] = [{ role: "user", content: "Keep the original acceptance criteria." }];
     for (let index = 0; index < 10; index += 1) {

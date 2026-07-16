@@ -10,6 +10,7 @@ export type InfrastructureFailureFamilyV1 =
   | "execution_broker"
   | "execution_sandbox"
   | "execution_capability"
+  | "execution_dependency"
   | "execution_output_encoding"
   | "execution_timeout";
 
@@ -50,6 +51,8 @@ const CODE_FAMILY_V1: Readonly<Record<string, InfrastructureFailureFamilyV1>> = 
   runtime_unavailable: "execution_capability",
   toolchain_unavailable: "execution_capability",
 
+  dependency_missing: "execution_dependency",
+
   invalid_output_encoding: "execution_output_encoding",
   output_decode_error: "execution_output_encoding",
   output_encoding_unsupported: "execution_output_encoding",
@@ -67,6 +70,8 @@ export function normalizeInfrastructureFailureCodeV1(value: string): string {
 /**
  * Classify stable diagnostic codes without inferring infrastructure failure
  * from generic policy denials, exit statuses, messages, paths, or task data.
+ * Execution adapters may emit dependency_missing after recognizing a
+ * language-runtime's stable missing-dependency diagnostic syntax.
  */
 export function classifyInfrastructureFailureCodesV1(
   values: readonly string[]

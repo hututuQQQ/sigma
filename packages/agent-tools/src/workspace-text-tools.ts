@@ -19,7 +19,9 @@ import {
 async function writableTarget(workspacePath: string, requestedPath: string): Promise<string> {
   const workspace = await realpath(workspacePath);
   const target = await resolveWorkspacePath(workspacePath, requestedPath);
-  const segments = path.relative(workspace, target).split(path.sep).filter(Boolean);
+  const relative = path.relative(workspace, target).split(path.sep).filter(Boolean).join("/");
+  if (!relative) throw Object.assign(new Error("Workspace root is not a writable file."), { code: "protected_path" });
+  const segments = relative.split("/");
   if (segments.some((segment) => {
     const normalized = segment.toLowerCase();
     return normalized === ".git" || normalized === ".agent";
@@ -28,7 +30,7 @@ async function writableTarget(workspacePath: string, requestedPath: string): Pro
       code: "protected_path"
     });
   }
-  return target;
+  return relative;
 }
 
 class EditPreconditionError extends Error {}
@@ -140,17 +142,18 @@ async function probeExactTextNoChange(
   transform: (content: string) => string
 ): Promise<ToolReceipt | undefined> {
   const startedAt = new Date().toISOString();
-  const target = await writableTarget(context.workspacePath, relative);
-  const loaded = await stableTextIfPresent(context.workspacePath, relative, context.signal, target);
+  const normalizedRelative = await writableTarget(context.workspacePath, relative);
+  const target = await resolveWorkspacePath(context.workspacePath, normalizedRelative);
+  const loaded = await stableTextIfPresent(context.workspacePath, normalizedRelative, context.signal, target);
   if (!loaded) return undefined;
   const replacement = Buffer.from(transform(loaded.content), "utf8");
   if (!loaded.bytes.equals(replacement)) return undefined;
   return receipt(request, startedAt, {
-    output: JSON.stringify({ status: "no_change", path: relative }),
-    result: { status: "no_change", path: relative },
+    output: JSON.stringify({ status: "no_change", path: normalizedRelative }),
+    result: { status: "no_change", path: normalizedRelative },
     observedEffects: ["filesystem.read"],
     actualEffects: ["filesystem.read"],
-    evidence: [noChangeDiagnostic(request, context, source, relative)]
+    evidence: [noChangeDiagnostic(request, context, source, normalizedRelative)]
   });
 }
 
@@ -193,8 +196,7 @@ function writeTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
-      const relative = stringArg(input, "path");
-      await writableTarget(context.workspacePath, relative);
+      const relative = await writableTarget(context.workspacePath, stringArg(input, "path"));
       const result = await replaceWorkspaceTextFile(context.workspacePath, relative, {
         ...(atomicPatchStateRootDir ? { stateRootDir: atomicPatchStateRootDir } : {}),
         signal: context.signal,
@@ -254,8 +256,7 @@ function editTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const input = args(request.arguments);
-      const relative = stringArg(input, "path");
-      await writableTarget(context.workspacePath, relative);
+      const relative = await writableTarget(context.workspacePath, stringArg(input, "path"));
       const oldText = stringArg(input, "oldText");
       let result: Awaited<ReturnType<typeof replaceWorkspaceTextFile>>;
       try {

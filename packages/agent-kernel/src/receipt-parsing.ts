@@ -1,12 +1,16 @@
+import { createHash } from "node:crypto";
 import {
   isEvidenceRecord,
   isJsonValue,
   type JsonValue,
+  type ArtifactRef,
   type ToolEffect,
   type ToolOutcome,
   type ToolReceipt,
   type WorkspaceDelta
 } from "agent-protocol";
+
+const MAX_RECEIPT_TEXT_CHARS = 12_000;
 
 function text(value: JsonValue | undefined): string {
   return typeof value === "string" ? value : "";
@@ -14,6 +18,35 @@ function text(value: JsonValue | undefined): string {
 
 function stringArray(value: JsonValue | undefined): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function artifactRefs(value: JsonValue | undefined): ArtifactRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    if (typeof entry.artifactId !== "string" || typeof entry.name !== "string" || typeof entry.digest !== "string") return [];
+    return [{
+      artifactId: entry.artifactId,
+      name: entry.name,
+      digest: entry.digest,
+      ...(typeof entry.mediaType === "string" ? { mediaType: entry.mediaType } : {}),
+      ...(typeof entry.sizeBytes === "number" ? { sizeBytes: entry.sizeBytes } : {})
+    }];
+  });
+}
+
+function boundedText(value: string, maximum = MAX_RECEIPT_TEXT_CHARS): string {
+  if (value.length <= maximum) return value;
+  const digest = createHash("sha256").update(value, "utf8").digest("hex");
+  const marker = `\n...[receipt output omitted; chars=${value.length}; sha256=${digest}]...\n`;
+  const available = Math.max(0, maximum - marker.length);
+  const head = Math.floor(available / 2);
+  const tail = available - head;
+  return `${value.slice(0, head)}${marker}${tail > 0 ? value.slice(-tail) : ""}`;
+}
+
+function boundedJson(value: JsonValue): string {
+  return boundedText(JSON.stringify(value));
 }
 
 function toolEffects(value: JsonValue | undefined): ToolEffect[] {
@@ -59,6 +92,7 @@ export function toolReceipt(value: unknown): ToolReceipt | null {
     ...(actualEffects ? { actualEffects } : {}),
     ...(delta ? { workspaceDelta: delta } : {}),
     artifacts: stringArray(item.artifacts),
+    ...(artifactRefs(item.artifactRefs).length > 0 ? { artifactRefs: artifactRefs(item.artifactRefs) } : {}),
     diagnostics: stringArray(item.diagnostics),
     evidence: Array.isArray(item.evidence) ? item.evidence.filter(isEvidenceRecord) : [],
     startedAt: text(item.startedAt),
@@ -70,7 +104,17 @@ export function receiptContent(receipt: ToolReceipt): string {
   const heading = `${receipt.ok ? "Successful" : "Failed"} tool receipt ID: ${receipt.callId}`;
   // Preserve the V2 projection for old durable events. Runtime-normalized V3
   // receipts always carry outcome and receive a bounded machine-readable summary.
-  if (!receipt.outcome) return `${heading}\n${receipt.output}`;
+  const output = boundedText(receipt.output);
+  const artifacts = (receipt.artifactRefs ?? []).slice(0, 32).map((artifact) => ({
+    artifactId: artifact.artifactId,
+    name: artifact.name,
+    digest: artifact.digest,
+    ...(artifact.mediaType ? { mediaType: artifact.mediaType } : {}),
+    ...(artifact.sizeBytes === undefined ? {} : { sizeBytes: artifact.sizeBytes })
+  }));
+  if (!receipt.outcome) {
+    return `${heading}\n${output}${artifacts.length > 0 ? `\nArtifacts (JSON): ${JSON.stringify(artifacts)}` : ""}`;
+  }
   const summary = {
     outcome: {
       status: receipt.outcome.status,
@@ -83,8 +127,10 @@ export function receiptContent(receipt: ToolReceipt): string {
       status: item.status,
       summary: item.summary.slice(0, 240)
     })),
-    ...(receipt.result === undefined ? {} : { result: receipt.result }),
-    ...(receipt.workspaceDelta ? { workspaceDelta: receipt.workspaceDelta } : {})
+    ...(receipt.result === undefined ? {} : { result: boundedJson(receipt.result) }),
+    ...(receipt.workspaceDelta ? { workspaceDelta: receipt.workspaceDelta } : {}),
+    ...(receipt.artifacts.length > 0 ? { artifactIds: receipt.artifacts.slice(0, 32) } : {}),
+    ...(artifacts.length > 0 ? { artifactRefs: artifacts } : {})
   };
-  return `${heading}\nReceipt summary (JSON): ${JSON.stringify(summary)}\nOutput:\n${receipt.output}`;
+  return `${heading}\nReceipt summary (JSON): ${JSON.stringify(summary)}\nOutput:\n${output}`;
 }

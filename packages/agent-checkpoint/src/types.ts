@@ -35,6 +35,21 @@ export interface CheckpointDelta {
   deleted: string[];
 }
 
+/** Stable post/pre-image identity for a changed non-text file. The content is
+ * intentionally opaque to reviewers; the checkpoint CAS digest and byte size
+ * are the evidence, not a lossy textual preview. */
+export interface CheckpointOpaqueArtifact {
+  path: string;
+  before?: { digest: string; sizeBytes: number };
+  after?: { digest: string; sizeBytes: number };
+}
+
+export interface CheckpointReviewMaterial {
+  reviewDiff: string;
+  reviewDiffPaths: string[];
+  opaqueArtifacts: CheckpointOpaqueArtifact[];
+}
+
 export interface CheckpointRecord {
   schemaVersion: 1;
   checkpointId: string;

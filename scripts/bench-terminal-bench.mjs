@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { cleanupHarborDockerResources } from "./harbor-docker-cleanup.mjs";
 import {
   benchRootDir,
   buildCommandScript,
@@ -26,12 +28,17 @@ import {
   resolveRunOptions,
   rootDir,
   runProcess,
+  safePathPart,
   terminalBenchDataset,
   writeJson
 } from "./bench-common.mjs";
 
 function statusFromExitCode(exitCode) {
   return exitCode === 0 ? "passed" : "failed";
+}
+
+async function sha256File(filePath) {
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
 
 async function writeRunFiles(runDir, config, harborCommand, harborArgs, env) {
@@ -71,8 +78,12 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   if (options.mode === "task" && !options.taskId) {
     throw new Error("Task mode requires --task-id <task-id>.");
   }
+  if (options.mode === "batch" && options.tasks.length === 0) {
+    throw new Error("Batch mode requires at least one externally selected task.");
+  }
 
-  const runId = makeRunId(new Date(), options.provider, options.model);
+  const baseRunId = makeRunId(new Date(), options.provider, options.model);
+  const runId = options.runLabel ? `${baseRunId}-${safePathPart(options.runLabel)}` : baseRunId;
   const runDir = path.join(benchRootDir, runId);
   const jobsDir = path.join(runDir, "harbor-jobs");
   const env = harborEnvForRun(runDir);
@@ -80,6 +91,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const runner = deps.runProcess ?? runProcess;
   const packager = deps.packageAgentCli ?? packageAgentCli;
   const harborRuntimePackager = deps.packageHarborRuntime ?? packageHarborRuntime;
+  const dockerCleanup = deps.cleanupHarborDockerResources ?? cleanupHarborDockerResources;
   const harborCommandInfo = deps.resolveHarborCommand?.(env) ?? resolveHarborCommand(env);
   const harborCommand = harborCommandInfo.command;
   await mkdir(runDir, { recursive: true });
@@ -95,7 +107,13 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     model: options.model ?? null,
     dataset: terminalBenchDataset,
     k: options.mode === "k" ? options.k : null,
+    n_concurrent_trials: options.nConcurrentTrials,
     task_id: options.mode === "task" ? options.taskId : null,
+    tasks_file: options.tasksFile,
+    tasks_file_sha256: options.tasksFileSha256,
+    package_reused: options.reusePackage,
+    expected_agent_cli_sha256: options.expectedArchiveSha256,
+    agent_cli_sha256: null,
     agent_cli_tarball: env.AGENT_CLI_TARBALL,
     harbor_jobs_dir: jobsDir,
     harbor_command: harborCommand,
@@ -110,21 +128,28 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
-  process.stdout.write(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
-  const packageResult = await packager({
-    cwd: rootDir,
-    env: process.env,
-    stdoutPath: path.join(runDir, "package.stdout.log"),
-    stderrPath: path.join(runDir, "package.stderr.log"),
-    rawPath: path.join(runDir, "package.raw.log")
-  });
-  if (packageResult.exitCode !== 0) {
-    return await failBeforeHarbor(
-      runDir,
-      config,
-      `pnpm package:agent-cli failed with exit code ${packageResult.exitCode}. See package.raw.log.`,
-      packageResult.exitCode
-    );
+  if (options.reusePackage) {
+    process.stdout.write(`Reusing SHA-pinned Sigma agent CLI archive...\n`);
+    await writeFile(path.join(runDir, "package.stdout.log"), "Reused existing SHA-pinned archive.\n", "utf8");
+    await writeFile(path.join(runDir, "package.stderr.log"), "", "utf8");
+    await writeFile(path.join(runDir, "package.raw.log"), "package_reused: true\n", "utf8");
+  } else {
+    process.stdout.write(`Packaging Sigma agent CLI for Terminal-Bench...\n`);
+    const packageResult = await packager({
+      cwd: rootDir,
+      env: process.env,
+      stdoutPath: path.join(runDir, "package.stdout.log"),
+      stderrPath: path.join(runDir, "package.stderr.log"),
+      rawPath: path.join(runDir, "package.raw.log")
+    });
+    if (packageResult.exitCode !== 0) {
+      return await failBeforeHarbor(
+        runDir,
+        config,
+        `pnpm package:agent-cli failed with exit code ${packageResult.exitCode}. See package.raw.log.`,
+        packageResult.exitCode
+      );
+    }
   }
 
   if (!existsSync(env.AGENT_CLI_TARBALL)) {
@@ -132,6 +157,18 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       runDir,
       config,
       `AGENT_CLI_TARBALL does not exist after packaging: ${env.AGENT_CLI_TARBALL}`,
+      1
+    );
+  }
+
+  const agentCliSha256 = await sha256File(env.AGENT_CLI_TARBALL);
+  config = { ...config, agent_cli_sha256: agentCliSha256 };
+  await writeJson(path.join(runDir, "config.json"), config);
+  if (options.expectedArchiveSha256 && agentCliSha256 !== options.expectedArchiveSha256) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `Agent CLI archive SHA-256 ${agentCliSha256} does not match frozen ${options.expectedArchiveSha256}.`,
       1
     );
   }
@@ -265,6 +302,17 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
 
+  const cleanupBefore = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
+  await writeJson(path.join(runDir, "docker-cleanup-before.json"), cleanupBefore);
+  if (!cleanupBefore.clean) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      "Docker resource preflight failed; refusing to start Harbor while run-scoped resources cannot be cleaned.",
+      1
+    );
+  }
+
   process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
   const harborResult = await runner(harborCommand, harborArgs, {
     cwd: rootDir,
@@ -273,13 +321,20 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     stderrPath: path.join(runDir, "harbor.stderr.log"),
     rawPath: path.join(runDir, "result.raw.log")
   });
+  const cleanupAfter = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
+  await writeJson(path.join(runDir, "docker-cleanup-after.json"), cleanupAfter);
 
   const finishedAt = new Date().toISOString();
+  const effectiveExitCode = cleanupAfter.clean ? harborResult.exitCode : 1;
   config = {
     ...config,
     finished_at: finishedAt,
-    exit_code: harborResult.exitCode,
-    status: statusFromExitCode(harborResult.exitCode)
+    exit_code: effectiveExitCode,
+    status: statusFromExitCode(effectiveExitCode),
+    docker_cleanup: cleanupAfter,
+    notes: cleanupAfter.clean
+      ? config.notes
+      : [...config.notes, "Run-scoped Docker resources remained after Harbor exited."]
   };
   await writeJson(path.join(runDir, "config.json"), config);
   await ensurePlaceholderTask(runDir, {
@@ -293,11 +348,11 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   process.stdout.write(`Benchmark artifacts: ${runDir}\n`);
   process.stdout.write(`Report: ${path.join(runDir, "report.md")}\n`);
   const exitCode = report?.status === "passed"
-    ? 0
-    : harborResult?.exitCode && harborResult.exitCode !== 0
-      ? harborResult.exitCode
+    ? cleanupAfter.clean ? 0 : 1
+    : effectiveExitCode && effectiveExitCode !== 0
+      ? effectiveExitCode
       : 1;
-  return { exitCode, runDir, report };
+  return { exitCode, runDir, report, dockerCleanup: cleanupAfter };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

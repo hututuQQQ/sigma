@@ -190,6 +190,26 @@ async function writeMinimalExecutable(
   await writeFile(filePath, header);
 }
 
+async function writeDynamicLinuxExecutable(filePath: string) {
+  const interpreter = Buffer.from("/lib64/ld-linux-x86-64.so.2\0", "utf8");
+  const bytes = Buffer.alloc(160);
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46]).copy(bytes, 0);
+  bytes[4] = 2;
+  bytes[5] = 1;
+  bytes[6] = 1;
+  bytes.writeUInt16LE(3, 16);
+  bytes.writeUInt16LE(0x003e, 18);
+  bytes.writeBigUInt64LE(64n, 32);
+  bytes.writeUInt16LE(64, 52);
+  bytes.writeUInt16LE(56, 54);
+  bytes.writeUInt16LE(1, 56);
+  bytes.writeUInt32LE(3, 64);
+  bytes.writeBigUInt64LE(120n, 72);
+  bytes.writeBigUInt64LE(BigInt(interpreter.length), 96);
+  interpreter.copy(bytes, 120);
+  await writeFile(filePath, bytes);
+}
+
 async function writeV3PackageFixture(
   brokerTarget: "linux" | "win32" = "linux",
   brokerArch: "x64" | "arm64" = "x64"
@@ -599,6 +619,33 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("sigma-exec binary target mismatch: expected linux-x64, detected linux-arm64");
   });
 
+  it("rejects a dynamically linked Linux broker", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    await writeDynamicLinuxExecutable(broker);
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+
+    await expect(packageAgentCli({
+      rootDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        SIGMA_EXEC_BINARY: broker
+      }
+    })).rejects.toThrow("Linux sigma-exec must be a static ELF without a dynamic interpreter");
+  });
+
+  it("rejects a non-Linux host Node disguised as a Linux package runtime", async () => {
+    const { rootDir, broker } = await writeV3PackageFixture("linux");
+    const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
+
+    await expect(packageAgentCli({
+      rootDir,
+      env: {
+        NODE_RUNTIME_TARBALL: runtimeTarball,
+        SIGMA_EXEC_BINARY: broker
+      }
+    })).rejects.toThrow("is not an ELF binary");
+  });
+
   it("packages V3 broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
     const { rootDir, broker, version } = await writeV3PackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
@@ -607,6 +654,7 @@ describe("package-agent-cli", () => {
     const packaged = await packageAgentCli({
       rootDir,
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         NODE_RUNTIME_SHA256: runtimeSha256,
@@ -693,6 +741,7 @@ describe("package-agent-cli", () => {
     const packaged = await packageAgentCli({
       rootDir,
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         SIGMA_EXEC_BINARY: broker
@@ -724,6 +773,7 @@ describe("package-agent-cli", () => {
     const packaged = await packageAgentCli({
       rootDir,
       artifactsDir,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         SIGMA_EXEC_BINARY: broker
@@ -781,6 +831,7 @@ describe("package-agent-cli", () => {
       rootDir,
       artifactsDir,
       releaseSigningPrivateKey: releaseKey.privateKey,
+      allowNonElfLinuxNodeFixture: true,
       env: {
         NODE_RUNTIME_TARBALL: runtimeTarball,
         SIGMA_EXEC_BINARY: broker
@@ -966,7 +1017,7 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("target wrapper smoke is required");
   });
 
-  it("can verify the Linux wrapper through WSL on Windows hosts", () => {
+  it("can explicitly verify the Linux wrapper through WSL on Windows hosts", () => {
     const calls: Array<{ command: string; args: string[] }> = [];
     const spawnSync = (command: string, args: string[]) => {
       calls.push({ command, args });
@@ -991,6 +1042,7 @@ describe("package-agent-cli", () => {
 
     const report = runTargetWrapperVersion("D:\\sigma\\.artifacts\\agent-cli-linux-x64", "x64", {
       platform: "win32",
+      linuxTargetTransport: "wsl",
       spawnSync
     });
 
@@ -1009,6 +1061,40 @@ describe("package-agent-cli", () => {
       }
     });
     expect(calls.map((call) => call.command)).toEqual(["wsl", "wsl", "wsl", "wsl"]);
+  });
+
+  it("verifies the Linux wrapper through a fixed Docker image by default on Windows", () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const spawnSync = (command: string, args: string[]) => {
+      calls.push({ command, args });
+      if (command === "docker" && args[0] === "version") {
+        return { status: 0, stdout: "29.5.3\n", stderr: "" };
+      }
+      if (command === "docker" && args[0] === "run") {
+        return {
+          status: 0,
+          stdout: `${JSON.stringify({ product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } })}\n`,
+          stderr: ""
+        };
+      }
+      return { status: 1, stdout: "", stderr: `unexpected call ${command} ${args.join(" ")}` };
+    };
+
+    const report = runTargetWrapperVersion("D:\\sigma\\.artifacts\\agent-cli-linux-x64", "x64", {
+      platform: "win32",
+      spawnSync
+    });
+
+    expect(report).toMatchObject({
+      ok: true,
+      status: "passed",
+      transport: "docker",
+      dockerVersion: "29.5.3",
+      version: { product: "Sigma Code", package: { name: "agent-cli", version: "2.0.0" } }
+    });
+    expect(calls.map((call) => call.command)).toEqual(["docker", "docker"]);
+    expect(calls[1].args).toContain("linux/amd64");
+    expect(calls[1].args.some((arg) => arg.includes("rockylinux:8@sha256:"))).toBe(true);
   });
 
   it("can verify the Windows wrapper through agent.cmd on Windows hosts", () => {
@@ -1059,6 +1145,7 @@ describe("package-agent-cli", () => {
 
     expect(runTargetWrapperVersion("D:\\sigma\\.artifacts\\agent-cli-linux-x64", "x64", {
       platform: "win32",
+      linuxTargetTransport: "wsl",
       spawnSync
     })).toMatchObject({
       ok: false,

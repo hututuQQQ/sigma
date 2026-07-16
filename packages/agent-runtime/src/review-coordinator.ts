@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import type {
-  BudgetReservation,
-  EvidenceRecord,
-  ReviewEvidence,
-  UsageRecord,
-  ValidationEvidence,
-  WorkspaceDeltaEvidence
+import {
+  evidenceSupportsClaim,
+  type BudgetReservation,
+  type EvidenceRecord,
+  type ReviewEvidence,
+  type UsageRecord,
+  type ValidationEvidence,
+  type WorkspaceDeltaEvidence
 } from "agent-protocol";
 import type { BudgetController } from "./budget-controller.js";
 import { consumedBudget } from "./model-accounting.js";
@@ -13,11 +14,16 @@ import type { RuntimeSession } from "./types.js";
 import {
   documentationOnly,
   isAccountableReviewer,
+  reviewInputFailure,
+  reviewInputFailureEvidence,
   type AccountableReviewerPort,
   type ReviewerInput,
   type ReviewerPort
 } from "./reviewer.js";
-import { validationCoversDelta } from "./validation-policy.js";
+import {
+  latestValidationExecutionForDelta,
+  validationExecutionCoversDelta
+} from "./validation-policy.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { sessionMutationEvidence } from "./mutation-evidence.js";
@@ -123,6 +129,18 @@ function activeReservation(session: RuntimeSession, ownerId: string): BudgetRese
     item.ownerId === ownerId && item.status !== "released");
 }
 
+function suppressDuplicateReview(
+  evidence: readonly EvidenceRecord[],
+  deltaIds: readonly string[],
+  validationIds: readonly string[],
+  retryableReview: ReviewEvidence | undefined,
+  explicitlyRequested: boolean
+): boolean {
+  const matchingReviews = evidence.filter((item) => sameReviewInput(item, deltaIds, validationIds));
+  const allowedRetryCount = explicitlyRequested && retryableReview ? 1 : 0;
+  return matchingReviews.length > allowedRetryCount;
+}
+
 export interface ReviewReadiness {
   pending: WorkspaceDeltaEvidence[];
   eligible: WorkspaceDeltaEvidence[];
@@ -137,16 +155,22 @@ export interface ReviewReadiness {
 export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
   const evidence = sessionMutationEvidence(session);
   const waivedIds = reviewerWaivedDeltaIds(evidence);
-  const reviewedIds = new Set(evidence.flatMap((item) => item.kind === "review" && item.status === "passed"
-    && item.data.verdict === "approved"
-    ? item.data.workspaceDeltaEvidenceIds : []));
+  const validations = evidence.filter((item): item is ValidationEvidence =>
+    item.kind === "validation" && evidenceSupportsClaim(item, "validation_executed"));
+  const reviewedIds = new Set(evidence.flatMap((item) => {
+    if (item.kind !== "review" || item.status !== "passed" || item.data.verdict !== "approved") return [];
+    return item.data.workspaceDeltaEvidenceIds.filter((deltaId) => {
+      const delta = evidence.find((candidate): candidate is WorkspaceDeltaEvidence =>
+        candidate.kind === "workspace_delta" && candidate.evidenceId === deltaId);
+      const latest = delta ? latestValidationExecutionForDelta(validations, delta) : undefined;
+      return latest?.status !== "failed" || item.data.validationEvidenceIds?.includes(latest.evidenceId);
+    });
+  }));
   const pending = evidence.filter((item): item is WorkspaceDeltaEvidence =>
     item.kind === "workspace_delta" && item.status === "passed"
     && !documentationOnly(item) && !reviewedIds.has(item.evidenceId) && !waivedIds.has(item.evidenceId));
-  const validations = evidence.filter((item): item is ValidationEvidence =>
-    item.kind === "validation" && item.status === "passed");
   const eligible = pending.filter((delta) => validations.some((validation) =>
-    validationCoversDelta(validation, delta)));
+    validationExecutionCoversDelta(validation, delta)));
   const eligibleIds = new Set(eligible.map((item) => item.evidenceId));
   const relevantValidations = validations.filter((item) =>
     item.data.workspaceDeltaEvidenceIds.some((evidenceId) => eligibleIds.has(evidenceId)));
@@ -210,6 +234,36 @@ export class ReviewCoordinator {
       workspaceDeltas: eligible,
       validations: relevantValidations
     };
+    // An interrupted accountable review has a durable reservation that must
+    // be recovered before input validation or duplicate suppression.
+    if (await this.recoverActiveAccountableReview(
+      session, reviewer, reviewerId, input, evidence, signal
+    )) return;
+    const inputProblem = reviewInputFailure(input);
+    if (inputProblem) {
+      await this.emit(session, "review.completed", "runtime", normalizeReview(
+        session,
+        reviewInputFailureEvidence(input, reviewerId, inputProblem),
+        eligible,
+        relevantValidations
+      ));
+      return;
+    }
+    // A review is keyed by the exact workspace-delta and validation evidence
+    // it consumed. Re-requesting the same input cannot add information and
+    // only creates duplicate reviewer calls; any new evidence ID naturally
+    // produces a different input and remains eligible.
+    // Preserve the established explicit one-time retry for a retryable
+    // infrastructure review. Once that retry is recorded, further requests
+    // with the same evidence are duplicates until a new delta/validation ID
+    // appears.
+    if (suppressDuplicateReview(
+      evidence,
+      [...eligibleIds],
+      relevantValidations.map((validation) => validation.evidenceId),
+      retryableReview,
+      explicitlyRequested
+    )) return;
     if (this.budgets && isAccountableReviewer(reviewer)) {
       await this.reviewAccounted(session, reviewer, reviewerId, input, evidence, signal);
       return;
@@ -234,6 +288,26 @@ export class ReviewCoordinator {
     await this.emit(session, "review.completed", "runtime", normalizeReview(
       session, rawReview, eligible, relevantValidations
     ));
+  }
+
+  private async recoverActiveAccountableReview(
+    session: RuntimeSession,
+    reviewer: ReviewerPort,
+    reviewerId: string,
+    input: ReviewerInput,
+    evidence: readonly EvidenceRecord[],
+    signal: AbortSignal
+  ): Promise<boolean> {
+    if (!this.budgets || !isAccountableReviewer(reviewer)) return false;
+    const requestId = requestIdentity(
+      session,
+      reviewerId,
+      input.workspaceDeltas.map((item) => item.evidenceId),
+      evidence
+    );
+    if (!activeReservation(session, `reviewer:${requestId}`)) return false;
+    await this.reviewAccounted(session, reviewer, reviewerId, input, evidence, signal);
+    return true;
   }
 
   private async reviewAccounted(

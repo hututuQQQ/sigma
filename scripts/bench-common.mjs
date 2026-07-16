@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -8,6 +9,10 @@ export const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 export const artifactsDir = path.join(rootDir, ".artifacts");
 export const benchRootDir = path.join(artifactsDir, "bench");
 export const harborRuntimeDir = path.join(artifactsDir, "harbor-runtime");
+export const harborSandboxComposePath = path.join(
+  harborRuntimeDir,
+  "docker-compose-sigma-sandbox.yaml"
+);
 export const terminalBenchDataset = "terminal-bench/terminal-bench-2";
 export const portableAgentImportPath = "sigma_harbor_agent:SigmaCliHarborAgent";
 export const agentImportPath = portableAgentImportPath;
@@ -22,8 +27,9 @@ export const defaultAgentTimeoutLeniencyMultiplier = 1.5;
 export const defaultAgentTimeoutLeniencyMinExtraSec = 600;
 export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
+export const defaultConcurrentTrials = 5;
 
-const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "unknown"];
+const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "needs_input", "tool_error", "verifier_failure", "unknown"];
 const FAILURE_COUNT_BUCKETS = new Map([
   ["host_proxy_error", "infra_failed"],
   ["host_encoding_error", "infra_failed"],
@@ -31,6 +37,10 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["node_missing", "infra_failed"],
   ["agent_setup_failed", "infra_failed"],
   ["api_error", "api_error"],
+  ["needs_input", "needs_input"],
+  ["timeout", "timeout"],
+  ["tool_error", "tool_error"],
+  ["verifier_failure", "verifier_failure"],
   ["agent_timeout", "timeout"],
   ["max_turns", "timeout"],
   ["tool_timeout", "timeout"],
@@ -45,6 +55,10 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["node_missing", "package-agent-cli"],
   ["agent_setup_failed", "portable/harbor"],
   ["api_error", "agent-model"],
+  ["needs_input", "agent-runtime"],
+  ["timeout", "agent-runtime"],
+  ["tool_error", "agent-tools"],
+  ["verifier_failure", "agent-runtime"],
   ["agent_timeout", "agent-runtime"],
   ["max_turns", "agent-runtime"],
   ["tool_timeout", "agent-tools"],
@@ -204,19 +218,104 @@ function asOptionalPositiveInt(value, name) {
   return parsed;
 }
 
+function asNonNegativeInt(value, fallback, name) {
+  if (value === undefined || value === null || value === true || value === "") return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer.`);
+  return parsed;
+}
+
+function networkMode(value, fallback = "none") {
+  const mode = asString(value, fallback);
+  if (mode !== "none" && mode !== "full") throw new Error("network mode must be none or full.");
+  return mode;
+}
+
+function normalizedSha256(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  const text = String(value).trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/u.test(text)) throw new Error(`${name} must be a SHA-256 digest.`);
+  return text;
+}
+
+function validateTaskRecord(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`tasks-file[${index}] must be an object.`);
+  }
+  const allowed = new Set(["name", "path", "git_url", "git_commit_id", "source"]);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) throw new Error(`tasks-file[${index}] has unsupported fields: ${unknown.join(", ")}.`);
+  const name = asString(value.name);
+  const taskPath = asString(value.path);
+  if (Boolean(name) === Boolean(taskPath)) {
+    throw new Error(`tasks-file[${index}] must contain exactly one of name or path.`);
+  }
+  const gitUrl = asString(value.git_url);
+  const gitCommit = asString(value.git_commit_id);
+  if (Boolean(gitUrl) !== Boolean(gitCommit)) {
+    throw new Error(`tasks-file[${index}] git_url and git_commit_id must be supplied together.`);
+  }
+  if (gitCommit && !/^[a-f0-9]{40}$/u.test(gitCommit)) {
+    throw new Error(`tasks-file[${index}].git_commit_id must be a lowercase 40-character Git commit.`);
+  }
+  return {
+    ...(name ? { name } : { path: taskPath }),
+    ...(gitUrl ? { git_url: gitUrl, git_commit_id: gitCommit } : {}),
+    ...(asString(value.source) ? { source: asString(value.source) } : {})
+  };
+}
+
+export function readTaskSelectionFile(filePath) {
+  if (!filePath) return [];
+  const resolved = path.resolve(filePath);
+  const parsed = JSON.parse(readFileSync(resolved, "utf8"));
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("--tasks-file must contain a non-empty JSON array.");
+  }
+  const tasks = parsed.map(validateTaskRecord);
+  const identities = tasks.map((task) => task.name ?? `${task.git_url}\0${task.git_commit_id}\0${task.path}`);
+  if (new Set(identities).size !== identities.length) throw new Error("--tasks-file contains duplicate tasks.");
+  return tasks;
+}
+
 export function resolveRunOptions(argv, env = process.env) {
   const flags = parseArgs(argv);
   const mode = flags.smoke ? "smoke" : asString(flags.mode, "k");
-  if (!["smoke", "k", "task"].includes(mode)) {
+  if (!["smoke", "k", "task", "batch"].includes(mode)) {
     throw new Error(`Unsupported benchmark mode: ${mode}`);
+  }
+
+  const tasksFile = asString(flags["tasks-file"]);
+  const tasks = tasksFile ? readTaskSelectionFile(tasksFile) : [];
+  if (mode === "batch" && tasks.length === 0) throw new Error("Batch mode requires --tasks-file <json>.");
+  if (mode !== "batch" && tasks.length > 0) throw new Error("--tasks-file requires --mode batch.");
+  const expectedArchiveSha256 = normalizedSha256(
+    flags["expected-archive-sha256"], "--expected-archive-sha256"
+  );
+  if (flags["reuse-package"] === true && !expectedArchiveSha256) {
+    throw new Error("--reuse-package requires --expected-archive-sha256.");
   }
 
   return {
     mode,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
+    networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
+    runLabel: asString(flags["run-label"]),
     k: asPositiveInt(flags.k, 1, "--k"),
+    nConcurrentTrials: asPositiveInt(
+      flags.concurrency ?? env.AGENT_BENCH_CONCURRENCY,
+      defaultConcurrentTrials,
+      "--concurrency"
+    ),
     taskId: asString(flags["task-id"]),
+    tasksFile: tasksFile ? path.resolve(tasksFile) : null,
+    tasksFileSha256: tasksFile
+      ? createHash("sha256").update(readFileSync(path.resolve(tasksFile))).digest("hex")
+      : null,
+    tasks,
+    reusePackage: flags["reuse-package"] === true,
+    expectedArchiveSha256,
     maxTurns: asPositiveInt(env.AGENT_MAX_TURNS, 200, "AGENT_MAX_TURNS"),
     maxTurnsExplicit: env.AGENT_MAX_TURNS !== undefined && env.AGENT_MAX_TURNS !== null && env.AGENT_MAX_TURNS !== "",
     commandTimeoutSec: asPositiveInt(env.AGENT_COMMAND_TIMEOUT_SEC, 180, "AGENT_COMMAND_TIMEOUT_SEC"),
@@ -227,14 +326,14 @@ export function resolveRunOptions(argv, env = process.env) {
       "AGENT_TIMEOUT_GRACE_SEC"
     ),
     agentTimeoutLeniencyMultiplier: asPositiveNumber(
-      env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER,
+      flags["timeout-leniency-multiplier"] ?? env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER,
       defaultAgentTimeoutLeniencyMultiplier,
-      "AGENT_TIMEOUT_LENIENCY_MULTIPLIER"
+      "--timeout-leniency-multiplier"
     ),
-    agentTimeoutLeniencyMinExtraSec: asPositiveInt(
-      env.AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC,
+    agentTimeoutLeniencyMinExtraSec: asNonNegativeInt(
+      flags["timeout-leniency-min-extra-sec"] ?? env.AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC,
       defaultAgentTimeoutLeniencyMinExtraSec,
-      "AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC"
+      "--timeout-leniency-min-extra-sec"
     )
   };
 }
@@ -315,6 +414,11 @@ function asFinitePositiveNumber(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function asFiniteNonNegativeNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function maxProbeNumber(timeoutProbe, key) {
   const direct = asFinitePositiveNumber(timeoutProbe?.[`max_${key}`]);
   if (direct !== null) return direct;
@@ -341,7 +445,9 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     asFinitePositiveNumber(options.agentTimeoutLeniencyMultiplier) ?? defaultAgentTimeoutLeniencyMultiplier;
   const leniencyMinExtraSec = Math.max(
     0,
-    Math.ceil(asFinitePositiveNumber(options.agentTimeoutLeniencyMinExtraSec) ?? defaultAgentTimeoutLeniencyMinExtraSec)
+    Math.ceil(
+      asFiniteNonNegativeNumber(options.agentTimeoutLeniencyMinExtraSec) ?? defaultAgentTimeoutLeniencyMinExtraSec
+    )
   );
   const lenientAgentWallTimeSec = Math.ceil(
     Math.max(recommendedAgentTimeoutSec * leniencyMultiplier, recommendedAgentTimeoutSec + leniencyMinExtraSec)
@@ -357,9 +463,27 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
+  const taskAgentTimeouts = (Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [])
+    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec))
+    .filter((value) => value !== null);
+  const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
+  const minimumOuterTrialDeadlineSec = taskAgentTimeouts.length > 0
+    ? Math.min(...taskAgentTimeouts) * appliedAgentTimeoutMultiplier
+    : null;
+  const safeChildDeadlineSec = minimumOuterTrialDeadlineSec === null
+    ? agentWallTimeSec
+    : Math.max(1, Math.floor(minimumOuterTrialDeadlineSec - cleanupGraceSec));
+  const effectiveAgentWallTimeSec = Math.min(agentWallTimeSec, safeChildDeadlineSec);
 
   return {
-    agent_wall_time_sec: agentWallTimeSec,
+    requested_agent_wall_time_sec: agentWallTimeSec,
+    agent_wall_time_sec: effectiveAgentWallTimeSec,
+    child_deadline_sec: effectiveAgentWallTimeSec,
+    outer_trial_deadline_sec: minimumOuterTrialDeadlineSec === null
+      ? null
+      : Math.floor(minimumOuterTrialDeadlineSec),
+    deadline_cleanup_grace_sec: cleanupGraceSec,
+    deadline_clamped: effectiveAgentWallTimeSec < agentWallTimeSec,
     agent_timeout_grace_sec: graceSec,
     cleanup_grace_sec: cleanupGraceSec,
     harness_timeout_sec: harnessTimeoutSec,
@@ -401,10 +525,17 @@ function selectedTaskRecords(timeoutProbe) {
     .filter(Boolean);
 }
 
+function harborTaskRecord(task) {
+  if (!task || typeof task !== "object") return task;
+  const { source: _controlPlaneSource, ...record } = task;
+  return record;
+}
+
 function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
-    provider: options.provider
+    provider: options.provider,
+    network_mode: options.networkMode ?? "none"
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -412,6 +543,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
 
   if (timeoutPlan?.agent_wall_time_sec) {
     agentKwargs.max_wall_time_sec = timeoutPlan.agent_wall_time_sec;
+  }
+  if (timeoutPlan?.outer_trial_deadline_sec) {
+    agentKwargs.outer_trial_deadline_sec = timeoutPlan.outer_trial_deadline_sec;
   }
   if (timeoutPlan?.cleanup_grace_sec !== undefined) {
     agentKwargs.agent_timeout_grace_sec = timeoutPlan.cleanup_grace_sec;
@@ -429,6 +563,7 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
 
   const config = {
     jobs_dir: jobsDir,
+    n_concurrent_trials: options.nConcurrentTrials ?? defaultConcurrentTrials,
     agents: [
       {
         name: agentName,
@@ -437,8 +572,21 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
     ]
   };
 
+  if (options.mode !== "smoke") {
+    config.environment = {
+      type: "docker",
+      extra_docker_compose: [path.resolve(options.harborSandboxComposePath ?? harborSandboxComposePath)]
+    };
+  }
+
+  const configuredTasks = Array.isArray(options.tasks) ? options.tasks : [];
   const resolvedTasks = selectedTaskRecords(timeoutProbe);
-  if (resolvedTasks.length > 0) {
+  if (configuredTasks.length > 0) {
+    // Harbor 0.17 does not resolve metrics for explicit task sources. Leaving
+    // source unset selects its supported adhoc Mean metric while Git/path
+    // provenance remains frozen in the external control-plane task file.
+    config.tasks = configuredTasks.map(harborTaskRecord);
+  } else if (resolvedTasks.length > 0) {
     config.tasks = resolvedTasks;
   } else if (options.mode === "task") {
     config.tasks = [{ name: normalizedTerminalBenchTaskName(options.taskId) }];
@@ -550,12 +698,18 @@ export function buildHarborArgs(options) {
 
   args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
+  if (options.networkMode !== undefined) {
+    args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
+  }
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
   }
   args.push("--ak", formatAgentKwarg("max_turns", "int", options.maxTurns, capabilities));
   args.push("--ak", formatAgentKwarg("command_timeout_sec", "int", options.commandTimeoutSec, capabilities));
   args.push("--ak", formatAgentKwarg("max_wall_time_sec", "int", timeoutPlan.agent_wall_time_sec, capabilities));
+  if (timeoutPlan.outer_trial_deadline_sec) {
+    args.push("--ak", formatAgentKwarg("outer_trial_deadline_sec", "int", timeoutPlan.outer_trial_deadline_sec, capabilities));
+  }
   args.push("--ak", formatAgentKwarg("harness_timeout_sec", "int", timeoutPlan.effective_harness_timeout_sec, capabilities));
   return args;
 }
@@ -749,6 +903,13 @@ export function classifyFailure(input = {}) {
   const logText = String(input.logText ?? "");
   const events = input.traceEvents ?? [];
 
+  const declared = input.failureKind
+    ?? input.metadata?.failure_kind
+    ?? summary.failure_kind;
+  if (["needs_input", "timeout", "tool_error", "api_error", "verifier_failure"].includes(declared)) {
+    return declared;
+  }
+
   if (/unknown scheme for proxy url/i.test(logText) || /\bhtpp:\/\//i.test(logText)) return "host_proxy_error";
   if (/unicodeencodeerror/i.test(logText) || /codec can't encode character/i.test(logText) || /illegal multibyte sequence/i.test(logText)) {
     return "host_encoding_error";
@@ -766,7 +927,8 @@ export function classifyFailure(input = {}) {
   if (/node is required|no bundled node and no system node/i.test(logText) || /command -v node/i.test(logText)) {
     return "node_missing";
   }
-  if (/harbor setup failed/i.test(logText) || /\/usr\/local\/bin\/agent --help failed/i.test(logText)) {
+  if (/agent_setup_failed/i.test(logText) || /harbor setup failed/i.test(logText)
+    || /\/usr\/local\/bin\/agent (?:--help|doctor .*--strict).*failed/i.test(logText)) {
     return "agent_setup_failed";
   }
   if (/api request failed|rate limit|missing api key/i.test(logText) || /\b(401|403|429|500)\b/.test(logText)) {
@@ -906,10 +1068,11 @@ function normalizeStatus(value) {
 function taskStatus(summary, metadata, runExitCode) {
   const metadataStatus = normalizeStatus(metadata.status ?? metadata.outcome ?? metadata.result);
   if (metadataStatus) return metadataStatus;
-  if (summary.status === "completed" && runExitCode === 0) return "passed";
+  const taskExitCode = metadata.exit_code ?? runExitCode;
+  if (summary.status === "completed" && taskExitCode === 0) return "passed";
   if (summary.status === "error" || summary.status === "stopped") return "failed";
-  if (runExitCode !== undefined && runExitCode !== 0) return "failed";
-  return runExitCode === 0 ? "passed" : "unknown";
+  if (taskExitCode !== undefined && taskExitCode !== 0) return "failed";
+  return taskExitCode === 0 ? "passed" : "unknown";
 }
 
 function addCount(counts, status, failureCategory) {
@@ -978,6 +1141,7 @@ function summarizeTraceEvents(events) {
     input_tokens: 0,
     output_tokens: 0,
     cache_tokens: 0,
+    cost_usd: null,
     duration_ms: 0,
     last_error: null
   };
@@ -989,6 +1153,8 @@ function summarizeTraceEvents(events) {
       summary.input_tokens += Number(usage.inputTokens ?? usage.input_tokens ?? 0);
       summary.output_tokens += Number(usage.outputTokens ?? usage.output_tokens ?? 0);
       summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens ?? 0);
+      const usageCost = Number(usage.costUsd ?? usage.cost_usd);
+      if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
     }
     if (event?.type === "tool_end" && metadata.toolName === "bash") {
       summary.commands_executed += 1;
@@ -1004,6 +1170,8 @@ function summarizeTraceEvents(events) {
       summary.input_tokens = Number(result.usage?.inputTokens ?? result.input_tokens ?? summary.input_tokens);
       summary.output_tokens = Number(result.usage?.outputTokens ?? result.output_tokens ?? summary.output_tokens);
       summary.cache_tokens = Number(result.usage?.cacheTokens ?? result.cache_tokens ?? summary.cache_tokens);
+      const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
+      summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
       summary.last_error = result.lastError ?? result.last_error ?? summary.last_error;
     }
@@ -1028,24 +1196,6 @@ async function readTrialTraceFallback(runDir, trialDir) {
     agent_trace_summary: summarizeTraceEvents(events),
     agent_trace_events: events
   };
-}
-
-function normalizeTaskKeys(value) {
-  const text = String(value ?? "").trim().toLowerCase();
-  if (!text) return [];
-  const lastSlash = text.split("/").filter(Boolean).pop();
-  const withoutTerminalBench = text.replace(/^terminal-bench\//, "");
-  return [...new Set([text, lastSlash, withoutTerminalBench].filter(Boolean))];
-}
-
-function tasksMatchTrial(task, trialResult) {
-  const taskKeys = normalizeTaskKeys(task.task_id);
-  const trialKeys = [
-    ...normalizeTaskKeys(trialResult?.task_name),
-    ...normalizeTaskKeys(trialResult?.trial_name)
-  ];
-  if (task.trial_name && String(task.trial_name) === String(trialResult?.trial_name)) return true;
-  return taskKeys.some((key) => trialKeys.includes(key));
 }
 
 function shortVerifierText(value, maxChars = 600) {
@@ -1136,32 +1286,151 @@ async function readHarborTrialResults(runDir) {
         ...value,
         ...(await readVerifierDetails(runDir, trialDir)),
         ...(await readTrialTraceFallback(runDir, trialDir)),
-        result_path: path.relative(runDir, filePath).replace(/\\/g, "/")
+        result_path: path.relative(runDir, filePath).replace(/\\/g, "/"),
+        trial_dir: trialDir
       });
     }
   }
   return results.sort((a, b) => String(a.trial_name).localeCompare(String(b.trial_name)));
 }
 
-function mergeHarborTrialResults(tasks, harborTrialResults) {
-  const remaining = [...harborTrialResults];
-  const merged = tasks.map((task) => {
-    const matchIndex = remaining.findIndex((trialResult) => tasksMatchTrial(task, trialResult));
-    if (matchIndex === -1) return task;
-    const [trialResult] = remaining.splice(matchIndex, 1);
-    return mergeHarborTrialResult(task, trialResult);
-  });
-
-  if (remaining.length === harborTrialResults.length && harborTrialResults.length === tasks.length) {
-    return tasks.map((task, index) => mergeHarborTrialResult(task, harborTrialResults[index]));
+async function readHarborJobAccounting(runDir) {
+  const resultFiles = await listJsonFiles(path.join(runDir, "harbor-jobs"));
+  const jobs = [];
+  for (const filePath of resultFiles) {
+    const value = await readJsonSafe(filePath);
+    if (value?.trial_name || value?.task_name || !Number.isInteger(value?.n_total_trials)) continue;
+    jobs.push({
+      result_path: path.relative(runDir, filePath).replace(/\\/g, "/"),
+      total: value.n_total_trials,
+      completed: Number(value?.stats?.n_completed_trials ?? 0),
+      errored: Number(value?.stats?.n_errored_trials ?? 0),
+      retries: Number(value?.stats?.n_retries ?? 0)
+    });
   }
+  if (jobs.length === 0) return null;
+  return {
+    jobs,
+    total: jobs.reduce((sum, job) => sum + job.total, 0),
+    completed: jobs.reduce((sum, job) => sum + job.completed, 0),
+    errored: jobs.reduce((sum, job) => sum + job.errored, 0),
+    retries: jobs.reduce((sum, job) => sum + job.retries, 0)
+  };
+}
 
-  return merged;
+async function resolvedJobConfigForReport(runDir, config) {
+  const configured = typeof config.resolved_job_config_path === "string"
+    ? config.resolved_job_config_path
+    : "resolved-job.config.json";
+  const filePath = path.isAbsolute(configured) ? configured : path.join(runDir, configured);
+  return existsSync(filePath) ? await readJsonSafe(filePath) : null;
+}
+
+function expectedTrialCount(config, resolvedJobConfig) {
+  if (Array.isArray(resolvedJobConfig?.tasks)) return resolvedJobConfig.tasks.length;
+  if (Array.isArray(resolvedJobConfig?.datasets)) {
+    const count = resolvedJobConfig.datasets.reduce((sum, dataset) => {
+      const value = Number(dataset?.n_tasks ?? 0);
+      return sum + (Number.isInteger(value) && value > 0 ? value : 0);
+    }, 0);
+    if (count > 0) return count;
+  }
+  if (Number.isInteger(config.k) && config.k > 0) return config.k;
+  if (config.mode === "task") return 1;
+  if (config.mode === "smoke") return 5;
+  return 0;
+}
+
+function trialAccounting(expected, trialResults) {
+  const scoredRewards = trialResults
+    .filter((trial) => !trial?.exception_info && typeof trial?.verifier_result?.rewards?.reward === "number")
+    .map((trial) => trial.verifier_result.rewards.reward);
+  const errored = trialResults.filter((trial) => Boolean(trial?.exception_info)).length;
+  return {
+    expected,
+    observed: trialResults.length,
+    scored: scoredRewards.length,
+    errored,
+    missing: Math.max(0, expected - trialResults.length),
+    meanReward: scoredRewards.length > 0
+      ? scoredRewards.reduce((sum, reward) => sum + reward, 0) / scoredRewards.length
+      : null
+  };
+}
+
+function normalizedArtifactPath(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const normalized = path.resolve(value).replace(/\\/g, "/").replace(/\/+$/u, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function artifactMatchesTrial(task, trialResult) {
+  const source = normalizedArtifactPath(task.source_logs_dir);
+  const trialDir = normalizedArtifactPath(trialResult.trial_dir);
+  if (!source || !trialDir) return false;
+  return source === `${trialDir}/agent` || source.startsWith(`${trialDir}/agent/`);
+}
+
+function emptyTaskForTrial(trialResult, index) {
+  return {
+    task_id: trialResult?.task_name ?? `trial-${index + 1}`,
+    index,
+    status: "unknown",
+    failure_category: "unknown",
+    failure_signals: [],
+    summary_path: null,
+    trace_path: null,
+    commands_executed: 0,
+    input_tokens: 0,
+    cache_tokens: 0,
+    output_tokens: 0,
+    cost_usd: null,
+    duration_ms: 0,
+    last_error: null,
+    trial_name: null,
+    harbor_result_path: null,
+    reward: null,
+    verifier_status: null,
+    agent_exception: null,
+    infra_warnings: [],
+    verifier_failed_tests: [],
+    verifier_log_path: null,
+    harness_service_cleanup_stopped: []
+  };
+}
+
+function mergeHarborTrialResults(mirroredTasks, harborTrialResults) {
+  const unused = new Set(mirroredTasks.map((_task, index) => index));
+  const tasks = harborTrialResults.map((trialResult, index) => {
+    const mirrorIndex = mirroredTasks.findIndex((task, candidateIndex) => (
+      unused.has(candidateIndex) && artifactMatchesTrial(task, trialResult)
+    ));
+    const mirror = mirrorIndex >= 0 ? mirroredTasks[mirrorIndex] : emptyTaskForTrial(trialResult, index);
+    if (mirrorIndex >= 0) unused.delete(mirrorIndex);
+    return mergeHarborTrialResult({ ...mirror, index }, trialResult);
+  });
+  const orphanArtifacts = [...unused].map((index) => {
+    const task = mirroredTasks[index];
+    return {
+      artifact_task_id: task.task_id,
+      source_logs_dir: task.source_logs_dir ?? null,
+      summary_path: task.summary_path,
+      trace_path: task.trace_path,
+      last_error: task.last_error
+    };
+  });
+  return { tasks, orphanArtifacts };
 }
 
 function mergeHarborTrialResult(task, trialResult) {
   const reward = trialResult?.verifier_result?.rewards?.reward;
   const exceptionMessage = trialResult?.exception_info?.exception_message;
+  const agentResult = trialResult?.agent_result ?? {};
+  const agentMetadata = agentResult?.metadata ?? {};
+  const agentExitCode = typeof agentMetadata.exit_code === "number" ? agentMetadata.exit_code : null;
+  const agentErrorMessage = typeof agentMetadata.error_message === "string" && agentMetadata.error_message
+    ? agentMetadata.error_message
+    : null;
   const traceSummary = trialResult?.agent_trace_summary ?? {};
   const verifierFailedTests = Array.isArray(trialResult?.verifier_failed_tests) ? trialResult.verifier_failed_tests : [];
   const next = {
@@ -1174,11 +1443,17 @@ function mergeHarborTrialResult(task, trialResult) {
     agent_exception: agentExceptionFromTrial(trialResult, exceptionMessage),
     infra_warnings: Array.isArray(task.infra_warnings) ? [...task.infra_warnings] : [],
     trace_path: task.trace_path ?? trialResult?.agent_trace_path ?? null,
-    commands_executed: task.commands_executed || Number(traceSummary.commands_executed ?? 0),
-    input_tokens: task.input_tokens || Number(traceSummary.input_tokens ?? 0),
-    output_tokens: task.output_tokens || Number(traceSummary.output_tokens ?? 0),
+    commands_executed: Number(
+      agentMetadata.commands_executed ?? (task.commands_executed || traceSummary.commands_executed || 0)
+    ),
+    input_tokens: Number(agentResult.n_input_tokens ?? (task.input_tokens || traceSummary.input_tokens || 0)),
+    cache_tokens: Number(agentResult.n_cache_tokens ?? (task.cache_tokens || traceSummary.cache_tokens || 0)),
+    output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
+    cost_usd: Number.isFinite(Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd))
+      ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
+      : null,
     duration_ms: task.duration_ms || Number(traceSummary.duration_ms ?? 0),
-    last_error: task.last_error ?? traceSummary.last_error ?? null,
+    last_error: agentErrorMessage ?? task.last_error ?? traceSummary.last_error ?? null,
     verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
     failure_signals: Array.isArray(task.failure_signals) ? [...task.failure_signals] : [],
@@ -1186,7 +1461,7 @@ function mergeHarborTrialResult(task, trialResult) {
       ? [...task.harness_service_cleanup_stopped]
       : []
   };
-  const trialLogText = `${exceptionMessage ?? ""}\n${JSON.stringify(trialResult)}`;
+  const trialLogText = `${exceptionMessage ?? ""}\n${agentErrorMessage ?? ""}\n${JSON.stringify(trialResult)}`;
 
   if (exceptionMessage && typeof reward === "number" && reward >= 1) {
     next.status = "passed";
@@ -1202,7 +1477,8 @@ function mergeHarborTrialResult(task, trialResult) {
       summary: traceSummary,
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: exceptionMessage,
-      exitCode: 1
+      exitCode: 1,
+      failureKind: agentMetadata.failure_kind
     });
     next.last_error = exceptionMessage;
     next.failure_signals = collectFailureSignals({
@@ -1212,6 +1488,36 @@ function mergeHarborTrialResult(task, trialResult) {
       logText: trialLogText,
       verifierFailures: next.verifier_failed_tests,
       verifierFailed: next.failure_category === "verifier_failed",
+      serviceCleanupStopped: next.harness_service_cleanup_stopped
+    });
+    return next;
+  }
+
+  if (typeof reward === "number" && reward >= 1 && (agentErrorMessage || (agentExitCode !== null && agentExitCode !== 0))) {
+    next.status = "passed";
+    next.failure_category = null;
+    next.failure_signals = [];
+    addSignal(next.infra_warnings, "agent_error_after_verifier_pass");
+    return next;
+  }
+
+  if (agentErrorMessage || (agentExitCode !== null && agentExitCode !== 0)) {
+    next.status = "failed";
+    next.failure_category = classifyFailure({
+      summary: traceSummary,
+      traceEvents: trialResult?.agent_trace_events ?? [],
+      logText: trialLogText,
+      exitCode: agentExitCode ?? 1,
+      failureKind: agentMetadata.failure_kind
+    });
+    next.last_error = agentErrorMessage ?? `agent exited with code ${agentExitCode}`;
+    next.failure_signals = collectFailureSignals({
+      existingSignals: next.failure_signals,
+      summary: traceSummary,
+      traceEvents: trialResult?.agent_trace_events ?? [],
+      logText: trialLogText,
+      verifierFailures: next.verifier_failed_tests,
+      verifierFailed: false,
       serviceCleanupStopped: next.harness_service_cleanup_stopped
     });
     return next;
@@ -1279,6 +1585,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
   const classifyExitCode = summary.status === "completed" ? 0 : metadata.exit_code ?? config.exit_code;
   let failureCategory = status === "passed" ? null : classifyFailure({
     summary,
+    metadata,
+    failureKind: metadata.failure_kind,
     traceEvents,
     logText: combinedLogText,
     exitCode: classifyExitCode
@@ -1294,14 +1602,16 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
         summary,
         traceEvents,
         logText: combinedLogText,
-        verifierFailed: status === "failed" && failureCategory === "verifier_failed"
+        verifierFailed: status === "failed" && ["verifier_failed", "verifier_failure"].includes(failureCategory)
       });
-  if (status === "failed" && failureCategory === "verifier_failed" && summary.status === "completed") {
+  if (status === "failed" && ["verifier_failed", "verifier_failure"].includes(failureCategory) && summary.status === "completed") {
     addSignal(failureSignals, "agent_completed_but_verifier_failed");
   }
 
   return {
     task_id: metadata.task_id ?? metadata.task_name ?? path.basename(taskDir),
+    source_logs_dir: typeof metadata.source_logs_dir === "string" ? metadata.source_logs_dir : null,
+    artifact_dir: path.relative(runDir, taskDir).replace(/\\/g, "/"),
     index,
     status,
     failure_category: failureCategory,
@@ -1310,7 +1620,11 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     trace_path: relativePathOrNull(runDir, tracePath),
     commands_executed: Number(summary.commands_executed ?? metadata.commands_executed ?? 0),
     input_tokens: Number(summary.input_tokens ?? metadata.n_input_tokens ?? 0),
+    cache_tokens: Number(summary.cache_tokens ?? metadata.n_cache_tokens ?? 0),
     output_tokens: Number(summary.output_tokens ?? metadata.n_output_tokens ?? 0),
+    cost_usd: Number.isFinite(Number(summary.cost_usd ?? metadata.cost_usd))
+      ? Number(summary.cost_usd ?? metadata.cost_usd)
+      : null,
     duration_ms: Number(summary.duration_ms ?? metadata.duration_ms ?? 0),
     last_error: summary.last_error ?? metadata.error_message ?? null,
     trial_name: null,
@@ -1326,10 +1640,16 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
 }
 
 function syntheticRunTask(config, globalLogText) {
-  const status = config.exit_code === 0 ? "passed" : "failed";
+  const status = config.exit_code === 0
+    ? "passed"
+    : config.exit_code === null || config.exit_code === undefined
+      ? "unknown"
+      : "failed";
   const failureCategory =
     status === "passed"
       ? null
+      : status === "unknown"
+        ? "unknown"
       : classifyFailure({
           summary: {},
           traceEvents: [],
@@ -1338,6 +1658,8 @@ function syntheticRunTask(config, globalLogText) {
         });
   return {
     task_id: "run",
+    source_logs_dir: null,
+    artifact_dir: null,
     index: 0,
     status,
     failure_category: failureCategory,
@@ -1346,7 +1668,9 @@ function syntheticRunTask(config, globalLogText) {
     trace_path: null,
     commands_executed: 0,
     input_tokens: 0,
+    cache_tokens: 0,
     output_tokens: 0,
+    cost_usd: null,
     duration_ms: 0,
     last_error: status === "passed" ? null : "No per-task artifacts were available; inspect harbor logs.",
     trial_name: null,
@@ -1381,6 +1705,20 @@ export function formatMarkdownReport(report) {
     `- Harbor exit code: ${report.harbor_exit_code ?? report.exit_code}`,
     `- Command: ${markdownEscape(report.command ?? "")}`,
     `- Harbor: ${markdownEscape(report.harbor_command ?? "harbor")}${report.harbor_version ? ` (${markdownEscape(report.harbor_version)})` : ""}`,
+    `- Concurrent trials: ${report.n_concurrent_trials ?? "unknown"}`,
+    "",
+    "## Trial Accounting",
+    "",
+    `- Expected: ${report.trial_accounting?.expected ?? "unknown"}`,
+    `- Observed: ${report.trial_accounting?.observed ?? "unknown"}`,
+    `- Scored: ${report.trial_accounting?.scored ?? "unknown"}`,
+    `- Errored: ${report.trial_accounting?.errored ?? "unknown"}`,
+    `- Missing: ${report.trial_accounting?.missing ?? "unknown"}`,
+    `- Mean reward: ${report.trial_accounting?.meanReward ?? "unknown"}`,
+    `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
+    `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
+    `- Output tokens: ${report.usage?.output_tokens ?? 0}`,
+    `- Cost USD: ${report.cost_usd ?? 0}`,
     "",
     "## Timeout Plan",
     "",
@@ -1393,14 +1731,14 @@ export function formatMarkdownReport(report) {
     "",
     "## Counts",
     "",
-    "| passed | failed | infra_failed | timeout | api_error | unknown |",
-    "| ---: | ---: | ---: | ---: | ---: | ---: |",
-    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.unknown} |`,
+    "| passed | failed | infra_failed | timeout | api_error | needs_input | tool_error | verifier_failure | unknown |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.needs_input} | ${report.counts.tool_error} | ${report.counts.verifier_failure} | ${report.counts.unknown} |`,
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | output_tokens | duration_ms | last_error |",
-    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | last_error |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   ];
 
   for (const task of report.tasks) {
@@ -1408,7 +1746,7 @@ export function formatMarkdownReport(report) {
     const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals) ?? "";
     const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.output_tokens} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 
@@ -1502,29 +1840,45 @@ export async function generateBenchReport(runDir) {
     await readTextSafe(path.join(runDir, "result.raw.log"))
   ].join("\n");
   const taskDirs = await listTaskDirs(runDir);
-  let tasks = taskDirs.length > 0
+  const mirroredTasks = taskDirs.length > 0
     ? await Promise.all(taskDirs.map((taskDir, index) => taskReportFromDir(runDir, taskDir, index, config, globalLogText)))
     : [syntheticRunTask(config, globalLogText)];
   const harborTrialResults = await readHarborTrialResults(runDir);
-  if (harborTrialResults.length > 0) {
-    tasks = mergeHarborTrialResults(tasks, harborTrialResults);
+  const harborJobAccounting = await readHarborJobAccounting(runDir);
+  const resolvedJobConfig = await resolvedJobConfigForReport(runDir, config);
+  const expected = expectedTrialCount(config, resolvedJobConfig);
+  const accounting = trialAccounting(expected, harborTrialResults);
+  const hasHarborEvidence = existsSync(path.join(runDir, "harbor-jobs"))
+    || typeof config.resolved_job_config_path === "string";
+  if (hasHarborEvidence && expected > 0) {
+    if (accounting.observed !== expected) {
+      incompleteReason.push(`Harbor trial result count ${accounting.observed} does not match expected ${expected}.`);
+    }
+    if (!harborJobAccounting) {
+      incompleteReason.push("Harbor job result.json summary is missing.");
+    } else {
+      if (harborJobAccounting.total !== expected) {
+        incompleteReason.push(`Harbor job total ${harborJobAccounting.total} does not match expected ${expected}.`);
+      }
+      if (harborJobAccounting.completed !== expected) {
+        incompleteReason.push(`Harbor job completed count ${harborJobAccounting.completed} does not match expected ${expected}.`);
+      }
+      if (harborJobAccounting.errored !== accounting.errored) {
+        incompleteReason.push(
+          `Harbor job errored count ${harborJobAccounting.errored} does not match trial exceptions ${accounting.errored}.`
+        );
+      }
+      if (harborJobAccounting.retries !== 0) {
+        incompleteReason.push(`Harbor reported ${harborJobAccounting.retries} retries; benchmark retries are prohibited.`);
+      }
+    }
   }
-  if (incompleteReason.length > 0) {
-    tasks = tasks.map((task) => ({
-      ...task,
-      status: task.status === "passed" ? "failed" : task.status,
-      failure_category:
-        task.failure_category && task.failure_category !== "agent_crashed"
-          ? task.failure_category
-          : classifyFailure({ summary: {}, traceEvents: [], logText: globalLogText, exitCode: config.exit_code }) === "agent_crashed"
-            ? "unknown"
-            : classifyFailure({ summary: {}, traceEvents: [], logText: globalLogText, exitCode: config.exit_code }),
-      failure_signals: collectFailureSignals({
-        existingSignals: task.failure_signals,
-        logText: `${globalLogText}\n${incompleteReason.join("\n")}`
-      }),
-      last_error: task.last_error ?? `Incomplete benchmark run: ${incompleteReason.join("; ")}`
-    }));
+  let tasks = mirroredTasks;
+  let orphanArtifacts = [];
+  if (harborTrialResults.length > 0) {
+    const merged = mergeHarborTrialResults(mirroredTasks, harborTrialResults);
+    tasks = merged.tasks;
+    orphanArtifacts = merged.orphanArtifacts;
   }
   tasks = tasks.map(withSuggestedOwner);
 
@@ -1535,11 +1889,12 @@ export async function generateBenchReport(runDir) {
 
   const commandScript = await readTextSafe(commandPath);
   const notes = Array.isArray(config.notes) ? [...config.notes] : [];
-  if (taskDirs.length === 0) {
+  if (taskDirs.length === 0 && harborTrialResults.length === 0) {
     notes.push("Harbor did not expose per-task trace/summary files in a predictable place for this run; inspect harbor.stdout.log and harbor.stderr.log.");
   }
 
-  const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error + counts.unknown;
+  const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error
+    + counts.needs_input + counts.tool_error + counts.verifier_failure + counts.unknown;
   const exitCode = Number(config.exit_code ?? 1);
   const scoreStatus = incompleteReason.length > 0
     ? "incomplete"
@@ -1558,6 +1913,15 @@ export async function generateBenchReport(runDir) {
       : exitCode === 0
         ? "passed"
         : "failed";
+  const usage = tasks.reduce((total, task) => ({
+    input_tokens: total.input_tokens + Number(task.input_tokens ?? 0),
+    cache_tokens: total.cache_tokens + Number(task.cache_tokens ?? 0),
+    output_tokens: total.output_tokens + Number(task.output_tokens ?? 0)
+  }), { input_tokens: 0, cache_tokens: 0, output_tokens: 0 });
+  const costUsd = tasks.reduce((total, task) => {
+    const value = Number(task.cost_usd);
+    return total + (Number.isFinite(value) ? value : 0);
+  }, 0);
   const report = {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
@@ -1573,6 +1937,15 @@ export async function generateBenchReport(runDir) {
     timeout_plan: config.timeout_plan ?? null,
     timeout_probe_tasks: Array.isArray(config.timeout_probe?.tasks) ? config.timeout_probe.tasks : [],
     resolved_job_config_path: config.resolved_job_config_path ?? null,
+    tasks_file_sha256: config.tasks_file_sha256 ?? null,
+    agent_cli_sha256: config.agent_cli_sha256 ?? null,
+    package_reused: config.package_reused ?? false,
+    n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
+    trial_accounting: accounting,
+    harbor_job_accounting: harborJobAccounting,
+    orphan_artifacts: orphanArtifacts,
+    usage,
+    cost_usd: costUsd,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
     exit_code: exitCode,
     harbor_exit_code: exitCode,
@@ -1625,6 +1998,7 @@ export function harborEnvForRun(runDir, env = process.env) {
     AGENT_CLI_TARBALL: env.AGENT_CLI_TARBALL || defaultAgentCliTarballForEnv(env),
     PYTHONPATH: pythonPathEntries.filter(Boolean).join(path.delimiter),
     SIGMA_BENCH_RUN_DIR: runDir,
+    SIGMA_HARBOR_RUN_ID: safePathPart(path.basename(path.resolve(runDir))),
     PYTHONIOENCODING: env.PYTHONIOENCODING || "utf-8",
     PYTHONUTF8: env.PYTHONUTF8 || "1",
     NO_COLOR: env.NO_COLOR || "1",

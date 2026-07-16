@@ -215,7 +215,11 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (command.type === "checkpoint_recovery") {
       await this.checkpoints.resolveOpen(session, command.checkpointId, command.decision);
       session.recovery.lastOutcome = undefined;
-      await this.recoverSession(session);
+      // Recovery is deliberately two-phase. The durable decision moves the
+      // session out of NeedsInput; an external controller can then issue the
+      // normal resume command after it has observed the decision. This keeps
+      // a checkpoint operation from starting a model turn while workspace
+      // control callers are still finishing their safety checks.
       return;
     }
     if (command.type === "budget_increase") {
@@ -242,6 +246,15 @@ export class InProcessRuntimeClient implements RuntimeClient {
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {
     await assertSessionStorageSupported(this.options.storeRootDir, command.sessionId);
+    const existing = this.sessions.get(command.sessionId);
+    if (existing) {
+      // A checkpoint decision is intentionally two-phase. The runtime that
+      // owns the hydrated session may resume it after the durable decision
+      // without trying to reacquire its own command-bus lease.
+      if (existing.recovery.openCheckpointRecovery || existing.execution.running) return;
+      await this.recoverSession(existing);
+      return;
+    }
     await this.commandBus.claim(command.sessionId);
     try {
       await this.resume(command.sessionId);

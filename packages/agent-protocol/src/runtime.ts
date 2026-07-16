@@ -10,6 +10,7 @@ export interface SessionRef {
 export interface StartSession {
   workspacePath: string;
   mode: RunMode;
+  goal?: string;
   title?: string;
   writeScope?: string[];
   strictWriteScope?: boolean;

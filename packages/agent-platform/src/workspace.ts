@@ -7,16 +7,22 @@ export function isInside(parent: string, candidate: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function pathEscape(message: string): Error {
+  return Object.assign(new Error(message), { code: "path_escape" });
+}
+
 export async function canonicalWorkspacePath(workspace: string, requested: string): Promise<string> {
   const root = await realpath(path.resolve(workspace));
   const candidate = path.resolve(root, requested);
-  if (!isInside(root, candidate)) throw new Error(`Path escapes workspace: ${requested}`);
+  if (!isInside(root, candidate)) throw pathEscape(`Path escapes workspace: ${requested}`);
   let ancestor = candidate;
   while (true) {
     try {
       const resolvedAncestor = await realpath(ancestor);
       const canonical = path.resolve(resolvedAncestor, path.relative(ancestor, candidate));
-      if (!isInside(root, canonical)) throw new Error(`Path resolves outside workspace through a link: ${requested}`);
+      if (!isInside(root, canonical)) {
+        throw pathEscape(`Path resolves outside workspace through a link: ${requested}`);
+      }
       return canonical;
     } catch (error) {
       const code = (error as { code?: unknown }).code;

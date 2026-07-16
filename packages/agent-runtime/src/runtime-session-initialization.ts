@@ -39,9 +39,10 @@ export interface RuntimeSessionInitializationOptions {
 
 function initialPlan(input: StartSession): PlanGraph {
   const title = input.title?.trim();
+  const goal = input.goal?.trim();
   return {
     revision: 1,
-    goal: title || "Complete the user's stated task.",
+    goal: goal || title || "Complete the user's stated task.",
     activeNodeId: "root",
     nodes: [{
       id: "root",

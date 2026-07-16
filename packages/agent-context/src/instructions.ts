@@ -23,7 +23,13 @@ async function readableFile(filePath: string, maxBytes: number): Promise<string 
 export async function loadNestedInstructions(options: LoadInstructionsOptions): Promise<ContextItem[]> {
   const root = await resolveWorkspacePath(options.workspacePath, ".");
   const target = await resolveWorkspacePath(root, options.targetPath ?? ".");
-  const targetDirectory = path.extname(target) ? path.dirname(target) : target;
+  let targetDirectory = target;
+  try {
+    const targetInfo = await stat(target);
+    if (!targetInfo.isDirectory()) targetDirectory = path.dirname(target);
+  } catch {
+    if (path.extname(target)) targetDirectory = path.dirname(target);
+  }
   const relative = path.relative(root, targetDirectory);
   const directories = [root];
   if (relative) {

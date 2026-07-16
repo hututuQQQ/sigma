@@ -7,21 +7,16 @@ import { activityText, footerText, headerText, queuedText } from "./chrome.js";
 import { matchingCommands, type TuiCommandDefinition } from "./commands.js";
 import { PromptHistory } from "./history.js";
 import { routeKey, type KeyRouterHost } from "./key-router.js";
-import { OverlayView } from "./overlay.js";
+import { approvalChoice, OverlayView } from "./overlay.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import { createTuiTheme, type TuiTheme } from "./theme.js";
 import { TranscriptView } from "./transcript.js";
 import type { SubmissionKind, TuiAppOptions, TuiSnapshot, TuiViewActions } from "./types.js";
 import { WelcomeView } from "./welcome.js";
 import { configureWindowsConsoleUtf8 } from "./windows-console.js";
-
-function approvalChoice(name: string): number | undefined {
-  const choices: Record<string, number> = { "1": 0, y: 0, "2": 1, a: 1, "3": 2, n: 2, escape: 2 };
-  return choices[name];
-}
-
 export class TuiView implements KeyRouterHost {
   private readonly theme: TuiTheme;
+  private readonly main: BoxRenderable;
   private readonly transcript: TranscriptView;
   private readonly welcome: WelcomeView;
   private readonly header: TextRenderable;
@@ -37,6 +32,7 @@ export class TuiView implements KeyRouterHost {
   private commands: TuiCommandDefinition[] = [];
   private commandIndex = 0;
   private approvalIndex = 0;
+  private approvalRequestId?: string;
   private approvalSubmitting = false;
   private activityExpanded = false;
   private scrolled = false;
@@ -74,7 +70,7 @@ export class TuiView implements KeyRouterHost {
     };
     this.theme = createTuiTheme(Boolean(process.env.NO_COLOR || process.env.SIGMA_NO_COLOR));
     renderer.root.flexDirection = "column";
-    const main = new BoxRenderable(renderer, { id: "main", width: "100%", height: "100%", flexDirection: "column" });
+    this.main = new BoxRenderable(renderer, { id: "main", width: "100%", height: "100%", flexDirection: "column" });
     this.header = new TextRenderable(renderer, { id: "header", width: "100%", height: 1, truncate: true });
     const content = new BoxRenderable(renderer, {
       id: "content", width: "100%", flexGrow: 1, minHeight: 0
@@ -101,9 +97,9 @@ export class TuiView implements KeyRouterHost {
     });
     this.footer = this.chromeText("footer", this.theme.muted);
     this.composerBox.add(this.composer);
-    for (const child of [this.header, content, this.activity, this.queued, this.notice, this.composerBox, this.footer]) main.add(child);
+    for (const child of [this.header, content, this.activity, this.queued, this.notice, this.composerBox, this.footer]) this.main.add(child);
     this.overlay = new OverlayView(renderer, this.theme);
-    renderer.root.add(main); renderer.root.add(this.overlay.box);
+    renderer.root.add(this.main); renderer.root.add(this.overlay.box);
     renderer.keyInput.on("keypress", this.onKey);
     renderer.on(CliRenderEvents.RESIZE, this.onResize);
     this.output?.on("resize", this.onOutputResize);
@@ -129,11 +125,17 @@ export class TuiView implements KeyRouterHost {
     this.setChrome(this.notice, snapshot.notice?.message ?? "", 1, this.renderer.height >= 6);
     const approvals = snapshot.presentation.approvals.filter((item) => item.status === "pending");
     if (approvals.length > 0) {
+      if (this.approvalRequestId !== approvals[0].requestId) {
+        this.approvalRequestId = approvals[0].requestId;
+        this.approvalIndex = 0; this.approvalSubmitting = false;
+      }
       this.overlay.showApproval(approvals[0], 0, approvals.length, this.approvalIndex);
       this.composer.blur();
     } else if (this.overlay.mode === "approval") {
-      this.approvalSubmitting = false; this.approvalIndex = 0; this.overlay.hide(); this.composer.focus();
+      this.approvalSubmitting = false; this.approvalIndex = 0; this.approvalRequestId = undefined;
+      this.overlay.hide(); this.composer.focus();
     }
+    this.main.visible = !["approval", "help"].includes(this.overlay.mode);
     this.refreshComposer();
     this.refreshFooter();
     this.renderer.requestRender();
@@ -157,8 +159,8 @@ export class TuiView implements KeyRouterHost {
   composerText = () => this.composer.plainText;
   composerLine = () => ({ row: this.composer.logicalCursor.row, lines: this.composer.lineCount });
   interrupt = () => { void this.actions.interrupt(); };
-  closeOverlay = () => { this.overlay.hide(); this.composer.focus(); };
-  showHelp = () => { this.overlay.showHelp(); this.composer.blur(); };
+  closeOverlay = () => { this.overlay.hide(); this.main.visible = true; this.composer.focus(); };
+  showHelp = () => { this.overlay.showHelp(); this.main.visible = false; this.composer.blur(); };
   newline = () => this.composer.newLine();
   submit = (kind: SubmissionKind) => this.submitComposer(kind);
   scroll = (delta: number) => this.scrollContent(delta);
@@ -171,11 +173,12 @@ export class TuiView implements KeyRouterHost {
 
   approvalKey(key: KeyEvent): boolean {
     if (key.name === "up" || key.name === "down") {
-      this.approvalIndex = (this.approvalIndex + (key.name === "up" ? 2 : 1)) % 3; this.update(this.snapshot); return true;
+      this.approvalIndex = (this.approvalIndex + (key.name === "up" ? 2 : 1)) % 3;
+      this.overlay.selectApproval(this.approvalIndex); return true;
     }
-    const direct = approvalChoice(key.name);
+    const direct = key.repeated ? undefined : approvalChoice(key);
     if (direct !== undefined) { this.approvalIndex = direct; this.confirmApproval(); return true; }
-    if (key.name === "return" || key.name === "enter") { this.confirmApproval(); return true; }
+    if (!key.repeated && (key.name === "return" || key.name === "enter")) { this.confirmApproval(); return true; }
     if (key.name === "pageup" || key.name === "pagedown") { this.overlay.scrollBy(key.name === "pageup" ? -8 : 8); return true; }
     return false;
   }
@@ -195,7 +198,7 @@ export class TuiView implements KeyRouterHost {
   }
 
   private readonly onKey = (key: KeyEvent): void => { this.actions.userAction(); routeKey(this, key); };
-  private readonly onResize = (): void => { this.refreshComposer(); this.update(this.snapshot); };
+  private readonly onResize = (): void => { this.refreshComposer(); this.update(this.snapshot); this.overlay.resize(); };
   private readonly onOutputResize = (): void => {
     const output = this.output as (NodeJS.WriteStream & { columns?: number; rows?: number }) | undefined;
     if (output?.columns && output.rows) this.renderer.resize(output.columns, output.rows);

@@ -226,6 +226,14 @@ export class RuntimeControlService {
     await this.checkpoints.recordChildDecision(session, recovery, decision);
   }
 
+  async recordChildCheckpointDecisionApplied(
+    session: RuntimeSession,
+    recovery: ChildCheckpointRecovery,
+    decision: "restore" | "keep"
+  ): Promise<void> {
+    await this.checkpoints.recordChildDecisionApplied(session, recovery, decision);
+  }
+
   async applyChildCheckpointDecision(
     session: RuntimeSession,
     recovery: ChildCheckpointRecovery,

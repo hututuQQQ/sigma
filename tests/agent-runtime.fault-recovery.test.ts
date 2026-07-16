@@ -429,7 +429,11 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     createdAt: now,
     producer: { authority: "runtime", id: "checkpoint-manager" },
     summary: "Workspace delta sealed.",
-    data: { checkpointId: checkpoint.checkpointId, delta: checkpoint.delta! }
+    data: {
+      checkpointId: checkpoint.checkpointId,
+      delta: checkpoint.delta!,
+      reviewDiff: "--- a/target.ts\n+++ b/target.ts\n@@\n-before\n+executed-1"
+    }
   });
   await append("execution.completed", {
     executionId: "mutation-call",
@@ -762,6 +766,7 @@ describe("durable transaction fault-injection recovery", () => {
       checkpointId: fixture.checkpoint!.checkpointId,
       decision: "keep"
     });
+    await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(executions.count).toBe(0);
     expect(reviewer.calls).toBe(0);
@@ -783,6 +788,7 @@ describe("durable transaction fault-injection recovery", () => {
       checkpointId: fixture.checkpoint!.checkpointId,
       decision: "restore"
     });
+    await runtime.command({ type: "resume", sessionId: fixture.sessionId });
     await expect(runtime.waitForOutcome(fixture.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(executions.count).toBe(0);
     expect(reviewer.calls).toBe(0);
@@ -798,13 +804,15 @@ describe("durable transaction fault-injection recovery", () => {
   ] as const) {
     it(`backfills ${boundary} idempotently without replay or gate bypass`, async () => {
       const fixture = await seedRecovery(boundary);
-      const { runtime, executions, reviewer } = recoveryRuntime(fixture, true);
+      const { runtime, executions, reviewer, gateway } = recoveryRuntime(fixture, true);
       await runtime.command({ type: "resume", sessionId: fixture.sessionId });
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
       expect(reviewer.calls).toBe(boundary === "validation_evidence" ? 1 : 0);
-      expect(outcome.kind).toBe(boundary === "review_completed" ? "completed" : "needs_input");
+      const convergedCompletion = boundary === "validation_evidence" || boundary === "review_completed";
+      expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
+      if (convergedCompletion) expect(gateway.calls).toBe(1);
 
       const checkpointId = fixture.checkpoint!.checkpointId;
       for (const evidenceId of [
@@ -827,7 +835,7 @@ describe("durable transaction fault-injection recovery", () => {
       expect(stored.filter((item) => item.type === "tool.approval_requested"
         && JSON.stringify(item.payload).includes("mutation-call"))).toHaveLength(0);
       expect(stored.filter((item) => item.type === "run.completed")).toHaveLength(
-        boundary === "review_completed" ? 1 : 0
+        convergedCompletion ? 1 : 0
       );
       if (boundary === "review_started" || boundary === "review_completed") {
         const reviewerReservationIds = new Set(stored.flatMap((item) => {

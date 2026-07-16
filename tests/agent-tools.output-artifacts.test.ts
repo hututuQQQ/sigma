@@ -281,6 +281,33 @@ describe("execution output artifact receipts", () => {
     })]);
   });
 
+  it("emits a stable dependency diagnostic for authenticated runtime syntax", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-missing-dependency-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 8,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "ModuleNotFoundError: No module named 'example_dependency'",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution,
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited"
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "exec")!.execute(
+      request("missing-dependency", "exec", { executable: process.execPath }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("dependency_missing");
+  });
+
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-launch-failure-receipt-"));
     const failure = {

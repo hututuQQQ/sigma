@@ -19,6 +19,7 @@ import type {
   evidenceRefSchema,
   evidenceStatusSchema,
   modelExecutionRoleSchema,
+  opaqueArtifactEvidenceSchema,
   planGraphSchema,
   reviewEvidenceSchema,
   usageRecordSchema,
@@ -48,6 +49,7 @@ export interface EvidenceBase<TKind extends EvidenceKind, TData> {
 }
 
 export type CheckpointDelta = z.infer<typeof checkpointDeltaSchema>;
+export type OpaqueArtifactEvidence = z.infer<typeof opaqueArtifactEvidenceSchema>;
 export type WorkspaceDeltaEvidence = z.infer<typeof workspaceDeltaEvidenceSchema>;
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export type ValidationEvidence = z.infer<typeof validationEvidenceSchema>;

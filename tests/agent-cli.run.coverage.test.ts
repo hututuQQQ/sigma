@@ -12,6 +12,7 @@ import type {
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
 import { runCommand } from "../packages/agent-cli/src/commands/run.js";
+import { createModelGateway } from "../packages/agent-model/src/index.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
 import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
@@ -116,6 +117,26 @@ function writeRequest(): ModelResponse {
   };
 }
 
+function networkExecutionRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "network-exec",
+        name: "exec",
+        arguments: {
+          executable: "node",
+          args: ["-e", "process.stdout.write('network-auto-ok')"],
+          network: "full",
+          readRoots: ["."]
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function userInputRequest(): ModelResponse {
   return {
     message: {
@@ -194,7 +215,37 @@ describe("run command branch coverage", () => {
     expect(code).toBe(0);
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
     expect(records.some((record) => record.type === "model.started")).toBe(true);
+    expect(records.some((record) => record.type === "run.completed")).toBe(true);
     expect(records.at(-1)?.type).toBe("result");
+  });
+
+  it("runs a non-interactive auto-approved network call without opening readline", async () => {
+    const root = await workspace("sigma-run-network-auto-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+    const code = await runCommand([
+      "run a network-enabled process",
+      "--workspace", root,
+      "--network", "full",
+      "--permission-mode", "auto",
+      "--output-format", "stream-json"
+    ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
+      networkExecutionRequest(), evidenceRequest("network-evidence"), complete("network complete")
+    ]) });
+
+    expect(code).toBe(0);
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      payload?: { approvalMode?: string; decision?: string };
+    });
+    expect(records.find((record) => record.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ approvalMode: "automatic" });
+    expect(records.find((record) => record.type === "tool.approval_resolved")?.payload)
+      .toMatchObject({ decision: "allow" });
+    expect(records.some((record) => record.type === "tool.completed")).toBe(true);
+    expect(records.some((record) => record.type === "run.completed")).toBe(true);
+    expect(stderr.text()).not.toContain("Allow exec");
   });
 
   it.each([true, false])("reads instructions from stdin (explicit=%s)", async (explicit) => {
@@ -297,8 +348,82 @@ describe("run command branch coverage", () => {
     expect(code).toBe(1);
     expect(JSON.parse(stdout.text())).toMatchObject({
       status: "error",
-      finalMessage: "Model route 'default' failed on 'deepseek/deepseek-v4-pro' (protocol)."
+      finalMessage: expect.stringContaining(
+        "Model route 'default' failed on 'deepseek/deepseek-v4-pro' (protocol)."
+      )
     });
+    expect(JSON.parse(stdout.text()).finalMessage).toContain("provider unavailable");
+  });
+
+  it("does not exit successfully when a model stream ends without a final response", async () => {
+    const root = await workspace("sigma-run-incomplete-stream-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: true });
+    stdout.isTTY = true;
+    let requestBody: Record<string, unknown> | undefined;
+    const code = await runCommand([
+      "fail an incomplete stream safely",
+      "--workspace", root,
+      "--permission-mode", "auto",
+      "--output-format", "stream-json"
+    ], {
+      stdin,
+      stdout,
+      stderr,
+      gatewayFactory: () => createModelGateway({
+        provider: "deepseek",
+        apiKey: "secret",
+        maxRetries: 0,
+        fetchImpl: (async (_url, init) => {
+          requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return new Response(
+            `data: ${JSON.stringify({
+              choices: [{ delta: { reasoning_content: "unfinished" }, finish_reason: null }]
+            })}\n\n`,
+            { status: 200, headers: { "content-type": "text/event-stream" } }
+          );
+        }) as typeof fetch
+      }),
+      executionBroker: createHostExecutionBroker()
+    });
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      status?: string;
+      payload?: { code?: string; diagnostics?: Record<string, unknown>; ledger?: {
+        reserved?: Record<string, number>;
+      } };
+    });
+
+    expect(code).toBe(1);
+    expect(records.find((record) => record.type === "model.failed")?.payload?.code)
+      .toBe("model_stream_protocol_error");
+    expect(records.find((record) => record.type === "model.failed")?.payload?.diagnostics).toMatchObject({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      category: "protocol",
+      httpStatus: 200,
+      doneReceived: false,
+      transportEnded: true,
+      lastEventType: "reasoning",
+      hasContent: false,
+      hasReasoning: true,
+      hasToolCall: false,
+      retryAttempts: 1,
+      sseFrames: 1,
+      ssePayloads: 1,
+      sseTrailingBytes: 0
+    });
+    expect(records.find((record) => record.type === "budget.committed")?.payload?.ledger?.reserved)
+      .toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0 });
+    expect(records.some((record) => record.type === "run.failed")).toBe(true);
+    expect(records.at(-1)).toMatchObject({ type: "result", status: "error" });
+    expect(requestBody).toMatchObject({
+      stream: true,
+      thinking: { type: "enabled" },
+      tools: expect.any(Array)
+    });
+    expect((requestBody?.tools as unknown[]).length).toBeGreaterThan(0);
   });
 
   it("reports prompt-file read failures through stderr", async () => {

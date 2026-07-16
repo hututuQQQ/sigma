@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isCompletionReferenceableEvidence, type JsonValue, type ModelMessage, type ModelToolCall, type RunOutcome, type ToolReceipt } from "agent-protocol";
 import type { KernelState } from "./state.js";
 
@@ -25,6 +26,7 @@ function propose(state: KernelState, outcome: RunOutcome): KernelState {
 export function protectedCompletionAnswer(state: KernelState): string | null {
   return state.completionRepair?.kind === "protected_completion"
     || state.completionRepair?.kind === "protected_recovery"
+    || state.completionRepair?.kind === "completion_prerequisite"
     ? state.completionRepair.answer
     : null;
 }
@@ -36,11 +38,45 @@ export function hasCompletionRepair(state: KernelState): boolean {
 export function completionRepairRequiresTerminalAction(state: KernelState): boolean {
   if (state.completionRepair?.kind === "evidence_acquisition") return false;
   if (state.completionRepair?.kind === "protected_recovery") return false;
+  if (state.completionRepair?.kind === "completion_prerequisite") {
+    return state.pendingTools.some((item) => item.request.name === "complete_task");
+  }
   if (state.completionRepair?.kind === "terminal_action"
     || state.completionRepair?.kind === "protected_completion") return true;
   // Compatibility for snapshots written before the explicit repair intent was
   // introduced. Newly reduced states always carry completionRepair.
   return state.completionRepairAttempts > 0 && hasCurrentRunEvidence(state);
+}
+
+export function currentRunReferenceableEvidenceCount(state: KernelState): number {
+  return state.evidence.filter((item) =>
+    isCompletionReferenceableEvidence(item, state.sessionId, state.runId)).length;
+}
+
+export function queueCompletionPrerequisiteRetry(state: KernelState): KernelState {
+  const repair = state.completionRepair;
+  if (repair?.kind !== "completion_prerequisite" || state.phase !== "ready_model"
+    || state.pendingTools.length > 0
+    || currentRunReferenceableEvidenceCount(state) <= repair.evidenceCount) return state;
+  const digest = createHash("sha256").update(repair.originalCallId).digest("hex").slice(0, 16);
+  const call = {
+    id: `completion_retry_${repair.retryCount + 1}_${digest}`,
+    name: "complete_task",
+    arguments: repair.arguments
+  };
+  if (state.toolCallIds.includes(call.id)) return state;
+  return {
+    ...state,
+    phase: "tool_pending",
+    messages: [...state.messages, { role: "assistant", content: "", toolCalls: [call] }],
+    pendingTools: [{
+      request: { callId: call.id, name: call.name, arguments: call.arguments },
+      modelTurn: repair.modelTurn,
+      approval: "not_required",
+      started: false
+    }],
+    toolCallIds: [...state.toolCallIds, call.id]
+  };
 }
 
 export function completionRepairFailureMessage(state: KernelState, detail: string): string {
@@ -230,7 +266,7 @@ export function incompleteModelCompletion(
       ...state,
       messages: [...messages, {
         role: "developer",
-        content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain successful durable evidence, or call request_user_input if a concrete user decision is required. Do not repeat the natural-language response and do not call complete_task before evidence exists."
+        content: "Your response did not obtain current-run durable evidence, so it cannot complete an actionable run. This repair turn requires a tool call: use an applicable non-completion tool to obtain referenceable durable evidence, or call request_user_input if a concrete user decision with a supported follow-up operation is required. If validation executes and fails, the next terminal action must report it with complete_task and validation_executed; no validation-waiver input exists. Do not repeat the natural-language response and do not call complete_task before evidence exists."
       }],
       completionRepairAttempts: state.completionRepairAttempts + 1,
       completionRepair: { kind: "evidence_acquisition" },
@@ -251,7 +287,7 @@ export function incompleteModelCompletion(
     ...state,
     messages: [...messages, {
       role: "developer",
-      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidence IDs when the task is finished, or call request_user_input with one concrete question when a user decision would materially change the result. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
+      content: "Your evidence-backed response stopped without choosing its terminal protocol. The substantive response is now protected. This bounded repair turn requires exactly one terminal action: call complete_task with explicit criteria and exact evidenceId/kind/claim references when the task is finished, or call request_user_input with one concrete question only when a supported user decision would materially change the result. Evidence references within one criterion may use different claims. An exited failed validation must be reported as validation_executed and never as validation_passed or acceptance_met; no validation waiver exists. Non-terminal tools are unavailable. Do not repeat or revise the natural-language response."
     }],
     completionRepairAttempts: state.completionRepairAttempts + 1,
     completionRepair: {

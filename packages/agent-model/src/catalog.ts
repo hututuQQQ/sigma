@@ -18,17 +18,51 @@ export type InfrastructureFailureCategory = Extract<
   "rate_limit" | "capacity" | "network" | "server" | "timeout"
 >;
 
+export interface ModelFailureDiagnostics {
+  provider?: string;
+  model?: string;
+  category?: ModelFailureCategory;
+  httpStatus?: number;
+  firstByteMs?: number;
+  lastFrameMs?: number;
+  idleDurationMs?: number;
+  totalDurationMs?: number;
+  doneReceived?: boolean;
+  transportEnded?: boolean;
+  lastEventType?: string;
+  hasContent?: boolean;
+  hasReasoning?: boolean;
+  hasToolCall?: boolean;
+  retryAttempts?: number;
+  sseChunks?: number;
+  sseBytes?: number;
+  sseFrames?: number;
+  ssePayloads?: number;
+  sseTrailingBytes?: number;
+  abortReason?: string;
+  timeoutReason?: string;
+}
+
 export class ModelGatewayError extends Error {
   constructor(
     message: string,
     readonly category: ModelFailureCategory,
     readonly semanticDelta = false,
     readonly status?: number,
-    options?: ErrorOptions
+    options?: ErrorOptions,
+    readonly diagnostics?: ModelFailureDiagnostics
   ) {
     super(message, options);
     this.name = "ModelGatewayError";
   }
+}
+
+export function failureDiagnostics(error: unknown): ModelFailureDiagnostics | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as { diagnostics?: unknown }).diagnostics;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as ModelFailureDiagnostics
+    : undefined;
 }
 
 export interface TokenizerMetadata {

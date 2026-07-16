@@ -5,8 +5,9 @@ export async function waitForSessionOutcome(session: RuntimeSession, signal?: Ab
   if (session.recovery.lastOutcome && (session.durable.state.phase === "terminal" || (session.durable.state.phase === "needs_input" && !session.execution.running))) {
     return session.recovery.lastOutcome;
   }
+  if (session.recovery.runError && !session.execution.running) throw session.recovery.runError;
   return await new Promise<RunOutcome>((resolve, reject) => {
-    const waiter = { runId: session.durable.runId, resolve };
+    const waiter = { runId: session.durable.runId, resolve, reject };
     const onAbort = (): void => {
       signal?.removeEventListener("abort", onAbort);
       const index = session.interaction.outcomeWaiters.indexOf(waiter);
@@ -18,6 +19,10 @@ export async function waitForSessionOutcome(session: RuntimeSession, signal?: Ab
     waiter.resolve = (outcome) => {
       signal?.removeEventListener("abort", onAbort);
       resolve(outcome);
+    };
+    waiter.reject = (error) => {
+      signal?.removeEventListener("abort", onAbort);
+      reject(error);
     };
     session.interaction.outcomeWaiters.push(waiter);
   });
@@ -64,6 +69,13 @@ export function resolveOutcomeWaiters(session: RuntimeSession, runId: string, ou
   const matching = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId === runId);
   session.interaction.outcomeWaiters = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId !== runId);
   for (const waiter of matching) waiter.resolve(outcome);
+}
+
+export function rejectOutcomeWaiters(session: RuntimeSession, runId: string, error: unknown): void {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  const matching = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId === runId);
+  session.interaction.outcomeWaiters = session.interaction.outcomeWaiters.filter((waiter) => waiter.runId !== runId);
+  for (const waiter of matching) waiter.reject(failure);
 }
 
 export function settleIdleWaiters(session: RuntimeSession, error?: unknown): void {
