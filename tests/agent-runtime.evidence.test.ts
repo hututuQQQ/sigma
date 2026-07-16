@@ -553,8 +553,18 @@ describe("run-scoped completion evidence", () => {
         }],
         nextActions: [
           { action: "address_review_findings", reviewEvidenceId: rejected.evidenceId, findings: ["fix it"] },
-          { tool: "validate" },
-          { tool: "request_review" }
+          {
+            tool: "validate",
+            argumentsSource: {
+              source: "post_repair_current_run_evidence_ledger",
+              field: "workspaceDeltaEvidenceIds",
+              selection: "all unresolved workspace deltas genuinely exercised by the validation command"
+            }
+          },
+          {
+            tool: "request_review",
+            when: expect.stringContaining("retryable reviewer infrastructure or interruption failure")
+          }
         ]
       }
     });

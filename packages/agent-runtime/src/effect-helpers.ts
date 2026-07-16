@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import {
   type JsonValue, type ModelGateway, type ModelToolCall, type ModelToolDefinition,
   type ToolCallPlan, type ToolDescriptor, type ToolReceipt, type WorkspaceDelta
@@ -191,6 +191,27 @@ function scopedWriteTargets(
     typeof input[key] === "string" ? [input[key] as string] : []);
 }
 
+async function implicitMissingCheckpointScope(
+  session: RuntimeSession,
+  plan: ToolCallPlan,
+  target: string,
+  canonical: string,
+  scopes: readonly string[]
+): Promise<boolean> {
+  if (plan.checkpointAction || plan.processMode !== "none"
+    || plan.exactEffects.includes("destructive") || plan.exactEffects.includes("open_world")
+    || !plan.checkpointScope.includes(target) || plan.writePaths.includes(target)) return false;
+  const state = await lstat(canonical).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (state) return false;
+  const writes = await Promise.all(plan.writePaths.map(async (item) =>
+    await canonicalWorkspacePath(session.identity.workspacePath, item).catch(() => null)));
+  return writes.some((write) => write && isInside(canonical, write)
+    && scopes.some((scope) => isInside(scope, write)));
+}
+
 export async function writeScopeFailure(
   session: RuntimeSession,
   call: ModelToolCall,
@@ -208,7 +229,13 @@ export async function writeScopeFailure(
   const outside: string[] = [];
   for (const target of targets) {
     const canonical = await canonicalWorkspacePath(session.identity.workspacePath, target).catch(() => null);
-    if (!canonical || !scopes.some((scope) => isInside(scope, canonical))) outside.push(target);
+    if (!canonical) {
+      outside.push(target);
+      continue;
+    }
+    if (scopes.some((scope) => isInside(scope, canonical))) continue;
+    if (plan && await implicitMissingCheckpointScope(session, plan, target, canonical, scopes)) continue;
+    outside.push(target);
   }
   return outside.length > 0 ? failed(call, startedAt, `Write target is outside the delegated scope: ${outside.join(", ")}.`, "write_scope_denied") : null;
 }

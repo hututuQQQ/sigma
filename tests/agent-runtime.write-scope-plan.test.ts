@@ -37,10 +37,10 @@ function plan(exactEffects: ToolCallPlan["exactEffects"], writePaths: string[]):
   };
 }
 
-function session(workspacePath: string): RuntimeSession {
+function session(workspacePath: string, writeScope = ["delegated"]): RuntimeSession {
   return runtimeSessionFixture({
     workspacePath,
-    identity: { strictWriteScope: true, writeScope: ["delegated"] }
+    identity: { strictWriteScope: true, writeScope }
   });
 }
 
@@ -83,6 +83,36 @@ describe("plan-aware delegated write scope", () => {
       descriptor,
       new Date().toISOString(),
       plan(["process.spawn.readonly", "open_world"], [])
+    )).resolves.toMatchObject({ ok: false, diagnostics: ["write_scope_denied"] });
+  });
+
+  it("allows an absent checkpoint ancestor needed for an exact nested file scope", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-missing-checkpoint-scope-"));
+    const nestedPlan: ToolCallPlan = {
+      exactEffects: ["filesystem.write"],
+      readPaths: ["delegated/new/file.ts"],
+      writePaths: ["delegated/new/file.ts"],
+      network: "none",
+      processMode: "none",
+      checkpointScope: ["delegated"],
+      idempotence: "replay_safe"
+    };
+
+    await expect(writeScopeFailure(
+      session(workspace, ["delegated/new/file.ts"]),
+      call(),
+      descriptor,
+      new Date().toISOString(),
+      nestedPlan
+    )).resolves.toBeNull();
+
+    await mkdir(path.join(workspace, "delegated"));
+    await expect(writeScopeFailure(
+      session(workspace, ["delegated/new/file.ts"]),
+      call(),
+      descriptor,
+      new Date().toISOString(),
+      nestedPlan
     )).resolves.toMatchObject({ ok: false, diagnostics: ["write_scope_denied"] });
   });
 });

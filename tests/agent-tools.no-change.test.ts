@@ -103,7 +103,7 @@ describe("exact text no-change writes", () => {
     await expect(readFile(target, "utf8")).resolves.toBe("created\n");
   });
 
-  it("plans rollback from the deepest existing ancestor when write parents are missing", async () => {
+  it("plans rollback from the first missing ancestor when write parents are missing", async () => {
     const root = await temporaryRoot();
     const workspace = path.join(root, "workspace");
     await mkdir(workspace);
@@ -118,7 +118,7 @@ describe("exact text no-change writes", () => {
     const plan = await tools.prepare(write, context(workspace));
     expect(plan).toMatchObject({
       writePaths: ["public/assets/site.txt"],
-      checkpointScope: ["."]
+      checkpointScope: ["public"]
     });
 
     const result = await tools.execute(write, context(workspace));

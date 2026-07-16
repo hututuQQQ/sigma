@@ -37,7 +37,7 @@ async function writeCheckpointScope(workspacePath: string, relative: string): Pr
   const workspace = await realpath(workspacePath);
   const target = await resolveWorkspacePath(workspacePath, relative);
   let ancestor = path.dirname(target);
-  let directParent = true;
+  let missingScope: string | undefined;
   while (true) {
     const state = await lstat(ancestor).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -49,11 +49,16 @@ async function writeCheckpointScope(workspacePath: string, relative: string): Pr
           code: "workspace_parent_invalid"
         });
       }
-      if (directParent) return [relative];
-      const scope = path.relative(workspace, ancestor).split(path.sep).filter(Boolean).join("/");
-      return [scope || "."];
+      if (!missingScope) return [relative];
+      const scope = path.relative(workspace, missingScope).split(path.sep).filter(Boolean).join("/");
+      if (!scope) {
+        throw Object.assign(new Error(`No contained checkpoint scope for: ${relative}`), {
+          code: "workspace_parent_invalid"
+        });
+      }
+      return [scope];
     }
-    directParent = false;
+    missingScope = ancestor;
     const parent = path.dirname(ancestor);
     if (parent === ancestor) {
       throw Object.assign(new Error(`No existing workspace ancestor for: ${relative}`), {
