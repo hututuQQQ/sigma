@@ -1,7 +1,8 @@
 {
   "name": "agent-supervisor",
-  "version": "3.0.0-beta.1",
+  "version": "3.0.0-rc.1",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

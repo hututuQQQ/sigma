@@ -1,9 +1,11 @@
 [package]
 name = "sigma-exec"
-version = "3.0.0-beta.1"
+version = "3.0.0-rc.1"
 edition = "2024"
 rust-version = "1.85"
-license = "UNLICENSED"
+license = "MIT"
+description = "Native sandbox and process broker for Sigma Code"
+repository = "https://github.com/hututuQQQ/sigma"
 publish = false
 
 [dependencies]

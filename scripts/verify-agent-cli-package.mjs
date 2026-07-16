@@ -718,6 +718,7 @@ async function verifyIntegrityManifest(bundleDir, metadata, targetPlatform, targ
     `bin/${targetPlatform === "win32" ? "agent.cmd" : "agent"}`,
     "package.json",
     "README.md",
+    "LICENSE",
     ...Object.values(portableLanguageAssets),
     "assets/tokenizers/sigma-cjk-byte-v1.json",
     "sbom.cdx.json"
@@ -1185,6 +1186,7 @@ export async function verifyAgentCliPackage(options = {}) {
     targetPlatform === "win32" ? `${bundleName}/bin/agent.cmd` : `${bundleName}/bin/agent`,
     targetPlatform === "win32" ? `${bundleName}/bin/node.exe` : `${bundleName}/bin/node`,
     `${bundleName}/README.md`,
+    `${bundleName}/LICENSE`,
     `${bundleName}/package.json`,
     `${bundleName}/package-metadata.json`,
     ...baseWorkspacePackages.map((name) => `${bundleName}/packages/${name}/dist/index.js`),
@@ -1211,6 +1213,7 @@ export async function verifyAgentCliPackage(options = {}) {
     const bundleDir = path.join(tempDir, bundleName);
     const wrapper = await readFile(path.join(bundleDir, "bin", targetPlatform === "win32" ? "agent.cmd" : "agent"), "utf8");
     const readme = await readFile(path.join(bundleDir, "README.md"), "utf8");
+    const license = await readFile(path.join(bundleDir, "LICENSE"), "utf8");
     const packageJson = await readJson(path.join(bundleDir, "package.json"));
     const metadata = await readJson(path.join(bundleDir, "package-metadata.json"));
     if (metadata.schemaVersion !== 2 && metadata.schemaVersion !== 3) {
@@ -1258,9 +1261,13 @@ export async function verifyAgentCliPackage(options = {}) {
     assertContains("README.md", readme, "Product Boundary");
     assertContains("README.md", readme, "never falls back to a system `node`");
     assertContains("README.md", readme, "benchmark identity, verifier output, rewards, scores, and hidden test details must not be fed back");
+    assertContains("LICENSE", license, "MIT License");
 
     if (packageJson.name !== `sigma-agent-cli-${targetPlatform}-${targetArch}`) {
       throw new Error(`bundle package.json has unexpected name: ${String(packageJson.name)}`);
+    }
+    if (packageJson.license !== "MIT") {
+      throw new Error(`bundle package.json has unexpected license: ${String(packageJson.license)}`);
     }
     if (releaseVersion !== null && packageJson.version !== releaseVersion) {
       throw new Error(`bundle package version=${String(packageJson.version)} expected ${releaseVersion}`);
@@ -1363,6 +1370,7 @@ export async function verifyAgentCliPackage(options = {}) {
       checks: {
         requiredEntries: requiredEntries.length,
         readme: true,
+        license: true,
         wrapper: true,
         metadata: true,
         bundledNode: true,
