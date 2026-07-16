@@ -1,109 +1,218 @@
 <p align="center">
-  <img src="assets/sigma-code-mark.png" alt="Sigma Code" width="160">
+  <img src="assets/sigma-code-mark.png" alt="Sigma Code logo" width="170">
 </p>
 
-# Sigma Code
+<h1 align="center">Sigma Code</h1>
 
-Sigma Code is an event-sourced coding agent for DeepSeek and GLM. The shipped product has one kernel, one session format, and one terminal UI. Removed `agent-core`, `agent-ai`, controller/final-gate, and prior TUI components are not part of the runtime or portable package.
+<p align="center">
+  A durable, evidence-driven coding agent built around DeepSeek.<br>
+  Plan, inspect, edit, execute, validate, review, and resume—all from the terminal.
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <img alt="Status: Beta" src="https://img.shields.io/badge/status-beta-f59e0b">
+  <img alt="Official release: Windows x64" src="https://img.shields.io/badge/official%20release-Windows%20x64-0078d4">
+  <img alt="Formal evaluation: DeepSeek only" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
+</p>
+
+<p align="center">
+  <img src="assets/sigma-code-tui.png" alt="Sigma Code terminal UI running in Windows PowerShell" width="960">
+</p>
+
+Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
+
+> [!IMPORTANT]
+> **Current product boundary**
+>
+> - **Official releases are currently Windows x64 only.** The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
+> - **Formal evaluation and benchmark runs are currently DeepSeek-only.** Sigma's evaluator, Harbor adapter, and Terminal-Bench harness are maintained around DeepSeek; results from other providers are not used for formal claims.
+> - The runtime contains DeepSeek and GLM/Z.ai gateway support, but the GLM path does not have the same formal evaluation coverage.
+> - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
+
+## Why Sigma Code
+
+| Principle | What it means in practice |
+| --- | --- |
+| Durable by default | Commands, model turns, tool receipts, approvals, plans, evidence, and outcomes are stored as checksummed events and can be replayed. |
+| Effects before execution | Every tool declares its possible effects; each call is narrowed to an exact plan before policy, approval, locking, checkpointing, and execution. |
+| Evidence before “done” | A natural-language answer cannot finish a run. Completion must cite typed evidence for explicit acceptance criteria. |
+| Fail-closed containment | Process execution defaults to a native sandbox with no network. If the required sandbox is unhealthy, Sigma refuses to execute. |
+| One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
+
+## Quick start on Windows
+
+Download the latest Windows x64 archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) and extract it. The bundle includes its pinned Node.js runtime, the native `sigma-exec` broker, the TUI runtime, TypeScript/Python language-server assets, and tokenizer data; a separate Node.js installation is not required.
+
+```powershell
+$Sigma = "C:\Tools\sigma-code"
+$Workspace = "D:\path\to\your\repository"
+
+$env:DEEPSEEK_API_KEY = "your-api-key"
+
+# One-time setup for the current Windows user.
+& "$Sigma\bin\agent.cmd" sandbox setup
+
+# Create workspace configuration, verify the runtime and provider, then enter the TUI.
+& "$Sigma\bin\agent.cmd" init --workspace $Workspace --provider deepseek
+& "$Sigma\bin\agent.cmd" doctor --workspace $Workspace --check-api
+& "$Sigma\bin\agent.cmd" tui --workspace $Workspace
+```
+
+The example sets the key only for the current PowerShell process. Keep secrets out of `.agent/config.toml` and source control.
+
+For a one-shot task:
+
+```powershell
+& "$Sigma\bin\agent.cmd" run "Fix the failing tests and explain the change" `
+  --workspace $Workspace `
+  --permission-mode auto
+```
+
+For read-only analysis:
+
+```powershell
+& "$Sigma\bin\agent.cmd" inspect "Map the request path and identify reliability risks" `
+  --workspace $Workspace `
+  --permission-mode auto
+```
+
+`run` uses **change** mode. `inspect` uses **analyze** mode and rejects tools whose declared effects include filesystem writes, unrestricted process spawning, or destructive work.
+
+## What Sigma can do
+
+- **Interactive coding:** use a CJK/IME-aware terminal UI with Markdown responses, activity views, command completion, multiline input, steering, follow-ups, scrolling, and approval overlays.
+- **Repository intelligence:** bounded file listing and grep, repository statistics, Git status/diff, stable hash-aware reads, nested `AGENTS.md` discovery, and LSP-backed code intelligence when a supported server is available.
+- **Scoped changes:** write and edit files, apply atomic multi-file patches, delete individual files, detect no-op writes, create mutation checkpoints, and restore the current run's latest sealed checkpoint.
+- **Sandboxed execution:** run direct executables or platform shells, execute semantic validation, and manage background/PTY processes through broker-scoped session handles.
+- **Evidence-based delivery:** record workspace deltas, commands, validation, diagnostics, reviews, child outcomes, and checkpoints in one typed evidence ledger.
+- **Durable sessions:** list, inspect, replay, resume, cancel, steer, approve, and continue sessions after a process interruption.
+- **Child agents:** delegate plan nodes to bounded child sessions; isolate writers in Git worktrees or narrow single-writer scopes, then explicitly integrate retained changes.
+- **Extensibility:** load skills, profiles, and hooks through frozen/trusted customization boundaries, and connect explicitly trusted read-only MCP stdio servers.
 
 ## Architecture
 
+`agent-runtime.createConfiguredRuntime` is the single production composition root. It wires the model routes, context provider, pure kernel, effect-aware tools, MCP clients, segmented event store, checkpoint manager, reviewer, supervisor, execution broker, and in-process `RuntimeClient`. The CLI creates that runtime; the TUI receives the client rather than rebuilding the agent loop.
+
 ```mermaid
-flowchart LR
-  CLI["agent-cli commands"] --> ROOT["agent-runtime composition root"]
-  CLI --> TUI["agent-tui"]
-  ROOT --> RC["RuntimeClient"]
-  TUI --> RC
-  ROOT --> K["agent-kernel reducer / decisions"]
-  ROOT --> M["agent-model"]
-  ROOT --> C["agent-context"]
-  ROOT --> TOOLS["agent-tools"]
-  ROOT --> MCP["agent-mcp stdio clients"]
-  ROOT --> STORE["agent-store"]
-  TOOLS --> PLATFORM["agent-platform"]
-  TOOLS --> SUP["agent-supervisor"]
-  RC --> EVENTS["AgentEventEnvelope"]
-  EVENTS --> PRESENT["agent-presentation"]
-  PRESENT --> TUI
+flowchart TB
+  USER["User task / TUI input"] --> CLI["agent-cli<br/>commands and configuration"]
+  CLI --> ROOT["agent-runtime<br/>single composition root"]
+  ROOT --> CLIENT["RuntimeClient<br/>session command bus"]
+  CLIENT --> KERNEL["agent-kernel<br/>pure reducer + effect decisions"]
+
+  KERNEL --> MODEL["agent-model<br/>DeepSeek / GLM gateway"]
+  KERNEL --> CONTEXT["agent-context<br/>instructions, retrieval, token budget"]
+  KERNEL --> TOOLS["agent-tools<br/>typed effect plans and receipts"]
+  KERNEL --> STORE["agent-store<br/>events, snapshots, artifacts"]
+
+  TOOLS --> MCP["agent-mcp<br/>trusted read-only stdio bridge"]
+  TOOLS --> SUP["agent-supervisor<br/>children, mailboxes, writer isolation"]
+  TOOLS --> EXEC["agent-execution<br/>only arbitrary-process boundary"]
+  EXEC --> NATIVE["sigma-exec (Rust)<br/>Windows AppContainer / ConPTY / Job Object"]
+
+  MODEL --> EVENTS["AgentEventEnvelope"]
+  CONTEXT --> EVENTS
+  TOOLS --> EVENTS
+  SUP --> EVENTS
+  EVENTS --> STORE
+  EVENTS --> KERNEL
+  EVENTS --> PRESENT["agent-presentation<br/>incremental projection"]
+  PRESENT --> TUI["agent-tui<br/>OpenTUI renderer"]
+
+  EVAL["External evaluation + benchmark harness"] -.->|"launch packaged subject; collect only after run"| CLI
 ```
 
-`agent-runtime.createConfiguredRuntime` is the only production composition root. It constructs the model gateway, context provider, tool registry, MCP clients, segmented store, supervisor, and in-process `RuntimeClient`. `agent-cli` parses commands/configuration and calls that public factory; `agent-tui` receives an injected `RuntimeClient` and depends only on `agent-protocol` and `agent-presentation`.
+### The event loop
 
-Workspace packages communicate through public exports, and the production dependency graph is required to be acyclic:
+1. A CLI/TUI command becomes a typed session command and durable event.
+2. `agent-kernel` reduces the event stream into state and decides the next effect; it does not perform I/O itself.
+3. `agent-runtime` executes that decision through protocol ports for the model, context, tools, store, review, or supervision.
+4. Before a tool runs, Sigma freezes its exact read/write roots, network mode, process mode, idempotence, and checkpoint scope. Mode policy, approval, locks, and trust checks are evaluated against that plan.
+5. The resulting receipt and evidence are appended as new events. The kernel then decides the next step from durable state, while `agent-presentation` projects the same events into CLI/TUI output.
+6. A run ends only with a typed outcome: `Completed`, `NeedsInput`, `Cancelled`, `RecoverableFailure`, or `Fatal`.
 
-- `agent-protocol`: events, typed outcomes, context authority, and model/tool/store/runtime ports
-- `agent-config`: the single CLI/env/TOML/default/help schema and command registry
-- `agent-kernel`: pure state evolution and effect decisions
-- `agent-model`: DeepSeek/GLM transport, tool-call aggregation, retry boundaries, deadlines, and cancellation
-- `agent-store`: checksummed segmented JSONL, snapshots, and content-addressed artifacts
-- `agent-context`: nested `AGENTS.md`, Unicode/CJK retrieval, repository context, and token budgeting
-- `agent-platform`: workspace path containment, platform shell selection, and cancellable process trees
-- `agent-tools`: structured repository/file/process/supervisor tools with declared effects
-- `agent-mcp`: shell-free MCP stdio transport and remote-tool bridge
-- `agent-supervisor`: bounded child scheduling, mailboxes, and writer isolation
-- `agent-runtime`: composition, event execution, recovery, and session ownership
-- `agent-presentation`: incremental event projection
-- `agent-tui`: imperative OpenTUI Core renderer over the event-driven `RuntimeClient`
-- `agent-cli`: thin user-command adapter
+This separation makes replay and recovery part of the normal execution model instead of a special UI feature.
+
+### Package map
+
+| Layer | Packages | Responsibility |
+| --- | --- | --- |
+| Contracts | `agent-protocol`, `agent-config` | Events, commands, outcomes, ports, tool effects, model capabilities, and the shared CLI/env/TOML schema. |
+| Decision engine | `agent-kernel` | Pure state reduction, convergence rules, terminal protocol repair, and effect selection. |
+| Intelligence | `agent-model`, `agent-context`, `agent-code-intel`, `agent-extensions` | Provider streaming, context fitting/compaction, repository instructions, LSP, skills, profiles, and hooks. |
+| Capabilities | `agent-tools`, `agent-mcp` | Repository/file/process/control/supervisor tools and the MCP bridge, all behind declared effects. |
+| Safety boundary | `agent-execution`, `agent-platform`, `agent-checkpoint`, `native/sigma-exec` | Path containment, process policy, native sandboxing, output redaction/artifacts, and transactional recovery. |
+| Durability and coordination | `agent-store`, `agent-supervisor`, `agent-runtime` | Event persistence, snapshots, session ownership, child isolation, recovery, review, and composition. |
+| Product surfaces | `agent-presentation`, `agent-tui`, `agent-cli` | Event projection, terminal interaction, automation commands, session administration, and diagnostics. |
+
+The production package dependency graph is checked for cycles and packages communicate through public exports.
+
+## Safety, permissions, and recovery
+
+### Windows execution boundary
+
+`agent-execution` is the only production package allowed to start arbitrary processes. It talks to the bundled Rust `sigma-exec` broker over a framed protocol. On Windows, each sandboxed command uses an AppContainer identity with scoped filesystem ACLs, a kill-on-close Job Object, capability-gated networking, and ConPTY for interactive processes.
+
+The default policy is `sandbox=required` and `network=none`. Required isolation never falls back to a host process. Unsafe host execution requires both a home-level opt-in and a per-run request. The broker rebuilds the child environment from an allowlist, rejects secret-looking overrides, and redacts configured secret values from returned output.
+
+Path containment and OS isolation are separate checks. Workspace tools reject lexical and symlink/junction escapes; `.git` and `.agent` remain protected from sandbox write grants.
+
+### Checkpoints and durable state
+
+Runtime state is stored outside the agent-writable workspace under a workspace-derived user-state directory:
+
+```text
+<user-state>/sigma/workspaces/<workspace-sha256>/stores/v4/sessions/<session-id>/
+  meta.json
+  events/000001.jsonl
+  snapshots/000000000250.json
+  artifacts/<sha256>
+```
+
+Event records have checksums and monotonic sequence numbers. Segments rotate at 8 MiB or 10,000 events, snapshots are written every 250 events and at rotation, and a torn final record can be repaired under the append lock. Resume restores pending approvals, follow-ups, discovered instructions, budgets, and safe idempotent work. Interrupted non-idempotent effects become `NeedsInput` instead of being silently replayed.
 
 ### Completion is a protocol action
 
-A provider `stop` response or a natural-language claim does not finish a run. The agent must call `complete_task` with a non-empty summary and explicit acceptance criteria:
+A provider `stop` or a confident final paragraph is not completion. The model must call `complete_task` with a non-empty summary, explicit acceptance criteria, and exact references from the current run's evidence ledger. Unknown, failed, stale, or semantically incompatible evidence is rejected and the run continues with a structured repair diagnostic.
 
-- every criterion must be `met` and cite exact typed `evidenceId`/`kind` pairs from the current-run durable evidence ledger;
-- each criterion has one typed claim shared by all of its evidence references; the default `acceptance_met` claim accepts only non-failed evidence, `validation_passed` accepts only passed validation evidence, and `validation_executed` may cite a failed validation solely to prove that it ran and its result was reported;
-- unknown, mismatched, or semantically incompatible evidence references reject the proposal with a structured repair diagnostic;
-- non-detached children are joined before completion, and a failed child or retained, unintegrated writer worktree keeps the parent run open.
+For non-documentation changes, completion requires passed semantic validation and approved independent review evidence. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
 
-When no actionable task was provided or a concrete decision is required, the agent calls `request_user_input`; this produces a durable `NeedsInput` outcome that can be continued in the same task. A natural `stop` never becomes an outcome by itself. After tool work, the kernel permits one bounded protocol-repair turn on which the model must choose exactly one typed terminal action: `complete_task` for an evidence-backed completion, or `request_user_input` for a concrete decision that changes the result. Repeated invalid repair calls and repeated output-limit continuations end as typed recoverable failures.
+## Commands
 
-Rejected completion proposals become ordinary tool failures and the kernel continues from the durable state. Their structured result identifies each missing delta-scoped obligation, the allowed next tool, and the evidence kind/status that tool can produce. Non-documentation deltas require passed semantic validation and approved independent review evidence. Passed validation triggers the internal reviewer automatically, and `request_review` is the explicit, ID-free way to request the same internal review path; neither path asks the user to re-authorize an already authorized code change. Genuine review findings remain blocked until addressed, while a typed reviewer infrastructure/interruption failure may be retried explicitly and is never misrepresented as code feedback.
+| Command | Purpose |
+| --- | --- |
+| `agent tui --workspace .` | Open the interactive terminal UI. |
+| `agent run "..." --workspace .` | Run a workspace-changing task. |
+| `agent inspect "..." --workspace .` | Analyze without write-capable tools. |
+| `agent sessions --workspace . --json` | List durable sessions. |
+| `agent session show --latest --workspace .` | Inspect the latest session. |
+| `agent replay --latest --workspace . --timeline` | Replay its event timeline. |
+| `agent resume <session-id> --workspace .` | Continue a durable session. |
+| `agent cancel <session-id> --workspace .` | Cancel an active session. |
+| `agent approval <session-id> <request-id> --decision allow --workspace .` | Resolve a pending approval. |
+| `agent doctor --workspace . --check-api` | Check configuration, sandbox, toolchains, and provider access. |
+| `agent sandbox setup` | Prepare and self-test the Windows sandbox. |
+| `agent init --workspace .` | Create `.agent/config.toml`. |
 
-## Requirements
+Stable process exit codes are `0` for `Completed`, `2` for `NeedsInput`, `130` for `Cancelled`, and `1` for recoverable or fatal failure.
 
-- Node.js `26.4.0` (pinned by `.node-version`, CI, package metadata, and the portable runtime)
-- pnpm `11.7.0`
-- for live model calls: `DEEPSEEK_API_KEY`, or one of `GLM_API_KEY`, `ZAI_API_KEY`, `BIGMODEL_API_KEY`
+### TUI controls
 
-```powershell
-corepack enable
-corepack prepare pnpm@11.7.0 --activate
-pnpm install --frozen-lockfile
-pnpm build
-pnpm --filter agent-cli start -- --help
-```
-
-Tests that use fake gateways do not require provider credentials.
-
-## Commands and outcomes
-
-```text
-agent run "Fix failing tests" --workspace . --permission-mode auto
-agent inspect "Review the architecture" --workspace . --permission-mode auto
-agent tui --workspace .
-agent sessions --workspace . --json
-agent session show --latest --workspace .
-agent replay --latest --workspace . --timeline
-agent resume <session-id> --workspace .
-agent cancel <session-id> --workspace .
-agent approval <session-id> <request-id> --decision allow --workspace .
-agent doctor --workspace . --check-api
-```
-
-`run` uses `change` mode. `inspect` uses `analyze` mode: tools declaring `filesystem.write`, unrestricted `process.spawn`, or `destructive` effects are denied, while read-only tools remain available. Policy is evaluated from `ToolDescriptor` effects and approval metadata, not from a hard-coded tool-name list.
-
-A non-interactive `run` or `inspect` in `permissionMode=ask` returns `NeedsInput` before starting because no approval response can be collected. `--permission-mode auto` controls tool approval; it does not disable process isolation. Process execution defaults independently to `sandbox=required` and `network=none`.
-
-Process exit codes are stable:
-
-- `0`: `Completed`
-- `2`: `NeedsInput`
-- `130`: `Cancelled`
-- `1`: `RecoverableFailure` or `Fatal`
+- `Enter`: send while idle, or steer the active run
+- `Shift+Enter` / `Ctrl+J`: insert a line
+- `Alt+Enter`: queue a follow-up
+- `Ctrl+O`: collapse or expand activity
+- `PgUp` / `PgDn`, `Ctrl+U` / `Ctrl+D`, mouse wheel: scroll
+- `/new`, `/mode analyze|change`, `/followup`, `/activity`, `/help`, `/quit`: session commands
+- First `Ctrl+C`: cancel; second press within 1.5 seconds: exit
 
 ## Configuration
 
-Precedence is: CLI flags, environment, workspace `.agent/config.toml`, home `~/.sigma/config.toml`, then defaults. Unknown flags and unknown TOML keys fail immediately. Help, shell completions, `agent init`, and runtime settings are derived from the same schema.
+Precedence is **CLI flags → environment → workspace `.agent/config.toml` → home `~/.sigma/config.toml` → defaults**. Unknown flags and TOML keys fail immediately. Workspace-authored MCP servers and executable hooks require an explicit digest-bound trust grant.
 
 ```toml
 [model]
@@ -115,8 +224,8 @@ mode = "ask"
 
 [runtime]
 run_deadline_sec = 900
-model_deadline_sec = 300
-stream_idle_sec = 60
+model_deadline_sec = 120
+stream_idle_sec = 45
 
 [tools]
 max_parallel = 4
@@ -131,125 +240,62 @@ output_format = "text"
 fps = 30
 ```
 
-### MCP servers
+DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path, but formal Sigma evaluation remains DeepSeek-only.
 
-MCP stdio servers can be declared in TOML, in the `SIGMA_MCP_SERVERS` JSON array, or with repeatable `--mcp-server <json>` flags. A TOML entry is explicit about the remote server's policy boundary:
+## Evaluation and benchmark boundary
 
-```toml
-[[mcp.servers]]
-name = "workspace-tools"
-command = "node"
-args = ["tools/server.mjs"]
-cwd = "."
-possible_effects = ["filesystem.read", "network"]
-approval = "prompt"
-execution_mode = "sequential"
-idempotent = false
-timeout_ms = 120000
-idle_timeout_ms = 30000
-hard_deadline_ms = 120000
-shutdown_grace_ms = 750
-```
+Sigma's formal experience evaluator runs the packaged product in fresh, opaque workspaces and reduces the durable event stream into separate correctness, safety, experience, and reliability results. The current manifest fixes formal evaluation to **DeepSeek** (currently `deepseek-v4-pro`). Terminal-Bench runs through the dedicated Harbor-compatible DeepSeek harness.
 
-Repository-level MCP configuration never starts on first use. Review `.agent/config.toml`, then explicitly grant durable trust with `--trust-workspace-mcp`; the grant is stored outside the repository and is valid only for the canonical workspace path and exact configuration digest. Any configuration change requires trust again. MCP supplied explicitly by a CLI flag, environment, or the user's home configuration is not treated as repository-authored.
-
-Sigma starts the configured executable directly, without a shell. Its working directory must resolve inside the workspace, and the child inherits only a small platform environment allowlist plus literal `env` entries from its configuration—not model keys or the rest of `process.env`. `possible_effects` is mandatory; V4 rejects `filesystem.write`, `destructive`, and `open_world` MCP servers before process spawn, and every accepted persistent server receives zero writable roots. MCP requests have cancellation, idle timeout, and absolute deadline handling; shutdown escalates to process-tree termination after the grace period. Global `permissionMode=deny` still denies prompt-gated MCP tools, while network effects remain subject to the normal approval and sandbox policy.
-
-## Permissions and containment
-
-Each tool invocation receives its own `ToolExecutionContext` and `AbortSignal`. Descriptors declare possible effects, approval mode, idempotency, execution mode, resource keys, context/write-path arguments, idle timeout, and hard timeout. The runtime uses those declarations for mode checks, approval, locking, receipt reuse, nested `AGENTS.md` discovery, and workspace-delta evidence. A newly discovered nested instruction is durably recorded and any affected mutating/open-world call is deferred until the model replans with that instruction.
-
-Filesystem tools reject lexical and symlink/junction escapes from the workspace. Path containment and OS isolation are separate controls: containment limits accepted paths, while the native broker provides Linux namespace/Landlock/seccomp or Windows AppContainer isolation. The default is fail-closed `sandbox=required` with `network=none`; if the broker is unavailable or its self-test fails, execution is refused. Unsafe host execution requires both a home-level `allow_unsafe_host_exec` grant and an explicit request for that run. `agent doctor` reports the detected backend, self-test result, network modes, and PTY capability.
-
-Text reads expose byte length, SHA-256, and whether the exact file ends with a newline in structured output. After the normal mode, scope, approval, and workspace-lock checks, `write` and `edit` compare the requested UTF-8 bytes with the pinned current file. An exact same-byte request returns `no_change` with read-only actual effects and creates no workspace delta or mutation checkpoint; analyze mode still rejects the mutating tool intent before this optimization is considered.
-
-## Sessions and recovery
-
-```text
-<user-state>/sigma/workspaces/<workspace-sha256>/stores/v4/sessions/<sessionId>/
-  meta.json
-  events/000001.jsonl
-  snapshots/000000000250.json
-  artifacts/<sha256>
-```
-
-Events have checksums and monotonic sequence numbers. Segments rotate at 8 MiB or 10,000 events; snapshots are written every 250 events and on rotation. Event records and metadata are fsynced, a torn final record can be repaired under the append lock, and readers do not mutate the log.
-
-Resume loads the newest valid snapshot, replays the remaining events, restores pending approvals, queued follow-ups, and dynamically discovered project instructions, restarts an interrupted model attempt from its durable boundary, and resets interrupted idempotent tools for safe re-execution. An interrupted non-idempotent tool becomes `NeedsInput` and requires an explicit retry decision.
-
-Long histories are fitted with the gateway tokenizer contract. Older turns may be replaced in the request by a low-authority, provenance-tagged lossy summary; the full durable transcript remains in the store and `context.compacted` records the boundary.
-
-Runtime state and its owner record live in the user's private state directory, outside the agent-writable workspace. The durable cross-process inbox accepts cancellation only; approvals, steering, and follow-ups must come through the controlling runtime/TUI and cannot be forged by writing a workspace file. Old workspace-local session directories are left untouched but are neither listed nor imported.
-
-## Supervisor and writer isolation
-
-The default child concurrency is four. Each child gets its own session transcript, context, receipts, and budget. Follow-ups use a bounded FIFO mailbox; non-detached children are joined when the parent proposes completion.
-
-- Analyze children share the source workspace in read-only mode.
-- A writer in a clean Git repository runs in a detached worktree.
-- Writers in dirty Git or non-Git workspaces use a single-writer lease against the source workspace. They require a non-empty relative `writeScope`; path-addressable writes are checked before execution and broad mutation-capable process/MCP tools are denied in this shared mode.
-- A changed worktree is retained until `integrate_agent` is called. Integration requires approval, verifies the source HEAD/status, rejects ignored files and changes outside the declared `writeScope`, copies the accepted delta, then removes the worktree.
-
-`spawn_agent` itself is prompt-gated and declares the complete delegated effect set. Child approval requests are allowed only when every requested effect is inside that explicit grant; the decision is surfaced as a parent `child.message`. Undelegated effects are denied. Parent cancellation propagates to every non-detached child, and durable spawned/completed/integrated events prevent a resumed parent from silently ignoring interrupted child work.
-
-## TUI
-
-The TUI uses the imperative `@opentui/core` API: a responsive status bar, keyed/culled conversation viewport, compact or expanded activity, queued follow-up preview, a one-to-six-line composer, and help/approval overlays. Assistant replies render as Markdown, user input remains literal text, and oversized terminal message views retain their beginning and end with an explicit omission marker. Untrusted terminal controls are sanitized throughout. CJK, combining characters, emoji, IME/bracketed paste, mouse wheels, and 20×5 terminals are supported; alternate-screen, raw mode, cursor, subscriptions, and active sessions are restored or released on every exit path.
-
-- Enter submits while idle and steers the active run; Shift+Enter or Ctrl+J inserts a line;
-- Alt+Enter queues a follow-up (`/followup` is the compatibility form);
-- `/new` cancels an active run and creates a new session;
-- `/mode analyze|change` changes the next run mode;
-- `/activity` collapses or expands activity;
-- `/help`, an empty-input `?`, and `/` completion expose the same command registry;
-- PgUp/PgDn, Ctrl+U/Ctrl+D, and the mouse wheel scroll without stealing composer focus;
-- the first Ctrl+C cancels, and a second within 1.5 seconds exits.
-
-Steering rejects stale model/tool turns before they can start later effects. Follow-ups are durably recorded as queued/delivered events and recover in FIFO order. Both queues reject new input at their 256-message capacity rather than overwriting existing entries. See [VALIDATION.md](./VALIDATION.md) for renderer and real-terminal CI boundaries.
-
-## Development and release
+The evaluator may select a task, launch the packaged CLI, and collect artifacts after the run. It must not send scenario identity, verifier output, scores, rewards, hidden checks, or post-run failures into the solving session, and verifier feedback never triggers another solving attempt. This fairness boundary is enforced by protocol types and production-source scans.
 
 ```powershell
-pnpm lint
-pnpm test:coverage
-pnpm test:harbor
-pnpm smoke:product
-pnpm smoke:tui-product
-pnpm verify:containment
-pnpm verify:package:agent-cli:linux
-# On Windows:
-pnpm verify:package:agent-cli:windows
-```
-
-`pnpm lint` runs TypeScript, ESLint complexity/function-size rules, dependency-cycle/public-export checks, Knip, and production file-size guards. Coverage gates are global and stricter for kernel/protocol/store; the exact commands and thresholds are documented in [VALIDATION.md](./VALIDATION.md).
-
-Development and release use Node `26.4.0`. TUI entry points add `--experimental-ffi` automatically; direct `runTuiApp` callers must start Node with that flag. Portable Linux and Windows packages recursively deploy the complete production dependency graph, preserve nested version conflicts, select optional dependencies for the target OS/CPU/libc, assert the matching OpenTUI native runtime, and bundle Node `26.4.0`. Linux remains glibc-targeted. The structural package check is cross-platform; executing a target wrapper requires a supported native or WSL environment for that target.
-
-## Agent experience evaluation
-
-The external experience evaluator runs Sigma with the provider/model declared in `sigma-manifest.json` in fresh, opaque workspaces and reduces the durable V4 event stream into separate correctness, safety, experience, and reliability results. It never sends scenario identity, verifier details, scores, or reviewer conclusions to the solving session. Evaluation hosts are restricted to `linux-x64` and `win32-x64`; unsupported OS/architectures fail before packaging.
-
-```powershell
-# Audit existing sessions without calling a model.
+# Audit existing sessions without a model call.
 pnpm eval:session -- --workspace . --latest 2
 
-# Fast live suite: five scenarios, one packaged subject attempt each.
+# DeepSeek-only live evaluation and benchmark paths.
 pnpm eval:agent -- --suite quick
-
-# Full live suite: twelve scenarios, three fresh attempts each.
 pnpm eval:agent -- --suite experience --repeat 3
-
-# Explicit development subject and isolated result root for local iteration.
-pnpm eval:agent -- --suite quick --subject dev --eval-root .artifacts/eval-dev
-
-# Compare compatible saved runs.
-pnpm eval:compare -- --baseline <run-dir> --candidate <run-dir>
+pnpm bench:deepseek
 ```
 
-Live runs load only `DEEPSEEK_API_KEY` from `.env`; the endpoint is not overridable and secret values are not written to artifacts. Formal runs use the packaged subject by default; `--subject dev` is an explicit local-development choice and never depends on suite identity. Results are stored under `.artifacts/eval/<run-id>/`, or the root selected by `--eval-root`, with conventional `run.json`, `report.md`, `human-audit.json`, and `human-audit.md` aliases plus immutable content-addressed publication files. Each run records a `subjectDigest` for the executed CLI/runtime/Node/broker bytes and an `environmentDigest` for controlled comparison inputs. `latest.files` points to one addressed machine-report snapshot, while `latest.humanReview` points to the matching terminal human-only bundle. The evaluator does not call a reviewer model, and the human-review bundle is never supplied to a solving or optimization agent, resumed session, or retry.
+No cross-provider benchmark conclusion should be inferred from these results.
 
-## Evaluation fairness boundary
+## Build and develop
 
-Evaluation adapters may select a task, launch the packaged CLI, and collect results after the run. They remain outside production packages. Evaluation identity, hidden checks, scores, evaluator logs, and post-run failures are not solver context and cannot trigger another solver attempt.
+The repository pins Node.js `26.4.0`, pnpm `11.7.0`, and Rust `1.96.0`.
 
-The type boundary reinforces this rule: solver-visible `AgentEventEnvelope` and `ContextItem` authorities exclude `external_verifier`; `ExternalEvaluationReport` is written only through a separate `EvaluationSink`. A production-source scan rejects benchmark/verifier/task-identity control flow, and the product gate contains no post-evaluation retry path.
+```powershell
+corepack enable
+corepack prepare pnpm@11.7.0 --activate
+pnpm install --frozen-lockfile
+pnpm build
+cargo build --release --locked --manifest-path native/sigma-exec/Cargo.toml
+
+pnpm lint
+pnpm test:coverage
+```
+
+Build and verify the current official target:
+
+```powershell
+pnpm package:agent-cli:windows
+pnpm verify:release:windows
+```
+
+After packaging, put the development key in the repository-local, gitignored `.env` file:
+
+```dotenv
+DEEPSEEK_API_KEY=your-api-key
+```
+
+Then launch the development TUI:
+
+```powershell
+pnpm tui:deepseek
+```
+
+Fake-gateway tests do not require provider credentials. See [VALIDATION.md](VALIDATION.md) for coverage thresholds, real-terminal boundaries, native sandbox checks, packaging proofs, and release gates.
+
+## Direction
+
+Sigma's near-term focus is deliberately narrow: make the Windows product dependable, deepen the DeepSeek-specific harness and long-session convergence, improve real task performance toward OpenCode, and keep evaluation feedback outside the solving boundary. Broader formal platform/provider support should follow demonstrated product reliability rather than lead it.
