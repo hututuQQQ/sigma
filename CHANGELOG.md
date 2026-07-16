@@ -10,6 +10,24 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 - Nothing yet.
 
+## [3.0.0-rc.2] - 2026-07-16
+
+### Added
+
+- A directly usable Windows x64 portable CLI preview archive.
+- SHA-256, CycloneDX SBOM, and provenance sidecars for the preview archive.
+
+### Security
+
+- The preview archive is explicitly unsigned: Windows Authenticode signer policy and
+  trusted provenance signature gates are not satisfied.
+- The development-only `qs` dependency is constrained to patched version `6.15.2`.
+- Users should verify the published SHA-256 sidecar before extracting the archive and
+  should expect Windows SmartScreen to warn.
+
+This prerelease is intended for hands-on evaluation while hosted Actions and trusted
+Windows code signing remain unavailable. It is not the stable or signed release.
+
 ## [3.0.0-rc.1] - 2026-07-16
 
 ### Added
@@ -35,5 +53,6 @@ trusted Windows code-signing gate is not yet configured. Windows x64 remains the
 first intended end-user binary target; Linux x64 packaging remains a technical
 preview and CI validation target.
 
-[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v3.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v3.0.0-rc.2...HEAD
+[3.0.0-rc.2]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.2
 [3.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.1

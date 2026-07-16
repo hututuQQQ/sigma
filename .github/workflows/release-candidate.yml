@@ -228,7 +228,7 @@ jobs:
           if-no-files-found: error
           path: |
             .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}
-            .artifacts/agent-cli-${{ matrix.label }}.sha256
+            .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}.sha256
             .artifacts/agent-cli-${{ matrix.label }}.sbom.cdx.json
             .artifacts/agent-cli-${{ matrix.label }}.provenance.json
       - name: Upload public provenance key
@@ -269,11 +269,11 @@ jobs:
 
           const expected = [
             "agent-cli-linux-x64.tgz",
-            "agent-cli-linux-x64.sha256",
+            "agent-cli-linux-x64.tgz.sha256",
             "agent-cli-linux-x64.sbom.cdx.json",
             "agent-cli-linux-x64.provenance.json",
             "agent-cli-win32-x64.zip",
-            "agent-cli-win32-x64.sha256",
+            "agent-cli-win32-x64.zip.sha256",
             "agent-cli-win32-x64.sbom.cdx.json",
             "agent-cli-win32-x64.provenance.json",
             "release-provenance-public.pem"
