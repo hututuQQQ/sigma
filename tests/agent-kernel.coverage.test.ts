@@ -401,6 +401,23 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.repeatedToolBatchCount).toBe(2);
   });
 
+  it("hashes large repeated outputs without weakening repeated-action convergence", () => {
+    const largeOutput = "stable payload ".repeat(100_000);
+    let state = apply(initial(), "user.message", { text: "inspect a large stable result" });
+    for (const index of [1, 2]) {
+      const callId = `large-${index}`;
+      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "large.txt" } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        largeOutput,
+        `2026-01-01T00:00:0${index}.000Z`
+      ));
+    }
+    state = proposeToolBatch(state, 3, [{ id: "large-3", name: "read", arguments: { path: "large.txt" } }]);
+
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "agent_no_progress" });
+  });
+
   it("resets the completed-outcome streak when another batch intervenes", () => {
     let state = apply(initial(), "user.message", { text: "inspect related paths" });
     for (const index of [1, 2]) {
@@ -864,6 +881,72 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       phase: "tool_pending",
       pendingTools: [{ approval: "not_required", started: false }]
     });
+  });
+
+  it("retries completion deterministically after prerequisite evidence arrives without another model turn", () => {
+    let state = withPendingTool("completion-needs-validation", "complete_task", {
+      summary: "The requested change is complete.",
+      criteria: []
+    });
+    state = toolEvent(state, "tool.failed", "completion-needs-validation", {
+      ok: false,
+      output: "Completion requires current-run validation evidence.",
+      outcome: {
+        status: "failed",
+        output: "Completion requires current-run validation evidence.",
+        diagnosticCodes: ["validation_evidence_required"]
+      },
+      observedEffects: ["outcome.propose"],
+      artifacts: [],
+      diagnostics: ["validation_evidence_required"],
+      evidence: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepair: {
+        kind: "completion_prerequisite",
+        originalCallId: "completion-needs-validation",
+        evidenceCount: 0,
+        retryCount: 0
+      }
+    });
+
+    state = apply(state, "evidence.recorded", {
+      evidenceId: "validation-ready",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" },
+      summary: "Validation passed.",
+      data: {
+        validator: "command",
+        command: "check",
+        exitCode: 0,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: [],
+        workspaceDeltaEvidenceIds: []
+      }
+    });
+
+    expect(state).toMatchObject({
+      phase: "tool_pending",
+      pendingTools: [{ request: { name: "complete_task" } }]
+    });
+    expect(state.pendingTools[0]?.request.callId).toMatch(/^completion_retry_1_/u);
+    expect(decide(state).map((effect) => effect.type)).toEqual(["execute_tool"]);
+    expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 
   it("advances a user-resolved checkpoint recovery out of NeedsInput", () => {

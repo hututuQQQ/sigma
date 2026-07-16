@@ -13,6 +13,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
@@ -216,6 +217,28 @@ function completionReceipt(
 }
 
 describe("run-scoped completion evidence", () => {
+  it("bounds the prompt projection while keeping the newest structural and observational evidence", () => {
+    const target = session([]);
+    const observations = Array.from({ length: 40 }, (_, index): EvidenceRecord => ({
+      ...proofEvidence(),
+      evidenceId: `observation-${index}`,
+      status: "passed",
+      summary: `observation ${index}`
+    }));
+    const validations = Array.from({ length: 40 }, (_, index) => validation(`validation-${index}`, []));
+    target.durable.state.evidence = [...observations, ...validations];
+
+    const ledger = evidenceLedger(target)!;
+    const projectedRecords = ledger.content.match(/^- /gmu) ?? [];
+    expect(projectedRecords).toHaveLength(48);
+    expect(ledger.content).toContain("32 older current-run evidence records omitted");
+    expect(ledger.content).not.toContain("- observation-0 ");
+    expect(ledger.content).toContain("- observation-39 ");
+    expect(ledger.content).not.toContain("- validation-0 ");
+    expect(ledger.content).toContain("- validation-39 ");
+    expect(ledger.id).toMatch(/^runtime:evidence-ledger:run:[a-f0-9]{16}$/u);
+  });
+
   it("requires exact validation and review links for every current-run delta", () => {
     expect(completionDiagnostic([])).toBeUndefined();
     const first = delta("delta-1");

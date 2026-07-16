@@ -23,7 +23,16 @@ function hasExitedFailedValidation(session: RuntimeSession): boolean {
     && evidenceSupportsClaim(item, "validation_executed"));
 }
 
-export function completionRepairPhase(session: RuntimeSession): CompletionRepairPhase {
+function prerequisiteRepairPhase(
+  session: RuntimeSession,
+  evidenceCount: number
+): CompletionRepairPhase {
+  const referenceableEvidence = session.durable.state.evidence.filter((item) =>
+    isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId)).length;
+  return referenceableEvidence > evidenceCount ? "protected_completion" : "evidence";
+}
+
+function explicitRepairPhase(session: RuntimeSession): CompletionRepairPhase | null {
   const repair = session.durable.state.completionRepair;
   if (repair?.kind === "evidence_acquisition") {
     // A failed validation is still referenceable for the narrow
@@ -44,6 +53,13 @@ export function completionRepairPhase(session: RuntimeSession): CompletionRepair
     return hasExitedFailedValidation(session) ? "failed_validation_terminal" : "protected_completion";
   }
   if (repair?.kind === "protected_recovery") return "protected_recovery";
+  if (repair?.kind === "completion_prerequisite") return prerequisiteRepairPhase(session, repair.evidenceCount);
+  return null;
+}
+
+export function completionRepairPhase(session: RuntimeSession): CompletionRepairPhase {
+  const explicit = explicitRepairPhase(session);
+  if (explicit) return explicit;
   if (session.durable.state.completionRepairAttempts === 0) return "none";
   // Compatibility for snapshots created before repair intent was durable.
   const hasEvidence = session.durable.state.evidence.some((item) =>

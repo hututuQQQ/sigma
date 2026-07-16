@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   INFRASTRUCTURE_FAILURE_LIMIT,
   classifyInfrastructureFailureCodesV1,
@@ -33,9 +34,15 @@ function isExecutionInfrastructureCluster(cluster: SemanticFailureCluster | unde
   return cluster?.family.startsWith("execution_") === true;
 }
 
+function isDependencyCluster(cluster: SemanticFailureCluster | undefined): boolean {
+  return cluster?.family === "execution_dependency";
+}
+
 export function semanticInfrastructureFailureMessage(cluster: SemanticFailureCluster): string {
   const recoveryBoundary = isExecutionInfrastructureCluster(cluster)
-    ? "a successful process launch"
+    ? isDependencyCluster(cluster)
+      ? "a bounded dependency recovery"
+      : "a successful process launch"
     : "workspace or durable evidence progress";
   return `Infrastructure repeatedly failed without ${recoveryBoundary} (${cluster.family}, ${cluster.attempts} attempts; diagnostics: ${cluster.diagnosticCodes.join(", ")}).`;
 }
@@ -71,6 +78,33 @@ function advancedProgress(
     durableEvidence: progress.durableEvidence + durableEvidence,
     revision
   };
+}
+
+function withoutDiagnosticIdentity(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutDiagnosticIdentity);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => key !== "callId")
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => [key, withoutDiagnosticIdentity(item)]));
+}
+
+function evidenceProgressSignature(evidence: EvidenceRecord): string {
+  const data = evidence.kind === "command"
+    ? {
+        command: evidence.data.command,
+        exitCode: evidence.data.exitCode,
+        ...(evidence.data.signal ? { signal: evidence.data.signal } : {})
+      }
+    : evidence.kind === "diagnostic"
+      ? { source: evidence.data.source, diagnostic: withoutDiagnosticIdentity(evidence.data.diagnostic) }
+      : evidence.data;
+  return createHash("sha256").update(JSON.stringify({
+    kind: evidence.kind,
+    status: evidence.status,
+    summary: evidence.summary,
+    data
+  })).digest("hex");
 }
 
 function progressMatches(left: SemanticProgressWatermark, right: SemanticProgressWatermark): boolean {
@@ -126,7 +160,7 @@ export function recordSemanticToolResult(
 ): SemanticFailureUpdate {
   const workspaceChanges = deltaSize(receipt.workspaceDelta);
   const executionCluster = isExecutionInfrastructureCluster(state.semanticFailureCluster);
-  if (successfulProcessLaunch(receipt, toolName)) {
+  if (successfulProcessLaunch(receipt, toolName) && !isDependencyCluster(state.semanticFailureCluster)) {
     return {
       state: withWorkspaceProgress({ ...state, semanticFailureCluster: undefined }, workspaceChanges, false),
       limitReached: false
@@ -163,6 +197,9 @@ export function recordSemanticEvidenceProgress(state: KernelState, evidence: Evi
   const evidenceFromFailedTool = evidence.producer.authority === "tool"
     && state.receipts.some((receipt) => receipt.callId === evidence.producer.id && !receipt.ok);
   if (evidenceFromFailedTool) return state;
+  const signature = evidenceProgressSignature(evidence);
+  if (state.evidence.some((item) => item.evidenceId !== evidence.evidenceId
+    && evidenceProgressSignature(item) === signature)) return state;
   const executionCluster = isExecutionInfrastructureCluster(state.semanticFailureCluster);
   const clearsPendingFailure = !executionCluster && state.phase === "outcome_pending"
     && state.proposedOutcome?.kind === "recoverable_failure"

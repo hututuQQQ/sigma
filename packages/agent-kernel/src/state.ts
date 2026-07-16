@@ -5,6 +5,7 @@ import {
   isBudgetLedgerState,
   isCheckpointRef,
   isEvidenceRecord,
+  isJsonValue,
   isPlanGraph,
   isUsageRecord,
   type BudgetLedgerState,
@@ -60,7 +61,8 @@ export interface SemanticFailureCluster {
   lastRevision: number;
   diagnosticCodes: string[];
   /** Latest global progress watermark. Execution clusters are rebased across
-   * unrelated evidence or workspace progress until a process launch succeeds. */
+   * unrelated evidence or workspace progress. Capability clusters clear after
+   * a successful process launch; dependency clusters retain their retry bound. */
   progress: SemanticProgressWatermark;
 }
 
@@ -68,7 +70,16 @@ export type CompletionRepairState =
   | { kind: "evidence_acquisition" }
   | { kind: "terminal_action" }
   | { kind: "protected_completion"; answer: string }
-  | { kind: "protected_recovery"; answer: string };
+  | { kind: "protected_recovery"; answer: string }
+  | {
+      kind: "completion_prerequisite";
+      answer: string;
+      arguments: ToolRequest["arguments"];
+      originalCallId: string;
+      evidenceCount: number;
+      retryCount: number;
+      modelTurn: ActiveModelTurn;
+    };
 
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
@@ -198,12 +209,23 @@ export function isSemanticFailureCluster(value: unknown): value is SemanticFailu
     && isSemanticProgressWatermark(cluster.progress));
 }
 
+function isCompletionPrerequisiteRepair(repair: Record<string, unknown>): boolean {
+  const modelTurn = record(repair.modelTurn);
+  if (!modelTurn) return false;
+  const validIdentity = typeof repair.originalCallId === "string" && repair.originalCallId.length > 0;
+  const validCounts = nonNegativeInteger(repair.evidenceCount) && nonNegativeInteger(repair.retryCount);
+  const validTurn = nonNegativeInteger(modelTurn.turnId) && nonNegativeInteger(modelTurn.effectRevision);
+  return typeof repair.answer === "string" && repair.answer.trim().length > 0
+    && validIdentity && isJsonValue(repair.arguments) && validCounts && validTurn;
+}
+
 export function isCompletionRepairState(value: unknown): value is CompletionRepairState {
   const repair = record(value);
   if (!repair) return false;
   if (repair.kind === "evidence_acquisition" || repair.kind === "terminal_action") {
     return Object.keys(repair).length === 1;
   }
+  if (repair.kind === "completion_prerequisite") return isCompletionPrerequisiteRepair(repair);
   return (repair.kind === "protected_completion" || repair.kind === "protected_recovery")
     && typeof repair.answer === "string"
     && repair.answer.trim().length > 0

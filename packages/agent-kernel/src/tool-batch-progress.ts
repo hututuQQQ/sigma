@@ -21,10 +21,18 @@ function canonicalJson(value: JsonValue): string {
   return JSON.stringify(value);
 }
 
+function contentIdentity(value: JsonValue): JsonValue {
+  const serialized = typeof value === "string" ? value : canonicalJson(value);
+  return {
+    characters: serialized.length,
+    sha256: createHash("sha256").update(serialized, "utf8").digest("hex")
+  };
+}
+
 function receiptSemantics(receipt: ToolReceipt): JsonValue {
   const outcome = receipt.outcome ?? {
     status: receipt.ok ? "succeeded" as const : "failed" as const,
-    output: receipt.output,
+    output: contentIdentity(receipt.output),
     diagnosticCodes: receipt.diagnostics
   };
   const artifactRefs = (receipt.artifactRefs ?? []).map((artifact) => ({
@@ -38,7 +46,7 @@ function receiptSemantics(receipt: ToolReceipt): JsonValue {
     output: receipt.output,
     outcome: {
       status: outcome.status,
-      output: outcome.output,
+      output: contentIdentity(outcome.output),
       diagnosticCodes: uniqueSorted(outcome.diagnosticCodes)
     },
     diagnostics: uniqueSorted(receipt.diagnostics),

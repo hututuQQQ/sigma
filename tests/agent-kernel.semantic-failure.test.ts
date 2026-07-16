@@ -173,6 +173,29 @@ function failAlternative(
 }
 
 describe("semantic execution failure convergence", () => {
+  it("bounds missing-dependency recovery even when diagnostic commands succeed between attempts", () => {
+    let state = failAlternative(initial(), "missing-one", "exec", "dependency_missing");
+    state = successfulReceipt(state, "diagnostic-one", "shell", {
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    });
+    state = failAlternative(state, "missing-two", "shell", "dependency_missing");
+    state = successfulReceipt(state, "diagnostic-two", "exec", {
+      observedEffects: ["process.spawn.readonly"],
+      actualEffects: ["process.spawn.readonly"]
+    });
+    state = failAlternative(state, "missing-three", "exec", "dependency_missing");
+
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE
+    });
+    expect(state.semanticFailureCluster).toMatchObject({
+      family: "execution_dependency",
+      attempts: 3
+    });
+  });
+
   it("puts structured outcome, diagnostics, and evidence summaries in modern tool history", () => {
     const evidence: EvidenceRecord = {
       evidenceId: "diagnostic-proof",

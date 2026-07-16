@@ -36,6 +36,22 @@ function commandSucceeded(result: ExecutionResult): boolean {
     && result.failure === undefined;
 }
 
+/** Stable, language-level diagnostics only. Package names and command text are
+ * deliberately excluded so convergence remains product- and task-invariant. */
+function dependencyDiagnostics(result: ExecutionResult): string[] {
+  if (commandSucceeded(result)) return [];
+  const output = `${result.stdout}\n${result.stderr}`;
+  const missing = [
+    /ModuleNotFoundError:\s*No module named/iu,
+    /(?:Error:\s*)?Cannot find (?:package|module)\b/iu,
+    /ERR_MODULE_NOT_FOUND/iu,
+    /cannot load such file --/iu,
+    /ClassNotFoundException\b/iu,
+    /NoClassDefFoundError\b/iu
+  ].some((pattern) => pattern.test(output));
+  return missing ? ["dependency_missing"] : [];
+}
+
 async function importOutputArtifacts(
   artifacts: readonly ProcessOutputArtifact[] | undefined,
   context: ToolExecutionContext
@@ -144,6 +160,7 @@ export async function commandReceipt(
     diagnostics: [
       `exit_code=${String(result.exitCode)}`,
       ...(result.failure ? [result.failure.code] : []),
+      ...dependencyDiagnostics(result),
       ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
       ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])
     ],

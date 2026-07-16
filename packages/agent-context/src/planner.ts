@@ -27,6 +27,13 @@ interface HistoryBlock {
 
 const LATEST_BLOCK_TOKEN_LIMIT = 8_192;
 const TOOL_ARGUMENT_TOKEN_LIMIT = 128;
+/**
+ * Replaying every tool turn that still fits the provider window makes the
+ * cumulative request cost quadratic in long sessions. Keep a generous raw
+ * working set and summarize the older blocks even when the provider could
+ * technically accept them. Small-context models still use their whole window.
+ */
+const PROACTIVE_HISTORY_TOKEN_LIMIT = 24_000;
 
 function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
@@ -249,20 +256,24 @@ function includeRecentHistory(
   blocks: readonly HistoryBlock[],
   selected: Map<number, ModelMessage[]>,
   initialUsed: number,
-  fitLimit: number
+  fitLimit: number,
+  historyTokenLimit: number
 ): number {
   let used = initialUsed;
+  let historyUsed = [...selected.values()].reduce((total, messages) => total + blockTokens(messages), 0);
   let reachedBoundary = false;
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
     const block = blocks[index];
     const tokens = blockTokens(block.messages);
-    if (reachedBoundary || !block.wireSafe || tokens > LATEST_BLOCK_TOKEN_LIMIT || used + tokens > fitLimit) {
+    if (reachedBoundary || !block.wireSafe || tokens > LATEST_BLOCK_TOKEN_LIMIT
+      || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;
     }
     selected.set(index, block.messages);
     used += tokens;
+    historyUsed += tokens;
   }
   return used;
 }
@@ -286,7 +297,17 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   const included: ContextItem[] = [...mandatory];
   const omitted: ContextItem[] = [];
   let used = includeDynamicContext(candidates, included, omitted, selection.used, selection.fitLimit);
-  used = includeRecentHistory(blocks, selection.selected, used, selection.fitLimit);
+  const historyTokenLimit = available <= PROACTIVE_HISTORY_TOKEN_LIMIT
+    ? available
+    : PROACTIVE_HISTORY_TOKEN_LIMIT;
+  used = includeRecentHistory(
+    blocks,
+    selection.selected,
+    used,
+    selection.fitLimit,
+    Math.max(historyTokenLimit, [...selection.selected.values()]
+      .reduce((total, messages) => total + blockTokens(messages), 0))
+  );
 
   const omittedBlocks = blocks
     .filter((_block, index) => !selection.selected.has(index))

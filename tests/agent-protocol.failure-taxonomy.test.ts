@@ -26,6 +26,14 @@ describe("infrastructure failure taxonomy v1", () => {
     ])).toBeUndefined();
   });
 
+  it("classifies adapter-authenticated missing dependencies separately from missing runtimes", () => {
+    expect(classifyInfrastructureFailureCodesV1(["dependency_missing"])).toEqual({
+      taxonomyVersion: FAILURE_TAXONOMY_VERSION,
+      family: "execution_dependency",
+      codes: ["dependency_missing"]
+    });
+  });
+
   it("selects one family deterministically and normalizes code suffixes", () => {
     expect(classifyInfrastructureFailureCodesV1([
       " BROKER_TIMEOUT:poll ",

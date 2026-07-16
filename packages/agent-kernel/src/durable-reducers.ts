@@ -12,6 +12,7 @@ import {
   type JsonValue
 } from "agent-protocol";
 import type { KernelState } from "./state.js";
+import { queueCompletionPrerequisiteRetry } from "./model-convergence.js";
 import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 
@@ -62,11 +63,12 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
       ? [...state.mutationEvidence, evidence]
       : state.mutationEvidence
   }, evidence);
-  return firstCompletionEvidence
+  const repaired: KernelState = firstCompletionEvidence
     ? isCompletionEligibleEvidence(evidence, state.sessionId, state.runId)
       ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
       : { ...progressed, completionRepairAttempts: Math.max(1, state.completionRepairAttempts), completionRepair: { kind: "terminal_action" } }
     : progressed;
+  return queueCompletionPrerequisiteRetry(repaired);
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {
