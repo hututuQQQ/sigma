@@ -33,6 +33,42 @@ async function writableTarget(workspacePath: string, requestedPath: string): Pro
   return relative;
 }
 
+async function writeCheckpointScope(workspacePath: string, relative: string): Promise<string[]> {
+  const workspace = await realpath(workspacePath);
+  const target = await resolveWorkspacePath(workspacePath, relative);
+  let ancestor = path.dirname(target);
+  let missingScope: string | undefined;
+  while (true) {
+    const state = await lstat(ancestor).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (state) {
+      if (!state.isDirectory() || state.isSymbolicLink()) {
+        throw Object.assign(new Error(`Writable parent is not a stable directory: ${relative}`), {
+          code: "workspace_parent_invalid"
+        });
+      }
+      if (!missingScope) return [relative];
+      const scope = path.relative(workspace, missingScope).split(path.sep).filter(Boolean).join("/");
+      if (!scope) {
+        throw Object.assign(new Error(`No contained checkpoint scope for: ${relative}`), {
+          code: "workspace_parent_invalid"
+        });
+      }
+      return [scope];
+    }
+    missingScope = ancestor;
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) {
+      throw Object.assign(new Error(`No existing workspace ancestor for: ${relative}`), {
+        code: "workspace_parent_invalid"
+      });
+    }
+    ancestor = parent;
+  }
+}
+
 class EditPreconditionError extends Error {}
 
 function readTool(): RegisteredEffectTool {
@@ -170,7 +206,7 @@ function writeTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
   return {
     descriptor: descriptor({
       name: "write",
-      description: "Write a complete UTF-8 file inside the workspace. If the requested UTF-8 bytes exactly match an existing regular file, returns status=no_change without a write effect, workspace delta, or checkpoint.",
+      description: "Write a complete UTF-8 file inside the workspace. Missing parent directories are created atomically and included in rollback. If the requested UTF-8 bytes exactly match an existing regular file, returns status=no_change without a write effect, workspace delta, or checkpoint.",
       properties: { path: { type: "string" }, content: { type: "string" } },
       required: ["path", "content"],
       possibleEffects: ["filesystem.read", "filesystem.write"],
@@ -180,7 +216,20 @@ function writeTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
       writePathArguments: ["path"],
       approval: "prompt",
       idempotent: true,
-      timeoutMs: 30_000
+      timeoutMs: 30_000,
+      async prepare(value, context) {
+        const input = args(value);
+        const relative = await writableTarget(context.workspacePath, stringArg(input, "path"));
+        return {
+          exactEffects: ["filesystem.read", "filesystem.write"],
+          readPaths: [relative],
+          writePaths: [relative],
+          network: "none",
+          processMode: "none",
+          checkpointScope: await writeCheckpointScope(context.workspacePath, relative),
+          idempotence: "replay_safe"
+        };
+      }
     }),
     async probeNoChange(request, context) {
       const input = args(request.arguments);

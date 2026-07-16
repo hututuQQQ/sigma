@@ -470,7 +470,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "completed",
-      message: "The validation was executed and failed; that result is reported honestly.",
+      message: "The validation was executed and failed; that result is reported honestly.\n\nResult: short fallback summary",
       evidence: expect.arrayContaining([expect.objectContaining({ kind: "validation", status: "failed" })])
     });
     expect(gateway.requests).toHaveLength(3);

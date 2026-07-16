@@ -404,6 +404,41 @@ describe("independent reviewer budget accounting", () => {
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
   });
 
+  it("fails closed when any reviewer port approves while returning findings", async () => {
+    const target = runtimeSession();
+    const contradictory: ReviewerPort = {
+      reviewerId: "contradictory-port",
+      review: async (input): Promise<ReviewEvidence> => ({
+        evidenceId: "contradictory-review",
+        sessionId: input.sessionId,
+        runId: input.runId,
+        kind: "review",
+        status: "passed",
+        createdAt: now,
+        producer: { authority: "runtime", id: "contradictory-port" },
+        summary: "approved with a finding",
+        data: {
+          reviewerId: "contradictory-port",
+          verdict: "approved",
+          findings: ["An unresolved correctness issue remains."],
+          workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId)
+        }
+      })
+    };
+    const { budgets, emit } = harness(target);
+
+    await new ReviewCoordinator(contradictory, emit, budgets)
+      .maybeReview(target, new AbortController().signal);
+
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        findings: ["An unresolved correctness issue remains."]
+      }
+    });
+  });
+
   it("deduplicates repeated review requests when no new evidence exists", async () => {
     const target = runtimeSession();
     let calls = 0;
@@ -453,6 +488,20 @@ describe("independent reviewer budget accounting", () => {
     const decorated = await new ModelReviewer(decoratedGateway).review(input, new AbortController().signal);
     expect(decorated).toMatchObject({ status: "failed", data: { verdict: "changes_requested" } });
     expect(decoratedGateway.calls).toBe(1);
+
+    const contradictoryGateway = new ReviewerGateway(
+      undefined,
+      '{"verdict":"approved","findings":["Fix the missing authorization check."]}'
+    );
+    const contradictory = await new ModelReviewer(contradictoryGateway)
+      .review(input, new AbortController().signal);
+    expect(contradictory).toMatchObject({
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        findings: ["Fix the missing authorization check."]
+      }
+    });
 
     const truncatedDelta = delta();
     truncatedDelta.data.reviewDiff += "\n[review diff truncated]";

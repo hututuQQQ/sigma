@@ -437,7 +437,7 @@ describe("configured runtime execution capabilities", () => {
       expectedNetworkModes: ["none"] as Array<"none" | "full">
     },
     {
-      name: "configuration narrows broker network support",
+      name: "configuration selects a default without hiding broker network support",
       shells: [] as BrokerVerifiedShell[],
       expectedShells: [],
       expectedDefault: "none",
@@ -448,7 +448,7 @@ describe("configured runtime execution capabilities", () => {
         networkModes: ["none", "full"] as Array<"none" | "full">
       },
       configuredNetworkMode: "none" as const,
-      expectedNetworkModes: ["none"] as Array<"none" | "full">
+      expectedNetworkModes: ["none", "full"] as Array<"none" | "full">
     },
     {
       name: "broker narrows configured network support",
@@ -477,7 +477,7 @@ describe("configured runtime execution capabilities", () => {
       expectedNetworkModes: ["full"] as Array<"none" | "full">
     },
     {
-      name: "empty configured and broker network intersection",
+      name: "broker full-only support remains available with a none configured default",
       shells: [] as BrokerVerifiedShell[],
       expectedShells: [],
       expectedDefault: "none",
@@ -487,7 +487,7 @@ describe("configured runtime execution capabilities", () => {
         foreground: true, background: true, stdin: true, pty: true, networkModes: ["full"]
       },
       configuredNetworkMode: "none" as const,
-      expectedNetworkModes: [] as Array<"none" | "full">
+      expectedNetworkModes: ["full"] as Array<"none" | "full">
     }
   ])("uses doctor capabilities for tools and runtime context with $name", async ({
     shells,

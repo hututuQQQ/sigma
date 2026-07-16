@@ -175,6 +175,35 @@ describe("execution output artifact receipts", () => {
     expect(released).toEqual([[artifact.brokerArtifactId]]);
   });
 
+  it("reports a background process non-zero exit as a failed poll", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-poll-exit-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 5,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "listen EACCES", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false
+    };
+    const poll: ProcessPollResult = {
+      handle: { id: "process", brokerInstanceId: "broker" },
+      state: "exited", exitCode: 1, signal: null, durationMs: 5,
+      stdout: "", stderr: "listen EACCES", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+
+    const receipt = await tools.find((tool) => tool.descriptor.name === "process_poll")!.execute(
+      request("failed-poll", "process_poll", { handleId: "process", brokerInstanceId: "broker" }),
+      context
+    );
+
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.diagnostics).toContain("process_exit_nonzero:1");
+    expect(receipt.output).toContain("listen EACCES");
+  });
+
   it("does not acknowledge the broker spool before durable CAS import succeeds", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-output-cas-failure-"));
     const artifact = outputArtifact("stdout", "full output");

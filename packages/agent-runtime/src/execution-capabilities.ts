@@ -48,11 +48,9 @@ export function verifiedNetworkPolicy(
   configuredMode: "none" | "full"
 ): VerifiedNetworkPolicy {
   const brokerModes = new Set(report.capabilities.networkModes);
-  const configuredModes: Array<"none" | "full"> = configuredMode === "full"
-    ? ["none", "full"] : ["none"];
-  const modes = configuredModes.filter((mode) => brokerModes.has(mode));
+  const modes = (["none", "full"] as const).filter((mode) => brokerModes.has(mode));
   return {
-    modes,
+    modes: [...modes],
     defaultMode: modes.includes(configuredMode) ? configuredMode : modes[0] ?? "none"
   };
 }

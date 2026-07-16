@@ -37,6 +37,14 @@ import {
 
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 
+function networkProperty(options: ExecutionToolOptions): JsonValue {
+  return {
+    type: "string",
+    enum: availableNetworkModes(options),
+    description: `Per-call network policy; configured default is '${options.networkMode}'. In a required sandbox, network=none denies every socket operation, including localhost bind/connect. Use network=full only for the smallest launch or probe that actually needs sockets; it requires fresh approval.`
+  };
+}
+
 async function closeLocks(
   ...locks: Array<{ close(): Promise<void> } | undefined>
 ): Promise<void> {
@@ -199,21 +207,21 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   };
   const properties: Record<string, JsonValue> = kind === "shell" ? {
     shell: { type: "string", enum: availableShells(options) }, command: { type: "string" }, cwd: { type: "string" },
-    network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
+    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
     timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   } : {
     executable: executableCapabilitySchema(options),
     args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
     skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
-    network: { type: "string", enum: availableNetworkModes(options) }, env: { type: "object", additionalProperties: { type: "string" } },
+    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
     timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
     ...writeContractProperties
   };
   if (validation) {
     properties.workspaceDeltaEvidenceIds = {
       type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Optional exact unresolved workspace-delta evidence IDs to validate. Omit this field to let the runtime bind every unresolved delta automatically; never guess IDs."
+      description: "Exact unresolved workspace-delta evidence IDs genuinely exercised by this command. Omission is inferred only when exactly one unresolved delta exists; with multiple deltas, supply the exact subset and never attach unrelated files to a narrow check."
     };
   }
   const required = kind === "shell" ? ["shell", "command"] : ["executable"];
@@ -223,7 +231,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   return {
     descriptor: {
       ...executionToolSchema(kind, validation
-        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. A non-zero exited command is referenceable only as validation_executed, never validation_passed. Omit workspaceDeltaEvidenceIds to bind all unresolved deltas automatically. Passed validation makes eligible non-documentation deltas available to Sigma's internal request_review path. With skill and skillScript, the frozen script is prepended to interpreter args."
+        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. A non-zero exited command is referenceable only as validation_executed, never validation_passed. Scope the command only to workspace deltas it genuinely exercises; omission is inferred only for one unresolved delta. Passed validation automatically triggers eligible internal review. With skill and skillScript, the frozen script is prepended to interpreter args."
         : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`, properties, required, effects),
       prepare(value, context) {
         if (kind === "shell") assertAvailableShell(executionArgs(value), options);
@@ -290,7 +298,7 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
       ...executionToolSchema("process_spawn", "Start a sandboxed background process and return an in-session handle.", {
         executable: executableCapabilitySchema(options),
         args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
-        network: { type: "string", enum: availableNetworkModes(options) },
+        network: networkProperty(options),
         env: { type: "object", additionalProperties: { type: "string" } },
         ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
         access: { type: "string", enum: ["readonly"] },
@@ -307,7 +315,9 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
     async execute(request: ToolRequest, context: PlannedToolExecutionContext) {
       const startedAt = new Date().toISOString();
       const result = await options.broker.poll(handle(executionArgs(request.arguments)), { signal: context.signal });
-      return await processReceipt(request, startedAt, result, ["process.spawn.readonly"], context, options.broker);
+      return await processReceipt(
+        request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "poll"
+      );
     }
   }, ...(options.stdin === false ? [] : [{
     descriptor: executionToolSchema("process_write", "Write UTF-8 input to an in-session background process.", {
@@ -324,7 +334,9 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const result = await options.broker.terminate(handle(executionArgs(request.arguments)), { signal: context.signal });
-      return await processReceipt(request, startedAt, result, ["process.spawn.readonly"], context, options.broker);
+      return await processReceipt(
+        request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "terminate"
+      );
     }
   }];
 }

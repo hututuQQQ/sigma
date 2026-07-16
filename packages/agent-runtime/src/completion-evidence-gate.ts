@@ -7,6 +7,7 @@ import {
   type JsonValue,
   type ModelToolCall,
   type PlanGraph,
+  type ReviewEvidence,
   type ToolDescriptor,
   type ToolReceipt,
   type ValidationEvidence,
@@ -134,6 +135,30 @@ function validationChangeEvidenceFailure(
   };
 }
 
+function blockedReviewRepairActions(blockedReview: ReviewEvidence): JsonValue[] {
+  return [
+    {
+      action: "address_review_findings",
+      reviewEvidenceId: blockedReview.evidenceId,
+      findings: blockedReview.data.findings.slice(0, 20)
+    },
+    {
+      tool: "validate",
+      after: "Create the repair workspace delta, then construct the validation call from the updated current-run evidence ledger.",
+      argumentsSource: {
+        source: "post_repair_current_run_evidence_ledger",
+        field: "workspaceDeltaEvidenceIds",
+        selection: "all unresolved workspace deltas genuinely exercised by the validation command"
+      }
+    },
+    {
+      tool: "request_review",
+      arguments: {},
+      when: "Only if the post-validation evidence ledger reports a retryable reviewer infrastructure or interruption failure."
+    }
+  ];
+}
+
 function reviewChangeEvidenceFailure(
   session: RuntimeSession,
   evidence: readonly EvidenceRecord[],
@@ -182,19 +207,7 @@ function reviewChangeEvidenceFailure(
         } : {})
       };
     }),
-    nextActions: blockedReview ? [
-      {
-        action: "address_review_findings",
-        reviewEvidenceId: blockedReview.evidenceId,
-        findings: blockedReview.data.findings.slice(0, 20)
-      },
-      {
-        tool: "validate",
-        arguments: {},
-        after: "Create the repair workspace delta; omit evidence IDs to bind all unresolved deltas."
-      },
-      { tool: "request_review", arguments: {}, after: "Passed validation records the repair scope." }
-    ] : [{
+    nextActions: blockedReview ? blockedReviewRepairActions(blockedReview) : [{
       tool: "request_review",
       arguments: {},
       ...(retryableReview ? { retryOfReviewEvidenceId: retryableReview.evidenceId } : {}),

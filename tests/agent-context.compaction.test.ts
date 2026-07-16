@@ -97,6 +97,36 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expectWireSafe(retained);
   });
 
+  it("does not replay oversized settled write arguments even in a large context window", () => {
+    const content = "export const generated = true;\n".repeat(4_000);
+    const result = plan([
+      { role: "user", content: "Create the requested artifact." },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "large-write",
+          name: "write",
+          arguments: { path: "src/generated.ts", content }
+        }]
+      },
+      { role: "tool", content: "Wrote src/generated.ts", toolCallId: "large-write" }
+    ], 128_000, 8_000);
+    const retained = retainedHistory(result);
+    const call = retained.flatMap((message) => message.toolCalls ?? [])[0];
+
+    expect(call).toMatchObject({
+      id: "large-write",
+      arguments: { _contextCompacted: true, originalTokens: expect.any(Number) }
+    });
+    expect(JSON.stringify(call?.arguments)).not.toContain(content.slice(0, 100));
+    expect(retained).toContainEqual(expect.objectContaining({
+      role: "tool", toolCallId: "large-write", content: "Wrote src/generated.ts"
+    }));
+    expect(result.budget.historyTokens).toBeLessThan(1_000);
+    expectWireSafe(retained);
+  });
+
   it("retains raw blocks as a contiguous newest-first suffix around the latest user", () => {
     const history: ModelMessage[] = [{ role: "user", content: "Keep the original acceptance criteria." }];
     for (let index = 0; index < 10; index += 1) {
