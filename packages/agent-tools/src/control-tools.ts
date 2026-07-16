@@ -98,7 +98,7 @@ function updatePlanTool(): RegisteredEffectTool {
 
 function budgetTool(): RegisteredEffectTool {
   return {
-    descriptor: descriptor("read_budget", "Read shared hard budget limits, consumption and reservations.", {}),
+    descriptor: descriptor("read_budget", "Read shared hard budget limits, consumption and reservations when the next strategy materially depends on remaining budget; do not use it as a startup ritual.", {}),
     async execute(request, context) {
       return receipt(request, new Date().toISOString(), await requiredControl(context).readBudget(), ["runtime.control"]);
     }
@@ -118,7 +118,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Request Sigma's internal read-only reviewer for every eligible non-documentation workspace delta. Supply no evidence IDs: the runtime selects pending deltas and their passed validation evidence. This is internal review, not a user decision or approval prompt. A prior reviewer infrastructure/interruption failure can be retried explicitly with this tool; genuine changes_requested findings must be addressed first. On success, cite the resulting review evidence ID from the next current-run evidence ledger.",
+      "Eligible non-documentation workspace deltas receive internal review automatically after passed validation. Use this tool only when the evidence ledger explicitly requests review or to retry a prior reviewer infrastructure/interruption failure. Supply no evidence IDs: the runtime selects pending deltas and their passed validation evidence. Genuine changes_requested findings must be addressed and revalidated first. On success, cite the resulting review evidence ID from the next current-run evidence ledger.",
       {}
     ),
     async execute(request, context) {

@@ -794,7 +794,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(bodyCompletion).toMatchObject({
       phase: "outcome_pending",
-      proposedOutcome: { kind: "completed", message: "Detailed same-turn answer." }
+      proposedOutcome: {
+        kind: "completed",
+        message: "Detailed same-turn answer.\n\nResult: short fallback"
+      }
     });
 
     let repairedCompletion = withPendingTool("repair-complete", "complete_task");

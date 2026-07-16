@@ -190,8 +190,8 @@ function reviewChangeEvidenceFailure(
       },
       {
         tool: "validate",
-        arguments: {},
-        after: "Create the repair workspace delta; omit evidence IDs to bind all unresolved deltas."
+        arguments: { workspaceDeltaEvidenceIds: ids },
+        after: "Create the repair workspace delta, then validate exactly the listed unresolved deltas."
       },
       { tool: "request_review", arguments: {}, after: "Passed validation records the repair scope." }
     ] : [{

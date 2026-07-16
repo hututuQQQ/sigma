@@ -16,14 +16,23 @@ export function validationTargetIds(
   const input = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
     ? argumentsValue as Record<string, unknown> : {};
   const requested = input.workspaceDeltaEvidenceIds;
-  if (requested === undefined) return undefined;
+  const unresolvedItems = unresolvedWorkspaceDeltas(session);
+  if (requested === undefined) {
+    if (call.name !== "validate") return undefined;
+    if (unresolvedItems.length <= 1) return unresolvedItems.map((item) => item.evidenceId);
+    throw Object.assign(new Error(
+      "Validation scope is ambiguous because multiple unresolved workspace deltas exist. "
+      + `Supply the exact workspaceDeltaEvidenceIds genuinely exercised by this command: ${unresolvedItems
+        .map((item) => item.evidenceId).join(", ")}.`
+    ), { code: "validation_scope_ambiguous" });
+  }
   if (!Array.isArray(requested) || requested.length === 0
     || requested.some((item) => typeof item !== "string" || item.length === 0)) {
     throw Object.assign(new Error(
       "workspaceDeltaEvidenceIds must be a non-empty array of unresolved workspace delta evidence IDs."
     ), { code: "validation_scope_invalid" });
   }
-  const unresolved = new Set(unresolvedWorkspaceDeltas(session).map((item) => item.evidenceId));
+  const unresolved = new Set(unresolvedItems.map((item) => item.evidenceId));
   const ids = [...new Set(requested as string[])];
   const invalid = ids.filter((id) => !unresolved.has(id));
   if (invalid.length > 0) {

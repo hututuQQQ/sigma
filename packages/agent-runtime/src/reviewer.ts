@@ -203,7 +203,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Approve only if the supplied evidence supports the code review verdict despite that reported failure; otherwise request changes with the failure in findings. Complete opaque artifacts are reviewable by their workspace path, SHA-256, size, checkpoint-bound delta, and passed validation; do not require textual source for a binary file. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Approve only if the supplied evidence supports the code review verdict despite that reported failure; otherwise request changes with the failure in findings. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. An approved verdict must have zero unresolved correctness, security, or acceptance findings: if you report any actionable finding, return changes_requested. Complete opaque artifacts are reviewable by their workspace path, SHA-256, size, checkpoint-bound delta, and passed validation; do not require textual source for a binary file. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -230,10 +230,11 @@ function reviewEvidence(
     const inputProblem = reviewInputFailure(input);
     const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
     const validFindings = rawFindings !== undefined;
-    const verdict = !inputProblem && validFindings && parsed?.verdict === "approved" ? "approved" : "changes_requested";
     const findings = inputProblem ? [inputProblem] : validFindings
       ? rawFindings.filter((item): item is JsonValue => item === null || ["string", "number", "boolean", "object"].includes(typeof item))
       : [parsed ? "Reviewer response omitted findings." : "Reviewer returned invalid JSON."];
+    const verdict = !inputProblem && validFindings && findings.length === 0
+      && parsed?.verdict === "approved" ? "approved" : "changes_requested";
     return {
       evidenceId: randomUUID(),
       sessionId: input.sessionId,

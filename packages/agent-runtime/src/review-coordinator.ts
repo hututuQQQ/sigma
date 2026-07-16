@@ -34,7 +34,9 @@ function normalizeReview(
   workspaceDeltas: WorkspaceDeltaEvidence[],
   validations: ValidationEvidence[]
 ): ReviewEvidence {
-  const verdict = raw.data.verdict === "approved" ? "approved" : "changes_requested";
+  const findings = [...raw.data.findings];
+  const verdict = raw.data.verdict === "approved" && findings.length === 0
+    ? "approved" : "changes_requested";
   return {
     evidenceId: randomUUID(),
     sessionId: session.identity.sessionId,
@@ -43,11 +45,11 @@ function normalizeReview(
     status: verdict === "approved" ? "passed" : "failed",
     createdAt: new Date().toISOString(),
     producer: { authority: "runtime", id: raw.data.reviewerId },
-    summary: raw.summary,
+    summary: verdict === "approved" ? raw.summary : "Independent reviewer requested changes.",
     data: {
       reviewerId: raw.data.reviewerId,
       verdict,
-      findings: [...raw.data.findings],
+      findings,
       workspaceDeltaEvidenceIds: workspaceDeltas.map((item) => item.evidenceId),
       validationEvidenceIds: validations.map((item) => item.evidenceId),
       ...(raw.data.failureKind ? { failureKind: raw.data.failureKind } : {}),

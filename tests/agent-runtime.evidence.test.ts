@@ -18,6 +18,7 @@ import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
+import { validationTargetIds } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
 import { unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
@@ -190,6 +191,42 @@ function session(evidence: EvidenceRecord[]): RuntimeSession {
   state.evidence = [proofEvidence(), ...evidence];
   return runtimeSessionFixture({ state, seq: 1 });
 }
+
+const validationPlan: ToolCallPlan = {
+  exactEffects: ["validation"],
+  readPaths: [],
+  writePaths: [],
+  network: "none",
+  processMode: "pipe",
+  checkpointScope: [],
+  idempotence: "read_only"
+};
+
+describe("validation workspace-delta scope", () => {
+  it("infers the only unresolved delta for the built-in validator", () => {
+    expect(validationTargetIds(session([delta("delta-one")]), {
+      id: "validate", name: "validate", arguments: {}
+    }, validationPlan)).toEqual(["delta-one"]);
+  });
+
+  it("requires an explicit scope when multiple unresolved deltas exist", () => {
+    expect(() => validationTargetIds(session([
+      delta("delta-one", "src/one.ts"),
+      delta("delta-two", "src/two.ts")
+    ]), {
+      id: "validate", name: "validate", arguments: {}
+    }, validationPlan)).toThrow(expect.objectContaining({ code: "validation_scope_ambiguous" }));
+  });
+
+  it("preserves implicit runtime binding for purpose-built validators", () => {
+    expect(validationTargetIds(session([
+      delta("delta-one", "src/one.ts"),
+      delta("delta-two", "src/two.ts")
+    ]), {
+      id: "fixture", name: "verify_fixture_files", arguments: {}
+    }, validationPlan)).toBeUndefined();
+  });
+});
 
 const completionDescriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
 const completionCall = {

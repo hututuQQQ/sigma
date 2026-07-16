@@ -168,13 +168,29 @@ export async function commandReceipt(
   };
 }
 
+function processOutcome(
+  operation: "poll" | "terminate",
+  value: ProcessPollResult
+): { ok: boolean; diagnostics: string[] } {
+  if (operation === "terminate") return { ok: true, diagnostics: [] };
+  if (value.state === "running") return { ok: true, diagnostics: [] };
+  if (value.state === "lost") return { ok: false, diagnostics: ["process_lost"] };
+  if (value.state === "terminated") return { ok: false, diagnostics: ["process_terminated"] };
+  const diagnostics = [
+    ...(value.exitCode === 0 ? [] : [`process_exit_nonzero:${String(value.exitCode)}`]),
+    ...(value.signal === null ? [] : [`process_signalled:${value.signal}`])
+  ];
+  return { ok: diagnostics.length === 0, diagnostics };
+}
+
 export async function processReceipt(
   request: ToolRequest,
   startedAt: string,
   value: ProcessPollResult,
   effects: ToolDescriptor["possibleEffects"],
   context: ToolExecutionContext,
-  broker: ExecutionBroker
+  broker: ExecutionBroker,
+  operation: "poll" | "terminate"
 ): Promise<ToolReceipt> {
   const completedAt = new Date().toISOString();
   const imported = await importOutputArtifacts(value.outputArtifacts, context);
@@ -192,13 +208,15 @@ export async function processReceipt(
     summary: "Broker output overflow was preserved as redacted durable artifacts.",
     data: { source: "sigma-exec", diagnostic: { type: "process_output_artifacts", artifacts: imported.metadata } }
   }];
+  const outcome = processOutcome(operation, value);
   return {
-    callId: request.callId, ok: value.failure === undefined,
+    callId: request.callId, ok: value.failure === undefined && outcome.ok,
     output: JSON.stringify(outputValue, (_key, item: unknown) => item instanceof Uint8Array ? undefined : item),
     observedEffects: effects, actualEffects: effects,
     artifacts: imported.ids, artifactRefs: imported.refs,
     diagnostics: [
       ...(value.failure ? [value.failure.code] : []),
+      ...outcome.diagnostics,
       ...(value.outputTruncated ? ["output_truncated"] : []),
       ...imported.diagnostics
     ],

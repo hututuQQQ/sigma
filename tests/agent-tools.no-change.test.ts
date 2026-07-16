@@ -103,6 +103,30 @@ describe("exact text no-change writes", () => {
     await expect(readFile(target, "utf8")).resolves.toBe("created\n");
   });
 
+  it("plans rollback from the deepest existing ancestor when write parents are missing", async () => {
+    const root = await temporaryRoot();
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      atomicPatchStateRootDir: path.join(root, "state")
+    });
+    const write = request("nested-write", "write", {
+      path: "public/assets/site.txt",
+      content: "created\n"
+    });
+
+    const plan = await tools.prepare(write, context(workspace));
+    expect(plan).toMatchObject({
+      writePaths: ["public/assets/site.txt"],
+      checkpointScope: ["."]
+    });
+
+    const result = await tools.execute(write, context(workspace));
+    expect(result).toMatchObject({ ok: true, result: { status: "changed" } });
+    await expect(readFile(path.join(workspace, "public", "assets", "site.txt"), "utf8"))
+      .resolves.toBe("created\n");
+  });
+
   it.each([
     ["write", { path: "same.txt", content: "same\n" }],
     ["edit", { path: "same.txt", oldText: "same", newText: "same" }]

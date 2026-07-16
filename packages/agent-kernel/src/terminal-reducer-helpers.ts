@@ -125,6 +125,15 @@ function assistantBodyForToolCall(state: KernelState, callId: string): string | 
   return message.content;
 }
 
+function ordinaryCompletionMessage(answer: string | null, summary: string): string {
+  if (!answer) return summary;
+  const normalizedAnswer = answer.trim();
+  const normalizedSummary = summary.trim();
+  if (!normalizedSummary || normalizedAnswer.includes(normalizedSummary)) return answer;
+  if (normalizedSummary.includes(normalizedAnswer)) return summary;
+  return `${answer}\n\nResult: ${summary}`;
+}
+
 const COMPLETION_PREREQUISITE_CODES = new Set([
   "validation_evidence_required",
   "validation_result_reporting_required",
@@ -204,10 +213,11 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
     return proposedOutcomeState(input.progressed, {
       kind: "completed",
       // A protected substantive answer is intentionally immutable during its
-      // terminal repair. On an ordinary completion, preserve the assistant's
-      // body from the same model turn and use the tool summary only when it is
-      // absent.
-      message: protectedCompletionAnswer(input.state) || sameTurnAnswer || summary,
+      // terminal repair. On an ordinary completion, retain both handoff
+      // surfaces so a generic same-turn status cannot hide
+      // the structured completion summary.
+      message: protectedCompletionAnswer(input.state)
+        || ordinaryCompletionMessage(sameTurnAnswer, summary),
       evidence: input.progressed.evidence
     });
   }

@@ -124,6 +124,11 @@ function boundedArguments(value: JsonValue): JsonValue {
     : { _contextCompacted: true, originalTokens: tokens };
 }
 
+function hasOversizedToolArguments(block: HistoryBlock): boolean {
+  return block.messages.some((message) => message.toolCalls?.some((call) =>
+    approximateTokens(JSON.stringify(call.arguments)) > TOOL_ARGUMENT_TOKEN_LIMIT));
+}
+
 function compactSkeleton(block: HistoryBlock): ModelMessage[] {
   return block.messages.map((message) => ({
     role: message.role,
@@ -223,7 +228,7 @@ function selectMandatoryHistory(
   const block = blocks[newest];
   const rawTokens = blockTokens(block.messages);
   const limit = Math.min(LATEST_BLOCK_TOKEN_LIMIT, fitLimit - used);
-  const messages = block.wireSafe && rawTokens <= limit
+  const messages = block.wireSafe && rawTokens <= limit && !hasOversizedToolArguments(block)
     ? block.messages
     : compactBlock(block, limit);
   if (!messages) {
@@ -265,13 +270,16 @@ function includeRecentHistory(
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
     const block = blocks[index];
-    const tokens = blockTokens(block.messages);
-    if (reachedBoundary || !block.wireSafe || tokens > LATEST_BLOCK_TOKEN_LIMIT
+    const messages = block.wireSafe && hasOversizedToolArguments(block)
+      ? compactBlock(block, LATEST_BLOCK_TOKEN_LIMIT)
+      : block.messages;
+    const tokens = messages ? blockTokens(messages) : Number.POSITIVE_INFINITY;
+    if (reachedBoundary || !block.wireSafe || !messages || tokens > LATEST_BLOCK_TOKEN_LIMIT
       || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;
     }
-    selected.set(index, block.messages);
+    selected.set(index, messages);
     used += tokens;
     historyUsed += tokens;
   }
