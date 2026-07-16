@@ -1,5 +1,7 @@
 packages:
   - "packages/*"
+overrides:
+  qs: 6.15.2
 supportedArchitectures:
   os:
     - current

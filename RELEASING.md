@@ -57,6 +57,11 @@ name the unavailable publication gates. Resume binary publication with a new ver
 after the normal workflow passes; do not add binaries to the existing source-only
 release later.
 
+An unsigned binary preview requires explicit maintainer approval. Publish it as a new
+prerelease version, attach the archive together with its checksum, SBOM, and disclosed
+unsigned provenance, and state that Windows SmartScreen may warn. Never describe it
+as release-ready, signed, official, or latest.
+
 ## After publication
 
 - Download every asset from GitHub and compare it with its `.sha256` sidecar.

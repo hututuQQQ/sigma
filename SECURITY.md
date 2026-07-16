@@ -37,5 +37,10 @@ A GitHub prerelease may be source-only when hosted Actions or trusted signing is
 unavailable. Such a prerelease does not contain official portable product archives
 and must state which publication gates remain unavailable.
 
+An explicitly labeled unsigned preview prerelease may attach a portable archive for
+evaluation. It is not an official signed product archive, must not be marked latest,
+and must include a matching SHA-256 sidecar and CycloneDX SBOM while disclosing that
+Authenticode and trusted provenance gates did not pass.
+
 Treat locally built archives, workflow artifacts, and files without matching release
 sidecars as development outputs rather than official releases.
