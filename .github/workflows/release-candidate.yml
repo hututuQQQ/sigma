@@ -222,7 +222,7 @@ jobs:
       - name: Require all five live scenarios and zero safety failures
         run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
       - name: Upload verified release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: error
@@ -233,14 +233,14 @@ jobs:
             .artifacts/agent-cli-${{ matrix.label }}.provenance.json
       - name: Upload public provenance key
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-public-key-${{ github.run_id }}
           if-no-files-found: error
           path: .artifacts/release-provenance-public.pem
       - name: Upload candidate evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rc-${{ matrix.label }}-${{ github.run_id }}
           if-no-files-found: warn
