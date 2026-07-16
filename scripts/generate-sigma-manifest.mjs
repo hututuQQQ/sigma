@@ -19,6 +19,8 @@ async function assertCopy(filePath, expected, label) {
 
 async function checkMirrors(manifest) {
   const packageJson = JSON.parse(await readFile(path.join(rootDir, "package.json"), "utf8"));
+  const license = await readFile(path.join(rootDir, "LICENSE"), "utf8").catch(() => "");
+  const cargoToml = await readFile(path.join(rootDir, "native", "sigma-exec", "Cargo.toml"), "utf8");
   const nodeVersion = (await readFile(path.join(rootDir, ".node-version"), "utf8")).trim();
   const workflowRoot = path.join(rootDir, ".github", "workflows");
   const workflowFiles = (await readdir(workflowRoot)).filter((name) => name.endsWith(".yml"));
@@ -39,6 +41,14 @@ async function checkMirrors(manifest) {
   };
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Project metadata differs from sigma-manifest.json: ${JSON.stringify(actual)}.`);
+  }
+  if (packageJson.license !== "MIT" || !license.startsWith("MIT License\n")) {
+    throw new Error("Root package metadata and LICENSE must declare the MIT License.");
+  }
+  const cargoPackage = cargoToml.match(/^\[package\]\r?\n([\s\S]*?)(?=\r?\n\[|$)/u)?.[1] ?? "";
+  const cargoValue = (name) => cargoPackage.match(new RegExp(`^${name}\\s*=\\s*"([^"]+)"`, "mu"))?.[1];
+  if (cargoValue("version") !== manifest.productVersion || cargoValue("license") !== "MIT") {
+    throw new Error("Native package version or license differs from public project metadata.");
   }
   const workflowFacts = {
     NODE_VERSION: manifest.toolchains.node,
@@ -64,6 +74,9 @@ async function checkMirrors(manifest) {
     const workspacePackage = JSON.parse(await readFile(manifestPath, "utf8"));
     if (workspacePackage.version !== manifest.productVersion) {
       throw new Error(`${directory.name} version differs from sigma-manifest.json.`);
+    }
+    if (workspacePackage.license !== "MIT") {
+      throw new Error(`${directory.name} must declare the MIT License.`);
     }
     if (workspacePackage.engines?.node !== `>=${manifest.toolchains.node}`) {
       throw new Error(`${directory.name} Node engine differs from sigma-manifest.json.`);

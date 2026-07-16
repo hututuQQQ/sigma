@@ -156,6 +156,10 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
       ...diagnostic,
       data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
     }, "session", "run")).toBe(false);
+    expect(evidenceSupportsClaim({
+      ...diagnostic,
+      data: { ...diagnostic.data, source: SUBJECT_ATTESTATION_EVIDENCE_SOURCE_V1 }
+    })).toBe(false);
     expect(isCompletionEligibleEvidence({ ...diagnostic, status: "failed" }, "session", "run")).toBe(false);
     expect(isCompletionEligibleEvidence(diagnostic, "session", "other-run")).toBe(false);
   });
@@ -210,6 +214,32 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     };
     expect(evidenceSupportsClaim(passed)).toBe(true);
     expect(evidenceSupportsClaim(passed, "validation_executed")).toBe(true);
+
+    const withoutTermination: ValidationEvidence = {
+      ...passed,
+      evidenceId: "passed-without-termination",
+      data: { ...passed.data, termination: undefined }
+    };
+    expect(evidenceSupportsClaim(withoutTermination, "validation_passed")).toBe(true);
+
+    for (const [evidenceId, termination] of [
+      ["not-started", { processStarted: false }],
+      ["not-exited", { state: "running" }],
+      ["nonzero-exit", { exitCode: 1 }],
+      ["timed-out", { timedOut: true }],
+      ["idle-timed-out", { idleTimedOut: true }],
+      ["cancelled", { cancelled: true }]
+    ] as const) {
+      const interrupted = {
+        ...passed,
+        evidenceId,
+        data: {
+          ...passed.data,
+          termination: { ...passed.data.termination!, ...termination }
+        }
+      } as ValidationEvidence;
+      expect(evidenceSupportsClaim(interrupted, "validation_passed")).toBe(false);
+    }
 
     const inconsistentPass: ValidationEvidence = {
       ...passed,

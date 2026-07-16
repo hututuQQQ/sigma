@@ -327,7 +327,14 @@ async function dependencyNode(packageName, ownerManifest, targetPlatform, target
   if (cache.has(manifestPath)) return cache.get(manifestPath);
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   if (!compatiblePackage(manifest, targetPlatform, targetArch)) return undefined;
-  const node = { name: packageName, version: String(manifest.version ?? "0.0.0"), manifestPath, sourceDir: path.dirname(manifestPath), dependencies: [] };
+  const node = {
+    name: packageName,
+    version: String(manifest.version ?? "0.0.0"),
+    license: typeof manifest.license === "string" ? manifest.license : undefined,
+    manifestPath,
+    sourceDir: path.dirname(manifestPath),
+    dependencies: []
+  };
   cache.set(manifestPath, node);
   const required = Object.keys(manifest.dependencies ?? {});
   const optionalNames = Object.keys(manifest.optionalDependencies ?? {});
@@ -1039,6 +1046,7 @@ async function addPackageComponents(rootDir, packageNames, targetPlatform, targe
       type: packageName === "agent-cli" ? "application" : "library",
       name: manifest.name,
       version: String(manifest.version),
+      ...(typeof manifest.license === "string" ? { licenses: [{ license: { id: manifest.license } }] } : {}),
       scope: "required"
     });
   }
@@ -1048,6 +1056,7 @@ async function addPackageComponents(rootDir, packageNames, targetPlatform, targe
       type: "library",
       name: node.name,
       version: node.version,
+      ...(node.license ? { licenses: [{ license: { id: node.license } }] } : {}),
       scope: "required"
     });
   }
@@ -1161,7 +1170,8 @@ function portableSbomDocument(components, releaseVersion, targetPlatform, target
       component: {
         type: "application",
         name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
-        version: releaseVersion
+        version: releaseVersion,
+        licenses: [{ license: { id: "MIT" } }]
       },
       properties: [
         { name: "sigma:target-platform", value: targetPlatform },
@@ -1719,7 +1729,7 @@ async function stagePortableRuntime(context) {
 }
 
 async function writeBundleEntrypoints(context, nodeRuntime) {
-  const { bundleDir, targetPlatform, targetArch, release } = context;
+  const { rootDir, bundleDir, targetPlatform, targetArch, release } = context;
   await writeFile(
     path.join(bundleDir, "package.json"),
     `${JSON.stringify(
@@ -1727,6 +1737,7 @@ async function writeBundleEntrypoints(context, nodeRuntime) {
         name: `sigma-agent-cli-${targetPlatform}-${targetArch}`,
         version: release.version,
         private: true,
+        license: "MIT",
         type: "module",
         bin: {
           agent: targetPlatform === "win32" ? "./bin/agent.cmd" : "./bin/agent"
@@ -1749,6 +1760,7 @@ async function writeBundleEntrypoints(context, nodeRuntime) {
     createBundleReadme(targetPlatform, targetArch, nodeRuntime),
     "utf8"
   );
+  await cp(path.join(rootDir, "LICENSE"), path.join(bundleDir, "LICENSE"));
 }
 
 async function writeV3BundleEvidence(context, runtime) {

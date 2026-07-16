@@ -45,6 +45,7 @@ async function writeBuiltPackage(
       {
         name: packageName,
         version,
+        license: "MIT",
         type: "module",
         main: "./dist/index.js",
         dependencies
@@ -149,6 +150,7 @@ async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
 
 async function writePackageFixture() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-"));
+  await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
   await writeBuiltPackage(rootDir, "agent-protocol");
   await writeBuiltPackage(rootDir, "agent-runtime", { "agent-protocol": "workspace:*" });
   await writeBuiltPackage(rootDir, "agent-tui", { "agent-protocol": "workspace:*" });
@@ -215,8 +217,13 @@ async function writeV3PackageFixture(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-v3-"));
-  const version = "3.0.0-beta.1";
-  await writeFile(path.join(rootDir, "package.json"), `${JSON.stringify({ name: "sigma", version, private: true })}\n`, "utf8");
+  const version = "3.0.0-rc.1";
+  await writeFile(
+    path.join(rootDir, "package.json"),
+    `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
+    "utf8"
+  );
+  await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
   await writeBuiltPackage(rootDir, "agent-protocol", {}, version);
   await writeBuiltPackage(rootDir, "agent-execution", {}, version);
   await writeBuiltPackage(rootDir, "agent-checkpoint", {}, version);
@@ -410,6 +417,7 @@ describe("package-agent-cli", () => {
 
   it("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
+    await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
     await writeBuiltPackage(rootDir, "agent-tui", { "@opentui/core": "0.4.3", "root-dep": "1.0.0" });
     await writeBuiltPackage(rootDir, "agent-cli", { "agent-tui": "workspace:*" });
     const modules = path.join(rootDir, "packages", "agent-tui", "node_modules");
@@ -923,6 +931,11 @@ describe("package-agent-cli", () => {
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
     expect(readme).toContain(String.raw`.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict`);
     expect(readme).not.toContain(String.raw`.\bin\agent.cmd doctor --workspace /path/to/repo`);
+    await expect(readFile(path.join(result.bundleDir, "LICENSE"), "utf8")).resolves.toContain("MIT License");
+    const bundlePackage = JSON.parse(await readFile(path.join(result.bundleDir, "package.json"), "utf8"));
+    expect(bundlePackage.license).toBe("MIT");
+    const sbom = JSON.parse(await readFile(path.join(result.bundleDir, "sbom.cdx.json"), "utf8"));
+    expect(sbom.metadata.component.licenses).toEqual([{ license: { id: "MIT" } }]);
 
     const report = await verifyAgentCliPackage({
       rootDir,
@@ -944,6 +957,7 @@ describe("package-agent-cli", () => {
       targetArch: "x64",
       checks: {
         readme: true,
+        license: true,
         wrapper: true,
         metadata: true,
         hostCli: true,

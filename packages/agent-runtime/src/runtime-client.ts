@@ -17,6 +17,7 @@ import { handleChildEvent } from "./child-event-handler.js";
 import { reconcileInterruptedChildren } from "./durable-children.js";
 import { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import { ModelAgentProfileHookRunner } from "./agent-profile-hook-runner.js";
+import { createRuntimeHooks } from "./create-runtime-hooks.js";
 import { runRuntimeSession } from "./runtime-run.js";
 import { terminateRunProcesses } from "./process-cleanup.js";
 import { requestDelegatedApproval as awaitDelegatedApproval } from "./delegated-approval.js";
@@ -31,7 +32,6 @@ import { RuntimeCheckpointCoordinator } from "./runtime-checkpoint-coordinator.j
 import { assertProfileResources, constrainBudget, resolveHookProfile, resolveChildProfile, roleForMode, type SessionProfileSelection } from "./session-profile.js";
 import { createCheckpointManager } from "./runtime-checkpoint-manager.js";
 import type { CheckpointManager } from "agent-checkpoint";
-import { FrozenWorkspaceHookMaterializer } from "./frozen-hook-assets.js";
 import { FrozenSkillMaterializer } from "./frozen-skill-assets.js";
 import { ChildCheckpointRecoveryCoordinator } from "./child-workspace-recovery.js";
 export class InProcessRuntimeClient implements RuntimeClient {
@@ -70,7 +70,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       await this.emit(session, type, authority, value));
     const productionProfileRunner = this.createProductionProfileRunner();
     this.profileHookRecovery = productionProfileRunner;
-    this.hooks = this.createHooks(productionProfileRunner);
+    this.hooks = createRuntimeHooks(
+      options,
+      this.artifacts,
+      productionProfileRunner,
+      async (session, type, authority, value) => await this.emit(session, type, authority, value)
+    );
     this.checkpointManager = testing.checkpointManager ?? createCheckpointManager(options);
     this.control = new RuntimeControlService({
       checkpoints: this.checkpointManager,
@@ -119,24 +124,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       resolveProfile: (session, profileId) => resolveHookProfile(this.options, session, profileId),
       gateway: (session, profile) => this.options.gatewayForRole?.("planner", profile) ?? session.services.gateway,
       budgets: this.budgets,
-      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
-    });
-  }
-  private createHooks(productionProfileRunner?: ModelAgentProfileHookRunner): RuntimeHookCoordinator {
-    if (this.options.hooks?.some((hook) => hook.kind === "command") && !this.options.hookRunner) {
-      throw new Error("A hookRunner is required when command hooks are configured.");
-    }
-    const agentProfileRunner = this.options.agentProfileHookRunner ?? productionProfileRunner;
-    const materializer = new FrozenWorkspaceHookMaterializer(this.options.storeRootDir, this.artifacts);
-    return new RuntimeHookCoordinator({
-      definitions: this.options.hooks ?? [],
-      runner: this.options.hookRunner ?? {
-        run: async () => ({ ok: false, error: "Hook runner is unavailable.", durationMs: 0 })
-      },
-      ...(agentProfileRunner ? { agentProfileRunner } : {}),
-      materializeWorkspaceHook: (session, hook) => materializer.materialize(
-        session.identity.workspacePath, session.identity.sessionId, hook
-      ),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
     });
   }

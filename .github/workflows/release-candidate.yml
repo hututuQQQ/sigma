@@ -1,9 +1,9 @@
-name: Release candidate verification
+name: Release verification and publication
 
 on:
   workflow_dispatch:
   push:
-    tags: ["v*-rc*"]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -16,8 +16,46 @@ env:
   CARGO_LLVM_COV_VERSION: 0.8.6
 
 jobs:
+  metadata:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require main or an exact version tag
+        id: release
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from "node:fs";
+
+          const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+          if (!semver.test(version)) throw new Error(`package.json contains invalid SemVer: ${version}`);
+          const expectedTag = `v${version}`;
+          if (process.env.GITHUB_EVENT_NAME === "push" && process.env.GITHUB_REF_NAME !== expectedTag) {
+            throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} must exactly equal ${expectedTag}.`);
+          }
+          if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch" && process.env.GITHUB_REF !== "refs/heads/main") {
+            throw new Error("Manual release verification must run from main.");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nprerelease=${version.includes("-")}\n`);
+          NODE
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            git fetch origin main --no-tags
+            git merge-base --is-ancestor "${GITHUB_SHA}" origin/main || {
+              echo "Release tags must point to a commit reachable from main." >&2
+              exit 1
+            }
+          fi
+
   verify:
     name: ${{ matrix.label }} release and quick five
+    needs: metadata
     strategy:
       fail-fast: false
       matrix:
@@ -153,6 +191,13 @@ jobs:
           }
       - name: Verify release target
         run: pnpm verify:release:${{ matrix.release }}
+      - name: Stage public provenance key
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p .artifacts
+          cp -- "${AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES}" .artifacts/release-provenance-public.pem
+          chmod 0644 .artifacts/release-provenance-public.pem
       - name: Remove release signing material (Linux)
         if: always() && runner.os == 'Linux'
         shell: bash
@@ -176,6 +221,23 @@ jobs:
           }
       - name: Require all five live scenarios and zero safety failures
         run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.label }}-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            .artifacts/agent-cli-${{ matrix.label }}.${{ matrix.release == 'windows' && 'zip' || 'tgz' }}
+            .artifacts/agent-cli-${{ matrix.label }}.sha256
+            .artifacts/agent-cli-${{ matrix.label }}.sbom.cdx.json
+            .artifacts/agent-cli-${{ matrix.label }}.provenance.json
+      - name: Upload public provenance key
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-public-key-${{ github.run_id }}
+          if-no-files-found: error
+          path: .artifacts/release-provenance-public.pem
       - name: Upload candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -184,3 +246,53 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           path: .artifacts/**
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [metadata, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-${{ github.run_id }}
+          path: release-assets
+          merge-multiple: true
+      - name: Require the complete release asset set
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdirSync } from "node:fs";
+
+          const expected = [
+            "agent-cli-linux-x64.tgz",
+            "agent-cli-linux-x64.sha256",
+            "agent-cli-linux-x64.sbom.cdx.json",
+            "agent-cli-linux-x64.provenance.json",
+            "agent-cli-win32-x64.zip",
+            "agent-cli-win32-x64.sha256",
+            "agent-cli-win32-x64.sbom.cdx.json",
+            "agent-cli-win32-x64.provenance.json",
+            "release-provenance-public.pem"
+          ];
+          const actual = new Set(readdirSync("release-assets"));
+          const missing = expected.filter((name) => !actual.has(name));
+          if (missing.length > 0) throw new Error(`Missing release assets: ${missing.join(", ")}`);
+          NODE
+      - name: Create immutable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+        run: |
+          options=(--verify-tag --generate-notes --title "Sigma Code ${GITHUB_REF_NAME}")
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            options+=(--prerelease)
+          else
+            options+=(--latest)
+          fi
+          gh release create "${GITHUB_REF_NAME}" release-assets/* "${options[@]}"

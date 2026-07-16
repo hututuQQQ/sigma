@@ -127,6 +127,36 @@ function waiverEvidence(evidenceId: string): EvidenceRecord {
   };
 }
 
+function failedValidationEvidence(evidenceId: string): EvidenceRecord {
+  return {
+    evidenceId,
+    sessionId: "session",
+    runId: "run",
+    kind: "validation",
+    status: "failed",
+    createdAt: NOW,
+    producer: { authority: "runtime" },
+    summary: "validation executed and failed",
+    data: {
+      validator: "command",
+      command: "pnpm test",
+      exitCode: 1,
+      termination: {
+        processStarted: true,
+        state: "exited",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false
+      },
+      artifactIds: [],
+      workspaceDeltaEvidenceIds: [],
+      checkpointIds: []
+    }
+  };
+}
+
 describe("durable reducer contracts", () => {
   it("requires the exact evidence authority, kind, producer, and identity tuple", () => {
     const state = initial();
@@ -222,6 +252,34 @@ describe("durable reducer contracts", () => {
     expect(reduce(used, "usage.recorded", usage)).toBe(used);
     const unused = initial();
     expect(reduce(unused, "usage.recorded", { ...usage, sessionId: "other" })).toBe(unused);
+  });
+
+  it("transitions evidence-acquisition repairs according to the first referenceable evidence", () => {
+    const eligible = diagnosticEvidence("eligible");
+    const explicitRepair: KernelState = {
+      ...initial(),
+      completionRepairAttempts: 2,
+      completionRepair: { kind: "evidence_acquisition" }
+    };
+    expect(reduce(explicitRepair, "evidence.recorded", eligible)).toMatchObject({
+      completionRepairAttempts: 0,
+      completionRepair: undefined
+    });
+
+    const inferredRepair: KernelState = {
+      ...initial(),
+      completionRepairAttempts: 2
+    };
+    expect(reduce(inferredRepair, "evidence.recorded", {
+      ...eligible,
+      evidenceId: "inferred-eligible"
+    })).toMatchObject({ completionRepairAttempts: 0, completionRepair: undefined });
+
+    const failedValidation = failedValidationEvidence("failed-referenceable");
+    expect(reduce(explicitRepair, "evidence.recorded", failedValidation)).toMatchObject({
+      completionRepairAttempts: 2,
+      completionRepair: { kind: "terminal_action" }
+    });
   });
 
   it("requires monotonic plans and validates frozen runtime identities", () => {
@@ -373,6 +431,38 @@ describe("durable reducer contracts", () => {
     });
     expect(reconciled.messages.at(-1)?.content).toContain("removed the durable evidence");
     expect(() => assertKernelInvariants(reconciled)).not.toThrow();
+
+    for (const completionRepair of [
+      { kind: "protected_recovery", answer: "Recovered answer." },
+      { kind: "terminal_action" }
+    ] as const) {
+      const repairing: KernelState = {
+        ...state,
+        completionRepairAttempts: 1,
+        completionRepair,
+        evidence: [delta],
+        mutationEvidence: [delta]
+      };
+      expect(reduce(repairing, "checkpoint.restored", restored).completionRepair)
+        .toEqual({ kind: "evidence_acquisition" });
+    }
+  });
+
+  it("unblocks checkpoint recovery only after a user decision is applicable", () => {
+    const waiting: KernelState = { ...initial(), phase: "needs_input" };
+    expect(reduce(waiting, "checkpoint.recovery_resolved", {}, { authority: "runtime" })).toBe(waiting);
+    const running = initial();
+    expect(reduce(running, "checkpoint.recovery_resolved", {}, { authority: "user" })).toBe(running);
+    expect(reduce(waiting, "checkpoint.recovery_resolved", "decision", { authority: "user" }).phase)
+      .toBe("ready_model");
+    expect(reduce(waiting, "checkpoint.recovery_resolved", {
+      sourceSessionId: "child",
+      applied: false
+    }, { authority: "user" })).toBe(waiting);
+    expect(reduce(waiting, "checkpoint.recovery_resolved", {
+      sourceSessionId: "child",
+      applied: true
+    }, { authority: "user" }).phase).toBe("ready_model");
   });
 
   it("tracks only runtime-owned processes for the active run", () => {

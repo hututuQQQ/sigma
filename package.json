@@ -1,7 +1,19 @@
 {
   "name": "sigma-agent-mvp",
-  "version": "3.0.0-beta.1",
+  "version": "3.0.0-rc.1",
   "private": true,
+  "license": "MIT",
+  "description": "A safety-focused coding agent that runs in your terminal.",
+  "author": "hututuQQQ",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hututuQQQ/sigma.git"
+  },
+  "homepage": "https://github.com/hututuQQQ/sigma#readme",
+  "bugs": {
+    "url": "https://github.com/hututuQQQ/sigma/issues"
+  },
+  "keywords": ["coding-agent", "terminal", "ai", "sandbox"],
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "engines": {
