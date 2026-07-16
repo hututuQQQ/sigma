@@ -203,7 +203,7 @@ jobs:
           rustup default $env:RUST_VERSION
           rustup toolchain install $env:RUST_COVERAGE_TOOLCHAIN --profile minimal --component llvm-tools-preview
           cargo install cargo-llvm-cov --version $env:CARGO_LLVM_COV_VERSION --locked
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Verify pinned toolchain
