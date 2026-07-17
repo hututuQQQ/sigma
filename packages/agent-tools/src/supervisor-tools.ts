@@ -13,8 +13,8 @@ import type {
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 const DELEGATED_CHILD_EFFECTS: ToolEffect[] = [
-  "filesystem.read", "filesystem.write", "process.spawn", "process.spawn.readonly", "agent.spawn",
-  "network", "validation", "destructive", "open_world"
+  "filesystem.read", "filesystem.read.external", "filesystem.write", "process.spawn",
+  "process.spawn.readonly", "process.handoff", "agent.spawn", "network", "validation", "destructive", "open_world"
 ];
 
 function input(request: ToolRequest): Record<string, JsonValue> {

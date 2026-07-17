@@ -1,10 +1,7 @@
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import type {
-  McpConfigSource,
-  McpServerConfigValue,
-  ModelRouteConfigValue,
-  ModelSpecConfigValue,
+  McpConfigSource, McpServerConfigValue, ModelRouteConfigValue, ModelSpecConfigValue,
   WorkspaceCustomizationTrustAttestation,
   WorkspaceMcpTrustAttestation
 } from "agent-config";
@@ -35,10 +32,7 @@ import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
 import { repositoryTransactionTool } from "./repository-transaction-tool.js";
 import {
-  brokerRuntimeEnvironment,
-  verifiedNetworkPolicy,
-  verifiedRuntimeCommands,
-  verifiedShellKinds
+  brokerRuntimeEnvironment, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
 } from "./execution-capabilities.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -58,7 +52,9 @@ export interface RuntimeCompositionConfig {
   workspaceCustomizationTrust?: WorkspaceCustomizationTrustAttestation;
   agentProfile?: string;
   sandboxMode?: "required";
+  readScope?: "workspace" | "host";
   networkMode?: "none" | "full";
+  processHandoff?: "allow" | "deny";
   allowUnsafeHostExec?: boolean;
   unsafeHostExecRequested?: boolean;
   reviewerWaiver?: boolean;
@@ -71,7 +67,6 @@ export interface RuntimeCompositionConfig {
   };
   checkpoint?: { maxFiles: number; maxBytes: number };
 }
-
 export interface RuntimeFactoryDeps {
   gatewayFactory?: (options: { provider: "deepseek" | "glm"; model: string; maxRetries: number;
     requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
@@ -369,11 +364,13 @@ function createTools(
   executionReport: BrokerDoctorReport,
   storeRootDir: string
 ): EffectToolRegistry {
-  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
+  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "full");
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
     atomicPatchStateRootDir: storeRootDir,
     sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
+    readScope: config.readScope ?? "host",
+    processHandoff: config.processHandoff ?? "allow",
     networkMode: network.defaultMode,
     networkModes: network.modes,
     shells: verifiedShellKinds(executionReport),
@@ -382,6 +379,9 @@ function createTools(
     background: executionReport.capabilities.background,
     stdin: executionReport.capabilities.stdin,
     pty: executionReport.capabilities.pty,
+    handoff: config.processHandoff !== "deny"
+      && executionReport.capabilities.processHandoff === true
+      && typeof execution.handoff === "function",
     ...repositoryRuntimeProviders,
     ...(executionReport.capabilities.background
       && executionReport.capabilities.stdin

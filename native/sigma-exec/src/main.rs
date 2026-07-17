@@ -75,6 +75,10 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
             request.params,
             "process.terminate params",
         )?),
+        "process.handoff" => state.handoff(decode::<HandleParams>(
+            request.params,
+            "process.handoff params",
+        )?),
         "process.release" => state.release_process(decode::<HandleParams>(
             request.params,
             "process.release params",

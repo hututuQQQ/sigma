@@ -35,10 +35,12 @@ function plannedEffects(
   validation: boolean,
   networkMode: "none" | "full",
   sandboxMode: ExecutionToolOptions["sandboxMode"],
-  readsSkillResource: boolean
+  readsSkillResource: boolean,
+  readsExternal: boolean
 ): ToolCallPlan["exactEffects"] {
   const effects: ToolCallPlan["exactEffects"] = [writes ? "process.spawn" : "process.spawn.readonly"];
-  if (readsSkillResource) effects.push("filesystem.read");
+  if (readsSkillResource || readsExternal) effects.push("filesystem.read");
+  if (readsExternal) effects.push("filesystem.read.external");
   if (writes) effects.push("filesystem.write");
   if (validation) effects.push("validation");
   if (networkMode === "full") effects.push("network");
@@ -90,7 +92,7 @@ function declaredReadRoots(input: Record<string, JsonValue>): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length === 0
     || value.some((item) => typeof item !== "string" || item.length === 0)) {
-    throw readScopeError("readRoots must be a non-empty array of workspace directory paths.");
+    throw readScopeError("readRoots must be a non-empty array of directory paths.");
   }
   return [...new Set(value as string[])];
 }
@@ -100,13 +102,20 @@ function portableWorkspacePath(workspaceRoot: string, target: string): string {
   return relative || ".";
 }
 
-async function stableReadDirectory(workspaceRoot: string, requested: string): Promise<string> {
-  const lexical = path.resolve(workspaceRoot, requested);
-  if (!isInside(workspaceRoot, lexical)) {
+async function stableReadDirectory(
+  workspaceRoot: string,
+  requested: string,
+  readScope: ExecutionToolOptions["readScope"]
+): Promise<string> {
+  const lexical = path.isAbsolute(requested)
+    ? path.resolve(requested) : path.resolve(workspaceRoot, requested);
+  const workspacePath = isInside(workspaceRoot, lexical);
+  if (!workspacePath && readScope !== "host") {
     throw readScopeError(`Process read root escapes the workspace: ${requested}.`);
   }
-  const segments = path.relative(workspaceRoot, lexical).split(path.sep).filter(Boolean);
-  let current = workspaceRoot;
+  const traversalRoot = workspacePath ? workspaceRoot : path.parse(lexical).root;
+  const segments = path.relative(traversalRoot, lexical).split(path.sep).filter(Boolean);
+  let current = traversalRoot;
   for (const segment of segments) {
     current = path.join(current, segment);
     const info = await lstat(current).catch((error: NodeJS.ErrnoException) => {
@@ -122,6 +131,7 @@ async function stableReadDirectory(workspaceRoot: string, requested: string): Pr
   if (!info?.isDirectory() || info.isSymbolicLink()) {
     throw readScopeError(`Process read roots must be stable existing directories: ${requested}.`);
   }
+  if (!workspacePath) return lexical;
   const resolved = await resolveWorkspacePath(workspaceRoot, requested).catch((error) => {
     throw readScopeError(
       `Invalid process read root '${requested}': ${error instanceof Error ? error.message : String(error)}`
@@ -133,18 +143,20 @@ async function stableReadDirectory(workspaceRoot: string, requested: string): Pr
 async function plannedReadPaths(
   input: Record<string, JsonValue>,
   workspacePath: string,
-  skillResource: LoadedSkillResourceAccess | undefined
+  skillResource: LoadedSkillResourceAccess | undefined,
+  options: ExecutionToolOptions
 ): Promise<string[]> {
   if (input.cwd !== undefined && (typeof input.cwd !== "string" || input.cwd.length === 0)) {
     throw readScopeError("cwd must be a non-empty workspace directory path.");
   }
   const cwd = typeof input.cwd === "string" ? input.cwd : ".";
   const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
-  const paths = await Promise.all(
-    [...new Set([cwd, ...declaredReadRoots(input)])].map(async (item) =>
-      await stableReadDirectory(workspaceRoot, item)
+  const stableCwd = await stableReadDirectory(workspaceRoot, cwd, "workspace");
+  const paths = [stableCwd, ...await Promise.all(
+    declaredReadRoots(input).map(async (item) =>
+      await stableReadDirectory(workspaceRoot, item, options.readScope)
     )
-  );
+  )];
   if (skillResource) paths.push(skillResource.readRoot, skillResource.absolutePath);
   return [...new Set(paths)];
 }
@@ -180,9 +192,16 @@ async function plannedCall(
   const networkMode = network(input, options);
   const mutation = await processMutationContract(input, context.workspacePath, context.runMode, background);
   const writes = mutation.access === "write";
+  const readPaths = await plannedReadPaths(input, context.workspacePath, skillResource, options);
+  const workspaceRoot = path.resolve(context.workspacePath);
+  const readsExternal = readPaths.some((item) => path.isAbsolute(item)
+    && !isInside(workspaceRoot, path.resolve(item))
+    && (!skillResource || !isInside(skillResource.readRoot, path.resolve(item))));
   return {
-    exactEffects: plannedEffects(writes, validation, networkMode, sandboxMode, Boolean(skillResource)),
-    readPaths: await plannedReadPaths(input, context.workspacePath, skillResource),
+    exactEffects: plannedEffects(
+      writes, validation, networkMode, sandboxMode, Boolean(skillResource), readsExternal
+    ),
+    readPaths,
     writePaths: mutation.expectedChanges,
     network: networkMode,
     processMode: plannedProcessMode(input, background),
@@ -256,10 +275,11 @@ export function executionPolicy(
   const workspaceRoot = path.resolve(context.workspacePath);
   const skillRoot = skillResource ? path.resolve(skillResource.readRoot) : undefined;
   const readRoots = plan.readPaths.flatMap((item) => {
-    const resolved = path.resolve(workspaceRoot, item);
+    const resolved = path.isAbsolute(item) ? path.resolve(item) : path.resolve(workspaceRoot, item);
     if (isInside(workspaceRoot, resolved)) return [resolved];
     if (skillRoot && isInside(skillRoot, resolved)) return [];
-    throw readScopeError(`Approved process read path escapes the workspace: ${item}.`);
+    if (options.readScope === "host" && context.approval?.externalReadApproved === true) return [resolved];
+    throw readScopeError(`Approved external process read path lacks a fresh grant: ${item}.`);
   });
   return {
     sandbox: required ? "required" : "unsafe",

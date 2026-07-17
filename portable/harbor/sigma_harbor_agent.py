@@ -460,7 +460,7 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
-        network_mode: str = "none",
+        network_mode: str = "full",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -491,6 +491,8 @@ class SigmaCliHarborAgent(BaseAgent):
         self.network_mode = network_mode
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
+        self.effective_read_scope = "host"
+        self.process_handoff_available = False
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
         parsed_outer_deadline = _as_int(
@@ -708,6 +710,8 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["failure_kind"] = failure_kind
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
+        summary["read_scope_effective"] = self.effective_read_scope
+        summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
         self._populate_context(context, result, summary, error_message)
@@ -748,6 +752,10 @@ class SigmaCliHarborAgent(BaseAgent):
             str(self.max_wall_time_sec),
             "--network",
             self.network_mode,
+            "--read-scope",
+            self.effective_read_scope,
+            "--process-handoff",
+            "allow",
             "--permission-mode",
             "auto",
             "--output-format",
@@ -1271,6 +1279,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "model_failure": model_failure,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
         }
 
     def _persist_timeout_artifacts(
@@ -1302,6 +1312,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "message": error_message or "agent execution timed out",
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
             "last_event": last_event,
             "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
             "tool_calls": live_state.get("tool_calls", sum(event.get("type") in {"tool.requested", "tool.started"} for event in events)),
@@ -1334,6 +1346,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
         })
         summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1492,6 +1506,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 f"agent_setup_failed: requested network_mode={self.network_mode} is not supported by the broker"
             )
         self.effective_network_mode = self.network_mode
+        self.process_handoff_available = capabilities["processHandoff"]
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -1536,6 +1551,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         modes = capabilities.get("networkModes")
         if not isinstance(modes, list) or any(mode not in SUPPORTED_NETWORK_MODES for mode in modes):
             return "capabilities.networkModes are missing or invalid"
+        if not isinstance(capabilities.get("processHandoff"), bool):
+            return "capabilities.processHandoff is missing or invalid"
         return None
 
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
@@ -1546,6 +1563,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "available_network_modes": list(self.available_network_modes),
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
             "checks": checks,
         }
         (self.logs_dir / "setup-check.json").write_text(
@@ -1698,6 +1717,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "cost_usd": summary.get("cost_usd"),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
+            "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
+            "process_handoff_available": summary.get("process_handoff_available", self.process_handoff_available),
         }
         for key, value in values.items():
             self._set_context_value(context, key, value)
@@ -1758,6 +1779,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "failure_kind": getattr(context, "failure_kind", None),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
+            "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),
+            "process_handoff_available": getattr(context, "process_handoff_available", self.process_handoff_available),
             "artifact_warnings": getattr(context, "artifact_warnings", []),
             "commands_executed": getattr(context, "commands_executed", 0),
             "tool_calls": getattr(context, "tool_calls", 0),

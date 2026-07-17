@@ -169,6 +169,7 @@ export function requestParams(
       resolvedCommand, request.policy, options, toolchains, verifiedExecutables, executableSha256
     ),
     maxOutputBytes: positiveInteger(request.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES, "maxOutputBytes"),
+    ...("lifecycle" in request ? { lifecycle: request.lifecycle ?? "session" } : {}),
     ...("pty" in request && request.pty === true ? {
       pty: true,
       ptyColumns: ptyDimension(request.ptyColumns, 120, "ptyColumns"),

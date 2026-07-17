@@ -127,15 +127,14 @@ export interface BuiltinToolOptions extends Partial<Omit<ExecutionToolOptions, "
   atomicPatchStateRootDir?: string;
 }
 
-export function registerBuiltinTools(
-  registry: EffectToolRegistry,
-  options: BuiltinToolOptions = {}
-): EffectToolRegistry {
+function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOptions {
   const defaultShell = runtimeEnvironment().defaultShell;
-  const execution: ExecutionToolOptions = {
+  return {
     broker: options.broker ?? unavailableExecutionBroker(),
     sandboxMode: options.sandboxMode ?? "required",
-    networkMode: options.networkMode ?? "none",
+    readScope: options.readScope ?? "host",
+    processHandoff: options.processHandoff ?? "allow",
+    networkMode: options.networkMode ?? "full",
     // The platform-selected shell is a verified local runtime capability;
     // an explicitly connected broker may narrow it with options.shells.
     shells: options.shells ?? (defaultShell === "none" ? [] : [defaultShell]),
@@ -144,13 +143,21 @@ export function registerBuiltinTools(
     background: options.background ?? true,
     stdin: options.stdin ?? true,
     pty: options.pty ?? true,
+    handoff: options.processHandoff !== "deny" && options.handoff === true,
     networkModes: options.networkModes ?? ["none", "full"]
   };
+}
+
+export function registerBuiltinTools(
+  registry: EffectToolRegistry,
+  options: BuiltinToolOptions = {}
+): EffectToolRegistry {
+  const execution = builtinExecutionOptions(options);
   const codeIntel = options.codeIntel
     ? [codeIntelTool({ broker: execution.broker, ...options.codeIntel })]
     : [];
   for (const tool of [
-    ...workspaceTextTools(options.atomicPatchStateRootDir),
+    ...workspaceTextTools(options.atomicPatchStateRootDir, execution.readScope),
     deleteFileTool(),
     applyPatchTool(options.atomicPatchStateRootDir),
     ...codeIntel,

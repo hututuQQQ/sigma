@@ -34,6 +34,7 @@ import {
   lockWindowsMutationRoots,
   pinProcessReadRoots
 } from "./windows-mutation-lock.js";
+import { processHandoffTool } from "./process-handoff-tool.js";
 
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 
@@ -186,7 +187,7 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   const writeContractProperties: Record<string, JsonValue> = {
     readRoots: {
       type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Additional stable existing workspace directories the process may read. The working directory is always included."
+      description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
     },
     access: {
       type: "string", enum: ["readonly", "write"],
@@ -220,8 +221,8 @@ function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionT
   };
   const required = kind === "shell" ? ["shell", "command"] : ["executable"];
   const effects: ToolDescriptor["possibleEffects"] = validation
-    ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.write", "validation", "network", "open_world"]
-    : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.write", "network", "open_world"];
+    ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "validation", "network", "open_world"]
+    : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "network", "open_world"];
   return {
     descriptor: {
       ...executionToolSchema(kind, validation
@@ -250,6 +251,15 @@ async function executeBackgroundProcess(
 ): Promise<ToolReceipt> {
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
+  const lifecycle = input.lifecycle === "deliverable" ? "deliverable" : "session";
+  if (lifecycle === "deliverable" && options.handoff !== true) {
+    throw Object.assign(new Error("Deliverable process handoff is unavailable for this execution broker."), {
+      code: "process_handoff_unavailable"
+    });
+  }
+  if (lifecycle === "deliverable" && input.pty === true) {
+    throw Object.assign(new Error("Deliverable processes cannot use a PTY."), { code: "policy_denied" });
+  }
   assertAvailableExecutable(input, options);
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
@@ -271,6 +281,7 @@ async function executeBackgroundProcess(
         environment: executionEnvironment(input)
       },
       policy: executionPolicy(context, approvedPlan, options, [], skillResource),
+      lifecycle,
       ...(input.pty === true ? { pty: true } : {})
     }, { signal: context.signal });
     return simpleReceipt(request, startedAt, processHandle, [
@@ -295,12 +306,18 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
         network: networkProperty(options),
         env: { type: "object", additionalProperties: { type: "string" } },
         ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
+        ...(options.handoff === true ? {
+          lifecycle: {
+            type: "string", enum: ["session", "deliverable"],
+            description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
+          }
+        } : {}),
         access: { type: "string", enum: ["readonly"] },
         readRoots: {
           type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-          description: "Additional stable existing workspace directories the process may read. The working directory is always included."
+          description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
         }
-      }, ["executable"], ["process.spawn.readonly", "filesystem.read", "network", "open_world"]),
+      }, ["executable"], ["process.spawn.readonly", "filesystem.read", "filesystem.read.external", "network", "open_world"]),
       prepare(value, context) { return prepareExecutionCallPlan(value, context, options, false, true); }
     },
     async execute(request, context) { return await executeBackgroundProcess(options, request, context); }
@@ -332,7 +349,7 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
         request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "terminate"
       );
     }
-  }];
+  }, ...(options.handoff === true ? [processHandoffTool(options, handleProperties)] : [])];
 }
 
 function simpleReceipt(

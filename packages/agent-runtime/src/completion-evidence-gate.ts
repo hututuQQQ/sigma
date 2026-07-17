@@ -21,15 +21,39 @@ function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
 }
 
+function unresolvedGoalInputPaths(session: RuntimeSession): string[] {
+  const latest = new Map<string, Extract<EvidenceRecord, { kind: "input_access" }>>();
+  for (const evidence of session.durable.state.evidence) {
+    if (evidence.kind === "input_access" && evidence.runId === session.durable.runId
+      && evidence.data.scope === "external") latest.set(evidence.data.path, evidence);
+  }
+  const goal = session.durable.state.plan.goal;
+  return [...latest.values()].filter((evidence) => evidence.status === "failed"
+    && goal.includes(evidence.data.path)).map((evidence) => evidence.data.path);
+}
+
 function commonTerminalFailure(
   session: RuntimeSession,
   call: ModelToolCall,
   startedAt: string
 ): ToolReceipt | null {
   if (session.durable.state.activeProcessIds.length > 0) {
+    const deliverable = session.durable.state.activeProcessIds.filter((id) =>
+      session.execution.processHandles.get(id)?.lifecycle === "deliverable");
+    const sessionLocal = session.durable.state.activeProcessIds.filter((id) => !deliverable.includes(id));
     return failed(call, startedAt,
-      `Terminal outcome is blocked while background processes remain active: ${session.durable.state.activeProcessIds.join(", ")}.`,
-      "active_processes");
+      `Terminal outcome is blocked while background processes remain active. `
+        + `${deliverable.length > 0 ? `Hand off verified deliverable processes: ${deliverable.join(", ")}. ` : ""}`
+        + `${sessionLocal.length > 0 ? `Terminate session processes: ${sessionLocal.join(", ")}.` : ""}`,
+      "active_processes", {
+        status: "rejected", code: "active_processes",
+        deliverableProcessIds: deliverable,
+        sessionProcessIds: sessionLocal,
+        nextActions: [
+          ...(deliverable.length > 0 ? [{ tool: "process_handoff", processIds: deliverable }] : []),
+          ...(sessionLocal.length > 0 ? [{ tool: "process_terminate", processIds: sessionLocal }] : [])
+        ]
+      });
   }
   if (session.durable.state.checkpointHead?.status === "open" || session.recovery.openCheckpointRecovery) {
     return failed(call, startedAt,
@@ -55,6 +79,20 @@ export function completionFailure(
     return failed(call, startedAt, "Completion proposal does not match the V4 schema.", "invalid_completion_proposal", {
       status: "rejected", code: "invalid_completion_proposal"
     });
+  }
+  const unresolvedInputs = unresolvedGoalInputPaths(session);
+  if (unresolvedInputs.length > 0) {
+    return failed(call, startedAt,
+      `Completion is blocked because required external inputs were not read: ${unresolvedInputs.join(", ")}. `
+        + "A run-created substitute does not satisfy the original input obligation.",
+      "input_access_unresolved", {
+        status: "rejected", code: "input_access_unresolved", paths: unresolvedInputs,
+        nextActions: [
+          { tool: "read", paths: unresolvedInputs },
+          { tool: "request_user_input", when: "the input location or substitution requires a user decision" },
+          { tool: "report_blocked", when: "the declared inputs remain inaccessible" }
+        ]
+      });
   }
   const frontier = session.durable.state.mutationFrontier;
   if (frontier.changedPaths.length === 0) return null;

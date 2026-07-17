@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
   BudgetReservation,
+  InputAccessEvidence,
   ReviewEvidence,
   UsageRecord,
   ValidationEvidence,
@@ -163,7 +164,9 @@ export class ReviewCoordinator {
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       workspaceDeltas: eligible,
-      validations: relevantValidations
+      validations: relevantValidations,
+      inputAccesses: session.durable.state.evidence.filter((item): item is InputAccessEvidence =>
+        item.kind === "input_access" && item.runId === session.durable.runId)
     };
     const requestId = requestIdentity(session, reviewerId);
     if (this.budgets && isAccountableReviewer(reviewer)) {

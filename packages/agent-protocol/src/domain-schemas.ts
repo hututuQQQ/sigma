@@ -19,7 +19,7 @@ export const nonNegativeIntegerSchema = z.number().int().nonnegative();
 
 export const evidenceKindSchema = z.enum([
   "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
-  "review", "checkpoint", "child_outcome", "user_waiver"
+  "input_access", "review", "checkpoint", "child_outcome", "user_waiver"
 ]);
 export const evidenceStatusSchema = z.enum(["passed", "failed", "warning", "informational"]);
 export const evidenceClaimSchema = z.enum([
@@ -153,6 +153,18 @@ export const diagnosticEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
+export const inputAccessEvidenceSchema = z.object({
+  ...evidenceBaseShape,
+  kind: z.literal("input_access"),
+  data: z.object({
+    path: nonEmptyStringSchema,
+    scope: z.enum(["workspace", "external"]),
+    sha256: digestSchema.optional(),
+    byteLength: nonNegativeIntegerSchema.optional(),
+    failureCode: nonEmptyStringSchema.optional()
+  }).strict()
+}).strict();
+
 export const reviewEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("review"),
@@ -208,6 +220,7 @@ export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   commandEvidenceSchema,
   validationEvidenceSchema,
   diagnosticEvidenceSchema,
+  inputAccessEvidenceSchema,
   reviewEvidenceSchema,
   checkpointEvidenceSchema,
   childOutcomeEvidenceSchema,

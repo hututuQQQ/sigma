@@ -1,13 +1,11 @@
 import {
-  modelRoutesValue,
-  modelSpecsValue,
-  type ModelRouteConfigValue,
-  type ModelSpecConfigValue
+  modelRoutesValue, modelSpecsValue, type ModelRouteConfigValue, type ModelSpecConfigValue
 } from "./model-catalog.js";
 import { assertMcpPersistentEffectsAllowed } from "agent-protocol";
 export type ConfigScalar = string | number | boolean;
 export type ConfigToolEffect =
-  | "filesystem.read" | "filesystem.write" | "process.spawn" | "process.spawn.readonly"
+  | "filesystem.read" | "filesystem.read.external" | "filesystem.write"
+  | "process.spawn" | "process.spawn.readonly" | "process.handoff"
   | "agent.spawn" | "network" | "validation" | "destructive" | "open_world";
 export interface McpServerConfigValue {
   name: string;
@@ -36,12 +34,9 @@ export interface WorkspaceCustomizationTrustAttestation {
   canonicalWorkspacePath: string;
   customizationDigest: string;
 }
-
 export type McpConfigSource = "none" | "flags" | "environment" | "home" | "workspace";
-
 export type ConfigValue = ConfigScalar | string[] | McpServerConfigValue[]
   | ModelSpecConfigValue[] | ModelRouteConfigValue[];
-
 export interface ConfigField<T extends ConfigValue = ConfigValue> {
   key: string;
   flag: string;
@@ -55,23 +50,18 @@ export interface ConfigField<T extends ConfigValue = ConfigValue> {
   secret?: boolean;
   hidden?: boolean;
 }
-
 export interface ConfigSources {
   flags?: Record<string, unknown>;
   env?: Record<string, string | undefined>;
   workspace?: Record<string, unknown>;
   home?: Record<string, unknown>;
 }
-
 export type ResolvedConfig = Record<string, ConfigValue>;
-
-export const CONFIG_SCHEMA_VERSION = 3 as const;
-
+export const CONFIG_SCHEMA_VERSION = 4 as const;
 function stringValue(raw: unknown, key: string, allowEmpty = false): string {
   if (typeof raw !== "string" || (!allowEmpty && !raw.trim())) throw new Error(`Configuration '${key}' requires a${allowEmpty ? "" : " non-empty"} string.`);
   return raw;
 }
-
 function numberValue(raw: unknown, key: string, minimum = 0, maximum = Number.POSITIVE_INFINITY): number {
   const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : Number.NaN;
   if (!Number.isFinite(value) || value < minimum || value > maximum) {
@@ -79,21 +69,19 @@ function numberValue(raw: unknown, key: string, minimum = 0, maximum = Number.PO
   }
   return value;
 }
-
 function booleanValue(raw: unknown, key: string): boolean {
   if (typeof raw === "boolean") return raw;
   if (raw === "true" || raw === "1") return true;
   if (raw === "false" || raw === "0") return false;
   throw new Error(`Configuration '${key}' requires true or false.`);
 }
-
 function enumValue<T extends string>(raw: unknown, key: string, values: readonly T[]): T {
   if (typeof raw === "string" && values.includes(raw as T)) return raw as T;
   throw new Error(`Configuration '${key}' must be one of: ${values.join(", ")}.`);
 }
-
 const EFFECTS: readonly ConfigToolEffect[] = [
-  "filesystem.read", "filesystem.write", "process.spawn", "process.spawn.readonly", "agent.spawn",
+  "filesystem.read", "filesystem.read.external", "filesystem.write",
+  "process.spawn", "process.spawn.readonly", "process.handoff", "agent.spawn",
   "network", "validation", "destructive", "open_world"
 ];
 const MCP_SERVER_KEYS = new Set([
@@ -178,7 +166,9 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "workspace", flag: "workspace", env: "SIGMA_WORKSPACE", toml: "workspace.path", description: "Workspace path", defaultValue: ".", parse: (raw) => stringValue(raw, "workspace") },
   { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode", defaultValue: "ask", parse: (raw) => enumValue(raw, "permissionMode", ["ask", "auto", "deny"] as const) },
   { key: "sandboxMode", flag: "sandbox", env: "SIGMA_SANDBOX", toml: "security.sandbox", description: "Process sandbox policy", defaultValue: "required", parse: (raw) => enumValue(raw, "sandboxMode", ["required"] as const) },
-  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
+  { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "host", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
+  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "full", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
+  { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
   { key: "allowUnsafeHostExec", flag: "allow-unsafe-host-exec", kind: "boolean", toml: "security.allow_unsafe_host_exec", description: "Home-only opt-in for unsafe host execution", defaultValue: false, parse: (raw) => booleanValue(raw, "allowUnsafeHostExec"), hidden: true },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
@@ -277,6 +267,8 @@ const ZERO_MEANS_UNBOUNDED_CAPS = new Set(["streamActiveSec"]);
 
 const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, ask: 1, auto: 2 };
 const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, full: 1 };
+const READ_SCOPE_STRICTNESS: Readonly<Record<string, number>> = { workspace: 0, host: 1 };
+const HANDOFF_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, allow: 1 };
 
 function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, workspaceRaw: unknown): ConfigValue {
   const workspaceValue = field.parse(workspaceRaw);
@@ -294,6 +286,14 @@ function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, works
   }
   if (field.key === "networkMode") {
     return NETWORK_STRICTNESS[String(workspaceValue)] < NETWORK_STRICTNESS[String(baseline)]
+      ? workspaceValue : baseline;
+  }
+  if (field.key === "readScope") {
+    return READ_SCOPE_STRICTNESS[String(workspaceValue)] < READ_SCOPE_STRICTNESS[String(baseline)]
+      ? workspaceValue : baseline;
+  }
+  if (field.key === "processHandoff") {
+    return HANDOFF_STRICTNESS[String(workspaceValue)] < HANDOFF_STRICTNESS[String(baseline)]
       ? workspaceValue : baseline;
   }
   if (field.key === "allowUnsafeHostExec") {

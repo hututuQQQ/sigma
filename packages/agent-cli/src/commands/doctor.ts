@@ -25,7 +25,8 @@ async function sandboxCheck(broker: ExecutionBroker): Promise<SandboxProbe> {
         name: "sandbox",
         status: ready ? "ok" : "warning",
         message: ready
-          ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; pty=${String(report.capabilities.pty)}`
+          ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; `
+            + `pty=${String(report.capabilities.pty)}; handoff=${String(report.capabilities.processHandoff === true)}`
           : `${report.sandbox.backend} unavailable: ${report.sandbox.reason ?? "self-test failed"}`
       }
     };

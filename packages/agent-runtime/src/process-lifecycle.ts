@@ -68,13 +68,15 @@ async function recordSpawnedProcess(
   session.execution.processHandles.set(id, {
     id,
     brokerInstanceId,
-    ...(typeof value.systemProcessId === "number" ? { systemProcessId: value.systemProcessId } : {})
+    ...(typeof value.systemProcessId === "number" ? { systemProcessId: value.systemProcessId } : {}),
+    lifecycle: value.lifecycle === "deliverable" ? "deliverable" : "session"
   });
   await emit(session, "process.spawned", "runtime", {
     processId: id,
     executionId: call.id,
     mode: plan.processMode === "pty" ? "pty" : "background",
-    brokerInstanceId
+    brokerInstanceId,
+    lifecycle: value.lifecycle === "deliverable" ? "deliverable" : "session"
   });
 }
 
@@ -102,11 +104,21 @@ export async function recordProcessReceipt(
   receipt: ToolReceipt,
   emit: RuntimeEventEmitter
 ): Promise<void> {
-  if (call.name !== "process_spawn" && call.name !== "process_poll" && call.name !== "process_terminate") return;
+  if (call.name !== "process_spawn" && call.name !== "process_poll"
+    && call.name !== "process_terminate" && call.name !== "process_handoff") return;
   const value = receiptOutput(receipt);
   const id = processId(value);
   if (call.name === "process_spawn") {
     await recordSpawnedProcess(session, call, plan, value, id, emit);
+    return;
+  }
+  if (call.name === "process_handoff") {
+    session.execution.processHandles?.delete(id);
+    await emit(session, "process.handed_off", "runtime", {
+      processId: id,
+      handoffId: typeof value.handoffId === "string" ? value.handoffId : `handoff:${id}`,
+      ...(typeof value.systemProcessId === "number" ? { systemProcessId: value.systemProcessId } : {})
+    });
     return;
   }
   await recordPolledProcess(session, value, id, emit);

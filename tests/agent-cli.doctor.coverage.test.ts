@@ -74,6 +74,7 @@ function healthyBroker(close: () => Promise<void> = async () => undefined): Exec
       background: true,
       stdin: true,
       pty: false,
+      processHandoff: false,
       networkModes: ["none"]
     }
   };
@@ -120,13 +121,14 @@ describe("doctor command branch coverage", () => {
       const report = JSON.parse(stdout.text()) as {
         doctorSchemaVersion: number;
         protocolVersion: number;
-        capabilities: { networkModes: string[] };
+        capabilities: { networkModes: string[]; processHandoff: boolean };
         status: string;
         checks: Array<{ name: string; status: string; message: string }>;
       };
       expect(report.doctorSchemaVersion).toBe(1);
       expect(report.protocolVersion).toBe(1);
       expect(report.capabilities.networkModes).toEqual(["none"]);
+      expect(report.capabilities.processHandoff).toBe(false);
       expect(report.status).toBe("ok");
       expect(report.checks).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "node", status: "ok" }),

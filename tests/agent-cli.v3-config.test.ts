@@ -10,12 +10,14 @@ class Capture {
   write(chunk: string | Uint8Array): boolean { this.value += chunk.toString(); return true; }
 }
 
-describe("Sigma V3 config", () => {
-  it("defaults to required sandbox, no network and hard shared budgets", () => {
+describe("Sigma config", () => {
+  it("defaults to required sandbox, host reads, full network, handoff, and hard shared budgets", () => {
     const config = loadCliConfig({}, { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") });
     expect(config).toMatchObject({
       sandboxMode: "required",
-      networkMode: "none",
+      readScope: "host",
+      networkMode: "full",
+      processHandoff: "allow",
       outputSchema: 3,
       legacySingleModelRoute: false,
       budget: { maxInputTokens: 8_000_000, maxOutputTokens: 1_000_000, maxCostMicroUsd: 50_000_000 }
@@ -83,7 +85,29 @@ describe("Sigma V3 config", () => {
       env: {}, homeDir: path.join(root, "home")
     })).toBe(0);
     await expect(readFile(`${configPath}.v2.bak`, "utf8")).resolves.toBe(original);
-    expect(await readFile(configPath, "utf8")).toContain("schema_version = 3");
+    expect(await readFile(configPath, "utf8")).toContain("schema_version = 4");
     expect(loadCliConfig({ workspace: root }, { env: {}, homeDir: path.join(root, "home") }).provider).toBe("glm");
+  });
+
+  it("migrates schema v3 to v4 and labels the backup with its source version", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-config-v3-migrate-"));
+    await mkdir(path.join(root, ".agent"));
+    const configPath = path.join(root, ".agent", "config.toml");
+    const original = [
+      "schema_version = 3", "[workspace]", "path = \".\"", "[security]",
+      "sandbox = \"required\"", "network = \"none\""
+    ].join("\n");
+    await writeFile(configPath, original, "utf8");
+
+    expect(await runConfigCommand(["migrate", "--workspace", root, "--write"], {
+      stdout: new Capture() as unknown as NodeJS.WritableStream,
+      env: {}, homeDir: path.join(root, "home")
+    })).toBe(0);
+    await expect(readFile(`${configPath}.v3.bak`, "utf8")).resolves.toBe(original);
+    const migrated = await readFile(configPath, "utf8");
+    expect(migrated).toContain("schema_version = 4");
+    expect(migrated).toContain('read_scope = "host"');
+    expect(migrated).toContain('network = "none"');
+    expect(migrated).toContain('process_handoff = "allow"');
   });
 });

@@ -227,59 +227,75 @@ export function parseHello(input: unknown): { instanceId: string; artifactRoot?:
   };
 }
 
-export function parseDoctor(input: unknown): BrokerDoctorReport {
-  const value = protocolRecord(input, "Broker doctor result");
-  if (value.protocolVersion !== BROKER_PROTOCOL_VERSION) throw new BrokerProtocolError("Broker doctor version mismatch.");
-  const sandbox = protocolRecord(value.sandbox, "Broker sandbox report");
-  const capabilities = protocolRecord(value.capabilities, "Broker capabilities");
-  const hardening = sandbox.hardening === undefined
-    ? undefined : protocolRecord(sandbox.hardening, "Broker sandbox hardening");
-  const landlockAbi = hardening?.landlockAbi;
+function parseDoctorHardening(input: unknown): BrokerDoctorReport["sandbox"]["hardening"] | undefined {
+  if (input === undefined) return undefined;
+  const hardening = protocolRecord(input, "Broker sandbox hardening");
+  const landlockAbi = hardening.landlockAbi;
   if (landlockAbi !== undefined && landlockAbi !== null
     && (!Number.isSafeInteger(landlockAbi) || Number(landlockAbi) < 1)) {
     throw new BrokerProtocolError("Broker Landlock ABI is invalid.");
   }
+  return {
+    ...(typeof landlockAbi === "number" ? { landlockAbi } : {}),
+    noNewPrivileges: booleanValue(hardening.noNewPrivileges, "sandbox.hardening.noNewPrivileges"),
+    seccompFilter: booleanValue(hardening.seccompFilter, "sandbox.hardening.seccompFilter"),
+    lessPrivilegedAppContainer: booleanValue(
+      hardening.lessPrivilegedAppContainer,
+      "sandbox.hardening.lessPrivilegedAppContainer"
+    ),
+    mountNamespace: booleanValue(hardening.mountNamespace, "sandbox.hardening.mountNamespace"),
+    pidNamespace: booleanValue(hardening.pidNamespace, "sandbox.hardening.pidNamespace"),
+    networkNamespace: booleanValue(hardening.networkNamespace, "sandbox.hardening.networkNamespace")
+  };
+}
+
+function parseDoctorSandbox(input: unknown): BrokerDoctorReport["sandbox"] {
+  const sandbox = protocolRecord(input, "Broker sandbox report");
+  const hardening = parseDoctorHardening(sandbox.hardening);
+  return {
+    available: booleanValue(sandbox.available, "sandbox.available"),
+    backend: stringValue(sandbox.backend, "sandbox.backend"),
+    selfTestPassed: booleanValue(sandbox.selfTestPassed, "sandbox.selfTestPassed"),
+    setupRequired: booleanValue(sandbox.setupRequired, "sandbox.setupRequired"),
+    ...(typeof sandbox.reason === "string" ? { reason: sandbox.reason } : {}),
+    ...(hardening ? { hardening } : {})
+  };
+}
+
+function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctorReport["capabilities"] {
+  const capabilities = protocolRecord(input, "Broker capabilities");
   const networkModes = capabilities.networkModes;
   if (!Array.isArray(networkModes) || networkModes.some((mode) => mode !== "none" && mode !== "full")) {
     throw new BrokerProtocolError("Broker networkModes are invalid.");
   }
-  const platform = brokerPlatform(value.platform);
   const shells = verifiedShells(capabilities.shells, platform);
+  return {
+    foreground: booleanValue(capabilities.foreground, "capabilities.foreground"),
+    background: booleanValue(capabilities.background, "capabilities.background"),
+    stdin: booleanValue(capabilities.stdin, "capabilities.stdin"),
+    pty: booleanValue(capabilities.pty, "capabilities.pty"),
+    ...(capabilities.processHandoff === undefined ? {} : {
+      processHandoff: booleanValue(capabilities.processHandoff, "capabilities.processHandoff")
+    }),
+    networkModes: networkModes as Array<"none" | "full">,
+    ...(capabilities.executionRoots === undefined ? {} : {
+      executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
+    }),
+    ...(shells ? { shells } : {})
+  };
+}
+
+export function parseDoctor(input: unknown): BrokerDoctorReport {
+  const value = protocolRecord(input, "Broker doctor result");
+  if (value.protocolVersion !== BROKER_PROTOCOL_VERSION) throw new BrokerProtocolError("Broker doctor version mismatch.");
+  const platform = brokerPlatform(value.platform);
   return {
     protocolVersion: BROKER_PROTOCOL_VERSION,
     brokerVersion: stringValue(value.brokerVersion, "Broker version"),
     platform,
     architecture: brokerArchitecture(value.architecture),
-    sandbox: {
-      available: booleanValue(sandbox.available, "sandbox.available"),
-      backend: stringValue(sandbox.backend, "sandbox.backend"),
-      selfTestPassed: booleanValue(sandbox.selfTestPassed, "sandbox.selfTestPassed"),
-      setupRequired: booleanValue(sandbox.setupRequired, "sandbox.setupRequired"),
-      ...(typeof sandbox.reason === "string" ? { reason: sandbox.reason } : {}),
-      ...(hardening ? { hardening: {
-        ...(typeof landlockAbi === "number" ? { landlockAbi } : {}),
-        noNewPrivileges: booleanValue(hardening.noNewPrivileges, "sandbox.hardening.noNewPrivileges"),
-        seccompFilter: booleanValue(hardening.seccompFilter, "sandbox.hardening.seccompFilter"),
-        lessPrivilegedAppContainer: booleanValue(
-          hardening.lessPrivilegedAppContainer,
-          "sandbox.hardening.lessPrivilegedAppContainer"
-        ),
-        mountNamespace: booleanValue(hardening.mountNamespace, "sandbox.hardening.mountNamespace"),
-        pidNamespace: booleanValue(hardening.pidNamespace, "sandbox.hardening.pidNamespace"),
-        networkNamespace: booleanValue(hardening.networkNamespace, "sandbox.hardening.networkNamespace")
-      } } : {})
-    },
-    capabilities: {
-      foreground: booleanValue(capabilities.foreground, "capabilities.foreground"),
-      background: booleanValue(capabilities.background, "capabilities.background"),
-      stdin: booleanValue(capabilities.stdin, "capabilities.stdin"),
-      pty: booleanValue(capabilities.pty, "capabilities.pty"),
-      networkModes: networkModes as Array<"none" | "full">,
-      ...(capabilities.executionRoots === undefined ? {} : {
-        executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
-      }),
-      ...(shells ? { shells } : {})
-    }
+    sandbox: parseDoctorSandbox(value.sandbox),
+    capabilities: parseDoctorCapabilities(value.capabilities, platform)
   };
 }
 
@@ -297,6 +313,17 @@ export function parseSpawnedProcess(input: unknown): { id: string; systemProcess
     throw new BrokerProtocolError("Process processId must be a positive integer when present.");
   }
   return { id, ...(processId === undefined ? {} : { systemProcessId: processId as number }) };
+}
+
+export function parseProcessHandoff(input: unknown): { handoffId: string; systemProcessId?: number } {
+  const value = protocolRecord(input, "Process handoff result");
+  const handoffId = stringValue(value.handoffId, "Process handoffId");
+  if (!handoffId) throw new BrokerProtocolError("Process handoffId cannot be empty.");
+  const processId = value.processId;
+  if (processId !== undefined && (!Number.isSafeInteger(processId) || (processId as number) <= 0)) {
+    throw new BrokerProtocolError("Process handoff processId must be a positive integer when present.");
+  }
+  return { handoffId, ...(processId === undefined ? {} : { systemProcessId: processId as number }) };
 }
 
 export function parseProcessValue(input: unknown): ProcessValue {

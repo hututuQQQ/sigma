@@ -44,6 +44,7 @@ export function isCompletionEligibleEvidence(
   runId: string
 ): boolean {
   if (evidence.sessionId !== sessionId || evidence.runId !== runId || evidence.status === "failed") return false;
+  if (evidence.kind === "input_access") return false;
   return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
 }
 

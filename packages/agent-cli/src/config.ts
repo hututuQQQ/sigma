@@ -28,7 +28,9 @@ export interface CliConfig {
   agentProfile: string;
   permissionMode: "ask" | "auto" | "deny";
   sandboxMode: "required";
+  readScope: "workspace" | "host";
   networkMode: "none" | "full";
+  processHandoff: "allow" | "deny";
   allowUnsafeHostExec: boolean;
   unsafeHostExecRequested: boolean;
   reviewerWaiver: boolean;
@@ -226,7 +228,9 @@ function cliConfig(
     agentProfile: String(values.agentProfile),
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
+    readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
+    processHandoff: values.processHandoff as CliConfig["processHandoff"],
     ...unsafe,
     reviewerWaiver: values.reviewerWaiver === true,
     legacySingleModelRoute,

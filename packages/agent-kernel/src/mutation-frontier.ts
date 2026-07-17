@@ -74,6 +74,19 @@ export function frontierAfterCheckpoint(
   checkpoint: CheckpointRef,
   mutationEvidence: readonly EvidenceRecord[]
 ): MutationFrontier {
+  if (checkpoint.status === "sealed" && checkpoint.delta) {
+    const emptyDelta = checkpoint.delta.added.length === 0
+      && checkpoint.delta.modified.length === 0
+      && checkpoint.delta.deleted.length === 0;
+    if (emptyDelta) {
+      if (checkpoint.postManifestDigest !== checkpoint.preManifestDigest) {
+        throw Object.assign(new Error(
+          `Checkpoint '${checkpoint.checkpointId}' has an empty delta but different pre/post manifests.`
+        ), { code: "checkpoint_integrity_error" });
+      }
+      return frontier;
+    }
+  }
   const sourceCheckpointIds = checkpoint.status === "restored"
     ? frontier.sourceCheckpointIds.filter((id) => id !== checkpoint.checkpointId)
     : [...new Set([...frontier.sourceCheckpointIds, checkpoint.checkpointId])];

@@ -3,6 +3,7 @@ import type {
   CommandEvidence,
   DiagnosticEvidence,
   EvidenceRecord,
+  InputAccessEvidence,
   RepositoryDeltaEvidence,
   ToolCallPlan,
   ToolReceipt,
@@ -102,6 +103,26 @@ function sanitizeDiagnostic(raw: DiagnosticEvidence, receipt: ToolReceipt, scope
   };
 }
 
+function sanitizeInputAccess(
+  raw: InputAccessEvidence,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): InputAccessEvidence {
+  return {
+    ...evidenceBase(scope, receipt),
+    kind: "input_access",
+    status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
+    summary: raw.summary,
+    data: {
+      path: raw.data.path,
+      scope: raw.data.scope,
+      ...(raw.data.sha256 ? { sha256: raw.data.sha256 } : {}),
+      ...(raw.data.byteLength === undefined ? {} : { byteLength: raw.data.byteLength }),
+      ...(raw.data.failureCode ? { failureCode: raw.data.failureCode } : {})
+    }
+  };
+}
+
 function sanitizeRepositoryDelta(
   raw: RepositoryDeltaEvidence,
   receipt: ToolReceipt,
@@ -160,6 +181,9 @@ export function normalizeReceiptEvidence(
       return [sanitizeCommand(raw, receipt, scope)];
     }
     if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
+    if (raw.kind === "input_access" && actualEffects.includes("filesystem.read")) {
+      return [sanitizeInputAccess(raw, receipt, scope)];
+    }
     return [];
   });
   return {

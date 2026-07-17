@@ -1,30 +1,15 @@
 import {
-  attachBrokerLifecycleFailure,
-  BrokerConnectionError,
-  BrokerProcessLostError
+  attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError
 } from "./errors.js";
 import {
-  awaitWithSignal,
-  cancellationError,
-  errorIdentity,
-  lifecycleFailure,
-  preserveConnectionFailure,
-  retireTerminalGenerationError
+  awaitWithSignal, cancellationError, errorIdentity, lifecycleFailure,
+  preserveConnectionFailure, retireTerminalGenerationError
 } from "./lazy-execution-broker-lifecycle.js";
 import { defaultBrokerClientFactory } from "./lazy-execution-broker-runtime.js";
-import {
-  LazyExecutionHandleRegistry,
-  type LazyProcessHandleOwner
-} from "./lazy-execution-handles.js";
+import { LazyExecutionHandleRegistry, type LazyProcessHandleOwner } from "./lazy-execution-handles.js";
 import type {
-  BrokerDoctorReport,
-  BrokerRequestOptions,
-  ExecutionBroker,
-  ExecutionRequest,
-  ExecutionResult,
-  ProcessHandle,
-  ProcessPollResult,
-  ProcessSpawnRequest,
+  BrokerDoctorReport, BrokerRequestOptions, ExecutionBroker, ExecutionRequest, ExecutionResult,
+  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
   TrustedToolchainManifestEntry
 } from "./types.js";
 export {
@@ -147,6 +132,25 @@ export class LazyExecutionBroker implements ExecutionBroker {
       options?.signal,
       (owner, result) => {
         if (result.state !== "running") this.processHandles.release(owner);
+        return { ...result, handle: owner.publicHandle };
+      }
+    );
+  }
+
+  async handoff(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult> {
+    return await this.invokeHandle(
+      handle,
+      async (client, owner) => {
+        if (!client.handoff) {
+          throw Object.assign(new Error("Process handoff is unavailable for this broker."), {
+            code: "process_handoff_unavailable"
+          });
+        }
+        return await client.handoff(owner.nativeHandle, options);
+      },
+      options?.signal,
+      (owner, result) => {
+        this.processHandles.release(owner);
         return { ...result, handle: owner.publicHandle };
       }
     );

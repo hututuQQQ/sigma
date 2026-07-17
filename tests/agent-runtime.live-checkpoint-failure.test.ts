@@ -5,13 +5,15 @@ import { describe, expect, it } from "vitest";
 import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
 import type {
   AgentEventEnvelope,
+  JsonValue,
   ModelCapabilities,
   ModelGateway,
   ModelMessage,
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
-  ModelToolDefinition
+  ModelToolDefinition,
+  ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -167,5 +169,87 @@ describe("live mutation checkpoint failure recovery", () => {
     expect(stored.some((event) => event.type === "checkpoint.sealed")).toBe(true);
     expect(stored.some((event) => event.type === "run.suspended"
       && String((event.payload as { requestId?: string }).requestId).startsWith("checkpoint:"))).toBe(false);
+  });
+
+  it("binds mutating validation evidence to the frontier produced by its sealed checkpoint", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-mutating-validation-"));
+    await writeFile(path.join(workspace, "target.txt"), "before", "utf8");
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const gateway = new ScriptedGateway([
+      toolTurn([{
+        id: "mutating-validation", name: "mutating_validation", arguments: { path: "target.txt" }
+      }]),
+      toolTurn([{
+        id: "validation-observed", name: "request_user_input", arguments: { message: "validation recorded" }
+      }])
+    ]);
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "mutating_validation",
+        description: "Fixture validation that writes its declared output.",
+        inputSchema: {
+          type: "object", properties: { path: { type: "string" } }, required: ["path"]
+        },
+        possibleEffects: ["filesystem.read", "filesystem.write", "validation"],
+        executionMode: "exclusive",
+        resourceKeys: ["workspace"],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 2_000,
+        prepare: async (value) => {
+          const input = value as Record<string, JsonValue>;
+          const target = String(input.path);
+          return {
+            exactEffects: ["filesystem.read", "filesystem.write", "validation"],
+            readPaths: [target], writePaths: [target], network: "none", processMode: "none",
+            checkpointScope: [target], idempotence: "non_replayable"
+          };
+        }
+      },
+      async execute(request): Promise<ToolReceipt> {
+        await writeFile(path.join(workspace, "target.txt"), "validated", "utf8");
+        const occurredAt = new Date().toISOString();
+        return {
+          callId: request.callId, ok: true, output: "validated",
+          observedEffects: ["filesystem.read", "filesystem.write", "validation"],
+          actualEffects: ["filesystem.read", "filesystem.write", "validation"],
+          artifacts: [], diagnostics: [], startedAt: occurredAt, completedAt: occurredAt,
+          evidence: [{
+            evidenceId: "mutating-validation-evidence",
+            sessionId: "untrusted", runId: "untrusted", kind: "validation", status: "passed",
+            createdAt: occurredAt, producer: { authority: "tool", id: request.callId },
+            summary: "Mutating validation passed.",
+            data: { validator: "command", command: "mutating_validation", exitCode: 0 }
+          }]
+        };
+      }
+    });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 10_000
+    });
+    const created = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({
+      type: "submit", sessionId: created.sessionId, text: "run the mutating validation"
+    });
+    await expect(runtime.waitForOutcome(created.sessionId)).resolves.toMatchObject({
+      kind: "needs_input", requestId: "validation-observed"
+    });
+
+    const stored = await events(store, created.sessionId);
+    const checkpoint = stored.find((event) => event.type === "checkpoint.sealed");
+    const evidence = stored.find((event) => event.type === "evidence.recorded"
+      && (event.payload as { kind?: string; summary?: string }).kind === "validation"
+      && (event.payload as { summary?: string }).summary === "Mutating validation passed.");
+    expect(checkpoint).toBeDefined();
+    expect(evidence?.payload).toMatchObject({
+      kind: "validation",
+      data: {
+        frontierRevision: 1,
+        stateDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        coveredPaths: ["target.txt"]
+      }
+    });
   });
 });

@@ -22,6 +22,20 @@ function coveredByRoot(changedPath: string, root: string): boolean {
     || normalizedPath.startsWith(`${normalizedRoot}/`);
 }
 
+/** Resolve the workspace object that was changed without following a final
+ * symlink. Parent links are still canonicalized and must remain contained. */
+async function canonicalWrittenObjectPath(
+  workspacePath: string,
+  requested: string
+): Promise<string | null> {
+  const workspace = path.resolve(workspacePath);
+  const lexical = path.resolve(workspace, requested);
+  if (!isInside(workspace, lexical)) return null;
+  if (lexical === workspace) return workspace;
+  const parent = await canonicalWorkspacePath(workspacePath, path.dirname(lexical)).catch(() => null);
+  return parent ? path.join(parent, path.basename(lexical)) : null;
+}
+
 /** Freeze validation authority at preparation time. Coverage is derived from
  * approved read roots, never from opaque identifiers supplied by the model. */
 export function validationScope(
@@ -89,12 +103,12 @@ export async function assertReceiptWithinPlan(
   const plannedWritePaths = plan.writePaths.length > 0
     ? plan.writePaths : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
   const allowedResults = await Promise.all(plannedWritePaths.map(async (item) =>
-    await canonicalWorkspacePath(session.identity.workspacePath, item).catch(() => null)));
+    await canonicalWrittenObjectPath(session.identity.workspacePath, item)));
   const invalidAllowed = plannedWritePaths.filter((_item, index) => !allowedResults[index]);
   const allowed = allowedResults.filter((item): item is string => Boolean(item));
   const outsidePaths: string[] = [];
   for (const item of changedPaths) {
-    const canonical = await canonicalWorkspacePath(session.identity.workspacePath, item.path).catch(() => null);
+    const canonical = await canonicalWrittenObjectPath(session.identity.workspacePath, item.path);
     if (canonical && allowed.some((root) => isInside(root, canonical))) continue;
     if (!await implicitAddedParentDirectory(session.identity.workspacePath, item, canonical, allowed)) {
       outsidePaths.push(item.path);

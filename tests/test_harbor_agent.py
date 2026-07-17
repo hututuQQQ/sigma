@@ -70,7 +70,10 @@ def current_doctor_payload(network_modes: list[str] | None = None) -> str:
         "platform": "linux",
         "architecture": "x86_64",
         "sandbox": {"available": True, "backend": "fixture", "selfTestPassed": True},
-        "capabilities": {"networkModes": network_modes or ["none", "full"]},
+        "capabilities": {
+            "networkModes": network_modes or ["none", "full"],
+            "processHandoff": True,
+        },
         "checks": [],
     })
 
@@ -237,6 +240,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["network_mode_effective"], "full")
+            self.assertEqual(record["read_scope_effective"], "host")
+            self.assertTrue(record["process_handoff_available"])
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
         module = import_portable_agent_module()

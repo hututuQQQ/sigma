@@ -738,8 +738,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(values[3], "--as-pid-1");
         assert_eq!(
-            &values[7..13],
+            &values[7..15],
             [
+                "--tmpfs",
+                "/tmp",
                 "--bind",
                 "/tmp/allowed",
                 "/tmp/allowed",

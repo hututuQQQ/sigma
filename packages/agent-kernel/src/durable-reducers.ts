@@ -22,7 +22,9 @@ export type KernelEventReducer = (
   payload: Record<string, JsonValue>
 ) => KernelState;
 
-const TOOL_EVIDENCE_KINDS = new Set(["workspace_delta", "repository_delta", "command", "validation", "diagnostic"]);
+const TOOL_EVIDENCE_KINDS = new Set([
+  "workspace_delta", "repository_delta", "command", "validation", "diagnostic", "input_access"
+]);
 const MUTATION_EVIDENCE_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
 
 function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {
@@ -265,5 +267,6 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "skill.loaded": skillLoaded,
   "process.spawned": processSpawned,
   "process.exited": processSettled,
-  "process.lost": processSettled
+  "process.lost": processSettled,
+  "process.handed_off": processSettled
 };

@@ -29,6 +29,7 @@ import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js"
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
 import { completionRepairPhase, descriptorAllowedForRepair, effectsAllowedForRepair } from "./tool-turn-policy.js";
+import { failedExternalInputReceipt } from "./failed-input-evidence.js";
 import {
   createMutationCheckpoint,
   delegatesWorkspaceMutation,
@@ -44,9 +45,7 @@ interface PreparedTool extends ToolAttempt {
   approval?: ToolCallApproval;
   validationScope?: FrozenValidationScope;
 }
-
 interface TransactionState { executionStarted: boolean }
-
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -250,12 +249,14 @@ export class ToolTransactionRunner {
       );
       return await this.runReserved(session, { ...prepared, ...(approval ? { approval } : {}) }, reservationId, signal);
     } catch (error) {
-      return failed(
+      const code = failureCode(error, signal);
+      const receipt = failed(
         call,
         startedAt,
         error instanceof Error ? error.message : String(error),
-        failureCode(error, signal)
+        code
       );
+      return failedExternalInputReceipt(session, call, plan, receipt, code);
     }
   }
 
@@ -325,15 +326,11 @@ export class ToolTransactionRunner {
     const { call, modelTurn, descriptor, plan } = prepared;
     try {
       const rawReceipt = await this.execution.execute(
-        session, call, modelTurn, descriptor, plan, signal, keys, prepared.approval
-      );
+        session, call, modelTurn, descriptor, plan, signal, keys, prepared.approval);
       assertToolReceiptIdentity(rawReceipt, call.id);
       let receipt = rawReceipt;
       if (checkpoint) {
-        const inspection = await this.options.control.inspectOpenCheckpoint(
-          session,
-          checkpoint.checkpointId
-        );
+        const inspection = await this.options.control.inspectOpenCheckpoint(session, checkpoint.checkpointId);
         receipt = {
           ...rawReceipt,
           workspaceDelta: mergeDelta(rawReceipt.workspaceDelta, inspection.delta)
@@ -342,11 +339,15 @@ export class ToolTransactionRunner {
       await assertReceiptWithinPlan(session, receipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
+      const finalValidationScope = plan.exactEffects.includes("validation")
+        && plan.exactEffects.includes("filesystem.write")
+        ? validationScope(session, call, plan)
+        : prepared.validationScope;
       const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
         sessionId: session.identity.sessionId,
         runId: session.durable.runId,
         workspaceDeltas: [],
-        ...(prepared.validationScope ? { validationScope: prepared.validationScope } : {})
+        ...(finalValidationScope ? { validationScope: finalValidationScope } : {})
       });
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,

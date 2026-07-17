@@ -62,6 +62,8 @@ function installCallGrant(
     callId: requestId,
     authority: "user",
     networkApproved: approval.effects.includes("network"),
+    externalReadApproved: approval.effects.includes("filesystem.read.external"),
+    processHandoffApproved: approval.effects.includes("process.handoff"),
     unsafeHostExecApproved: approval.effects.includes("open_world"),
     ...(decision === "always_allow"
       ? { alwaysAllowEffectGrant: approval.effects.slice().sort().join("\0") }

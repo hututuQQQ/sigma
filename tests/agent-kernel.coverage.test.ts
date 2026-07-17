@@ -1380,6 +1380,28 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
+  it("keeps a sealed no-op checkpoint outside the frontier and rejects inconsistent manifests", () => {
+    const frontier = {
+      ...emptyMutationFrontier(),
+      revision: 3,
+      baselineManifestDigest: "a".repeat(64),
+      currentStateDigest: "b".repeat(64),
+      changedPaths: ["src/existing.ts"],
+      sourceCheckpointIds: ["checkpoint-existing"]
+    };
+    const noOp = {
+      checkpointId: "checkpoint-no-op", sessionId: "session", runId: "run", status: "sealed" as const,
+      createdAt: "2026-01-01T00:00:00.000Z", sealedAt: "2026-01-01T00:00:01.000Z",
+      preManifestDigest: "c".repeat(64), postManifestDigest: "c".repeat(64),
+      delta: { added: [], modified: [], deleted: [] }
+    };
+
+    expect(frontierAfterCheckpoint(frontier, noOp, [])).toBe(frontier);
+    expect(() => frontierAfterCheckpoint(frontier, {
+      ...noOp, checkpointId: "checkpoint-inconsistent", postManifestDigest: "d".repeat(64)
+    }, [])).toThrow(expect.objectContaining({ code: "checkpoint_integrity_error" }));
+  });
+
   it("rehydrates imported checkpoints and repository deltas into one current frontier", () => {
     const importedCheckpoint: EvidenceRecord = {
       evidenceId: "imported", sessionId: "session", runId: "run",

@@ -18,6 +18,7 @@ import type {
   evidenceRecordSchema,
   evidenceRefSchema,
   evidenceStatusSchema,
+  inputAccessEvidenceSchema,
   mutationFrontierSchema,
   modelExecutionRoleSchema,
   opaqueArtifactEvidenceSchema,
@@ -58,6 +59,7 @@ export type MutationFrontier = z.infer<typeof mutationFrontierSchema>;
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export type ValidationEvidence = z.infer<typeof validationEvidenceSchema>;
 export type DiagnosticEvidence = z.infer<typeof diagnosticEvidenceSchema>;
+export type InputAccessEvidence = z.infer<typeof inputAccessEvidenceSchema>;
 export type ReviewEvidence = z.infer<typeof reviewEvidenceSchema>;
 export type CheckpointEvidence = z.infer<typeof checkpointEvidenceSchema>;
 export type ChildOutcomeEvidence = z.infer<typeof childOutcomeEvidenceSchema>;

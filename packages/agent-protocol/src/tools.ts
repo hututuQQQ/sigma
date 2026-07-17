@@ -12,10 +12,12 @@ import type { RunMode } from "./outcomes.js";
 
 export type ToolEffect =
   | "filesystem.read"
+  | "filesystem.read.external"
   | "filesystem.write"
   | "repository.write"
   | "process.spawn"
   | "process.spawn.readonly"
+  | "process.handoff"
   | "agent.spawn"
   | "network"
   | "validation"
@@ -174,6 +176,8 @@ export interface ToolCallApproval {
   /** Runtime authority is valid only for an auditable permission-mode=auto decision. */
   authority: "user" | "runtime";
   networkApproved: boolean;
+  externalReadApproved: boolean;
+  processHandoffApproved: boolean;
   unsafeHostExecApproved: boolean;
 }
 

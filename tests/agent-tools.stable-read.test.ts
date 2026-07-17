@@ -63,6 +63,60 @@ describe("stable explicit workspace reads", () => {
 
     expect(result.output).toBe("2: second\n3: third");
     expect(result.observedEffects).toEqual(["filesystem.read"]);
+    expect(result.evidence).toEqual([]);
+  });
+
+  it("reads an approved absolute host input with stable input-access evidence", async () => {
+    const workspace = await temporaryDirectory("sigma-stable-read-workspace-");
+    const external = await temporaryDirectory("sigma-stable-read-external-");
+    const inputPath = path.join(external, "input.txt");
+    await writeFile(inputPath, "external input\n", "utf8");
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { readScope: "host" });
+    const call = request("external-input", { path: inputPath });
+    const plan = await tools.prepare(call, {
+      sessionId: "stable-read-session", runId: "stable-read-run", workspacePath: workspace, runMode: "analyze"
+    });
+
+    expect(plan).toMatchObject({
+      exactEffects: ["filesystem.read", "filesystem.read.external"],
+      readPaths: [inputPath]
+    });
+    const result = await tools.execute(call, {
+      ...context(workspace),
+      callPlan: plan,
+      approval: { externalReadApproved: true }
+    });
+
+    expect(result.output).toBe("1: external input");
+    expect(result.evidence).toEqual([expect.objectContaining({
+      kind: "input_access",
+      status: "passed",
+      data: expect.objectContaining({
+        path: inputPath,
+        scope: "external",
+        byteLength: Buffer.byteLength("external input\n"),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u)
+      })
+    })]);
+  });
+
+  it("fails closed for strict workspace-only reads and missing external grants", async () => {
+    const workspace = await temporaryDirectory("sigma-strict-read-workspace-");
+    const external = await temporaryDirectory("sigma-strict-read-external-");
+    const inputPath = path.join(external, "input.txt");
+    await writeFile(inputPath, "external", "utf8");
+    const strict = registerBuiltinTools(new EffectToolRegistry(), { readScope: "workspace" });
+    await expect(strict.prepare(request("strict", { path: inputPath }), {
+      sessionId: "stable-read-session", runId: "stable-read-run", workspacePath: workspace, runMode: "analyze"
+    })).rejects.toMatchObject({ code: "policy_denied" });
+
+    const host = registerBuiltinTools(new EffectToolRegistry(), { readScope: "host" });
+    const call = request("unapproved", { path: inputPath });
+    const plan = await host.prepare(call, {
+      sessionId: "stable-read-session", runId: "stable-read-run", workspacePath: workspace, runMode: "analyze"
+    });
+    await expect(host.execute(call, { ...context(workspace), callPlan: plan }))
+      .rejects.toMatchObject({ code: "per_call_approval_required" });
   });
 
   it("uses shared CR, LF, and CRLF line semantics without synthetic empty lines", async () => {

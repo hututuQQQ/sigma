@@ -3,7 +3,9 @@ import type { ToolEffect } from "./tools.js";
 export const MCP_FORBIDDEN_PERSISTENT_EFFECTS = [
   "filesystem.write",
   "destructive",
-  "open_world"
+  "open_world",
+  "filesystem.read.external",
+  "process.handoff"
 ] as const satisfies readonly ToolEffect[];
 
 export type McpCapabilityPolicyErrorCode =
@@ -41,7 +43,7 @@ export function assertMcpPersistentEffectsAllowed(
   throw new McpCapabilityPolicyError(
     "mcp_persistent_effect_forbidden",
     `MCP server '${serverName}' requests forbidden persistent effects: ${forbidden.join(", ")}. `
-      + "Sigma V3 MCP servers are read-only and cannot receive workspace write, destructive, or open-world capabilities.",
+      + "Sigma MCP servers are read-only and cannot receive workspace write, external-read, handoff, destructive, or open-world capabilities.",
     serverName,
     forbidden
   );
@@ -51,7 +53,7 @@ export function assertMcpWriteRootsEmpty(serverName: string, writeRoots: readonl
   if (writeRoots.length === 0) return;
   throw new McpCapabilityPolicyError(
     "mcp_write_roots_forbidden",
-    `MCP server '${serverName}' cannot be started with writable roots. Sigma V3 MCP processes are always read-only.`,
+    `MCP server '${serverName}' cannot be started with writable roots. Sigma MCP processes are always read-only.`,
     serverName,
     ["filesystem.write"]
   );

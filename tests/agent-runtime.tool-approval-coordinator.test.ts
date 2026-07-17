@@ -119,3 +119,89 @@ describe("deny-mode internal terminal approval", () => {
     expect(outcome.emit).not.toHaveBeenCalled();
   });
 });
+
+describe("sensitive external-read and handoff approval", () => {
+  it.each([
+    ["external read", "filesystem.read.external", "externalReadApproved"],
+    ["process handoff", "process.handoff", "processHandoffApproved"]
+  ] as const)("prompts for every %s call in ask mode and consumes a fresh bound grant", async (
+    _label,
+    effect,
+    approvalField
+  ) => {
+    const emit = vi.fn(async () => ({}));
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "ask", interactiveApprovals: true } as never,
+      emit: emit as never,
+      finish: vi.fn() as never
+    });
+    const session = runtimeSessionFixture();
+    const sensitivePlan = plan([effect]);
+    const pending = coordinator.decision(session, {
+      call,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: descriptor([effect]),
+      plan: sensitivePlan
+    }, new AbortController().signal);
+    await vi.waitFor(() => expect(session.interaction.approvals.has(call.id)).toBe(true));
+    const waiter = session.interaction.approvals.get(call.id)!;
+    session.interaction.callApprovals.set(call.id, {
+      ...waiter.binding,
+      authority: "user",
+      networkApproved: false,
+      externalReadApproved: effect === "filesystem.read.external",
+      processHandoffApproved: effect === "process.handoff",
+      unsafeHostExecApproved: false
+    });
+    session.interaction.approvals.delete(call.id);
+    waiter.resolve("allow");
+
+    await expect(pending).resolves.toBe("allow");
+    expect(coordinator.consume(session, {
+      call,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: descriptor([effect]),
+      plan: sensitivePlan
+    })).toMatchObject({ [approvalField]: true, authority: "user" });
+    expect(emit).toHaveBeenCalledWith(
+      session,
+      "tool.approval_requested",
+      "runtime",
+      expect.objectContaining({ approvalMode: "human", effects: [effect] })
+    );
+  });
+
+  it.each([
+    ["filesystem.read.external", "externalReadApproved"],
+    ["process.handoff", "processHandoffApproved"]
+  ] as const)("auto mode issues a fresh runtime-bound %s grant", async (effect, approvalField) => {
+    const emit = vi.fn(async () => ({}));
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "auto" } as never,
+      emit: emit as never,
+      finish: vi.fn() as never
+    });
+    const session = runtimeSessionFixture();
+    const sensitivePlan = plan([effect]);
+    const prepared = {
+      call,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: descriptor([effect]),
+      plan: sensitivePlan
+    };
+
+    await expect(coordinator.decision(
+      session, prepared, new AbortController().signal
+    )).resolves.toBe("allow");
+    expect(coordinator.consume(session, prepared)).toMatchObject({
+      [approvalField]: true,
+      authority: "runtime"
+    });
+    expect(emit).toHaveBeenCalledWith(
+      session,
+      "tool.approval_requested",
+      "runtime",
+      expect.objectContaining({ approvalMode: "automatic", effects: [effect] })
+    );
+  });
+});

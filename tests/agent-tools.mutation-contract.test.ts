@@ -202,7 +202,10 @@ describe("typed workspace mutation contracts", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-contract-"));
     await mkdir(path.join(workspace, "src"));
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      networkMode: "none"
+    });
     const call = request("write-process", "exec", {
       executable: process.execPath,
       args: ["--version"],
@@ -284,6 +287,66 @@ describe("typed workspace mutation contracts", () => {
         properties: { readRoots: { type: "array", minItems: 1, uniqueItems: true } }
       });
     }
+  });
+
+  it("mounts only approved stable external read roots and requires an external-read grant", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-workspace-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-input-"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      readScope: "host",
+      networkMode: "none"
+    });
+    const call = request("external-read-exec", "exec", {
+      executable: process.execPath,
+      readRoots: [external]
+    });
+    const plan = await tools.prepare(call, preparation(workspace));
+
+    expect(plan).toMatchObject({
+      exactEffects: ["process.spawn.readonly", "filesystem.read", "filesystem.read.external"],
+      readPaths: [".", external]
+    });
+    await expect(tools.execute(call, { ...execution(workspace), callPlan: plan }))
+      .rejects.toMatchObject({ code: "policy_denied" });
+
+    const approved = request("external-read-approved", "exec", {
+      executable: process.execPath,
+      readRoots: [external]
+    });
+    const approvedPlan = await tools.prepare(approved, preparation(workspace));
+    await expect(tools.execute(approved, {
+      ...execution(workspace),
+      callPlan: approvedPlan,
+      approval: { externalReadApproved: true }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.executions).toHaveLength(1);
+    expect(fixture.executions[0]?.policy.readRoots).toEqual([workspace, external]);
+  });
+
+  it("rejects linked ancestors in external process read roots", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-workspace-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-input-"));
+    const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-parent-"));
+    const linked = path.join(parent, "linked");
+    try {
+      await symlink(external, linked, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      return;
+    }
+    const exec = executionTools({
+      broker: brokerFixture().broker,
+      sandboxMode: "required",
+      readScope: "host",
+      processHandoff: "deny",
+      networkMode: "none"
+    }).find((tool) => tool.descriptor.name === "exec")!;
+
+    await expect(exec.descriptor.prepare!({
+      executable: process.execPath,
+      readRoots: [linked]
+    }, preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
   });
 
   it("rejects escaping or unstable read roots and binds approved read paths into the plan signature", async () => {

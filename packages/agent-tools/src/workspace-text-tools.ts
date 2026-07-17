@@ -5,16 +5,16 @@ import type {
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
-import { resolveWorkspacePath, textLines } from "agent-platform";
+import { resolveWorkspacePath } from "agent-platform";
 import { replaceWorkspaceTextFile } from "./atomic-patch.js";
 import { args, descriptor, receipt, stringArg } from "./builtin-tool-support.js";
 import type { RegisteredEffectTool } from "./registry.js";
 import {
-  MAX_EXPLICIT_WORKSPACE_READ_BYTES,
   readStableWorkspaceTextFile,
   StableWorkspaceReadError,
   type StableWorkspaceTextRead
 } from "./stable-workspace-read.js";
+import { readTool } from "./workspace-read-tool.js";
 
 async function writableTarget(workspacePath: string, requestedPath: string): Promise<string> {
   const workspace = await realpath(workspacePath);
@@ -70,56 +70,6 @@ async function writeCheckpointScope(workspacePath: string, relative: string): Pr
 }
 
 class EditPreconditionError extends Error {}
-
-function readTool(): RegisteredEffectTool {
-  return {
-    descriptor: descriptor({
-      name: "read",
-      description: `Read a UTF-8 text file inside the workspace (maximum ${MAX_EXPLICIT_WORKSPACE_READ_BYTES} bytes). The structured receipt result reports the original byteLength, endsWithNewline, and SHA-256 so EOF and exact-byte state are unambiguous.`,
-      properties: {
-        path: { type: "string" },
-        offset: { type: "integer", minimum: 0 },
-        limit: { type: "integer", minimum: 1 }
-      },
-      required: ["path"],
-      possibleEffects: ["filesystem.read"],
-      executionMode: "parallel",
-      resourceKeys: [],
-      contextPathArguments: ["path"],
-      approval: "auto",
-      idempotent: true,
-      timeoutMs: 30_000
-    }),
-    async execute(request, context) {
-      const startedAt = new Date().toISOString();
-      const input = args(request.arguments);
-      const loaded = await readStableWorkspaceTextFile(
-        context.workspacePath,
-        stringArg(input, "path"),
-        context.signal
-      );
-      const offset = typeof input.offset === "number" ? Math.max(0, Math.floor(input.offset)) : 0;
-      const limit = typeof input.limit === "number" ? Math.max(1, Math.floor(input.limit)) : 500;
-      const allLines = [...textLines(loaded.content)];
-      const lines = allLines.slice(offset, offset + limit);
-      return receipt(request, startedAt, {
-        output: lines.map((line) => `${line.number}: ${line.text}`).join("\n"),
-        result: {
-          status: "read",
-          path: stringArg(input, "path"),
-          byteLength: loaded.byteLength,
-          endsWithNewline: loaded.endsWithNewline,
-          sha256: loaded.sha256,
-          offset,
-          limit,
-          returnedLines: lines.length,
-          totalLines: allLines.length
-        },
-        observedEffects: ["filesystem.read"]
-      });
-    }
-  };
-}
 
 function missingStableRead(error: unknown): boolean {
   return error instanceof StableWorkspaceReadError
@@ -340,6 +290,9 @@ function editTool(atomicPatchStateRootDir?: string): RegisteredEffectTool {
   };
 }
 
-export function workspaceTextTools(atomicPatchStateRootDir?: string): RegisteredEffectTool[] {
-  return [readTool(), writeTool(atomicPatchStateRootDir), editTool(atomicPatchStateRootDir)];
+export function workspaceTextTools(
+  atomicPatchStateRootDir?: string,
+  readScope: "workspace" | "host" = "host"
+): RegisteredEffectTool[] {
+  return [readTool(readScope), writeTool(atomicPatchStateRootDir), editTool(atomicPatchStateRootDir)];
 }

@@ -8,7 +8,19 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 ### Changed
 
-- Nothing yet.
+- Configuration schema v4 defaults to host-scoped declared reads, full sandbox networking, and explicit process handoff while retaining required isolation and workspace-only writes.
+- Sealed no-op checkpoints no longer advance the mutation frontier; mutating validation binds to the post-seal frontier.
+- Workspace write-plan checks no longer follow a final symlink object, while linked ancestors and external-target writes remain denied.
+
+### Added
+
+- Stable external-input reads with per-call approval, `input_access` evidence, and unresolved goal-input completion obligations.
+- Linux deliverable process handoff with detached stdio, watchdog revocation, durable lifecycle events, and fail-closed capability discovery on unsupported platforms.
+
+### Security
+
+- External reads and handoff are sensitive effects with fresh per-call grants; unsafe host execution and workspace-external writes remain disabled.
+- The strict pre-v4 posture remains available with `read_scope=workspace`, `network=none`, and `process_handoff=deny`.
 
 ## [4.0.0-rc.1] - 2026-07-17
 

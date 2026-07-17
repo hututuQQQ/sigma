@@ -378,7 +378,7 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(validation).toMatchObject({ ok: true, observedEffects: validationPlan.exactEffects });
     expect(validation.output).toBe("validated");
     expect(validationPlan).toMatchObject({
-      exactEffects: ["process.spawn.readonly", "validation"],
+      exactEffects: ["process.spawn.readonly", "validation", "network"],
       writePaths: [],
       checkpointScope: []
     });
@@ -388,7 +388,7 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(scopedProcessPlan).toMatchObject({
-      exactEffects: ["process.spawn", "filesystem.write"],
+      exactEffects: ["process.spawn", "filesystem.write", "network"],
       writePaths: ["src"],
       checkpointScope: ["src"]
     });
@@ -414,7 +414,7 @@ describe("context, platform, and repository tool capabilities", () => {
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze"
     });
-    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation"]);
+    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation", "network"]);
     expect(analyzeValidationPlan.writePaths).toEqual([]);
     expect(isToolAllowed(tools.descriptor("read")!, "analyze")).toBe(true);
     expect(isToolAllowed({ ...tools.descriptor("read")!, approval: "deny" }, "change")).toBe(false);

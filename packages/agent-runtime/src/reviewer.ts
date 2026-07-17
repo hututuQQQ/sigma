@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   BudgetAmounts,
   JsonValue,
+  InputAccessEvidence,
   ModelGateway,
   ModelMessage,
   ModelRequest,
@@ -30,6 +31,7 @@ export interface ReviewerInput {
   stateDigest: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
+  inputAccesses?: InputAccessEvidence[];
 }
 
 export interface ReviewerPort {
@@ -206,13 +208,14 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Approve only if the supplied evidence supports the code review verdict despite that reported failure; otherwise request changes with the failure in findings. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. An approved verdict must have zero unresolved correctness, security, or acceptance findings: if you report any actionable finding, return changes_requested. Complete opaque artifacts are reviewable by their workspace path, SHA-256, size, checkpoint-bound delta, and passed validation; do not require textual source for a binary file. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Approve only if the supplied evidence supports the code review verdict; otherwise request changes. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. An approved verdict must have zero unresolved correctness, security, or acceptance findings. Complete opaque artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
       goal: input.goal,
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
+      inputAccesses: input.inputAccesses ?? [],
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
         checkpointId: item.data.checkpointId,

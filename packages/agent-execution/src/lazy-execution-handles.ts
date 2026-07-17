@@ -39,7 +39,8 @@ export class LazyExecutionHandleRegistry {
       brokerInstanceId: this.brokerInstanceId,
       ...(nativeHandle.systemProcessId === undefined
         ? {}
-        : { systemProcessId: nativeHandle.systemProcessId })
+        : { systemProcessId: nativeHandle.systemProcessId }),
+      ...(nativeHandle.lifecycle === undefined ? {} : { lifecycle: nativeHandle.lifecycle })
     });
     const owner = { publicHandle, nativeHandle, generationId, client };
     this.active.set(handleKey(publicHandle), owner);

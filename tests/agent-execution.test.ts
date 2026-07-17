@@ -105,7 +105,10 @@ const handle = request => {
     const respond = () => ok(request, {
       protocolVersion: 1, brokerVersion: "fixture", platform: process.platform, architecture: process.arch,
       sandbox: { available, backend: "fixture", selfTestPassed: available, setupRequired: !available, reason: available ? undefined : "missing sandbox" },
-      capabilities: { foreground: true, background: true, stdin: true, pty: false, networkModes: ["none", "full"] }
+      capabilities: {
+        foreground: true, background: true, stdin: true, pty: false,
+        processHandoff: true, networkModes: ["none", "full"]
+      }
     });
     if (mode === "slow-doctor") setTimeout(respond, 50);
     else respond();
@@ -113,7 +116,10 @@ const handle = request => {
     ok(request, {
       protocolVersion: 1, brokerVersion: "fixture", platform: process.platform, architecture: process.arch,
       sandbox: { available: true, backend: "fixture", selfTestPassed: true, setupRequired: false },
-      capabilities: { foreground: true, background: true, stdin: true, pty: true, networkModes: ["none", "full"] }
+      capabilities: {
+        foreground: true, background: true, stdin: true, pty: true,
+        processHandoff: true, networkModes: ["none", "full"]
+      }
     });
   } else if (request.method === "exec" && mode === "hang") {
     // cancellation request remains readable while this logical request is pending
@@ -197,6 +203,8 @@ const handle = request => {
       fail(request, "policy_denied", "trusted toolchain alias was not resolved exactly");
     } else if (mode === "pty-check" && (request.params.pty !== true || request.params.ptyColumns !== 90 || request.params.ptyRows !== 20)) {
       fail(request, "broker_protocol_error", "PTY request was not forwarded");
+    } else if (mode === "handoff-check" && request.params.lifecycle !== "deliverable") {
+      fail(request, "broker_protocol_error", "deliverable lifecycle was not forwarded");
     } else if (mode === "slow-spawn") {
       const handleId = nextHandleId();
       setTimeout(() => ok(request, { handleId }), 50);
@@ -248,6 +256,8 @@ const handle = request => {
       ok(pendingExec, { ...terminal(), timedOut: false, idleTimedOut: false, cancelled: true });
       pendingExec = undefined;
     }, 50);
+  } else if (request.method === "process.handoff") {
+    ok(request, { handoffId: "handoff:" + request.params.handleId, processId: 4321 });
   } else if (request.method === "process.write" || request.method === "process.release" || request.method === "cancel") {
     ok(request, {});
   } else if (request.method === "artifact.release") {
@@ -677,6 +687,29 @@ describe("SigmaExecBrokerClient", () => {
     await client.write(handle, "input\n");
     await expect(client.poll(handle)).resolves.toMatchObject({ state: "exited", stdout: "******" });
     await expect(client.terminate(handle)).rejects.toBeInstanceOf(BrokerProcessLostError);
+    await client.close();
+  });
+
+  it("hands off only deliverable handles and releases client ownership", async () => {
+    const sessionClient = new SigmaExecBrokerClient(fixtureOptions("normal"));
+    await sessionClient.connect();
+    const sessionHandle = await sessionClient.spawn(spawnRequest());
+    await expect(sessionClient.handoff(sessionHandle)).rejects.toBeInstanceOf(BrokerPolicyError);
+    await expect(sessionClient.terminate(sessionHandle)).resolves.toMatchObject({ state: "terminated" });
+    await sessionClient.close();
+
+    const client = new SigmaExecBrokerClient(fixtureOptions("handoff-check"));
+    await expect(client.connect()).resolves.toMatchObject({
+      capabilities: { processHandoff: true }
+    });
+    const deliverable = await client.spawn({ ...spawnRequest(), lifecycle: "deliverable" });
+    expect(deliverable.lifecycle).toBe("deliverable");
+    await expect(client.handoff(deliverable)).resolves.toMatchObject({
+      handle: deliverable,
+      handoffId: `handoff:${deliverable.id}`,
+      systemProcessId: 4321
+    });
+    await expect(client.poll(deliverable)).rejects.toBeInstanceOf(BrokerProcessLostError);
     await client.close();
   });
 

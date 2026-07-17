@@ -112,11 +112,12 @@ export const agentEventPayloadFixtures = {
   "execution.completed": { executionId: "execution", evidenceIds: [] },
   "execution.failed": { executionId: "execution", code: "failed", message: "failed" },
   "process.spawned": {
-    processId: "process", executionId: "execution", mode: "background", brokerInstanceId: "broker"
+    processId: "process", executionId: "execution", mode: "background", lifecycle: "session", brokerInstanceId: "broker"
   },
   "process.output": { processId: "process", stream: "stdout", chunk: "output" },
   "process.exited": { processId: "process", exitCode: 0, state: "exited" },
   "process.lost": { processId: "process", reason: "broker ended" },
+  "process.handed_off": { processId: "process", handoffId: "handoff", systemProcessId: 1234 },
   "evidence.recorded": evidenceFixture(),
   "usage.recorded": usageFixture(),
   "model.route_resolved": { role: "orchestrator", routeId: "route", modelSpecId: "provider/model", attempt: 1 },

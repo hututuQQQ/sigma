@@ -34,6 +34,8 @@ export interface ApprovalRequest {
 function requiresPerCallApproval(plan: ToolCallPlan): boolean {
   return plan.network === "full"
     || plan.exactEffects.includes("network")
+    || plan.exactEffects.includes("filesystem.read.external")
+    || plan.exactEffects.includes("process.handoff")
     || plan.exactEffects.includes("open_world");
 }
 
@@ -71,7 +73,8 @@ function immediateApprovalDecision(
 ): "allow" | "deny" | undefined {
   const mandatory = mandatoryApprovalDecision(descriptor, effects, permissionMode);
   if (mandatory) return mandatory;
-  const perCall = effects.some((effect) => effect === "network" || effect === "open_world");
+  const perCall = effects.some((effect) => effect === "network"
+    || effect === "filesystem.read.external" || effect === "process.handoff" || effect === "open_world");
   const effectGrant = effects.slice().sort().join("\0");
   if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
   return !perCall && (descriptor.approval === "auto"
@@ -83,15 +86,18 @@ function validApprovalGrant(
   expectedBinding: ReturnType<typeof createApprovalBinding>,
   plan: ToolCallPlan
 ): grant is CallApprovalGrant {
-  const networkApproved = plan.network !== "full" || grant?.networkApproved === true;
-  const unsafeApproved = !plan.exactEffects.includes("open_world")
-    || grant?.unsafeHostExecApproved === true;
-  return Boolean(grant
-    && sameApprovalBinding(grant, expectedBinding)
+  if (!grant) return false;
+  const approvalSatisfied = (required: boolean, approved: boolean | undefined): boolean =>
+    !required || approved === true;
+  return sameApprovalBinding(grant, expectedBinding)
     && grant.callId === expectedBinding.callId
     && (grant.authority === "user" || grant.authority === "runtime")
-    && networkApproved
-    && unsafeApproved);
+    && approvalSatisfied(plan.network === "full", grant.networkApproved)
+    && approvalSatisfied(
+      plan.exactEffects.includes("filesystem.read.external"), grant.externalReadApproved
+    )
+    && approvalSatisfied(plan.exactEffects.includes("process.handoff"), grant.processHandoffApproved)
+    && approvalSatisfied(plan.exactEffects.includes("open_world"), grant.unsafeHostExecApproved);
 }
 
 async function cleanUpFailedApprovalRequest(
@@ -278,6 +284,8 @@ export class ToolApprovalCoordinator {
       ...binding,
       authority: "runtime",
       networkApproved: plan.network === "full",
+      externalReadApproved: plan.exactEffects.includes("filesystem.read.external"),
+      processHandoffApproved: plan.exactEffects.includes("process.handoff"),
       unsafeHostExecApproved: false
     });
     return "allow";
