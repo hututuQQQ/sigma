@@ -74,6 +74,11 @@ jobs:
       GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+      - name: Configure canonical runner temp directory
+        if: runner.os == 'Windows'
+        run: |
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
