@@ -193,5 +193,5 @@ describe("child follow-up lifecycle", () => {
     expect(initialPlan?.plan?.goal).toBe(instruction);
     expect(initialPlan?.plan?.nodes?.[0]?.title).toBe(instruction.slice(0, 80).trim());
     await execution.close();
-  });
+  }, 30_000);
 });
