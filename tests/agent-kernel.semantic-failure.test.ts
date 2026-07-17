@@ -196,6 +196,15 @@ describe("semantic execution failure convergence", () => {
     });
   });
 
+  it("does not classify child-command dependency errors as infrastructure failures", () => {
+    let state = failAlternative(initial(), "missing-one", "exec", "command_dependency_missing");
+    state = failAlternative(state, "missing-two", "shell", "command_dependency_missing");
+    state = failAlternative(state, "missing-three", "exec", "command_dependency_missing");
+
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.semanticFailureCluster).toBeUndefined();
+  });
+
   it("puts structured outcome, diagnostics, and evidence summaries in modern tool history", () => {
     const evidence: EvidenceRecord = {
       evidenceId: "diagnostic-proof",

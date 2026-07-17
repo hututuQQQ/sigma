@@ -46,6 +46,9 @@ export interface RuntimeOptions {
   permissionMode?: "ask" | "auto" | "deny";
   /** Whether this runtime surface can answer a human approval prompt. */
   interactiveApprovals?: boolean;
+  /** Trusted-launcher authorization for headless open-world calls inside an
+   * already disposable container. Never derive this from workspace state. */
+  openWorldAuthorization?: "disposable-container";
   outputReserveTokens?: number;
   budgetLimits?: BudgetLimits;
   checkpointMaxFiles?: number;

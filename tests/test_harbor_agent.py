@@ -91,6 +91,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             module.SigmaCliHarborAgent(execution_mode="host")
+        with self.assertRaisesRegex(ValueError, "agent_profile"):
+            module.SigmaCliHarborAgent(agent_profile="untrusted")
 
     async def test_disposable_execution_mode_uses_an_isolated_home_and_explicit_flag(self):
         module = import_portable_agent_module()
@@ -104,12 +106,50 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             await agent._configure_execution_mode(env)
             command = agent._agent_command()
+            session_command = agent._session_command("resume", "session-fixture")
 
             self.assertEqual(command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
             self.assertIn("--execution-mode", command)
             self.assertIn("disposable-container", command)
+            self.assertIn("--agent-profile", command)
+            self.assertIn("strict", command)
+            self.assertEqual(session_command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
+            self.assertIn("--execution-mode", session_command)
+            self.assertIn("disposable-container", session_command)
+            self.assertIn("--agent-profile", session_command)
+            self.assertIn("strict", session_command)
             configured = env.exec.await_args.args[0]
             self.assertIn("allow_unsafe_host_exec = true", configured)
+
+    async def test_disposable_setup_verifies_cross_command_persistence(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="", stderr=""),
+                SimpleNamespace(return_code=0, stdout="", stderr=""),
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=logs_dir,
+                execution_mode="disposable-container",
+            )
+            agent._workspace = "/app"
+
+            await agent._verify_agent_ready(env)
+
+            commands = [call.args[0] for call in env.exec.await_args_list]
+            self.assertIn("disposable-persistence-probe", commands[0])
+            self.assertIn("cat /tmp/agent/disposable-persistence-probe", commands[1])
+            record = json.loads((logs_dir / "setup-check.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["classification"], "passed")
+            self.assertEqual(record["execution_mode"], "disposable-container")
+            self.assertEqual(record["agent_profile"], "strict")
+            self.assertEqual(
+                [check["stage"] for check in record["checks"]],
+                ["disposable_persistence_write", "disposable_persistence_read", "help", "strict_doctor"],
+            )
 
     async def test_setup_prefers_uploaded_tarball(self):
         module = import_portable_agent_module()
@@ -329,6 +369,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
             self.assertIn("--run-deadline-sec 600", command)
             self.assertIn("--permission-mode auto", command)
+            self.assertIn("--agent-profile strict", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)
             self.assertIn("--stream-json-max-line-bytes 49152", command)
@@ -422,6 +463,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]][0]
             self.assertIn("--provider glm", command)
             self.assertIn("--model glm-test", command)
+            self.assertIn("--agent-profile strict", command)
             self.assertIn("--network full", command)
             self.assertIn("--run-deadline-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)
@@ -1154,6 +1196,90 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("kill -TERM", "\n".join(commands))
             self.assertIn("kill -KILL", "\n".join(commands))
             self.assertNotIn("pkill", "\n".join(commands))
+
+    async def test_outer_cancel_preserves_recorded_needs_input_terminal_state(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            active_callback = None
+
+            @contextlib.contextmanager
+            def scoped_output_callback(callback):
+                nonlocal active_callback
+                active_callback = callback
+                try:
+                    yield
+                finally:
+                    active_callback = None
+
+            async def exec_side_effect(command, **kwargs):
+                if "/usr/local/bin/agent run" in command:
+                    await active_callback(json.dumps({
+                        "kind": "event",
+                        "event": {
+                            "eventId": "suspended-event",
+                            "sessionId": "suspended-session",
+                            "seq": 1,
+                            "type": "run.suspended",
+                            "payload": {"requestId": "approval", "message": "approval unavailable"},
+                        },
+                    }) + "\n", "stdout")
+                    await active_callback(json.dumps({
+                        "kind": "result",
+                        "result": {
+                            "status": "needs_input",
+                            "sessionId": "suspended-session",
+                            "message": "approval unavailable",
+                        },
+                    }) + "\n", "stdout")
+                    raise asyncio.CancelledError()
+                if "agent-process.json" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout='{"pid_recorded":true,"pid":42,"pgid":42,"status":"terminated"}\n',
+                        stderr="",
+                    )
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(side_effect=exec_side_effect),
+                scoped_output_callback=scoped_output_callback,
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="recorded-terminal")
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "^needs_input:"):
+                await agent.run("run", env, context)
+
+            summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(context.failure_kind, "needs_input")
+            self.assertEqual(summary["failure_kind"], "needs_input")
+            self.assertEqual(summary["terminal_origin"], "runtime_result")
+            self.assertGreater(summary["duration_ms"], 0)
+            self.assertNotEqual(summary.get("terminal_origin"), "adapter_timeout")
+
+    def test_stream_accounting_counts_each_tool_call_once(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            for seq, event_type in enumerate(("tool.requested", "tool.started"), start=1):
+                recorder.record(json.dumps({
+                    "kind": "event",
+                    "event": {
+                        "eventId": f"tool-{seq}",
+                        "sessionId": "session",
+                        "seq": seq,
+                        "type": event_type,
+                        "payload": {"callId": "call"},
+                    },
+                }) + "\n", "stdout")
+
+            self.assertEqual(recorder.snapshot()["tool_calls"], 1)
 
     async def test_partial_logs_are_bounded(self):
         module = import_portable_agent_module()

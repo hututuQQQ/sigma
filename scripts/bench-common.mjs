@@ -233,7 +233,7 @@ function networkMode(value, fallback = "none") {
   return mode;
 }
 
-function executionMode(value, fallback = "sandboxed") {
+function executionMode(value, fallback = "disposable-container") {
   const mode = asString(value, fallback);
   if (mode !== "sandboxed" && mode !== "disposable-container") {
     throw new Error("execution mode must be sandboxed or disposable-container.");
@@ -329,6 +329,7 @@ export function resolveRunOptions(argv, env = process.env) {
     benchmarkClass: runClass,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
+    agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "strict"),
     networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
     executionMode: executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE),
     runLabel: asString(flags["run-label"]),
@@ -585,8 +586,9 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
+    agent_profile: options.agentProfile ?? "strict",
     network_mode: options.networkMode ?? "none",
-    execution_mode: options.executionMode ?? "sandboxed"
+    execution_mode: options.executionMode ?? "disposable-container"
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -749,6 +751,7 @@ export function buildHarborArgs(options) {
 
   args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
+  args.push("--ak", formatAgentKwarg("agent_profile", "str", options.agentProfile ?? "strict", capabilities));
   if (options.networkMode !== undefined) {
     args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
   }
@@ -1201,6 +1204,10 @@ function summarizeTraceEvents(events) {
     converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    execution_mode: null,
+    agent_profile: null,
     last_error: null
   };
 
@@ -1249,6 +1256,10 @@ function summarizeTraceEvents(events) {
       const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
       summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
+      summary.suspension_to_exit_ms = result.suspension_to_exit_ms ?? summary.suspension_to_exit_ms;
+      summary.terminal_origin = result.terminal_origin ?? summary.terminal_origin;
+      summary.execution_mode = result.execution_mode ?? summary.execution_mode;
+      summary.agent_profile = result.agent_profile ?? summary.agent_profile;
       summary.last_error = result.lastError ?? result.last_error ?? summary.last_error;
     }
   }
@@ -1489,6 +1500,10 @@ function emptyTaskForTrial(trialResult, index) {
     converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    execution_mode: null,
+    agent_profile: null,
     last_error: null,
     trial_name: null,
     harbor_result_path: null,
@@ -1606,6 +1621,11 @@ function mergeHarborTrialResult(task, trialResult) {
       ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
       : null,
     duration_ms: task.duration_ms || Number(traceSummary.duration_ms ?? 0),
+    suspension_to_exit_ms: task.suspension_to_exit_ms
+      ?? traceSummary.suspension_to_exit_ms ?? agentMetadata.suspension_to_exit_ms ?? null,
+    terminal_origin: task.terminal_origin ?? traceSummary.terminal_origin ?? agentMetadata.terminal_origin ?? null,
+    execution_mode: task.execution_mode ?? traceSummary.execution_mode ?? agentMetadata.execution_mode ?? null,
+    agent_profile: task.agent_profile ?? traceSummary.agent_profile ?? agentMetadata.agent_profile ?? null,
     last_error: agentErrorMessage ?? task.last_error ?? traceSummary.last_error ?? null,
     verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
@@ -1785,6 +1805,10 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
       ? Number(summary.cost_usd ?? metadata.cost_usd)
       : null,
     duration_ms: Number(summary.duration_ms ?? metadata.duration_ms ?? 0),
+    suspension_to_exit_ms: summary.suspension_to_exit_ms ?? metadata.suspension_to_exit_ms ?? null,
+    terminal_origin: summary.terminal_origin ?? metadata.terminal_origin ?? null,
+    execution_mode: summary.execution_mode ?? metadata.execution_mode ?? null,
+    agent_profile: summary.agent_profile ?? metadata.agent_profile ?? null,
     last_error: summary.last_error ?? metadata.error_message ?? null,
     trial_name: null,
     harbor_result_path: null,
@@ -1835,6 +1859,10 @@ function syntheticRunTask(config, globalLogText) {
     converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    execution_mode: null,
+    agent_profile: null,
     last_error: status === "passed" ? null : "No per-task artifacts were available; inspect harbor logs.",
     trial_name: null,
     harbor_result_path: null,
@@ -1906,8 +1934,8 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | last_error |",
-    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | suspension_to_exit_ms | terminal_origin | execution_mode | agent_profile | last_error |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
   ];
 
   for (const task of report.tasks) {
@@ -1915,7 +1943,7 @@ export function formatMarkdownReport(report) {
     const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals) ?? "";
     const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${task.suspension_to_exit_ms ?? ""} | ${task.terminal_origin ?? ""} | ${task.execution_mode ?? ""} | ${task.agent_profile ?? ""} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 

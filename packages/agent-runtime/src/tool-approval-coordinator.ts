@@ -69,14 +69,16 @@ function immediateApprovalDecision(
   session: RuntimeSession,
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
-  permissionMode: ReturnType<typeof profilePermissionMode>
+  permissionMode: ReturnType<typeof profilePermissionMode>,
+  openWorldAuthorization: EffectRunnerOptions["runtime"]["openWorldAuthorization"]
 ): "allow" | "deny" | undefined {
   const mandatory = mandatoryApprovalDecision(descriptor, effects, permissionMode);
   if (mandatory) return mandatory;
   const perCall = effects.some((effect) => effect === "network"
     || effect === "filesystem.read.external" || effect === "process.handoff" || effect === "open_world");
   const effectGrant = effects.slice().sort().join("\0");
-  if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
+  if (permissionMode === "auto" && (!effects.includes("open_world")
+    || openWorldAuthorization === "disposable-container")) return "allow";
   return !perCall && (descriptor.approval === "auto"
     || session.interaction.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
 }
@@ -210,7 +212,9 @@ export class ToolApprovalCoordinator {
     const permissionMode = profilePermissionMode(this.options.runtime, session);
     const immediate = forcePrompt
       ? undefined
-      : immediateApprovalDecision(session, descriptor, effects, permissionMode);
+      : immediateApprovalDecision(
+          session, descriptor, effects, permissionMode, this.options.runtime.openWorldAuthorization
+        );
     if (immediate) {
       return requiresPerCallApproval(plan)
         ? await this.resolveAutomatically(session, descriptor, effects, request, modelTurn, plan)
@@ -286,7 +290,8 @@ export class ToolApprovalCoordinator {
       networkApproved: plan.network === "full",
       externalReadApproved: plan.exactEffects.includes("filesystem.read.external"),
       processHandoffApproved: plan.exactEffects.includes("process.handoff"),
-      unsafeHostExecApproved: false
+      unsafeHostExecApproved: plan.exactEffects.includes("open_world")
+        && this.options.runtime.openWorldAuthorization === "disposable-container"
     });
     return "allow";
   }

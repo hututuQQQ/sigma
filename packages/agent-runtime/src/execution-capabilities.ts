@@ -43,6 +43,15 @@ export interface VerifiedNetworkPolicy {
   defaultMode: "none" | "full";
 }
 
+export function trustedOpenWorldAuthorization(config: {
+  executionMode?: "sandboxed" | "disposable-container";
+  unsafeHostExecRequested?: boolean;
+  allowUnsafeHostExec?: boolean;
+}): { openWorldAuthorization: "disposable-container" } | Record<string, never> {
+  const disposable = config.executionMode === "disposable-container" || config.unsafeHostExecRequested === true;
+  return disposable && config.allowUnsafeHostExec === true ? { openWorldAuthorization: "disposable-container" } : {};
+}
+
 export function verifiedNetworkPolicy(
   report: BrokerDoctorReport,
   configuredMode: "none" | "full"

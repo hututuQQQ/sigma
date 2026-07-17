@@ -35,7 +35,8 @@ export interface DefaultBrokerClientFactoryOptions {
 
 function reportWithRuntimeCommands(
   report: BrokerDoctorReport,
-  runtimeCommands: readonly string[]
+  runtimeCommands: readonly string[],
+  processHandoffAvailable: boolean
 ): BrokerDoctorReport {
   return {
     ...report,
@@ -43,7 +44,8 @@ function reportWithRuntimeCommands(
       ...report.capabilities,
       // The native doctor report does not own package toolchain trust. Replace
       // any lower-layer claim with aliases from this connection's manifest.
-      runtimeCommands: [...runtimeCommands]
+      runtimeCommands: [...runtimeCommands],
+      processHandoff: report.capabilities.processHandoff === true && processHandoffAvailable
     }
   };
 }
@@ -55,13 +57,18 @@ export function withTrustedRuntimeCapabilities(
   trustedToolchains: TrustedToolchainManifestEntry[] | undefined
 ): ExecutionBroker {
   const runtimeCommands = trustedToolchainCommandAliases(trustedToolchains);
+  const processHandoffAvailable = typeof broker.handoff === "function";
   return {
     get lostProcessHandles(): readonly ProcessHandle[] { return broker.lostProcessHandles; },
-    connect: async (signal) => reportWithRuntimeCommands(await broker.connect(signal), runtimeCommands),
-    doctor: async (signal) => reportWithRuntimeCommands(await broker.doctor(signal), runtimeCommands),
+    connect: async (signal) => reportWithRuntimeCommands(
+      await broker.connect(signal), runtimeCommands, processHandoffAvailable
+    ),
+    doctor: async (signal) => reportWithRuntimeCommands(
+      await broker.doctor(signal), runtimeCommands, processHandoffAvailable
+    ),
     ...(broker.setupSandbox ? {
       setupSandbox: async (signal?: AbortSignal) => reportWithRuntimeCommands(
-        await broker.setupSandbox!(signal), runtimeCommands
+        await broker.setupSandbox!(signal), runtimeCommands, processHandoffAvailable
       )
     } : {}),
     execute: async (request: ExecutionRequest, options) => await broker.execute(request, options),
@@ -69,6 +76,9 @@ export function withTrustedRuntimeCapabilities(
     poll: async (handle, options): Promise<ProcessPollResult> => await broker.poll(handle, options),
     write: async (handle, data, options) => await broker.write(handle, data, options),
     terminate: async (handle, options): Promise<ProcessPollResult> => await broker.terminate(handle, options),
+    ...(broker.handoff ? {
+      handoff: async (handle, options) => await broker.handoff!(handle, options)
+    } : {}),
     ...(broker.releaseOutputArtifacts ? {
       releaseOutputArtifacts: async (artifactIds: string[]) => await broker.releaseOutputArtifacts!(artifactIds)
     } : {}),

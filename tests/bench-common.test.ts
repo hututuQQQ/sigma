@@ -82,19 +82,24 @@ describe("Terminal-Bench command construction", () => {
       ...options,
       taskSelectionFlag: "--task-id",
       timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180, agent_timeout_multiplier: "1" }
-    })).toContain("network_mode:str=full");
-    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({ network_mode: "full" });
+    })).toEqual(expect.arrayContaining([
+      "network_mode:str=full",
+      "execution_mode:str=disposable-container",
+      "agent_profile:str=strict"
+    ]));
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
+      network_mode: "full",
+      execution_mode: "disposable-container",
+      agent_profile: "strict"
+    });
   });
 
   it("keeps standard runs at task resources and marks relaxed runs diagnostic", () => {
-    const standard = resolveRunOptions([
-      "--mode", "task", "--task-id", "generic-task",
-      "--execution-mode", "disposable-container"
-    ]);
+    const standard = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"]);
     const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
     const config = buildHarborJobConfig(standard, "jobs", standardPlan);
     expect(standard).toMatchObject({
-      benchmarkClass: "standard", executionMode: "disposable-container"
+      benchmarkClass: "standard", executionMode: "disposable-container", agentProfile: "strict"
     });
     expect(standardPlan).toMatchObject({
       agent_wall_time_sec: 780,
@@ -105,6 +110,12 @@ describe("Terminal-Bench command construction", () => {
     });
     expect(config).not.toHaveProperty("agent_timeout_multiplier");
     expect(config.agents[0].kwargs.execution_mode).toBe("disposable-container");
+    expect(config.agents[0].kwargs.agent_profile).toBe("strict");
+
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--execution-mode", "sandboxed",
+      "--agent-profile", "standard"
+    ])).toMatchObject({ executionMode: "sandboxed", agentProfile: "standard" });
 
     const diagnostic = resolveRunOptions([
       "--mode", "task", "--task-id", "generic-task",
@@ -170,6 +181,8 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "provider:str=deepseek",
       "--ak",
+      "agent_profile:str=strict",
+      "--ak",
       "model:str=deepseek-v4-pro",
       "--ak",
       "max_turns:int=200",
@@ -214,6 +227,8 @@ describe("Terminal-Bench command construction", () => {
       `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider=glm",
+      "--ak",
+      "agent_profile=strict",
       "--ak",
       "model=glm-5.2",
       "--ak",

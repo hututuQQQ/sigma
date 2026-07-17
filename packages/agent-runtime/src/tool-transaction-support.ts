@@ -29,6 +29,7 @@ export function isToolReceipt(value: object): value is ToolReceipt {
 
 export function failureCode(error: unknown, signal: AbortSignal): string {
   const code = (error as { code?: unknown })?.code;
+  if (code === "approval_needs_input") throw error;
   if (typeof code === "string") return code;
   return signal.aborted ? "tool_cancelled" : "tool_exception";
 }

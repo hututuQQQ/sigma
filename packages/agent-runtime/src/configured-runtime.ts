@@ -32,7 +32,7 @@ import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
 import { repositoryTransactionTool } from "./repository-transaction-tool.js";
 import {
-  brokerRuntimeEnvironment, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
+  brokerRuntimeEnvironment, trustedOpenWorldAuthorization, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
 } from "./execution-capabilities.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
@@ -153,6 +153,7 @@ export async function createConfiguredRuntime(
       tools,
       permissionMode: customization.permissionMode,
       interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
+      ...trustedOpenWorldAuthorization(config),
       runDeadlineMs: config.runDeadlineSec * 1_000,
       maxParallelTools: config.maxParallelTools,
       budgetLimits: customization.budgetLimits,

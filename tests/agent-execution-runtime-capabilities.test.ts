@@ -137,6 +137,28 @@ describe("connection-bound runtime capability reporting", () => {
     expect(JSON.stringify(connected)).not.toContain(process.execPath);
   });
 
+  it("reports and forwards handoff only when the wrapped broker implements it", async () => {
+    const advertised = report();
+    advertised.capabilities.processHandoff = true;
+    const withoutHandoff = withTrustedRuntimeCapabilities(
+      fixtureBroker(async () => advertised), undefined
+    );
+    await expect(withoutHandoff.connect()).resolves.toMatchObject({
+      capabilities: { processHandoff: false }
+    });
+
+    const handoff = vi.fn(async () => ({ handoffId: "handoff-fixture" }));
+    const native = { ...fixtureBroker(async () => advertised), handoff };
+    const wrapped = withTrustedRuntimeCapabilities(native, undefined);
+    await expect(wrapped.connect()).resolves.toMatchObject({
+      capabilities: { processHandoff: true }
+    });
+    await expect(wrapped.handoff?.({ id: "process-fixture" })).resolves.toEqual({
+      handoffId: "handoff-fixture"
+    });
+    expect(handoff).toHaveBeenCalledWith({ id: "process-fixture" }, undefined);
+  });
+
   it("does not manufacture a capability report when connection validation fails", async () => {
     const failure = new Error("connection validation failed");
     const broker = withTrustedRuntimeCapabilities(

@@ -429,8 +429,49 @@ describe("sensitive per-call approvals", () => {
       .toMatchObject({ requestId: "host-headless", approvalMode: "human" });
     expect(stored.find((event) => event.type === "tool.approval_resolved")?.payload)
       .toMatchObject({ requestId: "host-headless", decision: "cancelled" });
+    expect(stored.some((event) => event.type === "tool.failed")).toBe(false);
     expect(stored.at(-1)?.type).toBe("run.suspended");
     await expect(runtime.releaseSession(session.sessionId)).resolves.toBeUndefined();
+  });
+
+  it("auto-approves open-world calls only with trusted disposable-container authorization", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-host-disposable-auto-"));
+    fixtures.push(root);
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const requests: ExecutionRequest[] = [];
+    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([
+        fakeToolTurn([fakeToolCall("host-disposable", "exec", { executable: "host-fixture", args: [] })]),
+        fakeFinalTurn()
+      ]),
+      tools: registerBuiltinTools(new EffectToolRegistry(), {
+        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
+        runtimeCommands: fixtureRuntimeCommands
+      }),
+      store,
+      storeRootDir: path.join(root, "state"),
+      permissionMode: "auto",
+      interactiveApprovals: false,
+      openWorldAuthorization: "disposable-container",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({
+      type: "submit", sessionId: session.sessionId, text: "Run inside the disposable task container."
+    });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.policy).toMatchObject({
+      sandbox: "unsafe",
+      unsafeHostExecApproved: true
+    });
+    const stored = await events(store, session.sessionId);
+    expect(stored.find((event) => event.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ requestId: "host-disposable", approvalMode: "automatic" });
+    expect(stored.some((event) => event.type === "run.suspended")).toBe(false);
   });
 
   it.each([
