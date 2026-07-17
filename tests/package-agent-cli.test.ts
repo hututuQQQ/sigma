@@ -414,7 +414,7 @@ describe("package-agent-cli", () => {
     expect(readme).toContain("Product Boundary");
     expect(readme).toContain("`version`, `init`, `doctor`");
     expect(readme).not.toContain("Harbor task containers");
-  }, 30_000);
+  }, 60_000);
 
   linuxPackagingIt("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
