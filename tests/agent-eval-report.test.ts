@@ -1,4 +1,4 @@
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -429,12 +429,13 @@ describe("agent evaluation report", () => {
     const result = await runReportCli([
       "--input", inputPath, "--output-dir", outputDir, "--eval-root", root
     ]);
+    const canonicalOutputDir = await realpath(outputDir);
 
-    expect(result.humanAuditJsonPath).toBe(path.join(outputDir, "human-audit.json"));
-    expect(result.humanAuditMarkdownPath).toBe(path.join(outputDir, "human-audit.md"));
+    expect(result.humanAuditJsonPath).toBe(path.join(canonicalOutputDir, "human-audit.json"));
+    expect(result.humanAuditMarkdownPath).toBe(path.join(canonicalOutputDir, "human-audit.md"));
     await expect(readFile(result.humanAuditJsonPath, "utf8")).resolves.toContain('"audience": "human_only"');
     expect(result.publishedHumanAuditJsonPath)
-      .toBe(path.join(outputDir, `human-audit.${result.bundleDigest}.json`));
+      .toBe(path.join(canonicalOutputDir, `human-audit.${result.bundleDigest}.json`));
   });
 
   it("keeps the default report destination inside the configured results root", async () => {

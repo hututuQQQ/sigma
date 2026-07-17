@@ -31,6 +31,7 @@ import {
   parseExecutionValue,
   parseHandleId,
   parseHello,
+  parseProcessHandoff,
   parseProcessValue,
   parseSpawnedProcess
 } from "../packages/agent-execution/src/values.js";
@@ -536,6 +537,15 @@ describe("agent-execution protocol validation", () => {
     ]);
     expect(parseDoctor({
       ...doctor,
+      capabilities: {
+        ...doctor.capabilities,
+        shells: [{ kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }]
+      }
+    }).capabilities.shells).toEqual([
+      { kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }
+    ]);
+    expect(parseDoctor({
+      ...doctor,
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }
     }).sandbox.hardening).not.toHaveProperty("landlockAbi");
     expect(() => parseDoctor({ ...doctor, protocolVersion: 2 })).toThrow(BrokerProtocolError);
@@ -549,6 +559,21 @@ describe("agent-execution protocol validation", () => {
     expect(() => parseDoctor({
       ...doctor,
       capabilities: { ...doctor.capabilities, shells: [{ kind: "powershell", executable: "powershell.exe", verified: false }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, shells: {} }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: { ...doctor.capabilities, shells: [{ kind: "fish", executable: "/bin/fish", verified: true }] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor,
+      capabilities: {
+        ...doctor.capabilities,
+        shells: [{ kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: "yes" }]
+      }
     })).toThrow(BrokerProtocolError);
     expect(() => parseDoctor({
       ...doctor,
@@ -607,6 +632,15 @@ describe("agent-execution protocol validation", () => {
       ...processValue,
       failure: { phase: "sandbox_launch", code: "policy-denied\nforged", message: "bad code" }
     })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessValue({
+      ...processValue,
+      failure: { phase: "sandbox_launch", code: "sandbox_unavailable", message: "bad\0message" }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessValue({
+      ...processValue,
+      state: "running",
+      failure: { phase: "sandbox_launch", code: "sandbox_unavailable", message: "failed" }
+    })).toThrow(BrokerProtocolError);
     expect(parseExecutionValue({ ...processValue, timedOut: false, idleTimedOut: false, cancelled: false })).toMatchObject({ state: "exited" });
     expect(() => parseExecutionValue({ ...processValue, timedOut: "false", idleTimedOut: false, cancelled: false }))
       .toThrow(BrokerProtocolError);
@@ -658,6 +692,13 @@ describe("agent-execution protocol validation", () => {
     expect(parseSpawnedProcess({ handleId: "spawned", processId: 42 })).toEqual({ id: "spawned", systemProcessId: 42 });
     expect(() => parseSpawnedProcess({ handleId: "spawned", processId: 1.5 })).toThrow(BrokerProtocolError);
     expect(() => parseSpawnedProcess({ handleId: "spawned", processId: 0 })).toThrow(BrokerProtocolError);
+    expect(parseProcessHandoff({ handoffId: "handoff" })).toEqual({ handoffId: "handoff" });
+    expect(parseProcessHandoff({ handoffId: "handoff", processId: 42 })).toEqual({
+      handoffId: "handoff", systemProcessId: 42
+    });
+    expect(() => parseProcessHandoff({ handoffId: "" })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessHandoff({ handoffId: "handoff", processId: 1.5 })).toThrow(BrokerProtocolError);
+    expect(() => parseProcessHandoff({ handoffId: "handoff", processId: 0 })).toThrow(BrokerProtocolError);
   });
 
   it("resolves platform-specific helper names", () => {

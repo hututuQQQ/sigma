@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { access, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -259,7 +259,8 @@ describe("agent experience evaluation runner", () => {
         return { exitCode: 0, sessionId: "session", result: { status: "completed" }, events: successfulEvents() };
       }
     });
-    expect(result.latestPath).toBe(path.join(path.dirname(runDir), "latest.json"));
+    const canonicalResultsRoot = await realpath(path.dirname(runDir));
+    expect(result.latestPath).toBe(path.join(canonicalResultsRoot, "latest.json"));
     expect(JSON.parse(await readFile(result.latestPath, "utf8"))).toMatchObject({ runDir: "run-one" });
     expect(await readFile(repositoryLatest, "utf8").catch(() => null)).toBe(before);
   });
