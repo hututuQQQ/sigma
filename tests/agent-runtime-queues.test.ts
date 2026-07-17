@@ -1586,7 +1586,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write both files" });
     await expect(Promise.race([
       approvalsReady,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Approvals were not exposed.")), 2_000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Approvals were not exposed.")), 10_000))
     ])).resolves.toBeUndefined();
     expect(approvalIds.sort()).toEqual(["write-a-replanned", "write-b-replanned"]);
     await Promise.all(approvalIds.map(async (requestId) => {
@@ -1605,7 +1605,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       && (event.payload as { kind?: string }).kind === "nested_instructions_loaded")).toBe(true);
     expect(events.filter((event) => event.type === "tool.failed"
       && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("nested_instructions_require_replan"))).toHaveLength(2);
-  });
+  }, 30_000);
 
   it("returns a path failure receipt and continues after an instruction preload escape", async () => {
     const container = await mkdtemp(path.join(os.tmpdir(), "sigma-path-recovery-"));

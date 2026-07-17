@@ -189,8 +189,7 @@ describe("terminal convergence properties", () => {
   });
 
   it("always publishes ordinary text when its runtime completion intent succeeds", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, nonBlankText, (answer, repairText, summary) => {
-      void repairText;
+    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, summary) => {
       let state = protectedAnswer(answer);
       const pending = state.pendingTools[0]!;
       state = apply(state, "tool.completed", {
@@ -206,7 +205,7 @@ describe("terminal convergence properties", () => {
       });
       expect(state.proposedOutcome).toMatchObject({ kind: "completed" });
       expect(state.proposedOutcome?.message).toContain(answer.trim());
-      expect(state.proposedOutcome?.message).toContain(summary);
+      expect(state.proposedOutcome?.message).toContain(summary.trim());
       assertKernelInvariants(state);
     }));
   });

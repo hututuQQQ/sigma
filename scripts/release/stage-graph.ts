@@ -5,6 +5,7 @@ export interface ReleaseStage {
   readonly command: string;
   readonly args: readonly string[];
   readonly secretEnvironment: readonly string[];
+  readonly environment: Readonly<Record<string, string>>;
 }
 
 export type ReleaseGraphName = keyof typeof releaseStageGraphs;
@@ -14,15 +15,16 @@ const providerSecrets = ["DEEPSEEK_API_KEY", "GLM_API_KEY", "ZAI_API_KEY", "BIGM
 export const releaseSecretEnvironment: readonly string[] = providerSecrets;
 
 function stage(id: string, command: string, ...args: string[]): ReleaseStage {
-  return { id, command, args, secretEnvironment: noSecrets };
+  return { id, command, args, secretEnvironment: noSecrets, environment: {} };
 }
 
-function providerStage(): ReleaseStage {
+function providerStage(sigmaExecPath: string): ReleaseStage {
   return {
     id: "provider-smoke",
     command: "pnpm",
     args: ["smoke:provider", "--", "--provider", sigmaManifest.evaluation.provider],
-    secretEnvironment: providerSecrets
+    secretEnvironment: providerSecrets,
+    environment: { SIGMA_EXEC_PATH: sigmaExecPath }
   };
 }
 
@@ -51,7 +53,7 @@ const linuxRelease = [
   stage("lsp-sandbox", "node", "scripts/ci/lsp-sandbox-smoke.mjs", "--bundle",
     ".artifacts/agent-cli-linux-x64", "--broker", ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
     "--target-platform", "linux", "--output", ".artifacts/lsp-sandbox-smoke-linux-x64.json"),
-  providerStage(),
+  providerStage(".artifacts/agent-cli-linux-x64/bin/sigma-exec"),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "linux",
     "--target-arch", "x64", "--require-release-ready", "--require-provider-smoke")
 ] as const;
@@ -65,7 +67,7 @@ const windowsRelease = [
   stage("lsp-sandbox", "node", "scripts/ci/lsp-sandbox-smoke.mjs", "--bundle",
     ".artifacts/agent-cli-win32-x64", "--broker", ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
     "--target-platform", "win32", "--output", ".artifacts/lsp-sandbox-smoke-win32-x64.json"),
-  providerStage(),
+  providerStage(".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe"),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "win32",
     "--target-arch", "x64", "--require-preview-ready", "--require-provider-smoke")
 ] as const;
