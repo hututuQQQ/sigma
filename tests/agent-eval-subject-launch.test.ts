@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -219,5 +219,16 @@ describe("packaged subject launch contract", () => {
     await writeFile(executable, "host-python", "utf8");
     await expect(resolveTuiControllerPython({ PATH: root }, process.platform))
       .resolves.toBe(path.resolve(executable));
+  });
+
+  it.runIf(process.platform !== "win32")("resolves a host Python symlink to its regular target", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-host-python-link-"));
+    temporary.push(root);
+    const installed = path.join(root, "python3.12");
+    const executable = path.join(root, "python3");
+    await writeFile(installed, "host-python", "utf8");
+    await symlink(path.basename(installed), executable, "file");
+    await expect(resolveTuiControllerPython({ PATH: root }, "linux"))
+      .resolves.toBe(await realpath(installed));
   });
 });
