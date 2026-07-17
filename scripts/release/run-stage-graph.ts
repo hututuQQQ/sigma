@@ -9,13 +9,19 @@ import {
 } from "./stage-graph.ts";
 
 export function releaseStageEnvironment(
-  stage: Pick<ReleaseStage, "secretEnvironment">,
+  stage: Pick<ReleaseStage, "secretEnvironment" | "environment">,
   source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const allowed = new Set(stage.secretEnvironment);
   const environment = { ...source };
   for (const key of releaseSecretEnvironment) {
     if (!allowed.has(key)) delete environment[key];
+  }
+  for (const [key, value] of Object.entries(stage.environment)) {
+    if (releaseSecretEnvironment.includes(key)) {
+      throw new Error(`Release stage environment cannot override secret '${key}'.`);
+    }
+    environment[key] = value;
   }
   return environment;
 }

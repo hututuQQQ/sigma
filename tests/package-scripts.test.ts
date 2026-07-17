@@ -53,6 +53,12 @@ describe("package script semantics", () => {
     expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
     expect(windows.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
+    expect(linux.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
+      SIGMA_EXEC_PATH: ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
+    });
+    expect(windows.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
+      SIGMA_EXEC_PATH: ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
+    });
     expect(releaseStageGraph("verify-package-linux").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows-structure").at(-1)?.args)
@@ -69,6 +75,13 @@ describe("package script semantics", () => {
     expect(releaseStageEnvironment(linux[0], source)).toEqual({ PATH: "safe" });
     expect(releaseStageEnvironment(
       linux.find((stage) => stage.id === "provider-smoke")!, source,
-    )).toEqual(source);
+    )).toEqual({
+      ...source,
+      SIGMA_EXEC_PATH: ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
+    });
+    expect(() => releaseStageEnvironment({
+      secretEnvironment: [],
+      environment: { DEEPSEEK_API_KEY: "forbidden" },
+    }, source)).toThrow("cannot override secret 'DEEPSEEK_API_KEY'");
   });
 });
