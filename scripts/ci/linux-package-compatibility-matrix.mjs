@@ -44,6 +44,7 @@ function runImage(image, archivePath) {
   ].join(" && ");
   const result = spawnSync("docker", [
     "run", "--rm", "--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined",
     "--platform", "linux/amd64",
     "--mount", dockerMount(archivePath, "/tmp/agent-cli.tgz", true),
     "--mount", dockerMount(path.join(rootDir, "scripts"), "/sigma-tests", true),
