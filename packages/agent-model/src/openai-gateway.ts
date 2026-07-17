@@ -84,7 +84,10 @@ export class OpenAIModelGateway implements ModelGateway {
     this.provider = options.provider;
     this.model = options.model;
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.apiKey = options.apiKey;
+    // Secrets copied from files or CI settings can carry a UTF-8 BOM or a
+    // trailing line ending. Neither is credential material, and Fetch rejects
+    // non-ByteString header characters before the request reaches the provider.
+    this.apiKey = options.apiKey?.trim();
     this.apiKeyName = options.apiKeyName;
     this.capabilities = { ...defaultOpenAICapabilities, ...options.capabilities };
     this.maxRetries = Math.max(0, Math.trunc(options.maxRetries ?? 2));
