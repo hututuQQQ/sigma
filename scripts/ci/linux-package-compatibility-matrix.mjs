@@ -31,7 +31,7 @@ function requireDocker() {
 function runImage(image, archivePath) {
   const started = Date.now();
   const command = [
-    "set -eu",
+    "set -eux",
     "mkdir -p /opt/sigma /usr/local/bin /sigma-work/workspace /sigma-work/state",
     "chmod 0700 /sigma-work/state",
     "tar -xzf /tmp/agent-cli.tgz -C /opt/sigma --strip-components=1",
@@ -63,9 +63,12 @@ function runImage(image, archivePath) {
     image: image.image,
     passed: !result.error && result.status === 0,
     exitCode: result.status,
+    signal: result.signal,
     durationMs: Date.now() - started,
     stdout: result.stdout ?? "",
-    stderr: result.stderr ?? result.error?.message ?? ""
+    stderr: [result.stderr, result.error?.stack ?? result.error?.message]
+      .filter(Boolean)
+      .join("\n")
   };
 }
 
@@ -94,6 +97,9 @@ async function main() {
   for (const result of results) {
     process.stdout.write(`${result.passed ? "PASS" : "FAIL"} ${result.name} (${result.durationMs}ms)\n`);
     if (!result.passed) {
+      process.stderr.write(
+        `docker exit=${String(result.exitCode)} signal=${String(result.signal)} image=${result.image}\n`
+      );
       if (result.stdout) process.stderr.write(`${result.stdout}\n`);
       if (result.stderr) process.stderr.write(`${result.stderr}\n`);
     }
