@@ -38,7 +38,7 @@ function runImage(image, archivePath) {
     "chmod 0755 /opt/sigma/bin/agent /opt/sigma/bin/node /opt/sigma/bin/sigma-exec /opt/sigma/bin/bwrap",
     "ln -sf /opt/sigma/bin/bwrap /usr/local/bin/bwrap",
     "/opt/sigma/bin/agent --help >/sigma-work/help.txt",
-    "/opt/sigma/bin/agent doctor --workspace /sigma-work/workspace --json --strict >/sigma-work/doctor.json",
+    "/opt/sigma/bin/agent doctor --workspace /sigma-work/workspace --json --strict >/sigma-work/doctor.json || { cat /sigma-work/doctor.json >&2; exit 1; }",
     "/opt/sigma/bin/agent sandbox setup --json >/sigma-work/sandbox.json",
     `/opt/sigma/bin/node /sigma-tests/ci/${path.basename(linuxPackageFakeModelSmokeScript)}`
   ].join(" && ");
