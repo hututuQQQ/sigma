@@ -31,19 +31,19 @@ function requireDocker() {
 function runImage(image, archivePath) {
   const started = Date.now();
   const command = [
-    "set -eu",
+    "set -eux",
     "mkdir -p /opt/sigma /usr/local/bin /sigma-work/workspace /sigma-work/state",
     "chmod 0700 /sigma-work/state",
     "tar -xzf /tmp/agent-cli.tgz -C /opt/sigma --strip-components=1",
     "chmod 0755 /opt/sigma/bin/agent /opt/sigma/bin/node /opt/sigma/bin/sigma-exec /opt/sigma/bin/bwrap",
     "ln -sf /opt/sigma/bin/bwrap /usr/local/bin/bwrap",
     "/opt/sigma/bin/agent --help >/sigma-work/help.txt",
-    "/opt/sigma/bin/agent doctor --workspace /sigma-work/workspace --json --strict >/sigma-work/doctor.json",
+    "/opt/sigma/bin/agent doctor --workspace /sigma-work/workspace --json --strict >/sigma-work/doctor.json || { cat /sigma-work/doctor.json >&2; exit 1; }",
     "/opt/sigma/bin/agent sandbox setup --json >/sigma-work/sandbox.json",
     `/opt/sigma/bin/node /sigma-tests/ci/${path.basename(linuxPackageFakeModelSmokeScript)}`
   ].join(" && ");
   const result = spawnSync("docker", [
-    "run", "--rm", "--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined",
+    "run", "--rm", "--privileged",
     "--platform", "linux/amd64",
     "--mount", dockerMount(archivePath, "/tmp/agent-cli.tgz", true),
     "--mount", dockerMount(path.join(rootDir, "scripts"), "/sigma-tests", true),
@@ -63,9 +63,12 @@ function runImage(image, archivePath) {
     image: image.image,
     passed: !result.error && result.status === 0,
     exitCode: result.status,
+    signal: result.signal,
     durationMs: Date.now() - started,
     stdout: result.stdout ?? "",
-    stderr: result.stderr ?? result.error?.message ?? ""
+    stderr: [result.stderr, result.error?.stack ?? result.error?.message]
+      .filter(Boolean)
+      .join("\n")
   };
 }
 
@@ -93,7 +96,13 @@ async function main() {
   await writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   for (const result of results) {
     process.stdout.write(`${result.passed ? "PASS" : "FAIL"} ${result.name} (${result.durationMs}ms)\n`);
-    if (!result.passed) process.stderr.write(`${result.stderr || result.stdout}\n`);
+    if (!result.passed) {
+      process.stderr.write(
+        `docker exit=${String(result.exitCode)} signal=${String(result.signal)} image=${result.image}\n`
+      );
+      if (result.stdout) process.stderr.write(`${result.stdout}\n`);
+      if (result.stderr) process.stderr.write(`${result.stderr}\n`);
+    }
   }
   if (!report.passed) process.exitCode = 1;
 }

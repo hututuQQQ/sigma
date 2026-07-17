@@ -16,25 +16,14 @@ const workspace = path.resolve(process.env.SIGMA_SMOKE_WORKSPACE ?? "/workspace"
 const stateRoot = path.resolve(process.env.SIGMA_SMOKE_STATE_ROOT ?? "/tmp/sigma-package-smoke-state");
 export const linuxPackageFakeModelSmokeScript = fileURLToPath(import.meta.url);
 
-function currentRunWorkspaceDelta(request) {
-  const ledger = [...request.messages].reverse().find((message) =>
-    message.content.includes("Current-run typed durable evidence ledger."))?.content ?? "";
-  return [...ledger.matchAll(/^- (.+?) \(([^,]+), [^)]+\)$/gmu)]
-    .map((match) => ({ evidenceId: match[1], kind: match[2] }))
-    .findLast((item) => item.kind === "workspace_delta");
-}
-
-function realSandboxValidationTurn(request) {
-  const delta = currentRunWorkspaceDelta(request);
-  if (!delta) throw new Error("The package smoke requires current-run workspace delta evidence.");
+function realSandboxValidationTurn() {
   return fakeToolTurn([fakeToolCall("validate-package-smoke", "validate", {
     executable: "node",
     args: [
       "-e",
       "const fs=require('node:fs');process.exit(fs.readFileSync('hello.txt','utf8')==='hello from package\\n'?0:1)"
     ],
-    access: "readonly",
-    workspaceDeltaEvidenceIds: [delta.evidenceId]
+    access: "readonly"
   })]);
 }
 

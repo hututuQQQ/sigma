@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "sigma-exec"
-version = "4.0.0-rc.1"
+version = "4.0.0"
 dependencies = [
  "libc",
  "serde",

@@ -1,6 +1,6 @@
 {
   "name": "sigma-agent-mvp",
-  "version": "4.0.0-rc.1",
+  "version": "4.0.0",
   "private": true,
   "license": "MIT",
   "description": "A safety-focused coding agent that runs in your terminal.",

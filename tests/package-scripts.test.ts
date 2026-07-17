@@ -49,6 +49,10 @@ describe("package script semantics", () => {
     const windows = releaseStageGraph("release-windows");
     expect(linux.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:linux");
     expect(windows.find((stage) => stage.id === "package")?.args).toContain("verify:package:agent-cli:windows");
+    expect(linux.find((stage) => stage.id === "readiness")?.args).toContain("--require-release-ready");
+    expect(linux.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-preview-ready");
+    expect(windows.find((stage) => stage.id === "readiness")?.args).toContain("--require-preview-ready");
+    expect(windows.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
     expect(releaseStageGraph("verify-package-linux").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows-structure").at(-1)?.args)

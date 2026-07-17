@@ -32,6 +32,9 @@ async function createIndex(workspace, count) {
   const blob = await git(workspace, ["hash-object", "-w", "--stdin"]);
   const names = Array.from({ length: count }, (_, index) => `files/${String(index).padStart(6, "0")}.txt`);
   await git(workspace, ["update-index", "--index-info"], names.map((name) => `100644 ${blob}\t${name}\n`).join(""));
+  // RepositoryContextProvider V4 intentionally indexes the pinned host tree,
+  // not Git's mutable index, so materialize the synthetic entries as files.
+  await git(workspace, ["checkout-index", "--all"]);
   await git(workspace, ["commit", "-q", "-m", "synthetic 100k-file index"]);
   await git(workspace, ["update-index", "--assume-unchanged", "--stdin"], `${names.join("\n")}\n`);
 }

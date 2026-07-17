@@ -1475,9 +1475,19 @@ function createBundleReadme(targetPlatform, targetArch, nodeRuntime) {
   const agent = isWindows ? String.raw`.\bin\agent.cmd` : "./bin/agent";
   const workspace = isWindows ? String.raw`D:\path\to\repo` : "/path/to/repo";
   const platformLabel = isWindows ? `Windows ${targetArch}` : `Linux ${targetArch}`;
+  const trustNotice = isWindows
+    ? `
+> [!WARNING]
+> This Windows bundle is an unsigned preview. The GitHub Release publishes its SHA-256
+> sidecar, SBOM, and signed provenance, but its executables do not have a trusted
+> Authenticode signature. Windows SmartScreen or Smart App Control may warn or block
+> execution.
+`
+    : "";
   return `# Sigma Code CLI Bundle
 
 This archive contains a portable Sigma Code CLI for ${platformLabel}.
+${trustNotice}
 
 ## Start
 
@@ -1853,10 +1863,15 @@ function v3PackageMetadata(context, runtime, evidence) {
 
 async function writePackageMetadata(context, runtime, evidence) {
   const { release, targetPlatform, targetArch, bundleDir } = context;
+  const releaseChannel = targetPlatform === "win32" && evidence.signing?.policyVerified !== true
+    ? "preview"
+    : release.version.includes("-")
+      ? release.version.split("-")[1].split(".")[0]
+      : "stable";
   const metadata = {
     schemaVersion: release.packageSchemaVersion,
     productVersion: release.version,
-    releaseChannel: release.version.includes("-") ? release.version.split("-")[1].split(".")[0] : "stable",
+    releaseChannel,
     tier: "tier1",
     targetPlatform,
     targetArch,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { cp, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -124,6 +124,7 @@ describe("trusted toolchain boundaries", () => {
     const sibling = path.join(root, process.platform === "win32" ? "helper.exe" : "helper");
     await writeFile(entryPoint, "entry point\n");
     await writeFile(sibling, "helper\n");
+    if (process.platform !== "win32") await chmod(entryPoint, 0o755);
     const toolchains = normalizeTrustedToolchains([{
       id: "compiler",
       runtime: "generic",

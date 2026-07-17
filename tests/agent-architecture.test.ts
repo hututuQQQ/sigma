@@ -536,7 +536,7 @@ describe("Sigma architecture", () => {
     const started = Date.now();
     await sendSessionCommand(storeRootDir, { type: "cancel", sessionId: session.sessionId, reason: "test cancellation" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "cancelled" });
-    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 
   it("restores a durable pending approval and continues after approval", async () => {

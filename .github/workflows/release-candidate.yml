@@ -54,7 +54,7 @@ jobs:
           fi
 
   verify:
-    name: ${{ matrix.label }} release and quick five
+    name: ${{ matrix.label }} ${{ matrix.channel }} and quick five
     needs: metadata
     strategy:
       fail-fast: false
@@ -63,9 +63,11 @@ jobs:
           - os: ubuntu-24.04
             label: linux-x64
             release: linux
+            channel: stable release
           - os: windows-2022
             label: win32-x64
             release: windows
+            channel: unsigned preview
     runs-on: ${{ matrix.os }}
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -154,41 +156,6 @@ jobs:
           [System.IO.File]::WriteAllText($publicKey, $env:RELEASE_PROVENANCE_PUBLIC_KEY_PEM, $utf8)
           "AGENT_RELEASE_SIGNING_PRIVATE_KEY_FILE=$privateKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES=$publicKey" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Configure Authenticode signing identity
-        if: runner.os == 'Windows'
-        env:
-          WINDOWS_SIGN_CERTIFICATE_PFX_BASE64: ${{ secrets.AGENT_WINDOWS_SIGN_CERTIFICATE_PFX_BASE64 }}
-          WINDOWS_SIGN_CERTIFICATE_PASSWORD: ${{ secrets.AGENT_WINDOWS_SIGN_CERTIFICATE_PASSWORD }}
-          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.AGENT_WINDOWS_SIGN_TIMESTAMP_URL }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_CERTIFICATE_PFX_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_CERTIFICATE_PASSWORD)) {
-            throw "AGENT_WINDOWS_SIGN_CERTIFICATE_PFX_BASE64 and AGENT_WINDOWS_SIGN_CERTIFICATE_PASSWORD secrets are required."
-          }
-          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if ($null -eq $signTool) { throw "A Windows SDK signtool.exe installation is required." }
-          $pfx = Join-Path $env:RUNNER_TEMP "release-signing.pfx"
-          try {
-            [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGN_CERTIFICATE_PFX_BASE64))
-            $password = ConvertTo-SecureString $env:WINDOWS_SIGN_CERTIFICATE_PASSWORD -AsPlainText -Force
-            $certificate = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password) |
-              Where-Object HasPrivateKey |
-              Select-Object -First 1
-            if ($null -eq $certificate) { throw "The configured Windows signing PFX does not contain a private key." }
-          } finally {
-            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
-          }
-          $certificateSha256 = [Convert]::ToHexString(
-            $certificate.GetCertHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
-          ).ToLowerInvariant()
-          "AGENT_WINDOWS_SIGNTOOL_PATH=$($signTool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "AGENT_WINDOWS_ALLOWED_SIGNER_CERT_SHA256=$certificateSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_TIMESTAMP_URL)) {
-            "AGENT_WINDOWS_SIGN_TIMESTAMP_URL=$($env:WINDOWS_SIGN_TIMESTAMP_URL)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
       - name: Verify release target
         run: pnpm verify:release:${{ matrix.release }}
       - name: Stage public provenance key
@@ -213,11 +180,6 @@ jobs:
           }
           if (-not [string]::IsNullOrWhiteSpace($env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES)) {
             Remove-Item -LiteralPath $env:AGENT_RELEASE_TRUSTED_PUBLIC_KEY_FILES -Force -ErrorAction SilentlyContinue
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1)) {
-            Get-ChildItem Cert:\CurrentUser\My |
-              Where-Object Thumbprint -eq $env:AGENT_WINDOWS_SIGN_CERTIFICATE_SHA1 |
-              Remove-Item -Force
           }
       - name: Require all five live scenarios and zero safety failures
         run: pnpm eval:agent -- --suite quick --repeat 1 --skip-package --eval-root .artifacts/eval-rc
@@ -295,4 +257,24 @@ jobs:
           else
             options+=(--latest)
           fi
-          gh release create "${GITHUB_REF_NAME}" release-assets/* "${options[@]}"
+          release_notes="$(cat <<'EOF'
+          ## Platform status
+
+          - **Linux x64:** stable release. The archive passed the complete release-readiness gate.
+          - **Windows x64:** **unsigned preview**. The archive passed package, sandbox, live-product, checksum, SBOM, and signed-provenance verification, but its executables do not have a trusted Authenticode signature. Windows SmartScreen or Smart App Control may warn or block execution.
+
+          Verify the matching SHA-256 sidecar and signed provenance before extracting either archive. The Windows preview is not an official trusted Windows binary release.
+          EOF
+          )"
+          assets=(
+            "release-assets/agent-cli-linux-x64.tgz#Linux x64 — stable"
+            "release-assets/agent-cli-linux-x64.tgz.sha256"
+            "release-assets/agent-cli-linux-x64.sbom.cdx.json"
+            "release-assets/agent-cli-linux-x64.provenance.json"
+            "release-assets/agent-cli-win32-x64.zip#Windows x64 — UNSIGNED PREVIEW"
+            "release-assets/agent-cli-win32-x64.zip.sha256"
+            "release-assets/agent-cli-win32-x64.sbom.cdx.json"
+            "release-assets/agent-cli-win32-x64.provenance.json"
+            "release-assets/release-provenance-public.pem"
+          )
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --notes "${release_notes}" "${options[@]}"

@@ -1229,7 +1229,9 @@ describe("SigmaExecBrokerClient", () => {
 
   it("does not release an exec cancellation until the broker confirms terminal settlement", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-cancel-ack-"));
-    const client = new SigmaExecBrokerClient(fixtureOptions("cancel-ack", {}, artifactRoot));
+    const client = new SigmaExecBrokerClient(fixtureOptions("cancel-ack", {
+      cancellationGraceMs: 2_000
+    }, artifactRoot));
     await client.connect();
     const controller = new AbortController();
     const result = client.execute({ ...spawnRequest(), timeoutMs: 5_000 }, { signal: controller.signal });

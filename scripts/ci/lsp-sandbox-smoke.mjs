@@ -108,8 +108,13 @@ async function verifyPortableIntegrity(layout, metadata) {
   return { manifestDigest, entries: entries.size, manifest };
 }
 
-function assertMetadata(metadata, targetPlatform, brokerPath, brokerDigest, layout) {
-  if (metadata.schemaVersion !== 3) throw new Error("Portable package metadata schemaVersion must be 3.");
+export function assertMetadata(metadata, targetPlatform, brokerPath, brokerDigest, layout) {
+  const productMajor = Number.parseInt(String(metadata.productVersion ?? "").split(".")[0] ?? "", 10);
+  if ((productMajor !== 3 && productMajor !== 4) || metadata.schemaVersion !== productMajor) {
+    throw new Error(
+      `Portable package metadata schemaVersion=${String(metadata.schemaVersion)} must match supported product major ${String(metadata.productVersion)}.`
+    );
+  }
   if (metadata.targetPlatform !== targetPlatform || typeof metadata.targetArch !== "string") {
     throw new Error(`Package target does not match ${targetPlatform}: ${String(metadata.targetPlatform)}-${String(metadata.targetArch)}.`);
   }

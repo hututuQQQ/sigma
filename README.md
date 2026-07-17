@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="Status: Release candidate" src="https://img.shields.io/badge/status-v4.0.0--rc.1-f59e0b">
-  <img alt="First binary target: Windows x64" src="https://img.shields.io/badge/first%20binary%20target-Windows%20x64-0078d4">
+  <img alt="Status: Stable" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
+  <img alt="Release targets: Linux stable and Windows preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20preview-0078d4">
   <img alt="Formal evaluation: DeepSeek only" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
 </p>
 
@@ -25,15 +25,16 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`v4.0.0-rc.1` is an unsigned Windows x64 preview release candidate. It is suitable
-for evaluation and feedback, but it is not yet the stable `3.0.0` release. See the
-[changelog](CHANGELOG.md), [security policy](SECURITY.md), and
-[contribution guide](CONTRIBUTING.md) before reporting or proposing changes.
+`v4.0.0` is the first stable Sigma Code release. Linux x64 is the official stable
+binary target; Windows x64 is published alongside it as an explicitly unsigned
+preview until trusted Authenticode signing is available. See the
+[changelog](CHANGELOG.md), [security policy](SECURITY.md), and [contribution
+guide](CONTRIBUTING.md) before reporting or proposing changes.
 
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **The first signed binary release target is Windows x64.** `v4.0.0-rc.1` includes a directly usable but unsigned Windows x64 preview archive because trusted Windows code signing is not configured. Windows may show a SmartScreen warning. The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
+> - **Linux x64 is the official stable binary release. Windows x64 is an unsigned preview.** Both archives pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates, but the Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
 > - **Formal evaluation and benchmark runs are currently DeepSeek-only.** Sigma's evaluator, Harbor adapter, and Terminal-Bench harness are maintained around DeepSeek; results from other providers are not used for formal claims.
 > - The runtime contains DeepSeek and GLM/Z.ai gateway support, but the GLM path does not have the same formal evaluation coverage.
 > - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
@@ -48,14 +49,30 @@ for evaluation and feedback, but it is not yet the stable `3.0.0` release. See t
 | Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
-## Quick start on Windows
+## Quick start on Linux
 
-> [!NOTE]
-> `v4.0.0-rc.1` includes an unsigned Windows x64 preview archive. Verify its SHA-256
-> sidecar before extraction. Windows may show a SmartScreen warning because the
-> executables do not yet have a trusted Authenticode signature.
+Download the latest Linux x64 archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases), verify its SHA-256 sidecar and signed provenance, and extract it:
 
-Download the latest Windows x64 archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) and extract it. The bundle includes its pinned Node.js runtime, the native `sigma-exec` broker, the TUI runtime, TypeScript/Python language-server assets, and tokenizer data; a separate Node.js installation is not required.
+```sh
+SIGMA="$HOME/.local/share/sigma-code"
+WORKSPACE="/path/to/your/repository"
+
+export DEEPSEEK_API_KEY="your-api-key"
+
+"$SIGMA/bin/agent" init --workspace "$WORKSPACE" --provider deepseek
+"$SIGMA/bin/agent" doctor --workspace "$WORKSPACE" --check-api
+"$SIGMA/bin/agent" tui --workspace "$WORKSPACE"
+```
+
+## Quick start on Windows (unsigned preview)
+
+> [!WARNING]
+> The Windows x64 archive is an unsigned preview, not an official trusted Windows
+> binary release. Verify its SHA-256 sidecar and signed provenance before extraction.
+> Its executables do not have a trusted Authenticode signature, so Windows SmartScreen
+> or Smart App Control may warn or block execution.
+
+Download the Windows x64 preview archive from [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) and extract it only if you accept the unsigned-preview risk. The bundle includes its pinned Node.js runtime, the native `sigma-exec` broker, the TUI runtime, TypeScript/Python language-server assets, and tokenizer data; a separate Node.js installation is not required.
 
 ```powershell
 $Sigma = "C:\Tools\sigma-code"
@@ -74,9 +91,9 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 The example sets the key only for the current PowerShell process. Keep secrets out of `.agent/config.toml` and source control.
 
-Official archives include a SHA-256 checksum, CycloneDX SBOM, signed provenance, and
-the public provenance verification key. Windows executables are Authenticode-signed
-and timestamped. See [SECURITY.md](SECURITY.md) for the trust boundary and
+Both platform archives include a SHA-256 checksum, CycloneDX SBOM, signed provenance,
+and the public provenance verification key. Only Linux x64 is a stable binary release;
+Windows x64 remains an unsigned preview. See [SECURITY.md](SECURITY.md) for the trust boundary and
 [RELEASING.md](RELEASING.md) for the maintainer process.
 
 For a one-shot task:

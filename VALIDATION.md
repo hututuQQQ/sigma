@@ -1,4 +1,4 @@
-# Sigma Code 4.0.0-rc.1 validation
+# Sigma Code 4.0.0 validation
 
 Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 
@@ -59,11 +59,11 @@ What these commands prove:
 - `verify:package:agent-cli:windows`: the Windows portable archive provides the equivalent native-wrapper proof; `verify:package:agent-cli:windows:structure` is structure-only and is not release evidence.
 - `perf:replay-v4-100k`: validates segmented V4 reads, envelope validation, reducer replay, snapshot rebuild, and tail replay over 100,000 events.
 - `package:harbor-runtime`: packages the already-built CLI archive with the external Harbor adapter; it does not add Harbor behavior to the solving runtime.
-- `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness from release readiness.
+- `product:readiness`: evaluates generated smoke/package evidence. It distinguishes internal readiness, Windows preview readiness, and stable release readiness.
 
 `pnpm verify:product` combines only platform-neutral lint, coverage, fake product/TUI smoke, and internal readiness. Target archive, wrapper, sandbox, provider smoke, replay performance, and release readiness belong to `verify:release:linux` or `verify:release:windows`.
 
-## Windows release check
+## Windows preview check
 
 On Windows, with provider credentials configured, run:
 
@@ -71,7 +71,7 @@ On Windows, with provider credentials configured, run:
 pnpm verify:release:windows
 ```
 
-This requires successful execution of the bundled Windows wrapper and a live DeepSeek provider smoke in addition to the neutral product checks. A structure-only Windows archive produced on another OS does not prove that the Windows wrapper executed successfully.
+This requires successful execution of the bundled Windows wrapper, real packaged sandbox and LSP smokes, trusted release provenance, and a live DeepSeek provider smoke in addition to the neutral product checks. It deliberately requires the Authenticode signer policy to remain unsatisfied and emits a preview-ready result. A structure-only Windows archive produced on another OS does not prove that the Windows wrapper executed successfully.
 
 Live provider validation is intentionally separate because it costs money, depends on credentials/network/provider state, and is not a deterministic PR gate.
 

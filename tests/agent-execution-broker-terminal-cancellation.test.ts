@@ -515,7 +515,9 @@ describe("execution broker cancellation containment", () => {
 
   it("releases truncated terminal artifacts before returning cancellation", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-cancel-output-"));
-    const client = new SigmaExecBrokerClient(clientOptions("cancel-artifact", artifactRoot));
+    const client = new SigmaExecBrokerClient(clientOptions("cancel-artifact", artifactRoot, {
+      cancellationGraceMs: 2_000
+    }));
     try {
       await client.connect();
       const controller = new AbortController();

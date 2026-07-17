@@ -66,7 +66,7 @@ const windowsRelease = [
     "--target-platform", "win32", "--output", ".artifacts/lsp-sandbox-smoke-win32-x64.json"),
   providerStage(),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "win32",
-    "--target-arch", "x64", "--require-release-ready", "--require-provider-smoke")
+    "--target-arch", "x64", "--require-preview-ready", "--require-provider-smoke")
 ] as const;
 
 export const releaseStageGraphs = Object.freeze({

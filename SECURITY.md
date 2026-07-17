@@ -7,7 +7,9 @@ candidates may receive fixes without a backport to an older candidate.
 
 | Version | Supported |
 | --- | --- |
-| Latest `3.x` release or release candidate | Yes |
+| Latest `4.x` Linux stable release | Yes |
+| Latest `4.x` Windows unsigned preview | Yes, with preview limitations |
+| `3.x` release candidates | No |
 | Older versions | No |
 
 ## Reporting a vulnerability
@@ -28,19 +30,24 @@ open a minimal issue asking the maintainer to enable a private contact path.
 
 ## Release verification
 
-Official portable product archives are created only by the repository's GitHub
-Actions release workflow. Each archive is accompanied by a SHA-256 checksum,
-CycloneDX SBOM, signed provenance statement, and the public provenance verification
-key. Windows release executables are additionally Authenticode-signed and timestamped.
+Portable product archives are created only by the repository's GitHub Actions release
+workflow. Each archive is accompanied by a SHA-256 checksum, CycloneDX SBOM, signed
+provenance statement, and the public provenance verification key. Linux x64 is the
+official stable binary release.
+
+Windows x64 is published alongside the stable Linux release as an explicitly labeled
+unsigned preview. Its package, sandbox, wrapper, live-provider, checksum, SBOM, and
+signed-provenance gates must pass, but its executables do not have a trusted
+Authenticode signature. Windows SmartScreen or Smart App Control may warn or block it.
 
 A GitHub prerelease may be source-only when hosted Actions or trusted signing is
 unavailable. Such a prerelease does not contain official portable product archives
 and must state which publication gates remain unavailable.
 
-An explicitly labeled unsigned preview prerelease may attach a portable archive for
-evaluation. It is not an official signed product archive, must not be marked latest,
-and must include a matching SHA-256 sidecar and CycloneDX SBOM while disclosing that
-Authenticode and trusted provenance gates did not pass.
+The stable GitHub Release may contain the Windows preview because the latest designation
+applies to the stable Linux channel. Release notes, the Windows asset label, its bundle
+README, and package metadata must all disclose the preview status. Trusted provenance
+is still mandatory; only the Authenticode signer policy is allowed to remain unsatisfied.
 
 Treat locally built archives, workflow artifacts, and files without matching release
 sidecars as development outputs rather than official releases.

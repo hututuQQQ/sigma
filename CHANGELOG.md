@@ -6,6 +6,8 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-07-17
+
 ### Changed
 
 - Configuration schema v4 defaults to host-scoped declared reads, full sandbox networking, and explicit process handoff while retaining required isolation and workspace-only writes.
@@ -21,6 +23,8 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 - External reads and handoff are sensitive effects with fresh per-call grants; unsafe host execution and workspace-external writes remain disabled.
 - The strict pre-v4 posture remains available with `read_scope=workspace`, `network=none`, and `process_handoff=deny`.
+- Linux x64 is the stable binary release. Windows x64 is published alongside it as an explicitly unsigned preview until trusted Authenticode signing is available.
+- Both platform archives include checksums, CycloneDX SBOMs, and signed provenance; Windows users should expect SmartScreen or Smart App Control warnings.
 
 ## [4.0.0-rc.1] - 2026-07-17
 
@@ -82,7 +86,8 @@ trusted Windows code-signing gate is not yet configured. Windows x64 remains the
 first intended end-user binary target; Linux x64 packaging remains a technical
 preview and CI validation target.
 
-[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v4.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/hututuQQQ/sigma/compare/v4.0.0-rc.1...v4.0.0
 [4.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v4.0.0-rc.1
 [3.0.0-rc.2]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.2
 [3.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.1

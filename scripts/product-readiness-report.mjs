@@ -62,14 +62,18 @@ function tuiSmokeChecks(tuiSmoke) {
   ];
 }
 
-function packageChecks(packageVerify, expectedV3) {
+function packageChecks(packageVerify, expectedV3, expectedSchemaVersion) {
   const checks = packageVerify?.checks ?? {};
   return [
     check("package:ok", packageVerify?.ok === true, "package verification completed"),
     check("package:readme", checks.readme === true, "bundle README verified"),
     check("package:wrapper", checks.wrapper === true, "package wrapper verified"),
     check("package:metadata", checks.metadata === true, "package metadata verified"),
-    check("package:schemaVersion", !expectedV3 || packageVerify?.metadata?.schemaVersion === 3, "V3 metadata schema"),
+    check(
+      "package:schemaVersion",
+      expectedSchemaVersion !== null && packageVerify?.metadata?.schemaVersion === expectedSchemaVersion,
+      `expected=${String(expectedSchemaVersion ?? "unsupported")}, package=${String(packageVerify?.metadata?.schemaVersion ?? "missing")}`
+    ),
     check("package:bundledNode", !expectedV3 || checks.bundledNode === true, "pinned bundled Node verified"),
     check("package:noSystemNodeFallback", !expectedV3 || checks.noSystemNodeFallback === true, "wrapper cannot use system Node"),
     check("package:sigmaExec", !expectedV3 || checks.sigmaExec === true, "target-native sigma-exec verified"),
@@ -260,6 +264,7 @@ function markdownReport(report) {
     `- status: ${report.status}`,
     `- internalReady: ${String(report.internalReady)}`,
     `- releaseReady: ${String(report.releaseReady)}`,
+    `- previewReady: ${String(report.previewReady)}`,
     `- generatedAt: ${report.generatedAt}`,
     "",
     "## Evidence",
@@ -368,7 +373,7 @@ export async function buildProductReadinessReport(options = {}) {
       packageVerify?.metadata?.productVersion === expectedProductVersion,
       `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
     ));
-    checks.push(...packageChecks(packageVerify, expectedV3));
+    checks.push(...packageChecks(packageVerify, expectedV3, expectedProductMajor));
   }
 
   const target = `${targetPlatform}-${targetArch}`;
@@ -378,6 +383,15 @@ export async function buildProductReadinessReport(options = {}) {
     || (expectedV3
       ? packageVerify?.signing?.policyVerified === true
       : packageVerify?.metadata?.signing?.authenticodeVerified === true);
+  const windowsUnsigned = targetPlatform === "win32"
+    && (expectedV3
+      ? packageVerify?.signing?.authenticodeVerified === false
+      : packageVerify?.metadata?.signing?.authenticodeVerified === false);
+  const expectedReleaseChannel = windowsUnsigned
+    ? "preview"
+    : expectedProductVersion.includes("-")
+      ? expectedProductVersion.split("-")[1].split(".")[0]
+      : "stable";
   const releaseChecks = [
     check("package:tier1Target", supportedReleaseTargets.has(target), target),
     check("package:targetWrapper", packageVerify?.targetWrapper?.ok === true, packageVerify?.targetWrapper?.status ?? "missing"),
@@ -392,6 +406,11 @@ export async function buildProductReadinessReport(options = {}) {
       windowsSigned,
       targetPlatform === "win32" ? (windowsSigned ? "approved signer verified" : "unsigned or unapproved preview only") : "not applicable"
     ),
+    check(
+      "package:releaseChannel",
+      !expectedV3 || packageVerify?.metadata?.releaseChannel === expectedReleaseChannel,
+      `expected=${expectedReleaseChannel}, package=${String(packageVerify?.metadata?.releaseChannel ?? "missing")}`
+    ),
     ...sandboxSmokeReleaseChecks(sandboxSmoke, sandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
     ...lspSandboxSmokeReleaseChecks(lspSandboxSmoke, lspSandboxSmokePath, targetPlatform, targetArch, packageVerify, expectedV3),
     ...replayPerformanceReleaseChecks(replayPerformance, replayPerformancePath),
@@ -400,7 +419,17 @@ export async function buildProductReadinessReport(options = {}) {
   ];
   const internalReady = checks.every((item) => item.ok);
   const releaseReady = internalReady && releaseChecks.every((item) => item.ok);
-  const status = releaseReady ? "release-ready" : internalReady ? "internal-ready" : "not-ready";
+  const previewReady = targetPlatform === "win32"
+    && internalReady
+    && windowsUnsigned
+    && releaseChecks.every((item) => item.name === "package:windowsSignerPolicy" ? !item.ok : item.ok);
+  const status = releaseReady
+    ? "release-ready"
+    : previewReady
+      ? "preview-ready"
+      : internalReady
+        ? "internal-ready"
+        : "not-ready";
   const packageLabel = `${target} CLI wrapper`;
   const packageReleaseNote = packageVerify?.targetWrapper?.ok !== true
     ? `${packageLabel} is not proven in this environment: ${packageVerify?.targetWrapper?.status ?? "missing"}${packageVerify?.targetWrapper?.reason ? ` (${packageVerify.targetWrapper.reason})` : ""}`
@@ -432,6 +461,7 @@ export async function buildProductReadinessReport(options = {}) {
     status,
     internalReady,
     releaseReady,
+    previewReady,
     evidence: {
       productSmoke: { path: productSmokePath, sessionId: productSmoke?.sessionId ?? null },
       tuiSmoke: { path: tuiSmokePath, sessionId: tuiSmoke?.sessionId ?? null },
@@ -502,6 +532,9 @@ export async function writeProductReadinessReport(options = {}) {
   if (bool(options.requireReleaseReady ?? process.env.AGENT_REQUIRE_RELEASE_READY) && !report.releaseReady) {
     throw new Error(`Product readiness report is not release-ready: ${report.releaseNotes[0]}`);
   }
+  if (bool(options.requirePreviewReady ?? process.env.AGENT_REQUIRE_PREVIEW_READY) && !report.previewReady) {
+    throw new Error(`Product readiness report is not preview-ready: ${report.releaseNotes[0]}`);
+  }
   if (bool(options.requireProviderSmoke ?? process.env.AGENT_REQUIRE_PROVIDER_SMOKE) && !report.releaseChecks.some((item) => item.name === "providerSmoke:ok" && item.ok)) {
     throw new Error("Product readiness report is missing a passing live provider smoke.");
   }
@@ -518,6 +551,7 @@ function parseArgs(argv) {
     const arg = argv[index];
     const next = argv[index + 1];
     if (arg === "--require-release-ready") options.requireReleaseReady = true;
+    if (arg === "--require-preview-ready") options.requirePreviewReady = true;
     if (arg === "--require-provider-smoke") options.requireProviderSmoke = true;
     if (arg === "--internal-only") options.internalOnly = true;
     if (arg === "--target-platform" && next) {
