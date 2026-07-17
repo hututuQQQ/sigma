@@ -49,7 +49,7 @@ function setEnvironmentValue(environment, requested, value) {
 async function regularExecutable(candidate) {
   try {
     const direct = await lstat(candidate);
-    if (!direct.isFile() || direct.isSymbolicLink()) return undefined;
+    if (!direct.isFile() && !direct.isSymbolicLink()) return undefined;
     const canonical = await realpath(candidate);
     const installed = await lstat(canonical);
     return installed.isFile() && !installed.isSymbolicLink() ? canonical : undefined;
