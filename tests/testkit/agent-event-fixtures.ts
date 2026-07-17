@@ -24,7 +24,8 @@ export function evidenceFixture(
   };
   if (kind === "review") return {
     ...base, kind, producer: { authority: "runtime" }, data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: ["delta"]
+      reviewerId: "reviewer", verdict: "approved", findings: [],
+      frontierRevision: 1, stateDigest: "a".repeat(64)
     }
   };
   if (kind === "user_waiver") return {
@@ -111,11 +112,12 @@ export const agentEventPayloadFixtures = {
   "execution.completed": { executionId: "execution", evidenceIds: [] },
   "execution.failed": { executionId: "execution", code: "failed", message: "failed" },
   "process.spawned": {
-    processId: "process", executionId: "execution", mode: "background", brokerInstanceId: "broker"
+    processId: "process", executionId: "execution", mode: "background", lifecycle: "session", brokerInstanceId: "broker"
   },
   "process.output": { processId: "process", stream: "stdout", chunk: "output" },
   "process.exited": { processId: "process", exitCode: 0, state: "exited" },
   "process.lost": { processId: "process", reason: "broker ended" },
+  "process.handed_off": { processId: "process", handoffId: "handoff", systemProcessId: 1234 },
   "evidence.recorded": evidenceFixture(),
   "usage.recorded": usageFixture(),
   "model.route_resolved": { role: "orchestrator", routeId: "route", modelSpecId: "provider/model", attempt: 1 },
@@ -190,6 +192,14 @@ export function completeAgentEventPayload(type: AgentEventType, payload: unknown
   });
   if (type === "run.started") baseline.deadlineAt = new Date(Date.now() + 60_000).toISOString();
   const completed = { ...baseline, ...supplied };
+  if (type === "review.completed" && completed.data && typeof completed.data === "object") {
+    completed.data = {
+      ...(completed.data as Record<string, unknown>),
+      frontierRevision: (completed.data as Record<string, unknown>).frontierRevision ?? 1,
+      stateDigest: (completed.data as Record<string, unknown>).stateDigest ?? "a".repeat(64)
+    };
+    delete (completed.data as Record<string, unknown>).workspaceDeltaEvidenceIds;
+  }
   if (type === "tool.completed" || type === "tool.failed") {
     for (const field of ["startedAt", "completedAt"] as const) {
       if (typeof completed[field] !== "string" || !Number.isFinite(Date.parse(completed[field]))) {

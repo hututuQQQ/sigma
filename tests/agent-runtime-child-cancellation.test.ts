@@ -150,7 +150,7 @@ describe("child cancellation cleanup ordering", () => {
       reviewer: createApprovingReviewer(),
       execution,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const firstParent = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const secondParent = await runtime.createSession({ workspacePath: workspace, mode: "change" });

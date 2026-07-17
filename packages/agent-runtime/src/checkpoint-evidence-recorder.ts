@@ -58,7 +58,7 @@ export class CheckpointEvidenceRecorder {
       };
       await this.emit(session, "evidence.recorded", "runtime", checkpoint);
     }
-    const delta = await this.existingOrRecordImportedDelta(
+    await this.existingOrRecordImportedDelta(
       session, sealed, sealed.delta, sourceSessionId, childId
     );
     const validationId = `checkpoint-validation:${sourceSessionId}:${sealed.checkpointId}`;
@@ -75,7 +75,9 @@ export class CheckpointEvidenceRecorder {
         data: {
           validator: "checkpoint_postimage_integrity",
           artifactIds: [],
-          workspaceDeltaEvidenceIds: [delta.evidenceId],
+          frontierRevision: session.durable.state.mutationFrontier.revision,
+          stateDigest: session.durable.state.mutationFrontier.currentStateDigest,
+          coveredPaths: [],
           sourceSessionId,
           childId
         }
@@ -145,11 +147,12 @@ export class CheckpointEvidenceRecorder {
   }
 
   private async recordDelta(session: RuntimeSession, sealed: CheckpointRef): Promise<void> {
-    const delta = await this.existingOrRecordDelta(session, sealed);
+    await this.existingOrRecordDelta(session, sealed);
     const existingValidation = session.durable.state.evidence.find((item) =>
       item.kind === "validation"
       && item.data.validator === "checkpoint_postimage_integrity"
-      && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+      && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
+      && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest);
     if (existingValidation) return;
     const checkpointId = sealed.checkpointId;
     const validation: EvidenceRecord = {
@@ -164,7 +167,9 @@ export class CheckpointEvidenceRecorder {
       data: {
         validator: "checkpoint_postimage_integrity",
         artifactIds: [],
-        workspaceDeltaEvidenceIds: [delta.evidenceId]
+        frontierRevision: session.durable.state.mutationFrontier.revision,
+        stateDigest: session.durable.state.mutationFrontier.currentStateDigest,
+        coveredPaths: []
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", validation);

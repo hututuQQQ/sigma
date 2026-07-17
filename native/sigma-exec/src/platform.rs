@@ -155,6 +155,13 @@ impl PlatformGuard {
         self.terminate(child)
     }
 
+    pub(crate) fn handoff(&mut self) -> Result<(), RpcError> {
+        Err(RpcError::new(
+            "process_handoff_unavailable",
+            "process handoff is not available on Windows",
+        ))
+    }
+
     pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
         self.terminate_job_and_wait()
     }
@@ -212,6 +219,13 @@ impl PlatformGuard {
         Ok(())
     }
 
+    pub(crate) fn handoff(&mut self) -> Result<(), RpcError> {
+        Err(RpcError::new(
+            "process_handoff_unavailable",
+            "process handoff is not available on this platform",
+        ))
+    }
+
     pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
         #[cfg(unix)]
         unsafe {
@@ -235,6 +249,7 @@ const INTERNAL_PROCESS_WATCHDOG: &str = "--internal-linux-process-watchdog";
 pub(crate) struct PlatformGuard {
     process_group: i32,
     watchdog: Option<Child>,
+    handed_off: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -278,6 +293,7 @@ impl PlatformGuard {
         Ok(Self {
             process_group,
             watchdog: Some(watchdog),
+            handed_off: false,
         })
     }
 
@@ -299,7 +315,22 @@ impl PlatformGuard {
         Ok(())
     }
 
+    pub(crate) fn handoff(&mut self) -> Result<(), RpcError> {
+        if self.handed_off {
+            return Ok(());
+        }
+        if let Some(mut watchdog) = self.watchdog.take() {
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+        }
+        self.handed_off = true;
+        Ok(())
+    }
+
     pub(crate) fn cleanup_descendants(&mut self) -> Result<(), RpcError> {
+        if self.handed_off {
+            return Ok(());
+        }
         unsafe {
             libc::kill(-self.process_group, libc::SIGKILL);
         }

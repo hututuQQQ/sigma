@@ -81,6 +81,63 @@ function request(callId: string, name: string, argumentsValue: ToolRequest["argu
 }
 
 describe("execution output artifact receipts", () => {
+  it("projects each foreground stream to 16 KiB and preserves the complete output", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-model-output-limit-"));
+    const stdout = `${"H".repeat(8_192)}${"M".repeat(5_000)}${"T".repeat(8_192)}`;
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 0, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout, stderr: "", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context, artifacts } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "exec")!.execute(
+      request("bounded-output", "exec", { executable: process.execPath }), context
+    );
+
+    expect(Buffer.byteLength(receipt.output, "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect(receipt.output).toBe(`${"H".repeat(8_192)}${"T".repeat(8_192)}`);
+    expect(receipt.output).not.toContain("M");
+    expect(receipt.artifacts).toHaveLength(1);
+    expect(await artifacts.get("session", receipt.artifacts[0]!)).toEqual(Buffer.from(stdout));
+    expect(receipt.diagnostics).toContain("model_output_truncated:stdout:5000");
+  });
+
+  it("runs shell validation directly and records the target command exit code", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-shell-validation-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 7, signal: null, durationMs: 2,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "target failed", stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false, outputArtifacts: []
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none", shells: ["bash"]
+    });
+    const validate = tools.find((tool) => tool.descriptor.name === "validate")!;
+    const { context } = await fixtureContext(workspace);
+    const receipt = await validate.execute(request("shell-validation", "validate", {
+      shell: "bash", command: "run-the-real-tests --strict"
+    }), context);
+
+    expect(validate.descriptor.inputSchema).toMatchObject({ oneOf: expect.any(Array) });
+    expect(receipt).toMatchObject({ ok: false });
+    expect(receipt.evidence).toEqual([expect.objectContaining({
+      kind: "validation",
+      status: "failed",
+      data: expect.objectContaining({ command: "run-the-real-tests --strict", exitCode: 7 })
+    })]);
+  });
+
   it("binds foreground overflow CAS objects to validation evidence", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-output-receipt-"));
     const fullOutput = "complete redacted validation output\n";
@@ -305,7 +362,9 @@ describe("execution output artifact receipts", () => {
           idleTimedOut: false,
           cancelled: false
         },
-        workspaceDeltaEvidenceIds: []
+        frontierRevision: 0,
+        stateDigest: "0".repeat(64),
+        coveredPaths: []
       })
     })]);
   });

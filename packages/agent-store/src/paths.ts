@@ -34,6 +34,10 @@ export function legacySessionDirectoryV3(rootDir: string, sessionId: string): st
   return path.join(path.resolve(rootDir), "stores", "v3", "sessions", safeId(sessionId));
 }
 
+export function legacySessionsDirectoryV3(rootDir: string): string {
+  return path.join(path.resolve(rootDir), "stores", "v3", "sessions");
+}
+
 export function segmentName(index: number): string {
   return `${String(index).padStart(6, "0")}.jsonl`;
 }

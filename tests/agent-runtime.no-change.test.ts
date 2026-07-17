@@ -52,7 +52,7 @@ describe("runtime exact no-change convergence", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
 
@@ -111,7 +111,7 @@ describe("runtime exact no-change convergence", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
 

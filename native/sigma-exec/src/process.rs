@@ -5,7 +5,9 @@ use crate::output_artifact::{
 };
 use crate::platform::PlatformGuard;
 use crate::protocol::RpcError;
-use crate::sandbox::{ProcessParams, ProtectedPathGuard, SandboxMode, build_command};
+use crate::sandbox::{
+    ProcessLifecycle, ProcessParams, ProtectedPathGuard, SandboxMode, build_command,
+};
 use serde::Deserialize;
 use serde_json::{Value, json, to_value};
 use std::collections::{HashMap, HashSet};
@@ -71,6 +73,7 @@ struct ManagedProcess {
     exited: bool,
     terminated: bool,
     cancelled: bool,
+    lifecycle: ProcessLifecycle,
     capture_threads: Vec<JoinHandle<()>>,
     stdout_artifact: Arc<Mutex<ArtifactCapture>>,
     stderr_artifact: Arc<Mutex<ArtifactCapture>>,
@@ -172,10 +175,10 @@ impl BrokerState {
     }
 
     pub fn execute(&self, request_id: u64, params: ProcessParams) -> Result<Value, RpcError> {
-        if params.pty {
+        if params.pty || params.lifecycle == ProcessLifecycle::Deliverable {
             return Err(RpcError::new(
                 "pty_unavailable",
-                "PTY mode is available only through process.spawn",
+                "PTY and deliverable lifecycle are available only through process.spawn",
             ));
         }
         let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(120_000));
@@ -266,6 +269,35 @@ impl BrokerState {
         }
         self.register_artifacts(&managed)?;
         process_json(&managed, params.stdout_offset, params.stderr_offset, None)
+    }
+
+    pub fn handoff(&self, params: HandleParams) -> Result<Value, RpcError> {
+        let process = self.process(&params.handle_id)?;
+        let mut managed = process.lock().map_err(lock_error)?;
+        refresh(&mut managed)?;
+        if managed.exited {
+            return Err(RpcError::new(
+                "process_exited",
+                "an exited process cannot be handed off",
+            ));
+        }
+        if managed.lifecycle != ProcessLifecycle::Deliverable {
+            return Err(RpcError::new(
+                "process_handoff_denied",
+                "only a deliverable process may be handed off",
+            ));
+        }
+        managed._guard.handoff()?;
+        let process_id = managed.child.id();
+        drop(managed);
+        self.processes
+            .lock()
+            .map_err(lock_error)?
+            .remove(&params.handle_id);
+        Ok(json!({
+            "handoffId": format!("handoff:{}", params.handle_id),
+            "processId": process_id,
+        }))
     }
 
     pub fn release_process(&self, params: HandleParams) -> Result<Value, RpcError> {
@@ -363,6 +395,8 @@ impl BrokerState {
         close_stdin: bool,
     ) -> Result<(String, Arc<Mutex<ManagedProcess>>), RpcError> {
         let maximum = params.max_output_bytes;
+        let lifecycle = params.lifecycle.clone();
+        let deliverable = lifecycle == ProcessLifecycle::Deliverable;
         let initial_input = params.command.stdin.clone();
         let recover_sandbox = params.policy.sandbox == SandboxMode::Required;
         let mut prepared = build_command(&params, self.allow_unsafe)?;
@@ -392,23 +426,33 @@ impl BrokerState {
         let guard = PlatformGuard::attach(&mut child, recover_sandbox)?;
         let stdout = Arc::new(Mutex::new(OutputRing::new(maximum)));
         let stderr = Arc::new(Mutex::new(OutputRing::new(maximum)));
-        let stdout_capture = capture(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| RpcError::new("process_spawn_failed", "stdout pipe missing"))?,
-            stdout.clone(),
-            stdout_artifact.clone(),
-        );
-        let stderr_capture = capture(
-            child
-                .stderr
-                .take()
-                .ok_or_else(|| RpcError::new("process_spawn_failed", "stderr pipe missing"))?,
-            stderr.clone(),
-            stderr_artifact.clone(),
-        );
-        let mut stdin = child.stdin.take();
+        let mut capture_threads = Vec::new();
+        if deliverable {
+            stdout_artifact.lock().map_err(lock_error)?.finish_capture();
+            stderr_artifact.lock().map_err(lock_error)?.finish_capture();
+        } else {
+            capture_threads.push(capture(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| RpcError::new("process_spawn_failed", "stdout pipe missing"))?,
+                stdout.clone(),
+                stdout_artifact.clone(),
+            ));
+            capture_threads.push(capture(
+                child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| RpcError::new("process_spawn_failed", "stderr pipe missing"))?,
+                stderr.clone(),
+                stderr_artifact.clone(),
+            ));
+        }
+        let mut stdin = if deliverable {
+            None
+        } else {
+            child.stdin.take()
+        };
         if !prepared.bootstrap_stdin.is_empty() {
             let pipe = stdin.as_mut().ok_or_else(|| {
                 RpcError::new("process_spawn_failed", "sandbox bootstrap stdin is missing")
@@ -436,7 +480,8 @@ impl BrokerState {
             exited: false,
             terminated: false,
             cancelled: false,
-            capture_threads: vec![stdout_capture, stderr_capture],
+            lifecycle,
+            capture_threads,
             stdout_artifact,
             stderr_artifact,
             output_artifacts: Vec::new(),
@@ -792,6 +837,7 @@ mod tests {
             max_output_bytes: 1024,
             timeout_ms: Some(2_000),
             idle_timeout_ms: None,
+            lifecycle: ProcessLifecycle::Session,
             pty: false,
             pty_columns: 120,
             pty_rows: 30,

@@ -1,6 +1,6 @@
 {
   "name": "agent-protocol",
-  "version": "3.0.0-rc.2",
+  "version": "4.0.0-rc.1",
   "private": true,
   "license": "MIT",
   "type": "module",

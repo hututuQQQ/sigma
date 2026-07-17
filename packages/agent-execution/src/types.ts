@@ -5,6 +5,7 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 export type NetworkPolicy = "none" | "full";
 export type SandboxMode = "required" | "unsafe";
 export type ProcessState = "running" | "exited" | "terminated" | "lost";
+export type ProcessLifecycle = "session" | "deliverable";
 
 export interface EnvironmentRequest {
   /** Safe host variables to copy in addition to the platform baseline. */
@@ -50,11 +51,20 @@ export interface ProcessSpawnRequest {
   pty?: boolean;
   ptyColumns?: number;
   ptyRows?: number;
+  /** Deliverable processes may be explicitly handed to the outer environment. */
+  lifecycle?: ProcessLifecycle;
 }
 
 export interface ProcessHandle {
   id: string;
   brokerInstanceId: string;
+  systemProcessId?: number;
+  lifecycle?: ProcessLifecycle;
+}
+
+export interface ProcessHandoffResult {
+  handle: ProcessHandle;
+  handoffId: string;
   systemProcessId?: number;
 }
 
@@ -127,6 +137,7 @@ export interface BrokerCapabilities {
   background: boolean;
   stdin: boolean;
   pty: boolean;
+  processHandoff?: boolean;
   networkModes: NetworkPolicy[];
   /** The broker enforces read/execute-only roots independently from workspace roots. */
   executionRoots?: boolean;
@@ -206,6 +217,7 @@ export interface ExecutionBroker {
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   write(handle: ProcessHandle, data: string, options?: BrokerRequestOptions): Promise<void>;
   terminate(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
+  handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   /** Acknowledge broker spool files only after their bytes reached durable CAS or were intentionally discarded. */
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
   close(): Promise<void>;

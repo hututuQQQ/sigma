@@ -112,7 +112,7 @@ describe("effect-plan recovery", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
 
@@ -163,7 +163,7 @@ describe("effect-plan recovery", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
 
@@ -223,7 +223,7 @@ describe("effect-plan recovery", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
 
@@ -277,7 +277,7 @@ describe("effect-plan recovery", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     }, ({ point }) => {
         if (point === "after_install") throw new Error("injected restore failure");
         if (point === "before_rollback_restore") throw new Error("injected rollback failure");

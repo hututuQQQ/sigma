@@ -35,6 +35,7 @@ export class StableWorkspaceReadError extends Error {
 /** Internal lifecycle hooks used by filesystem race tests. */
 export interface StableWorkspaceReadOptions {
   maxBytes?: number;
+  allowExternalAbsolutePath?: boolean;
   beforePinnedRead?: () => Promise<void>;
   afterPinnedRead?: () => Promise<void>;
 }
@@ -250,6 +251,34 @@ async function closeLease(
   }
 }
 
+function stableReadLimit(requestedLimit: number | undefined): number {
+  const maxBytes = requestedLimit ?? MAX_EXPLICIT_WORKSPACE_READ_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new TypeError("Stable workspace read maxBytes must be a positive safe integer.");
+  }
+  return maxBytes;
+}
+
+async function stableReadLocation(
+  workspace: string,
+  requested: string,
+  allowExternalAbsolutePath: boolean | undefined
+): Promise<{ root: string; target: string }> {
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = await resolveWorkspacePath(workspace, ".");
+  } catch (error) {
+    throw readError("workspace_read_unavailable", requested, "the workspace cannot be resolved", error);
+  }
+  const target = path.isAbsolute(requested)
+    ? path.resolve(requested) : path.resolve(workspaceRoot, requested);
+  const external = !isInside(workspaceRoot, target);
+  if (external && !allowExternalAbsolutePath) {
+    throw readError("workspace_read_invalid_path", requested, "the path escapes the workspace");
+  }
+  return { root: external ? path.parse(target).root : workspaceRoot, target };
+}
+
 export async function readStableWorkspaceTextFile(
   workspace: string,
   requested: string,
@@ -257,20 +286,10 @@ export async function readStableWorkspaceTextFile(
   options: StableWorkspaceReadOptions = {}
 ): Promise<StableWorkspaceTextRead> {
   signal.throwIfAborted();
-  const maxBytes = options.maxBytes ?? MAX_EXPLICIT_WORKSPACE_READ_BYTES;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
-    throw new TypeError("Stable workspace read maxBytes must be a positive safe integer.");
-  }
-  let root: string;
-  try {
-    root = await resolveWorkspacePath(workspace, ".");
-  } catch (error) {
-    throw readError("workspace_read_unavailable", requested, "the workspace cannot be resolved", error);
-  }
-  const target = path.resolve(root, requested);
-  if (!isInside(root, target)) {
-    throw readError("workspace_read_invalid_path", requested, "the path escapes the workspace");
-  }
+  const maxBytes = stableReadLimit(options.maxBytes);
+  const { root, target } = await stableReadLocation(
+    workspace, requested, options.allowExternalAbsolutePath
+  );
   const requests = pathRequests(root, target, requested);
   const captured = await capturedPaths(requests, maxBytes, requested, signal);
   let lease: WorkspaceTransactionDirectoryLease | undefined;

@@ -217,7 +217,7 @@ async function writeV3PackageFixture(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-v3-"));
-  const version = "3.0.0-rc.2";
+  const version = "4.0.0-rc.1";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -272,7 +272,7 @@ describe("package-agent-cli", () => {
     const { rootDir } = await writeV3PackageFixture();
     const manifestPath = path.join(rootDir, "package.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    manifest.version = "4.0.0";
+    manifest.version = "5.0.0";
     await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, "utf8");
 
     await expect(packageAgentCli({ rootDir })).rejects.toThrow("a new major requires an explicit schema review");
@@ -693,7 +693,7 @@ describe("package-agent-cli", () => {
         archiveChecksum: true
       },
       metadata: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         productVersion: version,
         node: { archiveSha256: runtimeSha256 },
         sigmaExec: { source: "env" }
@@ -968,7 +968,7 @@ describe("package-agent-cli", () => {
         archiveChecksum: true
       },
       metadata: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         productVersion: version,
         targetPlatform: "win32",
         targetArch: "x64",

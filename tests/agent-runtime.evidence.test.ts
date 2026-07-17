@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import type {
@@ -18,9 +21,12 @@ import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
-import { validationTargetIds } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
+import {
+  assertReceiptWithinPlan,
+  validationScope
+} from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
-import { unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
+import { frontierValidationReadiness, unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -202,7 +208,11 @@ const validationPlan: ToolCallPlan = {
   idempotence: "read_only"
 };
 
-describe("validation workspace-delta scope", () => {
+const validationTargetIds = (): never => {
+  throw new Error("V3 evidence-ID validation scope was removed in V4.");
+};
+
+describe.skip("V3 validation workspace-delta scope", () => {
   it("infers the only unresolved delta for the built-in validator", () => {
     expect(validationTargetIds(session([delta("delta-one")]), {
       id: "validate", name: "validate", arguments: {}
@@ -225,6 +235,189 @@ describe("validation workspace-delta scope", () => {
     ]), {
       id: "fixture", name: "verify_fixture_files", arguments: {}
     }, validationPlan)).toBeUndefined();
+  });
+});
+
+describe("V4 mutation frontier completion", () => {
+  function frontierSession(): RuntimeSession {
+    const active = session([]);
+    active.durable.state.mutationFrontier = {
+      revision: 4,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "a".repeat(64),
+      changedPaths: ["src/code.ts", "docs/readme.md"],
+      sourceCheckpointIds: ["checkpoint-final"]
+    };
+    return active;
+  }
+
+  function frontierValidation(id: string, coveredPaths: string[]): ValidationEvidence {
+    return {
+      evidenceId: id, sessionId: "session", runId: "run", kind: "validation",
+      status: "passed", createdAt: now, producer: { authority: "tool", id },
+      summary: "passed", data: {
+        validator: "command", command: "pnpm test", exitCode: 0,
+        frontierRevision: 4, stateDigest: "a".repeat(64), coveredPaths
+      }
+    };
+  }
+
+  it("derives coverage from approved read roots without model-visible IDs", () => {
+    const active = frontierSession();
+    expect(validationScope(active, {
+      id: "validate", name: "validate", arguments: {}
+    }, { ...validationPlan, readPaths: ["src"] })).toEqual({
+      frontierRevision: 4,
+      stateDigest: "a".repeat(64),
+      coveredPaths: ["src/code.ts"]
+    });
+  });
+
+  it("allows one final validation set and invalidates it after a later revision", () => {
+    const active = frontierSession();
+    active.durable.state.evidence.push(
+      frontierValidation("code", ["src/code.ts"]),
+      frontierValidation("docs", ["docs/readme.md"])
+    );
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: true,
+      missingPaths: []
+    });
+    active.durable.state.mutationFrontier = {
+      ...active.durable.state.mutationFrontier,
+      revision: 5,
+      currentStateDigest: "b".repeat(64)
+    };
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      missingPaths: ["src/code.ts", "docs/readme.md"]
+    });
+  });
+
+  it("keeps semantic validation hard while advisory review does not block", () => {
+    const active = frontierSession();
+    const call: ModelToolCall = { id: "complete", name: "complete_task", arguments: { summary: "done" } };
+    const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
+    expect(completionFailure(active, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_evidence_required"]
+    });
+    active.durable.state.evidence.push(
+      frontierValidation("code", ["src/code.ts"]),
+      frontierValidation("docs", ["docs/readme.md"])
+    );
+    expect(completionFailure(active, call, descriptor, now)).toBeNull();
+  });
+
+  it("keeps failed goal input obligations open until that same external path is read", () => {
+    const requiredPath = pathForInputObligation();
+    const inputAccess = (
+      evidenceId: string,
+      status: "passed" | "failed",
+      inputPath: string,
+      scope: "external" | "workspace"
+    ): EvidenceRecord => ({
+      evidenceId, sessionId: "session", runId: "run", kind: "input_access", status,
+      createdAt: now, producer: { authority: "tool", id: evidenceId }, summary: evidenceId,
+      data: {
+        path: inputPath,
+        scope,
+        ...(status === "passed" ? { sha256: "f".repeat(64), byteLength: 7 } : { failureCode: "workspace_read_unavailable" })
+      }
+    });
+    const failed = inputAccess("required-failed", "failed", requiredPath, "external");
+    const substitute = inputAccess("generated-substitute", "passed", "fixture/generated.txt", "workspace");
+    const target = session([failed, substitute]);
+    target.durable.state.plan.goal = `Transform the user input at ${requiredPath}.`;
+    const call: ModelToolCall = { id: "complete", name: "complete_task", arguments: { summary: "done" } };
+    const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
+
+    expect(completionFailure(target, call, descriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["input_access_unresolved"],
+      result: { paths: [requiredPath] }
+    });
+    target.durable.state.evidence.push(inputAccess("required-passed", "passed", requiredPath, "external"));
+    expect(completionFailure(target, call, descriptor, now)).toBeNull();
+    expect(completionFailure(target, {
+      id: "blocked", name: "report_blocked", arguments: { summary: "input inaccessible" }
+    }, { possibleEffects: ["outcome.report_blocked"] } as ToolDescriptor, now)).toBeNull();
+  });
+});
+
+function pathForInputObligation(): string {
+  return process.platform === "win32" ? "C:\\user-input\\source.txt" : "/user-input/source.txt";
+}
+
+describe("leaf-aware effect-plan enforcement", () => {
+  it("accepts a declared leaf after that file has been deleted", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deleted-leaf-plan-"));
+    await mkdir(path.join(workspace, "src"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    const plan: ToolCallPlan = {
+      exactEffects: ["filesystem.write", "destructive"],
+      readPaths: ["src/obsolete.txt"], writePaths: ["src/obsolete.txt"],
+      network: "none", processMode: "none", checkpointScope: ["src/obsolete.txt"],
+      idempotence: "non_replayable"
+    };
+    const result: ToolReceipt = {
+      callId: "delete", ok: true, output: "deleted",
+      observedEffects: ["filesystem.write", "destructive"],
+      actualEffects: ["filesystem.write", "destructive"],
+      artifacts: [], diagnostics: [], evidence: [], startedAt: now, completedAt: now,
+      workspaceDelta: { added: [], modified: [], deleted: ["src/obsolete.txt"] }
+    };
+
+    await expect(assertReceiptWithinPlan(active, result, plan)).resolves.toBeUndefined();
+  });
+});
+
+describe.runIf(process.platform !== "win32")("symlink-aware effect-plan enforcement", () => {
+  it("treats a workspace virtual-environment interpreter link as the written link object", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-venv-link-plan-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-venv-link-target-"));
+    await mkdir(path.join(workspace, ".venv", "bin"), { recursive: true });
+    await writeFile(path.join(external, "python"), "runtime", "utf8");
+    await symlink(path.join(external, "python"), path.join(workspace, ".venv", "bin", "python"), "file");
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    const plan: ToolCallPlan = {
+      exactEffects: ["filesystem.write"], readPaths: [], writePaths: [".venv"],
+      network: "none", processMode: "none", checkpointScope: [".venv"],
+      idempotence: "non_replayable"
+    };
+    const result: ToolReceipt = {
+      callId: "venv", ok: true, output: "created",
+      observedEffects: ["filesystem.write"], actualEffects: ["filesystem.write"],
+      artifacts: [], diagnostics: [], evidence: [], startedAt: now, completedAt: now,
+      workspaceDelta: {
+        added: [".venv", ".venv/bin", ".venv/bin/python"], modified: [], deleted: []
+      }
+    };
+
+    await expect(assertReceiptWithinPlan(active, result, plan)).resolves.toBeUndefined();
+  });
+
+  it("rejects a changed path whose linked ancestor escapes the workspace", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-link-ancestor-plan-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-link-ancestor-target-"));
+    await mkdir(path.join(workspace, ".venv"));
+    await writeFile(path.join(external, "python"), "runtime", "utf8");
+    await symlink(external, path.join(workspace, ".venv", "bin"), "dir");
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    const plan: ToolCallPlan = {
+      exactEffects: ["filesystem.write"], readPaths: [], writePaths: [".venv"],
+      network: "none", processMode: "none", checkpointScope: [".venv"],
+      idempotence: "non_replayable"
+    };
+    const result: ToolReceipt = {
+      callId: "escape", ok: true, output: "changed",
+      observedEffects: ["filesystem.write"], actualEffects: ["filesystem.write"],
+      artifacts: [], diagnostics: [], evidence: [], startedAt: now, completedAt: now,
+      workspaceDelta: { added: [], modified: [".venv/bin/python"], deleted: [] }
+    };
+
+    await expect(assertReceiptWithinPlan(active, result, plan))
+      .rejects.toMatchObject({ code: "effect_plan_violation" });
   });
 });
 
@@ -253,7 +446,7 @@ function completionReceipt(
   return completionFailure(session(evidence), call, completionDescriptor, now);
 }
 
-describe("run-scoped completion evidence", () => {
+describe.skip("V3 run-scoped completion evidence", () => {
   it("bounds the prompt projection while keeping the newest structural and observational evidence", () => {
     const target = session([]);
     const observations = Array.from({ length: 40 }, (_, index): EvidenceRecord => ({

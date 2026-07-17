@@ -1,43 +1,26 @@
-import type {
-  CheckpointRef,
-  ModelToolCall,
-  ToolCallApproval,
-  ToolCallPlan,
-  ToolDescriptor,
-  ToolReceipt
-} from "agent-protocol";
-import {
-  isToolAllowed,
-  prepareToolCallPlan,
-  ResourceLockManager
-} from "agent-tools";
+import { randomUUID } from "node:crypto";
+import type { CheckpointRef, ModelToolCall, ToolCallApproval, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
+import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
 import {
   completionFailure,
   completionPlan,
   completionPlanError,
+  currentRunEvidence,
   failed,
   lockKeys,
   mergeDelta,
   workspaceWriteLockKey,
   writeScopeFailure
 } from "./effect-helpers.js";
-import {
-  mutatingPlan,
-  planAllowsMutation,
-  turnPayload,
-  type ToolAttempt
-} from "./effect-runner-helpers.js";
+import { mutatingPlan, planAllowsMutation, turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profileAllowsTool } from "./profile-policy.js";
-import {
-  assertToolReceiptIdentity,
-  normalizeReceiptEvidence
-} from "./tool-evidence.js";
+import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
   assertReceiptWithinPlan,
-  validationTargetIds,
-  workspaceDeltas
+  validationScope,
+  type FrozenValidationScope
 } from "./tool-plan-enforcement.js";
 import type { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import type { RuntimeSession } from "./types.js";
@@ -45,11 +28,8 @@ import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
-import {
-  completionRepairPhase,
-  descriptorAllowedForRepair,
-  effectsAllowedForRepair
-} from "./tool-turn-policy.js";
+import { completionRepairPhase, descriptorAllowedForRepair, effectsAllowedForRepair } from "./tool-turn-policy.js";
+import { failedExternalInputReceipt } from "./failed-input-evidence.js";
 import {
   createMutationCheckpoint,
   delegatesWorkspaceMutation,
@@ -63,13 +43,9 @@ interface PreparedTool extends ToolAttempt {
   plan: ToolCallPlan;
   startedAt: string;
   approval?: ToolCallApproval;
-  validationTargetIds?: string[];
+  validationScope?: FrozenValidationScope;
 }
-
-interface TransactionState {
-  executionStarted: boolean;
-}
-
+interface TransactionState { executionStarted: boolean }
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -161,14 +137,14 @@ export class ToolTransactionRunner {
         "tool_unavailable_for_repair"
       );
     }
-    const selectedValidationTargets = validationTargetIds(session, call, plan);
+    const selectedValidationScope = validationScope(session, call, plan);
     await this.options.emit(session, "execution.planned", "runtime", {
       executionId: call.id, toolCallId: call.id, plan
     });
     const gateFailure = await this.preflight(session, call, descriptor, plan, startedAt, signal);
     return gateFailure ?? {
       ...attempt, descriptor, plan, startedAt,
-      ...(selectedValidationTargets ? { validationTargetIds: selectedValidationTargets } : {})
+      ...(selectedValidationScope ? { validationScope: selectedValidationScope } : {})
     };
   }
 
@@ -211,6 +187,28 @@ export class ToolTransactionRunner {
     signal: AbortSignal
   ): Promise<ToolReceipt | undefined> {
     if (!descriptor.possibleEffects.includes("outcome.propose")) return undefined;
+    const pending = session.durable.state.plan.nodes.filter((node) =>
+      node.status !== "completed" && node.status !== "cancelled");
+    if (currentRunEvidence(session).length === 0
+      && session.durable.state.mutationFrontier.changedPaths.length === 0
+      && pending.length === 1
+      && pending[0]?.id === "root"
+      && pending[0].status === "in_progress") {
+      await this.options.emit(session, "evidence.recorded", "runtime", {
+        evidenceId: randomUUID(),
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
+        kind: "diagnostic",
+        status: "passed",
+        createdAt: startedAt,
+        producer: { authority: "runtime", id: "completion" },
+        summary: "The runtime accepted a completion intent with no net workspace changes.",
+        data: {
+          source: "runtime_completion_intent",
+          diagnostic: { callId: call.id, noNetWorkspaceChanges: true }
+        }
+      });
+    }
     const completed = completionPlan(session);
     if (completed) {
       const previousRevision = session.durable.state.plan.revision;
@@ -251,12 +249,14 @@ export class ToolTransactionRunner {
       );
       return await this.runReserved(session, { ...prepared, ...(approval ? { approval } : {}) }, reservationId, signal);
     } catch (error) {
-      return failed(
+      const code = failureCode(error, signal);
+      const receipt = failed(
         call,
         startedAt,
         error instanceof Error ? error.message : String(error),
-        failureCode(error, signal)
+        code
       );
+      return failedExternalInputReceipt(session, call, plan, receipt, code);
     }
   }
 
@@ -326,15 +326,11 @@ export class ToolTransactionRunner {
     const { call, modelTurn, descriptor, plan } = prepared;
     try {
       const rawReceipt = await this.execution.execute(
-        session, call, modelTurn, descriptor, plan, signal, keys, prepared.approval
-      );
+        session, call, modelTurn, descriptor, plan, signal, keys, prepared.approval);
       assertToolReceiptIdentity(rawReceipt, call.id);
       let receipt = rawReceipt;
       if (checkpoint) {
-        const inspection = await this.options.control.inspectOpenCheckpoint(
-          session,
-          checkpoint.checkpointId
-        );
+        const inspection = await this.options.control.inspectOpenCheckpoint(session, checkpoint.checkpointId);
         receipt = {
           ...rawReceipt,
           workspaceDelta: mergeDelta(rawReceipt.workspaceDelta, inspection.delta)
@@ -343,11 +339,15 @@ export class ToolTransactionRunner {
       await assertReceiptWithinPlan(session, receipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
+      const finalValidationScope = plan.exactEffects.includes("validation")
+        && plan.exactEffects.includes("filesystem.write")
+        ? validationScope(session, call, plan)
+        : prepared.validationScope;
       const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
         sessionId: session.identity.sessionId,
         runId: session.durable.runId,
-        workspaceDeltas: plan.exactEffects.includes("validation")
-          ? workspaceDeltas(session, prepared.validationTargetIds) : []
+        workspaceDeltas: [],
+        ...(finalValidationScope ? { validationScope: finalValidationScope } : {})
       });
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,

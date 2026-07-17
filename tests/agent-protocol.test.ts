@@ -139,7 +139,8 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     }
     const validation = {
       ...command, kind: "validation", data: {
-        validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [], workspaceDeltaEvidenceIds: []
+        validator: "tests", command: "pnpm test", exitCode: 0, artifactIds: [],
+        frontierRevision: 1, stateDigest: "a".repeat(64), coveredPaths: []
       }
     };
     expect(isEvidenceRecord(validation)).toBe(true);
@@ -188,8 +189,9 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
           cancelled: false
         },
         artifactIds: [],
-        workspaceDeltaEvidenceIds: ["delta"],
-        checkpointIds: ["checkpoint"]
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        coveredPaths: ["src/index.ts"]
       }
     };
     expect(isEvidenceRecord(failed)).toBe(true);

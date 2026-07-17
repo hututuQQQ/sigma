@@ -39,11 +39,23 @@ function evidenceVariants(): EvidenceRecord[] {
     { ...base, kind: "workspace_delta", data: {
       delta: { added: [], modified: [], deleted: [] }, checkpointId: "checkpoint",
     } },
+    { ...base, kind: "repository_delta", data: {
+      operationCount: 1, operations: ["add"],
+      beforeStateDigest: "a".repeat(64), afterStateDigest: "b".repeat(64),
+      headBefore: null, headAfter: "c".repeat(40),
+      refsBeforeDigest: "a".repeat(64), refsAfterDigest: "b".repeat(64),
+      indexBeforeDigest: "a".repeat(64), indexAfterDigest: "b".repeat(64),
+      reachableObjectsBefore: 0, reachableObjectsAfter: 1,
+    } },
     { ...base, kind: "command", data: { command: "pnpm test", exitCode: 0 } },
-    { ...base, kind: "validation", data: { validator: "test", workspaceDeltaEvidenceIds: [] } },
+    { ...base, kind: "validation", data: {
+      validator: "test", frontierRevision: 1,
+      stateDigest: "a".repeat(64), coveredPaths: []
+    } },
     { ...base, kind: "diagnostic", data: { source: "test", diagnostic: null } },
     { ...base, kind: "review", data: {
-      reviewerId: "reviewer", verdict: "approved", findings: [], workspaceDeltaEvidenceIds: [],
+      reviewerId: "reviewer", verdict: "approved", findings: [],
+      frontierRevision: 1, stateDigest: "a".repeat(64),
     } },
     { ...base, kind: "checkpoint", data: {
       checkpointId: "checkpoint", checkpointStatus: "open", preManifestDigest: "digest",
@@ -168,7 +180,7 @@ describe("protocol enum and invariant contracts", () => {
     ];
     expect(isPlanGraph({ revision: 1, goal: "goal", nodes: sharedDependency })).toBe(true);
     for (const kind of [
-      "workspace_delta", "command", "validation", "diagnostic",
+      "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
       "review", "checkpoint", "child_outcome", "user_waiver",
     ]) {
       expect(evidenceKindSchema.safeParse(kind).success, kind).toBe(true);

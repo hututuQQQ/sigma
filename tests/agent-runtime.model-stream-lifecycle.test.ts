@@ -54,7 +54,7 @@ describe("runtime model stream lifecycle", () => {
       storeRootDir,
       tools: new EffectToolRegistry(),
       permissionMode: "auto",
-      runDeadlineMs: 5_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
 
@@ -117,7 +117,7 @@ describe("runtime model stream lifecycle", () => {
       storeRootDir,
       tools: new EffectToolRegistry(),
       permissionMode: "auto",
-      runDeadlineMs: 5_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
 

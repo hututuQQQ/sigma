@@ -76,7 +76,7 @@ export function isToolAllowed(descriptor: ToolDescriptor, mode: RunMode): boolea
   if (descriptor.approval === "deny") return false;
   if (descriptor.availableModes) return descriptor.availableModes.includes(mode);
   if (mode === "change") return true;
-  const denied: ToolEffect[] = ["filesystem.write", "process.spawn", "destructive"];
+  const denied: ToolEffect[] = ["filesystem.write", "repository.write", "process.spawn", "destructive"];
   return !descriptor.possibleEffects.some((effect) => denied.includes(effect));
 }
 
@@ -120,7 +120,7 @@ export async function prepareToolCallPlan(
         const effects = maximumToolEffects(descriptor);
         const readPaths = pathArguments(argumentsValue, descriptor.contextPathArguments);
         const writePaths = pathArguments(argumentsValue, descriptor.writePathArguments);
-        const mutates = effects.some((effect) => effect === "filesystem.write" || effect === "process.spawn"
+        const mutates = effects.some((effect) => effect === "filesystem.write" || effect === "repository.write" || effect === "process.spawn"
           || effect === "destructive" || effect === "open_world");
         return {
           exactEffects: effects,
@@ -150,7 +150,7 @@ export class EffectToolRegistry implements ToolExecutor {
     }
     const availableModes = tool.descriptor.availableModes ?? (["analyze", "change"] as RunMode[]).filter((mode) => {
       if (mode === "change") return true;
-      return !maximumEffects.some((effect) => ["filesystem.write", "process.spawn", "destructive"].includes(effect));
+      return !maximumEffects.some((effect) => ["filesystem.write", "repository.write", "process.spawn", "destructive"].includes(effect));
     });
     const descriptor = { ...tool.descriptor, maximumEffects, availableModes };
     compileDescriptorArguments(descriptor);

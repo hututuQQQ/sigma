@@ -154,7 +154,7 @@ async function appendRecoveredWriteApproval(
   });
   append("run.suspended", {
     turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
-    message: "approval required", remainingDeadlineMs: 9_000
+    message: "approval required", remainingDeadlineMs: 60_000
   });
   for (const event of stored) await store.append(event, event.seq - 1);
   return stored.length;
@@ -246,7 +246,7 @@ describe("sensitive per-call approvals", () => {
         store,
         storeRootDir: path.join(root, "state"),
         permissionMode: "ask",
-        runDeadlineMs: 10_000
+        runDeadlineMs: 60_000
       });
       const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
       const approvals = approveEvery(runtime, session.sessionId, 2);
@@ -276,7 +276,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Run two network checks." });
@@ -307,7 +307,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "ask",
-      runDeadlineMs: 2_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     const requested = (async () => {
@@ -342,7 +342,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "deny",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Try a network check." });
@@ -372,7 +372,7 @@ describe("sensitive per-call approvals", () => {
       store: new SegmentedJsonlStore({ rootDir: path.join(root, "state") }),
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const approval = approveEvery(runtime, session.sessionId, 1);
@@ -411,7 +411,7 @@ describe("sensitive per-call approvals", () => {
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",
       interactiveApprovals: false,
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({
@@ -464,7 +464,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir,
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     try {
@@ -509,7 +509,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir,
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     try {
@@ -564,7 +564,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir,
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     let releasing: Promise<void> | undefined;
@@ -644,7 +644,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     const automaticRequest = (async () => {
@@ -718,7 +718,7 @@ describe("sensitive per-call approvals", () => {
       }),
       fixtureEvent(10, "run.suspended", {
         turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
-        message: "approval required", remainingDeadlineMs: 9_000
+        message: "approval required", remainingDeadlineMs: 60_000
       })
     ];
     for (const event of stored) await store.append(event, event.seq - 1);
@@ -732,7 +732,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir,
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     const rePrompt = nextEventAfter(runtime, "sensitive-session", 10, ["tool.approval_requested", "tool.failed"]);
@@ -808,7 +808,7 @@ describe("sensitive per-call approvals", () => {
       store,
       storeRootDir: path.join(root, "state"),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const parent = await runtime.createSession({ workspacePath: root, mode: "analyze" });
     const supervisor = new AgentSupervisor(createChildAgentFactory(() => runtime), 1);

@@ -7,8 +7,7 @@ import type {
   RuntimeControlPort,
   SupervisorPort,
   ToolExecutionContext,
-  ToolRequest,
-  ValidationEvidence
+  ToolRequest
 } from "../packages/agent-protocol/src/index.js";
 import {
   approximateTokens,
@@ -21,7 +20,6 @@ import {
 } from "../packages/agent-context/src/index.js";
 import { runProcess, runtimeEnvironment, shellInvocation } from "../packages/agent-platform/src/index.js";
 import {
-  completionEvidenceError,
   EffectToolRegistry,
   isToolAllowed,
   parseCompletionProposal,
@@ -57,7 +55,7 @@ function request(callId: string, name: string, args: JsonValue): ToolRequest {
 }
 
 describe("context, platform, and repository tool capabilities", () => {
-  it("requires every completion criterion to have current successful evidence", () => {
+  it("accepts only the V4 runtime-owned completion shape", () => {
     expect(parseCompletionProposal({
       summary: "bypass",
       criteria: [{
@@ -67,150 +65,9 @@ describe("context, platform, and repository tool capabilities", () => {
         rationale: "claimed unnecessary"
       }]
     })).toBeNull();
-    const proposal = parseCompletionProposal({
-      summary: "verified",
-      criteria: [{
-        criterion: "The requested change is complete.",
-        status: "met",
-        evidence: [{ evidenceId: "current-evidence", kind: "diagnostic" }]
-      }]
-    });
-    expect(proposal).toMatchObject({ criteria: [{ rationale: "" }] });
-    expect(completionEvidenceError(proposal!, new Map([["current-evidence", "diagnostic"]]))).toBeNull();
-    expect(completionEvidenceError(proposal!, new Map([["older-run-evidence", "diagnostic"]])))
-      .toContain("current-evidence");
-  });
-
-  it("accepts failed validation only for the validation_executed claim", () => {
-    const failed: ValidationEvidence = {
-      evidenceId: "failed-validation",
-      sessionId: "session",
-      runId: "run",
-      kind: "validation",
-      status: "failed",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      producer: { authority: "tool", id: "validate" },
-      summary: "exited 1",
-      data: {
-        validator: "command",
-        command: "pnpm test",
-        exitCode: 1,
-        termination: {
-          processStarted: true,
-          state: "exited",
-          exitCode: 1,
-          signal: null,
-          timedOut: false,
-          idleTimedOut: false,
-          cancelled: false
-        },
-        artifactIds: [],
-        workspaceDeltaEvidenceIds: []
-      }
-    };
-    const proposal = parseCompletionProposal({
-      summary: "reported honestly",
-      criteria: [{
-        criterion: "Validation was run and its failure was reported.",
-        status: "met",
-        evidence: [{
-          evidenceId: failed.evidenceId,
-          kind: failed.kind,
-          claim: "validation_executed"
-        }]
-      }]
-    })!;
-    expect(completionEvidenceError(proposal, new Map([[failed.evidenceId, failed]]))).toBeNull();
-    expect(completionEvidenceError({
-      ...proposal,
-      criteria: [{
-        ...proposal.criteria[0]!,
-        claim: "validation_passed",
-        evidence: [{ evidenceId: failed.evidenceId, kind: failed.kind, claim: "validation_passed" }]
-      }]
-    }, new Map([[failed.evidenceId, failed]]))).toContain("failed-validation");
-    const independentlyTyped = parseCompletionProposal({
-      summary: "invalid claim mix",
-      criteria: [{
-        criterion: "Validation was attempted after the requested work.",
-        status: "met",
-        claim: "validation_passed",
-        evidence: [{
-          evidenceId: failed.evidenceId,
-          kind: failed.kind,
-          claim: "validation_executed"
-        }]
-      }]
-    });
-    expect(independentlyTyped).toMatchObject({
-      criteria: [{
-        claim: "validation_executed",
-        evidence: [{ claim: "validation_executed" }]
-      }]
-    });
-    expect(completionEvidenceError(independentlyTyped!, new Map([[failed.evidenceId, failed]])))
-      .toBeNull();
-  });
-
-  it("accepts mixed workspace and passed-validation references and diagnoses malformed evidence", () => {
-    const changed = {
-      evidenceId: "workspace-delta",
-      sessionId: "session",
-      runId: "run",
-      kind: "workspace_delta" as const,
-      status: "passed" as const,
-      createdAt: "2026-01-01T00:00:00.000Z",
-      producer: { authority: "runtime" as const, id: "checkpoint" },
-      summary: "changed",
-      data: {
-        checkpointId: "checkpoint",
-        delta: { added: [], modified: ["src/code.ts"], deleted: [] }
-      }
-    };
-    const passed: ValidationEvidence = {
-      evidenceId: "passed-validation",
-      sessionId: "session",
-      runId: "run",
-      kind: "validation",
-      status: "passed",
-      createdAt: "2026-01-01T00:00:00.000Z",
-      producer: { authority: "tool", id: "validate" },
-      summary: "passed",
-      data: {
-        validator: "command",
-        command: "pnpm test",
-        exitCode: 0,
-        workspaceDeltaEvidenceIds: [changed.evidenceId]
-      }
-    };
-    const mixed = parseCompletionProposal({
-      summary: "changed and validated",
-      criteria: [{
-        criterion: "The change was applied and validation passed.",
-        status: "met",
-        evidence: [
-          { evidenceId: changed.evidenceId, kind: changed.kind, claim: "acceptance_met" },
-          { evidenceId: passed.evidenceId, kind: passed.kind, claim: "validation_passed" }
-        ]
-      }]
-    });
-    expect(mixed).not.toBeNull();
-    expect(mixed?.criteria[0]?.claim).toBeUndefined();
-    expect(completionEvidenceError(mixed!, new Map([
-      [changed.evidenceId, changed],
-      [passed.evidenceId, passed]
-    ]))).toBeNull();
-
-    const malformed = parseCompletionProposal({
-      summary: "bad evidence",
-      criteria: [{
-        criterion: "Malformed reference is rejected.",
-        status: "met",
-        evidence: [{ evidenceId: "missing", kind: "validation", claim: "validation_passed" }]
-      }]
-    });
-    expect(completionEvidenceError(malformed!, new Map([[passed.evidenceId, passed]])))
-      .toMatch(/missing:validation:validation_passed[\s\S]*different references in one criterion may use different claims/u);
+    expect(parseCompletionProposal({ summary: " verified ", warnings: ["review unavailable"] }))
+      .toEqual({ summary: "verified", warnings: ["review unavailable"] });
+    expect(parseCompletionProposal({ summary: "verified", unknown: true })).toBeNull();
   });
 
   it("exposes an ID-free internal review request without asking the user to re-authorize code", async () => {
@@ -226,9 +83,10 @@ describe("context, platform, and repository tool capabilities", () => {
     const runtimeControl = {
       requestReview: async () => ({
         status: "review_requested" as const,
-        workspaceDeltaEvidenceIds: ["delta"],
-        validationEvidenceIds: ["validation"],
-        missingValidationWorkspaceDeltaEvidenceIds: []
+        frontierRevision: 3,
+        stateDigest: "a".repeat(64),
+        changedPaths: ["src/index.ts"],
+        missingValidationPaths: []
       })
     } as RuntimeControlPort;
     const result = await tools.execute(
@@ -239,29 +97,24 @@ describe("context, platform, and repository tool capabilities", () => {
       ok: true,
       result: {
         status: "review_requested",
-        workspaceDeltaEvidenceIds: ["delta"],
-        validationEvidenceIds: ["validation"]
+        frontierRevision: 3,
+        changedPaths: ["src/index.ts"]
       },
       diagnostics: []
     });
   });
 
-  it("keeps completion and user-input terminal capabilities orthogonal", async () => {
+  it("keeps completion, blocked-report, and user-input terminal capabilities orthogonal", async () => {
     const tools = registerCompletionTool(new EffectToolRegistry());
     const completion = tools.descriptor("complete_task")!;
     const input = tools.descriptor("request_user_input")!;
+    const blocked = tools.descriptor("report_blocked")!;
     expect(completion.inputSchema).toMatchObject({
-      properties: {
-        criteria: {
-          items: {
-            properties: {
-              claim: { enum: ["acceptance_met", "validation_executed", "validation_passed"] }
-            }
-          }
-        }
-      }
+      properties: { summary: { type: "string" }, warnings: { type: "array" } },
+      additionalProperties: false
     });
     expect(terminalProtocolAction(completion)).toBe("complete");
+    expect(terminalProtocolAction(blocked)).toBe("report_blocked");
     expect(terminalProtocolAction(input)).toBe("request_input");
     expect(terminalProtocolAction({
       possibleEffects: ["outcome.propose", "outcome.request_input"]
@@ -284,22 +137,15 @@ describe("context, platform, and repository tool capabilities", () => {
     const completed = await tools.execute(request(
       "complete",
       "complete_task",
-      {
-        summary: "done",
-        criteria: [{
-          criterion: "The requested work is complete.",
-          status: "met",
-          evidence: [{ evidenceId: "evidence", kind: "diagnostic" }]
-        }]
-      }
+      { summary: "done", warnings: ["advisory review was unavailable"] }
     ), context("."));
     expect(completed).toMatchObject({
       ok: true,
       observedEffects: ["outcome.propose"],
       diagnostics: []
     });
-    expect(JSON.parse(completed.output)).toMatchObject({
-      criteria: [{ claim: "acceptance_met" }]
+    expect(JSON.parse(completed.output)).toEqual({
+      summary: "done", warnings: ["advisory review was unavailable"]
     });
   });
 
@@ -532,7 +378,7 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(validation).toMatchObject({ ok: true, observedEffects: validationPlan.exactEffects });
     expect(validation.output).toBe("validated");
     expect(validationPlan).toMatchObject({
-      exactEffects: ["process.spawn.readonly", "validation"],
+      exactEffects: ["process.spawn.readonly", "validation", "network"],
       writePaths: [],
       checkpointScope: []
     });
@@ -542,7 +388,7 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(scopedProcessPlan).toMatchObject({
-      exactEffects: ["process.spawn", "filesystem.write"],
+      exactEffects: ["process.spawn", "filesystem.write", "network"],
       writePaths: ["src"],
       checkpointScope: ["src"]
     });
@@ -568,7 +414,7 @@ describe("context, platform, and repository tool capabilities", () => {
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze"
     });
-    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation"]);
+    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation", "network"]);
     expect(analyzeValidationPlan.writePaths).toEqual([]);
     expect(isToolAllowed(tools.descriptor("read")!, "analyze")).toBe(true);
     expect(isToolAllowed({ ...tools.descriptor("read")!, approval: "deny" }, "change")).toBe(false);

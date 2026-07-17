@@ -45,6 +45,7 @@ function brokerFixture(): {
   broker: ExecutionBroker;
   execute: ReturnType<typeof vi.fn>;
   spawn: ReturnType<typeof vi.fn>;
+  handoff: ReturnType<typeof vi.fn>;
 } {
   const exited: ExecutionResult = {
     state: "exited",
@@ -62,11 +63,17 @@ function brokerFixture(): {
     outputArtifacts: []
   };
   const execute = vi.fn(async () => exited);
-  const spawn = vi.fn(async () => ({ id: "process", brokerInstanceId: "broker" }));
+  const spawn = vi.fn(async (input) => ({
+    id: "process", brokerInstanceId: "broker", lifecycle: input.lifecycle ?? "session"
+  }));
+  const handoff = vi.fn(async (handle) => ({
+    handle, handoffId: `handoff:${handle.id}`, systemProcessId: 4321
+  }));
   const unavailable = async (): Promise<never> => await Promise.reject(new Error("not used"));
   return {
     execute,
     spawn,
+    handoff,
     broker: {
       lostProcessHandles: [],
       connect: unavailable,
@@ -76,6 +83,7 @@ function brokerFixture(): {
       poll: unavailable,
       write: unavailable,
       terminate: unavailable,
+      handoff,
       close: async () => undefined
     }
   };
@@ -173,6 +181,52 @@ describe("execution tool capability closure", () => {
     for (const name of [
       "exec", "shell", "validate", "process_spawn", "process_poll", "process_write", "process_terminate"
     ]) expect(tools.descriptor(name)).toBeUndefined();
+  });
+
+  it("projects deliverable lifecycle and handoff only when policy and broker both allow it", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      foreground: true,
+      background: true,
+      handoff: true,
+      processHandoff: "allow",
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"]
+    });
+    expect(tools.descriptor("process_spawn")?.inputSchema).toMatchObject({
+      properties: { lifecycle: { enum: ["session", "deliverable"] } }
+    });
+    expect(tools.descriptor("process_handoff")?.possibleEffects).toEqual(["process.handoff"]);
+
+    const spawnCall = request("process_spawn", { executable: "runtime", lifecycle: "deliverable" });
+    const spawnPlan = await tools.prepare(spawnCall, preparation(root));
+    await expect(tools.execute(spawnCall, { ...execution(root), callPlan: spawnPlan }))
+      .resolves.toMatchObject({ ok: true });
+    expect(fixture.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "deliverable" }),
+      expect.anything()
+    );
+
+    const handoffCall = request("process_handoff", {
+      handleId: "process", brokerInstanceId: "broker"
+    });
+    const handoffPlan = await tools.prepare(handoffCall, preparation(root));
+    await expect(tools.execute(handoffCall, {
+      ...execution(root), callPlan: handoffPlan, approval: { processHandoffApproved: true }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.handoff).toHaveBeenCalledOnce();
+
+    const denied = registerBuiltinTools(new EffectToolRegistry(), {
+      handoff: true,
+      processHandoff: "deny"
+    });
+    expect(denied.descriptor("process_handoff")).toBeUndefined();
+    expect(denied.descriptor("process_spawn")?.inputSchema).not.toMatchObject({
+      properties: { lifecycle: expect.anything() }
+    });
   });
 
   it("keeps the shell schema aligned with verified capabilities and rejects unsupported arguments", async () => {

@@ -6,6 +6,7 @@ import {
   type CheckpointRef,
   type EvidenceRecord,
   type EvidenceClaim,
+  type MutationFrontier,
   type PlanGraph,
   type UsageRecord
 } from "./domain-types.js";
@@ -13,6 +14,7 @@ import {
   budgetLedgerStateSchema,
   checkpointRefSchema,
   evidenceRecordSchema,
+  mutationFrontierSchema,
   planGraphSchema,
   usageRecordSchema
 } from "./domain-schemas.js";
@@ -22,6 +24,10 @@ const NON_ACTIONABLE_DIAGNOSTIC_SOURCES = new Set([SUBJECT_ATTESTATION_EVIDENCE_
 
 export function isEvidenceRecord(value: unknown): value is EvidenceRecord {
   return evidenceRecordSchema.safeParse(value).success;
+}
+
+export function isMutationFrontier(value: unknown): value is MutationFrontier {
+  return mutationFrontierSchema.safeParse(value).success;
 }
 
 export function assertEvidenceRecord(value: unknown): asserts value is EvidenceRecord {
@@ -38,6 +44,7 @@ export function isCompletionEligibleEvidence(
   runId: string
 ): boolean {
   if (evidence.sessionId !== sessionId || evidence.runId !== runId || evidence.status === "failed") return false;
+  if (evidence.kind === "input_access") return false;
   return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
 }
 

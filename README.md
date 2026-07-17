@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: Release candidate" src="https://img.shields.io/badge/status-v3.0.0--rc.2-f59e0b">
+  <img alt="Status: Release candidate" src="https://img.shields.io/badge/status-v4.0.0--rc.1-f59e0b">
   <img alt="First binary target: Windows x64" src="https://img.shields.io/badge/first%20binary%20target-Windows%20x64-0078d4">
   <img alt="Formal evaluation: DeepSeek only" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
 </p>
@@ -25,7 +25,7 @@
 
 Sigma Code turns a coding task into a durable stream of typed decisions and evidence. It can explore a repository, make scoped changes, run sandboxed commands, validate the result, ask an independent reviewer, and recover the same session after interruption. The product uses one event-sourced kernel, one session format, and one terminal UI instead of separate execution paths that drift apart.
 
-`v3.0.0-rc.2` is an unsigned Windows x64 preview release candidate. It is suitable
+`v4.0.0-rc.1` is an unsigned Windows x64 preview release candidate. It is suitable
 for evaluation and feedback, but it is not yet the stable `3.0.0` release. See the
 [changelog](CHANGELOG.md), [security policy](SECURITY.md), and
 [contribution guide](CONTRIBUTING.md) before reporting or proposing changes.
@@ -33,7 +33,7 @@ for evaluation and feedback, but it is not yet the stable `3.0.0` release. See t
 > [!IMPORTANT]
 > **Current product boundary**
 >
-> - **The first signed binary release target is Windows x64.** `v3.0.0-rc.2` includes a directly usable but unsigned Windows x64 preview archive because trusted Windows code signing is not configured. Windows may show a SmartScreen warning. The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
+> - **The first signed binary release target is Windows x64.** `v4.0.0-rc.1` includes a directly usable but unsigned Windows x64 preview archive because trusted Windows code signing is not configured. Windows may show a SmartScreen warning. The repository contains a Linux sandbox backend and portable packaging work, but Linux is not a formally released product target yet.
 > - **Formal evaluation and benchmark runs are currently DeepSeek-only.** Sigma's evaluator, Harbor adapter, and Terminal-Bench harness are maintained around DeepSeek; results from other providers are not used for formal claims.
 > - The runtime contains DeepSeek and GLM/Z.ai gateway support, but the GLM path does not have the same formal evaluation coverage.
 > - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
@@ -44,14 +44,14 @@ for evaluation and feedback, but it is not yet the stable `3.0.0` release. See t
 | --- | --- |
 | Durable by default | Commands, model turns, tool receipts, approvals, plans, evidence, and outcomes are stored as checksummed events and can be replayed. |
 | Effects before execution | Every tool declares its possible effects; each call is narrowed to an exact plan before policy, approval, locking, checkpointing, and execution. |
-| Evidence before “done” | A natural-language answer cannot finish a run. Completion must cite typed evidence for explicit acceptance criteria. |
-| Fail-closed containment | Process execution defaults to a native sandbox with no network. If the required sandbox is unhealthy, Sigma refuses to execute. |
+| Current-state validation before “done” | The runtime completes only when semantic validation covers every net change on the current mutation frontier. |
+| Fail-closed containment | Process execution stays in the required native sandbox even when host reads or networking are authorized. If the sandbox is unhealthy, Sigma refuses to execute. |
 | One product path | CLI automation and the TUI use the same `RuntimeClient`, kernel, store, tools, recovery logic, and outcome protocol. |
 
 ## Quick start on Windows
 
 > [!NOTE]
-> `v3.0.0-rc.2` includes an unsigned Windows x64 preview archive. Verify its SHA-256
+> `v4.0.0-rc.1` includes an unsigned Windows x64 preview archive. Verify its SHA-256
 > sidecar before extraction. Windows may show a SmartScreen warning because the
 > executables do not yet have a trusted Authenticode signature.
 
@@ -100,9 +100,9 @@ For read-only analysis:
 ## What Sigma can do
 
 - **Interactive coding:** use a CJK/IME-aware terminal UI with Markdown responses, activity views, command completion, multiline input, steering, follow-ups, scrolling, and approval overlays.
-- **Repository intelligence:** bounded file listing and grep, repository statistics, Git status/diff, stable hash-aware reads, nested `AGENTS.md` discovery, and LSP-backed code intelligence when a supported server is available.
+- **Repository intelligence:** bounded file listing and grep, repository statistics, Git status/diff, stable hash-aware workspace and declared host-input reads, nested `AGENTS.md` discovery, and LSP-backed code intelligence when a supported server is available.
 - **Scoped changes:** write and edit files, apply atomic multi-file patches, delete individual files, detect no-op writes, create mutation checkpoints, and restore the current run's latest sealed checkpoint.
-- **Sandboxed execution:** run direct executables or platform shells, execute semantic validation, and manage background/PTY processes through broker-scoped session handles.
+- **Sandboxed execution:** run direct executables or platform shells, execute semantic validation, manage background/PTY processes through broker-scoped session handles, and explicitly hand off verified Linux deliverable services.
 - **Evidence-based delivery:** record workspace deltas, commands, validation, diagnostics, reviews, child outcomes, and checkpoints in one typed evidence ledger.
 - **Durable sessions:** list, inspect, replay, resume, cancel, steer, approve, and continue sessions after a process interruption.
 - **Child agents:** delegate plan nodes to bounded child sessions; isolate writers in Git worktrees or narrow single-writer scopes, then explicitly integrate retained changes.
@@ -127,7 +127,7 @@ flowchart TB
   TOOLS --> MCP["agent-mcp<br/>trusted read-only stdio bridge"]
   TOOLS --> SUP["agent-supervisor<br/>children, mailboxes, writer isolation"]
   TOOLS --> EXEC["agent-execution<br/>only arbitrary-process boundary"]
-  EXEC --> NATIVE["sigma-exec (Rust)<br/>Windows AppContainer / ConPTY / Job Object"]
+  EXEC --> NATIVE["sigma-exec (Rust)<br/>Windows AppContainer / Linux namespace sandbox"]
 
   MODEL --> EVENTS["AgentEventEnvelope"]
   CONTEXT --> EVENTS
@@ -168,13 +168,17 @@ The production package dependency graph is checked for cycles and packages commu
 
 ## Safety, permissions, and recovery
 
-### Windows execution boundary
+### Execution boundary
 
-`agent-execution` is the only production package allowed to start arbitrary processes. It talks to the bundled Rust `sigma-exec` broker over a framed protocol. On Windows, each sandboxed command uses an AppContainer identity with scoped filesystem ACLs, a kill-on-close Job Object, capability-gated networking, and ConPTY for interactive processes.
+`agent-execution` is the only production package allowed to start arbitrary processes. It talks to the bundled Rust `sigma-exec` broker over a framed protocol. On Windows, each sandboxed command uses an AppContainer identity with scoped filesystem ACLs, a kill-on-close Job Object, capability-gated networking, and ConPTY for interactive processes. Linux uses the native namespace sandbox and a watchdog for process-tree cleanup.
 
-The default policy is `sandbox=required` and `network=none`. Required isolation never falls back to a host process. Unsafe host execution requires both a home-level opt-in and a per-run request. The broker rebuilds the child environment from an allowlist, rejects secret-looking overrides, and redacts configured secret values from returned output.
+Configuration schema v4 defaults to `sandbox=required`, `read_scope=host`, `network=full`, and `process_handoff=allow`. These defaults expand only declared read and socket capabilities: working directories and every write remain workspace-contained, and required isolation never falls back to unsafe host execution. In `ask` mode, `filesystem.read.external`, `network`, and `process.handoff` require a fresh confirmation for each call; `auto` issues a fresh runtime-bound grant, while `deny` rejects them.
 
-Path containment and OS isolation are separate checks. Workspace tools reject lexical and symlink/junction escapes; `.git` and `.agent` remain protected from sandbox write grants.
+Absolute external inputs are read through stable no-follow traversal and produce `input_access` evidence with path, digest, and size. Process calls mount only their declared stable read roots. A failed goal input remains an unresolved completion obligation until the same external path is read successfully; a run-created fixture cannot replace it.
+
+Path containment and OS isolation are separate checks. Workspace tools reject lexical and symlink/junction ancestor escapes; creating a workspace symlink object such as a virtual-environment interpreter link is allowed without granting writes to its external target. `.git` and `.agent` remain protected from sandbox write grants.
+
+Linux advertises `processHandoff` only when safe transfer is available. A `deliverable` process uses detached stdio, cannot use PTY/stdin, and must be independently health-checked before `process_handoff`. Handoff removes it from session cleanup; unhanded processes are still terminated on failure, cancellation, timeout, or broker loss. Windows currently advertises this capability as unavailable and fails closed.
 
 ### Checkpoints and durable state
 
@@ -192,9 +196,9 @@ Event records have checksums and monotonic sequence numbers. Segments rotate at 
 
 ### Completion is a protocol action
 
-A provider `stop` or a confident final paragraph is not completion. The model must call `complete_task` with a non-empty summary, explicit acceptance criteria, and exact references from the current run's evidence ledger. Unknown, failed, stale, or semantically incompatible evidence is rejected and the run continues with a structured repair diagnostic.
+A provider `stop` with substantive text is treated as completion intent, and `complete_task` accepts only a summary plus optional warnings. The runtime—not the model—derives plan completion and evidence from the current mutation frontier. Failed, stale, or incomplete semantic validation keeps the run open with a structured repair diagnostic.
 
-For non-documentation changes, completion requires passed semantic validation and approved independent review evidence. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
+All net changes require passed semantic validation on the current state. Sealed no-op checkpoints do not advance that frontier; mutating validation is rebound after its checkpoint seals. The standard profile runs independent review as advisory and records findings as warnings; the strict profile requires approval. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
 
 ## Commands
 
@@ -230,12 +234,20 @@ Stable process exit codes are `0` for `Completed`, `2` for `NeedsInput`, `130` f
 Precedence is **CLI flags → environment → workspace `.agent/config.toml` → home `~/.sigma/config.toml` → defaults**. Unknown flags and TOML keys fail immediately. Workspace-authored MCP servers and executable hooks require an explicit digest-bound trust grant.
 
 ```toml
+schema_version = 4
+
 [model]
 provider = "deepseek"
 name = "auto"
 
 [permissions]
 mode = "ask"
+
+[security]
+sandbox = "required"
+read_scope = "host"
+network = "full"
+process_handoff = "allow"
 
 [runtime]
 run_deadline_sec = 900
@@ -254,6 +266,20 @@ output_format = "text"
 [tui]
 fps = 30
 ```
+
+To restore the strict pre-v4 capability posture, use:
+
+```toml
+schema_version = 4
+
+[security]
+sandbox = "required"
+read_scope = "workspace"
+network = "none"
+process_handoff = "deny"
+```
+
+Existing schema v2/v3 files can be checked with `agent config migrate --workspace . --check` and atomically upgraded with `agent config migrate --workspace . --write`. Migration keeps the original as `.agent/config.toml.v2.bak` or `.v3.bak`. Workspace configuration may narrow these capabilities but cannot widen a stricter home policy. The equivalent one-run CLI overrides are `--read-scope workspace --network none --process-handoff deny`.
 
 DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path, but formal Sigma evaluation remains DeepSeek-only.
 

@@ -1216,11 +1216,11 @@ export async function verifyAgentCliPackage(options = {}) {
     const license = await readFile(path.join(bundleDir, "LICENSE"), "utf8");
     const packageJson = await readJson(path.join(bundleDir, "package.json"));
     const metadata = await readJson(path.join(bundleDir, "package-metadata.json"));
-    if (metadata.schemaVersion !== 2 && metadata.schemaVersion !== 3) {
+    if (metadata.schemaVersion !== 2 && metadata.schemaVersion !== 3 && metadata.schemaVersion !== 4) {
       throw new Error(`Unsupported package metadata schemaVersion=${String(metadata.schemaVersion)}.`);
     }
-    const isV3 = metadata.schemaVersion === 3;
-    const expectedMajor = isV3 ? "3" : "2";
+    const isV3 = metadata.schemaVersion >= 3;
+    const expectedMajor = String(metadata.schemaVersion);
     if (typeof packageJson.version !== "string" || !packageJson.version.startsWith(`${expectedMajor}.`)) {
       throw new Error(`Package metadata schema ${metadata.schemaVersion} does not match version ${String(packageJson.version)}.`);
     }

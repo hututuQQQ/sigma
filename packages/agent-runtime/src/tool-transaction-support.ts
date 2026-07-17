@@ -68,7 +68,7 @@ async function probeNoChange(
     && result.status === "no_change";
   const actualEffects = receipt.actualEffects;
   const mutating = actualEffects?.some((effect) =>
-    ["filesystem.write", "process.spawn", "agent.spawn", "destructive", "open_world", "checkpoint.restore"]
+    ["filesystem.write", "repository.write", "process.spawn", "agent.spawn", "destructive", "open_world", "checkpoint.restore"]
       .includes(effect));
   if (!receipt.ok || !noChange || !actualEffects || mutating || receipt.workspaceDelta !== undefined) {
     throw Object.assign(new Error(

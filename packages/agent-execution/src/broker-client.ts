@@ -17,29 +17,17 @@ import {
   attachBrokerLifecycleFailure
 } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
-import {
-  positiveInteger,
-  redactionSecrets,
-  requestParams
-} from "./broker-request-policy.js";
+import { positiveInteger, redactionSecrets, requestParams } from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
 import {
-  assertTrustedToolchainsAvailable,
-  normalizeTrustedToolchains,
-  type NormalizedTrustedToolchain
+  assertTrustedToolchainsAvailable, normalizeTrustedToolchains, type NormalizedTrustedToolchain
 } from "./trusted-toolchains.js";
 import type {
-  BrokerDoctorReport,
-  BrokerRequestOptions,
-  ExecutionBroker,
-  ExecutionRequest,
-  ExecutionResult,
-  ProcessHandle,
-  ProcessPollResult,
-  ProcessSpawnRequest,
+  BrokerDoctorReport, BrokerRequestOptions, ExecutionBroker, ExecutionRequest, ExecutionResult,
+  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
   SigmaExecBrokerClientOptions
 } from "./types.js";
-import { parseDoctor, parseHello, parseProcessValue, parseSpawnedProcess } from "./values.js";
+import { parseDoctor, parseHello, parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
 
 export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly transport: BrokerTransport;
@@ -59,7 +47,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   private connectOperation?: Promise<BrokerDoctorReport>;
   private closeRequested = false;
   private doctorValue?: BrokerDoctorReport;
-
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
     if (!options.helperPath) throw new BrokerPolicyError("sigma-exec helperPath is required.");
     positiveInteger(options.cancellationGraceMs, 10_000, "cancellationGraceMs");
@@ -87,17 +74,14 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       }
     );
   }
-
   get lostProcessHandles(): readonly ProcessHandle[] { return [...this.lost.values()]; }
   get stderr(): string { return this.transport.stderr; }
-
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot connect broker client in '${this.state}' state.`);
     const operation = this.connectOnce(signal);
     this.connectOperation = operation;
     return await operation;
   }
-
   private async connectOnce(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.state = "connecting";
     try {
@@ -147,7 +131,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       throw failure;
     }
   }
-
   async doctor(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
     const report = await parsePostDispatchValue(
@@ -164,7 +147,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.doctorValue = report;
     return report;
   }
-
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
     const report = await parsePostDispatchValue(
@@ -184,7 +166,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.doctorValue = report;
     return report;
   }
-
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {
     this.assertReady();
     assertRequestSandbox(request.policy, this.doctorValue);
@@ -213,7 +194,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       return decodedExecutionResult(value, this.redactor, outputArtifacts);
     }, async () => await this.close());
   }
-
   async spawn(request: ProcessSpawnRequest, options: BrokerRequestOptions = {}): Promise<ProcessHandle> {
     this.assertReady();
     assertRequestSandbox(request.policy, this.doctorValue);
@@ -248,7 +228,12 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       }
       const reuse = reserveProcessId(spawned.id, this.seenProcessIds);
       if (reuse) return await containReusedProcessId(reuse, async () => await this.close());
-      const handle = { id: spawned.id, brokerInstanceId: this.instanceId!, systemProcessId: spawned.systemProcessId };
+      const handle = {
+        id: spawned.id,
+        brokerInstanceId: this.instanceId!,
+        systemProcessId: spawned.systemProcessId,
+        lifecycle: request.lifecycle ?? "session"
+      };
       this.cursors.set(handle.id, { stdout: 0, stderr: 0 });
       this.activeProcesses.set(handle.id, handle);
       this.processRedaction.set(handle.id, createProcessRedaction(this.redactor, request.outputRedaction));
@@ -260,7 +245,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       options.signal?.removeEventListener("abort", onAbort);
     }
   }
-
   async poll(handle: ProcessHandle, options: BrokerRequestOptions = {}): Promise<ProcessPollResult> {
     return await runPostResponseOperation(this.postResponseOperations, async () =>
       await this.processOperations.run(handle.id, async () => {
@@ -302,7 +286,28 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
         return await this.processResult(handle, value);
       }), async () => await this.close());
   }
-
+  async handoff(handle: ProcessHandle, options: BrokerRequestOptions = {}): Promise<ProcessHandoffResult> {
+    return await runPostResponseOperation(this.postResponseOperations, async () =>
+      await this.processOperations.run(handle.id, async () => {
+        this.assertHandle(handle);
+        if (handle.lifecycle !== "deliverable") {
+          throw new BrokerPolicyError("Only a deliverable process may be handed off.");
+        }
+        const value = await parsePostDispatchValue(
+          await this.transport.request("process.handoff", { handleId: handle.id }, options),
+          parseProcessHandoff,
+          async () => await this.closeForActiveOperation()
+        );
+        this.cursors.delete(handle.id);
+        this.activeProcesses.delete(handle.id);
+        this.processRedaction.delete(handle.id);
+        return {
+          handle,
+          handoffId: value.handoffId,
+          ...(value.systemProcessId === undefined ? {} : { systemProcessId: value.systemProcessId })
+        };
+      }), async () => await this.close());
+  }
   async releaseOutputArtifacts(artifactIds: string[]): Promise<void> {
     this.assertReady();
     await runPostResponseOperation(this.postResponseOperations, async () => {
@@ -313,15 +318,12 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       );
     }, async () => await this.close());
   }
-
   async close(): Promise<void> {
     await this.lifecycle.close();
   }
-
   private async closeForActiveOperation(): Promise<void> {
     await this.lifecycle.closeForActiveOperation();
   }
-
   private async processResult(handle: ProcessHandle, value: ReturnType<typeof parseProcessValue>): Promise<ProcessPollResult> {
     const decodingError = outputDecodingError(value);
     if (decodingError) {

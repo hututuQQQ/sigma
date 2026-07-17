@@ -119,7 +119,7 @@ async function promoteV3Evidence(
   {
     provenanceTrusted,
     windowsSignerPolicy,
-    version = "3.0.0-rc.2"
+    version = "4.0.0-rc.1"
   }: { provenanceTrusted: boolean; windowsSignerPolicy: boolean; version?: string }
 ) {
   const packageJsonPath = path.join(rootDir, "package.json");
@@ -347,7 +347,7 @@ describe("product readiness report", () => {
     await promoteV3Evidence(rootDir, artifactsDir, {
       provenanceTrusted: true,
       windowsSignerPolicy: true,
-      version: "4.0.0"
+      version: "5.0.0"
     });
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
@@ -385,7 +385,7 @@ describe("product readiness report", () => {
     const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
     const rootPackagePath = path.join(rootDir, "package.json");
     const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
-    rootPackage.version = "3.0.0-rc.2";
+    rootPackage.version = "4.0.0-rc.1";
     await writeJson(rootPackagePath, rootPackage);
     const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
     const packaged = JSON.parse(await readFile(packagePath, "utf8"));
@@ -406,12 +406,12 @@ describe("product readiness report", () => {
     const { rootDir, artifactsDir } = await fixture({ ok: true, status: "passed", transport: "native" });
     const rootPackagePath = path.join(rootDir, "package.json");
     const rootPackage = JSON.parse(await readFile(rootPackagePath, "utf8"));
-    rootPackage.version = "3.0.0-rc.2";
+    rootPackage.version = "4.0.0-rc.1";
     await writeJson(rootPackagePath, rootPackage);
     const packagePath = path.join(artifactsDir, "agent-cli-package-verify.json");
     const packageReport = JSON.parse(await readFile(packagePath, "utf8"));
     packageReport.metadata.schemaVersion = 2;
-    packageReport.metadata.productVersion = "3.0.0-rc.2";
+    packageReport.metadata.productVersion = "4.0.0-rc.1";
     packageReport.integrity = { manifestDigest: "b".repeat(64), manifest: { entries: [
       { path: "node_modules/agent-code-intel/dist/typescript-server.mjs", sha256: "e".repeat(64) },
       { path: "node_modules/pyright/langserver.index.js", sha256: "f".repeat(64) }
@@ -419,7 +419,7 @@ describe("product readiness report", () => {
     await writeJson(packagePath, packageReport);
     const evidencePath = path.join(artifactsDir, "lsp-sandbox-smoke-win32-x64.json");
     const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
-    evidence.productVersion = "3.0.0-rc.2";
+    evidence.productVersion = "4.0.0-rc.1";
     evidence.assets = {
       typescriptLanguageServerSha256: "0".repeat(64),
       pyrightSha256: "f".repeat(64)

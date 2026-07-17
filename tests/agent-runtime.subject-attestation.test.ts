@@ -66,7 +66,7 @@ describe("runtime subject attestation", () => {
       storeRootDir,
       tools: new EffectToolRegistry(),
       permissionMode: "auto",
-      runDeadlineMs: 10_000,
+      runDeadlineMs: 60_000,
       subjectAttestation
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });

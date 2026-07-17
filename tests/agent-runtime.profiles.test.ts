@@ -46,7 +46,7 @@ function profile(id: string, overrides: Partial<ResolvedAgentProfile> = {}): Res
     permissionMode: "ask",
     budget: { ...DEFAULT_PROFILE_BUDGET },
     mutationPolicy: {
-      requirePlanBeforeMutation: true, checkpointBeforeMutation: true, reviewNonDocumentationChanges: true
+      requirePlanBeforeMutation: true, checkpointBeforeMutation: true, reviewMode: "advisory"
     },
     allowedChildProfiles: [],
     ...overrides

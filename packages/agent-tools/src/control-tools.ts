@@ -118,7 +118,7 @@ function requestReviewTool(): RegisteredEffectTool {
   return {
     descriptor: descriptor(
       "request_review",
-      "Eligible non-documentation workspace deltas receive internal review automatically after passed validation. Use this tool only when the evidence ledger explicitly requests review or to retry a prior reviewer infrastructure/interruption failure. Supply no evidence IDs: the runtime selects pending deltas and their passed validation evidence. Genuine changes_requested findings must be addressed and revalidated first. On success, cite the resulting review evidence ID from the next current-run evidence ledger.",
+      "Eligible workspace changes receive internal review automatically after passed validation. Use this tool only when completion_status requests review or to retry a prior reviewer infrastructure/interruption failure. Supply no evidence IDs: the runtime selects the current frontier and validation. Genuine changes_requested findings must be addressed and revalidated first.",
       {}
     ),
     async execute(request, context) {

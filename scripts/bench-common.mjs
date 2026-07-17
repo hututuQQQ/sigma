@@ -36,6 +36,7 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["harbor_cli_error", "infra_failed"],
   ["node_missing", "infra_failed"],
   ["agent_setup_failed", "infra_failed"],
+  ["verifier_setup_failed", "infra_failed"],
   ["api_error", "api_error"],
   ["needs_input", "needs_input"],
   ["timeout", "timeout"],
@@ -54,6 +55,7 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["harbor_cli_error", "scripts/bench"],
   ["node_missing", "package-agent-cli"],
   ["agent_setup_failed", "portable/harbor"],
+  ["verifier_setup_failed", "environment"],
   ["api_error", "agent-model"],
   ["needs_input", "agent-runtime"],
   ["timeout", "agent-runtime"],
@@ -231,6 +233,22 @@ function networkMode(value, fallback = "none") {
   return mode;
 }
 
+function executionMode(value, fallback = "sandboxed") {
+  const mode = asString(value, fallback);
+  if (mode !== "sandboxed" && mode !== "disposable-container") {
+    throw new Error("execution mode must be sandboxed or disposable-container.");
+  }
+  return mode;
+}
+
+function benchmarkClass(value, fallback = "standard") {
+  const classification = asString(value, fallback);
+  if (classification !== "standard" && classification !== "diagnostic") {
+    throw new Error("benchmark class must be standard or diagnostic.");
+  }
+  return classification;
+}
+
 function normalizedSha256(value, name) {
   if (value === undefined || value === null || value === "") return null;
   const text = String(value).trim().toLowerCase();
@@ -296,11 +314,23 @@ export function resolveRunOptions(argv, env = process.env) {
     throw new Error("--reuse-package requires --expected-archive-sha256.");
   }
 
+  const runClass = benchmarkClass(flags["benchmark-class"] ?? env.SIGMA_BENCHMARK_CLASS);
+  const requestedLeniencyMultiplier = flags["timeout-leniency-multiplier"]
+    ?? env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER;
+  const requestedLeniencyExtra = flags["timeout-leniency-min-extra-sec"]
+    ?? env.AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC;
+  if (runClass === "standard" && (env.AGENT_MAX_WALL_TIME_SEC !== undefined
+    || (requestedLeniencyMultiplier !== undefined && Number(requestedLeniencyMultiplier) !== 1)
+    || (requestedLeniencyExtra !== undefined && Number(requestedLeniencyExtra) !== 0))) {
+    throw new Error("Standard benchmark runs prohibit timeout/resource overrides; use --benchmark-class diagnostic.");
+  }
   return {
     mode,
+    benchmarkClass: runClass,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
     networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
+    executionMode: executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE),
     runLabel: asString(flags["run-label"]),
     k: asPositiveInt(flags.k, 1, "--k"),
     nConcurrentTrials: asPositiveInt(
@@ -327,12 +357,12 @@ export function resolveRunOptions(argv, env = process.env) {
     ),
     agentTimeoutLeniencyMultiplier: asPositiveNumber(
       flags["timeout-leniency-multiplier"] ?? env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER,
-      defaultAgentTimeoutLeniencyMultiplier,
+      runClass === "diagnostic" ? defaultAgentTimeoutLeniencyMultiplier : 1,
       "--timeout-leniency-multiplier"
     ),
     agentTimeoutLeniencyMinExtraSec: asNonNegativeInt(
       flags["timeout-leniency-min-extra-sec"] ?? env.AGENT_TIMEOUT_LENIENCY_MIN_EXTRA_SEC,
-      defaultAgentTimeoutLeniencyMinExtraSec,
+      runClass === "diagnostic" ? defaultAgentTimeoutLeniencyMinExtraSec : 0,
       "--timeout-leniency-min-extra-sec"
     )
   };
@@ -438,6 +468,10 @@ function formatMultiplier(value) {
 }
 
 export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
+  // Direct library callers retain the historical diagnostic planning unless
+  // they classify the run. The CLI always resolves an explicit class and
+  // defaults it to standard.
+  const runClass = options.benchmarkClass ?? "diagnostic";
   const recommendedAgentTimeoutSec =
     maxProbeNumber(timeoutProbe, "agent_timeout_sec") ?? defaultAgentTimeoutFallbackSec;
   const requestedWallTimeSec = asFinitePositiveNumber(options.maxWallTimeSec);
@@ -452,14 +486,17 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
   const lenientAgentWallTimeSec = Math.ceil(
     Math.max(recommendedAgentTimeoutSec * leniencyMultiplier, recommendedAgentTimeoutSec + leniencyMinExtraSec)
   );
-  const agentWallTimeSec = Math.ceil(requestedWallTimeSec ?? lenientAgentWallTimeSec);
   const graceSec = Math.max(
     0,
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
   const cleanupGraceSec = graceSec;
+  const standardAgentWallTimeSec = Math.max(1, Math.floor(recommendedAgentTimeoutSec - cleanupGraceSec));
+  const agentWallTimeSec = runClass === "standard"
+    ? standardAgentWallTimeSec
+    : Math.ceil(requestedWallTimeSec ?? lenientAgentWallTimeSec);
   const harnessTimeoutSec = agentWallTimeSec + cleanupGraceSec;
-  const agentTimeoutMultiplier =
+  const agentTimeoutMultiplier = runClass === "diagnostic" &&
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
@@ -494,9 +531,11 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     recommended_verifier_timeout_sec: maxProbeNumber(timeoutProbe, "verifier_timeout_sec"),
     recommended_environment_build_timeout_sec: maxProbeNumber(timeoutProbe, "environment_build_timeout_sec"),
     agent_timeout_multiplier: agentTimeoutMultiplier,
-    verifier_timeout_multiplier: agentTimeoutMultiplier,
-    environment_build_timeout_multiplier: agentTimeoutMultiplier,
-    source: requestedWallTimeSec ? "explicit_max_wall_time" : timeoutProbe ? "harbor_task_metadata" : "fallback"
+    verifier_timeout_multiplier: runClass === "diagnostic" ? agentTimeoutMultiplier : null,
+    environment_build_timeout_multiplier: runClass === "diagnostic" ? agentTimeoutMultiplier : null,
+    benchmark_class: runClass,
+    source: runClass === "standard" ? "standard_task_timeout"
+      : requestedWallTimeSec ? "explicit_max_wall_time" : timeoutProbe ? "harbor_task_metadata" : "fallback"
   };
 }
 
@@ -535,7 +574,8 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
-    network_mode: options.networkMode ?? "none"
+    network_mode: options.networkMode ?? "none",
+    execution_mode: options.executionMode ?? "sandboxed"
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -700,6 +740,9 @@ export function buildHarborArgs(options) {
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
   if (options.networkMode !== undefined) {
     args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
+  }
+  if (options.executionMode !== undefined) {
+    args.push("--ak", formatAgentKwarg("execution_mode", "str", options.executionMode, capabilities));
   }
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
@@ -1232,16 +1275,39 @@ function parseStdoutVerifierFailures(stdoutText) {
   return failures;
 }
 
+function verifierInfrastructureEvidence(stdoutText, failedTests) {
+  if (failedTests.length > 0) return [];
+  const text = String(stdoutText ?? "");
+  const hasProductTestResult = /(?:^|\n)FAILED\s+\S+|\bAssertionError\b|\b\d+\s+(?:passed|failed)\b|=+\s+.*\b(?:passed|failed)\b.*=+/imu
+    .test(text);
+  if (hasProductTestResult) return [];
+  const evidence = [];
+  const checks = [
+    ["dependency_install_network", /(?:failed to fetch|bad gateway|temporary failure resolving|could not resolve|network is unreachable|connection (?:timed out|reset))/iu],
+    ["dependency_install_failed", /(?:unable to fetch some archives|could not install packages|subprocess-exited-with-error|npm err!|pnpm.*err)/iu],
+    ["verifier_launch_failed", /\/tests\/[^\s:]+:\s*(?:no such file or directory|permission denied)/iu],
+    ["verifier_toolchain_missing", /(?:pytest|uvx|curl|node|python\d*):\s*(?:command not found|no such file or directory)/iu],
+    ["verifier_module_missing", /(?:error collecting|ModuleNotFoundError:\s*No module named)/iu]
+  ];
+  for (const [code, pattern] of checks) {
+    if (pattern.test(text)) evidence.push(code);
+  }
+  return evidence;
+}
+
 async function readVerifierDetails(runDir, trialDir) {
   const verifierDir = path.join(trialDir, "verifier");
   const ctrfPath = path.join(verifierDir, "ctrf.json");
   const stdoutPath = path.join(verifierDir, "test-stdout.txt");
   const ctrf = await readJsonSafe(ctrfPath);
   const stdoutText = await readTextSafe(stdoutPath);
-  const failedTests = parseVerifierFailures(ctrf);
+  const parsedFailures = parseVerifierFailures(ctrf);
+  const failedTests = parsedFailures.length > 0 ? parsedFailures : parseStdoutVerifierFailures(stdoutText);
+  const infrastructureEvidence = verifierInfrastructureEvidence(stdoutText, failedTests);
   return {
-    verifier_failed_tests: failedTests.length > 0 ? failedTests : parseStdoutVerifierFailures(stdoutText),
-    verifier_log_path: relativePathOrNull(runDir, stdoutPath)
+    verifier_failed_tests: failedTests,
+    verifier_log_path: relativePathOrNull(runDir, stdoutPath),
+    verifier_infrastructure_evidence: infrastructureEvidence
   };
 }
 
@@ -1399,6 +1465,42 @@ function emptyTaskForTrial(trialResult, index) {
   };
 }
 
+function withLayeredOutcomes(task, trialResult) {
+  const traceSummary = trialResult?.agent_trace_summary ?? {};
+  const metadata = trialResult?.agent_result?.metadata ?? {};
+  const agentFailed = Boolean(trialResult?.exception_info)
+    || (typeof metadata.exit_code === "number" && metadata.exit_code !== 0)
+    || ["error", "failed", "cancelled"].includes(traceSummary.status);
+  const agentOutcome = task.agent_outcome ?? (traceSummary.status === "completed" || (!agentFailed && metadata.exit_code === 0)
+    ? "completed" : agentFailed ? "failed" : "unknown");
+  const reward = trialResult?.verifier_result?.rewards?.reward;
+  const infrastructureEvidence = Array.isArray(trialResult?.verifier_infrastructure_evidence)
+    ? trialResult.verifier_infrastructure_evidence : [];
+  if (infrastructureEvidence.length > 0) {
+    return withSuggestedOwner({
+      ...task,
+      status: "infra_failed",
+      failure_category: "verifier_setup_failed",
+      verifier_status: "infra_failed",
+      agent_outcome: agentOutcome,
+      verifier_outcome: "infra_failed",
+      validity: "infra_failed",
+      verifier_infrastructure_evidence: infrastructureEvidence,
+      last_error: `Verifier infrastructure failed before product assertions: ${infrastructureEvidence.join(", ")}.`
+    });
+  }
+  const verifierOutcome = typeof reward === "number"
+    ? reward >= 1 ? "passed" : "failed"
+    : (trialResult?.verifier_failed_tests?.length ?? 0) > 0 ? "failed" : "not_run";
+  return withSuggestedOwner({
+    ...task,
+    agent_outcome: agentOutcome,
+    verifier_outcome: verifierOutcome,
+    validity: "valid",
+    verifier_infrastructure_evidence: []
+  });
+}
+
 function mergeHarborTrialResults(mirroredTasks, harborTrialResults) {
   const unused = new Set(mirroredTasks.map((_task, index) => index));
   const tasks = harborTrialResults.map((trialResult, index) => {
@@ -1407,7 +1509,10 @@ function mergeHarborTrialResults(mirroredTasks, harborTrialResults) {
     ));
     const mirror = mirrorIndex >= 0 ? mirroredTasks[mirrorIndex] : emptyTaskForTrial(trialResult, index);
     if (mirrorIndex >= 0) unused.delete(mirrorIndex);
-    return mergeHarborTrialResult({ ...mirror, index }, trialResult);
+    return withLayeredOutcomes(
+      mergeHarborTrialResult({ ...mirror, index }, trialResult),
+      trialResult
+    );
   });
   const orphanArtifacts = [...unused].map((index) => {
     const task = mirroredTasks[index];
@@ -1614,6 +1719,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     artifact_dir: path.relative(runDir, taskDir).replace(/\\/g, "/"),
     index,
     status,
+    agent_outcome: summary.status === "completed" ? "completed"
+      : ["error", "failed", "cancelled"].includes(summary.status) ? "failed" : "unknown",
     failure_category: failureCategory,
     failure_signals: failureSignals,
     summary_path: relativePathOrNull(runDir, summaryPath),
@@ -1880,12 +1987,24 @@ export async function generateBenchReport(runDir) {
     tasks = merged.tasks;
     orphanArtifacts = merged.orphanArtifacts;
   }
-  tasks = tasks.map(withSuggestedOwner);
+  tasks = tasks.map((task) => withSuggestedOwner({
+    agent_outcome: task.agent_outcome ?? (task.status === "passed" ? "completed" : "unknown"),
+    verifier_outcome: task.verifier_outcome ?? (task.verifier_status ?? "not_run"),
+    validity: task.validity ?? "valid",
+    verifier_infrastructure_evidence: task.verifier_infrastructure_evidence ?? [],
+    ...task
+  }));
 
   const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
   for (const task of tasks) {
     addCount(counts, task.status, task.failure_category);
   }
+  const validity = {
+    valid: tasks.filter((task) => task.validity === "valid").length,
+    infra_failed: tasks.filter((task) => task.validity === "infra_failed").length
+  };
+  const effectiveTasks = tasks.filter((task) => task.validity === "valid");
+  const effectivePassed = effectiveTasks.filter((task) => task.verifier_outcome === "passed").length;
 
   const commandScript = await readTextSafe(commandPath);
   const notes = Array.isArray(config.notes) ? [...config.notes] : [];
@@ -1942,6 +2061,12 @@ export async function generateBenchReport(runDir) {
     package_reused: config.package_reused ?? false,
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
     trial_accounting: accounting,
+    validity,
+    effective_correctness: {
+      passed: effectivePassed,
+      total: effectiveTasks.length,
+      pass_rate: effectiveTasks.length > 0 ? effectivePassed / effectiveTasks.length : null
+    },
     harbor_job_accounting: harborJobAccounting,
     orphan_artifacts: orphanArtifacts,
     usage,
@@ -1951,7 +2076,8 @@ export async function generateBenchReport(runDir) {
     harbor_exit_code: exitCode,
     score_status: scoreStatus,
     infra_status: infraStatus,
-    score_mode: "standard_benchmark",
+    execution_mode: config.execution_mode ?? "sandboxed",
+    score_mode: config.score_mode ?? (config.benchmark_class === "diagnostic" ? "diagnostic" : "standard_benchmark"),
     status: incompleteReason.length > 0
       ? "incomplete"
       : failedCount > 0

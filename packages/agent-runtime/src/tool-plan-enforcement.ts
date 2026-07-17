@@ -1,57 +1,60 @@
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import type { ModelToolCall, ToolCallPlan, ToolReceipt, WorkspaceDeltaEvidence } from "agent-protocol";
+import type { ModelToolCall, ToolCallPlan, ToolReceipt } from "agent-protocol";
 import { canonicalWorkspacePath, isInside } from "agent-platform";
-import { sessionMutationEvidence, unresolvedWorkspaceDeltas } from "./mutation-evidence.js";
 import { effectsOutsidePlan } from "./tool-evidence.js";
 import type { RuntimeSession } from "./types.js";
 
-export function validationTargetIds(
-  session: RuntimeSession,
-  call: ModelToolCall,
-  plan: ToolCallPlan
-): string[] | undefined {
-  if (!plan.exactEffects.includes("validation")) return undefined;
-  const argumentsValue = call.arguments;
-  const input = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
-    ? argumentsValue as Record<string, unknown> : {};
-  const requested = input.workspaceDeltaEvidenceIds;
-  const unresolvedItems = unresolvedWorkspaceDeltas(session);
-  if (requested === undefined) {
-    if (call.name !== "validate") return undefined;
-    if (unresolvedItems.length <= 1) return unresolvedItems.map((item) => item.evidenceId);
-    throw Object.assign(new Error(
-      "Validation scope is ambiguous because multiple unresolved workspace deltas exist. "
-      + `Supply the exact workspaceDeltaEvidenceIds genuinely exercised by this command: ${unresolvedItems
-        .map((item) => item.evidenceId).join(", ")}.`
-    ), { code: "validation_scope_ambiguous" });
-  }
-  if (!Array.isArray(requested) || requested.length === 0
-    || requested.some((item) => typeof item !== "string" || item.length === 0)) {
-    throw Object.assign(new Error(
-      "workspaceDeltaEvidenceIds must be a non-empty array of unresolved workspace delta evidence IDs."
-    ), { code: "validation_scope_invalid" });
-  }
-  const unresolved = new Set(unresolvedItems.map((item) => item.evidenceId));
-  const ids = [...new Set(requested as string[])];
-  const invalid = ids.filter((id) => !unresolved.has(id));
-  if (invalid.length > 0) {
-    throw Object.assign(new Error(
-      `Validation targets are missing, foreign, or already covered: ${invalid.join(", ")}.`
-    ), { code: "validation_scope_invalid" });
-  }
-  return ids;
+export interface FrozenValidationScope {
+  frontierRevision: number;
+  stateDigest: string;
+  coveredPaths: string[];
 }
 
-export function workspaceDeltas(
+function portable(value: string): string {
+  return value.split(path.sep).join("/").replace(/^\.\//u, "") || ".";
+}
+
+function coveredByRoot(changedPath: string, root: string): boolean {
+  const normalizedRoot = portable(root).replace(/\/$/u, "");
+  const normalizedPath = portable(changedPath);
+  return normalizedRoot === "." || normalizedPath === normalizedRoot
+    || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+/** Resolve the workspace object that was changed without following a final
+ * symlink. Parent links are still canonicalized and must remain contained. */
+async function canonicalWrittenObjectPath(
+  workspacePath: string,
+  requested: string
+): Promise<string | null> {
+  const workspace = path.resolve(workspacePath);
+  const lexical = path.resolve(workspace, requested);
+  if (!isInside(workspace, lexical)) return null;
+  if (lexical === workspace) return workspace;
+  const parent = await canonicalWorkspacePath(workspacePath, path.dirname(lexical)).catch(() => null);
+  return parent ? path.join(parent, path.basename(lexical)) : null;
+}
+
+/** Freeze validation authority at preparation time. Coverage is derived from
+ * approved read roots, never from opaque identifiers supplied by the model. */
+export function validationScope(
   session: RuntimeSession,
-  selectedIds: string[] | undefined
-): WorkspaceDeltaEvidence[] {
-  if (!selectedIds) return unresolvedWorkspaceDeltas(session);
-  const byId = new Map(sessionMutationEvidence(session)
-    .filter((item): item is WorkspaceDeltaEvidence => item.kind === "workspace_delta" && item.status === "passed")
-    .map((item) => [item.evidenceId, item]));
-  return selectedIds.map((id) => byId.get(id)).filter((item): item is WorkspaceDeltaEvidence => Boolean(item));
+  _call: ModelToolCall,
+  plan: ToolCallPlan
+): FrozenValidationScope | undefined {
+  if (!plan.exactEffects.includes("validation")) return undefined;
+  const frontier = session.durable.state.mutationFrontier;
+  const workspaceRoot = path.resolve(session.identity.workspacePath);
+  const roots = plan.readPaths.flatMap((item) => {
+    const resolved = path.resolve(workspaceRoot, item);
+    return isInside(workspaceRoot, resolved) ? [portable(path.relative(workspaceRoot, resolved))] : [];
+  });
+  return {
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    coveredPaths: frontier.changedPaths.filter((item) => roots.some((root) => coveredByRoot(item, root)))
+  };
 }
 
 export async function assertCheckpointActionAllowed(
@@ -60,21 +63,14 @@ export async function assertCheckpointActionAllowed(
   hasActiveChildren: () => Promise<boolean | undefined>
 ): Promise<void> {
   if (!plan.checkpointAction) return;
-  if (plan.checkpointAction.kind !== "restore"
-    || !plan.exactEffects.includes("checkpoint.restore")) {
-    throw Object.assign(new Error("Invalid checkpoint transaction-control plan."), {
-      code: "checkpoint_action_invalid"
-    });
+  if (plan.checkpointAction.kind !== "restore" || !plan.exactEffects.includes("checkpoint.restore")) {
+    throw Object.assign(new Error("Invalid checkpoint transaction-control plan."), { code: "checkpoint_action_invalid" });
   }
   if (session.durable.state.activeProcessIds.length > 0) {
-    throw Object.assign(new Error("Run changes cannot be restored while background processes are active."), {
-      code: "checkpoint_processes_active"
-    });
+    throw Object.assign(new Error("Run changes cannot be restored while background processes are active."), { code: "checkpoint_processes_active" });
   }
   if (await hasActiveChildren()) {
-    throw Object.assign(new Error("Run changes cannot be restored while child agents are active."), {
-      code: "checkpoint_children_active"
-    });
+    throw Object.assign(new Error("Run changes cannot be restored while child agents are active."), { code: "checkpoint_children_active" });
   }
 }
 
@@ -99,28 +95,24 @@ export async function assertReceiptWithinPlan(
   plan: ToolCallPlan
 ): Promise<void> {
   const outside = effectsOutsidePlan(receipt, plan);
-  const changedPaths = receipt.workspaceDelta
-    ? [
-      ...receipt.workspaceDelta.added.map((item) => ({ path: item, kind: "added" as const })),
-      ...receipt.workspaceDelta.modified.map((item) => ({ path: item, kind: "modified" as const })),
-      ...receipt.workspaceDelta.deleted.map((item) => ({ path: item, kind: "deleted" as const }))
-    ]
-    : [];
+  const changedPaths = receipt.workspaceDelta ? [
+    ...receipt.workspaceDelta.added.map((item) => ({ path: item, kind: "added" as const })),
+    ...receipt.workspaceDelta.modified.map((item) => ({ path: item, kind: "modified" as const })),
+    ...receipt.workspaceDelta.deleted.map((item) => ({ path: item, kind: "deleted" as const }))
+  ] : [];
   const plannedWritePaths = plan.writePaths.length > 0
-    ? plan.writePaths
-    : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
+    ? plan.writePaths : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
   const allowedResults = await Promise.all(plannedWritePaths.map(async (item) =>
-    await canonicalWorkspacePath(session.identity.workspacePath, item).catch(() => null)));
+    await canonicalWrittenObjectPath(session.identity.workspacePath, item)));
   const invalidAllowed = plannedWritePaths.filter((_item, index) => !allowedResults[index]);
   const allowed = allowedResults.filter((item): item is string => Boolean(item));
   const outsidePaths: string[] = [];
   for (const item of changedPaths) {
-    const canonical = await canonicalWorkspacePath(session.identity.workspacePath, item.path).catch(() => null);
+    const canonical = await canonicalWrittenObjectPath(session.identity.workspacePath, item.path);
     if (canonical && allowed.some((root) => isInside(root, canonical))) continue;
-    const addedParentDirectory = await implicitAddedParentDirectory(
-      session.identity.workspacePath, item, canonical, allowed
-    );
-    if (!addedParentDirectory) outsidePaths.push(item.path);
+    if (!await implicitAddedParentDirectory(session.identity.workspacePath, item, canonical, allowed)) {
+      outsidePaths.push(item.path);
+    }
   }
   if (outside.length === 0 && outsidePaths.length === 0 && invalidAllowed.length === 0) return;
   const details = [

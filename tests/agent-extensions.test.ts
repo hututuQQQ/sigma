@@ -229,7 +229,7 @@ function profile(overrides: Partial<ResolvedAgentProfile> = {}): ResolvedAgentPr
     mutationPolicy: {
       requirePlanBeforeMutation: true,
       checkpointBeforeMutation: true,
-      reviewNonDocumentationChanges: true
+      reviewMode: "advisory"
     },
     allowedChildProfiles: [],
     ...overrides

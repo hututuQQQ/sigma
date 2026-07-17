@@ -175,7 +175,8 @@ export async function streamModelResponse(
   tools: ModelToolDefinition[],
   toolChoice: ModelRequest["toolChoice"],
   signal: AbortSignal,
-  routeConstraints: ModelRouteConstraints | undefined
+  routeConstraints: ModelRouteConstraints | undefined,
+  outputReserveTokens: number
 ): Promise<ModelResponse> {
   const state = newModelStreamState();
   const gateway = session.services.gateway as typeof session.services.gateway & {
@@ -189,7 +190,7 @@ export async function streamModelResponse(
     tools,
     ...(toolChoice ? { toolChoice } : {}),
     signal,
-    maxOutputTokens: Math.min(options.outputReserveTokens, session.services.gateway.capabilities.maxOutputTokens)
+    maxOutputTokens: Math.min(outputReserveTokens, session.services.gateway.capabilities.maxOutputTokens)
   };
   const stream = routeConstraints && gateway.streamWithConstraints
     ? gateway.streamWithConstraints(request, routeConstraints)

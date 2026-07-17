@@ -2,6 +2,7 @@ import type { JsonValue, ModelToolCall, RunOutcome, ToolReceipt } from "agent-pr
 import {
   completionRepairFailureMessage,
   completionSummary,
+  blockedReport,
   failedTerminalRepairState,
   currentRunReferenceableEvidenceCount,
   protectedCompletionAnswer,
@@ -81,10 +82,11 @@ export function protectedToolBatchFailure(
   calls: readonly ModelToolCall[]
 ): { code: "terminal_batch_conflict" | "terminal_protocol_invalid"; message: string } | null {
   if (state.completionRepair?.kind !== "protected_completion") return null;
-  const terminal = calls[0]?.name === "complete_task" || calls[0]?.name === "request_user_input";
+  const terminal = calls[0]?.name === "complete_task" || calls[0]?.name === "report_blocked"
+    || calls[0]?.name === "request_user_input";
   if (calls.length === 1 && terminal) return null;
   const terminalCount = calls.filter((call) =>
-    call.name === "complete_task" || call.name === "request_user_input").length;
+    call.name === "complete_task" || call.name === "report_blocked" || call.name === "request_user_input").length;
   return calls.length > 1 && terminalCount > 0
     ? {
         code: "terminal_batch_conflict",
@@ -100,9 +102,10 @@ function terminalReceiptFailure(
   state: KernelState,
   progressed: KernelState,
   toolName: string,
-  action: "complete" | "request_input"
+  action: "complete" | "report_blocked" | "request_input"
 ): KernelState | null {
-  const expectedTool = action === "complete" ? "complete_task" : "request_user_input";
+  const expectedTool = action === "complete" ? "complete_task"
+    : action === "report_blocked" ? "report_blocked" : "request_user_input";
   if (toolName === expectedTool) return null;
   return proposedOutcomeState(progressed, {
     kind: "recoverable_failure",
@@ -134,6 +137,45 @@ function ordinaryCompletionMessage(answer: string | null, summary: string): stri
   return `${answer}\n\nResult: ${summary}`;
 }
 
+function advisoryReviewWarnings(state: KernelState): string {
+  const frontier = state.mutationFrontier;
+  const review = state.evidence.filter((item): item is Extract<typeof item, { kind: "review" }> => item.kind === "review"
+    && item.data.frontierRevision === frontier.revision
+    && item.data.stateDigest === frontier.currentStateDigest).at(-1);
+  if (!review || (review.status === "passed" && review.data.findings.length === 0)) return "";
+  const findings = review.data.findings.slice(0, 20).map((item) =>
+    `- ${typeof item === "string" ? item : JSON.stringify(item)}`).join("\n");
+  return `\n\nAdvisory review warnings:\n${findings || `- ${review.summary}`}`;
+}
+
+function hasCurrentFailedValidation(state: KernelState): boolean {
+  return state.evidence.some((item) => item.kind === "validation"
+    && item.status === "failed"
+    && item.data.frontierRevision === state.mutationFrontier.revision
+    && item.data.stateDigest === state.mutationFrontier.currentStateDigest);
+}
+
+function invalidBlockedReportState(state: KernelState, progressed: KernelState): KernelState | null {
+  if (hasCurrentFailedValidation(progressed)) return null;
+  if (state.completionRepairAttempts >= 2) {
+    return proposedOutcomeState(progressed, {
+      kind: "recoverable_failure",
+      code: "convergence_no_progress",
+      message: "report_blocked was repeated without a failed validation on the current workspace state."
+    });
+  }
+  return {
+    ...progressed,
+    phase: "ready_model",
+    completionRepairAttempts: state.completionRepairAttempts + 1,
+    completionRepair: { kind: "terminal_action" },
+    messages: [...progressed.messages, {
+      role: "developer",
+      content: "report_blocked requires a failed semantic validation on the current workspace state. Continue repair or validation, complete if the frontier is ready, or request user input only for a genuine user decision."
+    }]
+  };
+}
+
 const COMPLETION_PREREQUISITE_CODES = new Set([
   "validation_evidence_required",
   "validation_result_reporting_required",
@@ -152,13 +194,13 @@ function completionPrerequisiteRepair(input: TerminalReceiptTransition): KernelS
   const previous = input.state.completionRepair?.kind === "completion_prerequisite"
     ? input.state.completionRepair : undefined;
   const retryCount = previous ? previous.retryCount + 1 : 0;
-  if (retryCount >= 3) {
+  if (retryCount >= 2) {
     return proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
-      code: "completion_prerequisite_unresolved",
+      code: "convergence_no_progress",
       message: completionRepairFailureMessage(
         input.state,
-        "Completion prerequisites remained unresolved after bounded automatic retries."
+        "Completion prerequisites remained unresolved after two correction turns."
       )
     });
   }
@@ -205,6 +247,18 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
       message: inputMessage
     });
   }
+  const blocked = blockedReport(input.receipt);
+  if (blocked) {
+    const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "report_blocked");
+    if (failure) return failure;
+    const invalid = invalidBlockedReportState(input.state, input.progressed);
+    if (invalid) return invalid;
+    return proposedOutcomeState(input.progressed, {
+      kind: "recoverable_failure",
+      code: blocked.code,
+      message: blocked.message
+    });
+  }
   const summary = completionSummary(input.receipt);
   if (summary) {
     const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
@@ -216,8 +270,8 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
       // terminal repair. On an ordinary completion, retain both handoff
       // surfaces so a generic same-turn status cannot hide
       // the structured completion summary.
-      message: protectedCompletionAnswer(input.state)
-        || ordinaryCompletionMessage(sameTurnAnswer, summary),
+      message: `${protectedCompletionAnswer(input.state)
+        || ordinaryCompletionMessage(sameTurnAnswer, summary)}${advisoryReviewWarnings(input.progressed)}`,
       evidence: input.progressed.evidence
     });
   }

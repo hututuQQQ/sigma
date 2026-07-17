@@ -5,7 +5,10 @@ import {
   type BudgetLimits
 } from "../packages/agent-protocol/src/index.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
-import { convergenceAdmissionFailure } from "../packages/agent-runtime/src/convergence-policy.js";
+import {
+  convergenceAdmissionFailure,
+  deadlineForecast
+} from "../packages/agent-runtime/src/convergence-policy.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -38,6 +41,30 @@ function controller(target: RuntimeSession): BudgetController {
 }
 
 describe("unified convergence admission policy", () => {
+  it("uses the latest eight P90 latencies to enter converge and stop stages", () => {
+    const target = runtimeSessionFixture();
+    target.durable.state.usage = [10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 100_000]
+      .map((latencyMs, index) => ({
+        usageId: `usage-${index}`, requestId: `request-${index}`,
+        sessionId: target.identity.sessionId, runId: target.durable.runId,
+        role: target.services.modelRole, routeId: "route", providerId: "provider", modelId: "model",
+        tokenizerId: "tokenizer", tokenizerAccuracy: "exact" as const, providerReported: true,
+        inputTokens: 1, outputTokens: 1, reasoningTokens: 0, cacheReadTokens: 0,
+        cacheWriteTokens: 0, costMicroUsd: 0, latencyMs, attempt: 1,
+        occurredAt: new Date().toISOString()
+      }));
+
+    target.durable.state.deadlineRemainingMs = 459_999;
+    expect(deadlineForecast(target)).toMatchObject({
+      stage: "converge", nextModelEstimateMs: 150_000, settlementReserveMs: 10_000
+    });
+    target.durable.state.deadlineRemainingMs = 159_999;
+    expect(deadlineForecast(target).stage).toBe("stop");
+    expect(convergenceAdmissionFailure(target, { kind: "model" })).toMatchObject({
+      kind: "recoverable_failure", code: "budget_exhausted"
+    });
+  });
+
   it("returns a typed failure before an action that cannot settle inside active time", () => {
     const target = runtimeSessionFixture();
     target.durable.state.deadlineRemainingMs = 1_000;

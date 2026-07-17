@@ -314,7 +314,7 @@ describe("configured runtime execution capabilities", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  it("keeps subject attestation out of task evidence and first-stop terminal repair", async () => {
+  it("keeps subject attestation out of task evidence while ordinary text completes", async () => {
     const root = await workspace();
     const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-attestation-state-"));
     fixtures.push(stateRoot);
@@ -357,16 +357,13 @@ describe("configured runtime execution capabilities", () => {
       for await (const event of configuredRuntime.runtime.sessionEvents(session.sessionId)) events.push(event);
       const toolResults = events.filter((event) => event.type === "tool.completed" || event.type === "tool.failed");
       expect(outcome, JSON.stringify(toolResults.map((event) => event.payload))).toMatchObject({
-        kind: "needs_input", message: "What should I inspect?"
+        kind: "completed", message: "Hello. What should I inspect?"
       });
 
-      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(1);
       const initialContext = gateway.requests[0]!.messages.map((message) => message.content).join("\n");
       expect(initialContext).not.toContain("Current-run typed durable evidence ledger");
       expect(initialContext).not.toContain("subject-attestation:");
-      expect(gateway.requests[1]!.toolChoice).toBe("required");
-      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).toContain("request_user_input");
-      expect(gateway.requests[1]!.tools?.map((tool) => tool.name)).not.toContain("complete_task");
 
       expect(events.filter((event) => event.type === "evidence.recorded"
         && (event.payload as { data?: { source?: string } }).data?.source

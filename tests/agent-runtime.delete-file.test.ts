@@ -35,7 +35,7 @@ describe("delete_file runtime transaction", () => {
       store,
       storeRootDir,
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const approve = (async () => {

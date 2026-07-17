@@ -94,7 +94,7 @@ function profile(id: string, hookIds: string[] = []): ReturnType<typeof freezeAg
     mutationPolicy: {
       requirePlanBeforeMutation: true,
       checkpointBeforeMutation: true,
-      reviewNonDocumentationChanges: true
+      reviewMode: "advisory"
     },
     allowedChildProfiles: []
   };
@@ -196,7 +196,7 @@ describe("production agent-profile hook runner", () => {
       const events = [];
       for await (const event of stored.events(session.sessionId)) events.push(event);
       expect(events.find((event) => event.type === "customization.frozen")?.payload)
-        .toMatchObject({ hookCount: 1, profileCount: 1 });
+        .toMatchObject({ hookCount: 1, profileCount: 2 });
       expect(events.find((event) => event.type === "usage.recorded")?.payload)
         .toMatchObject({ role: "planner", providerReported: true });
       expect(events.some((event) => event.type === "hook.completed")).toBe(true);

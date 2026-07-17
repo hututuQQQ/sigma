@@ -67,6 +67,22 @@ function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
   };
 }
 
+function receiptToolName(
+  session: RuntimeSession,
+  receipt: ToolReceipt,
+  modelTurn: ActiveModelTurn
+): string {
+  return session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
+    && item.modelTurn.turnId === modelTurn.turnId
+    && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
+}
+
+function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "required"): boolean {
+  if (name === "request_review") return true;
+  if (name === "complete_task") return reviewMode !== "off";
+  return reviewMode === "required" && name === "validate";
+}
+
 export class EffectRunner {
   private readonly models: ModelEffectRunner;
   private readonly reviews: ReviewCoordinator;
@@ -115,7 +131,8 @@ export class EffectRunner {
     const descriptors = this.options.runtime.tools.descriptors();
     const terminalOnly = effects.every((effect) => descriptors
       .find((item) => item.name === effect.request.name)
-      ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.request_input") === true);
+          ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.report_blocked"
+            || item === "outcome.request_input") === true);
     const failure = convergenceAdmissionFailure(session, {
       kind: "tool", count: effects.length, terminalOnly
     });
@@ -294,9 +311,7 @@ export class EffectRunner {
   }
 
   private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
-    const name = session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
-      && item.modelTurn.turnId === modelTurn.turnId
-      && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
+    const name = receiptToolName(session, receipt, modelTurn);
     const durableReceipt = durableToolReceipt(receipt);
     await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
       ...durableReceipt, name, ...turnPayload(modelTurn)
@@ -316,11 +331,14 @@ export class EffectRunner {
         evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
         artifactRefs: receipt.artifactRefs ?? []
       }, session.execution.controller?.signal ?? new AbortController().signal);
-      await this.reviews.maybeReview(
-        session,
-        session.execution.controller?.signal ?? new AbortController().signal,
-        name === "request_review"
-      );
+      const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
+      if (shouldReviewReceipt(name, reviewMode)) {
+        await this.reviews.maybeReview(
+          session,
+          session.execution.controller?.signal ?? new AbortController().signal,
+          name === "request_review"
+        );
+      }
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

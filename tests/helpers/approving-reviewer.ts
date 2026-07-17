@@ -18,7 +18,9 @@ export function createApprovingReviewer(id = "test-independent-reviewer"): Revie
           reviewerId: id,
           verdict: "approved",
           findings: [],
-          workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+          frontierRevision: input.frontierRevision,
+          stateDigest: input.stateDigest,
+          validationEvidenceIds: input.validations.map((item) => item.evidenceId),
           ...(input.workspaceDeltas.at(-1)?.data.checkpointId
             ? { checkpointId: input.workspaceDeltas.at(-1)!.data.checkpointId }
             : {})

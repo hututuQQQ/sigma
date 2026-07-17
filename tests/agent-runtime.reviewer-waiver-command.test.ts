@@ -102,7 +102,12 @@ function validation(id: string, deltaId: string): ValidationEvidence {
     createdAt: occurredAt,
     producer: { authority: "runtime", id: "test-validator" },
     summary: "Validation passed.",
-    data: { validator: "test", workspaceDeltaEvidenceIds: [deltaId] }
+    data: {
+      validator: "test",
+      frontierRevision: deltaId === "delta-one" ? 1 : 2,
+      stateDigest: (deltaId === "delta-one" ? "a" : "b").repeat(64),
+      coveredPaths: [deltaId === "delta-one" ? "src/one.ts" : "src/two.ts"]
+    }
   };
 }
 
@@ -120,7 +125,9 @@ function review(deltaId: string): ReviewEvidence {
       reviewerId: "independent-reviewer",
       verdict: "approved",
       findings: [],
-      workspaceDeltaEvidenceIds: [deltaId]
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      checkpointId: deltaId === "delta-one" ? "checkpoint-one" : "checkpoint-two"
     }
   };
 }
@@ -132,7 +139,7 @@ function runtime(storeRootDir: string, store = new SegmentedJsonlStore({ rootDir
     storeRootDir,
     tools: registerBuiltinTools(new EffectToolRegistry()),
     permissionMode: "auto",
-    runDeadlineMs: 10_000
+    runDeadlineMs: 60_000
   });
 }
 

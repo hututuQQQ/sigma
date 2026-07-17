@@ -108,7 +108,8 @@ function reviewEvidence(evidenceId: string): EvidenceRecord {
       reviewerId: "reviewer",
       verdict: "approved",
       findings: [],
-      workspaceDeltaEvidenceIds: []
+      frontierRevision: 0,
+      stateDigest: "0".repeat(64)
     }
   };
 }
@@ -151,8 +152,9 @@ function failedValidationEvidence(evidenceId: string): EvidenceRecord {
         cancelled: false
       },
       artifactIds: [],
-      workspaceDeltaEvidenceIds: [],
-      checkpointIds: []
+      frontierRevision: 0,
+      stateDigest: "0".repeat(64),
+      coveredPaths: []
     }
   };
 }

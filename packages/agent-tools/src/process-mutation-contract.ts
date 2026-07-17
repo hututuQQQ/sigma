@@ -87,23 +87,45 @@ function writeContract(
   return { access: "write", writeRoots: roots, expectedChanges: expected };
 }
 
-function mutationContract(
-  input: Record<string, JsonValue>,
-  runMode: "analyze" | "change",
-  background: boolean
-): ProcessMutationContract {
-  const declaration = mutationDeclaration(input);
-  const hasNewWriteScope = declaration.writeRoots.length + declaration.expectedChanges.length > 0;
-  if (!declaration.access && hasNewWriteScope) {
-    throw writePlanError(
-      "Explicit access='write' is required with writeRoots and expectedChanges.",
-      "write_scope_required"
-    );
+async function nearestExistingWriteRoot(workspacePath: string, requested: string): Promise<string> {
+  const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
+  let current = path.resolve(workspaceRoot, requested);
+  if (!isInside(workspaceRoot, current)) {
+    throw writePlanError(`Process mutation path escapes the workspace: ${requested}.`, "write_plan_invalid");
   }
-  const effectiveAccess = declaration.access ?? (declaration.legacy.length > 0 ? "write" : "readonly");
-  return effectiveAccess === "write"
-    ? writeContract(declaration, runMode, background)
-    : readonlyContract(declaration);
+  for (;;) {
+    const info = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (info?.isSymbolicLink()) {
+      throw writePlanError(`Process mutation paths cannot traverse links: ${requested}.`, "write_plan_invalid");
+    }
+    if (info?.isDirectory()) return portableWorkspacePath(workspaceRoot, current);
+    if (info) current = path.dirname(current);
+    else {
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    if (!isInside(workspaceRoot, current)) break;
+  }
+  throw writePlanError(`No existing workspace write root contains: ${requested}.`, "write_plan_invalid");
+}
+
+async function inferExpectedChangesContract(
+  declaration: ProcessMutationDeclaration,
+  workspacePath: string
+): Promise<ProcessMutationDeclaration> {
+  if (declaration.access || declaration.legacy.length > 0 || declaration.expectedChanges.length === 0) {
+    return declaration;
+  }
+  const inferredRoots = declaration.writeRoots.length > 0
+    ? declaration.writeRoots
+    : await Promise.all(declaration.expectedChanges.map(async (item) =>
+      await nearestExistingWriteRoot(workspacePath, item)
+    ));
+  return { ...declaration, access: "write", writeRoots: [...new Set(inferredRoots)] };
 }
 
 function isProtectedWorkspacePath(workspaceRoot: string, target: string): boolean {
@@ -202,5 +224,9 @@ export async function processMutationContract(
   runMode: "analyze" | "change",
   background: boolean
 ): Promise<ProcessMutationContract> {
-  return await validateMutationContract(workspacePath, mutationContract(input, runMode, background));
+  const declaration = await inferExpectedChangesContract(mutationDeclaration(input), workspacePath);
+  const contract = declaration.access === "write" || declaration.legacy.length > 0
+    ? writeContract(declaration, runMode, background)
+    : readonlyContract(declaration);
+  return await validateMutationContract(workspacePath, contract);
 }

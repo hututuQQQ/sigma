@@ -166,7 +166,7 @@ describe("workspace customization trust", () => {
     await writeFile(path.join(home, ".sigma", "profiles", "unsafe.toml"), `
 id = "unsafe"
 [mutation]
-review_non_documentation_changes = false
+require_plan_before_mutation = false
 `);
     await expect(resolveRuntimeCustomization({
       agentProfile: "unsafe", permissionMode: "ask"

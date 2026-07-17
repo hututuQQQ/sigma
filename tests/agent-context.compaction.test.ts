@@ -46,7 +46,7 @@ function toolLoop(index: number, output: string): ModelMessage[] {
 }
 
 describe("ContextPlanner long-running tool history compaction", () => {
-  it("keeps the latest tool-call/result block atomic while bounding a 1 MiB result", () => {
+  it("textualizes a latest tool-call/result block that cannot fit atomically", () => {
     const hugeOutput = "0123456789abcdef".repeat(65_536);
     const result = plan([
       { role: "user", content: "Inspect the repository and keep working." },
@@ -55,12 +55,44 @@ describe("ContextPlanner long-running tool history compaction", () => {
     const history = retainedHistory(result);
 
     expect(history[0]).toMatchObject({ role: "user", content: "Inspect the repository and keep working." });
-    expect(history[1]).toMatchObject({ role: "assistant", toolCalls: [{ id: "call-0" }] });
-    expect(history[2]).toMatchObject({ role: "tool", toolCallId: "call-0" });
-    expect(history[2].content.length).toBeLessThan(hugeOutput.length / 100);
-    expect(history[2].content).toContain("context compacted");
+    expect(history).toHaveLength(2);
+    expect(history[1]).toMatchObject({ role: "assistant" });
+    expect(history[1].toolCalls).toBeUndefined();
+    expect(history[1].content).toContain("history block was omitted");
+    expect(history[1].content).toContain("non-executable observation summary");
+    expect(history[1].content).toContain("0123456789abcdef");
+    expect(JSON.stringify(history)).not.toContain("_contextCompacted");
     expect(result.budget.historyTokens).toBeLessThanOrEqual(288);
     expectWireSafe(history);
+  });
+
+  it("preserves receipt status, output preview, and artifact references without call arguments", () => {
+    const secretArgument = "do-not-copy-this-executable-argument".repeat(2_000);
+    const receipt = [
+      "Failed tool receipt ID: large-command",
+      'Receipt summary (JSON): {"outcome":{"status":"failed","diagnosticCodes":["process_exit_nonzero"]},"artifactRefs":[{"artifactId":"artifact-output-1","name":"stdout.full"}]}',
+      "Output:",
+      "preview from the failed command"
+    ].join("\n");
+    const result = plan([
+      { role: "user", content: "Diagnose the command failure." },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "large-command", name: "process", arguments: { command: secretArgument } }]
+      },
+      { role: "tool", content: receipt, toolCallId: "large-command" }
+    ], 128_000, 8_000);
+    const summary = retainedHistory(result).at(-1);
+
+    expect(summary).toMatchObject({ role: "assistant" });
+    expect(summary?.toolCalls).toBeUndefined();
+    expect(summary?.content).toContain('"status":"failed"');
+    expect(summary?.content).toContain("preview from the failed command");
+    expect(summary?.content).toContain("artifact-output-1");
+    expect(summary?.content).not.toContain("do-not-copy-this-executable-argument");
+    expect(result.latestHistoryBlockTokens).toBeLessThanOrEqual(8_192);
+    expectWireSafe(retainedHistory(result));
   });
 
   it("plans one user followed by 100 tool loops in a small context window", () => {
@@ -72,8 +104,12 @@ describe("ContextPlanner long-running tool history compaction", () => {
     const result = plan(history, 360, 48);
     const retained = retainedHistory(result);
     expect(retained[0]).toMatchObject({ role: "user", content: "Complete this long task." });
-    expect(retained.some((message) => message.toolCalls?.some((call) => call.id === "call-99"))).toBe(true);
-    expect(retained.some((message) => message.role === "tool" && message.toolCallId === "call-99")).toBe(true);
+    const latestCallRetained = retained.some((message) =>
+      message.toolCalls?.some((call) => call.id === "call-99"));
+    expect(latestCallRetained).toBe(
+      retained.some((message) => message.role === "tool" && message.toolCallId === "call-99")
+    );
+    expect(JSON.stringify(retained)).not.toContain("_contextCompacted");
     expect(result.omittedHistoryTurns).toBeGreaterThan(0);
     expect(result.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
     expect(result.summary?.content).toContain("older history blocks");
@@ -97,7 +133,7 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expectWireSafe(retained);
   });
 
-  it("does not replay oversized settled write arguments even in a large context window", () => {
+  it("textualizes a latest tool block above the per-block 8K limit even when the provider window fits", () => {
     const content = "export const generated = true;\n".repeat(4_000);
     const result = plan([
       { role: "user", content: "Create the requested artifact." },
@@ -113,17 +149,11 @@ describe("ContextPlanner long-running tool history compaction", () => {
       { role: "tool", content: "Wrote src/generated.ts", toolCallId: "large-write" }
     ], 128_000, 8_000);
     const retained = retainedHistory(result);
-    const call = retained.flatMap((message) => message.toolCalls ?? [])[0];
-
-    expect(call).toMatchObject({
-      id: "large-write",
-      arguments: { _contextCompacted: true, originalTokens: expect.any(Number) }
-    });
-    expect(JSON.stringify(call?.arguments)).not.toContain(content.slice(0, 100));
-    expect(retained).toContainEqual(expect.objectContaining({
-      role: "tool", toolCallId: "large-write", content: "Wrote src/generated.ts"
-    }));
-    expect(result.budget.historyTokens).toBeLessThan(1_000);
+    expect(retained.flatMap((message) => message.toolCalls ?? [])).toEqual([]);
+    expect(retained.at(-1)).toMatchObject({ role: "assistant" });
+    expect(retained.at(-1)?.content).toContain("history block was omitted");
+    expect(result.latestHistoryBlockTokens).toBeLessThanOrEqual(8_192);
+    expect(result.budget.historyTokens).toBeLessThanOrEqual(24_000);
     expectWireSafe(retained);
   });
 

@@ -30,6 +30,59 @@ interface ImportedOutputArtifacts {
   diagnostics: string[];
 }
 
+const MODEL_STREAM_LIMIT_BYTES = 16 * 1024;
+const MODEL_STREAM_EDGE_BYTES = 8 * 1024;
+
+interface ProjectedStream {
+  value: string;
+  droppedBytes: number;
+}
+
+function projectStream(value: string): ProjectedStream {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= MODEL_STREAM_LIMIT_BYTES) return { value, droppedBytes: 0 };
+  let head = bytes.subarray(0, MODEL_STREAM_EDGE_BYTES).toString("utf8");
+  let tail = bytes.subarray(bytes.byteLength - MODEL_STREAM_EDGE_BYTES).toString("utf8");
+  while (Buffer.byteLength(head) + Buffer.byteLength(tail) > MODEL_STREAM_LIMIT_BYTES) {
+    if (Buffer.byteLength(head) >= Buffer.byteLength(tail)) head = head.slice(0, -1);
+    else tail = tail.slice(1);
+  }
+  const projected = `${head}${tail}`;
+  return {
+    value: projected,
+    droppedBytes: bytes.byteLength - Buffer.byteLength(projected)
+  };
+}
+
+async function preserveProjectedStream(
+  stream: "stdout" | "stderr",
+  original: string,
+  projected: ProjectedStream,
+  context: ToolExecutionContext,
+  imported: ImportedOutputArtifacts
+): Promise<void> {
+  if (projected.droppedBytes === 0) return;
+  if (!imported.byStream[stream]) {
+    const content = Buffer.from(original, "utf8");
+    const name = `${stream}-full.log`;
+    const artifactId = await context.createArtifact({ name, content });
+    imported.ids.push(artifactId);
+    imported.refs.push({
+      artifactId,
+      name,
+      digest: createHash("sha256").update(content).digest("hex"),
+      mediaType: "text/plain; charset=utf-8",
+      sizeBytes: content.byteLength
+    });
+    imported.byStream[stream] = artifactId;
+    imported.metadata.push({
+      artifactId, name, stream, complete: true, redactionLossy: false
+    });
+    imported.diagnostics.push(`full_output_artifact:${stream}:${artifactId}`);
+  }
+  imported.diagnostics.push(`model_output_truncated:${stream}:${String(projected.droppedBytes)}`);
+}
+
 function commandSucceeded(result: ExecutionResult): boolean {
   return result.state === "exited" && result.exitCode === 0 && result.signal === null
     && !result.timedOut && !result.idleTimedOut && !result.cancelled
@@ -123,7 +176,12 @@ function commandEvidence(
         cancelled: result.cancelled,
         ...(result.failure ? { failureCode: result.failure.code } : {})
       },
-      artifactIds: imported.ids, workspaceDeltaEvidenceIds: []
+      artifactIds: imported.ids,
+      // The runtime replaces this preparation-time placeholder with the
+      // frozen mutation-frontier identity before evidence is emitted.
+      frontierRevision: 0,
+      stateDigest: "0".repeat(64),
+      coveredPaths: []
     }
   };
   return {
@@ -150,11 +208,15 @@ export async function commandReceipt(
   const completedAt = new Date().toISOString();
   const ok = commandSucceeded(result);
   const imported = await importOutputArtifacts(result.outputArtifacts, context);
+  const stdout = projectStream(result.stdout);
+  const stderr = projectStream(result.stderr);
+  await preserveProjectedStream("stdout", result.stdout, stdout, context, imported);
+  await preserveProjectedStream("stderr", result.stderr, stderr, context, imported);
   await acknowledge(imported, broker);
   const evidence = commandEvidence(request, command, result, validation, completedAt, context, imported);
   return {
     callId: request.callId, ok,
-    output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
+    output: [stdout.value, stderr.value].filter(Boolean).join("\n"),
     observedEffects: [...actualEffects], actualEffects: [...actualEffects],
     artifacts: imported.ids, artifactRefs: imported.refs,
     diagnostics: [
@@ -194,9 +256,15 @@ export async function processReceipt(
 ): Promise<ToolReceipt> {
   const completedAt = new Date().toISOString();
   const imported = await importOutputArtifacts(value.outputArtifacts, context);
+  const stdout = projectStream(value.stdout);
+  const stderr = projectStream(value.stderr);
+  await preserveProjectedStream("stdout", value.stdout, stdout, context, imported);
+  await preserveProjectedStream("stderr", value.stderr, stderr, context, imported);
   await acknowledge(imported, broker);
   const outputValue = {
     ...value,
+    stdout: stdout.value,
+    stderr: stderr.value,
     ...(imported.metadata.length > 0 ? { outputArtifacts: imported.metadata } : {})
   };
   const evidence: EvidenceRecord[] = imported.metadata.length === 0 ? [] : [{

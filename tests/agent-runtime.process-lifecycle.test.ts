@@ -80,6 +80,7 @@ describe("durable process lifecycle events", () => {
         processId: "process-1",
         executionId: "call-process_spawn",
         mode: "pty",
+        lifecycle: "session",
         brokerInstanceId: "broker-1"
       }
     }]);
@@ -106,6 +107,39 @@ describe("durable process lifecycle events", () => {
       { type: "process.output", payload: { processId: "process-2", stream: "stderr", chunk: "warning\n" } },
       { type: "process.exited", payload: { processId: "process-2", exitCode: 0, state: "exited" } }
     ]);
+  });
+
+  it("records deliverable handoff and removes it from runtime ownership", async () => {
+    const target = runtimeSessionFixture({
+      execution: {
+        processHandles: new Map([[
+          "process-deliverable",
+          { id: "process-deliverable", brokerInstanceId: "broker-1", lifecycle: "deliverable" }
+        ]])
+      }
+    });
+    const recorded = recorder();
+    await recordProcessReceipt(
+      target,
+      call("process_handoff", { handleId: "process-deliverable", brokerInstanceId: "broker-1" }),
+      { ...plan("background"), exactEffects: ["process.handoff"] },
+      receipt({
+        handle: { id: "process-deliverable", brokerInstanceId: "broker-1", lifecycle: "deliverable" },
+        handoffId: "handoff:process-deliverable",
+        systemProcessId: 4321
+      }),
+      recorded.emit
+    );
+
+    expect(target.execution.processHandles.has("process-deliverable")).toBe(false);
+    expect(recorded.events).toEqual([{
+      type: "process.handed_off",
+      payload: {
+        processId: "process-deliverable",
+        handoffId: "handoff:process-deliverable",
+        systemProcessId: 4321
+      }
+    }]);
   });
 
   it("records a broker-lost handle and ignores process writes", async () => {
@@ -156,6 +190,41 @@ describe("durable process lifecycle events", () => {
     );
     expect(failure).toMatchObject({ ok: false, diagnostics: ["active_processes"] });
     expect(failure?.output).toContain("process-active");
+  });
+
+  it("directs deliverable processes to handoff and session processes to termination", () => {
+    const state = createKernelState({
+      sessionId: "session", runId: "run", mode: "change",
+      startedAt: "2026-01-01T00:00:00.000Z", deadlineAt: "2026-01-01T01:00:00.000Z"
+    });
+    state.activeProcessIds.push("service", "helper");
+    const target = runtimeSessionFixture({
+      state,
+      execution: {
+        processHandles: new Map([
+          ["service", { id: "service", brokerInstanceId: "broker-1", lifecycle: "deliverable" }],
+          ["helper", { id: "helper", brokerInstanceId: "broker-1", lifecycle: "session" }]
+        ])
+      }
+    });
+    const failure = completionFailure(
+      target,
+      call("complete_task"),
+      { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(failure).toMatchObject({
+      diagnostics: ["active_processes"],
+      result: {
+        deliverableProcessIds: ["service"],
+        sessionProcessIds: ["helper"],
+        nextActions: [
+          { tool: "process_handoff", processIds: ["service"] },
+          { tool: "process_terminate", processIds: ["helper"] }
+        ]
+      }
+    });
   });
 
   it("terminates runtime-local process trees before a terminal outcome", async () => {

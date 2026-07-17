@@ -18,6 +18,7 @@ import { turnPayload } from "./effect-runner-helpers.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
+import { ACTION_SETTLEMENT_GRACE_MS } from "./convergence-policy.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -44,6 +45,15 @@ export function resolveToolIdleWatchdogMs(runtime: RuntimeOptions, descriptor: T
 
 function processTimeout(message: string, code: "process_deadline" | "process_idle_timeout"): Error {
   return Object.assign(new Error(message), { name: "TimeoutError", code });
+}
+
+function deadlineBoundedToolTimeoutMs(session: RuntimeSession, descriptor: ToolDescriptor): number {
+  const remainingMs = session.durable.state.deadlineRemainingMs
+    ?? Date.parse(session.durable.state.deadlineAt) - Date.now();
+  return Math.max(1, Math.min(
+    descriptor.timeoutMs,
+    Math.max(1, remainingMs - ACTION_SETTLEMENT_GRACE_MS)
+  ));
 }
 
 export class ToolExecutionMonitor {
@@ -77,9 +87,10 @@ export class ToolExecutionMonitor {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
+    const timeoutMs = deadlineBoundedToolTimeoutMs(session, descriptor);
     const timer = setTimeout(() => controller.abort(processTimeout(
-      `Tool '${call.name}' exceeded ${descriptor.timeoutMs}ms.`, "process_deadline"
-    )), descriptor.timeoutMs);
+      `Tool '${call.name}' exceeded its ${timeoutMs}ms deadline-bounded timeout.`, "process_deadline"
+    )), timeoutMs);
     const idleTimeoutMs = resolveToolIdleWatchdogMs(this.options.runtime, descriptor);
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     const heartbeat = (): void => {
@@ -93,7 +104,7 @@ export class ToolExecutionMonitor {
     heartbeat();
     try {
       const requiresSettlement = plan.exactEffects.some((effect) =>
-        ["filesystem.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
+        ["filesystem.write", "repository.write", "process.spawn", "process.spawn.readonly", "destructive", "validation", "open_world"]
           .includes(effect));
       const observesWorkspace = plan.exactEffects.some((effect) =>
         ["filesystem.write", "destructive", "validation", "open_world"].includes(effect));

@@ -29,6 +29,14 @@ pub enum NetworkMode {
     Full,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessLifecycle {
+    #[default]
+    Session,
+    Deliverable,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSpec {
@@ -72,6 +80,8 @@ pub struct ProcessParams {
     pub max_output_bytes: usize,
     pub timeout_ms: Option<u64>,
     pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub lifecycle: ProcessLifecycle,
     #[serde(default)]
     pub pty: bool,
     #[serde(default = "default_pty_columns")]
@@ -189,6 +199,7 @@ pub fn doctor_report() -> Value {
             "background": true,
             "stdin": true,
             "pty": cfg!(any(target_os = "linux", target_os = "windows")) && status.available,
+            "processHandoff": cfg!(target_os = "linux") && status.available && status.self_test_passed,
             "networkModes": network_modes,
             "executionRoots": true,
             "shells": shells,
@@ -276,6 +287,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                 max_output_bytes: 4 * 1024,
                 timeout_ms: Some(5_000),
                 idle_timeout_ms: None,
+                lifecycle: ProcessLifecycle::Session,
                 pty: false,
                 pty_columns: 80,
                 pty_rows: 24,
@@ -387,6 +399,16 @@ fn validate(params: &ProcessParams, allow_unsafe: bool) -> Result<(), RpcError> 
         return Err(RpcError::new(
             "policy_denied",
             "PTY dimensions must be positive",
+        ));
+    }
+    if params.lifecycle == ProcessLifecycle::Deliverable
+        && (params.pty
+            || params.command.stdin.is_some()
+            || params.policy.sandbox != SandboxMode::Required)
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "deliverable processes require the native sandbox and detached stdio",
         ));
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -760,10 +782,17 @@ fn configure_common(command: &mut Command, params: &ProcessParams) {
     command.current_dir(&params.command.cwd);
     command.env_clear();
     command.envs(&params.command.env);
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    if params.lifecycle == ProcessLifecycle::Deliverable {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -802,12 +831,13 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
 fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
-    command.args([
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-all",
-        "--as-pid-1",
-    ]);
+    // Session processes retain bubblewrap's parent-death cleanup in addition
+    // to the broker watchdog. A deliverable must survive only after the
+    // watchdog has been explicitly revoked by process.handoff.
+    if params.lifecycle == ProcessLifecycle::Session {
+        command.arg("--die-with-parent");
+    }
+    command.args(["--new-session", "--unshare-all", "--as-pid-1"]);
     if params.policy.network == NetworkMode::Full {
         command.arg("--share-net");
     }
@@ -1608,6 +1638,7 @@ mod tests {
             max_output_bytes: 1024,
             timeout_ms: Some(1_000),
             idle_timeout_ms: None,
+            lifecycle: ProcessLifecycle::Session,
             pty: false,
             pty_columns: 80,
             pty_rows: 24,

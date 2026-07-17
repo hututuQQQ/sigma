@@ -4,6 +4,7 @@ import type {
   ToolDescriptor,
   UsageRecord
 } from "agent-protocol";
+import { recoverInterruptedRepositoryTransactions } from "./repository-transaction-tool.js";
 import { recoveryDenialPayload, recoveryResultLostPayload } from "./run-transitions.js";
 import type { RuntimeSession } from "./types.js";
 import type { BoundRuntimeEventEmitter } from "./runtime-event-emitter.js";
@@ -19,7 +20,7 @@ interface RecoveryOptions {
 
 function mutating(descriptor: ToolDescriptor | undefined): boolean {
   return Boolean(descriptor?.possibleEffects.some((effect) =>
-    ["filesystem.write", "process.spawn", "destructive", "open_world"].includes(effect)));
+    ["filesystem.write", "repository.write", "process.spawn", "destructive", "open_world"].includes(effect)));
 }
 
 function mustNotReplay(session: RuntimeSession, descriptor: ToolDescriptor | undefined): boolean {
@@ -106,6 +107,7 @@ async function recoverUnstartedTool(
 }
 
 export async function recoverInterruptedSession(session: RuntimeSession, options: RecoveryOptions): Promise<void> {
+  await recoverInterruptedRepositoryTransactions(session.identity.workspacePath, session.identity.sessionId);
   if (session.durable.state.phase === "terminal") return;
   const lostProcessIds = [...session.durable.state.activeProcessIds];
   for (const processId of lostProcessIds) {

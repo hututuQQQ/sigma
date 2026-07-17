@@ -1,4 +1,4 @@
-import type { ContextBudget, ContextItem, JsonValue, ModelMessage, ModelToolDefinition } from "agent-protocol";
+import type { ContextBudget, ContextItem, ModelMessage, ModelToolDefinition } from "agent-protocol";
 import { approximateTokens } from "./unicode.js";
 import { summarizeHistory } from "./summary.js";
 
@@ -9,6 +9,7 @@ export interface ContextPlan {
   budget: ContextBudget;
   summary?: ContextItem;
   omittedHistoryTurns: number;
+  latestHistoryBlockTokens: number;
 }
 
 export interface PlanContextOptions {
@@ -25,8 +26,7 @@ interface HistoryBlock {
   wireSafe: boolean;
 }
 
-const LATEST_BLOCK_TOKEN_LIMIT = 8_192;
-const TOOL_ARGUMENT_TOKEN_LIMIT = 128;
+const RECENT_RAW_BLOCK_TOKEN_LIMIT = 8_192;
 /**
  * Replaying every tool turn that still fits the provider window makes the
  * cumulative request cost quadratic in long sessions. Keep a generous raw
@@ -116,60 +116,43 @@ function fitText(value: string, maximumTokens: number): string {
   return `${value.slice(0, low)}${marker}${suffix}`.trimEnd();
 }
 
-function boundedArguments(value: JsonValue): JsonValue {
-  const serialized = JSON.stringify(value);
-  const tokens = approximateTokens(serialized);
-  return tokens <= TOOL_ARGUMENT_TOKEN_LIMIT
-    ? value
-    : { _contextCompacted: true, originalTokens: tokens };
-}
-
-function hasOversizedToolArguments(block: HistoryBlock): boolean {
-  return block.messages.some((message) => message.toolCalls?.some((call) =>
-    approximateTokens(JSON.stringify(call.arguments)) > TOOL_ARGUMENT_TOKEN_LIMIT));
-}
-
-function compactSkeleton(block: HistoryBlock): ModelMessage[] {
-  return block.messages.map((message) => ({
-    role: message.role,
-    content: "",
-    ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
-    ...(message.toolCalls?.length ? {
-      toolCalls: message.toolCalls.map((call) => ({ ...call, arguments: boundedArguments(call.arguments) }))
-    } : {})
-  }));
-}
-
 function compactFallback(block: HistoryBlock, maximumTokens: number): ModelMessage[] | undefined {
   const empty: ModelMessage = { role: "assistant", content: "" };
   const contentOverhead = messageTokens(empty) - approximateTokens(empty.content);
   if (maximumTokens < messageTokens(empty)) return undefined;
+  const observations = block.messages
+    .filter((message) => message.role === "tool")
+    .map((message, index) => `Observation ${index + 1}:\n${message.content}`)
+    .join("\n\n");
+  const explanation = `A ${block.messages.length}-message history block was omitted because it could not be represented within the context budget without breaking tool-call protocol. Re-inspect the relevant state if needed.`;
+  // Historical assistant tool calls contain executable arguments. Never copy
+  // those arguments into a lossy replacement. Tool-result messages are safe
+  // to textualize, however, and retain the receipt status, bounded output
+  // preview, and durable artifact references supplied by the kernel.
+  const observationSummary = observations.length > 0
+    ? `${explanation}\nThe following is a non-executable observation summary; it is not a tool call and contains no call arguments:\n${observations}`
+    : explanation;
   const compacted: ModelMessage = {
     role: "assistant",
-    content: fitText(
-      `A ${block.messages.length}-message history block was omitted because it could not be represented within the context budget without breaking tool-call protocol. Re-inspect the relevant state if needed.`,
-      maximumTokens - contentOverhead
-    )
+    content: fitText(observationSummary, maximumTokens - contentOverhead)
   };
   return messageTokens(compacted) <= maximumTokens ? [compacted] : [empty];
 }
 
 function compactBlock(block: HistoryBlock, maximumTokens: number): ModelMessage[] | undefined {
   if (!block.wireSafe) return compactFallback(block, maximumTokens);
-  const skeleton = compactSkeleton(block);
-  const fixedTokens = blockTokens(skeleton);
-  if (fixedTokens > maximumTokens) return compactFallback(block, maximumTokens);
-  let remaining = maximumTokens - fixedTokens;
-  let remainingMessages = block.messages.filter((message) => message.content.length > 0).length;
-  const compacted = skeleton.map((message, index) => {
-    const source = block.messages[index];
-    if (!source.content || remainingMessages === 0) return message;
-    const quota = Math.floor(remaining / remainingMessages);
-    const content = fitText(source.content, quota);
-    remaining -= approximateTokens(content);
-    remainingMessages -= 1;
-    return { ...message, content };
-  });
+  // A historical tool call is executable-looking protocol. Never manufacture
+  // replacement arguments or a partial call/result skeleton: models have been
+  // observed copying those placeholders into a later real invocation. Tool
+  // exchanges are therefore retained losslessly or replaced as one
+  // low-authority text summary.
+  if (block.messages.some((message) => (message.toolCalls?.length ?? 0) > 0 || message.role === "tool")) {
+    return compactFallback(block, maximumTokens);
+  }
+  const compacted = block.messages.map((message) => ({
+    ...message,
+    content: fitText(message.content, Math.max(0, maximumTokens - 6))
+  }));
   return blockTokens(compacted) <= maximumTokens ? compacted : compactFallback(block, maximumTokens);
 }
 
@@ -199,17 +182,24 @@ interface HistorySelection {
 function selectMandatoryHistory(
   blocks: readonly HistoryBlock[],
   available: number,
-  mandatoryTokens: number
+  mandatoryTokens: number,
+  historyTokenLimit: number
 ): HistorySelection {
   const selected = new Map<number, ModelMessage[]>();
   const newestUser = latestUserBlock(blocks);
   let used = mandatoryTokens;
   if (newestUser >= 0) {
-    const messages = blocks[newestUser].messages;
-    const tokens = blockTokens(messages);
-    if (used + tokens > available) {
-      throw overflow(`Mandatory context and the newest user turn require ${used + tokens} tokens but only ${available} context tokens are available.`);
+    const block = blocks[newestUser];
+    const rawTokens = blockTokens(block.messages);
+    const limit = Math.min(RECENT_RAW_BLOCK_TOKEN_LIMIT, historyTokenLimit, available - used);
+    // The user's latest request is mandatory authority-bearing input. Only
+    // oversized tool exchanges are textualized; silently truncating the user
+    // request could change the task itself.
+    if (!block.wireSafe || rawTokens > limit) {
+      throw overflow(`Mandatory context and the newest user turn cannot fit in ${available} context tokens.`);
     }
+    const messages = block.messages;
+    const tokens = blockTokens(messages);
     selected.set(newestUser, messages);
     used += tokens;
   }
@@ -227,8 +217,13 @@ function selectMandatoryHistory(
   if (!requiresLatest) return { selected, used, fitLimit };
   const block = blocks[newest];
   const rawTokens = blockTokens(block.messages);
-  const limit = Math.min(LATEST_BLOCK_TOKEN_LIMIT, fitLimit - used);
-  const messages = block.wireSafe && rawTokens <= limit && !hasOversizedToolArguments(block)
+  const selectedTokens = used - mandatoryTokens;
+  const limit = Math.min(
+    RECENT_RAW_BLOCK_TOKEN_LIMIT,
+    fitLimit - used,
+    historyTokenLimit - selectedTokens
+  );
+  const messages = block.wireSafe && rawTokens <= limit
     ? block.messages
     : compactBlock(block, limit);
   if (!messages) {
@@ -270,11 +265,9 @@ function includeRecentHistory(
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
     const block = blocks[index];
-    const messages = block.wireSafe && hasOversizedToolArguments(block)
-      ? compactBlock(block, LATEST_BLOCK_TOKEN_LIMIT)
-      : block.messages;
+    const messages = block.messages;
     const tokens = messages ? blockTokens(messages) : Number.POSITIVE_INFINITY;
-    if (reachedBoundary || !block.wireSafe || !messages || tokens > LATEST_BLOCK_TOKEN_LIMIT
+    if (reachedBoundary || !block.wireSafe || !messages || tokens > RECENT_RAW_BLOCK_TOKEN_LIMIT
       || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;
@@ -301,26 +294,28 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   // reasoning into a new request both wastes budget and destabilizes prompt
   // cache prefixes. It is intentionally removed from all historical turns.
   const blocks = historyBlocks(options.history.map(withoutHistoricalReasoning));
-  const selection = selectMandatoryHistory(blocks, available, mandatoryTokens);
+  const historyTokenLimit = Math.min(available, PROACTIVE_HISTORY_TOKEN_LIMIT);
+  const selection = selectMandatoryHistory(blocks, available, mandatoryTokens, historyTokenLimit);
   const included: ContextItem[] = [...mandatory];
   const omitted: ContextItem[] = [];
   let used = includeDynamicContext(candidates, included, omitted, selection.used, selection.fitLimit);
-  const historyTokenLimit = available <= PROACTIVE_HISTORY_TOKEN_LIMIT
-    ? available
-    : PROACTIVE_HISTORY_TOKEN_LIMIT;
   used = includeRecentHistory(
     blocks,
     selection.selected,
     used,
     selection.fitLimit,
-    Math.max(historyTokenLimit, [...selection.selected.values()]
-      .reduce((total, messages) => total + blockTokens(messages), 0))
+    historyTokenLimit
   );
 
   const omittedBlocks = blocks
     .filter((_block, index) => !selection.selected.has(index))
     .map((block) => block.messages);
-  const summary = summarizeHistory(omittedBlocks, available - used);
+  const retainedHistoryTokens = [...selection.selected.values()]
+    .reduce((total, messages) => total + blockTokens(messages), 0);
+  const summary = summarizeHistory(
+    omittedBlocks,
+    Math.min(available - used, Math.max(0, historyTokenLimit - retainedHistoryTokens))
+  );
   if (summary) included.push(summary);
   const retainedHistory = [...selection.selected.entries()]
     .sort(([left], [right]) => left - right)
@@ -336,13 +331,14 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     omitted,
     ...(summary ? { summary } : {}),
     omittedHistoryTurns: omittedBlocks.length,
+    latestHistoryBlockTokens: blockTokens(selection.selected.get(blocks.length - 1) ?? []),
     budget: {
       contextWindowTokens: options.contextWindowTokens,
       outputReserveTokens: options.outputReserveTokens,
       toolTokens: toolCount,
       systemTokens: mandatoryTokens,
       dynamicTokens,
-      historyTokens: blockTokens(retainedHistory)
+      historyTokens: blockTokens(retainedHistory) + (summary?.tokenCount ?? 0)
     }
   };
 }

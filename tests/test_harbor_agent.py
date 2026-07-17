@@ -70,7 +70,10 @@ def current_doctor_payload(network_modes: list[str] | None = None) -> str:
         "platform": "linux",
         "architecture": "x86_64",
         "sandbox": {"available": True, "backend": "fixture", "selfTestPassed": True},
-        "capabilities": {"networkModes": network_modes or ["none", "full"]},
+        "capabilities": {
+            "networkModes": network_modes or ["none", "full"],
+            "processHandoff": True,
+        },
         "checks": [],
     })
 
@@ -86,6 +89,27 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(module.SigmaCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
         self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
+        with self.assertRaisesRegex(ValueError, "execution_mode"):
+            module.SigmaCliHarborAgent(execution_mode="host")
+
+    async def test_disposable_execution_mode_uses_an_isolated_home_and_explicit_flag(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(return_code=0)))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="disposable-container",
+            )
+            agent._workspace = "/app"
+
+            await agent._configure_execution_mode(env)
+            command = agent._agent_command()
+
+            self.assertEqual(command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
+            self.assertIn("--execution-mode", command)
+            self.assertIn("disposable-container", command)
+            configured = env.exec.await_args.args[0]
+            self.assertIn("allow_unsafe_host_exec = true", configured)
 
     async def test_setup_prefers_uploaded_tarball(self):
         module = import_portable_agent_module()
@@ -237,6 +261,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["network_mode_effective"], "full")
+            self.assertEqual(record["read_scope_effective"], "host")
+            self.assertTrue(record["process_handoff_available"])
 
     async def test_setup_help_failure_includes_stdout_and_stderr(self):
         module = import_portable_agent_module()
@@ -569,6 +595,25 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(RuntimeError, f"^{expected}:"):
                     await agent.run("run", env, context)
                 self.assertEqual(context.failure_kind, expected)
+
+    async def test_runtime_terminal_failures_keep_v4_categories(self):
+        module = import_portable_agent_module()
+        agent = module.SigmaCliHarborAgent(logs_dir=Path("unused"))
+        cases = (
+            ("convergence_no_progress", {}, "convergence_no_progress"),
+            ("validation_failed", {}, "validation_blocked"),
+            ("runtime_terminal_missing", {}, "runtime_invariant_failure"),
+            ("model_stream_protocol_error", {"diagnostics": {"category": "protocol"}}, "agent_failure"),
+            ("model_route_failed", {"diagnostics": {"category": "rate_limit"}}, "api_error"),
+        )
+        for code, extra, expected in cases:
+            with self.subTest(code=code):
+                payload = {"code": code, **extra}
+                actual = agent._failure_kind_from_events(
+                    [{"type": "run.failed", "payload": payload}],
+                    {"status": "failed"},
+                )
+                self.assertEqual(actual, expected)
 
     async def test_timeout_persists_bounded_partial_outputs_and_trace_state(self):
         module = import_portable_agent_module()

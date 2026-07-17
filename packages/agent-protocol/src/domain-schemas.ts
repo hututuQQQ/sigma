@@ -18,8 +18,8 @@ export const dateTimeSchema = z.string().refine(
 export const nonNegativeIntegerSchema = z.number().int().nonnegative();
 
 export const evidenceKindSchema = z.enum([
-  "workspace_delta", "command", "validation", "diagnostic",
-  "review", "checkpoint", "child_outcome", "user_waiver"
+  "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
+  "input_access", "review", "checkpoint", "child_outcome", "user_waiver"
 ]);
 export const evidenceStatusSchema = z.enum(["passed", "failed", "warning", "informational"]);
 export const evidenceClaimSchema = z.enum([
@@ -75,6 +75,36 @@ export const workspaceDeltaEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
+const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+export const mutationFrontierSchema = z.object({
+  revision: nonNegativeIntegerSchema,
+  baselineManifestDigest: digestSchema,
+  currentStateDigest: digestSchema,
+  changedPaths: z.array(nonEmptyStringSchema),
+  sourceCheckpointIds: z.array(nonEmptyStringSchema),
+  repositoryStateDigest: digestSchema.optional()
+}).strict();
+
+export const repositoryDeltaEvidenceSchema = z.object({
+  ...evidenceBaseShape,
+  kind: z.literal("repository_delta"),
+  data: z.object({
+    operationCount: z.number().int().positive(),
+    operations: z.array(nonEmptyStringSchema),
+    beforeStateDigest: digestSchema,
+    afterStateDigest: digestSchema,
+    headBefore: z.string().nullable(),
+    headAfter: z.string().nullable(),
+    refsBeforeDigest: digestSchema,
+    refsAfterDigest: digestSchema,
+    indexBeforeDigest: digestSchema,
+    indexAfterDigest: digestSchema,
+    reachableObjectsBefore: nonNegativeIntegerSchema,
+    reachableObjectsAfter: nonNegativeIntegerSchema
+  }).strict()
+}).strict();
+
 export const commandEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("command"),
@@ -106,8 +136,9 @@ export const validationEvidenceSchema = z.object({
       failureCode: nonEmptyStringSchema.optional()
     }).strict().optional(),
     artifactIds: z.array(z.string()).optional(),
-    workspaceDeltaEvidenceIds: z.array(z.string()),
-    checkpointIds: z.array(nonEmptyStringSchema).optional(),
+    frontierRevision: nonNegativeIntegerSchema,
+    stateDigest: digestSchema,
+    coveredPaths: z.array(nonEmptyStringSchema),
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional()
   }).strict()
@@ -122,6 +153,18 @@ export const diagnosticEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
+export const inputAccessEvidenceSchema = z.object({
+  ...evidenceBaseShape,
+  kind: z.literal("input_access"),
+  data: z.object({
+    path: nonEmptyStringSchema,
+    scope: z.enum(["workspace", "external"]),
+    sha256: digestSchema.optional(),
+    byteLength: nonNegativeIntegerSchema.optional(),
+    failureCode: nonEmptyStringSchema.optional()
+  }).strict()
+}).strict();
+
 export const reviewEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("review"),
@@ -129,7 +172,8 @@ export const reviewEvidenceSchema = z.object({
     reviewerId: nonEmptyStringSchema,
     verdict: z.enum(["approved", "changes_requested"]),
     findings: z.array(jsonValueSchema),
-    workspaceDeltaEvidenceIds: z.array(z.string()),
+    frontierRevision: nonNegativeIntegerSchema,
+    stateDigest: digestSchema,
     validationEvidenceIds: z.array(z.string()).optional(),
     failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
     checkpointId: z.string().optional()
@@ -172,9 +216,11 @@ export const userWaiverEvidenceSchema = z.object({
 
 export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   workspaceDeltaEvidenceSchema,
+  repositoryDeltaEvidenceSchema,
   commandEvidenceSchema,
   validationEvidenceSchema,
   diagnosticEvidenceSchema,
+  inputAccessEvidenceSchema,
   reviewEvidenceSchema,
   checkpointEvidenceSchema,
   childOutcomeEvidenceSchema,

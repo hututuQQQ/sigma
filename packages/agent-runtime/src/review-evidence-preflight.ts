@@ -27,7 +27,8 @@ function binaryReviewEvidenceFailure(
     return `Delta ${delta.evidenceId} is missing an opaque artifact path bound to its workspace delta.`;
   }
   const validated = validations.some((item) => item.status === "passed"
-    && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+    && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
+      .some((path) => item.data.coveredPaths.includes(path)));
   if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
   return undefined;
 }
@@ -59,7 +60,8 @@ function legacyOpaqueArtifactReviewEvidenceFailure(
     return `Delta ${delta.evidenceId} has incomplete opaque artifact evidence.`;
   }
   const validated = validations.some((item) => item.status === "passed"
-    && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+    && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
+      .some((path) => item.data.coveredPaths.includes(path)));
   if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
   return undefined;
 }
@@ -114,8 +116,9 @@ function hasPassedValidation(
   delta: WorkspaceDeltaEvidence,
   validations: readonly ValidationEvidence[]
 ): boolean {
+  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
   return validations.some((item) => item.status === "passed"
-    && item.data.workspaceDeltaEvidenceIds.includes(delta.evidenceId));
+    && paths.some((path) => item.data.coveredPaths.includes(path)));
 }
 
 type EvidenceIndex<T> = { value: T } | { failure: string };

@@ -99,6 +99,17 @@ describe("connection-bound runtime capability reporting", () => {
     expect(prompt).toContain("verifiedRuntimeCommands=none");
   });
 
+  it("describes disposable-container execution as open-world without promising external rollback", () => {
+    const environment = { ...runtimeEnvironment("linux"), executionMode: "disposable-container" as const };
+    const prompt = runtimePrompt(environment);
+
+    expect(prompt).toContain("executionMode=disposable-container");
+    expect(prompt).toContain("open-world inside this user-declared disposable container");
+    expect(prompt).toContain("package managers may be used");
+    expect(prompt).toContain("outside the workspace are not covered by workspace checkpoint rollback");
+    expect(prompt).not.toContain("Do not probe or retry unlisted host commands");
+  });
+
   it("does not fall back or interpolate malformed broker environment fields", () => {
     expect(() => brokerRuntimeEnvironment({ ...report(), platform: "unknown" }))
       .toThrow(/unsupported platform/u);

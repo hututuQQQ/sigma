@@ -40,25 +40,39 @@ describe("agent-config single-source schema", () => {
   it("only lets workspace configuration narrow authority and resource caps", () => {
     const values = resolveConfig({
       home: {
-        permissions: { mode: "deny" }, security: { network: "none", allow_unsafe_host_exec: true },
+        permissions: { mode: "deny" },
+        security: { read_scope: "workspace", network: "none", process_handoff: "deny", allow_unsafe_host_exec: true },
         budget: { max_input_tokens: 1_000, max_tool_calls: 20 }, checkpoint: { max_files: 100 }
       },
       workspace: {
-        permissions: { mode: "auto" }, security: { network: "full", allow_unsafe_host_exec: false },
+        permissions: { mode: "auto" },
+        security: { read_scope: "host", network: "full", process_handoff: "allow", allow_unsafe_host_exec: false },
         budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
         agents: { max_parallel: 2 }
       }
     });
     expect(values).toMatchObject({
-      permissionMode: "deny", networkMode: "none", allowUnsafeHostExec: false,
+      permissionMode: "deny", readScope: "workspace", networkMode: "none", processHandoff: "deny",
+      allowUnsafeHostExec: false,
       maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
     });
 
     const narrowed = resolveConfig({
-      home: { permissions: { mode: "auto" }, security: { network: "full" }, budget: { max_input_tokens: 2_000 } },
-      workspace: { permissions: { mode: "ask" }, security: { network: "none" }, budget: { max_input_tokens: 1_000 } }
+      home: {
+        permissions: { mode: "auto" },
+        security: { read_scope: "host", network: "full", process_handoff: "allow" },
+        budget: { max_input_tokens: 2_000 }
+      },
+      workspace: {
+        permissions: { mode: "ask" },
+        security: { read_scope: "workspace", network: "none", process_handoff: "deny" },
+        budget: { max_input_tokens: 1_000 }
+      }
     });
-    expect(narrowed).toMatchObject({ permissionMode: "ask", networkMode: "none", maxInputTokens: 1_000 });
+    expect(narrowed).toMatchObject({
+      permissionMode: "ask", readScope: "workspace", networkMode: "none", processHandoff: "deny",
+      maxInputTokens: 1_000
+    });
 
     const explicit = resolveConfig({
       flags: { "permission-mode": "auto", "max-input-tokens": 3_000 },

@@ -28,7 +28,10 @@ export interface CliConfig {
   agentProfile: string;
   permissionMode: "ask" | "auto" | "deny";
   sandboxMode: "required";
+  executionMode: "sandboxed" | "disposable-container";
+  readScope: "workspace" | "host";
   networkMode: "none" | "full";
+  processHandoff: "allow" | "deny";
   allowUnsafeHostExec: boolean;
   unsafeHostExecRequested: boolean;
   reviewerWaiver: boolean;
@@ -198,15 +201,19 @@ function customizationTrustAttestation(
 }
 
 function unsafeHostSettings(values: ReturnType<typeof resolveConfig>): {
+  executionMode: "sandboxed" | "disposable-container";
   allowUnsafeHostExec: boolean;
   unsafeHostExecRequested: boolean;
 } {
   const allowUnsafeHostExec = values.allowUnsafeHostExec === true;
-  const unsafeHostExecRequested = values.unsafeHostExec === true;
+  const executionMode = values.executionMode === "disposable-container" || values.unsafeHostExec === true
+    ? "disposable-container"
+    : "sandboxed";
+  const unsafeHostExecRequested = executionMode === "disposable-container";
   if (unsafeHostExecRequested && !allowUnsafeHostExec) {
-    throw new Error("--unsafe-host-exec requires security.allow_unsafe_host_exec=true in ~/.sigma/config.toml.");
+    throw new Error("--execution-mode disposable-container requires security.allow_unsafe_host_exec=true in ~/.sigma/config.toml (--unsafe-host-exec is a compatibility alias).");
   }
-  return { allowUnsafeHostExec, unsafeHostExecRequested };
+  return { executionMode, allowUnsafeHostExec, unsafeHostExecRequested };
 }
 
 function cliConfig(
@@ -226,7 +233,9 @@ function cliConfig(
     agentProfile: String(values.agentProfile),
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
+    readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
+    processHandoff: values.processHandoff as CliConfig["processHandoff"],
     ...unsafe,
     reviewerWaiver: values.reviewerWaiver === true,
     legacySingleModelRoute,

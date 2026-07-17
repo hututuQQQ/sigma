@@ -202,7 +202,10 @@ describe("typed workspace mutation contracts", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-contract-"));
     await mkdir(path.join(workspace, "src"));
     const fixture = brokerFixture();
-    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      networkMode: "none"
+    });
     const call = request("write-process", "exec", {
       executable: process.execPath,
       args: ["--version"],
@@ -286,6 +289,66 @@ describe("typed workspace mutation contracts", () => {
     }
   });
 
+  it("mounts only approved stable external read roots and requires an external-read grant", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-workspace-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-input-"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      readScope: "host",
+      networkMode: "none"
+    });
+    const call = request("external-read-exec", "exec", {
+      executable: process.execPath,
+      readRoots: [external]
+    });
+    const plan = await tools.prepare(call, preparation(workspace));
+
+    expect(plan).toMatchObject({
+      exactEffects: ["process.spawn.readonly", "filesystem.read", "filesystem.read.external"],
+      readPaths: [".", external]
+    });
+    await expect(tools.execute(call, { ...execution(workspace), callPlan: plan }))
+      .rejects.toMatchObject({ code: "policy_denied" });
+
+    const approved = request("external-read-approved", "exec", {
+      executable: process.execPath,
+      readRoots: [external]
+    });
+    const approvedPlan = await tools.prepare(approved, preparation(workspace));
+    await expect(tools.execute(approved, {
+      ...execution(workspace),
+      callPlan: approvedPlan,
+      approval: { externalReadApproved: true }
+    })).resolves.toMatchObject({ ok: true });
+    expect(fixture.executions).toHaveLength(1);
+    expect(fixture.executions[0]?.policy.readRoots).toEqual([workspace, external]);
+  });
+
+  it("rejects linked ancestors in external process read roots", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-workspace-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-input-"));
+    const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-parent-"));
+    const linked = path.join(parent, "linked");
+    try {
+      await symlink(external, linked, process.platform === "win32" ? "junction" : "dir");
+    } catch {
+      return;
+    }
+    const exec = executionTools({
+      broker: brokerFixture().broker,
+      sandboxMode: "required",
+      readScope: "host",
+      processHandoff: "deny",
+      networkMode: "none"
+    }).find((tool) => tool.descriptor.name === "exec")!;
+
+    await expect(exec.descriptor.prepare!({
+      executable: process.execPath,
+      readRoots: [linked]
+    }, preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
+  });
+
   it("rejects escaping or unstable read roots and binds approved read paths into the plan signature", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-guards-"));
     const approvedRoot = path.join(workspace, "approved");
@@ -333,7 +396,7 @@ describe("typed workspace mutation contracts", () => {
 
     await expect(prepareExec("implicit", {
       writeRoots: ["src"], expectedChanges: ["src/file.ts"]
-    })).rejects.toMatchObject({ code: "write_scope_required" });
+    })).resolves.toMatchObject({ writePaths: ["src/file.ts"], checkpointScope: ["src"] });
     await expect(prepareExec("missing-expected", {
       access: "write", writeRoots: ["src"]
     })).rejects.toMatchObject({ code: "write_scope_required" });
@@ -380,6 +443,23 @@ describe("typed workspace mutation contracts", () => {
       expectedChanges: ["."]
     }), execution(workspace))).rejects.toMatchObject({ code: "write_plan_invalid" });
     expect(fixture.executions).toHaveLength(0);
+  });
+
+  it("infers write access and the nearest existing root from expectedChanges", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-inferred-write-"));
+    await mkdir(path.join(workspace, "src"));
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker: fixture.broker });
+    const plan = await tools.prepare(request("inferred-write", "exec", {
+      executable: process.execPath,
+      expectedChanges: ["src/generated/nested/file.ts"]
+    }), preparation(workspace));
+
+    expect(plan).toMatchObject({
+      writePaths: ["src/generated/nested/file.ts"],
+      checkpointScope: ["src"],
+      exactEffects: expect.arrayContaining(["filesystem.write"])
+    });
   });
 
   it("rejects a write root that changes to a link after its plan is approved", async () => {

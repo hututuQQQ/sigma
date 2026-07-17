@@ -16,6 +16,20 @@ export function registerContentValidator(tools: EffectToolRegistry): EffectToolR
       description: "Verify declared fixture file postconditions and return linked validation evidence.",
       inputSchema: { type: "object" },
       possibleEffects: ["filesystem.read", "validation"],
+      prepare(argumentsValue) {
+        const input = argumentsValue as { checks?: Array<{ path?: unknown }> };
+        const readPaths = (input.checks ?? []).flatMap((check) =>
+          typeof check.path === "string" ? [check.path] : []);
+        return {
+          exactEffects: ["filesystem.read", "validation"],
+          readPaths,
+          writePaths: [],
+          network: "none",
+          processMode: "none",
+          checkpointScope: [],
+          idempotence: "read_only"
+        };
+      },
       executionMode: "parallel",
       resourceKeys: ["workspace:read"],
       approval: "auto",
@@ -75,7 +89,9 @@ export function registerContentValidator(tools: EffectToolRegistry): EffectToolR
               cancelled: false
             },
             artifactIds: [],
-            workspaceDeltaEvidenceIds: []
+            frontierRevision: 0,
+            stateDigest: "0".repeat(64),
+            coveredPaths: []
           }
         }],
         startedAt,

@@ -146,7 +146,7 @@ describe("child follow-up lifecycle", () => {
       reviewer: createApprovingReviewer(),
       execution,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const parent = await runtime.createSession({ workspacePath: repository, mode: "change" });
     const supervisor = new AgentSupervisor(

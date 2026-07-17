@@ -115,7 +115,7 @@ function descriptor(
 }
 
 describe("terminal convergence properties", () => {
-  it("projects only standard pure terminal tools into protected terminal repair", () => {
+  it("keeps every normal tool available during terminal correction", () => {
     const effects = fc.uniqueArray(fc.constantFrom<ToolEffect>(
       "outcome.propose",
       "outcome.request_input",
@@ -127,40 +127,26 @@ describe("terminal convergence properties", () => {
     fc.assert(fc.property(effects, effects, effects, names,
       (possibleEffects, maximumEffects, exactEffects, name) => {
       const tool = descriptor(possibleEffects, maximumEffects, name);
-      const pureCompletion = possibleEffects.length === 1 && possibleEffects[0] === "outcome.propose"
-        && maximumEffects.length === 1 && maximumEffects[0] === "outcome.propose";
-      const pureInput = possibleEffects.length === 1 && possibleEffects[0] === "outcome.request_input"
-        && maximumEffects.length === 1 && maximumEffects[0] === "outcome.request_input";
-      const expected = (name === "complete_task" && pureCompletion)
-        || (name === "request_user_input" && pureInput);
-      expect(descriptorAllowedForRepair(tool, "protected_completion")).toBe(expected);
-      if (descriptorAllowedForRepair(tool, "protected_completion")) {
-        expect(terminalProtocolAction(tool)).toBe(name === "complete_task" ? "complete" : "request_input");
-      }
-      const noTerminalCapability = [...possibleEffects, ...maximumEffects].every((effect) =>
-        effect !== "outcome.propose" && effect !== "outcome.request_input");
-      expect(descriptorAllowedForRepair(tool, "evidence")).toBe(noTerminalCapability || pureInput);
-      expect(descriptorAllowedForRepair(tool, "protected_recovery"))
-        .toBe(noTerminalCapability || expected);
-      expect(effectsAllowedForRepair(exactEffects, "protected_completion")).toBe(
-        exactEffects.length === 1
-          && (exactEffects[0] === "outcome.propose" || exactEffects[0] === "outcome.request_input")
-      );
-      const terminalEffects = exactEffects.filter((effect) =>
-        effect === "outcome.propose" || effect === "outcome.request_input");
-      const expectedEvidence = terminalEffects.length === 0
-        || (exactEffects.length === 1 && exactEffects[0] === "outcome.request_input");
-      expect(effectsAllowedForRepair(exactEffects, "evidence")).toBe(expectedEvidence);
-      const expectedRecovery = terminalEffects.length === 0
-        || (exactEffects.length === 1 && terminalEffects.length === 1);
-      expect(effectsAllowedForRepair(exactEffects, "protected_recovery")).toBe(expectedRecovery);
+      expect(descriptorAllowedForRepair(tool, "protected_completion")).toBe(true);
+      const pureAction = possibleEffects.length === 1 && maximumEffects.length === 1
+        && possibleEffects[0] === maximumEffects[0]
+        ? possibleEffects[0] === "outcome.propose" ? "complete"
+          : possibleEffects[0] === "outcome.request_input" ? "request_input" : null
+        : null;
+      expect(terminalProtocolAction(tool)).toBe(pureAction);
+      expect(descriptorAllowedForRepair(tool, "evidence")).toBe(true);
+      expect(descriptorAllowedForRepair(tool, "protected_recovery")).toBe(true);
+      expect(effectsAllowedForRepair(exactEffects, "protected_completion")).toBe(true);
+      expect(effectsAllowedForRepair(exactEffects, "evidence")).toBe(true);
+      expect(effectsAllowedForRepair(exactEffects, "protected_recovery")).toBe(true);
     }));
   });
 
-  it("always converges a protected concrete question to a typed input proposal", () => {
+  it("always converges an explicit concrete question to a typed input proposal", () => {
     fc.assert(fc.property(nonBlankText, nonBlankText, (answer, question) => {
-      const protectedState = protectedAnswer(answer);
-      let attempted = settleModel(startModel(protectedState, 2), {
+      let prepared = apply(initial(), "user.message", { text: answer });
+      prepared = apply(prepared, "evidence.recorded", evidence());
+      let attempted = settleModel(startModel(prepared, 1), {
         message: {
           role: "assistant",
           content: "",
@@ -202,21 +188,13 @@ describe("terminal convergence properties", () => {
     }));
   });
 
-  it("always publishes the locked answer when protected completion succeeds", () => {
+  it("always publishes ordinary text when its runtime completion intent succeeds", () => {
     fc.assert(fc.property(nonBlankText, nonBlankText, nonBlankText, (answer, repairText, summary) => {
+      void repairText;
       let state = protectedAnswer(answer);
-      state = settleModel(startModel(state, 2), {
-        message: {
-          role: "assistant",
-          content: repairText,
-          toolCalls: [{ id: "repair-complete", name: "complete_task", arguments: {} }]
-        },
-        toolCalls: [{ id: "repair-complete", name: "complete_task", arguments: {} }],
-        finishReason: "tool_calls"
-      });
       const pending = state.pendingTools[0]!;
       state = apply(state, "tool.completed", {
-        callId: "repair-complete",
+        callId: pending.request.callId,
         ...pending.modelTurn,
         ok: true,
         output: JSON.stringify({ summary }),
@@ -226,10 +204,9 @@ describe("terminal convergence properties", () => {
         startedAt: NOW,
         completedAt: NOW
       });
-      expect(state.proposedOutcome).toMatchObject({
-        kind: "completed",
-        message: answer.trim()
-      });
+      expect(state.proposedOutcome).toMatchObject({ kind: "completed" });
+      expect(state.proposedOutcome?.message).toContain(answer.trim());
+      expect(state.proposedOutcome?.message).toContain(summary);
       assertKernelInvariants(state);
     }));
   });

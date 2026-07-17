@@ -66,7 +66,8 @@ export const durableEventPayloadSchemas = {
     processId: nonEmptyStringSchema,
     executionId: nonEmptyStringSchema,
     mode: z.enum(["pipe", "pty", "background"]),
-    brokerInstanceId: nonEmptyStringSchema
+    brokerInstanceId: nonEmptyStringSchema,
+    lifecycle: z.enum(["session", "deliverable"]).default("session")
   }).strict(),
   "process.output": z.object({
     processId: nonEmptyStringSchema,
@@ -81,6 +82,11 @@ export const durableEventPayloadSchemas = {
     reason: z.string().optional()
   }).strict(),
   "process.lost": z.object({ processId: nonEmptyStringSchema, reason: nonEmptyStringSchema }).strict(),
+  "process.handed_off": z.object({
+    processId: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
+    systemProcessId: z.number().int().positive().optional()
+  }).strict(),
   "evidence.recorded": sharedSchemas.evidenceRecordSchema,
   "usage.recorded": sharedSchemas.usageRecordSchema,
   "model.route_resolved": z.object({

@@ -3,6 +3,8 @@ import type {
   CommandEvidence,
   DiagnosticEvidence,
   EvidenceRecord,
+  InputAccessEvidence,
+  RepositoryDeltaEvidence,
   ToolCallPlan,
   ToolReceipt,
   ValidationEvidence,
@@ -13,6 +15,11 @@ export interface ReceiptEvidenceScope {
   sessionId: string;
   runId: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
+  validationScope?: {
+    frontierRevision: number;
+    stateDigest: string;
+    coveredPaths: string[];
+  };
 }
 
 export function effectsOutsidePlan(receipt: ToolReceipt, plan: ToolCallPlan): string[] {
@@ -45,6 +52,10 @@ function sanitizeValidation(
   receipt: ToolReceipt,
   scope: ReceiptEvidenceScope
 ): ValidationEvidence {
+  const frontier = scope.validationScope;
+  if (!frontier) throw Object.assign(new Error("Validation evidence is missing its frozen mutation frontier."), {
+    code: "validation_frontier_missing"
+  });
   return {
     ...evidenceBase(scope, receipt),
     kind: "validation",
@@ -56,8 +67,9 @@ function sanitizeValidation(
       ...(raw.data.exitCode === undefined ? {} : { exitCode: raw.data.exitCode }),
       ...(raw.data.termination ? { termination: { ...raw.data.termination } } : {}),
       artifactIds: [...new Set(receipt.artifacts)],
-      workspaceDeltaEvidenceIds: scope.workspaceDeltas.map((item) => item.evidenceId),
-      checkpointIds: [...new Set(scope.workspaceDeltas.map((item) => item.data.checkpointId))]
+      frontierRevision: frontier.frontierRevision,
+      stateDigest: frontier.stateDigest,
+      coveredPaths: [...frontier.coveredPaths]
     }
   };
 }
@@ -88,6 +100,40 @@ function sanitizeDiagnostic(raw: DiagnosticEvidence, receipt: ToolReceipt, scope
     status: receipt.ok ? raw.status : "failed",
     summary: raw.summary,
     data: { source: raw.data.source, diagnostic: raw.data.diagnostic }
+  };
+}
+
+function sanitizeInputAccess(
+  raw: InputAccessEvidence,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): InputAccessEvidence {
+  return {
+    ...evidenceBase(scope, receipt),
+    kind: "input_access",
+    status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
+    summary: raw.summary,
+    data: {
+      path: raw.data.path,
+      scope: raw.data.scope,
+      ...(raw.data.sha256 ? { sha256: raw.data.sha256 } : {}),
+      ...(raw.data.byteLength === undefined ? {} : { byteLength: raw.data.byteLength }),
+      ...(raw.data.failureCode ? { failureCode: raw.data.failureCode } : {})
+    }
+  };
+}
+
+function sanitizeRepositoryDelta(
+  raw: RepositoryDeltaEvidence,
+  receipt: ToolReceipt,
+  scope: ReceiptEvidenceScope
+): RepositoryDeltaEvidence {
+  return {
+    ...evidenceBase(scope, receipt),
+    kind: "repository_delta",
+    status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
+    summary: raw.summary,
+    data: { ...raw.data, operations: [...raw.data.operations] }
   };
 }
 
@@ -127,10 +173,17 @@ export function normalizeReceiptEvidence(
     if (raw.kind === "validation" && plan.exactEffects.includes("validation") && actualEffects.includes("validation")) {
       return [sanitizeValidation(raw, receipt, scope)];
     }
+    if (raw.kind === "repository_delta" && plan.exactEffects.includes("repository.write")
+      && actualEffects.includes("repository.write")) {
+      return [sanitizeRepositoryDelta(raw, receipt, scope)];
+    }
     if (raw.kind === "command" && actualEffects.some((effect) => effect === "process.spawn" || effect === "process.spawn.readonly")) {
       return [sanitizeCommand(raw, receipt, scope)];
     }
     if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
+    if (raw.kind === "input_access" && actualEffects.includes("filesystem.read")) {
+      return [sanitizeInputAccess(raw, receipt, scope)];
+    }
     return [];
   });
   return {

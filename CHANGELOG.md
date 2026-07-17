@@ -8,7 +8,36 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 ### Changed
 
-- Nothing yet.
+- Configuration schema v4 defaults to host-scoped declared reads, full sandbox networking, and explicit process handoff while retaining required isolation and workspace-only writes.
+- Sealed no-op checkpoints no longer advance the mutation frontier; mutating validation binds to the post-seal frontier.
+- Workspace write-plan checks no longer follow a final symlink object, while linked ancestors and external-target writes remain denied.
+
+### Added
+
+- Stable external-input reads with per-call approval, `input_access` evidence, and unresolved goal-input completion obligations.
+- Linux deliverable process handoff with detached stdio, watchdog revocation, durable lifecycle events, and fail-closed capability discovery on unsupported platforms.
+
+### Security
+
+- External reads and handoff are sensitive effects with fresh per-call grants; unsafe host execution and workspace-external writes remain disabled.
+- The strict pre-v4 posture remains available with `read_scope=workspace`, `network=none`, and `process_handoff=deny`.
+
+## [4.0.0-rc.1] - 2026-07-17
+
+### Changed
+
+- Completion and validation now converge on a runtime-owned mutation frontier instead of model-selected evidence IDs.
+- Review policy is now `off`, `advisory`, or `required`; the standard profile uses advisory review and the strict profile requires it.
+- Oversized tool exchanges are retained losslessly or replaced atomically by plain text during context compaction.
+
+### Added
+
+- A structured, local-only `git_transaction` tool with CAS-backed repository metadata rollback.
+- Typed `report_blocked` recovery outcomes and `repository_delta` evidence.
+
+### Removed
+
+- V3 completion criteria arguments and `review_non_documentation_changes` profile configuration.
 
 ## [3.0.0-rc.2] - 2026-07-16
 
@@ -53,6 +82,7 @@ trusted Windows code-signing gate is not yet configured. Windows x64 remains the
 first intended end-user binary target; Linux x64 packaging remains a technical
 preview and CI validation target.
 
-[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v3.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/hututuQQQ/sigma/compare/v4.0.0-rc.1...HEAD
+[4.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v4.0.0-rc.1
 [3.0.0-rc.2]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.2
 [3.0.0-rc.1]: https://github.com/hututuQQQ/sigma/releases/tag/v3.0.0-rc.1

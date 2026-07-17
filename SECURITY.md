@@ -44,3 +44,29 @@ Authenticode and trusted provenance gates did not pass.
 
 Treat locally built archives, workflow artifacts, and files without matching release
 sidecars as development outputs rather than official releases.
+
+## Runtime capability defaults
+
+Configuration schema v4 keeps `sandbox=required` and workspace-only writes, but
+defaults declared read access to `read_scope=host`, sandbox networking to
+`network=full`, and Linux process transfer to `process_handoff=allow`. External
+reads, network access, and handoff are sensitive per-call effects: `ask` requires
+confirmation for each call, `auto` issues a fresh call-bound grant, and `deny`
+rejects them. These settings never authorize unsafe host execution.
+
+Use the following configuration for the strict capability posture:
+
+```toml
+schema_version = 4
+
+[security]
+sandbox = "required"
+read_scope = "workspace"
+network = "none"
+process_handoff = "deny"
+```
+
+Process handoff is currently advertised only on Linux when the native sandbox and
+watchdog self-tests pass. Windows and other platforms fail closed. A handed-off
+service is intentionally no longer owned or terminated by its Sigma session, so
+only independently health-checked deliverables should use this capability.

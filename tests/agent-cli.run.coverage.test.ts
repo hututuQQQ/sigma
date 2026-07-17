@@ -117,6 +117,27 @@ function writeRequest(): ModelResponse {
   };
 }
 
+function validationRequest(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "validate-approval-result",
+        name: "validate",
+        arguments: {
+          executable: "node",
+          args: ["-e", "const fs=require('node:fs');process.exit(fs.readFileSync('approval-result.md','utf8')==='approved'?0:1)"],
+          cwd: ".",
+          readRoots: ["."],
+          network: "none"
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function networkExecutionRequest(): ModelResponse {
   return {
     message: {
@@ -194,7 +215,7 @@ describe("run command branch coverage", () => {
     ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
       evidenceRequest("file-evidence"), complete("file complete")
     ]) });
-    expect(code).toBe(0);
+    expect(code, `${stderr.text()}\nSTDOUT:\n${stdout.text()}`).toBe(0);
     expect(stdout.text()).toContain("file complete");
   });
 
@@ -314,21 +335,35 @@ describe("run command branch coverage", () => {
   ] as const)("handles interactive approval answer '%s'", async (answer, allowed, eventType) => {
     const root = await workspace("sigma-run-approval-");
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
-    stdin.end(`${answer}\n`);
     const stdout = new Capture();
     stdout.isTTY = true;
     const stderr = new Capture();
     const completion = allowed ? complete("approved complete") : complete("denied complete");
     const script = allowed
-      ? [writeRequest(), completion]
+      ? [writeRequest(), validationRequest(), completion]
       : [writeRequest(), evidenceRequest("denial-evidence"), completion];
+    // Each approval creates its own readline interface. Respond only after its
+    // prompt is visible so a line intended for validation cannot be consumed
+    // by the write approval's interface.
+    const responses = allowed ? [answer, "a"] : [answer];
+    let sent = 0;
+    const feeder = setInterval(() => {
+      const promptCount = stderr.text().match(/Allow /g)?.length ?? 0;
+      while (sent < promptCount && sent < responses.length) {
+        stdin.write(`${responses[sent]}\n`);
+        sent += 1;
+      }
+    }, 5);
     const code = await runCommand([
       "write approval result",
       "--workspace", root,
       "--permission-mode", "ask",
       ...(allowed ? ["--waive-reviewer"] : [])
-    ], { stdin, stdout, stderr, ...runDeps(script) });
-    expect(code).toBe(0);
+    ], { stdin, stdout, stderr, ...runDeps(script) }).finally(() => {
+      clearInterval(feeder);
+      stdin.end();
+    });
+    expect(code, `${stderr.text()}\nSTDOUT:\n${stdout.text()}`).toBe(0);
     expect(stderr.text()).toContain(eventType);
     if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.md"), "utf8"))).toBe("approved");
   });

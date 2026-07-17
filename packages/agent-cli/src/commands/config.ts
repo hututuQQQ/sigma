@@ -15,7 +15,7 @@ interface ConfigCommandDeps {
 
 interface ConfigMigrationResult {
   configPath: string;
-  currentVersion: 2 | 3;
+  currentVersion: 2 | 3 | 4;
   migrationRequired: boolean;
   written: boolean;
   json: boolean;
@@ -30,7 +30,9 @@ function overrides(config: CliConfig): Partial<Record<string, ConfigValue>> {
     workspace: ".",
     permissionMode: config.permissionMode,
     sandboxMode: config.sandboxMode,
+    readScope: config.readScope,
     networkMode: config.networkMode,
+    processHandoff: config.processHandoff,
     runDeadlineSec: config.runDeadlineSec,
     modelDeadlineSec: config.modelDeadlineSec,
     streamIdleSec: config.streamIdleSec,
@@ -81,7 +83,7 @@ async function migrateConfig(argv: string[], deps: ConfigCommandDeps): Promise<C
   const currentVersion = configVersion(parseToml(source) as Record<string, unknown>);
   const migrationRequired = currentVersion !== CONFIG_SCHEMA_VERSION;
   const written = flags.write === true && migrationRequired;
-  if (written) await writeMigratedConfig(configPath, source, config);
+  if (written) await writeMigratedConfig(configPath, source, config, currentVersion);
   return { configPath, currentVersion, migrationRequired, written, json: flags.json === true };
 }
 
@@ -92,15 +94,21 @@ function assertMigrationArguments(positionals: string[], flags: Record<string, u
   if (flags.check === true && flags.write === true) throw new Error("Choose either --check or --write, not both.");
 }
 
-function configVersion(document: Record<string, unknown>): 2 | 3 {
+function configVersion(document: Record<string, unknown>): 2 | 3 | 4 {
   const current = document.schema_version;
   if (current === undefined || current === 2) return 2;
   if (current === 3) return 3;
+  if (current === 4) return 4;
   throw new Error(`Unsupported config schema_version '${String(current)}'.`);
 }
 
-async function writeMigratedConfig(configPath: string, source: string, config: CliConfig): Promise<void> {
-  const backupPath = `${configPath}.v2.bak`;
+async function writeMigratedConfig(
+  configPath: string,
+  source: string,
+  config: CliConfig,
+  currentVersion: 2 | 3 | 4
+): Promise<void> {
+  const backupPath = `${configPath}.v${currentVersion}.bak`;
   try { await writeFile(backupPath, source, { flag: "wx" }); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw new Error(`Migration backup already exists: ${backupPath}`, { cause: error });
@@ -124,7 +132,7 @@ function writeMigrationResult(stdout: NodeJS.WritableStream, result: ConfigMigra
     })}\n`);
     return;
   }
-  if (!result.migrationRequired) stdout.write(`${result.configPath} already uses schema v3\n`);
+  if (!result.migrationRequired) stdout.write(`${result.configPath} already uses schema v${CONFIG_SCHEMA_VERSION}\n`);
   else if (result.written) stdout.write(`migrated ${result.configPath}\n`);
-  else stdout.write(`${result.configPath} requires migration from v${result.currentVersion} to v3\n`);
+  else stdout.write(`${result.configPath} requires migration from v${result.currentVersion} to v${CONFIG_SCHEMA_VERSION}\n`);
 }

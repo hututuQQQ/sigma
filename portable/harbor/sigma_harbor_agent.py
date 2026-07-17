@@ -36,7 +36,8 @@ MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
 FAILURE_KINDS = {
-    "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure"
+    "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
+    "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
 }
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
@@ -48,6 +49,32 @@ MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
 PROCESS_TERM_GRACE_SEC = 1
+
+
+def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> str | None:
+    normalized = code.lower() if isinstance(code, str) else ""
+    if not normalized:
+        return None
+    diagnostics = (payload or {}).get("diagnostics")
+    category = diagnostics.get("category") if isinstance(diagnostics, dict) else None
+    if normalized == "convergence_no_progress":
+        return "convergence_no_progress"
+    if normalized.startswith("validation_"):
+        return "validation_blocked"
+    if normalized.startswith("runtime_") or normalized in {
+        "effect_plan_violation", "tool_receipt_identity_mismatch", "validation_frontier_missing"
+    }:
+        return "runtime_invariant_failure"
+    # Model protocol/convergence failures are agent outcomes, not provider API
+    # failures. A provider category or an unambiguous transport/API prefix is
+    # required before Harbor reports api_error.
+    if category in {"network", "timeout", "authentication", "rate_limit", "server"}:
+        return "api_error"
+    if normalized.startswith(("api_", "provider_", "network_")):
+        return "api_error"
+    if normalized.startswith(("tool_", "execution_", "process_")):
+        return "tool_error"
+    return None
 
 
 def _default_model(provider: str) -> str:
@@ -398,12 +425,7 @@ class _OutputRecorder:
             error = value.get("error")
             error_record = error if isinstance(error, dict) else value
             code = error_record.get("code")
-            normalized = code.lower() if isinstance(code, str) else ""
-            failure = (
-                "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
-                else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
-                else None
-            )
+            failure = _failure_kind_for_code(code, error_record)
             self.output_result = {
                 "status": "error",
                 "message": str(error_record.get("message") or "agent CLI returned an error"),
@@ -438,7 +460,8 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
-        network_mode: str = "none",
+        network_mode: str = "full",
+        execution_mode: str = "sandboxed",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -467,8 +490,15 @@ class SigmaCliHarborAgent(BaseAgent):
         if network_mode not in {"none", "full"}:
             raise ValueError("network_mode must be one of: none, full")
         self.network_mode = network_mode
+        if execution_mode not in {"sandboxed", "disposable-container"}:
+            raise ValueError(
+                "execution_mode must be one of: sandboxed, disposable-container"
+            )
+        self.execution_mode = execution_mode
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
+        self.effective_read_scope = "host"
+        self.process_handoff_available = False
         self.agent_timeout_grace_sec = max(0, _as_int(agent_timeout_grace_sec, 120))
         env_outer_deadline = os.environ.get("SIGMA_HARBOR_OUTER_TRIAL_DEADLINE_SEC")
         parsed_outer_deadline = _as_int(
@@ -502,6 +532,7 @@ class SigmaCliHarborAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
+        await self._configure_execution_mode(environment)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
             await self._verify_agent_ready(environment)
@@ -520,6 +551,26 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self._write_setup_checks([], "agent_setup_failed")
         raise RuntimeError(message)
+
+    async def _configure_execution_mode(self, environment: BaseEnvironment) -> None:
+        """Create an isolated home opt-in for an explicitly disposable run.
+
+        The adapter never infers this mode from a task or environment. Keeping
+        the opt-in under a dedicated HOME also prevents a workspace config from
+        granting itself host execution privileges.
+        """
+        if self.execution_mode != "disposable-container":
+            return
+        command = (
+            "umask 077; mkdir -p /tmp/agent/disposable-home/.sigma; "
+            "printf '[security]\\nallow_unsafe_host_exec = true\\n' "
+            "> /tmp/agent/disposable-home/.sigma/config.toml"
+        )
+        configured = await environment.exec(command, timeout_sec=30)
+        if _return_code(configured) != 0:
+            raise RuntimeError(
+                "agent_setup_failed: could not create the disposable-container home opt-in"
+            )
 
     async def run(
         self,
@@ -686,6 +737,9 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["failure_kind"] = failure_kind
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
+        summary["execution_mode"] = self.execution_mode
+        summary["read_scope_effective"] = self.effective_read_scope
+        summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
         self._populate_context(context, result, summary, error_message)
@@ -711,7 +765,10 @@ class SigmaCliHarborAgent(BaseAgent):
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        command = [
+        command = []
+        if self.execution_mode == "disposable-container":
+            command.extend(["env", "HOME=/tmp/agent/disposable-home"])
+        command.extend([
             "/usr/local/bin/agent",
             "run",
             "--workspace",
@@ -726,6 +783,10 @@ class SigmaCliHarborAgent(BaseAgent):
             str(self.max_wall_time_sec),
             "--network",
             self.network_mode,
+            "--read-scope",
+            self.effective_read_scope,
+            "--process-handoff",
+            "allow",
             "--permission-mode",
             "auto",
             "--output-format",
@@ -734,7 +795,9 @@ class SigmaCliHarborAgent(BaseAgent):
             "3",
             "--stream-json-max-line-bytes",
             "49152",
-        ]
+        ])
+        if self.execution_mode == "disposable-container":
+            command.extend(["--execution-mode", "disposable-container"])
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
         return command
@@ -898,12 +961,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     error = value.get("error")
                     error_record = error if isinstance(error, dict) else value
                     code = error_record.get("code")
-                    normalized = code.lower() if isinstance(code, str) else ""
-                    failure = (
-                        "api_error" if normalized.startswith(("api_", "provider_", "model_", "network_"))
-                        else "tool_error" if normalized.startswith(("tool_", "execution_", "process_"))
-                        else None
-                    )
+                    failure = _failure_kind_for_code(code, error_record)
                     output_result = {
                         "status": "error",
                         "message": str(error_record.get("message") or "agent CLI returned an error"),
@@ -925,8 +983,18 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         # A durable run terminal is the Agent/runtime outcome. Earlier model or
         # tool failures remain diagnostic causes, but must not override the
         # completed runtime lifecycle classification.
-        if any(event.get("type") in {"run.failed", "run.cancelled"} for event in events):
-            return "agent_failure"
+        terminal = next((event for event in reversed(events)
+                         if event.get("type") in {"run.failed", "run.cancelled"}), None)
+        if terminal is not None:
+            payload = _event_payload(terminal)
+            explicit = payload.get("failureKind") or payload.get("failure_kind")
+            if explicit in FAILURE_KINDS:
+                return explicit
+            classified = _failure_kind_for_code(
+                payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode"),
+                payload,
+            )
+            return classified or "agent_failure"
         finish_reason = output_result.get("finishReason") or output_result.get("finish_reason")
         if finish_reason in {"timeout", "timed_out", "max_wall_time"}:
             return "timeout"
@@ -938,11 +1006,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return explicit
             code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
             if isinstance(code, str):
-                normalized = code.lower()
-                if normalized.startswith(("api_", "provider_", "model_")):
-                    return "api_error"
-                if normalized.startswith(("tool_", "execution_", "process_")):
-                    return "tool_error"
+                classified = _failure_kind_for_code(code, payload)
+                if classified:
+                    return classified
             if event_type == "model.failed":
                 return "api_error"
             if event_type == "tool.failed":
@@ -1246,6 +1312,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "model_failure": model_failure,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
         }
 
     def _persist_timeout_artifacts(
@@ -1277,6 +1345,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "message": error_message or "agent execution timed out",
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
             "last_event": last_event,
             "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
             "tool_calls": live_state.get("tool_calls", sum(event.get("type") in {"tool.requested", "tool.started"} for event in events)),
@@ -1309,6 +1379,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
         })
         summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1467,6 +1539,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 f"agent_setup_failed: requested network_mode={self.network_mode} is not supported by the broker"
             )
         self.effective_network_mode = self.network_mode
+        self.process_handoff_available = capabilities["processHandoff"]
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -1511,6 +1584,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         modes = capabilities.get("networkModes")
         if not isinstance(modes, list) or any(mode not in SUPPORTED_NETWORK_MODES for mode in modes):
             return "capabilities.networkModes are missing or invalid"
+        if not isinstance(capabilities.get("processHandoff"), bool):
+            return "capabilities.processHandoff is missing or invalid"
         return None
 
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
@@ -1521,6 +1596,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "available_network_modes": list(self.available_network_modes),
+            "read_scope_effective": self.effective_read_scope,
+            "process_handoff_available": self.process_handoff_available,
             "checks": checks,
         }
         (self.logs_dir / "setup-check.json").write_text(
@@ -1673,6 +1750,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "cost_usd": summary.get("cost_usd"),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
+            "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
+            "process_handoff_available": summary.get("process_handoff_available", self.process_handoff_available),
         }
         for key, value in values.items():
             self._set_context_value(context, key, value)
@@ -1733,6 +1812,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "failure_kind": getattr(context, "failure_kind", None),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
+            "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),
+            "process_handoff_available": getattr(context, "process_handoff_available", self.process_handoff_available),
             "artifact_warnings": getattr(context, "artifact_warnings", []),
             "commands_executed": getattr(context, "commands_executed", 0),
             "tool_calls": getattr(context, "tool_calls", 0),

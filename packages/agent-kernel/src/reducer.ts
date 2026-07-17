@@ -13,6 +13,7 @@ import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
 import { recordSemanticToolResult } from "./semantic-failures.js";
+import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { completedToolBatchProgress, repeatsCompletedToolBatch } from "./tool-batch-progress.js";
 import {
   acceptsOutcomeRevision,
@@ -118,7 +119,6 @@ const modelStarted: EventReducer = (state, _event, payload) => {
   if (state.phase !== "ready_model" || !turn || turn.effectRevision !== state.revision - 1) return state;
   return { ...state, phase: "model_in_flight", activeModelTurn: turn, activeModelSemanticDelta: false };
 };
-
 const modelSemanticDelta: EventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !state.activeModelTurn
     || payload.turnId !== state.activeModelTurn.turnId) return state;
@@ -164,7 +164,7 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
       toolCallIds: [...state.toolCallIds, ...identifiers]
     }, {
       kind: "recoverable_failure",
-      code: "agent_no_progress",
+      code: "convergence_no_progress",
       message: completionRepairFailureMessage(
         state,
         "The same tool batch produced the same completed outcome twice and was proposed again without progress."
@@ -310,7 +310,10 @@ const runFailed: EventReducer = (state, _event, payload) => {
 const runCompleted: EventReducer = (state, _event, payload) => {
   if (!Number.isInteger(payload.outcomeRevision) || !acceptsOutcomeRevision(state, payload)
     || state.proposedOutcome?.kind !== "completed") return state;
-  return terminalState(state, { ...state.proposedOutcome, evidence: state.evidence });
+  return terminalState({
+    ...state,
+    mutationFrontier: acceptMutationFrontier(state.mutationFrontier)
+  }, { ...state.proposedOutcome, evidence: state.evidence });
 };
 
 const diagnostic: EventReducer = (state, _event, payload) => {

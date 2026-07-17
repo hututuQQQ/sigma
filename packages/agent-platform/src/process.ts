@@ -5,6 +5,7 @@ import type {
   ExecutionResult,
   ProcessLaunchFailureV1,
   ProcessHandle,
+  ProcessHandoffResult,
   ProcessPollResult
 } from "agent-execution";
 import { BrokerCancelledError } from "agent-execution";
@@ -14,6 +15,7 @@ export interface ProcessExecutionPort {
   readonly lostProcessHandles?: readonly ProcessHandle[];
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
+  handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
 }
 

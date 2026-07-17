@@ -34,6 +34,8 @@ import {
   lockWindowsMutationRoots,
   pinProcessReadRoots
 } from "./windows-mutation-lock.js";
+import { processHandoffTool } from "./process-handoff-tool.js";
+import { foregroundExecutionSchema } from "./execution-foreground-schema.js";
 
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 
@@ -113,6 +115,25 @@ async function releaseRejectedResultArtifacts(
   throw primary;
 }
 
+function assertForegroundInvocation(
+  kind: "exec" | "shell" | "validate",
+  input: Record<string, JsonValue>,
+  options: ExecutionToolOptions
+): boolean {
+  const validation = kind === "validate";
+  const shellCommand = kind === "shell" || (validation && input.shell !== undefined);
+  if (validation) {
+    const hasExecutable = input.executable !== undefined;
+    const hasShell = input.shell !== undefined || input.command !== undefined;
+    if (hasExecutable === hasShell || (hasShell && (input.shell === undefined || input.command === undefined))) {
+      throw new Error("validate requires exactly one invocation form: {executable,args} or {shell,command}.");
+    }
+  }
+  if (shellCommand) assertAvailableShell(input, options);
+  else assertAvailableExecutable(input, options);
+  return shellCommand;
+}
+
 async function executeForegroundCommand(
   kind: "exec" | "shell" | "validate",
   options: ExecutionToolOptions,
@@ -122,11 +143,10 @@ async function executeForegroundCommand(
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
   const validation = kind === "validate";
-  if (kind === "shell") assertAvailableShell(input, options);
-  else assertAvailableExecutable(input, options);
+  const shellCommand = assertForegroundInvocation(kind, input, options);
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
-  const invocation = kind === "shell"
+  const invocation = shellCommand
     ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
     : normalizeWindowsShellInvocation(
       executionText(input, "executable"),
@@ -165,7 +185,9 @@ async function executeForegroundCommand(
     return await commandReceipt(
       request,
       startedAt,
-      [invocation.executable, ...invocation.args].join(" "),
+      validation && shellCommand
+        ? executionText(input, "command")
+        : [invocation.executable, ...invocation.args].join(" "),
       result,
       validation,
       approvedPlan.exactEffects,
@@ -182,59 +204,13 @@ async function executeForegroundCommand(
 }
 
 function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionToolOptions): RegisteredEffectTool {
-  const validation = kind === "validate";
-  const writeContractProperties: Record<string, JsonValue> = {
-    readRoots: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Additional stable existing workspace directories the process may read. The working directory is always included."
-    },
-    access: {
-      type: "string", enum: ["readonly", "write"],
-      description: "Explicit process filesystem access. Defaults to readonly unless legacy writePaths is supplied."
-    },
-    writeRoots: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Existing sandbox ACL root directories. Required with access=write."
-    },
-    expectedChanges: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Exact files or narrow paths approved to change. New parent directories needed to create an approved path are implicit; other changes are rolled back."
-    },
-    writePaths: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Deprecated compatibility alias that supplies both sandbox/checkpoint roots and approved changes."
-    }
-  };
-  const properties: Record<string, JsonValue> = kind === "shell" ? {
-    shell: { type: "string", enum: availableShells(options) }, command: { type: "string" }, cwd: { type: "string" },
-    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
-    ...writeContractProperties
-  } : {
-    executable: executableCapabilitySchema(options),
-    args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
-    skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
-    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
-    ...writeContractProperties
-  };
-  if (validation) {
-    properties.workspaceDeltaEvidenceIds = {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Exact unresolved workspace-delta evidence IDs genuinely exercised by this command. Omission is inferred only when exactly one unresolved delta exists; with multiple deltas, supply the exact subset and never attach unrelated files to a narrow check."
-    };
-  }
-  const required = kind === "shell" ? ["shell", "command"] : ["executable"];
-  const effects: ToolDescriptor["possibleEffects"] = validation
-    ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.write", "validation", "network", "open_world"]
-    : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.write", "network", "open_world"];
+  const { schema, validation } = foregroundExecutionSchema(kind, options, networkProperty(options));
   return {
     descriptor: {
-      ...executionToolSchema(kind, validation
-        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. A non-zero exited command is referenceable only as validation_executed, never validation_passed. Scope the command only to workspace deltas it genuinely exercises; omission is inferred only for one unresolved delta. Passed validation automatically triggers eligible internal review. With skill and skillScript, the frozen script is prepended to interpreter args."
-        : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`, properties, required, effects),
+      ...schema,
       prepare(value, context) {
-        if (kind === "shell") assertAvailableShell(executionArgs(value), options);
+        const input = executionArgs(value);
+        if (kind === "shell" || (validation && input.shell !== undefined)) assertAvailableShell(input, options);
         return prepareExecutionCallPlan(value, context, options, validation);
       }
     },
@@ -256,6 +232,15 @@ async function executeBackgroundProcess(
 ): Promise<ToolReceipt> {
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
+  const lifecycle = input.lifecycle === "deliverable" ? "deliverable" : "session";
+  if (lifecycle === "deliverable" && options.handoff !== true) {
+    throw Object.assign(new Error("Deliverable process handoff is unavailable for this execution broker."), {
+      code: "process_handoff_unavailable"
+    });
+  }
+  if (lifecycle === "deliverable" && input.pty === true) {
+    throw Object.assign(new Error("Deliverable processes cannot use a PTY."), { code: "policy_denied" });
+  }
   assertAvailableExecutable(input, options);
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, false, true);
@@ -277,6 +262,7 @@ async function executeBackgroundProcess(
         environment: executionEnvironment(input)
       },
       policy: executionPolicy(context, approvedPlan, options, [], skillResource),
+      lifecycle,
       ...(input.pty === true ? { pty: true } : {})
     }, { signal: context.signal });
     return simpleReceipt(request, startedAt, processHandle, [
@@ -301,12 +287,18 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
         network: networkProperty(options),
         env: { type: "object", additionalProperties: { type: "string" } },
         ...(options.pty === false ? {} : { pty: { type: "boolean" } }),
+        ...(options.handoff === true ? {
+          lifecycle: {
+            type: "string", enum: ["session", "deliverable"],
+            description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
+          }
+        } : {}),
         access: { type: "string", enum: ["readonly"] },
         readRoots: {
           type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-          description: "Additional stable existing workspace directories the process may read. The working directory is always included."
+          description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
         }
-      }, ["executable"], ["process.spawn.readonly", "filesystem.read", "network", "open_world"]),
+      }, ["executable"], ["process.spawn.readonly", "filesystem.read", "filesystem.read.external", "network", "open_world"]),
       prepare(value, context) { return prepareExecutionCallPlan(value, context, options, false, true); }
     },
     async execute(request, context) { return await executeBackgroundProcess(options, request, context); }
@@ -338,7 +330,7 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
         request, startedAt, result, ["process.spawn.readonly"], context, options.broker, "terminate"
       );
     }
-  }];
+  }, ...(options.handoff === true ? [processHandoffTool(options, handleProperties)] : [])];
 }
 
 function simpleReceipt(

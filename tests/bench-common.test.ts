@@ -86,6 +86,39 @@ describe("Terminal-Bench command construction", () => {
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({ network_mode: "full" });
   });
 
+  it("keeps standard runs at task resources and marks relaxed runs diagnostic", () => {
+    const standard = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--execution-mode", "disposable-container"
+    ]);
+    const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
+    const config = buildHarborJobConfig(standard, "jobs", standardPlan);
+    expect(standard).toMatchObject({
+      benchmarkClass: "standard", executionMode: "disposable-container"
+    });
+    expect(standardPlan).toMatchObject({
+      agent_wall_time_sec: 780,
+      benchmark_class: "standard",
+      agent_timeout_multiplier: null,
+      verifier_timeout_multiplier: null,
+      environment_build_timeout_multiplier: null
+    });
+    expect(config).not.toHaveProperty("agent_timeout_multiplier");
+    expect(config.agents[0].kwargs.execution_mode).toBe("disposable-container");
+
+    const diagnostic = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--benchmark-class", "diagnostic",
+      "--timeout-leniency-multiplier", "2"
+    ]);
+    expect(computeHarborTimeoutPlan(diagnostic, { max_agent_timeout_sec: 900 }))
+      .toMatchObject({ benchmark_class: "diagnostic", agent_timeout_multiplier: "2.14" });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--timeout-leniency-multiplier", "2"
+    ])).toThrow(/diagnostic/u);
+  });
+
   it("can bind formal agent wall time exactly to task metadata", () => {
     const options = resolveRunOptions([
       "--mode", "task", "--task-id", "one",
@@ -93,9 +126,11 @@ describe("Terminal-Bench command construction", () => {
     ]);
     expect(computeHarborTimeoutPlan(options, { max_agent_timeout_sec: 900 })).toMatchObject({
       recommended_agent_timeout_sec: 900,
-      agent_wall_time_sec: 900,
+      agent_wall_time_sec: 780,
       leniency_multiplier: 1,
-      leniency_min_extra_sec: 0
+      leniency_min_extra_sec: 0,
+      agent_timeout_multiplier: null,
+      benchmark_class: "standard"
     });
   });
 
@@ -834,6 +869,50 @@ describe("benchmark report generation", () => {
     });
     expect(report.tasks[0].last_error).toContain("test_outputs.py::test_vm_execution");
     expect(await readFile(path.join(runDir, "report.md"), "utf8")).toContain("## Verifier Failures");
+  });
+
+  it("excludes verifier setup failures from effective correctness", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-verifier-infra-"));
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "verifier-infra-run", provider: "deepseek", model: "deepseek-v4-pro",
+      dataset: terminalBenchDataset, k: 1, command_text: "harbor run -l 1",
+      exit_code: 0, status: "passed"
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    const trialDir = path.join(runDir, "harbor-jobs", "job-1", "trial-1");
+    const taskDir = path.join(runDir, "tasks", "task-a");
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "task-a", status: "passed", source_logs_dir: path.join(trialDir, "agent")
+    })}\n`, "utf8");
+    await writeFile(path.join(taskDir, "summary.json"), JSON.stringify({
+      status: "completed", commands_executed: 2, input_tokens: 3, output_tokens: 4
+    }), "utf8");
+    await mkdir(path.join(trialDir, "verifier"), { recursive: true });
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1", task_name: "terminal-bench/task-a",
+      verifier_result: { rewards: { reward: 0 } }, exception_info: null
+    })}\n`, "utf8");
+    await writeFile(path.join(trialDir, "verifier", "test-stdout.txt"), [
+      "E: Failed to fetch http://deb.example/pkg 502 Bad Gateway",
+      "/tests/test.sh: line 8: curl: command not found"
+    ].join("\n"), "utf8");
+    await writeHarborJobResult(path.dirname(trialDir), 1);
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.tasks[0]).toMatchObject({
+      status: "infra_failed",
+      failure_category: "verifier_setup_failed",
+      agent_outcome: "completed",
+      verifier_outcome: "infra_failed",
+      validity: "infra_failed"
+    });
+    expect(report.counts.infra_failed).toBe(1);
+    expect(report.validity).toEqual({ valid: 0, infra_failed: 1 });
+    expect(report.effective_correctness).toEqual({ passed: 0, total: 0, pass_rate: null });
   });
 
   it("keeps reward=1 tasks passed when Harbor also reports an agent exception", async () => {
