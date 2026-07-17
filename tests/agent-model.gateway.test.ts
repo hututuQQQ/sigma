@@ -50,6 +50,17 @@ afterEach(() => {
 });
 
 describe("OpenAI-compatible model gateway", () => {
+  it("removes invisible file and CI framing from API keys before building headers", async () => {
+    let authorization = "";
+    const gateway = createGateway((async (_url, init) => {
+      authorization = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+      return jsonResponse("ok");
+    }) as typeof fetch, { apiKey: "\uFEFF  secret\r\n" });
+
+    await expect(gateway.complete(request())).resolves.toMatchObject({ message: { content: "ok" } });
+    expect(authorization).toBe("Bearer secret");
+  });
+
   it("parses split CRLF and multi-line SSE frames without losing the terminal payload", async () => {
     const encoder = new TextEncoder();
     const chunks = [
