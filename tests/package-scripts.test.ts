@@ -41,7 +41,7 @@ describe("package script semantics", () => {
 
   it("keeps target release stages explicit, ordered, and isolated from secrets", async () => {
     expect(stageIds("release-linux")).toEqual([
-      "lint", "coverage", "native-coverage", "v4-replay", "product-smoke", "tui-smoke",
+      "build", "lint", "coverage", "native-coverage", "v4-replay", "product-smoke", "tui-smoke",
       "package", "sandbox", "lsp-sandbox", "provider-smoke", "readiness"
     ]);
     expect(stageIds("release-windows")).toEqual(stageIds("release-linux"));

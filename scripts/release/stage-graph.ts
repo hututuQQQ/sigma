@@ -34,6 +34,7 @@ const neutral = [
 ] as const;
 
 const releaseQuality = [
+  stage("build", "pnpm", "build"),
   stage("lint", "pnpm", "lint"),
   stage("coverage", "pnpm", "test:coverage"),
   stage("native-coverage", "pnpm", "test:coverage:native-protocol"),
