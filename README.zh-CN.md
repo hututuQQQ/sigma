@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <img alt="状态：候选发布版" src="https://img.shields.io/badge/status-v4.0.0--rc.1-f59e0b">
-  <img alt="首个二进制目标：Windows x64" src="https://img.shields.io/badge/first%20binary%20target-Windows%20x64-0078d4">
+  <img alt="状态：稳定版" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
+  <img alt="发布目标：Windows 与 Linux x64" src="https://img.shields.io/badge/release%20targets-Windows%20%2B%20Linux%20x64-0078d4">
   <img alt="正式评估：仅 DeepSeek" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
 </p>
 
@@ -25,12 +25,12 @@
 
 Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放的类型化事件流。它可以理解仓库、执行范围明确的修改、在沙箱内运行命令、验证结果、请求独立审查，并在进程中断后恢复原来的会话。CLI 与 TUI 不各自维护一套 Agent：产品只有一个事件溯源内核、一种会话格式和一条执行链。
 
-`v4.0.0-rc.1` 是未签名的 Windows x64 预览候选版，适合公开测试和收集反馈，但还不是稳定版 `3.0.0`。提交问题或参与贡献前，请先查看[变更记录](CHANGELOG.md)、[安全策略](SECURITY.md)和[贡献指南](CONTRIBUTING.md)。
+`v4.0.0` 是 Sigma Code 的首个稳定版。只有完整发布工作流全部通过后，才会发布正式的 Windows x64 与 Linux x64 归档。提交问题或参与贡献前，请先查看[变更记录](CHANGELOG.md)、[安全策略](SECURITY.md)和[贡献指南](CONTRIBUTING.md)。
 
 > [!IMPORTANT]
 > **当前产品边界**
 >
-> - **首个带签名二进制发布目标是 Windows x64。** `v4.0.0-rc.1` 提供可直接使用但未签名的 Windows x64 预览归档，因为目前尚未配置可信 Windows 代码签名；Windows 可能显示 SmartScreen 警告。仓库中已经存在 Linux 沙箱后端和便携包构建代码，但 Linux 暂时不是正式发布目标。
+> - **正式二进制发布目标是 Windows x64 与 Linux x64。** 两种归档都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件还必须使用可信代码签名身份完成 Authenticode 签名与时间戳。
 > - **目前正式评估与 Benchmark 只跑 DeepSeek。** Sigma 的评估系统、Harbor 适配器和 Terminal-Bench harness 都以 DeepSeek 为重点维护；其他 Provider 的结果不用于正式性能声明。
 > - 运行时包含 DeepSeek 与 GLM/Z.ai 网关，但 GLM 路径还没有获得与 DeepSeek 相同的正式评估覆盖。
 > - Sigma 把 **OpenCode 视为直接竞争对手和追赶目标，而不是已经达到的水平**。就当前整体实际表现与成熟度而言，Sigma 和 OpenCode 仍有真实差距。
@@ -48,7 +48,7 @@ Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放
 ## Windows 快速开始
 
 > [!NOTE]
-> `v4.0.0-rc.1` 提供未签名的 Windows x64 预览归档。解压前请核对 SHA-256 侧文件；由于可执行文件暂时没有可信 Authenticode 签名，Windows 可能显示 SmartScreen 警告。
+> 解压前请核对归档的 SHA-256 侧文件与签名来源证明。正式 Windows 可执行文件带有 Authenticode 签名与时间戳；如果签名验证失败，请勿运行该归档。
 
 从 [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) 下载最新的 Windows x64 压缩包并解压。正式包已经包含固定版本的 Node.js、原生 `sigma-exec` Broker、TUI 运行时、TypeScript/Python Language Server 资源和 Tokenizer 数据，无需另外安装 Node.js。
 

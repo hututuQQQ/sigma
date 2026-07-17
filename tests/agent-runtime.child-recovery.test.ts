@@ -594,6 +594,7 @@ describe("durable child identity and crash recovery", () => {
     await resumed.command({ type: "resume", sessionId: fixture.parentSessionId });
     expect((await sessionEvents(store, fixture.parentSessionId))
       .filter((event) => event.type === "run.suspended")).toHaveLength(1);
+    await resumed.releaseSession(fixture.parentSessionId);
   });
 
   it("restores an interrupted exclusive-workspace child checkpoint without importing its delta", async () => {
@@ -618,6 +619,7 @@ describe("durable child identity and crash recovery", () => {
       && (event.payload as { kind?: unknown }).kind === "workspace_delta")).toBe(false);
     expect((await new CheckpointManager({ rootDir: root }).list(fixture.childSessionId)).at(-1)?.status)
       .toBe("restored");
+    await runtime.releaseSession(fixture.parentSessionId);
   });
 
   it("replays a durable user keep decision after a crash before checkpoint application", async () => {
@@ -657,5 +659,6 @@ describe("durable child identity and crash recovery", () => {
     }));
     expect((await new CheckpointManager({ rootDir: root }).list(fixture.childSessionId)).at(-1)?.status)
       .toBe("sealed");
+    await runtime.releaseSession(fixture.parentSessionId);
   });
 });

@@ -1,4 +1,4 @@
-# Sigma Code 4.0.0-rc.1 validation
+# Sigma Code 4.0.0 validation
 
 Run release checks from the repository root with Node `26.4.0`. The exact pin is shared by `.node-version`, the root package, CI, and the portable packager. TUI checks also require `--experimental-ffi`; a lower local Node may run some tests but is not release evidence.
 

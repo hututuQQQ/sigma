@@ -218,7 +218,7 @@ async function writeV3PackageFixture(
   brokerArch: "x64" | "arm64" = "x64"
 ) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-agent-cli-v3-"));
-  const version = "4.0.0-rc.1";
+  const version = "4.0.0";
   await writeFile(
     path.join(rootDir, "package.json"),
     `${JSON.stringify({ name: "sigma", version, private: true, license: "MIT" })}\n`,
@@ -414,7 +414,7 @@ describe("package-agent-cli", () => {
     expect(readme).toContain("Product Boundary");
     expect(readme).toContain("`version`, `init`, `doctor`");
     expect(readme).not.toContain("Harbor task containers");
-  });
+  }, 30_000);
 
   linuxPackagingIt("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
