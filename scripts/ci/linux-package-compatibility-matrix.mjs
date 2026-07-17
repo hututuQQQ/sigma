@@ -93,7 +93,10 @@ async function main() {
   await writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   for (const result of results) {
     process.stdout.write(`${result.passed ? "PASS" : "FAIL"} ${result.name} (${result.durationMs}ms)\n`);
-    if (!result.passed) process.stderr.write(`${result.stderr || result.stdout}\n`);
+    if (!result.passed) {
+      if (result.stdout) process.stderr.write(`${result.stdout}\n`);
+      if (result.stderr) process.stderr.write(`${result.stderr}\n`);
+    }
   }
   if (!report.passed) process.exitCode = 1;
 }
