@@ -141,7 +141,7 @@ async function promoteV3Evidence(
     archiveChecksum: true,
     windowsSignerPolicy
   });
-  verification.metadata.schemaVersion = 3;
+  verification.metadata.schemaVersion = Number(version.split(".")[0]);
   verification.metadata.productVersion = version;
   verification.metadata.signing = { authenticodeVerified: windowsSignerPolicy };
   verification.signing = { policyVerified: windowsSignerPolicy };

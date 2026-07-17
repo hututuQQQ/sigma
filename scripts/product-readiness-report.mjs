@@ -62,14 +62,18 @@ function tuiSmokeChecks(tuiSmoke) {
   ];
 }
 
-function packageChecks(packageVerify, expectedV3) {
+function packageChecks(packageVerify, expectedV3, expectedSchemaVersion) {
   const checks = packageVerify?.checks ?? {};
   return [
     check("package:ok", packageVerify?.ok === true, "package verification completed"),
     check("package:readme", checks.readme === true, "bundle README verified"),
     check("package:wrapper", checks.wrapper === true, "package wrapper verified"),
     check("package:metadata", checks.metadata === true, "package metadata verified"),
-    check("package:schemaVersion", !expectedV3 || packageVerify?.metadata?.schemaVersion === 3, "V3 metadata schema"),
+    check(
+      "package:schemaVersion",
+      expectedSchemaVersion !== null && packageVerify?.metadata?.schemaVersion === expectedSchemaVersion,
+      `expected=${String(expectedSchemaVersion ?? "unsupported")}, package=${String(packageVerify?.metadata?.schemaVersion ?? "missing")}`
+    ),
     check("package:bundledNode", !expectedV3 || checks.bundledNode === true, "pinned bundled Node verified"),
     check("package:noSystemNodeFallback", !expectedV3 || checks.noSystemNodeFallback === true, "wrapper cannot use system Node"),
     check("package:sigmaExec", !expectedV3 || checks.sigmaExec === true, "target-native sigma-exec verified"),
@@ -368,7 +372,7 @@ export async function buildProductReadinessReport(options = {}) {
       packageVerify?.metadata?.productVersion === expectedProductVersion,
       `workspace=${expectedProductVersion || "missing"}, package=${String(packageVerify?.metadata?.productVersion ?? "missing")}`
     ));
-    checks.push(...packageChecks(packageVerify, expectedV3));
+    checks.push(...packageChecks(packageVerify, expectedV3, expectedProductMajor));
   }
 
   const target = `${targetPlatform}-${targetArch}`;

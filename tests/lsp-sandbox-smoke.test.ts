@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  assertMetadata,
   parseArguments,
   portableLayout,
   portableNodeToolchain
@@ -101,6 +102,23 @@ describe("bundled LSP sandbox smoke", () => {
         sandboxRuntimeEnvironment: { NODE_OPTIONS: "--inspect" }
       }, sha256: nodeDigest }
     }, integrity, nodeDigest)).toThrow("does not match the integrity manifest");
+  });
+
+  it("binds portable metadata schema to the supported product major", () => {
+    const layout = portableLayout("release", "win32");
+    const broker = path.join(layout.bundle, "bin", "sigma-exec.exe");
+    const digest = "a".repeat(64);
+    const metadata = {
+      schemaVersion: 4,
+      productVersion: "4.0.0",
+      targetPlatform: "win32",
+      targetArch: "x64",
+      sigmaExec: { path: "bin/sigma-exec.exe", sha256: digest }
+    };
+    expect(() => assertMetadata(metadata, "win32", broker, digest, layout)).not.toThrow();
+    expect(() => assertMetadata(
+      { ...metadata, schemaVersion: 3 }, "win32", broker, digest, layout
+    )).toThrow("must match supported product major 4.0.0");
   });
 
   it("removes stale evidence before reporting a failed smoke", async () => {
