@@ -162,7 +162,8 @@ describe("Sigma architecture", () => {
       dynamic: [{ id: "large", authority: "tool", provenance: "repo", content: "large", tokenCount: 95, priority: 1_000 }],
       tools: [],
       contextWindowTokens: 100,
-      outputReserveTokens: 0
+      outputReserveTokens: 0,
+      promptCache: false
     });
     expect(planned.messages.at(-1)).toMatchObject({ role: "user", content: "This current request must remain visible." });
     expect(planned.omitted.map((item) => item.id)).toContain("large");

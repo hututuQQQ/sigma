@@ -61,6 +61,35 @@ function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
     }, 0);
 }
 
+interface ActionPolicy {
+  required: boolean;
+  outputReserveTokens: number;
+  context: ContextItem[];
+}
+
+function actionPolicy(
+  session: RuntimeSession,
+  forecast: DeadlineForecast,
+  turnId: number,
+  defaultOutputReserveTokens: number
+): ActionPolicy {
+  const lengthRecovery = session.durable.state.continuationAttempts > 0;
+  const required = lengthRecovery || forecast.stage === "converge";
+  const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
+  if (!required) return { required, outputReserveTokens, context: [] };
+  const content = lengthRecovery
+    ? "The previous response reached its output limit, and its private reasoning is not replayed. Do not reconstruct or continue that reasoning. Choose one concrete tool action now, based on the durable conversation and evidence."
+    : "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work.";
+  return { required, outputReserveTokens, context: [{
+    id: `runtime:action-required:${session.durable.runId}:${turnId}`,
+    authority: "runtime",
+    provenance: lengthRecovery ? "length recovery" : "deadline stage",
+    content,
+    tokenCount: lengthRecovery ? 42 : 30,
+    priority: 10_000
+  }] };
+}
+
 export class ModelEffectRunner {
   private readonly repositoryContext: RepositoryContextProvider;
 
@@ -159,6 +188,9 @@ export class ModelEffectRunner {
       ...plan.budget,
       latestHistoryBlockTokens: plan.latestHistoryBlockTokens,
       omittedHistoryTurns: plan.omittedHistoryTurns,
+      cacheMode: plan.cacheMode,
+      historyTokenLimit: plan.historyTokenLimit,
+      dynamicSuffixTokens: plan.dynamicSuffixTokens,
       modelVisibleOutputTruncatedBytes: modelVisibleOutputTruncatedBytes(session),
       reviewCount: session.durable.state.evidence.filter((item) => item.kind === "review").length,
       deadlineStage: forecast.stage,
@@ -195,17 +227,8 @@ export class ModelEffectRunner {
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);
-    const outputReserveTokens = forecast.stage === "converge"
-      ? Math.min(2_048, this.options.outputReserveTokens)
-      : this.options.outputReserveTokens;
-    const convergenceContext: ContextItem[] = forecast.stage === "converge" ? [{
-      id: `runtime:deadline-converge:${session.durable.runId}`,
-      authority: "runtime",
-      provenance: "deadline stage",
-      content: "Deadline stage is converge. Perform at most one focused finishing action, then immediately use the appropriate terminal tool. Do not start exploratory work.",
-      tokenCount: 34,
-      priority: 1_000
-    }] : [];
+    const policy = actionPolicy(session, forecast, turnId, this.options.outputReserveTokens);
+    const outputReserveTokens = policy.outputReserveTokens;
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,
@@ -214,12 +237,12 @@ export class ModelEffectRunner {
       outputReserveTokens
     });
     const plan = await providerSizedPlan(session.services.gateway, {
-      system: [...session.interaction.contextItems, ...hookContext],
+      system: session.interaction.contextItems,
       history: session.durable.state.messages,
       // Keep the stable system prefix cacheable. The evidence ledger is
       // current-run state and belongs in the dynamic suffix, where changes do
       // not invalidate static policy/context cache entries.
-      dynamic: [...dynamic, ledger, ...convergenceContext],
+      dynamic: [...dynamic, ...hookContext, ledger, ...policy.context],
       tools,
       outputReserveTokens
     });
@@ -244,7 +267,7 @@ export class ModelEffectRunner {
     const turn: PreparedModelTurn = {
       messages: plan.messages,
       tools,
-      ...(repairPending ? { toolChoice: "required" } : {}),
+      ...(tools.length > 0 && (repairPending || policy.required) ? { toolChoice: "required" } : {}),
       budget,
       outputReserveTokens
     };
@@ -335,7 +358,6 @@ export class ModelEffectRunner {
       toolCallCount: response.message.toolCalls?.length ?? 0,
       usage
     }, signal);
-    if (response.finishReason === "length") this.addContinuationContext(session);
   }
 
   private async emitResolvedRoute(session: RuntimeSession, response: ModelResponse): Promise<void> {
@@ -377,14 +399,4 @@ export class ModelEffectRunner {
     await this.options.emit(session, "usage.recorded", "runtime", usage);
   }
 
-  private addContinuationContext(session: RuntimeSession): void {
-    session.interaction.contextItems.push({
-      id: `runtime:continue:${session.durable.seq}`,
-      authority: "runtime",
-      provenance: "model finish reason",
-      content: "The previous response reached its output limit. Continue from the exact stopping point without repeating completed work.",
-      tokenCount: 24,
-      priority: 950
-    });
-  }
 }

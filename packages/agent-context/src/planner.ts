@@ -10,6 +10,9 @@ export interface ContextPlan {
   summary?: ContextItem;
   omittedHistoryTurns: number;
   latestHistoryBlockTokens: number;
+  cacheMode: "prefix_cache" | "proactive_window";
+  historyTokenLimit: number;
+  dynamicSuffixTokens: number;
 }
 
 export interface PlanContextOptions {
@@ -19,6 +22,7 @@ export interface PlanContextOptions {
   tools: ModelToolDefinition[];
   contextWindowTokens: number;
   outputReserveTokens: number;
+  promptCache: boolean;
 }
 
 interface HistoryBlock {
@@ -29,20 +33,22 @@ interface HistoryBlock {
 const RECENT_RAW_BLOCK_TOKEN_LIMIT = 8_192;
 /**
  * Replaying every tool turn that still fits the provider window makes the
- * cumulative request cost quadratic in long sessions. Keep a generous raw
- * working set and summarize the older blocks even when the provider could
- * technically accept them. Small-context models still use their whole window.
+ * cumulative request cost quadratic in long sessions. For providers without
+ * prompt caching, keep a generous raw working set and summarize older blocks
+ * even when the provider could technically accept them. Cache-capable
+ * providers instead retain the append-only prefix until the real window fills.
  */
 const PROACTIVE_HISTORY_TOKEN_LIMIT = 24_000;
 
 function messageTokens(message: ModelMessage): number {
   return approximateTokens(message.content)
+    + approximateTokens(message.reasoningContent ?? "")
     + approximateTokens(JSON.stringify(message.toolCalls ?? []))
     + 6;
 }
 
-function withoutHistoricalReasoning(message: ModelMessage): ModelMessage {
-  if (message.reasoningContent === undefined) return message;
+function withoutUnneededHistoricalReasoning(message: ModelMessage): ModelMessage {
+  if (message.reasoningContent === undefined || (message.toolCalls?.length ?? 0) > 0) return message;
   const { reasoningContent: _reasoningContent, ...wireMessage } = message;
   return wireMessage;
 }
@@ -183,7 +189,9 @@ function selectMandatoryHistory(
   blocks: readonly HistoryBlock[],
   available: number,
   mandatoryTokens: number,
-  historyTokenLimit: number
+  historyTokenLimit: number,
+  rawBlockTokenLimit: number,
+  reserveSummary: boolean
 ): HistorySelection {
   const selected = new Map<number, ModelMessage[]>();
   const newestUser = latestUserBlock(blocks);
@@ -191,7 +199,7 @@ function selectMandatoryHistory(
   if (newestUser >= 0) {
     const block = blocks[newestUser];
     const rawTokens = blockTokens(block.messages);
-    const limit = Math.min(RECENT_RAW_BLOCK_TOKEN_LIMIT, historyTokenLimit, available - used);
+    const limit = Math.min(rawBlockTokenLimit, historyTokenLimit, available - used);
     // The user's latest request is mandatory authority-bearing input. Only
     // oversized tool exchanges are textualized; silently truncating the user
     // request could change the task itself.
@@ -207,7 +215,7 @@ function selectMandatoryHistory(
   const newest = blocks.length - 1;
   const requiresLatest = newest >= 0 && newest !== newestUser;
   const couldOmit = blocks.length > selected.size + (requiresLatest ? 1 : 0);
-  const desiredSummaryReserve = couldOmit
+  const desiredSummaryReserve = reserveSummary && couldOmit
     ? Math.min(1_024, Math.max(16, Math.floor(available * 0.05)))
     : 0;
   const minimumLatestTokens = requiresLatest ? messageTokens({ role: "assistant", content: "" }) : 0;
@@ -219,7 +227,7 @@ function selectMandatoryHistory(
   const rawTokens = blockTokens(block.messages);
   const selectedTokens = used - mandatoryTokens;
   const limit = Math.min(
-    RECENT_RAW_BLOCK_TOKEN_LIMIT,
+    rawBlockTokenLimit,
     fitLimit - used,
     historyTokenLimit - selectedTokens
   );
@@ -257,7 +265,8 @@ function includeRecentHistory(
   selected: Map<number, ModelMessage[]>,
   initialUsed: number,
   fitLimit: number,
-  historyTokenLimit: number
+  historyTokenLimit: number,
+  rawBlockTokenLimit: number
 ): number {
   let used = initialUsed;
   let historyUsed = [...selected.values()].reduce((total, messages) => total + blockTokens(messages), 0);
@@ -267,7 +276,7 @@ function includeRecentHistory(
     const block = blocks[index];
     const messages = block.messages;
     const tokens = messages ? blockTokens(messages) : Number.POSITIVE_INFINITY;
-    if (reachedBoundary || !block.wireSafe || !messages || tokens > RECENT_RAW_BLOCK_TOKEN_LIMIT
+    if (reachedBoundary || !block.wireSafe || !messages || tokens > rawBlockTokenLimit
       || used + tokens > fitLimit || historyUsed + tokens > historyTokenLimit) {
       reachedBoundary = true;
       continue;
@@ -277,6 +286,33 @@ function includeRecentHistory(
     historyUsed += tokens;
   }
   return used;
+}
+
+function toContextMessage(item: ContextItem): ModelMessage {
+  return { role: contextRole(item), content: `[${item.provenance}]\n${item.content}` };
+}
+
+function arrangeMessages(
+  mandatory: readonly ContextItem[],
+  included: readonly ContextItem[],
+  summary: ContextItem | undefined,
+  retainedHistory: readonly ModelMessage[],
+  promptCache: boolean
+): { messages: ModelMessage[]; dynamicTokens: number } {
+  const dynamic = included.filter((item) => !mandatory.includes(item) && item !== summary);
+  const dynamicSuffix = [...dynamic]
+    .sort((left, right) => left.priority - right.priority || left.id.localeCompare(right.id));
+  const legacy = [...included.map(toContextMessage), ...retainedHistory];
+  const cacheFirst = [
+    ...mandatory.map(toContextMessage),
+    ...(summary ? [toContextMessage(summary)] : []),
+    ...retainedHistory,
+    ...dynamicSuffix.map(toContextMessage)
+  ];
+  return {
+    messages: promptCache ? cacheFirst : legacy,
+    dynamicTokens: dynamic.reduce((total, item) => total + item.tokenCount, 0)
+  };
 }
 
 export function planContext(options: PlanContextOptions): ContextPlan {
@@ -290,12 +326,24 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     throw overflow(`Mandatory system and project context requires ${mandatoryTokens} tokens but only ${available} context tokens are available.`);
   }
 
-  // Provider-private reasoning is durable audit data, but replaying old
-  // reasoning into a new request both wastes budget and destabilizes prompt
-  // cache prefixes. It is intentionally removed from all historical turns.
-  const blocks = historyBlocks(options.history.map(withoutHistoricalReasoning));
-  const historyTokenLimit = Math.min(available, PROACTIVE_HISTORY_TOKEN_LIMIT);
-  const selection = selectMandatoryHistory(blocks, available, mandatoryTokens, historyTokenLimit);
+  // Tool-call reasoning is part of the provider wire protocol for thinking
+  // models and must be replayed with that call. Reasoning on ordinary
+  // assistant turns remains audit-only and is omitted from future requests.
+  const blocks = historyBlocks(options.history.map(withoutUnneededHistoricalReasoning));
+  const historyTokenLimit = options.promptCache
+    ? available
+    : Math.min(available, PROACTIVE_HISTORY_TOKEN_LIMIT);
+  const rawBlockTokenLimit = options.promptCache
+    ? historyTokenLimit
+    : RECENT_RAW_BLOCK_TOKEN_LIMIT;
+  const selection = selectMandatoryHistory(
+    blocks,
+    available,
+    mandatoryTokens,
+    historyTokenLimit,
+    rawBlockTokenLimit,
+    !options.promptCache
+  );
   const included: ContextItem[] = [...mandatory];
   const omitted: ContextItem[] = [];
   let used = includeDynamicContext(candidates, included, omitted, selection.used, selection.fitLimit);
@@ -304,7 +352,8 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     selection.selected,
     used,
     selection.fitLimit,
-    historyTokenLimit
+    historyTokenLimit,
+    rawBlockTokenLimit
   );
 
   const omittedBlocks = blocks
@@ -320,24 +369,23 @@ export function planContext(options: PlanContextOptions): ContextPlan {
   const retainedHistory = [...selection.selected.entries()]
     .sort(([left], [right]) => left - right)
     .flatMap(([, messages]) => messages);
-  const contextMessages: ModelMessage[] = included.map((item) => ({
-    role: contextRole(item),
-    content: `[${item.provenance}]\n${item.content}`
-  }));
-  const dynamicTokens = included.slice(mandatory.length).reduce((total, item) => total + item.tokenCount, 0);
+  const layout = arrangeMessages(mandatory, included, summary, retainedHistory, options.promptCache);
   return {
-    messages: [...contextMessages, ...retainedHistory],
+    messages: layout.messages,
     included,
     omitted,
     ...(summary ? { summary } : {}),
     omittedHistoryTurns: omittedBlocks.length,
     latestHistoryBlockTokens: blockTokens(selection.selected.get(blocks.length - 1) ?? []),
+    cacheMode: options.promptCache ? "prefix_cache" : "proactive_window",
+    historyTokenLimit,
+    dynamicSuffixTokens: layout.dynamicTokens,
     budget: {
       contextWindowTokens: options.contextWindowTokens,
       outputReserveTokens: options.outputReserveTokens,
       toolTokens: toolCount,
       systemTokens: mandatoryTokens,
-      dynamicTokens,
+      dynamicTokens: layout.dynamicTokens,
       historyTokens: blockTokens(retainedHistory) + (summary?.tokenCount ?? 0)
     }
   };

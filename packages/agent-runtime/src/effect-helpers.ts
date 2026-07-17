@@ -95,12 +95,16 @@ export function projectModelToolDescriptors(
 
 export async function providerSizedPlan(
   gateway: ModelGateway,
-  input: Omit<PlanContextOptions, "contextWindowTokens">
+  input: Omit<PlanContextOptions, "contextWindowTokens" | "promptCache">
 ): Promise<ContextPlan> {
   const providerLimit = gateway.capabilities.contextWindowTokens;
   let planningLimit = providerLimit;
   while (planningLimit > input.outputReserveTokens) {
-    const plan = planContext({ ...input, contextWindowTokens: planningLimit });
+    const plan = planContext({
+      ...input,
+      contextWindowTokens: planningLimit,
+      promptCache: gateway.capabilities.promptCache
+    });
     const tokens = await gateway.countTokens(plan.messages, input.tools);
     if (tokens + input.outputReserveTokens <= providerLimit) return plan;
     const ratio = providerLimit / (tokens + input.outputReserveTokens);

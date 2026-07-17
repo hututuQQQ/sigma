@@ -500,25 +500,36 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
-  const taskAgentTimeouts = (Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [])
-    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec))
-    .filter((value) => value !== null);
+  const timeoutTasks = Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [];
+  const taskAgentTimeouts = timeoutTasks
+    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec));
+  const knownTaskAgentTimeouts = taskAgentTimeouts.filter((value) => value !== null);
   const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
-  const minimumOuterTrialDeadlineSec = taskAgentTimeouts.length > 0
-    ? Math.min(...taskAgentTimeouts) * appliedAgentTimeoutMultiplier
+  const allTaskTimeoutsAvailable = timeoutTasks.length > 0
+    && knownTaskAgentTimeouts.length === timeoutTasks.length;
+  const uniformTaskTimeout = allTaskTimeoutsAvailable
+    && knownTaskAgentTimeouts.every((value) => value === knownTaskAgentTimeouts[0]);
+  const outerTrialDeadlineSec = uniformTaskTimeout
+    ? knownTaskAgentTimeouts[0] * appliedAgentTimeoutMultiplier
     : null;
-  const safeChildDeadlineSec = minimumOuterTrialDeadlineSec === null
+  const outerTrialDeadlineScope = uniformTaskTimeout
+    ? "uniform_task_timeout"
+    : allTaskTimeoutsAvailable && knownTaskAgentTimeouts.length > 1
+      ? "harbor_per_trial"
+      : "unavailable";
+  const safeChildDeadlineSec = outerTrialDeadlineSec === null
     ? agentWallTimeSec
-    : Math.max(1, Math.floor(minimumOuterTrialDeadlineSec - cleanupGraceSec));
+    : Math.max(1, Math.floor(outerTrialDeadlineSec - cleanupGraceSec));
   const effectiveAgentWallTimeSec = Math.min(agentWallTimeSec, safeChildDeadlineSec);
 
   return {
     requested_agent_wall_time_sec: agentWallTimeSec,
     agent_wall_time_sec: effectiveAgentWallTimeSec,
     child_deadline_sec: effectiveAgentWallTimeSec,
-    outer_trial_deadline_sec: minimumOuterTrialDeadlineSec === null
+    outer_trial_deadline_sec: outerTrialDeadlineSec === null
       ? null
-      : Math.floor(minimumOuterTrialDeadlineSec),
+      : Math.floor(outerTrialDeadlineSec),
+    outer_trial_deadline_scope: outerTrialDeadlineScope,
     deadline_cleanup_grace_sec: cleanupGraceSec,
     deadline_clamped: effectiveAgentWallTimeSec < agentWallTimeSec,
     agent_timeout_grace_sec: graceSec,
@@ -1183,7 +1194,11 @@ function summarizeTraceEvents(events) {
     commands_executed: 0,
     input_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
     last_error: null
@@ -1195,9 +1210,19 @@ function summarizeTraceEvents(events) {
       const usage = metadata.usage ?? {};
       summary.input_tokens += Number(usage.inputTokens ?? usage.input_tokens ?? 0);
       summary.output_tokens += Number(usage.outputTokens ?? usage.output_tokens ?? 0);
+      summary.reasoning_tokens += Number(usage.reasoningTokens ?? usage.reasoning_tokens ?? 0);
       summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens ?? 0);
+      summary.cache_read_tokens += Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
       const usageCost = Number(usage.costUsd ?? usage.cost_usd);
       if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
+    }
+    if (event?.type === "model_end"
+      && (metadata.finishReason ?? metadata.finish_reason) === "length") {
+      summary.length_finish_count += 1;
+    }
+    if (event?.type === "diagnostic") {
+      const payload = metadata.payload ?? metadata;
+      if (payload.kind === "deadline.stage" && payload.stage === "converge") summary.converge_turns += 1;
     }
     if (event?.type === "tool_end" && metadata.toolName === "bash") {
       summary.commands_executed += 1;
@@ -1212,7 +1237,15 @@ function summarizeTraceEvents(events) {
       summary.commands_executed = Number(result.commandsExecuted ?? result.commands_executed ?? summary.commands_executed);
       summary.input_tokens = Number(result.usage?.inputTokens ?? result.input_tokens ?? summary.input_tokens);
       summary.output_tokens = Number(result.usage?.outputTokens ?? result.output_tokens ?? summary.output_tokens);
+      summary.reasoning_tokens = Number(
+        result.usage?.reasoningTokens ?? result.reasoning_tokens ?? summary.reasoning_tokens
+      );
       summary.cache_tokens = Number(result.usage?.cacheTokens ?? result.cache_tokens ?? summary.cache_tokens);
+      summary.cache_read_tokens = Number(
+        result.usage?.cacheReadTokens ?? result.cache_read_tokens ?? summary.cache_read_tokens
+      );
+      summary.length_finish_count = Number(result.length_finish_count ?? summary.length_finish_count);
+      summary.converge_turns = Number(result.converge_turns ?? summary.converge_turns);
       const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
       summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
@@ -1449,7 +1482,11 @@ function emptyTaskForTrial(trialResult, index) {
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
     last_error: null,
@@ -1553,7 +1590,18 @@ function mergeHarborTrialResult(task, trialResult) {
     ),
     input_tokens: Number(agentResult.n_input_tokens ?? (task.input_tokens || traceSummary.input_tokens || 0)),
     cache_tokens: Number(agentResult.n_cache_tokens ?? (task.cache_tokens || traceSummary.cache_tokens || 0)),
+    cache_read_tokens: Number(
+      task.cache_read_tokens || traceSummary.cache_read_tokens || agentResult.n_cache_read_tokens
+      || 0
+    ),
     output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
+    reasoning_tokens: Number(
+      task.reasoning_tokens || traceSummary.reasoning_tokens || agentResult.n_reasoning_tokens || 0
+    ),
+    length_finish_count: Number(
+      task.length_finish_count || traceSummary.length_finish_count || agentResult.length_finish_count || 0
+    ),
+    converge_turns: Number(task.converge_turns || traceSummary.converge_turns || agentResult.converge_turns || 0),
     cost_usd: Number.isFinite(Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd))
       ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
       : null,
@@ -1728,7 +1776,11 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     commands_executed: Number(summary.commands_executed ?? metadata.commands_executed ?? 0),
     input_tokens: Number(summary.input_tokens ?? metadata.n_input_tokens ?? 0),
     cache_tokens: Number(summary.cache_tokens ?? metadata.n_cache_tokens ?? 0),
+    cache_read_tokens: Number(summary.cache_read_tokens ?? metadata.n_cache_read_tokens ?? 0),
     output_tokens: Number(summary.output_tokens ?? metadata.n_output_tokens ?? 0),
+    reasoning_tokens: Number(summary.reasoning_tokens ?? metadata.n_reasoning_tokens ?? 0),
+    length_finish_count: Number(summary.length_finish_count ?? metadata.length_finish_count ?? 0),
+    converge_turns: Number(summary.converge_turns ?? metadata.converge_turns ?? 0),
     cost_usd: Number.isFinite(Number(summary.cost_usd ?? metadata.cost_usd))
       ? Number(summary.cost_usd ?? metadata.cost_usd)
       : null,
@@ -1776,7 +1828,11 @@ function syntheticRunTask(config, globalLogText) {
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
     last_error: status === "passed" ? null : "No per-task artifacts were available; inspect harbor logs.",
@@ -1824,7 +1880,12 @@ export function formatMarkdownReport(report) {
     `- Mean reward: ${report.trial_accounting?.meanReward ?? "unknown"}`,
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
+    `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
     `- Output tokens: ${report.usage?.output_tokens ?? 0}`,
+    `- Reasoning tokens: ${report.reasoning_tokens ?? report.usage?.reasoning_tokens ?? 0}`,
+    `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
+    `- Length finishes: ${report.length_finish_count ?? 0}`,
+    `- Converge turns: ${report.converge_turns ?? 0}`,
     `- Cost USD: ${report.cost_usd ?? 0}`,
     "",
     "## Timeout Plan",
@@ -1834,6 +1895,7 @@ export function formatMarkdownReport(report) {
     `- Agent wall time sec: ${report.timeout_plan?.agent_wall_time_sec ?? "unknown"}`,
     `- Harness timeout sec: ${report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
     `- Effective harness timeout sec: ${report.timeout_plan?.effective_harness_timeout_sec ?? report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
+    `- Outer trial deadline scope: ${report.timeout_plan?.outer_trial_deadline_scope ?? "unavailable"}`,
     `- Agent timeout multiplier: ${report.timeout_plan?.agent_timeout_multiplier ?? "none"}`,
     "",
     "## Counts",
@@ -2035,8 +2097,16 @@ export async function generateBenchReport(runDir) {
   const usage = tasks.reduce((total, task) => ({
     input_tokens: total.input_tokens + Number(task.input_tokens ?? 0),
     cache_tokens: total.cache_tokens + Number(task.cache_tokens ?? 0),
-    output_tokens: total.output_tokens + Number(task.output_tokens ?? 0)
-  }), { input_tokens: 0, cache_tokens: 0, output_tokens: 0 });
+    cache_read_tokens: total.cache_read_tokens + Number(task.cache_read_tokens ?? 0),
+    output_tokens: total.output_tokens + Number(task.output_tokens ?? 0),
+    reasoning_tokens: total.reasoning_tokens + Number(task.reasoning_tokens ?? 0)
+  }), { input_tokens: 0, cache_tokens: 0, cache_read_tokens: 0, output_tokens: 0, reasoning_tokens: 0 });
+  const cacheReadRatio = usage.input_tokens > 0 ? usage.cache_read_tokens / usage.input_tokens : null;
+  const reasoningOutputRatio = usage.output_tokens > 0 ? usage.reasoning_tokens / usage.output_tokens : null;
+  const lengthFinishCount = tasks.reduce(
+    (total, task) => total + Number(task.length_finish_count ?? 0), 0
+  );
+  const convergeTurns = tasks.reduce((total, task) => total + Number(task.converge_turns ?? 0), 0);
   const costUsd = tasks.reduce((total, task) => {
     const value = Number(task.cost_usd);
     return total + (Number.isFinite(value) ? value : 0);
@@ -2070,6 +2140,11 @@ export async function generateBenchReport(runDir) {
     harbor_job_accounting: harborJobAccounting,
     orphan_artifacts: orphanArtifacts,
     usage,
+    reasoning_tokens: usage.reasoning_tokens,
+    cache_read_ratio: cacheReadRatio,
+    reasoning_output_ratio: reasoningOutputRatio,
+    length_finish_count: lengthFinishCount,
+    converge_turns: convergeTurns,
     cost_usd: costUsd,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
     exit_code: exitCode,

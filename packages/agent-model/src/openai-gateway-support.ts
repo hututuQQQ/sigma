@@ -223,10 +223,15 @@ export function rawUsage(usage: Record<string, unknown>): RawUsage {
     ? usage.prompt_tokens_details as Record<string, unknown> : {};
   const outputDetails = usage.completion_tokens_details && typeof usage.completion_tokens_details === "object"
     ? usage.completion_tokens_details as Record<string, unknown> : {};
+  const cacheReadTokens = typeof inputDetails.cached_tokens === "number"
+    ? inputDetails.cached_tokens
+    : typeof usage.prompt_cache_hit_tokens === "number"
+      ? usage.prompt_cache_hit_tokens
+      : undefined;
   return {
     inputTokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : undefined,
     outputTokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined,
-    cacheReadTokens: typeof inputDetails.cached_tokens === "number" ? inputDetails.cached_tokens : undefined,
+    cacheReadTokens,
     reasoningTokens: typeof outputDetails.reasoning_tokens === "number" ? outputDetails.reasoning_tokens : undefined
   };
 }

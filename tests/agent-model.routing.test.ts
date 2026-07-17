@@ -508,6 +508,26 @@ describe("normalized model usage", () => {
       }
     });
   });
+
+  it("normalizes DeepSeek top-level cache-hit usage on streaming responses", async () => {
+    const frame = {
+      usage: { prompt_tokens: 10, completion_tokens: 2, prompt_cache_hit_tokens: 7 },
+      choices: [{ delta: { content: "ok" }, finish_reason: "stop" }]
+    };
+    const body = `data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`;
+    const model = new OpenAIModelGateway({
+      provider: "fake", model: "fake", baseUrl: "https://example.invalid", apiKey: "secret",
+      apiKeyName: "FAKE_KEY", pricing: spec("deepseek/a").pricing,
+      fetchImpl: (async () => new Response(body, { headers: { "content-type": "text/event-stream" } })) as typeof fetch
+    });
+    const events: ModelStreamEvent[] = [];
+    for await (const event of model.stream(request())) events.push(event);
+
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      response: { usage: { cacheReadTokens: 7, providerReported: true } }
+    });
+  });
 });
 
 function response(content: string): ModelResponse {

@@ -276,7 +276,7 @@ describe("Terminal-Bench command construction", () => {
     ).toContain("max_wall_time_sec=2700");
   });
 
-  it("caps a run-wide child deadline below the smallest Harbor outer deadline", () => {
+  it("uses Harbor per-trial deadlines for heterogeneous timeout batches", () => {
     const timeoutProbe = {
       tasks: [
         { agent_timeout_sec: 900 },
@@ -284,25 +284,41 @@ describe("Terminal-Bench command construction", () => {
       ],
       max_agent_timeout_sec: 1200
     };
-    const plan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
+    const plan = computeHarborTimeoutPlan({ benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, timeoutProbe);
 
     expect(plan).toMatchObject({
-      requested_agent_wall_time_sec: 1800,
-      agent_wall_time_sec: 1320,
-      child_deadline_sec: 1320,
-      outer_trial_deadline_sec: 1440,
+      requested_agent_wall_time_sec: 1080,
+      agent_wall_time_sec: 1080,
+      child_deadline_sec: 1080,
+      outer_trial_deadline_sec: null,
+      outer_trial_deadline_scope: "harbor_per_trial",
       deadline_cleanup_grace_sec: 120,
-      deadline_clamped: true
+      deadline_clamped: false
     });
-    expect(plan.agent_wall_time_sec).toBeLessThanOrEqual(
-      plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec
-    );
-    expect(buildHarborJobConfig({
+    const kwargs = buildHarborJobConfig({
       mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
-    }, "jobs", plan, timeoutProbe).agents[0].kwargs).toMatchObject({
-      max_wall_time_sec: 1320,
-      outer_trial_deadline_sec: 1440
+    }, "jobs", plan, timeoutProbe).agents[0].kwargs;
+    expect(kwargs).toMatchObject({ max_wall_time_sec: 1080 });
+    expect(kwargs).not.toHaveProperty("outer_trial_deadline_sec");
+  });
+
+  it("injects an exact outer deadline only when all task timeouts are uniform", () => {
+    const timeoutProbe = {
+      tasks: [{ agent_timeout_sec: 900 }, { agent_timeout_sec: 900 }],
+      max_agent_timeout_sec: 900
+    };
+    const plan = computeHarborTimeoutPlan(
+      { benchmarkClass: "standard", agentTimeoutGraceSec: 120 },
+      timeoutProbe
+    );
+
+    expect(plan).toMatchObject({
+      agent_wall_time_sec: 780,
+      outer_trial_deadline_sec: 900,
+      outer_trial_deadline_scope: "uniform_task_timeout",
+      deadline_cleanup_grace_sec: 120
     });
+    expect(plan.agent_wall_time_sec).toBe(plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec);
   });
 
   it("gives long MVP tasks lenient wall time by default", () => {
@@ -757,7 +773,7 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(passedDir, "metadata.json"), '{"task_id":"passed-task","status":"passed"}\n', "utf8");
     await writeFile(
       path.join(passedDir, "summary.json"),
-      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":3,"input_tokens":10,"output_tokens":5,"duration_ms":1000,"last_error":null}\n',
+      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":3,"input_tokens":10,"cache_tokens":8,"cache_read_tokens":8,"output_tokens":5,"reasoning_tokens":4,"length_finish_count":1,"converge_turns":2,"duration_ms":1000,"last_error":null}\n',
       "utf8"
     );
     await writeFile(path.join(passedDir, "trace.jsonl"), '{"type":"run_end","metadata":{}}\n', "utf8");
@@ -779,6 +795,14 @@ describe("benchmark report generation", () => {
     expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
     expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
+    expect(report).toMatchObject({
+      reasoning_tokens: 4,
+      cache_read_ratio: 8 / 22,
+      reasoning_output_ratio: 4 / 6,
+      length_finish_count: 1,
+      converge_turns: 2,
+      usage: { reasoning_tokens: 4, cache_read_tokens: 8 }
+    });
     const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
     const jsonReport = JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8"));
     expect(markdown).toContain("# Terminal-Bench Run synthetic-run");

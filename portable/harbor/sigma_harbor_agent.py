@@ -346,6 +346,8 @@ class _OutputRecorder:
         self.usage: dict[str, Any] = {}
         self.retry_count = 0
         self.last_retry: dict[str, Any] | None = None
+        self.length_finish_count = 0
+        self.converge_turns = 0
         logs_dir.mkdir(parents=True, exist_ok=True)
         for path in (self.stdout_path, self.stderr_path, self.trace_path):
             path.write_text("", encoding="utf-8")
@@ -394,6 +396,11 @@ class _OutputRecorder:
             if event_type in {"tool.requested", "tool.started"}:
                 self.tool_calls += 1
             payload = _event_payload(event)
+            if event_type == "model.completed" and payload.get("finishReason") == "length":
+                self.length_finish_count += 1
+            if (event_type == "diagnostic" and payload.get("kind") == "deadline.stage"
+                    and payload.get("stage") == "converge"):
+                self.converge_turns += 1
             if event_type == "usage.recorded":
                 self.usage = {
                     **self.usage,
@@ -441,6 +448,8 @@ class _OutputRecorder:
             "usage": dict(self.usage),
             "retry_count": self.retry_count,
             "last_retry": self.last_retry,
+            "length_finish_count": self.length_finish_count,
+            "converge_turns": self.converge_turns,
         }
 
     def _write_state(self) -> None:
@@ -1274,9 +1283,19 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         usage = [_event_payload(event) for event in events if event.get("type") == "usage.recorded"]
         input_tokens = sum(_as_int(item.get("inputTokens"), 0) for item in usage)
         output_tokens = sum(_as_int(item.get("outputTokens"), 0) for item in usage)
-        cache_tokens = sum(
-            _as_int(item.get("cacheReadTokens"), 0) + _as_int(item.get("cacheWriteTokens"), 0)
-            for item in usage
+        reasoning_tokens = sum(_as_int(item.get("reasoningTokens"), 0) for item in usage)
+        cache_read_tokens = sum(_as_int(item.get("cacheReadTokens"), 0) for item in usage)
+        cache_write_tokens = sum(_as_int(item.get("cacheWriteTokens"), 0) for item in usage)
+        cache_tokens = cache_read_tokens + cache_write_tokens
+        length_finish_count = sum(
+            event.get("type") == "model.completed" and _event_payload(event).get("finishReason") == "length"
+            for event in events
+        )
+        converge_turns = sum(
+            event.get("type") == "diagnostic"
+            and _event_payload(event).get("kind") == "deadline.stage"
+            and _event_payload(event).get("stage") == "converge"
+            for event in events
         )
         cost_micro_usd = sum(_as_int(item.get("costMicroUsd"), 0) for item in usage)
         model_failure_event = next(
@@ -1301,7 +1320,14 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "model_turns": sum(event.get("type") == "model.started" for event in events),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
             "cache_tokens": cache_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_read_ratio": cache_read_tokens / input_tokens if input_tokens > 0 else None,
+            "reasoning_output_ratio": reasoning_tokens / output_tokens if output_tokens > 0 else None,
+            "length_finish_count": length_finish_count,
+            "converge_turns": converge_turns,
             "cost_usd": cost_micro_usd / 1_000_000,
             "last_event": _bounded_event(events[-1]) if events else None,
             "retry_count": sum(
@@ -1353,6 +1379,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "usage": live_state.get("usage", {}),
             "retry_count": live_state.get("retry_count", 0),
             "last_retry": live_state.get("last_retry"),
+            "length_finish_count": live_state.get("length_finish_count", 0),
+            "converge_turns": live_state.get("converge_turns", 0),
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
             "process_cleanup": process_cleanup,
@@ -1376,6 +1404,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "usage": state["usage"],
             "retry_count": state["retry_count"],
             "last_retry": state["last_retry"],
+            "length_finish_count": state["length_finish_count"],
+            "converge_turns": state["converge_turns"],
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
@@ -1434,7 +1464,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                         "commands_executed": summary.get("commands_executed", 0),
                         "input_tokens": summary.get("input_tokens", 0),
                         "output_tokens": summary.get("output_tokens", 0),
+                        "reasoning_tokens": summary.get("reasoning_tokens", 0),
                         "cache_tokens": summary.get("cache_tokens", 0),
+                        "cache_read_tokens": summary.get("cache_read_tokens", 0),
+                        "length_finish_count": summary.get("length_finish_count", 0),
+                        "converge_turns": summary.get("converge_turns", 0),
                         "cost_usd": summary.get("cost_usd"),
                     } if summary is not None else {}),
                 }
@@ -1746,7 +1780,11 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_model_turns": _json_number(summary, "model_turns"),
             "n_input_tokens": _json_number(summary, "input_tokens"),
             "n_output_tokens": _json_number(summary, "output_tokens"),
+            "n_reasoning_tokens": _json_number(summary, "reasoning_tokens"),
             "n_cache_tokens": _json_number(summary, "cache_tokens"),
+            "n_cache_read_tokens": _json_number(summary, "cache_read_tokens"),
+            "length_finish_count": _json_number(summary, "length_finish_count"),
+            "converge_turns": _json_number(summary, "converge_turns"),
             "cost_usd": summary.get("cost_usd"),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
@@ -1820,7 +1858,11 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "model_turns": getattr(context, "model_turns", 0),
             "n_input_tokens": getattr(context, "n_input_tokens", 0),
             "n_output_tokens": getattr(context, "n_output_tokens", 0),
+            "n_reasoning_tokens": getattr(context, "n_reasoning_tokens", 0),
             "n_cache_tokens": getattr(context, "n_cache_tokens", 0),
+            "n_cache_read_tokens": getattr(context, "n_cache_read_tokens", 0),
+            "length_finish_count": getattr(context, "length_finish_count", 0),
+            "converge_turns": getattr(context, "converge_turns", 0),
             "cost_usd": getattr(context, "cost_usd", None),
             "changed_app_files": [],
             "workspace_snapshots": [],

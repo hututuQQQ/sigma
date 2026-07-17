@@ -209,14 +209,15 @@ describe("context, platform, and repository tool capabilities", () => {
       ],
       tools: [{ name: "read", description: "read", inputSchema: { type: "object" } }],
       contextWindowTokens: 200,
-      outputReserveTokens: 20
+      outputReserveTokens: 20,
+      promptCache: false
     });
     expect(planned.messages.at(-1)?.content).toBe("new");
     expect(planned.budget.toolTokens).toBeGreaterThan(0);
     const withoutReasoning = planContext({
       system: [], dynamic: [],
       history: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
-      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: false
     });
     const withReasoning = planContext({
       system: [], dynamic: [],
@@ -224,13 +225,28 @@ describe("context, platform, and repository tool capabilities", () => {
         { role: "user", content: "question" },
         { role: "assistant", content: "answer", reasoningContent: "reasoning ".repeat(20) }
       ],
-      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: false
     });
     expect(withReasoning.budget.historyTokens).toBe(withoutReasoning.budget.historyTokens);
     expect(withReasoning.messages.at(-1)?.reasoningContent).toBeUndefined();
+    const toolReasoning = planContext({
+      system: [], dynamic: [],
+      history: [
+        { role: "user", content: "question" },
+        {
+          role: "assistant", content: "", reasoningContent: "required reasoning ".repeat(20),
+          toolCalls: [{ id: "read-1", name: "read", arguments: { path: "file.txt" } }]
+        },
+        { role: "tool", content: "contents", toolCallId: "read-1" }
+      ],
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: true
+    });
+    const replayedCall = toolReasoning.messages.find((message) => message.toolCalls?.[0]?.id === "read-1");
+    expect(replayedCall?.reasoningContent).toContain("required reasoning");
+    expect(toolReasoning.budget.historyTokens).toBeGreaterThan(withoutReasoning.budget.historyTokens);
     expect(() => planContext({
       system: [], dynamic: [], history: [{ role: "user", content: "x".repeat(1_000) }], tools: [],
-      contextWindowTokens: 10, outputReserveTokens: 0
+      contextWindowTokens: 10, outputReserveTokens: 0, promptCache: false
     })).toThrow("newest user turn");
 
     const authorities = planContext({
@@ -239,7 +255,8 @@ describe("context, platform, and repository tool capabilities", () => {
         { id: "project", authority: "project", provenance: "AGENTS.md", content: "instructions", tokenCount: 2, priority: 9 }
       ],
       dynamic: [{ id: "diff", authority: "tool", provenance: "repository diff", content: "untrusted", tokenCount: 2, priority: 8 }],
-      history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 100, outputReserveTokens: 0
+      history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 100, outputReserveTokens: 0,
+      promptCache: false
     });
     expect(authorities.messages.map((message) => message.role)).toEqual(["system", "developer", "user", "user"]);
     const compacted = planContext({
@@ -248,13 +265,14 @@ describe("context, platform, and repository tool capabilities", () => {
         role: index % 2 === 0 ? "user" as const : "assistant" as const,
         content: `${index}: ${"history ".repeat(20)}`
       })),
-      tools: [], contextWindowTokens: 160, outputReserveTokens: 20
+      tools: [], contextWindowTokens: 160, outputReserveTokens: 20, promptCache: false
     });
     expect(compacted.omittedHistoryTurns).toBeGreaterThan(0);
     expect(compacted.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
     expect(() => planContext({
       system: [{ id: "required", authority: "system", provenance: "required", content: "required", tokenCount: 90, priority: 1 }],
-      dynamic: [], history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 95, outputReserveTokens: 0
+      dynamic: [], history: [{ role: "user", content: "request" }], tools: [],
+      contextWindowTokens: 95, outputReserveTokens: 0, promptCache: false
     })).toThrow("Mandatory context and the newest user turn");
 
     const cache = new VersionedContextCache<number>();

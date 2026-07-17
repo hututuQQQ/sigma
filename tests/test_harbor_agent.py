@@ -749,13 +749,16 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 json.dumps(event(2, "usage.recorded", {
                     "inputTokens": 11,
                     "outputTokens": 7,
+                    "reasoningTokens": 6,
                     "cacheReadTokens": 3,
                     "cacheWriteTokens": 2,
                     "costMicroUsd": 19,
                 })),
-                json.dumps(event(3, "tool.requested", {"callId": "tool-1", "name": "execute"})),
-                json.dumps(event(4, "tool.completed", {"callId": "tool-1", "name": "execute"})),
-                json.dumps(event(5, "run.completed", {"message": "done"})),
+                json.dumps(event(3, "model.completed", {"finishReason": "length"})),
+                json.dumps(event(4, "diagnostic", {"kind": "deadline.stage", "stage": "converge"})),
+                json.dumps(event(5, "tool.requested", {"callId": "tool-1", "name": "execute"})),
+                json.dumps(event(6, "tool.completed", {"callId": "tool-1", "name": "execute"})),
+                json.dumps(event(7, "run.completed", {"message": "done"})),
                 json.dumps({
                     "kind": "result",
                     "result": {
@@ -790,10 +793,19 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.n_input_tokens, 11)
             self.assertEqual(context.n_output_tokens, 7)
             self.assertEqual(context.n_cache_tokens, 5)
+            self.assertEqual(context.n_cache_read_tokens, 3)
+            self.assertEqual(context.n_reasoning_tokens, 6)
+            self.assertEqual(context.length_finish_count, 1)
+            self.assertEqual(context.converge_turns, 1)
             self.assertEqual(context.model_turns, 1)
             self.assertEqual(context.tool_calls, 1)
             summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["input_tokens"], 11)
+            self.assertEqual(summary["reasoning_tokens"], 6)
+            self.assertEqual(summary["cache_read_ratio"], 3 / 11)
+            self.assertEqual(summary["reasoning_output_ratio"], 6 / 7)
+            self.assertEqual(summary["length_finish_count"], 1)
+            self.assertEqual(summary["converge_turns"], 1)
             self.assertEqual(summary["model_turns"], 1)
             trace_types = [
                 json.loads(line)["type"]
