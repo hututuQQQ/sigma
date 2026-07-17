@@ -23,7 +23,8 @@ All notable changes to Sigma Code are documented in this file. The project follo
 
 - External reads and handoff are sensitive effects with fresh per-call grants; unsafe host execution and workspace-external writes remain disabled.
 - The strict pre-v4 posture remains available with `read_scope=workspace`, `network=none`, and `process_handoff=deny`.
-- Official Windows executables must pass trusted, timestamped Authenticode verification before publication; both platform archives include checksums, CycloneDX SBOMs, and signed provenance.
+- Linux x64 is the stable binary release. Windows x64 is published alongside it as an explicitly unsigned preview until trusted Authenticode signing is available.
+- Both platform archives include checksums, CycloneDX SBOMs, and signed provenance; Windows users should expect SmartScreen or Smart App Control warnings.
 
 ## [4.0.0-rc.1] - 2026-07-17
 

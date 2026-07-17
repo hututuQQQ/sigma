@@ -15,7 +15,7 @@
 
 <p align="center">
   <img alt="状态：稳定版" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
-  <img alt="发布目标：Windows 与 Linux x64" src="https://img.shields.io/badge/release%20targets-Windows%20%2B%20Linux%20x64-0078d4">
+  <img alt="发布目标：Linux 稳定版与 Windows 预览版" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20preview-0078d4">
   <img alt="正式评估：仅 DeepSeek" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
 </p>
 
@@ -25,12 +25,12 @@
 
 Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放的类型化事件流。它可以理解仓库、执行范围明确的修改、在沙箱内运行命令、验证结果、请求独立审查，并在进程中断后恢复原来的会话。CLI 与 TUI 不各自维护一套 Agent：产品只有一个事件溯源内核、一种会话格式和一条执行链。
 
-`v4.0.0` 是 Sigma Code 的首个稳定版。只有完整发布工作流全部通过后，才会发布正式的 Windows x64 与 Linux x64 归档。提交问题或参与贡献前，请先查看[变更记录](CHANGELOG.md)、[安全策略](SECURITY.md)和[贡献指南](CONTRIBUTING.md)。
+`v4.0.0` 是 Sigma Code 的首个稳定版。Linux x64 是正式稳定的二进制目标；在取得可信 Authenticode 签名之前，Windows x64 会随同发布，但明确标记为未签名预览版。提交问题或参与贡献前，请先查看[变更记录](CHANGELOG.md)、[安全策略](SECURITY.md)和[贡献指南](CONTRIBUTING.md)。
 
 > [!IMPORTANT]
 > **当前产品边界**
 >
-> - **正式二进制发布目标是 Windows x64 与 Linux x64。** 两种归档都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁；Windows 可执行文件还必须使用可信代码签名身份完成 Authenticode 签名与时间戳。
+> - **Linux x64 是正式稳定的二进制发布；Windows x64 是未签名预览版。** 两种归档都必须通过原生沙箱、打包产品、校验和、SBOM 与签名来源证明门禁，但 Windows 可执行文件目前没有可信 Authenticode 签名，可能触发 Windows 安全警告。
 > - **目前正式评估与 Benchmark 只跑 DeepSeek。** Sigma 的评估系统、Harbor 适配器和 Terminal-Bench harness 都以 DeepSeek 为重点维护；其他 Provider 的结果不用于正式性能声明。
 > - 运行时包含 DeepSeek 与 GLM/Z.ai 网关，但 GLM 路径还没有获得与 DeepSeek 相同的正式评估覆盖。
 > - Sigma 把 **OpenCode 视为直接竞争对手和追赶目标，而不是已经达到的水平**。就当前整体实际表现与成熟度而言，Sigma 和 OpenCode 仍有真实差距。
@@ -45,12 +45,27 @@ Sigma Code 把一次编码任务变成一条可持久化、可验证、可重放
 | 沙箱失效即拒绝 | 即使授权了宿主机只读输入或网络，进程仍运行在必需的原生沙箱中；沙箱不健康时，Sigma 会拒绝执行。 |
 | 一条产品执行链 | CLI 自动化和 TUI 共用同一个 `RuntimeClient`、内核、事件仓库、工具、恢复逻辑和结果协议。 |
 
-## Windows 快速开始
+## Linux 快速开始
 
-> [!NOTE]
-> 解压前请核对归档的 SHA-256 侧文件与签名来源证明。正式 Windows 可执行文件带有 Authenticode 签名与时间戳；如果签名验证失败，请勿运行该归档。
+从 [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) 下载最新的 Linux x64 归档，核对 SHA-256 侧文件与签名来源证明后解压：
 
-从 [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) 下载最新的 Windows x64 压缩包并解压。正式包已经包含固定版本的 Node.js、原生 `sigma-exec` Broker、TUI 运行时、TypeScript/Python Language Server 资源和 Tokenizer 数据，无需另外安装 Node.js。
+```sh
+SIGMA="$HOME/.local/share/sigma-code"
+WORKSPACE="/path/to/your/repository"
+
+export DEEPSEEK_API_KEY="your-api-key"
+
+"$SIGMA/bin/agent" init --workspace "$WORKSPACE" --provider deepseek
+"$SIGMA/bin/agent" doctor --workspace "$WORKSPACE" --check-api
+"$SIGMA/bin/agent" tui --workspace "$WORKSPACE"
+```
+
+## Windows 快速开始（未签名预览版）
+
+> [!WARNING]
+> Windows x64 归档是未签名预览版，不是受信任的正式 Windows 二进制发布。解压前请核对 SHA-256 侧文件与签名来源证明。可执行文件目前没有可信 Authenticode 签名，因此 Windows SmartScreen 或 Smart App Control 可能警告或阻止运行。
+
+只有在接受未签名预览版风险时，才从 [GitHub Releases](https://github.com/hututuQQQ/sigma/releases) 下载 Windows x64 预览归档并解压。该包已经包含固定版本的 Node.js、原生 `sigma-exec` Broker、TUI 运行时、TypeScript/Python Language Server 资源和 Tokenizer 数据，无需另外安装 Node.js。
 
 ```powershell
 $Sigma = "C:\Tools\sigma-code"
@@ -69,7 +84,7 @@ $env:DEEPSEEK_API_KEY = "your-api-key"
 
 上面的 API Key 只对当前 PowerShell 进程生效。不要把密钥写进 `.agent/config.toml` 或提交到版本库。
 
-官方归档同时发布 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和公开验证密钥；Windows 可执行文件还会进行带时间戳的 Authenticode 签名。信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见 [RELEASING.md](RELEASING.md)。
+两个平台归档都会发布 SHA-256 校验和、CycloneDX SBOM、签名的来源证明和公开验证密钥。只有 Linux x64 属于稳定二进制发布；Windows x64 仍是未签名预览版。信任边界见 [SECURITY.md](SECURITY.md)，维护者发布流程见 [RELEASING.md](RELEASING.md)。
 
 执行一次性的修改任务：
 

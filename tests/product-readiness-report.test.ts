@@ -143,8 +143,12 @@ async function promoteV3Evidence(
   });
   verification.metadata.schemaVersion = Number(version.split(".")[0]);
   verification.metadata.productVersion = version;
+  verification.metadata.releaseChannel = windowsSignerPolicy ? "stable" : "preview";
   verification.metadata.signing = { authenticodeVerified: windowsSignerPolicy };
-  verification.signing = { policyVerified: windowsSignerPolicy };
+  verification.signing = {
+    authenticodeVerified: windowsSignerPolicy,
+    policyVerified: windowsSignerPolicy
+  };
   verification.integrity = {
     manifestDigest: "d".repeat(64),
     manifest: { entries: [
@@ -304,11 +308,67 @@ describe("product readiness report", () => {
     });
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
-    expect(report).toMatchObject({ status: "internal-ready", internalReady: true, releaseReady: false });
+    expect(report).toMatchObject({
+      status: "internal-ready", internalReady: true, releaseReady: false, previewReady: false
+    });
     expect(report.releaseChecks).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "package:provenanceSignature", ok: false }),
       expect.objectContaining({ name: "package:windowsSignerPolicy", ok: false })
     ]));
+  });
+
+  it("marks trusted Windows artifacts preview-ready when only Authenticode is unavailable", async () => {
+    const { rootDir, artifactsDir } = await fixture({
+      ok: true,
+      status: "passed",
+      transport: "native"
+    }, {
+      ok: true,
+      status: "passed",
+      checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
+    });
+    await promoteV3Evidence(rootDir, artifactsDir, {
+      provenanceTrusted: true,
+      windowsSignerPolicy: false
+    });
+
+    const report = await buildProductReadinessReport({ rootDir, artifactsDir });
+    expect(report).toMatchObject({
+      status: "preview-ready", internalReady: true, releaseReady: false, previewReady: true
+    });
+    await expect(writeProductReadinessReport({
+      rootDir, artifactsDir, requirePreviewReady: true
+    })).resolves.toMatchObject({ report: { previewReady: true } });
+  });
+
+  it("rejects a signed but unapproved Windows artifact from the unsigned-preview channel", async () => {
+    const { rootDir, artifactsDir } = await fixture({
+      ok: true,
+      status: "passed",
+      transport: "native"
+    }, {
+      ok: true,
+      status: "passed",
+      checks: { doctorApi: true, runCompleted: true, fileContent: true, inspect: true }
+    });
+    await promoteV3Evidence(rootDir, artifactsDir, {
+      provenanceTrusted: true,
+      windowsSignerPolicy: false
+    });
+    const verificationPath = path.join(artifactsDir, "agent-cli-package-verify.json");
+    const verification = JSON.parse(await readFile(verificationPath, "utf8"));
+    verification.signing.authenticodeVerified = true;
+    await writeJson(verificationPath, verification);
+
+    const report = await buildProductReadinessReport({ rootDir, artifactsDir });
+    expect(report).toMatchObject({
+      status: "internal-ready", releaseReady: false, previewReady: false
+    });
+    expect(report.releaseChecks).toContainEqual({
+      name: "package:releaseChannel",
+      ok: false,
+      detail: "expected=stable, package=preview"
+    });
   });
 
   it("requires both external provenance trust and approved Windows signer policy for V3 release", async () => {
@@ -327,7 +387,9 @@ describe("product readiness report", () => {
     });
 
     const report = await buildProductReadinessReport({ rootDir, artifactsDir });
-    expect(report).toMatchObject({ status: "release-ready", internalReady: true, releaseReady: true });
+    expect(report).toMatchObject({
+      status: "release-ready", internalReady: true, releaseReady: true, previewReady: false
+    });
     expect(report.releaseChecks).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "package:provenanceSignature", ok: true }),
       expect.objectContaining({ name: "package:windowsSignerPolicy", ok: true })

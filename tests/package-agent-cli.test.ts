@@ -932,6 +932,7 @@ describe("package-agent-cli", () => {
     const readme = await readFile(path.join(result.bundleDir, "README.md"), "utf8");
     expect(readme).toContain(String.raw`.\bin\agent.cmd doctor --workspace D:\path\to\repo --json --strict`);
     expect(readme).not.toContain(String.raw`.\bin\agent.cmd doctor --workspace /path/to/repo`);
+    expect(readme).toContain("This Windows bundle is an unsigned preview.");
     await expect(readFile(path.join(result.bundleDir, "LICENSE"), "utf8")).resolves.toContain("MIT License");
     const bundlePackage = JSON.parse(await readFile(path.join(result.bundleDir, "package.json"), "utf8"));
     expect(bundlePackage.license).toBe("MIT");
@@ -989,6 +990,7 @@ describe("package-agent-cli", () => {
       .toBe(windowsAppContainerNodeCompatibility.normalizedContentSha256);
     expect(report.metadata.node.compatibilitySmokePassed).toBe(true);
     const metadata = JSON.parse(await readFile(path.join(result.bundleDir, "package-metadata.json"), "utf8"));
+    expect(metadata.releaseChannel).toBe("preview");
     expect(metadata.node.compatibility).toEqual(windowsAppContainerNodeCompatibility);
     expect(report.signing).toMatchObject({ policyVerified: false });
     expect(report.signing.signatures.node).toEqual(expect.objectContaining({
