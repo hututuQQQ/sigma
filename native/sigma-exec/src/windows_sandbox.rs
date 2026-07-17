@@ -3942,6 +3942,18 @@ fn pin_executable(
     executable: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<OwnedHandle, RpcError> {
+    // GetFinalPathNameByHandleW expands short (8.3) path components. Resolve the
+    // requested path through Windows first so equivalent short and long aliases
+    // compare equal while the post-open check still detects target changes.
+    let executable = executable.canonicalize().map_err(|error| {
+        RpcError::new(
+            "executable_unavailable",
+            format!(
+                "cannot resolve executable '{}' for launch: {error}",
+                executable.display()
+            ),
+        )
+    })?;
     let wide = wide_null(executable.as_os_str());
     let handle = unsafe {
         CreateFileW(
@@ -3978,7 +3990,7 @@ fn pin_executable(
         ));
     }
     let actual = final_handle_path(handle.0)?;
-    if !windows_path_eq(&actual, executable) {
+    if !windows_path_eq(&actual, &executable) {
         return Err(RpcError::new(
             "executable_unavailable",
             format!(
@@ -3989,7 +4001,7 @@ fn pin_executable(
         ));
     }
     if let Some(expected) = expected_sha256 {
-        let mut file = std::fs::File::open(executable).map_err(|error| {
+        let mut file = std::fs::File::open(&executable).map_err(|error| {
             RpcError::new(
                 "executable_unavailable",
                 format!(

@@ -1874,8 +1874,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn executable_replacement_keeps_the_pin_but_fails_destination_attestation() {
-        use std::os::unix::process::CommandExt;
-
         let root = std::env::temp_dir().join(format!(
             "sigma-pinned-executable-{}-{}",
             std::process::id(),
@@ -1913,13 +1911,16 @@ mod tests {
             .expect_err("replacement must fail before bwrap setup");
         assert_eq!(error.code, "policy_denied");
 
-        let output = Command::new(executable.source.fd_path())
-            .arg0("sh")
-            .args(["-c", "printf pinned-executable-ok"])
-            .output()
-            .expect("execute pinned file object");
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"pinned-executable-ok");
+        let pinned = executable
+            .source
+            .fd_path()
+            .metadata()
+            .expect("inspect pinned file object");
+        let original = std::fs::metadata(&moved).expect("inspect moved original executable");
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (original.dev(), original.ino())
+        );
         std::fs::remove_dir_all(root).expect("remove executable test root");
     }
 

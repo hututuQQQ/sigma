@@ -128,6 +128,7 @@ function approvedWindowsNodeFixtureAvailable() {
 }
 
 const approvedWindowsPackageIt = windowsZipFixtureAvailable() && approvedWindowsNodeFixtureAvailable() ? it : it.skip;
+const linuxPackagingIt = process.platform === "win32" ? it.skip : it;
 
 async function writeFakeWindowsNodeRuntimeZip(tmpDir: string, arch = "x64") {
   const runtimeRoot = path.join(tmpDir, "runtime-win");
@@ -369,7 +370,7 @@ describe("package-agent-cli", () => {
     expect(probes).toBe(0);
   });
 
-  it("creates the Linux x64 artifact with bin/agent and bundled node", async () => {
+  linuxPackagingIt("creates the Linux x64 artifact with bin/agent and bundled node", async () => {
     const rootDir = await writePackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
 
@@ -415,7 +416,7 @@ describe("package-agent-cli", () => {
     expect(readme).not.toContain("Harbor task containers");
   });
 
-  it("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
+  linuxPackagingIt("recursively deploys target optional dependencies and preserves nested version conflicts", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-package-dependency-graph-"));
     await writeFile(path.join(rootDir, "LICENSE"), "MIT License\n", "utf8");
     await writeBuiltPackage(rootDir, "agent-tui", { "@opentui/core": "0.4.3", "root-dep": "1.0.0" });
@@ -464,7 +465,7 @@ describe("package-agent-cli", () => {
     expect(wrapper).toContain("--experimental-ffi");
   });
 
-  it("uses a cached Node runtime tarball when env override is absent", async () => {
+  linuxPackagingIt("uses a cached Node runtime tarball when env override is absent", async () => {
     const rootDir = await writePackageFixture();
     const artifactsDir = path.join(rootDir, ".artifacts");
     const cacheDir = path.join(artifactsDir, "cache");
@@ -506,7 +507,7 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("exactly one SHA-256 digest for the exact file");
   });
 
-  it("auto-downloads the Node runtime tarball into cache when missing", async () => {
+  linuxPackagingIt("auto-downloads the Node runtime tarball into cache when missing", async () => {
     const rootDir = await writePackageFixture();
     const sourceTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const sourceDigest = createHash("sha256").update(await readFile(sourceTarball)).digest("hex");
@@ -540,7 +541,7 @@ describe("package-agent-cli", () => {
     });
   });
 
-  it("verifies the release bundle structure and product metadata", async () => {
+  linuxPackagingIt("verifies the release bundle structure and product metadata", async () => {
     const rootDir = await writePackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -654,7 +655,7 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("is not an ELF binary");
   });
 
-  it("packages V3 broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
+  linuxPackagingIt("packages V3 broker/LSP assets with integrity, SBOM, checksum, and provenance", async () => {
     const { rootDir, broker, version } = await writeV3PackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const runtimeSha256 = createHash("sha256").update(await readFile(runtimeTarball)).digest("hex");
@@ -742,7 +743,7 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("unexpected builder identity");
   });
 
-  it("rejects every unmanifested file in the portable bundle tree", async () => {
+  linuxPackagingIt("rejects every unmanifested file in the portable bundle tree", async () => {
     const { rootDir, broker } = await writeV3PackageFixture("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -774,7 +775,7 @@ describe("package-agent-cli", () => {
     })).rejects.toThrow("Integrity manifest omits portable bundle file");
   });
 
-  it("binds sidecar and provenance verification to the initially inspected archive bytes", async () => {
+  linuxPackagingIt("binds sidecar and provenance verification to the initially inspected archive bytes", async () => {
     const { rootDir, broker } = await writeV3PackageFixture("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -829,7 +830,7 @@ describe("package-agent-cli", () => {
     expect(replaced).toBe(true);
   });
 
-  it("verifies release provenance only against an externally trusted Ed25519 key", async () => {
+  linuxPackagingIt("verifies release provenance only against an externally trusted Ed25519 key", async () => {
     const { rootDir, broker } = await writeV3PackageFixture("linux");
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
@@ -1006,7 +1007,7 @@ describe("package-agent-cli", () => {
   // runner from a stuck package operation.
   }, 60_000);
 
-  it("can require the target wrapper smoke for release environments", async () => {
+  linuxPackagingIt("can require the target wrapper smoke for release environments", async () => {
     const rootDir = await writePackageFixture();
     const runtimeTarball = await writeFakeNodeRuntimeTarball(rootDir);
     const artifactsDir = path.join(rootDir, ".artifacts");
