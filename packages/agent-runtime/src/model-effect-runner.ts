@@ -8,7 +8,7 @@ import {
    type ModelToolDefinition
 } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
-import { RepositoryContextProvider } from "agent-context";
+import { RepositoryContextProvider, type ContextPlan } from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import {
   modelTools,
@@ -35,6 +35,7 @@ import {
   modelFailureMessage,
   streamModelResponse
 } from "./model-effect-support.js";
+import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
@@ -43,11 +44,21 @@ interface PreparedModelTurn {
   tools: ModelToolDefinition[];
   toolChoice?: ModelRequest["toolChoice"];
   budget: PreparedModelBudget;
+  outputReserveTokens: number;
 }
 
 interface ModelReservationState {
   settled: boolean;
   response?: ModelResponse; consumed?: Partial<BudgetAmounts>;
+}
+
+function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
+  return session.durable.state.receipts
+    .flatMap((receipt) => receipt.diagnostics)
+    .reduce((total, diagnostic) => {
+      const match = /^model_output_truncated:(?:stdout|stderr):(\d+)$/u.exec(diagnostic);
+      return total + (match ? Number(match[1]) : 0);
+    }, 0);
 }
 
 export class ModelEffectRunner {
@@ -138,6 +149,23 @@ export class ModelEffectRunner {
     });
   }
 
+  private async emitContextComposition(
+    session: RuntimeSession,
+    plan: ContextPlan,
+    forecast: DeadlineForecast
+  ): Promise<void> {
+    await this.options.emit(session, "diagnostic", "runtime", {
+      kind: "context.composition",
+      ...plan.budget,
+      latestHistoryBlockTokens: plan.latestHistoryBlockTokens,
+      omittedHistoryTurns: plan.omittedHistoryTurns,
+      modelVisibleOutputTruncatedBytes: modelVisibleOutputTruncatedBytes(session),
+      reviewCount: session.durable.state.evidence.filter((item) => item.kind === "review").length,
+      deadlineStage: forecast.stage,
+      executionMode: this.options.runtime.runtimeEnvironment?.executionMode ?? "sandboxed"
+    });
+  }
+
   private async attempt(
     session: RuntimeSession,
     turnId: number,
@@ -166,16 +194,36 @@ export class ModelEffectRunner {
     const tools = modelTools(projectedDescriptors);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
+    const forecast = deadlineForecast(session);
+    const outputReserveTokens = forecast.stage === "converge"
+      ? Math.min(2_048, this.options.outputReserveTokens)
+      : this.options.outputReserveTokens;
+    const convergenceContext: ContextItem[] = forecast.stage === "converge" ? [{
+      id: `runtime:deadline-converge:${session.durable.runId}`,
+      authority: "runtime",
+      provenance: "deadline stage",
+      content: "Deadline stage is converge. Perform at most one focused finishing action, then immediately use the appropriate terminal tool. Do not start exploratory work.",
+      tokenCount: 34,
+      priority: 1_000
+    }] : [];
+    await this.options.emit(session, "diagnostic", "runtime", {
+      kind: "deadline.stage",
+      stage: forecast.stage,
+      remainingMs: forecast.remainingMs,
+      nextModelEstimateMs: forecast.nextModelEstimateMs,
+      outputReserveTokens
+    });
     const plan = await providerSizedPlan(session.services.gateway, {
       system: [...session.interaction.contextItems, ...hookContext],
       history: session.durable.state.messages,
       // Keep the stable system prefix cacheable. The evidence ledger is
       // current-run state and belongs in the dynamic suffix, where changes do
       // not invalidate static policy/context cache entries.
-      dynamic: [...dynamic, ledger],
+      dynamic: [...dynamic, ledger, ...convergenceContext],
       tools,
-      outputReserveTokens: this.options.outputReserveTokens
+      outputReserveTokens
     });
+    await this.emitContextComposition(session, plan, forecast);
     if (plan.summary && !session.interaction.loadedContextIds.has(plan.summary.id)) {
       session.interaction.loadedContextIds.add(plan.summary.id);
       await this.options.emit(session, "context.compacted", "runtime", {
@@ -188,7 +236,7 @@ export class ModelEffectRunner {
       session.services.gateway,
       plan.messages,
       tools,
-      this.options.outputReserveTokens,
+      outputReserveTokens,
       Math.max(0, session.durable.state.budget.limits.costMicroUsd
         - session.durable.state.budget.consumed.costMicroUsd
         - session.durable.state.budget.reserved.costMicroUsd)
@@ -197,7 +245,8 @@ export class ModelEffectRunner {
       messages: plan.messages,
       tools,
       ...(repairPending ? { toolChoice: "required" } : {}),
-      budget
+      budget,
+      outputReserveTokens
     };
     const requestId = `${session.durable.runId}:${turnId}`;
     const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, budget.reserved);
@@ -217,7 +266,8 @@ export class ModelEffectRunner {
     const state: ModelReservationState = { settled: false };
     try {
       const response = await streamModelResponse(
-        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, signal, turn.budget.routeConstraints
+        this.options, session, turnId, turn.messages, turn.tools, turn.toolChoice, signal,
+        turn.budget.routeConstraints, turn.outputReserveTokens
       );
       state.response = response;
       await this.completeReservation(

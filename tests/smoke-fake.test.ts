@@ -27,7 +27,7 @@ describe("generic fake model smoke", () => {
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       reviewer: createApprovingReviewer(),
       permissionMode: "auto",
-      runDeadlineMs: 30_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect the workspace and make the requested change.", mode: "change" });

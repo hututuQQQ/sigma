@@ -1,9 +1,9 @@
 import type { BudgetAmounts, RunOutcome } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 
-const ACTION_SETTLEMENT_GRACE_MS = 500;
-const MODEL_MINIMUM_MS = 500;
-const MODEL_MAXIMUM_MS = 60_000;
+export const ACTION_SETTLEMENT_GRACE_MS = 10_000;
+const MODEL_MINIMUM_MS = 15_000;
+const MODEL_MAXIMUM_MS = 180_000;
 const TOOL_MINIMUM_MS = 250;
 const TOOL_MAXIMUM_MS = 30_000;
 
@@ -14,7 +14,7 @@ export type ConvergenceAction =
 function quantile(values: readonly number[], fraction: number, fallback: number): number {
   const finite = values.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
   if (finite.length === 0) return fallback;
-  return finite[Math.min(finite.length - 1, Math.floor((finite.length - 1) * fraction))]!;
+  return finite[Math.min(finite.length - 1, Math.max(0, Math.ceil(finite.length * fraction) - 1))]!;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -23,21 +23,48 @@ function clamp(value: number, minimum: number, maximum: number): number {
 
 function modelEstimateMs(session: RuntimeSession): number {
   const samples = session.durable.state.usage
-    .filter((item) => item.runId === session.durable.runId && item.role === session.services.modelRole)
+    .filter((item) => item.runId === session.durable.runId)
     .slice(-8)
     .map((item) => item.latencyMs);
-  return clamp(Math.ceil(quantile(samples, 0.75, MODEL_MINIMUM_MS) * 1.5), MODEL_MINIMUM_MS, MODEL_MAXIMUM_MS);
+  return clamp(Math.ceil(quantile(samples, 0.90, MODEL_MINIMUM_MS / 1.5) * 1.5), MODEL_MINIMUM_MS, MODEL_MAXIMUM_MS);
 }
 
 function toolEstimateMs(session: RuntimeSession, terminalOnly: boolean): number {
   if (terminalOnly) return TOOL_MINIMUM_MS;
-  const samples = session.durable.state.receipts.slice(-12).flatMap((receipt) => {
+  const samples = session.durable.state.receipts.slice(-8).flatMap((receipt) => {
     const started = Date.parse(receipt.startedAt);
     const completed = Date.parse(receipt.completedAt);
     return Number.isFinite(started) && Number.isFinite(completed) && completed >= started
       ? [completed - started] : [];
   });
-  return clamp(Math.ceil(quantile(samples, 0.75, 500) * 1.5), TOOL_MINIMUM_MS, TOOL_MAXIMUM_MS);
+  return clamp(Math.ceil(quantile(samples, 0.90, 500) * 1.5), TOOL_MINIMUM_MS, TOOL_MAXIMUM_MS);
+}
+
+export type DeadlineStage = "normal" | "converge" | "stop";
+
+export interface DeadlineForecast {
+  stage: DeadlineStage;
+  remainingMs: number;
+  usableMs: number;
+  nextModelEstimateMs: number;
+  settlementReserveMs: number;
+}
+
+export function deadlineForecast(session: RuntimeSession, now = Date.now()): DeadlineForecast {
+  const remainingMs = session.durable.state.deadlineRemainingMs
+    ?? Date.parse(session.durable.state.deadlineAt) - now;
+  const nextModelEstimateMs = modelEstimateMs(session);
+  const usableMs = Math.max(0, remainingMs - ACTION_SETTLEMENT_GRACE_MS);
+  const stage: DeadlineStage = usableMs < nextModelEstimateMs
+    ? "stop"
+    : usableMs < nextModelEstimateMs * 3 ? "converge" : "normal";
+  return {
+    stage,
+    remainingMs,
+    usableMs,
+    nextModelEstimateMs,
+    settlementReserveMs: ACTION_SETTLEMENT_GRACE_MS
+  };
 }
 
 function usedBudget(session: RuntimeSession, dimension: keyof BudgetAmounts): number {
@@ -81,10 +108,10 @@ export function convergenceAdmissionFailure(
 ): RunOutcome | null {
   const hardFailure = hardBudgetFailure(session, action);
   if (hardFailure) return hardFailure;
-  const remainingMs = session.durable.state.deadlineRemainingMs
-    ?? Date.parse(session.durable.state.deadlineAt) - now;
+  const forecast = deadlineForecast(session, now);
+  const remainingMs = forecast.remainingMs;
   const estimateMs = action.kind === "model"
-    ? modelEstimateMs(session)
+    ? forecast.nextModelEstimateMs
     : toolEstimateMs(session, action.terminalOnly === true);
   const requiredMs = estimateMs + ACTION_SETTLEMENT_GRACE_MS;
   if (remainingMs > requiredMs) return null;

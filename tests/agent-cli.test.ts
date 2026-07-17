@@ -75,7 +75,7 @@ async function completedRuntime(workspace: string) {
     storeRootDir,
     tools: registerBuiltinTools(new EffectToolRegistry(), { repositoryList: repositoryListJsonLines }),
     permissionMode: "auto",
-    runDeadlineMs: 5_000
+    runDeadlineMs: 60_000
   });
   const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
   await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect", mode: "analyze" });

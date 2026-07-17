@@ -125,7 +125,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
       storeRootDir,
       tools,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     })
   };
 }
@@ -227,7 +227,7 @@ describe("live mutation checkpoint failure recovery", () => {
       }
     });
     const runtime = createRuntime({
-      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 10_000
+      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 60_000
     });
     const created = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({

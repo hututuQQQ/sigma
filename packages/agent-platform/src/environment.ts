@@ -7,6 +7,7 @@ export interface RuntimeEnvironment {
   availableShells: ShellKind[];
   availableRuntimeCommands: string[];
   executionCapabilitiesVerified: boolean;
+  executionMode?: "sandboxed" | "disposable-container";
   pathSeparator: string;
 }
 
@@ -22,11 +23,13 @@ export function runtimeEnvironment(platform: NodeJS.Platform = process.platform)
     availableShells: [defaultShell],
     availableRuntimeCommands: [],
     executionCapabilitiesVerified: false,
+    executionMode: "sandboxed",
     pathSeparator: platform === "win32" ? "\\" : "/"
   };
 }
 
 export function runtimePrompt(environment = runtimeEnvironment()): string {
+  const disposableContainer = environment.executionMode === "disposable-container";
   const verifiedShells = environment.executionCapabilitiesVerified
     ? environment.availableShells : [];
   const verifiedRuntimeCommands = environment.executionCapabilitiesVerified
@@ -41,7 +44,12 @@ export function runtimePrompt(environment = runtimeEnvironment()): string {
     `verifiedShells=${verifiedShells.join(",") || "none"}`,
     `verifiedRuntimeCommands=${verifiedRuntimeCommands.join(",") || "none"}`,
     `pathSeparator=${environment.pathSeparator}.`,
-    "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands.",
-    "Do not probe or retry unlisted host commands."
+    `executionMode=${environment.executionMode ?? "sandboxed"}`,
+    disposableContainer
+      ? "Execution capabilities are open-world inside this user-declared disposable container: native container commands and package managers may be used when required by the task."
+      : "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands.",
+    disposableContainer
+      ? "Writes outside the workspace are not covered by workspace checkpoint rollback; keep them limited to the disposable container."
+      : "Do not probe or retry unlisted host commands."
   ].join("; ");
 }

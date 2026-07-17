@@ -103,6 +103,28 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
   z.object({
+    kind: z.literal("deadline.stage"),
+    stage: z.enum(["normal", "converge", "stop"]),
+    remainingMs: z.number(),
+    nextModelEstimateMs: z.number().int().nonnegative(),
+    outputReserveTokens: z.number().int().positive()
+  }).strict(),
+  z.object({
+    kind: z.literal("context.composition"),
+    contextWindowTokens: z.number().int().nonnegative(),
+    outputReserveTokens: z.number().int().positive(),
+    toolTokens: z.number().int().nonnegative(),
+    systemTokens: z.number().int().nonnegative(),
+    dynamicTokens: z.number().int().nonnegative(),
+    historyTokens: z.number().int().nonnegative(),
+    latestHistoryBlockTokens: z.number().int().nonnegative(),
+    omittedHistoryTurns: z.number().int().nonnegative(),
+    modelVisibleOutputTruncatedBytes: z.number().int().nonnegative(),
+    reviewCount: z.number().int().nonnegative(),
+    deadlineStage: z.enum(["normal", "converge", "stop"]),
+    executionMode: z.enum(["sandboxed", "disposable-container"])
+  }).strict(),
+  z.object({
     kind: z.literal("recovery.reset_tool"),
     callId: nonEmptyStringSchema,
     approval: z.literal("not_required")

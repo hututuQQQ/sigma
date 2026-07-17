@@ -730,7 +730,7 @@ function recoveryRuntime(
       storeRootDir: fixture.storeRootDir,
       reviewer,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     })
   };
 }

@@ -222,6 +222,7 @@ function runtimeSession(budgetLimits = limits()): RuntimeSession {
     startedAt: now,
     deadlineAt: "2026-07-12T00:00:00.000Z"
   });
+  state.deadlineRemainingMs = 60_000;
   state.budget.limits = budgetLimits;
   state.evidence = [delta(), validation()];
   state.mutationFrontier = {
@@ -449,6 +450,42 @@ describe("independent reviewer budget accounting", () => {
         verdict: "changes_requested",
         findings: ["An unresolved correctness issue remains."]
       }
+    });
+  });
+
+  it("keeps structured warnings and positive observations advisory", async () => {
+    const target = runtimeSession();
+    const advisory: ReviewerPort = {
+      reviewerId: "structured-reviewer",
+      review: async (input): Promise<ReviewEvidence> => ({
+        evidenceId: "structured-review",
+        sessionId: input.sessionId,
+        runId: input.runId,
+        kind: "review",
+        status: "failed",
+        createdAt: now,
+        producer: { authority: "runtime", id: "structured-reviewer" },
+        summary: "advisory observations",
+        data: {
+          reviewerId: "structured-reviewer",
+          verdict: "changes_requested",
+          findings: [
+            { actionable: false, severity: "info", summary: "Validation coverage is strong." },
+            { actionable: true, severity: "warning", summary: "Consider a follow-up cleanup." }
+          ],
+          frontierRevision: input.frontierRevision,
+          stateDigest: input.stateDigest,
+          validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+        }
+      })
+    };
+    const { emit } = harness(target);
+
+    await new ReviewCoordinator(advisory, emit).maybeReview(target, new AbortController().signal);
+
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
+      status: "passed",
+      data: { verdict: "approved" }
     });
   });
 

@@ -447,7 +447,7 @@ describe("tool argument container contract", () => {
       tools: registerBuiltinTools(new EffectToolRegistry()),
       reviewer: createApprovingReviewer(),
       permissionMode: "auto",
-      runDeadlineMs: 30_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({

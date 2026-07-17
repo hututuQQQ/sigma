@@ -461,6 +461,7 @@ class SigmaCliHarborAgent(BaseAgent):
         provider: str = "deepseek",
         model: str | None = None,
         network_mode: str = "full",
+        execution_mode: str = "sandboxed",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -489,6 +490,11 @@ class SigmaCliHarborAgent(BaseAgent):
         if network_mode not in {"none", "full"}:
             raise ValueError("network_mode must be one of: none, full")
         self.network_mode = network_mode
+        if execution_mode not in {"sandboxed", "disposable-container"}:
+            raise ValueError(
+                "execution_mode must be one of: sandboxed, disposable-container"
+            )
+        self.execution_mode = execution_mode
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
@@ -526,6 +532,7 @@ class SigmaCliHarborAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
+        await self._configure_execution_mode(environment)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
             await self._verify_agent_ready(environment)
@@ -544,6 +551,26 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self._write_setup_checks([], "agent_setup_failed")
         raise RuntimeError(message)
+
+    async def _configure_execution_mode(self, environment: BaseEnvironment) -> None:
+        """Create an isolated home opt-in for an explicitly disposable run.
+
+        The adapter never infers this mode from a task or environment. Keeping
+        the opt-in under a dedicated HOME also prevents a workspace config from
+        granting itself host execution privileges.
+        """
+        if self.execution_mode != "disposable-container":
+            return
+        command = (
+            "umask 077; mkdir -p /tmp/agent/disposable-home/.sigma; "
+            "printf '[security]\\nallow_unsafe_host_exec = true\\n' "
+            "> /tmp/agent/disposable-home/.sigma/config.toml"
+        )
+        configured = await environment.exec(command, timeout_sec=30)
+        if _return_code(configured) != 0:
+            raise RuntimeError(
+                "agent_setup_failed: could not create the disposable-container home opt-in"
+            )
 
     async def run(
         self,
@@ -710,6 +737,7 @@ class SigmaCliHarborAgent(BaseAgent):
             summary["failure_kind"] = failure_kind
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
+        summary["execution_mode"] = self.execution_mode
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
@@ -737,7 +765,10 @@ class SigmaCliHarborAgent(BaseAgent):
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        command = [
+        command = []
+        if self.execution_mode == "disposable-container":
+            command.extend(["env", "HOME=/tmp/agent/disposable-home"])
+        command.extend([
             "/usr/local/bin/agent",
             "run",
             "--workspace",
@@ -764,7 +795,9 @@ class SigmaCliHarborAgent(BaseAgent):
             "3",
             "--stream-json-max-line-bytes",
             "49152",
-        ]
+        ])
+        if self.execution_mode == "disposable-container":
+            command.extend(["--execution-mode", "disposable-container"])
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
         return command

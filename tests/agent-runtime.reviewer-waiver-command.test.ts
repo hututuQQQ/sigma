@@ -139,7 +139,7 @@ function runtime(storeRootDir: string, store = new SegmentedJsonlStore({ rootDir
     storeRootDir,
     tools: registerBuiltinTools(new EffectToolRegistry()),
     permissionMode: "auto",
-    runDeadlineMs: 10_000
+    runDeadlineMs: 60_000
   });
 }
 

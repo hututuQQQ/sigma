@@ -18,6 +18,7 @@ import {
 import type { RuntimeSession } from "./types.js";
 import {
   isAccountableReviewer,
+  isActionableErrorFinding,
   reviewInputFailure,
   reviewInputFailureEvidence,
   type AccountableReviewerPort,
@@ -26,6 +27,7 @@ import {
 } from "./reviewer.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
+import { deadlineForecast } from "./convergence-policy.js";
 
 function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
@@ -34,7 +36,7 @@ function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "requi
 function normalizeReview(session: RuntimeSession, raw: ReviewEvidence): ReviewEvidence {
   const frontier = session.durable.state.mutationFrontier;
   const findings = [...raw.data.findings];
-  const verdict = raw.data.verdict === "approved" && findings.length === 0 ? "approved" : "changes_requested";
+  const verdict = findings.some(isActionableErrorFinding) ? "changes_requested" : "approved";
   return {
     evidenceId: randomUUID(),
     sessionId: session.identity.sessionId,
@@ -133,6 +135,7 @@ export class ReviewCoordinator {
 
   async maybeReview(session: RuntimeSession, signal: AbortSignal, explicitlyRequested = false): Promise<void> {
     if (profileReviewMode(session) === "off") return;
+    if (deadlineForecast(session).stage === "stop") return;
     const existing = this.active.get(session.identity.sessionId);
     if (existing) return await existing;
     const task = this.reviewEligibleChange(session, signal, explicitlyRequested);
@@ -205,7 +208,8 @@ export class ReviewCoordinator {
     const remaining = Math.max(0, session.durable.state.budget.limits.costMicroUsd
       - session.durable.state.budget.consumed.costMicroUsd
       - session.durable.state.budget.reserved.costMicroUsd);
-    const prepared = await reviewer.prepareReview(input, remaining);
+    const outputLimit = deadlineForecast(session).stage === "converge" ? 2_048 : undefined;
+    const prepared = await reviewer.prepareReview(input, remaining, outputLimit);
     const reservationId = await this.budgets!.reserve(session, `reviewer:${requestId}`, prepared.budget.reserved);
     await this.emit(session, "review.started", "runtime", {
       reviewerId, requestId,

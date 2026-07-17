@@ -89,6 +89,27 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(module.SigmaCliHarborAgent(provider="deepseek").model, "deepseek-v4-pro")
         self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
+        with self.assertRaisesRegex(ValueError, "execution_mode"):
+            module.SigmaCliHarborAgent(execution_mode="host")
+
+    async def test_disposable_execution_mode_uses_an_isolated_home_and_explicit_flag(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(return_code=0)))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="disposable-container",
+            )
+            agent._workspace = "/app"
+
+            await agent._configure_execution_mode(env)
+            command = agent._agent_command()
+
+            self.assertEqual(command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
+            self.assertIn("--execution-mode", command)
+            self.assertIn("disposable-container", command)
+            configured = env.exec.await_args.args[0]
+            self.assertIn("allow_unsafe_host_exec = true", configured)
 
     async def test_setup_prefers_uploaded_tarball(self):
         module = import_portable_agent_module()

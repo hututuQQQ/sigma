@@ -103,6 +103,8 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     started_at: startedAt,
     finished_at: null,
     mode: options.mode,
+    benchmark_class: options.benchmarkClass,
+    execution_mode: options.executionMode,
     provider: options.provider,
     model: options.model ?? null,
     dataset: terminalBenchDataset,
@@ -297,7 +299,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     task_selection_flag: taskSelectionFlag,
     timeout_probe: timeoutProbe,
     timeout_plan: timeoutPlan,
-    score_mode: "standard_benchmark",
+    score_mode: options.benchmarkClass === "diagnostic" ? "diagnostic" : "standard_benchmark",
     resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);

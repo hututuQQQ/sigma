@@ -981,7 +981,7 @@ describe("host repository context", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000,
+      runDeadlineMs: 60_000,
       execution,
       reviewer: createApprovingReviewer()
     });

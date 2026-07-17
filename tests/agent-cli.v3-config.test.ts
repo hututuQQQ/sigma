@@ -15,6 +15,7 @@ describe("Sigma config", () => {
     const config = loadCliConfig({}, { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") });
     expect(config).toMatchObject({
       sandboxMode: "required",
+      executionMode: "sandboxed",
       readScope: "host",
       networkMode: "full",
       processHandoff: "allow",
@@ -65,6 +66,29 @@ describe("Sigma config", () => {
     ].join("\n"), "utf8");
     expect(() => loadCliConfig({ workspace: root }, { env: {}, homeDir: path.join(root, "home") }))
       .toThrow(/home-only/u);
+  });
+
+  it("requires both a home opt-in and an explicit disposable-container run selection", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-config-disposable-"));
+    const home = path.join(root, "home");
+    await mkdir(path.join(home, ".sigma"), { recursive: true });
+    await writeFile(path.join(home, ".sigma", "config.toml"), [
+      "[security]", "allow_unsafe_host_exec = true"
+    ].join("\n"), "utf8");
+
+    expect(loadCliConfig({ "execution-mode": "disposable-container" }, {
+      env: {}, cwd: root, homeDir: home
+    })).toMatchObject({
+      executionMode: "disposable-container",
+      unsafeHostExecRequested: true,
+      allowUnsafeHostExec: true
+    });
+    expect(loadCliConfig({ "unsafe-host-exec": true }, {
+      env: {}, cwd: root, homeDir: home
+    }).executionMode).toBe("disposable-container");
+    expect(() => loadCliConfig({ "execution-mode": "disposable-container" }, {
+      env: {}, cwd: root, homeDir: path.join(root, "missing-home")
+    })).toThrow(/home.*opt-in|allow_unsafe_host_exec/u);
   });
 
   it("checks and atomically writes a V2 migration with a backup", async () => {

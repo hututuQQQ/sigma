@@ -250,7 +250,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
@@ -280,7 +280,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
@@ -331,7 +331,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify failure barrier" });
@@ -380,7 +380,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "verify result.txt" });
@@ -417,7 +417,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "read both files", mode: "analyze" });
@@ -441,7 +441,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await firstRuntime.createSession({ workspacePath: workspace, mode: "change" });
     await firstRuntime.command({ type: "submit", sessionId: session.sessionId, text: "one" });
@@ -459,7 +459,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await resumed.command({ type: "resume", sessionId: session.sessionId });
     await expect(resumed.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed", message: "second" });
@@ -523,7 +523,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const approvalSeen = (async () => {
@@ -601,7 +601,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await runtime.command({ type: "resume", sessionId: "session" });
     await runtime.command({ type: "approve", sessionId: "session", requestId: "restored-write", decision: "allow" });
@@ -640,7 +640,7 @@ describe("Sigma architecture", () => {
       storeRootDir: deniedStore.storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await deniedRuntime.command({ type: "resume", sessionId: "session" });
     await deniedRuntime.command({ type: "approve", sessionId: "session", requestId: "pending-write", decision: "deny" });
@@ -655,7 +655,7 @@ describe("Sigma architecture", () => {
       storeRootDir: cancelledStore.storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await cancelledRuntime.command({ type: "resume", sessionId: "session" });
     await cancelledRuntime.command({ type: "cancel", sessionId: "session", reason: "do not retry" });
@@ -679,7 +679,7 @@ describe("Sigma architecture", () => {
       storeRootDir: durableDeniedStore.storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await durableDeniedRuntime.command({ type: "resume", sessionId: "session" });
     await expect(durableDeniedRuntime.waitForOutcome("session")).resolves.toMatchObject({
@@ -720,7 +720,7 @@ describe("Sigma architecture", () => {
       storeRootDir,
       tools,
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "invoke failure", mode: "analyze" });
@@ -746,7 +746,7 @@ describe("Sigma architecture", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const runtime = createRuntime({
       gateway, store: new SegmentedJsonlStore({ rootDir: storeRootDir }), storeRootDir, tools,
-      permissionMode: "auto", runDeadlineMs: 5_000
+      permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     const deadlineObserved = (async (): Promise<number> => {
@@ -767,7 +767,8 @@ describe("Sigma architecture", () => {
     ]);
     expect(failedAt - started).toBeLessThan(1_500);
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
-    expect(gateway.requests[1].messages.some((message) => message.role === "tool" && message.content.includes("exceeded 25ms"))).toBe(true);
+    expect(gateway.requests[1].messages.some((message) => message.role === "tool"
+      && message.content.includes("exceeded its 25ms deadline-bounded timeout"))).toBe(true);
   });
 
   it("projects later streaming turns without historical messages clearing them", () => {

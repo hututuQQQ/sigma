@@ -88,7 +88,6 @@ const MCP_SERVER_KEYS = new Set([
   "name", "command", "args", "cwd", "env", "possible_effects", "approval", "execution_mode", "idempotent",
   "timeout_ms", "idle_timeout_ms", "hard_deadline_ms", "shutdown_grace_ms"
 ]);
-
 function objectValue(raw: unknown, key: string): Record<string, unknown> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Configuration '${key}' requires an object.`);
   return raw as Record<string, unknown>;
@@ -166,6 +165,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "workspace", flag: "workspace", env: "SIGMA_WORKSPACE", toml: "workspace.path", description: "Workspace path", defaultValue: ".", parse: (raw) => stringValue(raw, "workspace") },
   { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode", defaultValue: "ask", parse: (raw) => enumValue(raw, "permissionMode", ["ask", "auto", "deny"] as const) },
   { key: "sandboxMode", flag: "sandbox", env: "SIGMA_SANDBOX", toml: "security.sandbox", description: "Process sandbox policy", defaultValue: "required", parse: (raw) => enumValue(raw, "sandboxMode", ["required"] as const) },
+  { key: "executionMode", flag: "execution-mode", description: "Execution boundary for this run (disposable-container also requires the home unsafe-exec opt-in)", defaultValue: "sandboxed", parse: (raw) => enumValue(raw, "executionMode", ["sandboxed", "disposable-container"] as const) },
   { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "host", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
   { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "full", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },

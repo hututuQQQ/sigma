@@ -35,6 +35,7 @@ import {
   pinProcessReadRoots
 } from "./windows-mutation-lock.js";
 import { processHandoffTool } from "./process-handoff-tool.js";
+import { foregroundExecutionSchema } from "./execution-foreground-schema.js";
 
 export type { ExecutionToolOptions } from "./execution-tool-types.js";
 
@@ -114,6 +115,25 @@ async function releaseRejectedResultArtifacts(
   throw primary;
 }
 
+function assertForegroundInvocation(
+  kind: "exec" | "shell" | "validate",
+  input: Record<string, JsonValue>,
+  options: ExecutionToolOptions
+): boolean {
+  const validation = kind === "validate";
+  const shellCommand = kind === "shell" || (validation && input.shell !== undefined);
+  if (validation) {
+    const hasExecutable = input.executable !== undefined;
+    const hasShell = input.shell !== undefined || input.command !== undefined;
+    if (hasExecutable === hasShell || (hasShell && (input.shell === undefined || input.command === undefined))) {
+      throw new Error("validate requires exactly one invocation form: {executable,args} or {shell,command}.");
+    }
+  }
+  if (shellCommand) assertAvailableShell(input, options);
+  else assertAvailableExecutable(input, options);
+  return shellCommand;
+}
+
 async function executeForegroundCommand(
   kind: "exec" | "shell" | "validate",
   options: ExecutionToolOptions,
@@ -123,11 +143,10 @@ async function executeForegroundCommand(
   const startedAt = new Date().toISOString();
   const input = executionArgs(request.arguments);
   const validation = kind === "validate";
-  if (kind === "shell") assertAvailableShell(input, options);
-  else assertAvailableExecutable(input, options);
+  const shellCommand = assertForegroundInvocation(kind, input, options);
   let skillResource = await loadedSkillResource(input, context.runtimeControl, "execute");
   let approvedPlan = await approvedProcessPlan(input, context, options, skillResource, validation);
-  const invocation = kind === "shell"
+  const invocation = shellCommand
     ? shellInvocation(executionText(input, "shell"), executionText(input, "command"))
     : normalizeWindowsShellInvocation(
       executionText(input, "executable"),
@@ -166,7 +185,9 @@ async function executeForegroundCommand(
     return await commandReceipt(
       request,
       startedAt,
-      [invocation.executable, ...invocation.args].join(" "),
+      validation && shellCommand
+        ? executionText(input, "command")
+        : [invocation.executable, ...invocation.args].join(" "),
       result,
       validation,
       approvedPlan.exactEffects,
@@ -183,53 +204,13 @@ async function executeForegroundCommand(
 }
 
 function foregroundTool(kind: "exec" | "shell" | "validate", options: ExecutionToolOptions): RegisteredEffectTool {
-  const validation = kind === "validate";
-  const writeContractProperties: Record<string, JsonValue> = {
-    readRoots: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
-    },
-    access: {
-      type: "string", enum: ["readonly", "write"],
-      description: "Explicit process filesystem access. Defaults to readonly unless legacy writePaths is supplied."
-    },
-    writeRoots: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Existing sandbox ACL root directories. Required with access=write."
-    },
-    expectedChanges: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Exact files or narrow paths approved to change. New parent directories needed to create an approved path are implicit; other changes are rolled back."
-    },
-    writePaths: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Deprecated compatibility alias that supplies both sandbox/checkpoint roots and approved changes."
-    }
-  };
-  const properties: Record<string, JsonValue> = kind === "shell" ? {
-    shell: { type: "string", enum: availableShells(options) }, command: { type: "string" }, cwd: { type: "string" },
-    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
-    ...writeContractProperties
-  } : {
-    executable: executableCapabilitySchema(options),
-    args: { type: "array", items: { type: "string" } }, cwd: { type: "string" },
-    skill: { type: "string", pattern: "^(home|workspace):" }, skillScript: { type: "string" },
-    network: networkProperty(options), env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
-    ...writeContractProperties
-  };
-  const required = kind === "shell" ? ["shell", "command"] : ["executable"];
-  const effects: ToolDescriptor["possibleEffects"] = validation
-    ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "validation", "network", "open_world"]
-    : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "network", "open_world"];
+  const { schema, validation } = foregroundExecutionSchema(kind, options, networkProperty(options));
   return {
     descriptor: {
-      ...executionToolSchema(kind, validation
-        ? "Run a sandboxed validation command and return durable typed evidence whether it passes or fails. The runtime binds it to the current mutation frontier and derives path coverage from cwd and readRoots; never supply evidence IDs. With skill and skillScript, the frozen script is prepended to interpreter args."
-        : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`, properties, required, effects),
+      ...schema,
       prepare(value, context) {
-        if (kind === "shell") assertAvailableShell(executionArgs(value), options);
+        const input = executionArgs(value);
+        if (kind === "shell" || (validation && input.shell !== undefined)) assertAvailableShell(input, options);
         return prepareExecutionCallPlan(value, context, options, validation);
       }
     },

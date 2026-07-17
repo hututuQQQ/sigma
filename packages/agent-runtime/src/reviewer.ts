@@ -51,7 +51,11 @@ export interface AccountedReviewerResult {
 }
 
 export interface AccountableReviewerPort extends ReviewerPort {
-  prepareReview(input: ReviewerInput, remainingBudgetMicroUsd: number): Promise<PreparedReviewerCall>;
+  prepareReview(
+    input: ReviewerInput,
+    remainingBudgetMicroUsd: number,
+    maxOutputTokens?: number
+  ): Promise<PreparedReviewerCall>;
   reviewPrepared(
     input: ReviewerInput,
     requestId: string,
@@ -122,9 +126,13 @@ export class ModelReviewer implements ReviewerPort {
     return (await this.reviewPrepared(input, randomUUID(), prepared, signal)).evidence;
   }
 
-  async prepareReview(input: ReviewerInput, remainingBudgetMicroUsd: number): Promise<PreparedReviewerCall> {
+  async prepareReview(
+    input: ReviewerInput,
+    remainingBudgetMicroUsd: number,
+    outputLimit = 4_096
+  ): Promise<PreparedReviewerCall> {
     const messages = reviewMessages(input);
-    const maxOutputTokens = Math.min(4_096, this.gateway.capabilities.maxOutputTokens);
+    const maxOutputTokens = Math.min(outputLimit, this.gateway.capabilities.maxOutputTokens);
     const budget = await prepareModelBudget(
       this.gateway,
       messages,
@@ -208,7 +216,7 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Approve only if the supplied evidence supports the code review verdict; otherwise request changes. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. An approved verdict must have zero unresolved correctness, security, or acceptance findings. Complete opaque artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[JSON values]}. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
@@ -229,6 +237,17 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
   }];
 }
 
+export function isActionableErrorFinding(finding: JsonValue): boolean {
+  if (finding && typeof finding === "object" && !Array.isArray(finding)
+    && Object.hasOwn(finding, "actionable") && Object.hasOwn(finding, "severity")) {
+    const structured = finding as Record<string, JsonValue>;
+    return structured.actionable === true && structured.severity === "error";
+  }
+  // Old review evidence allowed arbitrary JSON findings. Preserve the prior
+  // conservative interpretation when reading those durable records.
+  return true;
+}
+
 function reviewEvidence(
   input: ReviewerInput,
   reviewerId: string,
@@ -241,8 +260,8 @@ function reviewEvidence(
     const findings = inputProblem ? [inputProblem] : validFindings
       ? rawFindings.filter((item): item is JsonValue => item === null || ["string", "number", "boolean", "object"].includes(typeof item))
       : [parsed ? "Reviewer response omitted findings." : "Reviewer returned invalid JSON."];
-    const verdict = !inputProblem && validFindings && findings.length === 0
-      && parsed?.verdict === "approved" ? "approved" : "changes_requested";
+    const verdict = !inputProblem && validFindings && !findings.some(isActionableErrorFinding)
+      ? "approved" : "changes_requested";
     return {
       evidenceId: randomUUID(),
       sessionId: input.sessionId,

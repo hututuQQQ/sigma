@@ -224,7 +224,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "hi" });
@@ -249,7 +249,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -277,7 +277,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -320,7 +320,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store,
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({
@@ -386,7 +386,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect the requested file" });
@@ -414,7 +414,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir: path.join(workspace, ".agent"),
       tools,
       permissionMode: "auto",
-      runDeadlineMs: 30_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "run the validation and report its result" });
@@ -460,7 +460,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir: path.join(workspace, ".agent"),
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "auto",
-      runDeadlineMs: 30_000
+      runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Update README and validate it." });
@@ -496,7 +496,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -534,7 +534,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store,
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "change the selected target" });
@@ -573,7 +573,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -601,7 +601,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "change it" });
@@ -639,7 +639,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect, then change the selected target" });
@@ -666,7 +666,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 30_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
@@ -692,7 +692,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway,
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write two files" });
@@ -713,7 +713,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect without looping" });
@@ -767,7 +767,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect, or ask if a target is required." });
@@ -791,7 +791,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       gateway: new ScriptedGateway([]),
       store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
       storeRootDir: path.join(workspace, ".agent"),
-      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 10_000
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     const controller = new AbortController();
@@ -840,7 +840,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
-      gateway, store, storeRootDir: path.join(workspace, ".agent"), tools, permissionMode: "auto", runDeadlineMs: 10_000
+      gateway, store, storeRootDir: path.join(workspace, ".agent"), tools, permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "remove victim" });
@@ -871,7 +871,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000,
+      runDeadlineMs: 60_000,
       joinChildren: async () => ({ evidence: [{ childId: "durable-child", status: "completed" }], failures: [] })
     });
     const session = await first.createSession({ workspacePath: workspace, mode: "analyze" });
@@ -891,7 +891,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     await resumed.command({ type: "resume", sessionId: session.sessionId });
     await expect(resumed.waitForOutcome(session.sessionId)).resolves.toMatchObject({
@@ -1238,7 +1238,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const runtime = createRuntime({
       gateway, store, storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
-      permissionMode: "auto", runDeadlineMs: 10_000
+      permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({
       workspacePath: workspace, mode: "change", writeScope: ["allowed"], strictWriteScope: true
@@ -1300,7 +1300,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "auto", runDeadlineMs: 30_000
+      permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "read the seed", mode: "analyze" });
@@ -1338,7 +1338,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const gateway = new FailingFirstGateway();
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "auto", runDeadlineMs: 10_000
+      permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "initial instruction", mode: "analyze" });
@@ -1426,7 +1426,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       completion("new steering completed")
     ]);
     const runtime = createRuntime({
-      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 10_000
+      gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "start old completion" });
@@ -1486,7 +1486,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      runDeadlineMs: 10_000,
+      runDeadlineMs: 60_000,
       joinChildren: async () => {
         joins += 1;
         if (joins === 1) {
@@ -1531,7 +1531,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "ask", runDeadlineMs: 10_000
+      permissionMode: "ask", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const approval = (async () => {
@@ -1572,7 +1572,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const runtime = createRuntime({
       gateway, store, storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
-      permissionMode: "ask", runDeadlineMs: 10_000, maxParallelTools: 4
+      permissionMode: "ask", runDeadlineMs: 60_000, maxParallelTools: 4
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const approvalIds: string[] = [];
@@ -1640,7 +1640,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const runtime = createRuntime({
       gateway, store, storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "auto", runDeadlineMs: 10_000
+      permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
 
@@ -1690,7 +1690,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     tools.register(sideEffectTool("approval_side_effect", "prompt", "approved.txt"));
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const runtime = createRuntime({ gateway, store, storeRootDir, tools, permissionMode: "ask", runDeadlineMs: 10_000 });
+    const runtime = createRuntime({ gateway, store, storeRootDir, tools, permissionMode: "ask", runDeadlineMs: 60_000 });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     let approvalSeen = false;
     let receiptSeen = false;
@@ -1734,7 +1734,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       storeRootDir,
       tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
       permissionMode: "ask",
-      runDeadlineMs: 10_000
+      runDeadlineMs: 60_000
     });
     const parent = await runtime.createSession({ workspacePath: workspace, mode: "change" });
     const messages: unknown[] = [];

@@ -52,6 +52,7 @@ export interface RuntimeCompositionConfig {
   workspaceCustomizationTrust?: WorkspaceCustomizationTrustAttestation;
   agentProfile?: string;
   sandboxMode?: "required";
+  executionMode?: "sandboxed" | "disposable-container";
   readScope?: "workspace" | "host";
   networkMode?: "none" | "full";
   processHandoff?: "allow" | "deny";
@@ -79,7 +80,6 @@ export interface RuntimeFactoryDeps {
    * evaluator inputs must never populate this contract. */
   subjectProductAttestation?: SubjectProductAttestationV1;
 }
-
 export interface ConfiguredRuntime {
   runtime: RuntimeClient;
   workspace: string;
@@ -87,7 +87,6 @@ export interface ConfiguredRuntime {
   execution: ExecutionBroker;
   close(): Promise<void>;
 }
-
 export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; interactiveApprovals?: boolean; }
 
 interface PreparedComposition {
@@ -164,7 +163,7 @@ export async function createConfiguredRuntime(
       availableProfiles: customization.availableProfiles,
       gatewayForRole: gateways.forRole,
       execution,
-      runtimeEnvironment: brokerRuntimeEnvironment(executionReport),
+      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? (config.unsafeHostExecRequested === true ? "disposable-container" : "sandboxed") },
       subjectAttestation,
       skills: customization.skills,
       hooks: customization.hookDefinitions,
