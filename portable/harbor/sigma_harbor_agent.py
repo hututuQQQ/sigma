@@ -489,7 +489,7 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
-        agent_profile: str = "strict",
+        agent_profile: str = "standard",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
         max_wall_time_sec: int = 7200,
@@ -781,6 +781,7 @@ class SigmaCliHarborAgent(BaseAgent):
             )
             else None
         )
+        derived_summary["termination_source"] = derived_summary["terminal_origin"]
         if events and (summary_path is None or trace_path is None):
             derived_summary_path, derived_trace_path = self._write_accounting_artifacts(
                 events,
@@ -799,6 +800,7 @@ class SigmaCliHarborAgent(BaseAgent):
         # replace them with stale or zero-valued placeholders.
         summary.update(recorder.timing_snapshot())
         summary["terminal_origin"] = derived_summary["terminal_origin"]
+        summary["termination_source"] = derived_summary["termination_source"]
         if protocol_failure is not None:
             summary.update({
                 "status": "error",
@@ -1452,6 +1454,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
             "agent_profile": self.agent_profile,
+            "harbor_deadline_sec": self.outer_trial_deadline_sec,
+            "sigma_deadline_sec": self.max_wall_time_sec,
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
         }
@@ -1501,6 +1505,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "duration_ms": live_state.get("duration_ms", 0),
             "suspension_to_exit_ms": live_state.get("suspension_to_exit_ms"),
             "terminal_origin": "adapter_timeout",
+            "termination_source": "adapter_timeout",
+            "harbor_deadline_sec": self.outer_trial_deadline_sec,
+            "sigma_deadline_sec": self.max_wall_time_sec,
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
             "process_cleanup": process_cleanup,
@@ -1529,6 +1536,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "duration_ms": state["duration_ms"],
             "suspension_to_exit_ms": state["suspension_to_exit_ms"],
             "terminal_origin": state["terminal_origin"],
+            "termination_source": state["termination_source"],
+            "harbor_deadline_sec": state["harbor_deadline_sec"],
+            "sigma_deadline_sec": state["sigma_deadline_sec"],
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,

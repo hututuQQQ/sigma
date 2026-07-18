@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { EvidenceRecord, ReviewEvidence, ValidationEvidence, WorkspaceDeltaEvidence } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 import { CHECKPOINT_INTEGRITY_VALIDATOR } from "./validation-policy.js";
@@ -53,11 +54,45 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
   };
 }
 
-export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
+function validationSemanticSignature(validation: ValidationEvidence): string {
+  return JSON.stringify({
+    status: validation.status,
+    validator: validation.data.validator,
+    command: validation.data.command ?? null,
+    exitCode: validation.data.exitCode ?? null,
+    termination: validation.data.termination ?? null,
+    coveredPaths: [...new Set(validation.data.coveredPaths)].sort(),
+    frontierRevision: validation.data.frontierRevision,
+    stateDigest: validation.data.stateDigest
+  });
+}
+
+export function reviewBasisDigest(
+  session: RuntimeSession,
+  validations = frontierValidationReadiness(session).validations
+): string {
+  const frontier = session.durable.state.mutationFrontier;
+  const signatures = [...new Set(validations.map(validationSemanticSignature))].sort();
+  return createHash("sha256").update(JSON.stringify({
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    validations: signatures
+  })).digest("hex");
+}
+
+export function latestFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
   const frontier = session.durable.state.mutationFrontier;
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
     && item.data.frontierRevision === frontier.revision
     && item.data.stateDigest === frontier.currentStateDigest).at(-1);
+}
+
+export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
+  const basisDigest = reviewBasisDigest(session);
+  return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
+    && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
+    && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest
+    && item.data.reviewBasisDigest === basisDigest).at(-1);
 }
 
 /** Compatibility projection for reviewer diff material. Only deltas that

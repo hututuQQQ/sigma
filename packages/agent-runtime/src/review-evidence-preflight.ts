@@ -233,6 +233,9 @@ function completeReviewEvidenceFailure(
 
 export function reviewInputFailure(input: ReviewerInput): string | undefined {
   for (const delta of input.workspaceDeltas) {
+    if (delta.data.reviewProblem) {
+      return `${delta.data.reviewProblem.code}: ${delta.data.reviewProblem.message} ${delta.data.reviewProblem.action}`;
+    }
     if (delta.data.reviewDiffPaths !== undefined) {
       const completeFailure = completeReviewEvidenceFailure(delta, input.validations);
       if (completeFailure) return completeFailure;

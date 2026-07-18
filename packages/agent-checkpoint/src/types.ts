@@ -40,6 +40,7 @@ export interface CheckpointDelta {
  * are the evidence, not a lossy textual preview. */
 export interface CheckpointOpaqueArtifact {
   path: string;
+  representation?: "binary" | "content_omitted";
   before?: { digest: string; sizeBytes: number };
   after?: { digest: string; sizeBytes: number };
 }
@@ -48,6 +49,11 @@ export interface CheckpointReviewMaterial {
   reviewDiff: string;
   reviewDiffPaths: string[];
   opaqueArtifacts: CheckpointOpaqueArtifact[];
+  reviewProblem?: {
+    code: "review_scope_too_large";
+    message: string;
+    action: string;
+  };
 }
 
 export interface CheckpointRecord {

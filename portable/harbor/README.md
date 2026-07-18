@@ -1,18 +1,17 @@
 # Sigma Harbor adapter
 
-The adapter receives the Harbor trial timeout as generic metadata
-(`outer_trial_deadline_sec`) only when every selected trial has the same
-timeout. In that uniform case, the agent child deadline is capped at:
+The benchmark launcher groups selected trials by Harbor agent timeout. Each
+group passes its uniform timeout to the adapter as generic metadata
+(`outer_trial_deadline_sec`), and the agent child deadline is capped at:
 
 ```text
 child_deadline <= outer_trial_deadline - cleanup_grace
 ```
 
-For heterogeneous batches, Harbor's per-trial timeout remains authoritative
-and no run-wide outer deadline is injected. Sigma uses the maximum selected
-timeout to plan its internal wall time and still reserves cleanup grace. The
-calculation is based only on timeout metadata and configuration; it does not
-inspect task identity, verifier output, or benchmark answers.
+This keeps Harbor's per-trial timeout authoritative without planning every
+trial from the batch maximum. Group selection is control-plane infrastructure:
+the solving agent receives only its deadline, never task identity, verifier
+output, or benchmark answers.
 
 The setup preflight invokes `agent doctor --check-api`. Its JSON result records
 provider, model, endpoint host, latency, and a bounded error summary without

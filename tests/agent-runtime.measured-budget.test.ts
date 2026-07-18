@@ -204,6 +204,56 @@ describe("provider-measured model budget settlement", () => {
     }));
   });
 
+  it("exposes only terminal tools when one model request fits", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-budget-state-"));
+    const gateway = new InspectableGateway([requestInputResponse()]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: state }),
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+      inputTokens: 150, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+      toolCalls: 1_000, children: 32, maxDepth: 4
+    });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish within budget" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0].toolChoice).toBe("required");
+    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
+      "complete_task", "report_blocked", "request_user_input"
+    ]);
+  });
+
+  it("returns typed budget exhaustion before an unfundable final request", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exhausted-budget-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-exhausted-budget-state-"));
+    const gateway = new InspectableGateway([]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: state }),
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      outputReserveTokens: 100
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+      inputTokens: 149, outputTokens: 1_000, costMicroUsd: 10_000_000, modelTurns: 10,
+      toolCalls: 1_000, children: 32, maxDepth: 4
+    });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish within budget" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "budget_exhausted"
+    });
+    expect(gateway.requests).toHaveLength(0);
+  });
+
   it.each(["budget.committed", "budget.overrun", "usage.recorded", "model.completed"] as const)(
     "closes the final-response reservation once when %s persistence fails",
     async (failingType) => {

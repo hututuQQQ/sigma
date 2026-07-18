@@ -8,64 +8,6 @@ import {
   type CheckpointReviewMaterial
 } from "./types.js";
 
-const TRUNCATION_MARKER = "[review diff truncated]";
-const TRUNCATION_MARKER_BYTES = Buffer.byteLength(TRUNCATION_MARKER, "utf8");
-
-class ReviewBudget {
-  private readonly parts: string[] = [];
-  private outputRemaining: number;
-  private readRemaining: number;
-  private readonly maxBytes: number;
-  truncated = false;
-
-  constructor(maxBytes: number) {
-    this.maxBytes = maxBytes;
-    this.outputRemaining = maxBytes;
-    this.readRemaining = maxBytes;
-  }
-
-  get availableOutput(): number {
-    return this.outputRemaining;
-  }
-
-  get availableRead(): number {
-    return this.readRemaining;
-  }
-
-  append(value: string): boolean {
-    const bytes = Buffer.from(value, "utf8");
-    if (bytes.byteLength <= this.outputRemaining) {
-      this.parts.push(value);
-      this.outputRemaining -= bytes.byteLength;
-      return true;
-    }
-    if (this.outputRemaining > 0) {
-      const decoder = new TextDecoder("utf-8");
-      this.parts.push(decoder.decode(bytes.subarray(0, this.outputRemaining), { stream: true }));
-    }
-    this.outputRemaining = 0;
-    this.truncated = true;
-    return false;
-  }
-
-  recordRead(bytes: number): void {
-    this.readRemaining -= bytes;
-  }
-
-  markTruncated(): void {
-    this.truncated = true;
-  }
-
-  value(): string {
-    const value = this.parts.join("");
-    if (!this.truncated) return value;
-    const bytes = Buffer.from(value, "utf8");
-    const decoder = new TextDecoder("utf-8");
-    const prefix = decoder.decode(bytes.subarray(0, this.maxBytes - TRUNCATION_MARKER_BYTES), { stream: true });
-    return `${prefix}${TRUNCATION_MARKER}`;
-  }
-}
-
 type OpaqueIdentity = { digest: string; sizeBytes: number };
 
 function metadata(entry: CheckpointEntry | undefined): string {
@@ -82,54 +24,68 @@ function decodeText(content: Buffer): string | null {
   }
 }
 
-async function appendContent(
-  budget: ReviewBudget,
+function identity(entry: CheckpointEntry | undefined): OpaqueIdentity | undefined {
+  return entry?.kind === "file" && entry.digest
+    ? { digest: entry.digest, sizeBytes: entry.size }
+    : undefined;
+}
+
+async function renderedContent(
   entry: CheckpointEntry | undefined,
   opaque: OpaqueIdentity | undefined,
   cas: CheckpointCasStore
-): Promise<boolean> {
-  if (!entry) return budget.append("[absent]");
-  if (entry.kind === "directory") return budget.append("[directory]");
-  if (entry.kind === "symlink") return budget.append(`[symlink -> ${entry.linkTarget ?? ""}]`);
-  if (opaque) return budget.append(`[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`);
-  const limit = Math.min(budget.availableOutput, budget.availableRead);
-  if (limit <= 0) {
-    budget.markTruncated();
-    return false;
-  }
-  if (!entry.casIdentity) {
+): Promise<string> {
+  if (!entry) return "[absent]";
+  if (entry.kind === "directory") return "[directory]";
+  if (entry.kind === "symlink") return `[symlink -> ${entry.linkTarget ?? ""}]`;
+  if (opaque) return `[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`;
+  if (!entry.casIdentity || !entry.digest) {
     throw new CheckpointConflictError(`Checkpoint manifest lacks a trusted CAS identity: ${entry.path}`);
   }
-  const prefix = await cas.readPrefix(entry.digest!, limit, entry.casIdentity);
-  budget.recordRead(prefix.content.byteLength);
-  const text = decodeText(prefix.content);
-  const appended = budget.append(text === null
-    ? `[binary sha256=${entry.digest} size=${entry.size}]`
-    : text);
-  if (prefix.truncated) {
-    budget.markTruncated();
-    budget.append("\n[content truncated]");
-    return false;
+  const complete = await cas.readPrefix(entry.digest, entry.size, entry.casIdentity);
+  if (complete.truncated || complete.content.byteLength !== entry.size) {
+    throw new CheckpointConflictError(`Checkpoint CAS object could not be read completely: ${entry.path}`);
   }
-  return appended;
+  const text = decodeText(complete.content);
+  if (text === null) {
+    throw new CheckpointConflictError(`Checkpoint text classification changed while reviewing: ${entry.path}`);
+  }
+  return text;
 }
 
-async function appendSection(
-  budget: ReviewBudget,
+async function renderSection(
   file: string,
   before: CheckpointEntry | undefined,
   after: CheckpointEntry | undefined,
   opaque: CheckpointOpaqueArtifact | undefined,
   cas: CheckpointCasStore
-): Promise<boolean> {
-  let complete = budget.append(`--- ${before ? `a/${file}` : "/dev/null"}\n+++ ${after ? `b/${file}` : "/dev/null"}\n`);
-  complete = budget.append(`[metadata before=${metadata(before)} after=${metadata(after)}]\n`) && complete;
-  complete = budget.append("[before]\n") && complete;
-  complete = await appendContent(budget, before, opaque?.before, cas) && complete;
-  complete = budget.append("\n[after]\n") && complete;
-  complete = await appendContent(budget, after, opaque?.after, cas) && complete;
-  complete = budget.append("\n") && complete;
-  return complete && !budget.truncated;
+): Promise<string> {
+  return `--- ${before ? `a/${file}` : "/dev/null"}\n+++ ${after ? `b/${file}` : "/dev/null"}\n`
+    + `[metadata before=${metadata(before)} after=${metadata(after)}]\n`
+    + `[before]\n${await renderedContent(before, opaque?.before, cas)}\n`
+    + `[after]\n${await renderedContent(after, opaque?.after, cas)}\n`;
+}
+
+function renderedContentBytes(entry: CheckpointEntry | undefined, opaque: OpaqueIdentity | undefined): number {
+  if (!entry) return Buffer.byteLength("[absent]", "utf8");
+  if (entry.kind === "directory") return Buffer.byteLength("[directory]", "utf8");
+  if (entry.kind === "symlink") return Buffer.byteLength(`[symlink -> ${entry.linkTarget ?? ""}]`, "utf8");
+  if (opaque) return Buffer.byteLength(`[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`, "utf8");
+  return entry.size;
+}
+
+function sectionBytes(
+  file: string,
+  before: CheckpointEntry | undefined,
+  after: CheckpointEntry | undefined,
+  opaque: CheckpointOpaqueArtifact | undefined
+): number {
+  const framing = `--- ${before ? `a/${file}` : "/dev/null"}\n+++ ${after ? `b/${file}` : "/dev/null"}\n`
+    + `[metadata before=${metadata(before)} after=${metadata(after)}]\n`
+    + "[before]\n\n[after]\n\n";
+  return Buffer.byteLength(framing, "utf8")
+    + renderedContentBytes(before, opaque?.before)
+    + renderedContentBytes(after, opaque?.after);
 }
 
 function fullyOpaque(
@@ -143,6 +99,36 @@ function fullyOpaque(
   return artifact.before !== undefined && artifact.after !== undefined;
 }
 
+function omittedArtifact(
+  file: string,
+  before: CheckpointEntry | undefined,
+  after: CheckpointEntry | undefined
+): CheckpointOpaqueArtifact | undefined {
+  const beforeIdentity = identity(before);
+  const afterIdentity = identity(after);
+  if (!beforeIdentity && !afterIdentity) return undefined;
+  return {
+    path: file,
+    representation: "content_omitted",
+    ...(beforeIdentity ? { before: beforeIdentity } : {}),
+    ...(afterIdentity ? { after: afterIdentity } : {})
+  };
+}
+
+function representedBytes(diffParts: readonly string[], artifacts: readonly CheckpointOpaqueArtifact[]): number {
+  return Buffer.byteLength(diffParts.join(""), "utf8")
+    + Buffer.byteLength(JSON.stringify(artifacts), "utf8");
+}
+
+function reviewScopeTooLarge(message: string, action: string): CheckpointReviewMaterial {
+  return {
+    reviewDiff: "",
+    reviewDiffPaths: [],
+    opaqueArtifacts: [],
+    reviewProblem: { code: "review_scope_too_large", message, action }
+  };
+}
+
 export async function buildCheckpointReviewMaterial(
   checkpoint: CheckpointRecord,
   before: CheckpointManifest,
@@ -154,38 +140,65 @@ export async function buildCheckpointReviewMaterial(
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw new RangeError("Checkpoint review maxBytes must be a non-negative safe integer.");
   }
-  if (maxBytes < TRUNCATION_MARKER_BYTES) {
-    throw new RangeError(`Checkpoint review maxBytes must be at least ${TRUNCATION_MARKER_BYTES}.`);
-  }
-  const budget = new ReviewBudget(maxBytes);
   const beforeByPath = new Map(before.entries.map((entry) => [entry.path, entry]));
   const afterByPath = new Map(after.entries.map((entry) => [entry.path, entry]));
-  const opaqueByPath = new Map(opaqueArtifacts.map((artifact) => [artifact.path, artifact]));
+  const artifacts: CheckpointOpaqueArtifact[] = opaqueArtifacts.map((artifact) => ({
+    ...artifact,
+    representation: artifact.representation ?? "binary"
+  }));
+  const opaqueByPath = new Map(artifacts.map((artifact) => [artifact.path, artifact]));
   const reviewDiffPaths: string[] = [];
+  const diffParts: string[] = [];
   const changed = [...new Set([
     ...checkpoint.delta!.added,
     ...checkpoint.delta!.modified,
     ...checkpoint.delta!.deleted
   ])].sort();
+
+  if (representedBytes(diffParts, artifacts) > maxBytes) {
+    return reviewScopeTooLarge(
+      "Changed-path identity metadata exceeds the bounded review scope.",
+      "Remove generated or temporary artifacts, or split the change into a smaller checkpoint."
+    );
+  }
+
   for (const file of changed) {
+    const beforeEntry = beforeByPath.get(file);
+    const afterEntry = afterByPath.get(file);
     const opaque = opaqueByPath.get(file);
     if (fullyOpaque(checkpoint, file, opaque)) continue;
-    if (budget.availableOutput <= 0 || budget.truncated) {
-      budget.markTruncated();
-      break;
+
+    const projectedSectionBytes = representedBytes(diffParts, artifacts)
+      + sectionBytes(file, beforeEntry, afterEntry, opaque);
+    if (projectedSectionBytes <= maxBytes) {
+      const section = await renderSection(file, beforeEntry, afterEntry, opaque, cas);
+      diffParts.push(section);
+      reviewDiffPaths.push(file);
+      continue;
     }
-    const complete = await appendSection(
-      budget,
-      file,
-      beforeByPath.get(file),
-      afterByPath.get(file),
-      opaque,
-      cas
-    );
-    if (complete) reviewDiffPaths.push(file);
-    if (budget.truncated) break;
+
+    const omitted = omittedArtifact(file, beforeEntry, afterEntry);
+    if (!omitted) {
+      return reviewScopeTooLarge(
+        `Review metadata for '${file}' cannot fit in the bounded review scope.`,
+        "Remove generated or temporary artifacts, shorten exceptional paths, or split the change into a smaller checkpoint."
+      );
+    }
+    const existingIndex = artifacts.findIndex((artifact) => artifact.path === file);
+    const nextArtifacts = existingIndex < 0
+      ? [...artifacts, omitted]
+      : artifacts.map((artifact, index) => index === existingIndex ? omitted : artifact);
+    if (representedBytes(diffParts, nextArtifacts) > maxBytes) {
+      return reviewScopeTooLarge(
+        "Changed-path identity metadata exceeds the bounded review scope.",
+        "Remove generated or temporary artifacts, or split the change into a smaller checkpoint."
+      );
+    }
+    artifacts.splice(0, artifacts.length, ...nextArtifacts);
+    opaqueByPath.set(file, omitted);
   }
-  return { reviewDiff: budget.value(), reviewDiffPaths, opaqueArtifacts };
+
+  return { reviewDiff: diffParts.join(""), reviewDiffPaths, opaqueArtifacts: artifacts };
 }
 
 export async function buildCheckpointReview(

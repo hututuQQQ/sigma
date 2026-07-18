@@ -19,7 +19,12 @@ import {
 import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
-import { frontierValidationReadiness } from "./mutation-evidence.js";
+import {
+  currentFrontierReview,
+  frontierValidationReadiness,
+  latestFrontierReview,
+  reviewBasisDigest
+} from "./mutation-evidence.js";
 
 export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
@@ -60,11 +65,15 @@ export class RuntimeControlService {
     const readiness = reviewReadiness(session);
     const validation = frontierValidationReadiness(session);
     const frontier = session.durable.state.mutationFrontier;
+    const currentReview = currentFrontierReview(session);
+    const latestReview = latestFrontierReview(session);
     return {
       status: readiness.pending.length === 0
         ? "not_required"
         : readiness.eligible.length === 0 ? "validation_required"
           : readiness.blockedReview ? "changes_required" : "review_requested",
+      reviewState: currentReview ? "current" : latestReview ? "stale" : "none",
+      reviewBasisDigest: reviewBasisDigest(session),
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       changedPaths: [...frontier.changedPaths],

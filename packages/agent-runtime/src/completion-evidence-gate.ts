@@ -12,6 +12,11 @@ import { currentFrontierReview, frontierValidationReadiness } from "./mutation-e
 import { failed } from "./tool-receipt.js";
 import type { RuntimeSession } from "./types.js";
 
+function findingText(value: unknown): string {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
 export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
   return session.durable.state.evidence.filter((item) =>
     isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId));
@@ -136,9 +141,21 @@ function requiredReviewFailure(
   const frontier = session.durable.state.mutationFrontier;
   const review = currentFrontierReview(session);
   if (review?.status === "passed" && review.data.verdict === "approved") return null;
+  if (review?.data.failureCode === "review_scope_too_large") {
+    return failed(call, startedAt,
+      `${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`,
+      "review_scope_too_large",
+      {
+        status: "rejected", code: "review_scope_too_large",
+        frontierRevision: frontier.revision,
+        stateDigest: frontier.currentStateDigest,
+        nextActions: [{ action: "remove_temporary_artifacts_or_reduce_change_scope" }]
+      }
+    );
+  }
   return failed(call, startedAt,
     review
-      ? `Strict review requested changes: ${review.data.findings.slice(0, 20).map(String).join("; ")}.`
+      ? `Strict review requested changes: ${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`
       : "Strict profile requires an approved review of the validated current state.",
     "review_evidence_required",
     {

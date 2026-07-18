@@ -44,6 +44,7 @@ const opaqueArtifactIdentitySchema = z.object({
 
 export const opaqueArtifactEvidenceSchema = z.object({
   path: nonEmptyStringSchema,
+  representation: z.enum(["binary", "content_omitted"]).optional(),
   before: opaqueArtifactIdentitySchema.optional(),
   after: opaqueArtifactIdentitySchema.optional()
 }).strict().refine(
@@ -71,7 +72,12 @@ export const workspaceDeltaEvidenceSchema = z.object({
     childId: nonEmptyStringSchema.optional(),
     reviewDiff: z.string().optional(),
     reviewDiffPaths: z.array(nonEmptyStringSchema).optional(),
-    opaqueArtifacts: z.array(opaqueArtifactEvidenceSchema).optional()
+    opaqueArtifacts: z.array(opaqueArtifactEvidenceSchema).optional(),
+    reviewProblem: z.object({
+      code: z.literal("review_scope_too_large"),
+      message: nonEmptyStringSchema,
+      action: nonEmptyStringSchema
+    }).strict().optional()
   }).strict()
 }).strict();
 
@@ -174,8 +180,10 @@ export const reviewEvidenceSchema = z.object({
     findings: z.array(jsonValueSchema),
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
+    reviewBasisDigest: digestSchema.optional(),
     validationEvidenceIds: z.array(z.string()).optional(),
     failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
+    failureCode: z.literal("review_scope_too_large").optional(),
     checkpointId: z.string().optional()
   }).strict()
 }).strict();

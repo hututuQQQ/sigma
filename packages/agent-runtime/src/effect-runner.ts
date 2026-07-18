@@ -119,8 +119,7 @@ export class EffectRunner {
   ): Promise<boolean> {
     const failure = convergenceAdmissionFailure(session, { kind: "model" });
     if (failure) return await this.options.finish(session, failure);
-    await this.models.request(session, signal, effect);
-    return false;
+    return await this.models.request(session, signal, effect);
   }
 
   private async requestTools(

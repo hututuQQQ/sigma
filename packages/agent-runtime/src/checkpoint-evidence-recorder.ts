@@ -118,7 +118,8 @@ export class CheckpointEvidenceRecorder {
         },
         reviewDiff: material.reviewDiff,
         reviewDiffPaths: material.reviewDiffPaths,
-        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {})
+        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {}),
+        ...(material.reviewProblem ? { reviewProblem: material.reviewProblem } : {})
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);
@@ -202,7 +203,8 @@ export class CheckpointEvidenceRecorder {
         },
         reviewDiff: material.reviewDiff,
         reviewDiffPaths: material.reviewDiffPaths,
-        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {})
+        ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {}),
+        ...(material.reviewProblem ? { reviewProblem: material.reviewProblem } : {})
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);

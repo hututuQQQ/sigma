@@ -139,6 +139,8 @@ export interface RuntimeControlPort {
 
 export interface ReviewRequestResult {
   status: "review_requested" | "validation_required" | "changes_required" | "not_required";
+  reviewState: "none" | "current" | "stale";
+  reviewBasisDigest: string;
   frontierRevision: number;
   stateDigest: string;
   changedPaths: string[];

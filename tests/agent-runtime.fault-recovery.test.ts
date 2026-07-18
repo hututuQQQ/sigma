@@ -487,12 +487,29 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   if (!reached(boundary, "review_started")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const reviewerId = "fault-injection-reviewer";
+  const validationSignature = JSON.stringify({
+    status: "passed",
+    validator: "command",
+    command: null,
+    exitCode: null,
+    termination: null,
+    coveredPaths: ["target.ts"],
+    frontierRevision: sealedFrontier.revision,
+    stateDigest: sealedFrontier.currentStateDigest
+  });
+  const reviewBasisDigest = createHash("sha256").update(JSON.stringify({
+    frontierRevision: sealedFrontier.revision,
+    stateDigest: sealedFrontier.currentStateDigest,
+    validations: [validationSignature]
+  })).digest("hex");
   const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
     sessionId,
     runId,
     reviewerId,
     revision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest
+    stateDigest: sealedFrontier.currentStateDigest,
+    reviewBasisDigest,
+    attempt: 1
   })).digest("hex")}`;
   const reviewerAmount = {
     inputTokens: 1,
@@ -574,6 +591,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       findings: [],
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
+      reviewBasisDigest,
       validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
       checkpointId: checkpoint.checkpointId
     }

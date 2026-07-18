@@ -4,7 +4,14 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { benchRootDir, parseArgs, safePathPart, writeJson } from "./bench-common.mjs";
+import {
+  assertComparableBenchmarkReports,
+  benchRootDir,
+  laneMetrics,
+  parseArgs,
+  safePathPart,
+  writeJson
+} from "./bench-common.mjs";
 import { runTerminalBenchCli } from "./bench-terminal-bench.mjs";
 
 const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "unknown"];
@@ -110,6 +117,9 @@ function categoryCounts(tasks) {
 
 export function aggregateFormalReports(plan, batchRecords, minimumPasses) {
   const reports = batchRecords.map((record) => record.report).filter(Boolean);
+  assertComparableBenchmarkReports(...reports);
+  const agentProfile = reports.find((report) => report.agent_profile)?.agent_profile ?? null;
+  const evaluationLane = reports.find((report) => report.evaluation_lane)?.evaluation_lane ?? null;
   const tasks = batchRecords.flatMap((record) => (
     record.report?.tasks ?? []
   ).map((task) => ({ batch: record.batch, ...task })));
@@ -140,6 +150,9 @@ export function aggregateFormalReports(plan, batchRecords, minimumPasses) {
     schemaVersion: 1,
     status: complete ? "complete" : "incomplete",
     acceptance: complete && counts.passed >= minimumPasses ? "passed" : "failed",
+    agent_profile: agentProfile,
+    evaluation_lane: evaluationLane,
+    lane_metrics: laneMetrics(tasks, evaluationLane),
     minimum_passes: minimumPasses,
     batches: { expected: plan.batches.length, completed: reports.length },
     trial_accounting: accounting,
@@ -156,6 +169,9 @@ function formalMarkdown(report) {
     "# Sigma Formal Benchmark Report", "",
     `- Status: ${report.status}`,
     `- Acceptance: ${report.acceptance}`,
+    `- Agent profile: ${report.agent_profile ?? "unknown"}`,
+    `- Evaluation lane: ${report.evaluation_lane ?? "unknown"}`,
+    `- Lane metrics: ${JSON.stringify(report.lane_metrics)}`,
     `- Passed: ${report.counts.passed}/${report.trial_accounting.expected}`,
     `- Missing: ${report.trial_accounting.missing}`,
     `- Verifier failed: ${report.failure_categories.verifier_failed}`,

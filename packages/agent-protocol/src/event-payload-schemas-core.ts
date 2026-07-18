@@ -105,6 +105,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("deadline.stage"),
     stage: z.enum(["normal", "converge", "stop"]),
+    budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
     remainingMs: z.number(),
     nextModelEstimateMs: z.number().int().nonnegative(),
     outputReserveTokens: z.number().int().positive()

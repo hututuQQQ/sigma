@@ -112,12 +112,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--execution-mode", command)
             self.assertIn("disposable-container", command)
             self.assertIn("--agent-profile", command)
-            self.assertIn("strict", command)
+            self.assertIn("standard", command)
             self.assertEqual(session_command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
             self.assertIn("--execution-mode", session_command)
             self.assertIn("disposable-container", session_command)
             self.assertIn("--agent-profile", session_command)
-            self.assertIn("strict", session_command)
+            self.assertIn("standard", session_command)
             configured = env.exec.await_args.args[0]
             self.assertIn("allow_unsafe_host_exec = true", configured)
 
@@ -145,7 +145,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             record = json.loads((logs_dir / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["execution_mode"], "disposable-container")
-            self.assertEqual(record["agent_profile"], "strict")
+            self.assertEqual(record["agent_profile"], "standard")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
                 ["disposable_persistence_write", "disposable_persistence_read", "help", "strict_doctor"],
@@ -369,7 +369,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
             self.assertIn("--run-deadline-sec 600", command)
             self.assertIn("--permission-mode auto", command)
-            self.assertIn("--agent-profile strict", command)
+            self.assertIn("--agent-profile standard", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)
             self.assertIn("--stream-json-max-line-bytes 49152", command)
@@ -463,7 +463,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = [item for item in exec_commands if "/usr/local/bin/agent run" in item[0]][0]
             self.assertIn("--provider glm", command)
             self.assertIn("--model glm-test", command)
-            self.assertIn("--agent-profile strict", command)
+            self.assertIn("--agent-profile standard", command)
             self.assertIn("--network full", command)
             self.assertIn("--run-deadline-sec 700", command)
             self.assertEqual(kwargs["timeout_sec"], 720)

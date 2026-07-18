@@ -2,18 +2,13 @@ import {
   type BudgetAmounts,
   type ContextItem,
   type ModelExecutionRole,
-  type ModelMessage,
-   type ModelRequest,
-   type ModelResponse,
-   type ModelToolDefinition
+  type ModelResponse,
+  type RunOutcome
 } from "agent-protocol";
 import type { KernelEffect } from "agent-kernel";
 import { RepositoryContextProvider, type ContextPlan } from "agent-context";
 import { isToolAllowed } from "agent-tools";
 import {
-  modelTools,
-  projectModelToolDescriptors,
-  providerSizedPlan,
   sessionSkillProjectionCapabilities,
   steeringRestart
 } from "./effect-helpers.js";
@@ -22,9 +17,7 @@ import type { RuntimeSession } from "./types.js";
 import {
   consumedBudget,
   failedModelUsage,
-  prepareModelBudget,
-  successfulModelUsage,
-  type PreparedModelBudget
+  successfulModelUsage
 } from "./model-accounting.js";
 import { evidenceLedger } from "./model-evidence-ledger.js";
 import { profileAllowsTool } from "./profile-policy.js";
@@ -36,16 +29,17 @@ import {
   streamModelResponse
 } from "./model-effect-support.js";
 import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
+import {
+  availableModelBudget,
+  budgetFailure,
+  fitPreparedBudget,
+  prepareBudgetedModelTurn,
+  requestCapacity,
+  type BudgetStage,
+  type PreparedModelTurn
+} from "./model-budget-convergence.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
-
-interface PreparedModelTurn {
-  messages: ModelMessage[];
-  tools: ModelToolDefinition[];
-  toolChoice?: ModelRequest["toolChoice"];
-  budget: PreparedModelBudget;
-  outputReserveTokens: number;
-}
 
 interface ModelReservationState {
   settled: boolean;
@@ -61,35 +55,6 @@ function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
     }, 0);
 }
 
-interface ActionPolicy {
-  required: boolean;
-  outputReserveTokens: number;
-  context: ContextItem[];
-}
-
-function actionPolicy(
-  session: RuntimeSession,
-  forecast: DeadlineForecast,
-  turnId: number,
-  defaultOutputReserveTokens: number
-): ActionPolicy {
-  const lengthRecovery = session.durable.state.continuationAttempts > 0;
-  const required = lengthRecovery || forecast.stage === "converge";
-  const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
-  if (!required) return { required, outputReserveTokens, context: [] };
-  const content = lengthRecovery
-    ? "The previous response reached its output limit, and its private reasoning is not replayed. Do not reconstruct or continue that reasoning. Choose one concrete tool action now, based on the durable conversation and evidence."
-    : "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work.";
-  return { required, outputReserveTokens, context: [{
-    id: `runtime:action-required:${session.durable.runId}:${turnId}`,
-    authority: "runtime",
-    provenance: lengthRecovery ? "length recovery" : "deadline stage",
-    content,
-    tokenCount: lengthRecovery ? 42 : 30,
-    priority: 10_000
-  }] };
-}
-
 export class ModelEffectRunner {
   private readonly repositoryContext: RepositoryContextProvider;
 
@@ -100,7 +65,7 @@ export class ModelEffectRunner {
     this.repositoryContext = new RepositoryContextProvider();
   }
 
-  async request(session: RuntimeSession, signal: AbortSignal, effect: RequestModelEffect): Promise<void> {
+  async request(session: RuntimeSession, signal: AbortSignal, effect: RequestModelEffect): Promise<boolean> {
     const turnController = new AbortController();
     session.execution.turnController = turnController;
     const turnSignal = AbortSignal.any([signal, turnController.signal]);
@@ -124,11 +89,18 @@ export class ModelEffectRunner {
         turnId,
         effectRevision
       });
-      if (!this.isCurrent(session, turnId, effectRevision)) return;
-      await this.attempt(session, turnId, effectRevision, turnSignal, hookResult.contextItems);
+      if (!this.isCurrent(session, turnId, effectRevision)) return false;
+      const failure = await this.attempt(session, turnId, effectRevision, turnSignal, hookResult.contextItems);
+      return failure ? await this.options.finish(session, failure) : false;
     } catch (error) {
       if ((error as { code?: unknown })?.code === "hook_gate_denied") throw error;
+      if ((error as { code?: unknown })?.code === "budget_exhausted") {
+        return await this.options.finish(session, budgetFailure(
+          error instanceof Error ? error.message : "The remaining budget cannot fund a final model request."
+        ));
+      }
       await this.handleFailure(session, turnId, effectRevision, turnSignal, error);
+      return false;
     }
   }
 
@@ -204,7 +176,7 @@ export class ModelEffectRunner {
     effectRevision: number,
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
-  ): Promise<void> {
+  ): Promise<RunOutcome | null> {
     const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
     const repairPhase = completionRepairPhase(session);
@@ -214,37 +186,46 @@ export class ModelEffectRunner {
     const repairPending = repairPhase !== "none";
     const ledger = evidenceLedger(session);
     const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
-    const projectedDescriptors = projectModelToolDescriptors(
-      descriptors,
-      sessionSkillProjectionCapabilities({
-        frozenCustomization: session.durable.frozenCustomization,
-        liveSkillDescriptors: this.options.runtime.skills?.descriptors,
-        loadedSkills: session.durable.state.frozenSkills,
-        profileSkillNames: session.services.profile?.profile.skills
-      })
-    );
-    const tools = modelTools(projectedDescriptors);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);
-    const policy = actionPolicy(session, forecast, turnId, this.options.outputReserveTokens);
-    const outputReserveTokens = policy.outputReserveTokens;
+    const available = availableModelBudget(session);
+    const capabilities = sessionSkillProjectionCapabilities({
+      frozenCustomization: session.durable.frozenCustomization,
+      liveSkillDescriptors: this.options.runtime.skills?.descriptors,
+      loadedSkills: session.durable.state.frozenSkills,
+      profileSkillNames: session.services.profile?.profile.skills
+    });
+
+    let budgetStage: BudgetStage = forecast.stage === "converge" ? "converge" : "normal";
+    const preparation = {
+      session, forecast, turnId, descriptors, capabilities, dynamic, hookContext,
+      ledger, available, repairPending, defaultOutputReserveTokens: this.options.outputReserveTokens
+    };
+    let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
+    const capacity = requestCapacity(available, prepared.turn.budget);
+    if (capacity <= 1) budgetStage = "terminal";
+    else if (capacity === 2) budgetStage = "converge";
+    if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
+    const fittedBudget = fitPreparedBudget(
+      prepared.turn.budget,
+      available,
+      budgetStage === "normal" ? Number.MAX_SAFE_INTEGER : 1
+    );
+    if (!fittedBudget) {
+      return budgetFailure(
+        `The remaining budget cannot fund one ${budgetStage === "terminal" ? "terminal " : ""}model request after bounded context compaction.`
+      );
+    }
+    const turn: PreparedModelTurn = { ...prepared.turn, budget: fittedBudget };
+    const plan = prepared.plan;
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,
+      budgetStage,
       remainingMs: forecast.remainingMs,
       nextModelEstimateMs: forecast.nextModelEstimateMs,
-      outputReserveTokens
-    });
-    const plan = await providerSizedPlan(session.services.gateway, {
-      system: session.interaction.contextItems,
-      history: session.durable.state.messages,
-      // Keep the stable system prefix cacheable. The evidence ledger is
-      // current-run state and belongs in the dynamic suffix, where changes do
-      // not invalidate static policy/context cache entries.
-      dynamic: [...dynamic, ...hookContext, ledger, ...policy.context],
-      tools,
-      outputReserveTokens
+      outputReserveTokens: turn.outputReserveTokens
     });
     await this.emitContextComposition(session, plan, forecast);
     if (plan.summary && !session.interaction.loadedContextIds.has(plan.summary.id)) {
@@ -255,25 +236,10 @@ export class ModelEffectRunner {
       });
     }
     signal.throwIfAborted();
-    const budget = await prepareModelBudget(
-      session.services.gateway,
-      plan.messages,
-      tools,
-      outputReserveTokens,
-      Math.max(0, session.durable.state.budget.limits.costMicroUsd
-        - session.durable.state.budget.consumed.costMicroUsd
-        - session.durable.state.budget.reserved.costMicroUsd)
-    );
-    const turn: PreparedModelTurn = {
-      messages: plan.messages,
-      tools,
-      ...(tools.length > 0 && (repairPending || policy.required) ? { toolChoice: "required" } : {}),
-      budget,
-      outputReserveTokens
-    };
     const requestId = `${session.durable.runId}:${turnId}`;
-    const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, budget.reserved);
+    const reservationId = await this.options.budgets.reserve(session, `model:${requestId}`, turn.budget.reserved);
     await this.runReserved(session, turnId, effectRevision, signal, turn, requestId, reservationId);
+    return null;
   }
 
   private async runReserved(
