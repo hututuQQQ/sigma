@@ -78,7 +78,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
       { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } },
       {
         id: "same-turn-completion",
-        name: "complete_task",
+        name: "runtime_finalize",
         arguments: {
           summary: "must not complete over an open checkpoint",
           criteria: [{

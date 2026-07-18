@@ -249,7 +249,13 @@ export class HostExecutionBroker implements ExecutionBroker {
         stdin: true,
         pty: false,
         networkModes: ["none", "full"],
-        runtimeCommands: ["node"]
+        shells: [{
+          kind: process.platform === "win32" ? "cmd" : "bash",
+          executable: process.platform === "win32" ? "cmd.exe" : "bash",
+          verified: true,
+          supportsChildProcesses: true
+        }],
+        runtimeCommands: ["node", process.platform === "win32" ? "npm.cmd" : "npm"]
       }
     };
   }

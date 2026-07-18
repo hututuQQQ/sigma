@@ -33,6 +33,14 @@ function broker(ready: boolean): ExecutionBroker {
   const unused = async (): Promise<never> => { throw new Error("unused"); };
   return {
     lostProcessHandles: [], connect: async () => report, doctor: async () => report,
+    repairSandbox: async () => report,
+    sandboxLeaseStatus: async (workspacePath) => ({
+      leaseId: "lease", workspaceIdentity: "workspace", generation: 4,
+      principalId: "principal", access: "read", roots: [workspacePath], state: "active"
+    }),
+    revokeSandboxLease: async () => ({
+      revoked: true, retiredPrincipalId: "principal", generation: 5
+    }),
     execute: unused, spawn: unused, poll: unused, write: unused, terminate: unused,
     close: async () => undefined
   };
@@ -54,9 +62,25 @@ describe("sandbox CLI", () => {
   it("prints help and rejects unknown subcommands", async () => {
     const stdout = new Capture();
     await expect(runSandboxCommand(["--help"], { stdout })).resolves.toBe(0);
-    expect(stdout.text()).toContain("agent sandbox setup");
+    expect(stdout.text()).toContain("agent sandbox <status|setup|repair|revoke>");
     const stderr = new Capture();
     await expect(runSandboxCommand(["break"], { stderr })).resolves.toBe(1);
     expect(stderr.text()).toContain("Unknown sandbox command");
+  });
+
+  it("reports and revokes the workspace lease generation", async () => {
+    const status = new Capture();
+    await expect(runSandboxCommand(["status", "--json"], {
+      stdout: status, executionBroker: broker(true)
+    })).resolves.toBe(0);
+    expect(JSON.parse(status.text())).toMatchObject({
+      lease: { state: "active", generation: 4, principalId: "principal" }
+    });
+
+    const revoked = new Capture();
+    await expect(runSandboxCommand(["revoke", "--json"], {
+      stdout: revoked, executionBroker: broker(true)
+    })).resolves.toBe(0);
+    expect(JSON.parse(revoked.text())).toMatchObject({ revoked: true, generation: 5 });
   });
 });

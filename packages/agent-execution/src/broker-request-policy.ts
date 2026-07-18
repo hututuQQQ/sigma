@@ -17,7 +17,7 @@ import {
   assertTrustedExecutableAvailable,
   comparablePath,
   pathWithin,
-  resolveTrustedExecutable,
+  resolveTrustedInvocation,
   samePath,
   trustedExecutableSha256,
   uniquePaths,
@@ -125,8 +125,10 @@ function wirePolicy(
   if (policy.network === "full" && policy.networkApproved !== true) {
     throw new BrokerPolicyError("Full network access requires an explicit per-call approval.");
   }
-  if (policy.sandbox === "unsafe" && (!options.allowUnsafeHostExec || policy.unsafeHostExecApproved !== true)) {
-    throw new BrokerPolicyError("Unsafe host execution requires broker opt-in and explicit per-call approval.");
+  if (String(policy.sandbox) !== "required") {
+    throw new BrokerPolicyError(
+      "Unsafe host execution was removed in V5; use the required sandbox or a real OCI backend."
+    );
   }
   return {
     sandbox: policy.sandbox,
@@ -139,8 +141,7 @@ function wirePolicy(
     writeRoots: resolvedWriteRoots,
     executionRoots: resolvedExecutionRoots,
     ...(executableSha256 ? { executableSha256 } : {}),
-    protectedPaths: defaultProtectedPaths(policy).map((item) => path.resolve(item)),
-    unsafeHostExecApproved: policy.unsafeHostExecApproved === true
+    protectedPaths: defaultProtectedPaths(policy).map((item) => path.resolve(item))
   };
 }
 
@@ -150,12 +151,16 @@ export function requestParams(
   toolchains: NormalizedTrustedToolchain[],
   verifiedExecutables: string[]
 ): Record<string, unknown> {
-  const executable = resolveTrustedExecutable(request.command.executable, toolchains, request.command.cwd);
+  const invocation = resolveTrustedInvocation(
+    request.command.executable, request.command.args ?? [], toolchains, request.command.cwd
+  );
+  const executable = invocation.executable;
   assertTrustedExecutableAvailable(executable, toolchains, options.sandboxMode);
   const executableSha256 = trustedExecutableSha256(executable, toolchains, options.sandboxMode);
   const resolvedCommand = {
     ...request.command,
-    executable
+    executable,
+    args: invocation.args
   };
   if (request.policy.sandbox === "required") {
     const roots = [...request.policy.readRoots, ...request.policy.writeRoots];

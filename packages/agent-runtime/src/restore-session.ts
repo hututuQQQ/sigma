@@ -341,7 +341,7 @@ export interface SnapshotRebuildInput {
   events(): AsyncIterable<AgentEventEnvelope>;
 }
 
-/** Replays the durable event log through the kernel to rebuild a V4 snapshot. */
+/** Replays the durable event log through the kernel to rebuild a V5 snapshot. */
 export async function rebuildSnapshotFromEvents(
   input: SnapshotRebuildInput,
   runDeadlineMs = 30 * 60 * 1_000

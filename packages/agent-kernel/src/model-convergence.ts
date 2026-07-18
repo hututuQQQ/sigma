@@ -5,6 +5,7 @@ const TERMINAL_PROTOCOL_FAILURE_CODES = new Set([
   "invalid_completion_proposal",
   "invalid_blocked_report",
   "invalid_user_input_request",
+  "internal_tool_denied",
   "mode_denied",
   "profile_denied",
   "terminal_batch_conflict",
@@ -39,7 +40,7 @@ export function completionRepairRequiresTerminalAction(state: KernelState): bool
   if (state.completionRepair?.kind === "evidence_acquisition") return false;
   if (state.completionRepair?.kind === "protected_recovery") return false;
   if (state.completionRepair?.kind === "completion_prerequisite") {
-    return state.pendingTools.some((item) => item.request.name === "complete_task");
+    return state.pendingTools.some((item) => item.request.name === "runtime_finalize");
   }
   if (state.completionRepair?.kind === "terminal_action"
     || state.completionRepair?.kind === "protected_completion") return true;
@@ -142,7 +143,7 @@ export function conflictingTerminalBatch(
   calls: readonly ModelToolCall[],
   repairPending: boolean
 ): boolean {
-  const completionCount = calls.filter((call) => call.name === "complete_task").length;
+  const completionCount = calls.filter((call) => call.name === "runtime_finalize").length;
   const blockedCount = calls.filter((call) => call.name === "report_blocked").length;
   const inputRequestCount = calls.filter((call) => call.name === "request_user_input").length;
   const terminalCount = completionCount + blockedCount + inputRequestCount;
@@ -255,7 +256,7 @@ export function incompleteModelCompletion(
   const effectRevision = typeof payload.effectRevision === "number" ? payload.effectRevision : state.revision;
   const call = {
     id: `runtime_completion_intent_${turnId}_${effectRevision}`,
-    name: "complete_task",
+    name: "runtime_finalize",
     arguments: { summary: response }
   };
   const projectedMessages = messages.map((message, index) => index === messages.length - 1

@@ -91,7 +91,6 @@ export class BrokerTransport {
   start(): void {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot start broker transport in '${this.state}' state.`);
     const args = [...(this.options.helperArgs ?? [])];
-    if (this.options.allowUnsafeHostExec) args.push("--allow-unsafe-host-exec");
     const child = spawn(this.options.helperPath, args, {
       cwd: process.cwd(), env: createMinimalEnvironment(), windowsHide: true, shell: false,
       stdio: ["pipe", "pipe", "pipe"]

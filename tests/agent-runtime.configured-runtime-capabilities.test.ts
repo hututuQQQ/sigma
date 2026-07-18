@@ -42,18 +42,12 @@ it("finds the debug broker produced by a development build", async () => {
   expect(defaultSigmaExecPath({}, pathToFileURL(modulePath))).toBe(debugBroker);
 });
 
-it("omits an unproved automatic Windows Node capability without weakening explicit manifests", async () => {
+it("omits an unproved automatic Windows Node capability", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-node-proof-"));
   fixtures.push(root);
   const executable = path.join(root, "node.exe");
   await writeFile(executable, "not an approved Node runtime", "utf8");
   expect(runtimeTrustedToolchains(executable, "win32", "required")).toEqual([]);
-  const unsafe = runtimeTrustedToolchains(executable, "win32", "unsafe");
-  expect(unsafe).toMatchObject([{
-    id: "runtime-node",
-    executable: path.resolve(executable)
-  }]);
-  expect(unsafe[0]).not.toHaveProperty("compatibility");
 });
 
 it("binds a host-loaded portable runtime to its canonical bundled Node file", async () => {
@@ -119,8 +113,7 @@ it.each(["", "relative/node"])(
 
 it("uses the environment passed to the default broker factory", async () => {
   expect(() => new LazyExecutionBroker({
-    sandboxMode: "unsafe",
-    allowUnsafeHostExec: true,
+    sandboxMode: "required",
     helperPath: process.execPath,
     env: { SIGMA_RUNTIME_NODE_PATH: "relative/node" }
   })).toThrow(expect.objectContaining({ code: "toolchain_unavailable" }));
@@ -147,10 +140,6 @@ it("requires the same Windows LPAC proof for an explicitly configured Node", asy
 
   expect(() => runtimeTrustedToolchainsForBinding(binding, "win32", "required"))
     .toThrow(/toolchain.*unavailable|could not be inspected|PE/iu);
-  expect(runtimeTrustedToolchainsForBinding(binding, "win32", "unsafe")).toMatchObject([{
-    executable: path.resolve(executable),
-    aliases: ["node", "node.exe"]
-  }]);
 });
 
 function doctorReport(

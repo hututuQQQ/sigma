@@ -15,18 +15,22 @@ interface DoctorDeps {
   languageServers?: LanguageServerPreset[];
 }
 
-async function sandboxCheck(broker: ExecutionBroker): Promise<SandboxProbe> {
+async function sandboxCheck(broker: ExecutionBroker, workspace: string): Promise<SandboxProbe> {
   try {
     const report = await broker.doctor();
+    const lease = broker.sandboxLeaseStatus
+      ? await broker.sandboxLeaseStatus(workspace).catch(() => undefined) : undefined;
     const ready = report.sandbox.available && report.sandbox.selfTestPassed;
     return {
       report,
+      lease,
       check: {
         name: "sandbox",
         status: ready ? "ok" : "warning",
         message: ready
           ? `${report.sandbox.backend} ready; network=${report.capabilities.networkModes.join("|")}; `
-            + `pty=${String(report.capabilities.pty)}; handoff=${String(report.capabilities.processHandoff === true)}`
+            + `pty=${String(report.capabilities.pty)}; handoff=${String(report.capabilities.processHandoff === true)}; `
+            + (lease ? `lease=${lease.state}/g${lease.generation}` : "lease=inactive")
           : `${report.sandbox.backend} unavailable: ${report.sandbox.reason ?? "self-test failed"}`
       }
     };
@@ -64,6 +68,7 @@ type BrokerDoctorReport = Awaited<ReturnType<ExecutionBroker["doctor"]>>;
 interface SandboxProbe {
   check: DoctorCheck;
   report?: BrokerDoctorReport;
+  lease?: Awaited<ReturnType<NonNullable<ExecutionBroker["sandboxLeaseStatus"]>>>;
 }
 
 function configuredKey(provider: "deepseek" | "glm"): boolean {
@@ -154,13 +159,12 @@ async function executeDoctor(
   const { flags } = parseArgs(argv);
   const config = loadCliConfig(flags);
   const ownedBroker = deps.executionBroker ? undefined : (deps.createExecutionBroker?.() ?? new LazyExecutionBroker({
-    sandboxMode: "unsafe",
-    allowUnsafeHostExec: false
+    sandboxMode: "required"
   }));
   try {
     const broker = deps.executionBroker ?? ownedBroker!;
     const checks: DoctorCheck[] = [nodeCheck(), await workspaceCheck(config.workspace), providerKeyCheck(config.provider)];
-    const sandbox = await sandboxCheck(broker);
+    const sandbox = await sandboxCheck(broker, config.workspace);
     checks.push(sandbox.check);
     checks.push(...languageServerChecks(deps.languageServers ?? discoverLanguageServers()));
     checks.push(await apiCheck(config.provider, config.model, flags["check-api"] === true));
@@ -176,7 +180,13 @@ async function executeDoctor(
         platform: sandbox.report.platform,
         architecture: sandbox.report.architecture,
         sandbox: sandbox.report.sandbox,
-        capabilities: sandbox.report.capabilities
+        capabilities: sandbox.report.capabilities,
+        workspaceLease: sandbox.lease ?? null,
+        container: {
+          available: false,
+          backend: "oci",
+          reason: "No OCI backend is installed in this Sigma build. Container mode fails with container_unavailable."
+        }
       } : {}),
       checks
     };

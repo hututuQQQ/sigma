@@ -15,6 +15,7 @@ import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
+import { convergedToolFailure } from "../packages/agent-runtime/src/capability-failure-convergence.js";
 import { resolveToolIdleWatchdogMs } from "../packages/agent-runtime/src/tool-execution-monitor.js";
 import type { RuntimeOptions } from "../packages/agent-runtime/src/types.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
@@ -42,6 +43,24 @@ function runtime(toolIdleWatchdogMs?: number | false): RuntimeOptions {
 }
 
 describe("runtime recovery convergence", () => {
+  it("counts repeated capability failures per semantic invocation", () => {
+    const session = runtimeSessionFixture();
+    session.interaction.capabilityFailures = new Map();
+    const signal = new AbortController().signal;
+    const failure = Object.assign(new Error("runtime unavailable"), { code: "toolchain_unavailable" });
+    const first = { id: "first", name: "exec", arguments: { executable: "node", args: ["--version"] } };
+    const different = { id: "different", name: "exec", arguments: { executable: "pnpm", args: ["test"] } };
+    expect(convergedToolFailure(
+      session, first, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("toolchain_unavailable");
+    expect(convergedToolFailure(
+      session, different, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("toolchain_unavailable");
+    expect(convergedToolFailure(
+      session, { ...first, id: "retry" }, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("capability_retry_exhausted");
+  });
+
   it("keeps the outer idle watchdog behind a tool-owned idle deadline and allows an explicit policy", () => {
     expect(resolveToolIdleWatchdogMs(runtime(), descriptor(120_000))).toBe(150_000);
     expect(resolveToolIdleWatchdogMs(runtime(), descriptor())).toBeUndefined();
@@ -68,7 +87,7 @@ describe("runtime recovery convergence", () => {
     }
   });
 
-  it("defaults semantic progress when restoring a pre-feature V4 snapshot", async () => {
+  it("defaults semantic progress when restoring a pre-feature V5 snapshot", async () => {
     const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-semantic-restore-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
     const sessionId = "legacy-semantic-session";

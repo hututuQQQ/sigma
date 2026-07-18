@@ -41,19 +41,18 @@ describe("agent-config single-source schema", () => {
     const values = resolveConfig({
       home: {
         permissions: { mode: "deny" },
-        security: { read_scope: "workspace", network: "none", process_handoff: "deny", allow_unsafe_host_exec: true },
+        security: { read_scope: "workspace", network: "none", process_handoff: "deny" },
         budget: { max_input_tokens: 1_000, max_tool_calls: 20 }, checkpoint: { max_files: 100 }
       },
       workspace: {
         permissions: { mode: "auto" },
-        security: { read_scope: "host", network: "full", process_handoff: "allow", allow_unsafe_host_exec: false },
+        security: { read_scope: "host", network: "full", process_handoff: "allow" },
         budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
         agents: { max_parallel: 2 }
       }
     });
     expect(values).toMatchObject({
       permissionMode: "deny", readScope: "workspace", networkMode: "none", processHandoff: "deny",
-      allowUnsafeHostExec: false,
       maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
     });
 
@@ -91,6 +90,7 @@ describe("agent-config single-source schema", () => {
   it("validates every scalar boundary", () => {
     const field = (key: string) => SIGMA_CONFIG_SCHEMA.find((item) => item.key === key)!;
     expect(() => field("permissionMode").parse("yolo")).toThrow("must be one of");
+    expect(field("permissionMode").parse("workspace-auto")).toBe("workspace-auto");
     expect(() => field("provider").parse("other")).toThrow("must be one of");
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");

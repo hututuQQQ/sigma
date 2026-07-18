@@ -91,64 +91,59 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(provider="glm").model, "glm-5.2")
         with self.assertRaisesRegex(ValueError, "execution_mode"):
             module.SigmaCliHarborAgent(execution_mode="host")
+        self.assertEqual(module.SigmaCliHarborAgent(network_mode="loopback").network_mode, "loopback")
         with self.assertRaisesRegex(ValueError, "agent_profile"):
             module.SigmaCliHarborAgent(agent_profile="untrusted")
 
-    async def test_disposable_execution_mode_uses_an_isolated_home_and_explicit_flag(self):
+    async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
-            env = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(return_code=0)))
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
-                execution_mode="disposable-container",
+                execution_mode="container",
             )
             agent._workspace = "/app"
 
-            await agent._configure_execution_mode(env)
             command = agent._agent_command()
             session_command = agent._session_command("resume", "session-fixture")
 
-            self.assertEqual(command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
+            self.assertEqual(command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", command)
-            self.assertIn("disposable-container", command)
+            self.assertIn("container", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
-            self.assertEqual(session_command[:2], ["env", "HOME=/tmp/agent/disposable-home"])
+            self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
-            self.assertIn("disposable-container", session_command)
+            self.assertIn("container", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
-            configured = env.exec.await_args.args[0]
-            self.assertIn("allow_unsafe_host_exec = true", configured)
+            self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
 
-    async def test_disposable_setup_verifies_cross_command_persistence(self):
+    async def test_container_setup_never_manufactures_host_persistence(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             logs_dir = Path(tmp) / "logs"
             env = SimpleNamespace(exec=AsyncMock(side_effect=[
-                SimpleNamespace(return_code=0, stdout="", stderr=""),
-                SimpleNamespace(return_code=0, stdout="", stderr=""),
                 SimpleNamespace(return_code=0, stdout="usage", stderr=""),
                 SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
             ]))
             agent = module.SigmaCliHarborAgent(
                 logs_dir=logs_dir,
-                execution_mode="disposable-container",
+                execution_mode="container",
             )
             agent._workspace = "/app"
 
             await agent._verify_agent_ready(env)
 
             commands = [call.args[0] for call in env.exec.await_args_list]
-            self.assertIn("disposable-persistence-probe", commands[0])
-            self.assertIn("cat /tmp/agent/disposable-persistence-probe", commands[1])
+            self.assertTrue(all("disposable" not in command for command in commands))
             record = json.loads((logs_dir / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "passed")
-            self.assertEqual(record["execution_mode"], "disposable-container")
+            self.assertEqual(record["execution_mode"], "container")
             self.assertEqual(record["agent_profile"], "standard")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
-                ["disposable_persistence_write", "disposable_persistence_read", "help", "strict_doctor"],
+                ["help", "strict_doctor"],
             )
 
     async def test_setup_prefers_uploaded_tarball(self):
@@ -368,7 +363,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = main_commands[0]
             self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
             self.assertIn("--run-deadline-sec 600", command)
-            self.assertIn("--permission-mode auto", command)
+            self.assertIn("--permission-mode workspace-auto", command)
             self.assertIn("--agent-profile standard", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)

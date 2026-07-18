@@ -76,7 +76,7 @@ function attempt({
     subject: subject(subjectOverrides),
     outcome: {
       status: passing ? "completed" : "failed",
-      finishReason: passing ? "complete_task" : "deadline",
+      finishReason: passing ? "model_stop" : "deadline",
       sessionId: `session-${repetition}`,
       exitCode: passing ? 0 : 1
     },

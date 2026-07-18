@@ -3,9 +3,9 @@ import { readFile, readdir, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-export const STORE_LAYOUT_VERSION = 4;
-const EVENT_SCHEMA_VERSION = 4;
-const SNAPSHOT_SCHEMA_VERSION = 4;
+export const STORE_LAYOUT_VERSION = 5;
+const EVENT_SCHEMA_VERSION = 5;
+const SNAPSHOT_SCHEMA_VERSION = 5;
 const EVENT_TYPES = new Set([
   "session.created", "run.started", "run.suspended", "run.completed", "run.cancelled", "run.failed",
   "user.message", "user.steer", "user.follow_up", "model.started", "model.delta", "model.reasoning_delta",
@@ -26,12 +26,12 @@ try {
   if (protocol.STORE_LAYOUT_VERSION !== STORE_LAYOUT_VERSION
     || protocol.EVENT_SCHEMA_VERSION !== EVENT_SCHEMA_VERSION
     || protocol.SNAPSHOT_SCHEMA_VERSION !== SNAPSHOT_SCHEMA_VERSION) {
-    throw new Error("Built agent-protocol versions do not match the V4 audit reader.");
+    throw new Error("Built agent-protocol versions do not match the V5 audit reader.");
   }
   officialAssertAgentEventEnvelope = protocol.assertAgentEventEnvelope;
 } catch (error) {
   if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-  // Audit remains usable before a build; the complete V4 envelope
+  // Audit remains usable before a build; the complete V5 envelope
   // boundary below still rejects unknown types, authorities, non-JSON payloads,
   // invalid identities, dates, and sequences. A normal built tree additionally
   // runs the production payload validator above.
@@ -49,29 +49,29 @@ function jsonValue(value, seen = new Set()) {
   return valid;
 }
 
-export function assertV4EventEnvelope(event) {
+export function assertV5EventEnvelope(event) {
   const valid = event && typeof event === "object" && !Array.isArray(event)
     && event.schemaVersion === EVENT_SCHEMA_VERSION
     && Number.isSafeInteger(event.seq) && event.seq >= 1
     && [event.eventId, event.sessionId, event.runId].every((item) => typeof item === "string" && item.length > 0)
     && validDate(event.occurredAt) && EVENT_TYPES.has(event.type) && AUTHORITIES.has(event.authority)
     && jsonValue(event.payload);
-  if (!valid) throw new Error("Invalid AgentEventEnvelope V4.");
+  if (!valid) throw new Error("Invalid AgentEventEnvelope V5.");
   officialAssertAgentEventEnvelope?.(event);
 }
 
-export function assertV4EventStream(input) {
+export function assertV5EventStream(input) {
   if (!Array.isArray(input) || input.length < 1) {
-    throw new Error("A V4 event stream must contain at least one event.");
+    throw new Error("A V5 event stream must contain at least one event.");
   }
   let sessionId = null;
   let expectedSeq = 1;
   for (const event of input) {
-    assertV4EventEnvelope(event);
+    assertV5EventEnvelope(event);
     if (sessionId === null) sessionId = event.sessionId;
-    if (event.sessionId !== sessionId) throw new Error("A V4 event stream cannot mix sessions.");
+    if (event.sessionId !== sessionId) throw new Error("A V5 event stream cannot mix sessions.");
     if (event.seq !== expectedSeq) {
-      throw new Error(`V4 event sequence discontinuity: expected ${expectedSeq}, actual ${event.seq}.`);
+      throw new Error(`V5 event sequence discontinuity: expected ${expectedSeq}, actual ${event.seq}.`);
     }
     expectedSeq += 1;
   }
@@ -96,7 +96,7 @@ function validDate(value) {
 }
 
 function validateMeta(value, sessionId) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid V4 session metadata.");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid V5 session metadata.");
   const valid = [
     value.schemaVersion === STORE_LAYOUT_VERSION,
     value.eventSchemaVersion === EVENT_SCHEMA_VERSION,
@@ -108,7 +108,7 @@ function validateMeta(value, sessionId) {
     Number.isSafeInteger(value.segment) && value.segment >= 1,
     Number.isSafeInteger(value.segmentEvents) && value.segmentEvents >= 0
   ].every(Boolean);
-  if (!valid) throw new Error(`Invalid V4 session metadata for '${sessionId}'.`);
+  if (!valid) throw new Error(`Invalid V5 session metadata for '${sessionId}'.`);
   return value;
 }
 
@@ -121,12 +121,12 @@ function parseRecord(line, sessionId, expectedSeq, location) {
   try {
     stored = JSON.parse(line);
   } catch (error) {
-    throw new Error(`Invalid JSON in V4 event record ${location}.`, { cause: error });
+    throw new Error(`Invalid JSON in V5 event record ${location}.`, { cause: error });
   }
   if (!stored || typeof stored !== "object" || typeof stored.checksum !== "string" || !stored.event) {
-    throw new Error(`Invalid V4 event record envelope ${location}.`);
+    throw new Error(`Invalid V5 event record envelope ${location}.`);
   }
-  assertV4EventEnvelope(stored.event);
+  assertV5EventEnvelope(stored.event);
   if (stored.event.sessionId !== sessionId) throw new Error(`Foreign session event in ${location}.`);
   if (stored.event.seq !== expectedSeq) {
     throw new Error(`Event sequence discontinuity in ${location}: expected ${expectedSeq}, actual ${stored.event.seq}.`);
@@ -152,7 +152,7 @@ export async function resolveWorkspaceStateRoot(workspace, options = {}) {
   return path.join(stateHome, "workspaces", workspaceDigest);
 }
 
-export async function listV4Sessions(rootDir) {
+export async function listV5Sessions(rootDir) {
   const directory = sessionsDirectory(rootDir);
   const entries = await readdir(directory, { withFileTypes: true }).catch((error) => {
     if (error?.code === "ENOENT") return [];
@@ -166,20 +166,20 @@ export async function listV4Sessions(rootDir) {
       const meta = validateMeta(JSON.parse(raw), entry.name);
       sessions.push({ sessionId: meta.sessionId, createdAt: meta.createdAt, updatedAt: meta.updatedAt, lastSeq: meta.lastSeq });
     } catch {
-      // A corrupt or non-V4 directory is not selectable. Explicit reads still fail loudly.
+      // A corrupt or non-V5 directory is not selectable. Explicit reads still fail loudly.
     }
   }
   return sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
-export async function readV4Session(rootDir, inputSessionId) {
+export async function readV5Session(rootDir, inputSessionId) {
   const sessionId = validateSessionId(inputSessionId);
   const directory = path.join(sessionsDirectory(rootDir), sessionId);
   let meta;
   try {
     meta = validateMeta(JSON.parse(await readFile(path.join(directory, "meta.json"), "utf8")), sessionId);
   } catch (error) {
-    throw new Error(`Cannot read valid V4 metadata for session '${sessionId}'.`, { cause: error });
+    throw new Error(`Cannot read valid V5 metadata for session '${sessionId}'.`, { cause: error });
   }
   const eventDirectory = path.join(directory, "events");
   const files = (await readdir(eventDirectory).catch((error) => {
@@ -188,7 +188,7 @@ export async function readV4Session(rootDir, inputSessionId) {
   })).filter((name) => /^\d{6}\.jsonl$/u.test(name)).sort();
   for (let index = 0; index < files.length; index += 1) {
     const segment = Number.parseInt(files[index].slice(0, 6), 10);
-    if (segment !== index + 1) throw new Error(`V4 event segment discontinuity for '${sessionId}' at '${files[index]}'.`);
+    if (segment !== index + 1) throw new Error(`V5 event segment discontinuity for '${sessionId}' at '${files[index]}'.`);
   }
   const events = [];
   let expectedSeq = 1;
@@ -209,11 +209,11 @@ export async function readV4Session(rootDir, inputSessionId) {
     lastSegmentEvents = segmentEvents;
   }
   if (events.length !== meta.lastSeq) {
-    throw new Error(`V4 metadata/event mismatch for '${sessionId}': meta=${meta.lastSeq}, events=${events.length}.`);
+    throw new Error(`V5 metadata/event mismatch for '${sessionId}': meta=${meta.lastSeq}, events=${events.length}.`);
   }
   const lastSegment = files.length === 0 ? 1 : Number.parseInt(files.at(-1).slice(0, 6), 10);
   if (meta.segment !== lastSegment || meta.segmentEvents !== lastSegmentEvents) {
-    throw new Error(`V4 segment metadata mismatch for '${sessionId}'.`);
+    throw new Error(`V5 segment metadata mismatch for '${sessionId}'.`);
   }
   return { meta, events };
 }

@@ -23,8 +23,8 @@ Security invariants:
 
 - Required sandbox execution never falls back to a host process.
 - `network: "full"` requires `networkApproved: true` on that call.
-- Unsafe host execution requires the client launch opt-in and
-  `unsafeHostExecApproved: true` on that call.
+- Unsafe host execution does not exist in V5. An unsafe policy request is
+  rejected before dispatch; container mode requires a real OCI backend.
 - The process environment is rebuilt from an allowlist. Secret-looking keys
   are rejected and configured secret values are redacted from responses.
 - The current Node process is never an implicit toolchain. Product composition

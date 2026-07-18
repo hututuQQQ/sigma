@@ -226,7 +226,7 @@ describe("provider-measured model budget settlement", () => {
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0].toolChoice).toBe("required");
     expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "complete_task", "report_blocked", "request_user_input"
+      "report_blocked", "request_user_input"
     ]);
   });
 

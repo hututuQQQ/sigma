@@ -229,14 +229,16 @@ function asNonNegativeInt(value, fallback, name) {
 
 function networkMode(value, fallback = "none") {
   const mode = asString(value, fallback);
-  if (mode !== "none" && mode !== "full") throw new Error("network mode must be none or full.");
+  if (mode !== "none" && mode !== "loopback" && mode !== "full") {
+    throw new Error("network mode must be none, loopback, or full.");
+  }
   return mode;
 }
 
-function executionMode(value, fallback = "disposable-container") {
+function executionMode(value, fallback = "sandboxed") {
   const mode = asString(value, fallback);
-  if (mode !== "sandboxed" && mode !== "disposable-container") {
-    throw new Error("execution mode must be sandboxed or disposable-container.");
+  if (mode !== "sandboxed" && mode !== "container") {
+    throw new Error("execution mode must be sandboxed or container.");
   }
   return mode;
 }
@@ -588,7 +590,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     provider: options.provider,
     agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "none",
-    execution_mode: options.executionMode ?? "disposable-container"
+    execution_mode: options.executionMode ?? "sandboxed"
   };
   if (options.model) {
     agentKwargs.model = options.model;

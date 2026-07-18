@@ -182,7 +182,18 @@ function validation(coveredPaths = ["src/code.ts"]): ValidationEvidence {
       artifactIds: [],
       frontierRevision: 1,
       stateDigest: "a".repeat(64),
-      coveredPaths
+      coveredPaths,
+      claim: {
+        kind: "typecheck",
+        commandDigest: "c".repeat(64),
+        subject: {
+          projectId: ".",
+          configPaths: [],
+          selectedTests: [],
+          exactFiles: []
+        },
+        status: "passed"
+      }
     }
   };
 }

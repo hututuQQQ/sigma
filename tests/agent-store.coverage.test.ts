@@ -39,7 +39,7 @@ function event(sessionId: string, seq: number, type: "session.created" | "diagno
   };
 }
 
-describe("agent-store V4 durability", () => {
+describe("agent-store V5 durability", () => {
   it.skipIf(process.platform === "win32")("creates owner-only state directories", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-private-store-"));
     const root = path.join(parent, "state");
@@ -116,7 +116,7 @@ describe("agent-store V4 durability", () => {
     await recovered.append(event("crash", 3) as never, 2);
   });
 
-  it("rejects checksummed event corruption through the shared V4 schema", async () => {
+  it("rejects checksummed event corruption through the shared V5 schema", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-corruption-"));
     const store = new SegmentedJsonlStore({ rootDir: root });
     await store.append(event("corrupt", 1, "session.created") as never, 0);
@@ -151,20 +151,21 @@ describe("agent-store V4 durability", () => {
     expect(await store.listSessions()).toHaveLength(1);
   });
 
-  it("uses stores/v4 while preserving legacy V2 and V3 directories byte-for-byte", async () => {
+  it("uses stores/v5 while preserving V2, V3, and V4 directories byte-for-byte", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-versioned-store-"));
     const legacyFiles = [
       path.join(legacySessionDirectoryV2(root, "old-v2"), "meta.json"),
-      path.join(legacySessionDirectoryV3(root, "old-v3"), "meta.json")
+      path.join(legacySessionDirectoryV3(root, "old-v3"), "meta.json"),
+      path.join(root, "stores", "v4", "sessions", "old-v4", "meta.json")
     ];
     for (const file of legacyFiles) {
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, "legacy bytes\n", "utf8");
     }
     const store = new SegmentedJsonlStore({ rootDir: root });
-    await store.append(event("new-v4", 1, "session.created") as never, 0);
-    expect(sessionDirectory(root, "new-v4")).toContain(path.join("stores", "v4", "sessions"));
+    await store.append(event("new-v5", 1, "session.created") as never, 0);
+    expect(sessionDirectory(root, "new-v5")).toContain(path.join("stores", "v5", "sessions"));
     for (const file of legacyFiles) expect(await readFile(file, "utf8")).toBe("legacy bytes\n");
-    expect(await readdir(sessionsDirectory(root))).toEqual(["new-v4"]);
+    expect(await readdir(sessionsDirectory(root))).toEqual(["new-v5"]);
   });
 });

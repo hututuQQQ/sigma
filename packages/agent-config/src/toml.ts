@@ -23,7 +23,6 @@ export function renderConfigToml(overrides: Partial<Record<string, ConfigValue>>
   let mcpServers: McpServerConfigValue[] = [];
   for (const field of SIGMA_CONFIG_SCHEMA) {
     if (!field.toml) continue;
-    if (field.key === "allowUnsafeHostExec") continue;
     const value = overrides[field.key] ?? field.defaultValue;
     if (field.key === "mcpServers") {
       mcpServers = value as McpServerConfigValue[];

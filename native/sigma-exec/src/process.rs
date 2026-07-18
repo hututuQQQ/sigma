@@ -832,6 +832,7 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::<PathBuf>::new(),
+                #[cfg(test)]
                 unsafe_host_exec_approved: true,
             },
             max_output_bytes: 1024,

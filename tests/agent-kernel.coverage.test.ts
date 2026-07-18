@@ -160,7 +160,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     let state = apply(initial(), "user.message", { text: "write the result and finish" });
     state = proposeToolBatch(state, 1, [
       { id: "write-1", name: "write", arguments: { path: "result.txt", content: "done" } },
-      { id: "complete-1", name: "complete_task", arguments: { summary: "done" } }
+      { id: "complete-1", name: "runtime_finalize", arguments: { summary: "done" } }
     ]);
     expect(state).toMatchObject({ phase: "tool_pending", completionRepairAttempts: 0 });
     expect(state.pendingTools.map((item) => item.request.callId)).toEqual(["write-1", "complete-1"]);
@@ -175,7 +175,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     };
     state = proposeToolBatch(state, 1, [
       { id: "read-1", name: "read", arguments: { path: "seed.txt" } },
-      { id: "complete-1", name: "complete_task", arguments: { summary: "done" } }
+      { id: "complete-1", name: "runtime_finalize", arguments: { summary: "done" } }
     ]);
     expect(state.pendingTools).toEqual([]);
     expect(state.proposedOutcome).toMatchObject({
@@ -192,7 +192,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       evidence: [diagnosticEvidence("current-run-evidence")]
     };
     state = proposeToolBatch(state, 1, [{
-      id: "complete-while-active", name: "complete_task", arguments: { summary: "done" }
+      id: "complete-while-active", name: "runtime_finalize", arguments: { summary: "done" }
     }]);
     const failed = {
       ...completedReceipt("Background processes remain active.", "2026-01-01T00:00:01.000Z"),
@@ -219,7 +219,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "tool_pending",
       completionRepairAttempts: 0,
-      pendingTools: [{ request: { name: "complete_task", arguments: {
+      pendingTools: [{ request: { name: "runtime_finalize", arguments: {
         summary: "Which target should I change?"
       } } }]
     });
@@ -565,7 +565,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(incomplete).toMatchObject({
       phase: "tool_pending",
-      pendingTools: [{ request: { name: "complete_task", arguments: { summary: "premature answer" } } }]
+      pendingTools: [{ request: { name: "runtime_finalize", arguments: { summary: "premature answer" } } }]
     });
     const failedEvidence = settleModel({
       ...inFlight(),
@@ -575,7 +575,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(failedEvidence).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "complete_task" } }] });
+    expect(failedEvidence).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "runtime_finalize" } }] });
     const provenanceOnly = settleModel({
       ...inFlight(),
       evidence: [{
@@ -587,7 +587,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(provenanceOnly).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "complete_task" } }] });
+    expect(provenanceOnly).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "runtime_finalize" } }] });
     const evidenceBacked = settleModel({
       ...inFlight(),
       evidence: [diagnosticEvidence("current-run-evidence")]
@@ -598,7 +598,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(evidenceBacked).toMatchObject({
       phase: "tool_pending",
-      pendingTools: [{ request: { name: "complete_task", arguments: { summary: "evidence-backed answer" } } }]
+      pendingTools: [{ request: { name: "runtime_finalize", arguments: { summary: "evidence-backed answer" } } }]
     });
     const protocolError = settleModel(inFlight(), "model.completed", {
       message: { role: "assistant", content: "invalid boundary" },
@@ -713,7 +713,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(malformedInputRequest).toMatchObject({ phase: "ready_model", proposedOutcome: undefined });
 
-    let malformedCompletion = withPendingTool("completion-malformed", "complete_task");
+    let malformedCompletion = withPendingTool("completion-malformed", "runtime_finalize");
     malformedCompletion = toolEvent(malformedCompletion, "tool.completed", "completion-malformed", {
       ok: true, output: "{", observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [],
       startedAt: "start", completedAt: "end"
@@ -727,14 +727,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(arrayArguments).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { callId: "array-args" } }] });
 
-    let completion = withPendingTool("complete", "complete_task");
+    let completion = withPendingTool("complete", "runtime_finalize");
     completion = toolEvent(completion, "tool.completed", "complete", {
       ok: true, output: JSON.stringify({ summary: "evidence-backed result" }),
       observedEffects: ["outcome.propose"], artifacts: ["artifact"], diagnostics: ["checked"], startedAt: "start", completedAt: "end"
     });
     expect(completion).toMatchObject({ phase: "outcome_pending", proposedOutcome: { kind: "completed", message: "evidence-backed result" } });
 
-    let bodyCompletion = withPendingTool("complete-with-body", "complete_task");
+    let bodyCompletion = withPendingTool("complete-with-body", "runtime_finalize");
     bodyCompletion = {
       ...bodyCompletion,
       messages: bodyCompletion.messages.map((message, index) => index === bodyCompletion.messages.length - 1
@@ -752,7 +752,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       }
     });
 
-    let repairedCompletion = withPendingTool("repair-complete", "complete_task");
+    let repairedCompletion = withPendingTool("repair-complete", "runtime_finalize");
     repairedCompletion = {
       ...repairedCompletion,
       completionRepairAttempts: 1,
@@ -803,7 +803,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(initial(), "diagnostic", { kind: "other" }).phase).toBe("idle");
     expect(apply(initial(), "context.compacted", []).phase).toBe("idle");
 
-    let superseded = withPendingTool("complete-race", "complete_task");
+    let superseded = withPendingTool("complete-race", "runtime_finalize");
     const staleToolTurn = superseded.pendingTools[0].modelTurn;
     superseded = apply(superseded, "user.steer", { text: "new acceptance criteria" });
     superseded = apply(superseded, "tool.completed", {
@@ -839,7 +839,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
   });
 
   it("does not replay completion arguments after prerequisite evidence arrives", () => {
-    let state = withPendingTool("completion-needs-validation", "complete_task", {
+    let state = withPendingTool("completion-needs-validation", "runtime_finalize", {
       summary: "The requested change is complete.",
     });
     state = toolEvent(state, "tool.failed", "completion-needs-validation", {

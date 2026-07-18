@@ -136,7 +136,6 @@ describe("LazyExecutionBroker process-handle generations", () => {
     let factoryCalls = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factoryCalls++]!
     });
 
@@ -182,7 +181,6 @@ describe("LazyExecutionBroker process-handle generations", () => {
     let factoryCalls = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factoryCalls++]!
     });
 
@@ -207,7 +205,6 @@ describe("LazyExecutionBroker process-handle generations", () => {
     let factoryCalls = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factoryCalls++]!
     });
 
@@ -229,7 +226,6 @@ describe("LazyExecutionBroker process-handle generations", () => {
     let factoryCalls = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factoryCalls++]!
     });
 

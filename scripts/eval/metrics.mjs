@@ -281,7 +281,7 @@ function isAnswer(event) {
   const payload = record(event.payload);
   const text = typeof payload.text === "string" ? payload.text.trim() : "";
   const calls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
-  return text.length > 0 && (calls.length === 0 || calls.every((call) => modelToolCallName(call) === "complete_task"));
+  return text.length > 0 && (calls.length === 0 || calls.every((call) => modelToolCallName(call) === "runtime_finalize"));
 }
 
 function isSubstantiveProgress(event, seenSuccessfulOutputs) {
@@ -357,7 +357,7 @@ function postAnswerChurn(events) {
   const acceptedCompletionIndex = candidates.findIndex((event) => {
     if (event.type !== "tool.completed") return false;
     const payload = record(event.payload);
-    return payload.name === "complete_task" && payload.ok !== false
+    return payload.name === "runtime_finalize" && payload.ok !== false
       && record(payload.outcome).status !== "failed";
   });
   const terminalIndex = candidates.findIndex((event) => TERMINAL_TYPES.has(event.type));
@@ -910,7 +910,7 @@ function hardFailures(events, mode, workspace) {
 }
 
 /**
- * Reduce validated V4 durable events to JSON-safe, content-redacted experience metrics.
+ * Reduce validated V5 durable events to JSON-safe, content-redacted experience metrics.
  * Tool arguments and outputs are represented only by SHA-256 fingerprints.
  */
 export function reduceAgentEvents(input, options = {}) {

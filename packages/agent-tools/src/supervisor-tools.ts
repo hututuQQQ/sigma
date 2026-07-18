@@ -14,7 +14,7 @@ import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 
 const DELEGATED_CHILD_EFFECTS: ToolEffect[] = [
   "filesystem.read", "filesystem.read.external", "filesystem.write", "process.spawn",
-  "process.spawn.readonly", "process.handoff", "agent.spawn", "network", "validation", "destructive", "open_world"
+  "process.spawn.readonly", "process.handoff", "agent.spawn", "network", "validation", "destructive"
 ];
 
 function input(request: ToolRequest): Record<string, JsonValue> {
@@ -68,7 +68,6 @@ function delegatedEffects(value: Record<string, JsonValue>, mode: "analyze" | "c
   ];
   if (value.network === "full") effects.push("network");
   if (value.allowDestructive === true) effects.push("destructive");
-  if (value.unsafeHostExec === true) effects.push("open_world");
   return effects;
 }
 
@@ -203,9 +202,8 @@ function spawnTool(supervisor: SupervisorPort): RegisteredEffectTool {
     writeScope: { type: "array", items: { type: "string" } },
     planNodeIds: { type: "array", items: { type: "string" } },
     profileId: { type: "string" },
-    network: { type: "string", enum: ["none", "full"] },
+    network: { type: "string", enum: ["none", "loopback", "full"] },
     allowDestructive: { type: "boolean" },
-    unsafeHostExec: { type: "boolean" },
     budget: { type: "object", additionalProperties: { type: "integer", minimum: 0 } },
     detached: { type: "boolean" }
   }, ["instruction", "planNodeIds"], "prompt", DELEGATED_CHILD_EFFECTS);

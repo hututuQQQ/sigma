@@ -39,25 +39,16 @@ export function verifiedRuntimeCommands(report: BrokerDoctorReport): string[] {
 }
 
 export interface VerifiedNetworkPolicy {
-  modes: Array<"none" | "full">;
-  defaultMode: "none" | "full";
-}
-
-export function trustedOpenWorldAuthorization(config: {
-  executionMode?: "sandboxed" | "disposable-container";
-  unsafeHostExecRequested?: boolean;
-  allowUnsafeHostExec?: boolean;
-}): { openWorldAuthorization: "disposable-container" } | Record<string, never> {
-  const disposable = config.executionMode === "disposable-container" || config.unsafeHostExecRequested === true;
-  return disposable && config.allowUnsafeHostExec === true ? { openWorldAuthorization: "disposable-container" } : {};
+  modes: Array<"none" | "loopback" | "full">;
+  defaultMode: "none" | "loopback" | "full";
 }
 
 export function verifiedNetworkPolicy(
   report: BrokerDoctorReport,
-  configuredMode: "none" | "full"
+  configuredMode: "none" | "loopback" | "full"
 ): VerifiedNetworkPolicy {
   const brokerModes = new Set(report.capabilities.networkModes);
-  const modes = (["none", "full"] as const).filter((mode) => brokerModes.has(mode));
+  const modes = (["none", "loopback", "full"] as const).filter((mode) => brokerModes.has(mode));
   return {
     modes: [...modes],
     defaultMode: modes.includes(configuredMode) ? configuredMode : modes[0] ?? "none"

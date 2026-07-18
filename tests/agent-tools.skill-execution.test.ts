@@ -147,7 +147,7 @@ describe("sandboxed skill resource execution", () => {
           readRoots: [workspace, skillRoot],
           writeRoots: [],
           protectedPaths: [skillRoot],
-          unsafeHostExecApproved: false
+          networkApproved: false
         })
       })]);
 

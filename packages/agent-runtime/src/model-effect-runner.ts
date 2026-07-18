@@ -55,6 +55,13 @@ function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
     }, 0);
 }
 
+function takeUnloadedSummary(session: RuntimeSession, plan: ContextPlan): ContextItem | undefined {
+  const summary = plan.summary;
+  if (!summary || session.interaction.loadedContextIds.has(summary.id)) return undefined;
+  session.interaction.loadedContextIds.add(summary.id);
+  return summary;
+}
+
 export class ModelEffectRunner {
   private readonly repositoryContext: RepositoryContextProvider;
 
@@ -177,7 +184,9 @@ export class ModelEffectRunner {
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
   ): Promise<RunOutcome | null> {
-    const availableDescriptors = this.options.runtime.tools.descriptors().filter((item) =>
+    const modelDescriptors = this.options.runtime.tools.modelDescriptors?.()
+      ?? this.options.runtime.tools.descriptors();
+    const availableDescriptors = modelDescriptors.filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
     const repairPhase = completionRepairPhase(session);
     // Every protocol-repair phase is a tool sub-turn, including recovery after
@@ -228,10 +237,10 @@ export class ModelEffectRunner {
       outputReserveTokens: turn.outputReserveTokens
     });
     await this.emitContextComposition(session, plan, forecast);
-    if (plan.summary && !session.interaction.loadedContextIds.has(plan.summary.id)) {
-      session.interaction.loadedContextIds.add(plan.summary.id);
+    const summary = takeUnloadedSummary(session, plan);
+    if (summary) {
       await this.options.emit(session, "context.compacted", "runtime", {
-        item: plan.summary,
+        item: summary,
         omittedHistoryTurns: plan.omittedHistoryTurns
       });
     }

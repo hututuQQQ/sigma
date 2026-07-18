@@ -97,13 +97,24 @@ describe("Terminal-Bench command construction", () => {
       timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180, agent_timeout_multiplier: "1" }
     })).toEqual(expect.arrayContaining([
       "network_mode:str=full",
-      "execution_mode:str=disposable-container",
+      "execution_mode:str=sandboxed",
       "agent_profile:str=standard"
     ]));
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
       network_mode: "full",
-      execution_mode: "disposable-container",
+      execution_mode: "sandboxed",
       agent_profile: "standard"
+    });
+  });
+
+  it("accepts loopback without promoting it to full network", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--network", "loopback"
+    ]);
+    expect(options.networkMode).toBe("loopback");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
+      network_mode: "loopback",
+      execution_mode: "sandboxed"
     });
   });
 
@@ -112,7 +123,7 @@ describe("Terminal-Bench command construction", () => {
     const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
     const config = buildHarborJobConfig(standard, "jobs", standardPlan);
     expect(standard).toMatchObject({
-      benchmarkClass: "standard", executionMode: "disposable-container", agentProfile: "standard"
+      benchmarkClass: "standard", executionMode: "sandboxed", agentProfile: "standard"
     });
     expect(standardPlan).toMatchObject({
       agent_wall_time_sec: 780,
@@ -122,7 +133,7 @@ describe("Terminal-Bench command construction", () => {
       environment_build_timeout_multiplier: null
     });
     expect(config).not.toHaveProperty("agent_timeout_multiplier");
-    expect(config.agents[0].kwargs.execution_mode).toBe("disposable-container");
+    expect(config.agents[0].kwargs.execution_mode).toBe("sandboxed");
     expect(config.agents[0].kwargs.agent_profile).toBe("standard");
 
     expect(resolveRunOptions([

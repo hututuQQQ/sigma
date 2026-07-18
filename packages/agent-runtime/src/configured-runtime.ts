@@ -32,13 +32,13 @@ import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
 import { repositoryTransactionTool } from "./repository-transaction-tool.js";
 import {
-  brokerRuntimeEnvironment, trustedOpenWorldAuthorization, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
+  brokerRuntimeEnvironment, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
 } from "./execution-capabilities.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: "deepseek" | "glm";
   model: string;
-  permissionMode: "ask" | "auto" | "deny";
+  permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   runDeadlineSec: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
@@ -52,12 +52,10 @@ export interface RuntimeCompositionConfig {
   workspaceCustomizationTrust?: WorkspaceCustomizationTrustAttestation;
   agentProfile?: string;
   sandboxMode?: "required";
-  executionMode?: "sandboxed" | "disposable-container";
+  executionMode?: "sandboxed" | "container";
   readScope?: "workspace" | "host";
-  networkMode?: "none" | "full";
+  networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
-  allowUnsafeHostExec?: boolean;
-  unsafeHostExecRequested?: boolean;
   reviewerWaiver?: boolean;
   legacySingleModelRoute?: boolean;
   modelSpecs?: readonly ModelSpecConfigValue[];
@@ -97,7 +95,6 @@ interface PreparedComposition {
   executionReport: BrokerDoctorReport;
   hookRunner: HookRunnerPort;
 }
-
 async function joinChildren(supervisor: AgentSupervisor, store: RunStore, parentId: string, signal: AbortSignal): Promise<ChildJoinSummary> {
   const jobs = await supervisor.joinParent(parentId, signal);
   const evidence: JsonValue[] = jobs.map((job) => JSON.parse(JSON.stringify({
@@ -153,7 +150,6 @@ export async function createConfiguredRuntime(
       tools,
       permissionMode: customization.permissionMode,
       interactiveApprovals: options.interactiveApprovals ?? options.surface !== "cli",
-      ...trustedOpenWorldAuthorization(config),
       runDeadlineMs: config.runDeadlineSec * 1_000,
       maxParallelTools: config.maxParallelTools,
       budgetLimits: customization.budgetLimits,
@@ -164,7 +160,7 @@ export async function createConfiguredRuntime(
       availableProfiles: customization.availableProfiles,
       gatewayForRole: gateways.forRole,
       execution,
-      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? (config.unsafeHostExecRequested === true ? "disposable-container" : "sandboxed") },
+      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? "sandboxed" },
       subjectAttestation,
       skills: customization.skills,
       hooks: customization.hookDefinitions,
@@ -241,6 +237,11 @@ async function prepareComposition(
   deps: RuntimeFactoryDeps,
   options: RuntimeFactoryOptions
 ): Promise<PreparedComposition> {
+  if (config.executionMode === "container") {
+    throw Object.assign(new Error(
+      "The OCI execution backend is not installed for this Sigma build; host execution is never used as a fallback."
+    ), { code: "container_unavailable" });
+  }
   const workspace = await realpath(path.resolve(config.workspace));
   await verifyMcpTrust(config, options, workspace);
   const storeRootDir = await prepareStoreRoot(
@@ -250,8 +251,7 @@ async function prepareComposition(
   const customization = await resolveRuntimeCustomization(config, workspace, undefined, deps.hookDefinitions);
   verifyCustomization(config, workspace, customization);
   const execution = deps.executionBroker ?? new LazyExecutionBroker({
-    sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
-    allowUnsafeHostExec: config.allowUnsafeHostExec === true
+    sandboxMode: "required"
   });
   try {
     const hookRunner = createHookRunner(config, deps, workspace, storeRootDir, customization, execution);
@@ -364,12 +364,12 @@ function createTools(
   executionReport: BrokerDoctorReport,
   storeRootDir: string
 ): EffectToolRegistry {
-  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "full");
+  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
     atomicPatchStateRootDir: storeRootDir,
-    sandboxMode: config.unsafeHostExecRequested === true ? "unsafe" : "required",
-    readScope: config.readScope ?? "host",
+    sandboxMode: "required",
+    readScope: config.readScope ?? "workspace",
     processHandoff: config.processHandoff ?? "allow",
     networkMode: network.defaultMode,
     networkModes: network.modes,

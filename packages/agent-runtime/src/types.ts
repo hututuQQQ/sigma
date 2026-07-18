@@ -33,6 +33,8 @@ export interface RuntimeAgentProfile {
   source: "home" | "workspace" | "builtin";
 }
 
+export type RuntimePermissionMode = "workspace-auto" | "ask" | "auto" | "deny";
+
 export interface RuntimeOptions {
   gateway: ModelGateway;
   tools: ToolExecutor;
@@ -43,12 +45,9 @@ export interface RuntimeOptions {
    * deadline so broker-managed foreground execution remains authoritative.
    * Set false to disable it, or a positive number for an explicit timeout. */
   toolIdleWatchdogMs?: number | false;
-  permissionMode?: "ask" | "auto" | "deny";
+  permissionMode?: RuntimePermissionMode;
   /** Whether this runtime surface can answer a human approval prompt. */
   interactiveApprovals?: boolean;
-  /** Trusted-launcher authorization for headless open-world calls inside an
-   * already disposable container. Never derive this from workspace state. */
-  openWorldAuthorization?: "disposable-container";
   outputReserveTokens?: number;
   budgetLimits?: BudgetLimits;
   checkpointMaxFiles?: number;
@@ -162,6 +161,9 @@ export interface RuntimeSessionInteractionState {
   /** One-shot grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
+  /** Runtime-local convergence guard; infrastructure failures are summarized
+   * instead of being replayed through durable model history. */
+  capabilityFailures: Map<string, number>;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];

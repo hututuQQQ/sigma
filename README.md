@@ -189,7 +189,7 @@ The production package dependency graph is checked for cycles and packages commu
 
 `agent-execution` is the only production package allowed to start arbitrary processes. It talks to the bundled Rust `sigma-exec` broker over a framed protocol. On Windows, each sandboxed command uses an AppContainer identity with scoped filesystem ACLs, a kill-on-close Job Object, capability-gated networking, and ConPTY for interactive processes. Linux uses the native namespace sandbox and a watchdog for process-tree cleanup.
 
-Configuration schema v4 defaults to `sandbox=required`, `read_scope=host`, `network=full`, and `process_handoff=allow`. These defaults expand only declared read and socket capabilities: working directories and every write remain workspace-contained, and required isolation never falls back to unsafe host execution. In `ask` mode, `filesystem.read.external`, `network`, and `process.handoff` require a fresh confirmation for each call; `auto` issues a fresh runtime-bound grant, while `deny` rejects them.
+Configuration schema v5 defaults to `permission_mode=workspace-auto`, `sandbox=required`, `read_scope=workspace`, `network=none`, and the native sandbox backend. Workspace-scoped offline reads and declared writes run automatically; external reads, full network, and repository metadata writes remain separately authorized. Required isolation never falls back to host execution, and `container` mode fails with `container_unavailable` until a real OCI backend is installed.
 
 Absolute external inputs are read through stable no-follow traversal and produce `input_access` evidence with path, digest, and size. Process calls mount only their declared stable read roots. A failed goal input remains an unresolved completion obligation until the same external path is read successfully; a run-created fixture cannot replace it.
 
@@ -202,7 +202,7 @@ Linux advertises `processHandoff` only when safe transfer is available. A `deliv
 Runtime state is stored outside the agent-writable workspace under a workspace-derived user-state directory:
 
 ```text
-<user-state>/sigma/workspaces/<workspace-sha256>/stores/v4/sessions/<session-id>/
+<user-state>/sigma/workspaces/<workspace-sha256>/stores/v5/sessions/<session-id>/
   meta.json
   events/000001.jsonl
   snapshots/000000000250.json
@@ -213,7 +213,7 @@ Event records have checksums and monotonic sequence numbers. Segments rotate at 
 
 ### Completion is a protocol action
 
-A provider `stop` with substantive text is treated as completion intent, and `complete_task` accepts only a summary plus optional warnings. The runtime—not the model—derives plan completion and evidence from the current mutation frontier. Failed, stale, or incomplete semantic validation keeps the run open with a structured repair diagnostic.
+A provider `stop` is only `model_stopped`. The Completion Coordinator independently derives assurance and review requirements from the current mutation frontier and emits `run.completed` only when `model_stopped`, `assurance_satisfied`, and `review_satisfied` are all true. Failed, stale, weak, or incomplete semantic validation produces structured repair guidance or a typed blocker; the model has no completion tool that can bypass the gate.
 
 All net changes require passed semantic validation on the current state. Sealed no-op checkpoints do not advance that frontier; mutating validation is rebound after its checkpoint seals. The standard profile runs independent review as advisory and records findings as warnings; the strict profile requires approval. Active non-detached children are joined before completion, and an unintegrated writer worktree keeps the parent open.
 
@@ -251,19 +251,19 @@ Stable process exit codes are `0` for `Completed`, `2` for `NeedsInput`, `130` f
 Precedence is **CLI flags → environment → workspace `.agent/config.toml` → home `~/.sigma/config.toml` → defaults**. Unknown flags and TOML keys fail immediately. Workspace-authored MCP servers and executable hooks require an explicit digest-bound trust grant.
 
 ```toml
-schema_version = 4
+schema_version = 5
 
 [model]
 provider = "deepseek"
 name = "auto"
 
 [permissions]
-mode = "ask"
+mode = "workspace-auto"
 
 [security]
 sandbox = "required"
-read_scope = "host"
-network = "full"
+read_scope = "workspace"
+network = "none"
 process_handoff = "allow"
 
 [runtime]
@@ -284,19 +284,19 @@ output_format = "text"
 fps = 30
 ```
 
-To restore the strict pre-v4 capability posture, use:
+To opt into broader per-call capabilities, use:
 
 ```toml
-schema_version = 4
+schema_version = 5
 
 [security]
 sandbox = "required"
-read_scope = "workspace"
-network = "none"
+read_scope = "host"
+network = "full"
 process_handoff = "deny"
 ```
 
-Existing schema v2/v3 files can be checked with `agent config migrate --workspace . --check` and atomically upgraded with `agent config migrate --workspace . --write`. Migration keeps the original as `.agent/config.toml.v2.bak` or `.v3.bak`. Workspace configuration may narrow these capabilities but cannot widen a stricter home policy. The equivalent one-run CLI overrides are `--read-scope workspace --network none --process-handoff deny`.
+Older configuration files can be checked with `agent config migrate --workspace . --check` and atomically upgraded with `agent config migrate --workspace . --write`. Durable V5 sessions are written only to `stores/v5`; V5 never reads or falls back to a V4 session store.
 
 DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path, but formal Sigma evaluation remains DeepSeek-only.
 

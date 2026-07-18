@@ -18,16 +18,18 @@ async function main() {
   if (!existsSync(helperPath)) throw new Error(`Native broker not found at ${helperPath}. Run cargo build first.`);
   const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-platform-verify-"));
   const external = await mkdtemp(path.join(os.tmpdir(), "sigma-platform-external-"));
+  const probeExecutable = process.platform === "win32"
+    ? path.resolve(process.env.ComSpec ?? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"))
+    : process.execPath;
   const execution = new SigmaExecBrokerClient({
     helperPath,
-    sandboxMode: "unsafe",
-    allowUnsafeHostExec: false,
+    sandboxMode: "required",
     trustedToolchains: [{
       id: "verification-runtime",
-      runtime: "node",
-      executable: process.execPath,
-      aliases: process.platform === "win32" ? ["node", "node.exe"] : ["node"],
-      executionRoots: [process.execPath],
+      runtime: process.platform === "win32" ? "generic" : "node",
+      executable: probeExecutable,
+      aliases: process.platform === "win32" ? ["cmd", "cmd.exe"] : ["node"],
+      executionRoots: [probeExecutable],
       pathEntries: []
     }]
   });
@@ -51,12 +53,15 @@ async function main() {
     }
 
     const controller = new AbortController();
-    const executable = process.execPath;
+    const executable = probeExecutable;
+    const args = process.platform === "win32"
+      ? ["/d", "/q", "/c", "for /L %i in (1,1,2147483647) do @rem"]
+      : ["-e", "setInterval(() => {}, 1000)"];
     const started = Date.now();
     const pending = runProcess({
       execution,
       executable,
-      args: ["-e", "setInterval(() => {}, 1000)"],
+      args,
       cwd: workspace,
       timeoutMs: 30_000,
       signal: controller.signal,

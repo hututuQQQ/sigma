@@ -184,7 +184,7 @@ describe("durable process lifecycle events", () => {
     state.activeProcessIds.push("process-active");
     const failure = completionFailure(
       runtimeSessionFixture({ state }),
-      call("complete_task"),
+      call("runtime_finalize"),
       { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
       "2026-01-01T00:00:00.000Z"
     );
@@ -209,7 +209,7 @@ describe("durable process lifecycle events", () => {
     });
     const failure = completionFailure(
       target,
-      call("complete_task"),
+      call("runtime_finalize"),
       { possibleEffects: ["outcome.propose"] } as ToolDescriptor,
       "2026-01-01T00:00:00.000Z"
     );

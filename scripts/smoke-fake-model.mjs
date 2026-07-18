@@ -21,8 +21,7 @@ export function fakeProcessValidationTurn(id, relativePath, expected) {
   return () => fakeToolTurn([fakeToolCall(id, "validate", {
       executable: "./sigma-smoke-validate",
       args: [relativePath, expected],
-      access: "readonly",
-      readRoots: ["."]
+      access: "readonly"
     })]);
 }
 
@@ -174,12 +173,9 @@ export function fakeFinalTurn(content = "done") {
   return () => ({
     message: {
       role: "assistant",
-      content: "",
-      toolCalls: [fakeToolCall("complete-smoke", "complete_task", {
-        summary: content
-      })]
+      content
     },
-    finishReason: "tool_calls",
+    finishReason: "stop",
     inputTokens: 1,
     outputTokens: 1
     });

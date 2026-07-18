@@ -1,4 +1,4 @@
-import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import path from "node:path";
 import {
   BrokerPolicyError,
@@ -20,6 +20,7 @@ export interface NormalizedTrustedToolchain {
   id: string;
   executable: string;
   aliases: string[];
+  aliasArguments: Record<string, string[]>;
   executionRoots: string[];
   runtimeRoots: string[];
   pathEntries: string[];
@@ -90,6 +91,37 @@ function normalizeToolchainAliases(
     aliasIdentifiers.add(key);
   }
   return [...aliases];
+}
+
+function normalizeAliasArguments(
+  entry: TrustedToolchainManifestEntry,
+  aliases: string[],
+  runtimeRoots: string[]
+): Record<string, string[]> {
+  const configured = entry.aliasArguments ?? {};
+  if (!configured || typeof configured !== "object" || Array.isArray(configured)) {
+    throw new BrokerPolicyError(`Trusted toolchain '${entry.id}' aliasArguments must be an object.`);
+  }
+  const accepted = new Set(aliases.map(aliasKey));
+  const normalized: Record<string, string[]> = {};
+  for (const [alias, args] of Object.entries(configured)) {
+    if (!accepted.has(aliasKey(alias))) {
+      throw new BrokerPolicyError(`Trusted toolchain '${entry.id}' has arguments for unknown alias '${alias}'.`);
+    }
+    if (!Array.isArray(args) || args.length === 0
+      || args.some((argument) => typeof argument !== "string" || argument.length === 0 || argument.includes("\0"))) {
+      throw new BrokerPolicyError(`Trusted toolchain alias '${alias}' arguments must be non-empty NUL-free strings.`);
+    }
+    const entryPoint = args[0]!;
+    if (!path.isAbsolute(entryPoint)
+      || !runtimeRoots.some((root) => pathWithin(entryPoint, root))) {
+      throw new BrokerPolicyError(
+        `Trusted toolchain alias '${alias}' entry point must be inside a declared runtime root.`
+      );
+    }
+    normalized[aliasKey(alias)] = [...args];
+  }
+  return normalized;
 }
 
 function normalizedAbsolutePaths(values: string[], label: string): string[] {
@@ -165,6 +197,7 @@ function normalizeTrustedToolchain(
     id: entry.id,
     executable,
     aliases,
+    aliasArguments: normalizeAliasArguments(entry, aliases, runtimeRoots),
     ...roots,
     runtimeRoots,
     environment: createMinimalEnvironment({ overrides: entry.environment ?? {} }, {}, process.platform),
@@ -317,52 +350,7 @@ export function trustedExecutableSha256(
   return toolchain.executableSha256;
 }
 
-function existingCanonicalFile(candidate: string): string | undefined {
-  try {
-    if (!statSync(candidate).isFile()) return undefined;
-    return realpathSync.native(candidate);
-  } catch {
-    return undefined;
-  }
-}
-
-function executableNames(executable: string, toolchains: NormalizedTrustedToolchain[]): string[] {
-  if (process.platform !== "win32" || path.extname(executable) !== "") return [executable];
-  const pathExt = toolchains.flatMap((toolchain) => {
-    const key = environmentKey(toolchain.environment, "PATHEXT");
-    return key === undefined ? [] : [toolchain.environment[key]!];
-  })[0] ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD";
-  return pathExt.split(";").filter(Boolean).map((extension) => `${executable}${extension}`);
-}
-
-function resolveToolchainPathExecutable(
-  executable: string,
-  cwd: string | undefined,
-  toolchains: NormalizedTrustedToolchain[]
-): string | undefined {
-  if (cwd !== undefined && path.parse(executable).dir !== "") {
-    return existingCanonicalFile(path.resolve(cwd, executable));
-  }
-  const names = executableNames(executable, toolchains);
-  for (const directory of toolchains.flatMap((toolchain) => toolchain.pathEntries)) {
-    for (const name of names) {
-      const candidate = existingCanonicalFile(path.join(directory, name));
-      if (candidate !== undefined) return candidate;
-    }
-  }
-  return undefined;
-}
-
-export function resolveTrustedExecutable(
-  executable: string,
-  toolchains: NormalizedTrustedToolchain[],
-  cwd?: string
-): string {
-  if (path.isAbsolute(executable)) return executable;
-  const key = aliasKey(executable);
-  const match = toolchains.find((toolchain) => toolchain.aliases.some((alias) => aliasKey(alias) === key));
-  return match?.executable ?? resolveToolchainPathExecutable(executable, cwd, toolchains) ?? executable;
-}
+export { resolveTrustedExecutable, resolveTrustedInvocation } from "./trusted-toolchain-resolution.js";
 
 function environmentKey(environment: Record<string, string>, requested: string): string | undefined {
   if (process.platform !== "win32") return Object.hasOwn(environment, requested) ? requested : undefined;

@@ -40,7 +40,7 @@ const releaseQuality = [
   stage("lint", "pnpm", "lint"),
   stage("coverage", "pnpm", "test:coverage"),
   stage("native-coverage", "pnpm", "test:coverage:native-protocol"),
-  stage("v4-replay", "pnpm", "perf:replay-v4-100k"),
+  stage("v5-replay", "pnpm", "perf:replay-v5-100k"),
   stage("product-smoke", "pnpm", "smoke:product"),
   stage("tui-smoke", "pnpm", "smoke:tui-product")
 ] as const;

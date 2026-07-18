@@ -520,12 +520,12 @@ class SigmaCliHarborAgent(BaseAgent):
         if agent_profile not in {"standard", "strict"}:
             raise ValueError("agent_profile must be one of: standard, strict")
         self.agent_profile = agent_profile
-        if network_mode not in {"none", "full"}:
-            raise ValueError("network_mode must be one of: none, full")
+        if network_mode not in {"none", "loopback", "full"}:
+            raise ValueError("network_mode must be one of: none, loopback, full")
         self.network_mode = network_mode
-        if execution_mode not in {"sandboxed", "disposable-container"}:
+        if execution_mode not in {"sandboxed", "container"}:
             raise ValueError(
-                "execution_mode must be one of: sandboxed, disposable-container"
+                "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
         self.effective_network_mode: str | None = network_mode
@@ -565,7 +565,6 @@ class SigmaCliHarborAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
-        await self._configure_execution_mode(environment)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
             await self._verify_agent_ready(environment)
@@ -584,26 +583,6 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self._write_setup_checks([], "agent_setup_failed")
         raise RuntimeError(message)
-
-    async def _configure_execution_mode(self, environment: BaseEnvironment) -> None:
-        """Create an isolated home opt-in for an explicitly disposable run.
-
-        The adapter never infers this mode from a task or environment. Keeping
-        the opt-in under a dedicated HOME also prevents a workspace config from
-        granting itself host execution privileges.
-        """
-        if self.execution_mode != "disposable-container":
-            return
-        command = (
-            "umask 077; mkdir -p /tmp/agent/disposable-home/.sigma; "
-            "printf '[security]\\nallow_unsafe_host_exec = true\\n' "
-            "> /tmp/agent/disposable-home/.sigma/config.toml"
-        )
-        configured = await environment.exec(command, timeout_sec=30)
-        if _return_code(configured) != 0:
-            raise RuntimeError(
-                "agent_setup_failed: could not create the disposable-container home opt-in"
-            )
 
     async def run(
         self,
@@ -844,10 +823,7 @@ class SigmaCliHarborAgent(BaseAgent):
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        command = []
-        if self.execution_mode == "disposable-container":
-            command.extend(["env", "HOME=/tmp/agent/disposable-home"])
-        command.extend([
+        command = [
             "/usr/local/bin/agent",
             "run",
             "--workspace",
@@ -869,16 +845,16 @@ class SigmaCliHarborAgent(BaseAgent):
             "--process-handoff",
             "allow",
             "--permission-mode",
-            "auto",
+            "workspace-auto",
+            "--execution-mode",
+            self.execution_mode,
             "--output-format",
             "stream-json",
             "--output-schema",
             "3",
             "--stream-json-max-line-bytes",
             "49152",
-        ])
-        if self.execution_mode == "disposable-container":
-            command.extend(["--execution-mode", "disposable-container"])
+        ]
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
         return command
@@ -1273,10 +1249,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     def _session_command(self, subcommand: str, session_id: str) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        command: list[str] = []
-        if self.execution_mode == "disposable-container":
-            command.extend(["env", "HOME=/tmp/agent/disposable-home"])
-        command.extend([
+        command: list[str] = [
             "/usr/local/bin/agent",
             "session",
             subcommand,
@@ -1290,16 +1263,16 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "--agent-profile",
             self.agent_profile,
             "--permission-mode",
-            "auto",
+            "workspace-auto",
+            "--execution-mode",
+            self.execution_mode,
             "--network",
             self.network_mode,
             "--read-scope",
             self.effective_read_scope,
             "--process-handoff",
             "allow",
-        ])
-        if self.execution_mode == "disposable-container":
-            command.extend(["--execution-mode", "disposable-container"])
+        ]
         return command
 
     async def _read_session_events(
@@ -1671,24 +1644,6 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
         checks: list[dict[str, Any]] = []
-        if self.execution_mode == "disposable-container":
-            write_probe = await environment.exec(
-                "printf 'sigma-disposable-persistence-v1\\n' > /tmp/agent/disposable-persistence-probe",
-                timeout_sec=30,
-            )
-            checks.append(self._setup_check_record("disposable_persistence_write", write_probe))
-            if _return_code(write_probe) != 0:
-                self._write_setup_checks(checks, "agent_setup_failed")
-                raise RuntimeError(self._setup_failure_message("disposable_persistence_write", write_probe))
-            read_probe = await environment.exec(
-                "test \"$(cat /tmp/agent/disposable-persistence-probe)\" = "
-                "sigma-disposable-persistence-v1; rm -f /tmp/agent/disposable-persistence-probe",
-                timeout_sec=30,
-            )
-            checks.append(self._setup_check_record("disposable_persistence_read", read_probe))
-            if _return_code(read_probe) != 0:
-                self._write_setup_checks(checks, "agent_setup_failed")
-                raise RuntimeError(self._setup_failure_message("disposable_persistence_read", read_probe))
         help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
         checks.append(self._setup_check_record("help", help_check))
         self._write_setup_checks(checks, "running")

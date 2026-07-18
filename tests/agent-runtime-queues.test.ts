@@ -286,7 +286,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       kind: "completed", message: "The file contains seed."
     });
     expect(gateway.requests).toHaveLength(2);
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
   }, 30_000);
 
@@ -336,7 +336,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1].toolChoice).toBeUndefined();
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
@@ -397,7 +397,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[1].toolChoice).toBeUndefined();
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("request_user_input");
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("complete_task");
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
     expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
   }, 30_000);
 
@@ -487,7 +487,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: {
           role: "assistant" as const,
           content: "",
-          toolCalls: [{ id: `malformed-complete-${attempt}`, name: "complete_task", arguments: {} }]
+          toolCalls: [{ id: `malformed-complete-${attempt}`, name: "runtime_finalize", arguments: {} }]
         },
         finishReason: "tool_calls" as const
       }))
@@ -507,7 +507,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     expect(gateway.requests).toHaveLength(3);
     for (const request of gateway.requests) {
-      expect(request.tools?.map((tool) => tool.name)).toContain("complete_task");
+      expect(request.tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
       expect(request.tools?.map((tool) => tool.name)).toContain("read");
     }
   }, 30_000);
@@ -557,7 +557,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
       {
         message: {
           role: "assistant", content: "",
-          toolCalls: [{ id: "invalid-before-read", name: "complete_task", arguments: {} }]
+          toolCalls: [{ id: "invalid-before-read", name: "runtime_finalize", arguments: {} }]
         },
         finishReason: "tool_calls"
       },
@@ -741,7 +741,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     ]],
     ["multiple terminal calls", [
       { id: "ask-terminal-first", name: "request_user_input", arguments: { message: "Need input." } },
-      { id: "complete-terminal-second", name: "complete_task", arguments: {} }
+      { id: "complete-terminal-second", name: "runtime_finalize", arguments: {} }
     ]]
   ])("rejects a conflicting %s batch before any call executes", async (_label, toolCalls) => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-batch-"));
@@ -1049,7 +1049,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.completionRepairAttempts).toBe(1);
   });
 
-  it("does not synthesize a V3 completion-repair state while rebuilding V4 events", async () => {
+  it("does not synthesize a V3 completion-repair state while rebuilding V5 events", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-completion-repair-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const sessionId = "legacy-completion-session";
@@ -1159,15 +1159,15 @@ describe("runtime queues and non-blocking instruction steering", () => {
       message: {
         role: "assistant",
         content: "",
-        toolCalls: [{ id: "complete-first", name: "complete_task", arguments: {} }]
+        toolCalls: [{ id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "first done" } }]
       },
-      toolCalls: [{ id: "complete-first", name: "complete_task", arguments: {} }],
+      toolCalls: [{ id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "first done" } }],
       finishReason: "tool_calls"
     });
     await append(firstRunId, "tool.completed", {
       turnId: 1,
       effectRevision: 3,
-      callId: "complete-first",
+      callId: "runtime_completion_intent_1_3",
       ok: true,
       output: JSON.stringify({ summary: "first done", criteria: [] }),
       observedEffects: ["outcome.propose"],

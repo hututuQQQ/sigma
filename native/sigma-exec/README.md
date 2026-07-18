@@ -21,5 +21,5 @@ network access, and ConPTY for interactive background processes. Run
 `agent sandbox setup` once per Windows user to create and verify the base
 profile. A failed setup or self-test is never replaced with host execution.
 
-Unsafe host execution requires both the broker launch flag
-`--allow-unsafe-host-exec` and `unsafeHostExecApproved: true` on every request.
+V5 has no unsafe host-execution switch. Commands must use the native sandbox;
+an OCI execution mode must be backed by a real container runtime or fail closed.

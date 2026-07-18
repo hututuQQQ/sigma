@@ -26,14 +26,12 @@ export interface CliConfig {
   provider: "deepseek" | "glm";
   model: string;
   agentProfile: string;
-  permissionMode: "ask" | "auto" | "deny";
+  permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";
-  executionMode: "sandboxed" | "disposable-container";
+  executionMode: "sandboxed" | "container";
   readScope: "workspace" | "host";
-  networkMode: "none" | "full";
+  networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
-  allowUnsafeHostExec: boolean;
-  unsafeHostExecRequested: boolean;
   reviewerWaiver: boolean;
   legacySingleModelRoute: boolean;
   modelSpecs: ModelSpecConfigValue[];
@@ -148,18 +146,6 @@ function configInputs(flags: Record<string, unknown>, options: CliConfigLoadOpti
   };
 }
 
-function assertUnsafeHostConfiguration(flags: Record<string, unknown>, document: TomlDocument | undefined): void {
-  const security = document?.values.security;
-  const workspaceOptIn = security && typeof security === "object" && !Array.isArray(security)
-    && (security as Record<string, unknown>).allow_unsafe_host_exec === true;
-  if (workspaceOptIn) {
-    throw new Error("security.allow_unsafe_host_exec is home-only and cannot be enabled by workspace configuration.");
-  }
-  if (Object.hasOwn(flags, "allow-unsafe-host-exec")) {
-    throw new Error("--allow-unsafe-host-exec is not accepted; set security.allow_unsafe_host_exec in ~/.sigma/config.toml and use --unsafe-host-exec per run.");
-  }
-}
-
 function mcpTrustAttestation(
   source: McpConfigSource,
   grant: boolean,
@@ -200,22 +186,6 @@ function customizationTrustAttestation(
   };
 }
 
-function unsafeHostSettings(values: ReturnType<typeof resolveConfig>): {
-  executionMode: "sandboxed" | "disposable-container";
-  allowUnsafeHostExec: boolean;
-  unsafeHostExecRequested: boolean;
-} {
-  const allowUnsafeHostExec = values.allowUnsafeHostExec === true;
-  const executionMode = values.executionMode === "disposable-container" || values.unsafeHostExec === true
-    ? "disposable-container"
-    : "sandboxed";
-  const unsafeHostExecRequested = executionMode === "disposable-container";
-  if (unsafeHostExecRequested && !allowUnsafeHostExec) {
-    throw new Error("--execution-mode disposable-container requires security.allow_unsafe_host_exec=true in ~/.sigma/config.toml (--unsafe-host-exec is a compatibility alias).");
-  }
-  return { executionMode, allowUnsafeHostExec, unsafeHostExecRequested };
-}
-
 function cliConfig(
   values: ReturnType<typeof resolveConfig>,
   input: ConfigInputs,
@@ -225,7 +195,6 @@ function cliConfig(
   trust: WorkspaceMcpTrustAttestation | undefined,
   customizationTrust: WorkspaceCustomizationTrustAttestation | undefined
 ): CliConfig {
-  const unsafe = unsafeHostSettings(values);
   return {
     workspace: path.resolve(input.workspace, String(values.workspace)),
     provider: values.provider as CliConfig["provider"],
@@ -233,10 +202,10 @@ function cliConfig(
     agentProfile: String(values.agentProfile),
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
+    executionMode: values.executionMode as CliConfig["executionMode"],
     readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
-    ...unsafe,
     reviewerWaiver: values.reviewerWaiver === true,
     legacySingleModelRoute,
     modelSpecs: values.modelSpecs as ModelSpecConfigValue[],
@@ -267,7 +236,6 @@ function cliConfig(
 
 export function loadCliConfig(flags: Record<string, unknown>, options: CliConfigLoadOptions = {}): CliConfig {
   const input = configInputs(flags, options);
-  assertUnsafeHostConfiguration(flags, input.workspaceDocument);
   const values = resolveConfig({
     flags,
     env: input.env,

@@ -90,6 +90,7 @@ const TOKEN_SECURITY_ATTRIBUTE_TYPE_INT64: u16 = 1;
 const TOKEN_SECURITY_ATTRIBUTE_TYPE_UINT64: u16 = 2;
 const RECOVERY_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_PRODUCT: &str = "sigma-exec";
+const ROOT_LEASE_RECOVERY_PRODUCT: &str = "sigma-exec-v5-root-lease";
 const RECOVERY_DIRECTORY: &str = "sandbox-recovery";
 const RECOVERY_MUTEX_PREFIX: &str = "Global\\SigmaCode.sigma-exec.sandbox-acl.v3";
 const MAX_RECOVERY_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -246,7 +247,7 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
     // tree preflight. The launcher repeats this check before any ACL mutation
     // and again immediately before CreateProcess, preserving defense in depth.
     resolve_executable(params)?;
-    validate_writable_acl_trees(params)?;
+    validate_writable_acl_roots(params)?;
     let failure_nonce = secure_nonce("launch failure marker")?;
     let payload = serde_json::to_vec(&LauncherBootstrap {
         params: params.clone(),
@@ -290,7 +291,7 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
     })
 }
 
-fn validate_writable_acl_trees(params: &ProcessParams) -> Result<(), RpcError> {
+fn validate_writable_acl_roots(params: &ProcessParams) -> Result<(), RpcError> {
     let read = canonical_unique(&params.policy.read_roots)?;
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let mut protected = params.policy.protected_paths.clone();
@@ -300,45 +301,17 @@ fn validate_writable_acl_trees(params: &ProcessParams) -> Result<(), RpcError> {
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
     let protected = canonical_protected(&protected, &write)?;
-    let mut scanned = 0;
     for root in &write {
-        validate_writable_acl_tree(root, root, &protected, &mut scanned, 0)?;
-    }
-    Ok(())
-}
-
-fn validate_writable_acl_tree(
-    path: &Path,
-    writable_root: &Path,
-    protected: &[PathBuf],
-    scanned: &mut usize,
-    depth: usize,
-) -> Result<(), RpcError> {
-    check_acl_tree_limits(scanned, depth, "writable ACL validation")?;
-    let is_directory = inspect_acl_target_path(path, Some(writable_root))?;
-    if protected.iter().any(|item| recovery_path_eq(item, path)) {
-        return Ok(());
-    }
-    if !is_directory {
-        return Ok(());
-    }
-    let entries = std::fs::read_dir(path).map_err(|error| {
-        RpcError::new(
-            "policy_denied",
-            format!(
-                "cannot inspect writable ACL tree '{}': {error}",
-                path.display()
-            ),
-        )
-    })?;
-    for entry in entries {
-        validate_writable_acl_tree(
-            &entry.map_err(RpcError::from)?.path(),
-            writable_root,
-            protected,
-            scanned,
-            depth + 1,
-        )?;
+        inspect_acl_target_path(root, Some(root))?;
+        if protected.iter().any(|item| windows_path_within(root, item)) {
+            return Err(RpcError::new(
+                "write_scope_invalid",
+                format!(
+                    "sandbox write root contains protected repository metadata: '{}'",
+                    root.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -412,6 +385,9 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // executable is resolved and authorized again immediately before launch,
     // so this is only a fail-fast check and does not weaken the TOCTOU guard.
     resolve_executable(&params)?;
+    if params.policy.write_roots.is_empty() {
+        return run_with_workspace_read_lease(&params);
+    }
     let profile_name = ephemeral_profile_name()?;
     // Persist the profile intent before profile creation. A hard kill in the
     // narrow create/journal window can therefore still be recovered exactly.
@@ -432,7 +408,7 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // writer from inside the sandbox.
     let granted = {
         let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
-        grant_policy_access(&params, profile.sid, &user_profile, &mut journal)
+        grant_root_lease_access(&params, profile.sid, &user_profile, &mut journal)
     };
     let result = match granted {
         Ok(()) => launch_appcontainer(&params, profile.sid),
@@ -447,6 +423,278 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     drop(profile);
     drop(journal);
     result
+}
+
+/// Read-only commands use a stable AppContainer identity bound to the opened
+/// workspace object. Its root ACEs are durable leases, so warm launches do no
+/// repository traversal and do not create per-object recovery entries.
+fn run_with_workspace_read_lease(params: &ProcessParams) -> Result<i32, RpcError> {
+    let workspace = workspace_lease_root(params)?;
+    let recovery = base_recovery_directory()?;
+    let (profile, generation) = {
+        let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
+        let generation = workspace_read_generation(&recovery, &workspace)?;
+        let profile_name = workspace_read_profile_name(&workspace, generation)?;
+        let profile = open_or_create_profile(&profile_name)?;
+        let appcontainer_profile = appcontainer_folder(profile.sid)?;
+        let user_profile = host_user_profile(&appcontainer_profile)?;
+        ensure_workspace_read_lease(params, profile.sid, &user_profile)?;
+        (profile, generation)
+    };
+    let _generation = generation;
+    launch_appcontainer(params, profile.sid)
+}
+
+fn workspace_lease_root(params: &ProcessParams) -> Result<RecoveryRootIdentity, RpcError> {
+    let cwd = params.command.cwd.canonicalize().map_err(|error| {
+        RpcError::new(
+            "filesystem_acl_unsupported",
+            format!("cannot identify workspace lease root: {error}"),
+        )
+    })?;
+    let roots = canonical_unique(&params.policy.read_roots)?;
+    let root = roots
+        .iter()
+        .filter(|root| windows_path_within(root, &cwd))
+        .min_by_key(|root| root.components().count())
+        .ok_or_else(|| {
+            RpcError::new(
+                "write_scope_invalid",
+                "sandbox cwd is not contained by a workspace read capability",
+            )
+        })?;
+    workspace_root_identity(root)
+}
+
+fn workspace_root_identity(root: &Path) -> Result<RecoveryRootIdentity, RpcError> {
+    let root = root.canonicalize().map_err(|error| {
+        RpcError::new(
+            "filesystem_acl_unsupported",
+            format!("cannot canonicalize workspace lease root: {error}"),
+        )
+    })?;
+    let handle = open_acl_target(&root)?;
+    assert_acl_handle_target(&handle, &root, None)?;
+    let information = acl_target_information(handle.0)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(RpcError::new(
+            "filesystem_acl_unsupported",
+            "workspace lease root is not a directory",
+        ));
+    }
+    Ok(RecoveryRootIdentity {
+        path: final_handle_path(handle.0)?,
+        identity: acl_target_identity(handle.0)?,
+    })
+}
+
+pub(crate) fn workspace_lease_status(workspace: &Path) -> Result<Value, RpcError> {
+    let workspace = workspace_root_identity(workspace)?;
+    let recovery = base_recovery_directory()?;
+    let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
+    let generation = workspace_read_generation(&recovery, &workspace)?;
+    let profile_name = workspace_read_profile_name(&workspace, generation)?;
+    let active = if let Ok(sid) = derive_profile_sid(&profile_name) {
+        let active = appcontainer_folder(sid).is_ok_and(|folder| folder.exists());
+        unsafe { FreeSid(sid) };
+        active
+    } else {
+        false
+    };
+    let identity = workspace_read_identity_digest(&workspace);
+    Ok(json!({
+        "leaseId": format!("read:{}:g{generation}", &identity[..32]),
+        "workspaceIdentity": identity,
+        "generation": generation,
+        "principalId": profile_name,
+        "access": "read",
+        "roots": [workspace.path],
+        "state": if active { "active" } else { "retired" },
+    }))
+}
+
+pub(crate) fn revoke_workspace_lease(workspace: &Path) -> Result<Value, RpcError> {
+    let workspace = workspace_root_identity(workspace)?;
+    let recovery = base_recovery_directory()?;
+    let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
+    let generation = workspace_read_generation(&recovery, &workspace)?;
+    let profile_name = workspace_read_profile_name(&workspace, generation)?;
+    delete_profile(&profile_name)?;
+    let next_generation = generation.checked_add(1).ok_or_else(|| {
+        RpcError::new(
+            "sandbox_recovery_required",
+            "workspace lease generation overflow",
+        )
+    })?;
+    persist_workspace_read_generation(&recovery, &workspace, next_generation)?;
+    Ok(json!({
+        "revoked": true,
+        "retiredPrincipalId": profile_name,
+        "generation": next_generation,
+    }))
+}
+
+fn workspace_read_identity_digest(workspace: &RecoveryRootIdentity) -> String {
+    let normalized = workspace.path.to_string_lossy().to_lowercase();
+    let mut digest = Sha256::new();
+    digest.update(b"SigmaCode.WorkspaceRead.v5\0");
+    digest.update(normalized.as_bytes());
+    digest.update(workspace.identity.volume_serial_number.to_le_bytes());
+    digest.update(workspace.identity.file_id);
+    format!("{:x}", digest.finalize())
+}
+
+fn workspace_read_profile_name(
+    workspace: &RecoveryRootIdentity,
+    generation: u64,
+) -> Result<String, RpcError> {
+    let value = workspace_read_identity_digest(workspace);
+    Ok(format!("SigmaCode.Read.v5.{}.g{generation}", &value[..24]))
+}
+
+fn workspace_read_generation_path(recovery: &Path, workspace: &RecoveryRootIdentity) -> PathBuf {
+    let value = workspace_read_identity_digest(workspace);
+    recovery.join(format!("workspace-read-{}.generation", &value[..32]))
+}
+
+fn workspace_read_generation(
+    recovery: &Path,
+    workspace: &RecoveryRootIdentity,
+) -> Result<u64, RpcError> {
+    let path = workspace_read_generation_path(recovery, workspace);
+    match std::fs::read_to_string(&path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                RpcError::new(
+                    "sandbox_recovery_required",
+                    format!(
+                        "invalid workspace lease generation file '{}'",
+                        path.display()
+                    ),
+                )
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(1),
+        Err(error) => Err(RpcError::new(
+            "sandbox_recovery_required",
+            format!(
+                "cannot read workspace lease generation '{}': {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn persist_workspace_read_generation(
+    recovery: &Path,
+    workspace: &RecoveryRootIdentity,
+    generation: u64,
+) -> Result<(), RpcError> {
+    let path = workspace_read_generation_path(recovery, workspace);
+    let temporary = path.with_extension(format!("{}.tmp", secure_nonce("lease generation")?));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        writeln!(file, "{generation}")?;
+        file.sync_all()?;
+        drop(file);
+        let source = wide_null(temporary.as_os_str());
+        let destination = wide_null(path.as_os_str());
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(last_error("MoveFileExW(workspace lease generation)"));
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn open_or_create_profile(name: &str) -> Result<Profile, RpcError> {
+    match create_profile(name, false) {
+        Ok(profile) => Ok(profile),
+        Err(error) if error.code == "sandbox_profile_exists" => Ok(Profile {
+            name: name.into(),
+            sid: derive_profile_sid(name)?,
+            delete_on_drop: false,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_workspace_read_lease(
+    params: &ProcessParams,
+    sid: PSID,
+    user_profile: &Path,
+) -> Result<(), RpcError> {
+    let mut declared = params.policy.read_roots.clone();
+    declared.extend(params.policy.execution_roots.iter().cloned());
+    let roots = minimal_windows_roots(&canonical_unique(&declared)?);
+    for path in policy_ancestor_paths(params, user_profile)? {
+        ensure_persistent_acl(
+            &path,
+            sid,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            false,
+            false,
+        )?;
+    }
+    for root in roots {
+        let handle = open_acl_target(&root)?;
+        assert_acl_handle_target(&handle, &root, None)?;
+        let information = acl_target_information(handle.0)?;
+        let directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        ensure_persistent_acl(
+            &root,
+            sid,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            directory,
+            directory,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_persistent_acl(
+    path: &Path,
+    sid: PSID,
+    permissions: u32,
+    inherit: bool,
+    propagate_inheritance: bool,
+) -> Result<(), RpcError> {
+    let handle = open_acl_target(path)?;
+    assert_acl_handle_target(&handle, path, None)?;
+    let count = count_exact_acl_entries_for_handle(
+        &handle,
+        sid,
+        permissions,
+        expected_explicit_ace_flags(inherit),
+    )?;
+    if count > 0 {
+        return Ok(());
+    }
+    update_acl_handle(
+        &handle,
+        path,
+        sid,
+        permissions,
+        GRANT_ACCESS,
+        inherit,
+        propagate_inheritance,
+    )
 }
 
 fn validate_launcher_params(params: &ProcessParams) -> Result<(), RpcError> {
@@ -628,6 +876,84 @@ fn secure_nonce(label: &str) -> Result<String, RpcError> {
     Ok(nonce)
 }
 
+/// V5 writer capability: journal and grant only declared roots. Windows may
+/// propagate inheritable ACEs internally, but Sigma never enumerates the
+/// repository and the durable journal stays O(number of capability roots).
+/// The per-command profile is retired before recovery, so an interrupted ACL
+/// cleanup leaves an inert SID instead of a reusable writer token.
+fn grant_root_lease_access(
+    params: &ProcessParams,
+    sid: PSID,
+    user_profile: &Path,
+    journal: &mut RecoveryJournal,
+) -> Result<(), RpcError> {
+    let mut readable = params.policy.read_roots.clone();
+    readable.extend(params.policy.execution_roots.iter().cloned());
+    let declared_read = canonical_unique(&readable)?;
+    let read = minimal_windows_roots(&declared_read);
+    let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
+    let mut protected = params.policy.protected_paths.clone();
+    protected.extend(
+        minimal_roots(&canonical_unique(&params.policy.read_roots)?)
+            .into_iter()
+            .flat_map(|root| [root.join(".git"), root.join(".agent")]),
+    );
+    let protected = canonical_protected(&protected, &write)?;
+    let mut plan = Vec::new();
+    for path in policy_ancestor_paths(params, user_profile)? {
+        plan.push(PlannedAcl {
+            path,
+            permissions: FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            inherit: false,
+            propagate_inheritance: false,
+            read_reparse_target: None,
+            writable_root: None,
+        });
+    }
+    for root in read {
+        let Some((directory, reparse_target)) =
+            inspect_read_acl_target_path(&root, &declared_read)?
+        else {
+            continue;
+        };
+        plan.push(PlannedAcl {
+            path: root,
+            permissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            inherit: directory && reparse_target.is_none(),
+            propagate_inheritance: directory && reparse_target.is_none(),
+            read_reparse_target: reparse_target,
+            writable_root: None,
+        });
+    }
+    for root in write {
+        if protected
+            .iter()
+            .any(|item| windows_path_within(&root, item))
+        {
+            return Err(RpcError::new(
+                "write_scope_invalid",
+                format!(
+                    "sandbox write root contains protected metadata: '{}'",
+                    root.display()
+                ),
+            ));
+        }
+        let directory = inspect_acl_target_path(&root, Some(&root))?;
+        plan.push(PlannedAcl {
+            path: root.clone(),
+            permissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            inherit: directory,
+            propagate_inheritance: directory,
+            read_reparse_target: None,
+            writable_root: directory.then_some(root),
+        });
+    }
+    journal.snapshot.product = ROOT_LEASE_RECOVERY_PRODUCT.into();
+    journal.prepare(&plan, sid)?;
+    journal.apply(&plan, sid)
+}
+
+#[allow(dead_code)]
 fn grant_policy_access(
     params: &ProcessParams,
     sid: PSID,
@@ -691,7 +1017,11 @@ fn policy_ancestor_paths(
     let mut declared = params.policy.read_roots.clone();
     declared.extend(params.policy.write_roots.iter().cloned());
     declared.extend(params.policy.execution_roots.iter().cloned());
-    let roots = canonical_unique(&declared)?;
+    // Capabilities nested below another declared root need no separate
+    // traversal chain. Collapsing first keeps warm lease checks proportional
+    // to the effective roots (for example workspace + external runtime), not
+    // to every executable and dependency path inside the workspace.
+    let roots = minimal_windows_roots(&canonical_unique(&declared)?);
     let root_keys = roots
         .iter()
         .map(|path| path.to_string_lossy().to_lowercase())
@@ -958,19 +1288,6 @@ fn read_acl_directory(path: &Path, context: &str) -> Result<Vec<PathBuf>, RpcErr
         })?
         .map(|entry| entry.map(|item| item.path()).map_err(RpcError::from))
         .collect()
-}
-
-fn check_acl_tree_limits(scanned: &mut usize, depth: usize, context: &str) -> Result<(), RpcError> {
-    *scanned += 1;
-    if *scanned > MAX_RECOVERY_ENTRIES || depth > MAX_RECOVERY_SCAN_DEPTH {
-        return Err(RpcError::new(
-            "policy_denied",
-            format!(
-                "{context} exceeds sandbox ACL traversal limits (maximum {MAX_RECOVERY_ENTRIES} objects; declare narrower read roots)"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn check_acl_plan_limits(
@@ -2802,7 +3119,9 @@ fn validate_recovery_snapshot(
     snapshot: &RecoverySnapshot,
     journal_path: &Path,
 ) -> Result<(), RpcError> {
-    if snapshot.schema_version != RECOVERY_SCHEMA_VERSION || snapshot.product != RECOVERY_PRODUCT {
+    if snapshot.schema_version != RECOVERY_SCHEMA_VERSION
+        || (snapshot.product != RECOVERY_PRODUCT && snapshot.product != ROOT_LEASE_RECOVERY_PRODUCT)
+    {
         return Err(RpcError::new(
             "sandbox_recovery_failed",
             "sandbox recovery journal has an unsupported schema or product",
@@ -2956,10 +3275,28 @@ fn recover_stale_profiles(directory: &Path) -> Result<(), RpcError> {
             continue;
         }
         let sid = derive_profile_sid(&snapshot.profile_name)?;
-        let cleanup = cleanup_recovery_snapshot(&snapshot, sid);
+        // Retire V5 writer credentials before touching ACLs. If cleanup is
+        // interrupted, the remaining SID grants cannot be used to mint a new
+        // token and later repair can remove them without blocking execution.
+        if snapshot.product == ROOT_LEASE_RECOVERY_PRODUCT {
+            delete_profile(&snapshot.profile_name)?;
+        }
+        let cleanup = if snapshot.product == ROOT_LEASE_RECOVERY_PRODUCT {
+            cleanup_root_lease_snapshot(&snapshot, sid)
+        } else {
+            cleanup_recovery_snapshot(&snapshot, sid)
+        };
         unsafe { FreeSid(sid) };
-        cleanup?;
-        delete_profile(&snapshot.profile_name)?;
+        if let Err(_error) = cleanup {
+            if snapshot.product == ROOT_LEASE_RECOVERY_PRODUCT {
+                claim.restore_canonical()?;
+                continue;
+            }
+            return Err(_error);
+        }
+        if snapshot.product != ROOT_LEASE_RECOVERY_PRODUCT {
+            delete_profile(&snapshot.profile_name)?;
+        }
         claim.remove()?;
     }
     Ok(())
@@ -3071,6 +3408,40 @@ fn cleanup_recovery_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(
         }
     }
     verify_recovery_scopes(snapshot, sid, &writable_roots, &resolved_paths)
+}
+
+fn cleanup_root_lease_snapshot(snapshot: &RecoverySnapshot, sid: PSID) -> Result<(), RpcError> {
+    for entry in snapshot.entries.iter().rev() {
+        if !entry.path.try_exists().map_err(RpcError::from)? {
+            return Err(RpcError::new(
+                "sandbox_recovery_required",
+                format!(
+                    "root lease cleanup target moved or disappeared: '{}'",
+                    entry.path.display()
+                ),
+            ));
+        }
+        let handle = open_acl_target(&entry.path)?;
+        let actual = final_handle_path(handle.0)?;
+        let identity = acl_target_identity(handle.0)?;
+        if identity != entry.identity || !recovery_path_eq(&actual, &entry.path) {
+            return Err(RpcError::new(
+                "sandbox_recovery_required",
+                format!(
+                    "root lease cleanup target identity changed: '{}'",
+                    entry.path.display()
+                ),
+            ));
+        }
+        remove_exact_acl_entry(
+            &handle,
+            sid,
+            entry.permissions,
+            entry.inherit,
+            entry.preexisting_ace_count,
+        )?;
+    }
+    Ok(())
 }
 
 fn verify_recovery_scopes(
@@ -4244,6 +4615,7 @@ fn std_handle(kind: u32) -> Result<HANDLE, RpcError> {
 fn self_test() -> Result<(), RpcError> {
     let unique = ephemeral_profile_name()?.replace('.', "-");
     let root = std::env::temp_dir().join(format!("sigma-sandbox-test-{unique}"));
+    let writable = root.join("write");
     let outside = std::env::temp_dir().join(format!("sigma-host-secret-{unique}.txt"));
     let all_packages = std::env::temp_dir().join(format!("sigma-all-packages-{unique}.txt"));
     let network_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(RpcError::from)?;
@@ -4253,6 +4625,7 @@ fn self_test() -> Result<(), RpcError> {
         .port();
     std::fs::create_dir_all(root.join(".git")).map_err(RpcError::from)?;
     std::fs::create_dir_all(root.join(".agent")).map_err(RpcError::from)?;
+    std::fs::create_dir_all(&writable).map_err(RpcError::from)?;
     std::fs::write(root.join(".git").join("sentinel"), b"protected").map_err(RpcError::from)?;
     std::fs::write(&outside, b"host-secret").map_err(RpcError::from)?;
     std::fs::write(&all_packages, b"regular-appcontainer-readable").map_err(RpcError::from)?;
@@ -4289,7 +4662,7 @@ fn self_test() -> Result<(), RpcError> {
     }
     env.insert(
         "SIGMA_PROBE_ALLOWED".into(),
-        root.to_string_lossy().into_owned(),
+        writable.to_string_lossy().into_owned(),
     );
     env.insert(
         "SIGMA_PROBE_OUTSIDE".into(),
@@ -4319,10 +4692,11 @@ fn self_test() -> Result<(), RpcError> {
             network: NetworkMode::None,
             network_approved: false,
             read_roots: vec![root.clone()],
-            write_roots: vec![root.clone()],
+            write_roots: vec![writable],
             execution_roots: Vec::new(),
             executable_sha256: None,
             protected_paths: vec![root.join(".git"), root.join(".agent")],
+            #[cfg(test)]
             unsafe_host_exec_approved: false,
         },
         max_output_bytes: 64 * 1024,
@@ -6069,6 +6443,7 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::new(),
+                #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },
             max_output_bytes: 1_024,

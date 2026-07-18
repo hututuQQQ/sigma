@@ -10,7 +10,9 @@ use std::fs::{create_dir, read_dir, read_to_string, remove_dir, remove_file, wri
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(any(target_os = "linux", test))]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     Required,
+    #[cfg(test)]
     Unsafe,
 }
 
@@ -26,6 +29,7 @@ pub enum SandboxMode {
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     None,
+    Loopback,
     Full,
 }
 
@@ -67,6 +71,7 @@ pub struct ExecutionPolicy {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
+    #[cfg(test)]
     #[serde(default)]
     pub unsafe_host_exec_approved: bool,
 }
@@ -165,6 +170,55 @@ pub fn setup_sandbox() -> Result<Value, RpcError> {
     Ok(doctor_report())
 }
 
+pub fn repair_sandbox() -> Result<Value, RpcError> {
+    #[cfg(windows)]
+    crate::windows_sandbox::recover_after_process_quiesced()?;
+    #[cfg(not(windows))]
+    {
+        let current = detect_sandbox();
+        if !current.available {
+            return Err(RpcError::new(
+                "sandbox_recovery_required",
+                current
+                    .reason
+                    .unwrap_or_else(|| "sandbox recovery is unavailable".into()),
+            ));
+        }
+    }
+    replace_status(detect_sandbox());
+    Ok(doctor_report())
+}
+
+pub fn sandbox_lease_status(workspace: &Path) -> Result<Value, RpcError> {
+    #[cfg(windows)]
+    {
+        crate::windows_sandbox::workspace_lease_status(workspace)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = workspace;
+        Err(RpcError::new(
+            "filesystem_acl_unsupported",
+            "workspace ACL leases are available only on Windows",
+        ))
+    }
+}
+
+pub fn revoke_sandbox(workspace: &Path) -> Result<Value, RpcError> {
+    #[cfg(windows)]
+    {
+        crate::windows_sandbox::revoke_workspace_lease(workspace)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = workspace;
+        Err(RpcError::new(
+            "filesystem_acl_unsupported",
+            "workspace ACL leases are available only on Windows",
+        ))
+    }
+}
+
 pub fn doctor_report() -> Value {
     let status = sandbox_status();
     let network_modes = if status.available {
@@ -184,6 +238,12 @@ pub fn doctor_report() -> Value {
             "selfTestPassed": status.self_test_passed,
             "setupRequired": status.setup_required,
             "reason": status.reason,
+            "lease": if cfg!(windows) { json!({
+                "protocolVersion": 1,
+                "readStrategy": "persistent_workspace_root",
+                "writerStrategy": "root_lease_checkpointed",
+                "recoveryJournal": "writes_only",
+            }) } else { Value::Null },
             "hardening": {
                 "landlockAbi": status.landlock_abi,
                 "noNewPrivileges": status.no_new_privileges,
@@ -282,6 +342,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     execution_roots: Vec::new(),
                     executable_sha256: None,
                     protected_paths: Vec::new(),
+                    #[cfg(test)]
                     unsafe_host_exec_approved: false,
                 },
                 max_output_bytes: 4 * 1024,
@@ -353,17 +414,19 @@ pub fn build_command(
     validate(params, allow_unsafe)?;
     let guards = match params.policy.sandbox {
         SandboxMode::Required => create_missing_protected_guards(params)?,
+        #[cfg(test)]
         SandboxMode::Unsafe => Vec::new(),
     };
     let mut prepared = match params.policy.sandbox {
         SandboxMode::Required => build_sandboxed_command(params),
+        #[cfg(test)]
         SandboxMode::Unsafe => build_host_command(params),
     }?;
     prepared.protected_path_guards = guards;
     Ok(prepared)
 }
 
-fn validate(params: &ProcessParams, allow_unsafe: bool) -> Result<(), RpcError> {
+fn validate(params: &ProcessParams, _allow_unsafe: bool) -> Result<(), RpcError> {
     if params.command.executable.is_empty()
         || params.command.executable.contains('\0')
         || params
@@ -440,8 +503,9 @@ fn validate(params: &ProcessParams, allow_unsafe: bool) -> Result<(), RpcError> 
             "executableSha256 must be a lowercase SHA-256 digest",
         ));
     }
+    #[cfg(test)]
     if params.policy.sandbox == SandboxMode::Unsafe
-        && (!allow_unsafe || !params.policy.unsafe_host_exec_approved)
+        && (!_allow_unsafe || !params.policy.unsafe_host_exec_approved)
     {
         return Err(RpcError::new(
             "policy_denied",
@@ -778,6 +842,7 @@ fn secret_key(key: &str) -> bool {
         .any(|pair| matches!(pair, ["api", "key"] | ["private", "key"]))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn configure_common(command: &mut Command, params: &ProcessParams) {
     command.current_dir(&params.command.cwd);
     command.env_clear();
@@ -807,6 +872,7 @@ fn configure_common(command: &mut Command, params: &ProcessParams) {
     }
 }
 
+#[cfg(test)]
 fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
     if params.pty {
         return Err(RpcError::new(
@@ -1633,6 +1699,7 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
+                #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },
             max_output_bytes: 1024,

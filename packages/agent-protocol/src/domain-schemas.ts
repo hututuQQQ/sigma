@@ -145,6 +145,17 @@ export const validationEvidenceSchema = z.object({
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
     coveredPaths: z.array(nonEmptyStringSchema),
+    claim: z.object({
+      kind: z.enum(["probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"]),
+      commandDigest: digestSchema,
+      subject: z.object({
+        projectId: z.string().optional(),
+        configPaths: z.array(z.string()),
+        selectedTests: z.array(z.string()),
+        exactFiles: z.array(z.string())
+      }).strict(),
+      status: z.enum(["passed", "failed", "unavailable"])
+    }).strict().optional(),
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional()
   }).strict()

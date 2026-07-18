@@ -137,8 +137,8 @@ describe("Sigma architecture", () => {
     state = evolve(state, event(3, "model.completed", {
       turnId: 1,
       effectRevision: 1,
-      message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }] },
-      toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }]
+      message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "runtime_finalize", arguments: {} }] },
+      toolCalls: [{ id: "complete", name: "runtime_finalize", arguments: {} }]
     }));
     state = evolve(state, event(4, "tool.completed", {
       turnId: 1, effectRevision: 1,
@@ -356,7 +356,7 @@ describe("Sigma architecture", () => {
         content: "",
         toolCalls: [{
           id,
-          name: "complete_task",
+          name: "runtime_finalize",
           arguments: { summary: "Verified result.txt.", evidenceId: "invented-evidence" }
         }]
       },
@@ -478,12 +478,16 @@ describe("Sigma architecture", () => {
       event(4, "model.started", { turnId: 1, effectRevision: 3 }),
       event(5, "model.completed", {
         turnId: 1, effectRevision: 3,
-        message: { role: "assistant", content: "", toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }] },
-        toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }], finishReason: "tool_calls"
+        message: { role: "assistant", content: "", toolCalls: [{
+          id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "already generated" }
+        }] },
+        toolCalls: [{
+          id: "runtime_completion_intent_1_3", name: "runtime_finalize", arguments: { summary: "already generated" }
+        }], finishReason: "tool_calls"
       }),
       event(6, "tool.completed", {
         turnId: 1, effectRevision: 3,
-        callId: "complete", ok: true, output: JSON.stringify({ summary: "already generated" }),
+        callId: "runtime_completion_intent_1_3", ok: true, output: JSON.stringify({ summary: "already generated" }),
         observedEffects: ["outcome.propose"], artifacts: [], diagnostics: [], startedAt: "start", completedAt: "end"
       })
     ];

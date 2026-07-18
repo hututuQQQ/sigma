@@ -11,6 +11,7 @@ import { parseCompletionProposal } from "agent-tools";
 import { currentFrontierReview, frontierValidationReadiness } from "./mutation-evidence.js";
 import { failed } from "./tool-receipt.js";
 import type { RuntimeSession } from "./types.js";
+import { assuranceRequirement } from "./assurance-engine.js";
 
 function findingText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -24,6 +25,32 @@ export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
 
 function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
+}
+
+export interface CompletionCoordinatorStateV1 {
+  modelStopped: boolean;
+  assuranceSatisfied: boolean;
+  reviewSatisfied: boolean;
+  runCompleted: boolean;
+}
+
+/** Defense-in-depth projection used at the durable outcome boundary. A model
+ * stop is only an intent; it cannot imply assurance, review, or completion. */
+export function completionCoordinatorState(session: RuntimeSession): CompletionCoordinatorStateV1 {
+  const requirement = assuranceRequirement(session);
+  const assuranceSatisfied = session.durable.state.mutationFrontier.changedPaths.length === 0
+    || frontierValidationReadiness(session).ready;
+  const reviewRequired = reviewMode(session) === "required" || requirement.review === "required";
+  const review = currentFrontierReview(session);
+  const reviewSatisfied = !reviewRequired
+    || (review?.status === "passed" && review.data.verdict === "approved");
+  const modelStopped = true;
+  return {
+    modelStopped,
+    assuranceSatisfied,
+    reviewSatisfied,
+    runCompleted: modelStopped && assuranceSatisfied && reviewSatisfied
+  };
 }
 
 function unresolvedGoalInputPaths(session: RuntimeSession): string[] {
@@ -80,8 +107,13 @@ export function completionFailure(
   const common = commonTerminalFailure(session, call, startedAt);
   if (common) return common;
   if (!descriptor.possibleEffects.includes("outcome.propose")) return null;
+  if (call.name !== "runtime_finalize" || !call.id.startsWith("runtime_completion_intent_")) {
+    return failed(call, startedAt,
+      "Completion is owned by the runtime coordinator and cannot be invoked as a model tool.",
+      "internal_tool_denied", { status: "rejected", code: "internal_tool_denied" });
+  }
   if (!parseCompletionProposal(call.arguments)) {
-    return failed(call, startedAt, "Completion proposal does not match the V4 schema.", "invalid_completion_proposal", {
+    return failed(call, startedAt, "Completion proposal does not match the V5 schema.", "invalid_completion_proposal", {
       status: "rejected", code: "invalid_completion_proposal"
     });
   }
@@ -114,8 +146,8 @@ function validationOrReviewFailure(
   if (!validation.ready) {
     return failed(call, startedAt,
       validation.latestFailed
-        ? `Current-state semantic validation failed; repair and validate again, or use report_blocked. Missing coverage: ${validation.missingPaths.join(", ")}.`
-        : `Current-state semantic validation is required for: ${validation.missingPaths.join(", ")}.`,
+        ? `Current-state semantic validation failed; repair and validate again, or use report_blocked. Missing claims: ${validation.missingClaims.join(", ")}; missing coverage: ${validation.missingPaths.join(", ")}.`
+        : `Current-state semantic validation is required. Missing claims: ${validation.missingClaims.join(", ")}; paths: ${validation.missingPaths.join(", ")}.`,
       validation.latestFailed ? "validation_failed" : "validation_evidence_required",
       {
         status: "rejected",
@@ -123,9 +155,10 @@ function validationOrReviewFailure(
         frontierRevision: frontier.revision,
         stateDigest: frontier.currentStateDigest,
         missingPaths: validation.missingPaths,
+        missingClaims: validation.missingClaims,
         nextActions: validation.latestFailed
           ? [{ tool: "report_blocked", when: "repair is exhausted" }, { tool: "validate", after: "repair" }]
-          : [{ tool: "validate", deriveCoverageFrom: ["cwd", "readRoots"] }]
+          : [{ tool: "validate", deriveCoverageFrom: ["semantic_command_adapter"] }]
       }
     );
   }
@@ -137,7 +170,7 @@ function requiredReviewFailure(
   call: ModelToolCall,
   startedAt: string
 ): ToolReceipt | null {
-  if (reviewMode(session) !== "required") return null;
+  if (reviewMode(session) !== "required" && assuranceRequirement(session).review !== "required") return null;
   const frontier = session.durable.state.mutationFrontier;
   const review = currentFrontierReview(session);
   if (review?.status === "passed" && review.data.verdict === "approved") return null;

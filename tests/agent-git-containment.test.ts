@@ -170,7 +170,7 @@ describe("Git workspace containment", () => {
       outputArtifacts: [],
       failure: {
         phase: "sandbox_launch",
-        code: "policy_denied",
+        code: "git_probe_failed",
         message: "sandbox ACL plan exceeds durable recovery limits"
       }
     };
@@ -178,9 +178,12 @@ describe("Git workspace containment", () => {
 
     await expect(selfContainedGitRoot(workspace, new AbortController().signal, broker))
       .rejects.toMatchObject({
-        code: "policy_denied",
+        code: "git_probe_failed",
         message: expect.stringContaining("sandbox ACL plan exceeds durable recovery limits"),
-        cause: failure.failure
+        sandboxFailure: expect.objectContaining({
+          phase: "sandbox_launch",
+          message: "sandbox ACL plan exceeds durable recovery limits"
+        })
       });
   });
 

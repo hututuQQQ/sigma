@@ -13,9 +13,9 @@ import { SegmentedJsonlStore, sessionDirectory } from "../packages/agent-store/d
 
 const EVENT_COUNT = 100_000;
 const EVENTS_PER_SEGMENT = 1_000;
-const SESSION_ID = "replay-v4-100k";
+const SESSION_ID = "replay-v5-100k";
 const BASE_TIME = Date.parse("2026-01-01T00:00:00.000Z");
-const OUTPUT_PATH = path.resolve(process.env.SIGMA_PERF_OUTPUT ?? ".artifacts/replay-v4-100k.json");
+const OUTPUT_PATH = path.resolve(process.env.SIGMA_PERF_OUTPUT ?? ".artifacts/replay-v5-100k.json");
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -34,7 +34,7 @@ function event(seq, workspace) {
     payload: seq === 1 ? {
       workspacePath: workspace,
       mode: "change",
-      title: "V4 replay performance fixture",
+      title: "V5 replay performance fixture",
       writeScope: ["."],
       strictWriteScope: true,
       modelRole: "orchestrator"
@@ -83,7 +83,7 @@ async function replay(root) {
   });
   await store.writeSnapshot(snapshot);
   const restored = await store.latestSnapshot(SESSION_ID);
-  if (restored?.seq !== EVENT_COUNT) throw new Error("V4 snapshot reconstruction did not reach the event tail.");
+  if (restored?.seq !== EVENT_COUNT) throw new Error("V5 snapshot reconstruction did not reach the event tail.");
   let count = 0;
   for await (const value of store.events(SESSION_ID, EVENT_COUNT - 10)) {
     count += 1;
@@ -93,7 +93,7 @@ async function replay(root) {
 }
 
 async function main() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v4-replay-100k-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v5-replay-100k-"));
   try {
     await writeFixture(root);
     globalThis.gc?.();
@@ -107,7 +107,7 @@ async function main() {
     const peakRssMiB = peakRss / 1024 / 1024;
     const report = {
       schemaVersion: 1,
-      kind: "v4Replay100k",
+      kind: "v5Replay100k",
       ok: peakRssMiB < 256,
       events: EVENT_COUNT,
       elapsedMs,

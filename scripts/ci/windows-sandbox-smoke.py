@@ -162,7 +162,6 @@ def params(root: Path, command: str, *, pty: bool = False) -> dict:
             "readRoots": [str(root)],
             "writeRoots": [str(root / "out")],
             "protectedPaths": [str(root / ".git"), str(root / ".agent")],
-            "unsafeHostExecApproved": False,
         },
         "maxOutputBytes": 65536,
         "pty": pty,
@@ -681,27 +680,30 @@ setTimeout(() => process.exit(4), 3000);
         if denied.get("ok") or (external / "escaped.txt").exists():
             raise RuntimeError(f"reparse-point write root was not rejected: {denied}")
 
-        nested_escape = params(workspace, "echo escaped>linked-outside\\nested-escaped.txt")
-        nested_escape["policy"]["writeRoots"] = [str(workspace)]
-        nested_denied = broker.request("exec", {**nested_escape, "timeoutMs": 10000})
-        if nested_denied.get("ok") or (external / "nested-escaped.txt").exists():
-            raise RuntimeError(
-                f"junction nested inside a writable root was not rejected before ACL changes: {nested_denied}"
-            )
+        mutable = workspace / "mutable"
+        mutable.mkdir()
+        create_junction(mutable / "linked-outside", external)
+        nested_escape = params(workspace, "echo escaped>mutable\\linked-outside\\nested-escaped.txt")
+        nested_escape["policy"]["writeRoots"] = [str(mutable)]
+        nested_result = broker.request("exec", {**nested_escape, "timeoutMs": 10000})
+        if (external / "nested-escaped.txt").exists():
+            raise RuntimeError(f"junction escaped a narrow writable lease: {nested_result}")
 
         non_git = workspace / "non-git"
         non_git.mkdir()
+        non_git_write = non_git / "write"
+        non_git_write.mkdir()
         non_git_request = params(
             non_git,
-            "echo ordinary>ordinary.txt & "
+            "echo ordinary>write\\ordinary.txt & "
             "(echo blocked>.git\\blocked.txt) 2>nul & "
             "(echo blocked>.agent\\blocked.txt) 2>nul & exit /b 0",
         )
-        non_git_request["policy"]["writeRoots"] = [str(non_git)]
+        non_git_request["policy"]["writeRoots"] = [str(non_git_write)]
         non_git_result = require_ok(
             broker.request("exec", {**non_git_request, "timeoutMs": 10000})
         )
-        if non_git_result["exitCode"] != 0 or not (non_git / "ordinary.txt").exists():
+        if non_git_result["exitCode"] != 0 or not (non_git_write / "ordinary.txt").exists():
             raise RuntimeError(f"non-Git writable workspace failed: {non_git_result}")
         if (non_git / ".git" / "blocked.txt").exists() or (non_git / ".agent" / "blocked.txt").exists():
             raise RuntimeError("missing protected metadata path became writable in a non-Git workspace")

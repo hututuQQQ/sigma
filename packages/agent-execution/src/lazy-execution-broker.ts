@@ -8,10 +8,13 @@ import {
 import { defaultBrokerClientFactory } from "./lazy-execution-broker-runtime.js";
 import { LazyExecutionHandleRegistry, type LazyProcessHandleOwner } from "./lazy-execution-handles.js";
 import type {
-  BrokerDoctorReport, BrokerRequestOptions, ExecutionBroker, ExecutionRequest, ExecutionResult,
-  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  TrustedToolchainManifestEntry
+  BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
+  ExecutionBroker, ExecutionRequest, ExecutionResult,
+  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest
 } from "./types.js";
+import type {
+  BrokerGeneration, ConnectedGeneration, GenerationResult, LazyExecutionBrokerOptions
+} from "./lazy-execution-broker-types.js";
 export {
   defaultSigmaExecPath,
   runtimeNodeBinding,
@@ -20,33 +23,7 @@ export {
   type RuntimeNodeBinding
 } from "./lazy-execution-broker-runtime.js";
 
-export interface LazyExecutionBrokerOptions {
-  sandboxMode: "required" | "unsafe";
-  allowUnsafeHostExec: boolean;
-  helperPath?: string;
-  env?: NodeJS.ProcessEnv;
-  trustedToolchains?: TrustedToolchainManifestEntry[];
-  clientFactory?: () => ExecutionBroker;
-}
-
-interface BrokerGeneration {
-  readonly id: number;
-  readonly client: ExecutionBroker;
-  connecting?: Promise<BrokerDoctorReport>;
-  failure?: Error;
-  retiring?: boolean;
-  retired?: boolean;
-}
-
-interface ConnectedGeneration {
-  readonly generation: BrokerGeneration;
-  readonly report: BrokerDoctorReport;
-}
-
-interface GenerationResult<T> {
-  readonly generation: BrokerGeneration;
-  readonly value: T;
-}
+export type { LazyExecutionBrokerOptions } from "./lazy-execution-broker-types.js";
 
 /**
  * Owns replaceable broker generations. A connection failure retires only the
@@ -85,6 +62,31 @@ export class LazyExecutionBroker implements ExecutionBroker {
     return (await this.invokeFresh(async (client) => {
       if (!client.setupSandbox) return await client.doctor(signal);
       return await client.setupSandbox(signal);
+    }, signal)).value;
+  }
+
+  async repairSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+    return (await this.invokeFresh(async (client) => {
+      if (!client.repairSandbox) return client.setupSandbox ? await client.setupSandbox(signal) : await client.doctor(signal);
+      return await client.repairSandbox(signal);
+    }, signal)).value;
+  }
+
+  async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
+    return (await this.invokeFresh(async (client) => {
+      if (!client.sandboxLeaseStatus) throw Object.assign(new Error("Sandbox lease status is unavailable."), {
+        code: "sandbox_recovery_required"
+      });
+      return await client.sandboxLeaseStatus(workspacePath, signal);
+    }, signal)).value;
+  }
+
+  async revokeSandboxLease(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult> {
+    return (await this.invokeFresh(async (client) => {
+      if (!client.revokeSandboxLease) throw Object.assign(new Error("Sandbox lease revoke is unavailable."), {
+        code: "sandbox_recovery_required"
+      });
+      return await client.revokeSandboxLease(workspacePath, signal);
     }, signal)).value;
   }
 

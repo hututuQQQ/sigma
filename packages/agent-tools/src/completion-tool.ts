@@ -64,7 +64,7 @@ export function parseBlockedReport(value: JsonValue): BlockedReport | null {
   return { code, summary, ...(recoveryAttempted ? { recoveryAttempted } : {}) };
 }
 
-/** @deprecated V4 completion evidence is selected by the runtime. */
+/** @deprecated V5 completion evidence is selected by the runtime. */
 export function completionEvidenceError(
   _proposal: CompletionProposal,
   _availableEvidence: ReadonlyMap<string, EvidenceKind | EvidenceRecord>
@@ -93,8 +93,8 @@ function terminalReceipt(
 
 function completionTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
-    name: "complete_task",
-    description: "Finish the task with a concise summary. The runtime derives plan completion and evidence from the current mutation frontier; never supply evidence IDs.",
+    name: "runtime_finalize",
+    description: "Internal completion-coordinator action derived from a natural model stop.",
     inputSchema: {
       type: "object",
       properties: {
@@ -117,6 +117,7 @@ function completionTool(): RegisteredEffectTool {
   };
   return {
     descriptor,
+    modelVisible: false,
     async execute(request): Promise<ToolReceipt> {
       const startedAt = new Date().toISOString();
       return terminalReceipt(

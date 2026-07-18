@@ -1,5 +1,9 @@
 import { BrokerTransport } from "./broker-transport.js";
 import {
+  requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport,
+  requestVerifiedSandboxReport
+} from "./broker-sandbox-operations.js";
+import {
   assertRequestSandbox, assertRequiredSandbox, cancellationError,
   BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
   containReusedProcessId, createProcessRedaction, decodedExecutionResult,
@@ -10,10 +14,8 @@ import {
 } from "./broker-client-support.js";
 import { settleCancelledSpawn } from "./broker-client-cancellation.js";
 import {
-  BrokerCancelledError, BrokerConnectionError,
-  BrokerPolicyError,
-  BrokerProcessLostError,
-  BrokerTimeoutError,
+  BrokerCancelledError, BrokerConnectionError, BrokerPolicyError,
+  BrokerProcessLostError, BrokerTimeoutError,
   attachBrokerLifecycleFailure
 } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
@@ -23,12 +25,11 @@ import {
   assertTrustedToolchainsAvailable, normalizeTrustedToolchains, type NormalizedTrustedToolchain
 } from "./trusted-toolchains.js";
 import type {
-  BrokerDoctorReport, BrokerRequestOptions, ExecutionBroker, ExecutionRequest, ExecutionResult,
-  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  SigmaExecBrokerClientOptions
+  BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
+  ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
+  ProcessPollResult, ProcessSpawnRequest, SigmaExecBrokerClientOptions
 } from "./types.js";
 import { parseDoctor, parseHello, parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
-
 export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly transport: BrokerTransport;
   private readonly redactor: SecretRedactor;
@@ -133,38 +134,41 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   }
   async doctor(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
-    const report = await parsePostDispatchValue(
-      await this.transport.request("doctor", {}, {
-        signal, timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_DOCTOR_TIMEOUT_MS
-      }), parseDoctor, async () => await this.close()
-    );
-    try {
-      assertRequiredSandbox(report, this.options.sandboxMode);
-    } catch (error) {
-      return await containPostDispatchFailure(error, async () => await this.close());
-    }
-    if (this.closeRequested) throw new BrokerConnectionError("Broker client closed during doctor response.");
+    const report = await requestVerifiedSandboxReport({
+      transport: this.transport, method: "doctor",
+      timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_DOCTOR_TIMEOUT_MS, signal,
+      closeRequested: () => this.closeRequested,
+      close: async () => await this.close(), closedMessage: "Broker client closed during doctor response."
+    });
     this.doctorValue = report;
     return report;
   }
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.assertReady();
-    const report = await parsePostDispatchValue(
-      await this.transport.request("sandbox.setup", {}, {
-        signal,
-        timeoutMs: this.options.startupTimeoutMs
-          ?? this.options.requestTimeoutMs
-          ?? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS
-      }), parseDoctor, async () => await this.close()
-    );
-    try {
-      assertRequiredSandbox(report, this.options.sandboxMode);
-    } catch (error) {
-      return await containPostDispatchFailure(error, async () => await this.close());
-    }
-    if (this.closeRequested) throw new BrokerConnectionError("Broker client closed during setup response.");
+    const report = await requestVerifiedSandboxReport({
+      transport: this.transport, method: "sandbox.setup",
+      timeoutMs: this.options.startupTimeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS,
+      signal, closeRequested: () => this.closeRequested,
+      close: async () => await this.close(), closedMessage: "Broker client closed during setup response."
+    });
     this.doctorValue = report;
     return report;
+  }
+  async repairSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+    this.assertReady();
+    return await requestSandboxReport(
+      this.transport, "sandbox.repair",
+      this.options.startupTimeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS,
+      signal
+    );
+  }
+  async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
+    this.assertReady();
+    return await requestSandboxLeaseStatus(this.transport, workspacePath, this.options.requestTimeoutMs, signal);
+  }
+  async revokeSandboxLease(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult> {
+    this.assertReady();
+    return await requestSandboxLeaseRevoke(this.transport, workspacePath, this.options.requestTimeoutMs, signal);
   }
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {
     this.assertReady();
@@ -370,25 +374,21 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     }
     return result;
   }
-
   private verifiedShellExecutables(): string[] {
     return this.doctorValue?.capabilities.shells
       ?.filter((shell) => shell.verified)
       .map((shell) => shell.executable) ?? [];
   }
-
   private assertHandle(handle: ProcessHandle): void {
     if (handle.brokerInstanceId !== this.instanceId) throw new BrokerProcessLostError(handle.id);
     if (this.lost.has(handle.id) || !this.cursors.has(handle.id)) throw new BrokerProcessLostError(handle.id);
     this.assertReady();
   }
-
   private assertReady(): void {
     if (this.state !== "ready") {
       throw new BrokerConnectionError(`Broker client is not ready (state: ${this.state}).`, { retrySafe: true });
     }
   }
-
   private markProcessesLost(): void {
     if (this.state === "closed") return;
     for (const [id, handle] of this.activeProcesses) this.lost.set(id, handle);

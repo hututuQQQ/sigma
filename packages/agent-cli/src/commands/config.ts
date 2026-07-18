@@ -15,7 +15,7 @@ interface ConfigCommandDeps {
 
 interface ConfigMigrationResult {
   configPath: string;
-  currentVersion: 2 | 3 | 4;
+  currentVersion: 2 | 3 | 4 | 5;
   migrationRequired: boolean;
   written: boolean;
   json: boolean;
@@ -94,11 +94,12 @@ function assertMigrationArguments(positionals: string[], flags: Record<string, u
   if (flags.check === true && flags.write === true) throw new Error("Choose either --check or --write, not both.");
 }
 
-function configVersion(document: Record<string, unknown>): 2 | 3 | 4 {
+function configVersion(document: Record<string, unknown>): 2 | 3 | 4 | 5 {
   const current = document.schema_version;
   if (current === undefined || current === 2) return 2;
   if (current === 3) return 3;
   if (current === 4) return 4;
+  if (current === 5) return 5;
   throw new Error(`Unsupported config schema_version '${String(current)}'.`);
 }
 
@@ -106,7 +107,7 @@ async function writeMigratedConfig(
   configPath: string,
   source: string,
   config: CliConfig,
-  currentVersion: 2 | 3 | 4
+  currentVersion: 2 | 3 | 4 | 5
 ): Promise<void> {
   const backupPath = `${configPath}.v${currentVersion}.bak`;
   try { await writeFile(backupPath, source, { flag: "wx" }); } catch (error) {
@@ -116,7 +117,7 @@ async function writeMigratedConfig(
     throw error;
   }
   const temporary = `${configPath}.${randomUUID()}.tmp`;
-  await writeFile(temporary, renderConfigToml(overrides(config), "Sigma Code 3.0 migrated workspace configuration"), { flag: "wx" });
+  await writeFile(temporary, renderConfigToml(overrides(config), "Sigma Code V5 migrated workspace configuration"), { flag: "wx" });
   await rename(temporary, configPath);
 }
 
