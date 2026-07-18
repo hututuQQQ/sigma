@@ -55,6 +55,7 @@ export async function checkpointOpaqueArtifacts(
     if (!beforeOpaque && !afterOpaque) continue;
     result.push({
       path: file,
+      representation: "binary",
       ...(beforeOpaque && left.digest ? { before: { digest: left.digest, sizeBytes: left.size } } : {}),
       ...(afterOpaque && right.digest ? { after: { digest: right.digest, sizeBytes: right.size } } : {})
     });

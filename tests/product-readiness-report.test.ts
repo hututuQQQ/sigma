@@ -89,9 +89,9 @@ async function fixture(targetWrapper: Record<string, unknown>, providerSmoke?: R
       }
     }
   });
-  await writeJson(path.join(artifactsDir, "replay-v4-100k.json"), {
+  await writeJson(path.join(artifactsDir, "replay-v5-100k.json"), {
     schemaVersion: 1,
-    kind: "v4Replay100k",
+    kind: "v5Replay100k",
     ok: true,
     events: 100_000,
     elapsedMs: 5_000,
@@ -277,7 +277,7 @@ describe("product readiness report", () => {
         inspect: true
       }
     });
-    const evidencePath = path.join(artifactsDir, "replay-v4-100k.json");
+    const evidencePath = path.join(artifactsDir, "replay-v5-100k.json");
     const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
     evidence.snapshotRebuilt = false;
     await writeJson(evidencePath, evidence);

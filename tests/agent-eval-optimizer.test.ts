@@ -126,7 +126,7 @@ function attestationDiagnostic(overrides: Record<string, unknown> = {}) {
 
 function durableEvent(seq: number, type: Parameters<typeof completeAgentEventPayload>[0], payload: unknown) {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     seq,
     eventId: `event-${seq}`,
     sessionId: "session",

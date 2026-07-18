@@ -9,7 +9,8 @@ function plan(history: ModelMessage[], contextWindowTokens = 320, outputReserveT
     history,
     tools: [],
     contextWindowTokens,
-    outputReserveTokens
+    outputReserveTokens,
+    promptCache: false
   });
 }
 
@@ -131,6 +132,55 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expect(retained.some((message) => message.role === "tool" && message.toolCallId === "call-0")).toBe(false);
     expect(retained.some((message) => message.role === "tool" && message.toolCallId === "call-95")).toBe(true);
     expectWireSafe(retained);
+  });
+
+  it("keeps append-only history beyond 24K for prompt-cache providers", () => {
+    const history: ModelMessage[] = [{ role: "user", content: "Keep working from durable evidence." }];
+    for (let index = 0; index < 96; index += 1) {
+      history.push(...toolLoop(index, `observation-${index} ${"large output ".repeat(500)}`));
+    }
+
+    const result = planContext({
+      system: [], dynamic: [], history, tools: [],
+      contextWindowTokens: 512_000, outputReserveTokens: 8_000, promptCache: true
+    });
+
+    expect(result.cacheMode).toBe("prefix_cache");
+    expect(result.historyTokenLimit).toBe(504_000);
+    expect(result.budget.historyTokens).toBeGreaterThan(24_000);
+    expect(result.omittedHistoryTurns).toBe(0);
+    expect(result.summary).toBeUndefined();
+    expectWireSafe(result.messages);
+  });
+
+  it("keeps stable context and durable history before low-to-high priority dynamic suffixes", () => {
+    const stable = { id: "stable", authority: "system" as const, provenance: "policy", content: "fixed", tokenCount: 2, priority: 1_000 };
+    const durable: ModelMessage[] = [
+      { role: "user", content: "request" },
+      { role: "assistant", content: "", reasoningContent: "tool reasoning", toolCalls: [{ id: "call", name: "read", arguments: { path: "a" } }] },
+      { role: "tool", content: "result", toolCallId: "call" }
+    ];
+    const dynamic = [
+      { id: "deadline", authority: "runtime" as const, provenance: "deadline", content: "finish", tokenCount: 2, priority: 1_000 },
+      { id: "repository", authority: "tool" as const, provenance: "repo", content: "changed", tokenCount: 2, priority: 10 }
+    ];
+    const first = planContext({
+      system: [stable], history: durable, dynamic, tools: [],
+      contextWindowTokens: 10_000, outputReserveTokens: 100, promptCache: true
+    });
+    const second = planContext({
+      system: [stable], history: durable,
+      dynamic: dynamic.map((item) => ({ ...item, content: `${item.content}-again` })), tools: [],
+      contextWindowTokens: 10_000, outputReserveTokens: 100, promptCache: true
+    });
+
+    const durablePrefixLength = 1 + durable.length;
+    expect(second.messages.slice(0, durablePrefixLength)).toEqual(first.messages.slice(0, durablePrefixLength));
+    expect(first.messages.slice(durablePrefixLength).map((message) => message.content)).toEqual([
+      "[repo]\nchanged",
+      "[deadline]\nfinish"
+    ]);
+    expect(first.dynamicSuffixTokens).toBe(4);
   });
 
   it("textualizes a latest tool block above the per-block 8K limit even when the provider window fits", () => {

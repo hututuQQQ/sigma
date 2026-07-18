@@ -57,7 +57,7 @@ export interface ConfigSources {
   home?: Record<string, unknown>;
 }
 export type ResolvedConfig = Record<string, ConfigValue>;
-export const CONFIG_SCHEMA_VERSION = 4 as const;
+export const CONFIG_SCHEMA_VERSION = 5 as const;
 function stringValue(raw: unknown, key: string, allowEmpty = false): string {
   if (typeof raw !== "string" || (!allowEmpty && !raw.trim())) throw new Error(`Configuration '${key}' requires a${allowEmpty ? "" : " non-empty"} string.`);
   return raw;
@@ -163,13 +163,12 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   },
   { key: "agentProfile", flag: "agent-profile", env: "SIGMA_AGENT_PROFILE", toml: "agent.profile", description: "Resolved Agent Profile identifier", defaultValue: "standard", parse: (raw) => stringValue(raw, "agentProfile") },
   { key: "workspace", flag: "workspace", env: "SIGMA_WORKSPACE", toml: "workspace.path", description: "Workspace path", defaultValue: ".", parse: (raw) => stringValue(raw, "workspace") },
-  { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode", defaultValue: "ask", parse: (raw) => enumValue(raw, "permissionMode", ["ask", "auto", "deny"] as const) },
+  { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode (workspace-auto automatically permits workspace-scoped offline operations)", defaultValue: "workspace-auto", parse: (raw) => enumValue(raw, "permissionMode", ["workspace-auto", "ask", "auto", "deny"] as const) },
   { key: "sandboxMode", flag: "sandbox", env: "SIGMA_SANDBOX", toml: "security.sandbox", description: "Process sandbox policy", defaultValue: "required", parse: (raw) => enumValue(raw, "sandboxMode", ["required"] as const) },
-  { key: "executionMode", flag: "execution-mode", description: "Execution boundary for this run (disposable-container also requires the home unsafe-exec opt-in)", defaultValue: "sandboxed", parse: (raw) => enumValue(raw, "executionMode", ["sandboxed", "disposable-container"] as const) },
-  { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "host", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
-  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "full", parse: (raw) => enumValue(raw, "networkMode", ["none", "full"] as const) },
+  { key: "executionMode", flag: "execution-mode", description: "Execution backend for this run", defaultValue: "sandboxed", parse: (raw) => enumValue(raw, "executionMode", ["sandboxed", "container"] as const) },
+  { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "workspace", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
+  { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "loopback", "full"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
-  { key: "allowUnsafeHostExec", flag: "allow-unsafe-host-exec", kind: "boolean", toml: "security.allow_unsafe_host_exec", description: "Home-only opt-in for unsafe host execution", defaultValue: false, parse: (raw) => booleanValue(raw, "allowUnsafeHostExec"), hidden: true },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
   { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 45, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
@@ -220,7 +219,6 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   booleanField("force", "force", "Overwrite an existing file"),
   booleanField("latest", "latest", "Select the latest session"),
   booleanField("timeline", "timeline", "Include event timeline"),
-  booleanField("unsafeHostExec", "unsafe-host-exec", "Request one-time unsafe host execution"),
   booleanField("reviewerWaiver", "waive-reviewer", "Request a one-time human reviewer waiver"),
   booleanField("dryRun", "dry-run", "Validate without writing"),
   { ...booleanField("restore", "restore", "Safely restore an interrupted checkpoint"), hidden: true },
@@ -265,8 +263,10 @@ const WORKSPACE_NUMERIC_CAPS = new Set([
 ]);
 const ZERO_MEANS_UNBOUNDED_CAPS = new Set(["streamActiveSec"]);
 
-const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, ask: 1, auto: 2 };
-const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, full: 1 };
+const PERMISSION_STRICTNESS: Readonly<Record<string, number>> = {
+  deny: 0, ask: 1, "workspace-auto": 2, auto: 3
+};
+const NETWORK_STRICTNESS: Readonly<Record<string, number>> = { none: 0, loopback: 1, full: 2 };
 const READ_SCOPE_STRICTNESS: Readonly<Record<string, number>> = { workspace: 0, host: 1 };
 const HANDOFF_STRICTNESS: Readonly<Record<string, number>> = { deny: 0, allow: 1 };
 
@@ -295,9 +295,6 @@ function restrictWorkspaceValue(field: ConfigField, baseline: ConfigValue, works
   if (field.key === "processHandoff") {
     return HANDOFF_STRICTNESS[String(workspaceValue)] < HANDOFF_STRICTNESS[String(baseline)]
       ? workspaceValue : baseline;
-  }
-  if (field.key === "allowUnsafeHostExec") {
-    return baseline === true && workspaceValue === true;
   }
   return workspaceValue;
 }

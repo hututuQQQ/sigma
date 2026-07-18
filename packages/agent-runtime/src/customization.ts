@@ -20,11 +20,11 @@ import {
   type SkillCatalog
 } from "agent-extensions";
 import type { BudgetLimits } from "agent-protocol";
-import type { RuntimeAgentProfile } from "./types.js";
+import type { RuntimeAgentProfile, RuntimePermissionMode } from "./types.js";
 
 export interface CustomizationConfig {
   agentProfile?: string;
-  permissionMode: "ask" | "auto" | "deny";
+  permissionMode: RuntimePermissionMode;
   budget?: {
     maxInputTokens: number;
     maxOutputTokens: number;
@@ -42,7 +42,7 @@ export interface RuntimeCustomization {
   availableProfiles: readonly RuntimeAgentProfile[];
   skills: SkillCatalog;
   budgetLimits: BudgetLimits;
-  permissionMode: "ask" | "auto" | "deny";
+  permissionMode: RuntimePermissionMode;
   hookDefinitions: readonly HookDefinition[];
   hookArtifacts: readonly RuntimeHookArtifact[];
   workspaceExecutableHookIds: readonly string[];
@@ -88,8 +88,8 @@ function builtinProfile(
   return {
     id: mode,
     description: mode === "strict"
-      ? "Sigma Code V4 local coding profile with required review"
-      : "Sigma Code V4 local coding profile with advisory review",
+      ? "Sigma Code V5 local coding profile with required review"
+      : "Sigma Code V5 local coding profile with advisory review",
     roleRoutes: {
       orchestrator: "default", planner: "default", reviewer: "default",
       child_analyze: "default", child_write: "default", summarizer: "default"
@@ -98,7 +98,7 @@ function builtinProfile(
     toolDeny: [],
     skills: skills.descriptors.map((item) => item.qualifiedName),
     hooks: injectedHooks.map((hook) => hook.id),
-    permissionMode: config.permissionMode,
+    permissionMode: config.permissionMode === "workspace-auto" ? "auto" : config.permissionMode,
     budget: configuredBudget(config),
     mutationPolicy: {
       requirePlanBeforeMutation: true,
@@ -109,8 +109,10 @@ function builtinProfile(
   };
 }
 
-function strictPermission(left: ProfilePermissionMode, right: ProfilePermissionMode): ProfilePermissionMode {
-  const rank: Record<ProfilePermissionMode, number> = { deny: 0, ask: 1, auto: 2 };
+function strictPermission(left: RuntimePermissionMode, right: ProfilePermissionMode): RuntimePermissionMode {
+  const rank: Record<RuntimePermissionMode, number> = {
+    deny: 0, ask: 1, "workspace-auto": 2, auto: 3
+  };
   return rank[left] <= rank[right] ? left : right;
 }
 
@@ -174,7 +176,7 @@ export async function resolveRuntimeCustomization(
   }
   const permissionMode = strictPermission(config.permissionMode, selected.permissionMode);
   const budgetLimits = minimumBudget(selected.budget, configuredBudget(config));
-  const resolved = { ...selected, permissionMode, budget: budgetProfile(budgetLimits) };
+  const resolved = { ...selected, budget: budgetProfile(budgetLimits) };
   const referencedHookIds = new Set([builtin, ...profiles.map((item) => item.profile)].flatMap((item) => item.hooks));
   for (const id of referencedHookIds) hookCatalog.resolve(id);
   // Keep the complete discovered catalog available so frozen sessions can resume

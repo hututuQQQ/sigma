@@ -346,6 +346,11 @@ class _OutputRecorder:
         self.usage: dict[str, Any] = {}
         self.retry_count = 0
         self.last_retry: dict[str, Any] | None = None
+        self.length_finish_count = 0
+        self.converge_turns = 0
+        self._started_monotonic = time.monotonic()
+        self._suspended_monotonic: float | None = None
+        self._process_exit_monotonic: float | None = None
         logs_dir.mkdir(parents=True, exist_ok=True)
         for path in (self.stdout_path, self.stderr_path, self.trace_path):
             path.write_text("", encoding="utf-8")
@@ -391,9 +396,16 @@ class _OutputRecorder:
             event_type = str(event.get("type"))
             if event_type == "model.started":
                 self.model_turns += 1
-            if event_type in {"tool.requested", "tool.started"}:
+            if event_type == "tool.requested":
                 self.tool_calls += 1
+            if event_type == "run.suspended" and self._suspended_monotonic is None:
+                self._suspended_monotonic = time.monotonic()
             payload = _event_payload(event)
+            if event_type == "model.completed" and payload.get("finishReason") == "length":
+                self.length_finish_count += 1
+            if (event_type == "diagnostic" and payload.get("kind") == "deadline.stage"
+                    and payload.get("stage") == "converge"):
+                self.converge_turns += 1
             if event_type == "usage.recorded":
                 self.usage = {
                     **self.usage,
@@ -441,6 +453,23 @@ class _OutputRecorder:
             "usage": dict(self.usage),
             "retry_count": self.retry_count,
             "last_retry": self.last_retry,
+            "length_finish_count": self.length_finish_count,
+            "converge_turns": self.converge_turns,
+            **self.timing_snapshot(),
+        }
+
+    def mark_process_exit(self) -> None:
+        self._process_exit_monotonic = time.monotonic()
+
+    def timing_snapshot(self) -> dict[str, Any]:
+        ended = self._process_exit_monotonic or time.monotonic()
+        return {
+            "duration_ms": max(1, round((ended - self._started_monotonic) * 1000)),
+            "suspension_to_exit_ms": (
+                max(0, round((ended - self._suspended_monotonic) * 1000))
+                if self._suspended_monotonic is not None and self._process_exit_monotonic is not None
+                else None
+            ),
         }
 
     def _write_state(self) -> None:
@@ -460,6 +489,7 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_cli_tarball: pathlib.Path | str | None = None,
         provider: str = "deepseek",
         model: str | None = None,
+        agent_profile: str = "standard",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
         max_wall_time_sec: int = 7200,
@@ -487,12 +517,15 @@ class SigmaCliHarborAgent(BaseAgent):
         self.agent_cli_tarball = pathlib.Path(agent_cli_tarball) if agent_cli_tarball is not None else None
         self.provider = provider
         self.model = resolved_model
-        if network_mode not in {"none", "full"}:
-            raise ValueError("network_mode must be one of: none, full")
+        if agent_profile not in {"standard", "strict"}:
+            raise ValueError("agent_profile must be one of: standard, strict")
+        self.agent_profile = agent_profile
+        if network_mode not in {"none", "loopback", "full"}:
+            raise ValueError("network_mode must be one of: none, loopback, full")
         self.network_mode = network_mode
-        if execution_mode not in {"sandboxed", "disposable-container"}:
+        if execution_mode not in {"sandboxed", "container"}:
             raise ValueError(
-                "execution_mode must be one of: sandboxed, disposable-container"
+                "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
         self.effective_network_mode: str | None = network_mode
@@ -532,7 +565,6 @@ class SigmaCliHarborAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
-        await self._configure_execution_mode(environment)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
             await self._verify_agent_ready(environment)
@@ -551,26 +583,6 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self._write_setup_checks([], "agent_setup_failed")
         raise RuntimeError(message)
-
-    async def _configure_execution_mode(self, environment: BaseEnvironment) -> None:
-        """Create an isolated home opt-in for an explicitly disposable run.
-
-        The adapter never infers this mode from a task or environment. Keeping
-        the opt-in under a dedicated HOME also prevents a workspace config from
-        granting itself host execution privileges.
-        """
-        if self.execution_mode != "disposable-container":
-            return
-        command = (
-            "umask 077; mkdir -p /tmp/agent/disposable-home/.sigma; "
-            "printf '[security]\\nallow_unsafe_host_exec = true\\n' "
-            "> /tmp/agent/disposable-home/.sigma/config.toml"
-        )
-        configured = await environment.exec(command, timeout_sec=30)
-        if _return_code(configured) != 0:
-            raise RuntimeError(
-                "agent_setup_failed: could not create the disposable-container home opt-in"
-            )
 
     async def run(
         self,
@@ -643,23 +655,51 @@ class SigmaCliHarborAgent(BaseAgent):
                 error_message = _output_text(result).strip() or f"agent exited with code {_return_code(result)}"
                 failure_kind = "agent_failure"
         except asyncio.CancelledError as exc:
-            cancelled_error = exc
-            timed_out = True
-            failure_kind = "timeout"
-            error_message = "agent execution cancelled by the Harbor outer trial deadline"
             events, output_result = self._merge_recorded_output(result, recorder)
+            recorded_terminal = self._recorded_terminal_result(events, output_result)
             self._process_cleanup = await self._cleanup_remote_process(environment)
             if self._process_cleanup.get("error"):
                 artifact_warnings.append(str(self._process_cleanup["error"]))
-            summary_path, trace_path = self._persist_timeout_artifacts(
-                result,
-                events,
-                None,
-                recorder.trace_path,
-                error_message,
-                recorder=recorder,
-                process_cleanup=self._process_cleanup,
-            )
+            if recorded_terminal is not None:
+                output_result = recorded_terminal
+                result = self._result_with_payload(result, recorded_terminal)
+                status = recorded_terminal.get("status")
+                if status == "needs_input":
+                    failure_kind = "needs_input"
+                    error_message = str(
+                        recorded_terminal.get("finalMessage")
+                        or recorded_terminal.get("message")
+                        or "agent requires external input"
+                    )
+                elif status != "completed":
+                    reported_failure = (
+                        recorded_terminal.get("failureKind")
+                        or recorded_terminal.get("failure_kind")
+                    )
+                    failure_kind = (
+                        reported_failure
+                        if reported_failure in FAILURE_KINDS
+                        else "agent_failure"
+                    )
+                    error_message = str(
+                        recorded_terminal.get("finalMessage")
+                        or recorded_terminal.get("message")
+                        or f"agent returned terminal status {status}"
+                    )
+            else:
+                cancelled_error = exc
+                timed_out = True
+                failure_kind = "timeout"
+                error_message = "agent execution cancelled by the Harbor outer trial deadline"
+                summary_path, trace_path = self._persist_timeout_artifacts(
+                    result,
+                    events,
+                    None,
+                    recorder.trace_path,
+                    error_message,
+                    recorder=recorder,
+                    process_cleanup=self._process_cleanup,
+                )
         except Exception as exc:
             partial = getattr(exc, "result", None)
             if partial is None and (_stdout_text(exc) or _stderr_text(exc)):
@@ -687,6 +727,7 @@ class SigmaCliHarborAgent(BaseAgent):
                 error_message = str(exc)
                 failure_kind = "agent_crash"
         finally:
+            recorder.mark_process_exit()
             if cancelled_error is None and not timed_out:
                 for remote_path, filename in (
                     ("/tmp/agent/summary.json", "summary.json"),
@@ -710,6 +751,16 @@ class SigmaCliHarborAgent(BaseAgent):
                     trace_path = None
 
         derived_summary = self._summary_from_events(events, output_result)
+        derived_summary.update(recorder.timing_snapshot())
+        derived_summary["terminal_origin"] = (
+            "adapter_timeout" if timed_out
+            else "runtime_result" if output_result.get("status") is not None
+            else "runtime_event" if any(
+                event.get("type") in {*TERMINAL_EVENT_TYPES, "run.suspended"} for event in events
+            )
+            else None
+        )
+        derived_summary["termination_source"] = derived_summary["terminal_origin"]
         if events and (summary_path is None or trace_path is None):
             derived_summary_path, derived_trace_path = self._write_accounting_artifacts(
                 events,
@@ -723,6 +774,12 @@ class SigmaCliHarborAgent(BaseAgent):
         downloaded_summary = self._read_summary(summary_path)
         if downloaded_summary:
             summary = {**summary, **downloaded_summary}
+        # Adapter-observed timing and terminal provenance describe the Harbor
+        # process boundary itself, so a runtime-produced summary must not
+        # replace them with stale or zero-valued placeholders.
+        summary.update(recorder.timing_snapshot())
+        summary["terminal_origin"] = derived_summary["terminal_origin"]
+        summary["termination_source"] = derived_summary["termination_source"]
         if protocol_failure is not None:
             summary.update({
                 "status": "error",
@@ -738,6 +795,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
+        summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
@@ -747,7 +805,7 @@ class SigmaCliHarborAgent(BaseAgent):
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
-        if protocol_failure is not None and summary_path is not None:
+        if summary_path is not None:
             summary_path.write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -765,10 +823,7 @@ class SigmaCliHarborAgent(BaseAgent):
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        command = []
-        if self.execution_mode == "disposable-container":
-            command.extend(["env", "HOME=/tmp/agent/disposable-home"])
-        command.extend([
+        command = [
             "/usr/local/bin/agent",
             "run",
             "--workspace",
@@ -779,6 +834,8 @@ class SigmaCliHarborAgent(BaseAgent):
             self.provider,
             "--model",
             self.model,
+            "--agent-profile",
+            self.agent_profile,
             "--run-deadline-sec",
             str(self.max_wall_time_sec),
             "--network",
@@ -788,16 +845,16 @@ class SigmaCliHarborAgent(BaseAgent):
             "--process-handoff",
             "allow",
             "--permission-mode",
-            "auto",
+            "workspace-auto",
+            "--execution-mode",
+            self.execution_mode,
             "--output-format",
             "stream-json",
             "--output-schema",
             "3",
             "--stream-json-max-line-bytes",
             "49152",
-        ])
-        if self.execution_mode == "disposable-container":
-            command.extend(["--execution-mode", "disposable-container"])
+        ]
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
         return command
@@ -1099,6 +1156,32 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return value
         return None
 
+    def _recorded_terminal_result(
+        self,
+        events: list[dict[str, Any]],
+        output_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if output_result.get("status") in {"completed", "needs_input", "cancelled", "error", "failed"}:
+            return dict(output_result)
+        session_id = self._session_id(events, output_result) or ""
+        terminal = self._terminal_result(events, session_id)
+        if terminal is not None:
+            return terminal
+        if self._pending_checkpoint(events) is not None:
+            return None
+        suspended = next((event for event in reversed(events) if event.get("type") == "run.suspended"), None)
+        if suspended is None:
+            return None
+        payload = _event_payload(suspended)
+        message = payload.get("message")
+        return {
+            **payload,
+            "status": "needs_input",
+            "finishReason": "needs_input",
+            "sessionId": session_id,
+            **({"finalMessage": message} if isinstance(message, str) else {}),
+        }
+
     def _pending_checkpoint(self, events: list[dict[str, Any]]) -> tuple[str, dict[str, Any]] | None:
         resolved: set[str] = set()
         for event in events:
@@ -1166,7 +1249,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     def _session_command(self, subcommand: str, session_id: str) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        return [
+        command: list[str] = [
             "/usr/local/bin/agent",
             "session",
             subcommand,
@@ -1177,7 +1260,20 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.provider,
             "--model",
             self.model,
+            "--agent-profile",
+            self.agent_profile,
+            "--permission-mode",
+            "workspace-auto",
+            "--execution-mode",
+            self.execution_mode,
+            "--network",
+            self.network_mode,
+            "--read-scope",
+            self.effective_read_scope,
+            "--process-handoff",
+            "allow",
         ]
+        return command
 
     async def _read_session_events(
         self,
@@ -1274,9 +1370,19 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         usage = [_event_payload(event) for event in events if event.get("type") == "usage.recorded"]
         input_tokens = sum(_as_int(item.get("inputTokens"), 0) for item in usage)
         output_tokens = sum(_as_int(item.get("outputTokens"), 0) for item in usage)
-        cache_tokens = sum(
-            _as_int(item.get("cacheReadTokens"), 0) + _as_int(item.get("cacheWriteTokens"), 0)
-            for item in usage
+        reasoning_tokens = sum(_as_int(item.get("reasoningTokens"), 0) for item in usage)
+        cache_read_tokens = sum(_as_int(item.get("cacheReadTokens"), 0) for item in usage)
+        cache_write_tokens = sum(_as_int(item.get("cacheWriteTokens"), 0) for item in usage)
+        cache_tokens = cache_read_tokens + cache_write_tokens
+        length_finish_count = sum(
+            event.get("type") == "model.completed" and _event_payload(event).get("finishReason") == "length"
+            for event in events
+        )
+        converge_turns = sum(
+            event.get("type") == "diagnostic"
+            and _event_payload(event).get("kind") == "deadline.stage"
+            and _event_payload(event).get("stage") == "converge"
+            for event in events
         )
         cost_micro_usd = sum(_as_int(item.get("costMicroUsd"), 0) for item in usage)
         model_failure_event = next(
@@ -1301,7 +1407,14 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "model_turns": sum(event.get("type") == "model.started" for event in events),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
             "cache_tokens": cache_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_read_ratio": cache_read_tokens / input_tokens if input_tokens > 0 else None,
+            "reasoning_output_ratio": reasoning_tokens / output_tokens if output_tokens > 0 else None,
+            "length_finish_count": length_finish_count,
+            "converge_turns": converge_turns,
             "cost_usd": cost_micro_usd / 1_000_000,
             "last_event": _bounded_event(events[-1]) if events else None,
             "retry_count": sum(
@@ -1312,6 +1425,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "model_failure": model_failure,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "execution_mode": self.execution_mode,
+            "agent_profile": self.agent_profile,
+            "harbor_deadline_sec": self.outer_trial_deadline_sec,
+            "sigma_deadline_sec": self.max_wall_time_sec,
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
         }
@@ -1349,10 +1466,21 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "process_handoff_available": self.process_handoff_available,
             "last_event": last_event,
             "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
-            "tool_calls": live_state.get("tool_calls", sum(event.get("type") in {"tool.requested", "tool.started"} for event in events)),
+            "tool_calls": live_state.get(
+                "tool_calls",
+                sum(event.get("type") == "tool.requested" for event in events),
+            ),
             "usage": live_state.get("usage", {}),
             "retry_count": live_state.get("retry_count", 0),
             "last_retry": live_state.get("last_retry"),
+            "length_finish_count": live_state.get("length_finish_count", 0),
+            "converge_turns": live_state.get("converge_turns", 0),
+            "duration_ms": live_state.get("duration_ms", 0),
+            "suspension_to_exit_ms": live_state.get("suspension_to_exit_ms"),
+            "terminal_origin": "adapter_timeout",
+            "termination_source": "adapter_timeout",
+            "harbor_deadline_sec": self.outer_trial_deadline_sec,
+            "sigma_deadline_sec": self.max_wall_time_sec,
             "stdout": _text_artifact_summary(stdout),
             "stderr": _text_artifact_summary(stderr),
             "process_cleanup": process_cleanup,
@@ -1376,6 +1504,14 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "usage": state["usage"],
             "retry_count": state["retry_count"],
             "last_retry": state["last_retry"],
+            "length_finish_count": state["length_finish_count"],
+            "converge_turns": state["converge_turns"],
+            "duration_ms": state["duration_ms"],
+            "suspension_to_exit_ms": state["suspension_to_exit_ms"],
+            "terminal_origin": state["terminal_origin"],
+            "termination_source": state["termination_source"],
+            "harbor_deadline_sec": state["harbor_deadline_sec"],
+            "sigma_deadline_sec": state["sigma_deadline_sec"],
             "process_cleanup": process_cleanup,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
@@ -1434,8 +1570,17 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                         "commands_executed": summary.get("commands_executed", 0),
                         "input_tokens": summary.get("input_tokens", 0),
                         "output_tokens": summary.get("output_tokens", 0),
+                        "reasoning_tokens": summary.get("reasoning_tokens", 0),
                         "cache_tokens": summary.get("cache_tokens", 0),
+                        "cache_read_tokens": summary.get("cache_read_tokens", 0),
+                        "length_finish_count": summary.get("length_finish_count", 0),
+                        "converge_turns": summary.get("converge_turns", 0),
                         "cost_usd": summary.get("cost_usd"),
+                        "duration_ms": summary.get("duration_ms", 0),
+                        "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
+                        "terminal_origin": summary.get("terminal_origin"),
+                        "execution_mode": summary.get("execution_mode"),
+                        "agent_profile": summary.get("agent_profile"),
                     } if summary is not None else {}),
                 }
                 metadata = {"result": result}
@@ -1595,6 +1740,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "classification": status,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
+            "execution_mode": self.execution_mode,
+            "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
@@ -1746,8 +1893,17 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_model_turns": _json_number(summary, "model_turns"),
             "n_input_tokens": _json_number(summary, "input_tokens"),
             "n_output_tokens": _json_number(summary, "output_tokens"),
+            "n_reasoning_tokens": _json_number(summary, "reasoning_tokens"),
             "n_cache_tokens": _json_number(summary, "cache_tokens"),
+            "n_cache_read_tokens": _json_number(summary, "cache_read_tokens"),
+            "length_finish_count": _json_number(summary, "length_finish_count"),
+            "converge_turns": _json_number(summary, "converge_turns"),
             "cost_usd": summary.get("cost_usd"),
+            "duration_ms": _json_number(summary, "duration_ms"),
+            "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
+            "terminal_origin": summary.get("terminal_origin"),
+            "execution_mode": summary.get("execution_mode", self.execution_mode),
+            "agent_profile": summary.get("agent_profile", self.agent_profile),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
             "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
@@ -1810,6 +1966,11 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "exit_code": getattr(context, "exit_code", None),
             "error_message": getattr(context, "error_message", None),
             "failure_kind": getattr(context, "failure_kind", None),
+            "duration_ms": getattr(context, "duration_ms", 0),
+            "suspension_to_exit_ms": getattr(context, "suspension_to_exit_ms", None),
+            "terminal_origin": getattr(context, "terminal_origin", None),
+            "execution_mode": getattr(context, "execution_mode", self.execution_mode),
+            "agent_profile": getattr(context, "agent_profile", self.agent_profile),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
             "read_scope_effective": getattr(context, "read_scope_effective", self.effective_read_scope),
@@ -1820,7 +1981,11 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "model_turns": getattr(context, "model_turns", 0),
             "n_input_tokens": getattr(context, "n_input_tokens", 0),
             "n_output_tokens": getattr(context, "n_output_tokens", 0),
+            "n_reasoning_tokens": getattr(context, "n_reasoning_tokens", 0),
             "n_cache_tokens": getattr(context, "n_cache_tokens", 0),
+            "n_cache_read_tokens": getattr(context, "n_cache_read_tokens", 0),
+            "length_finish_count": getattr(context, "length_finish_count", 0),
+            "converge_turns": getattr(context, "converge_turns", 0),
             "cost_usd": getattr(context, "cost_usd", None),
             "changed_app_files": [],
             "workspace_snapshots": [],

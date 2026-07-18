@@ -191,7 +191,11 @@ export class ModelRouter {
   ): Promise<RoutedModelResponse> {
     const resolution = this.resolveForRequest(routeId, request, constraints);
     let lastError: unknown;
-    const attempts = Math.min(resolution.route.maxAttempts, resolution.candidates.length);
+    const attempts = Math.min(
+      resolution.route.maxAttempts,
+      constraints.maxAttempts ?? resolution.route.maxAttempts,
+      resolution.candidates.length
+    );
     for (let index = 0; index < attempts; index += 1) {
       request.signal.throwIfAborted();
       const spec = resolution.candidates[index] as ModelSpec;
@@ -219,7 +223,11 @@ export class ModelRouter {
     constraints: ModelRouteConstraints = {}
   ): AsyncIterable<RoutedModelStreamEvent> {
     const resolution = this.resolveForRequest(routeId, request, constraints);
-    const attempts = Math.min(resolution.route.maxAttempts, resolution.candidates.length);
+    const attempts = Math.min(
+      resolution.route.maxAttempts,
+      constraints.maxAttempts ?? resolution.route.maxAttempts,
+      resolution.candidates.length
+    );
     for (let index = 0; index < attempts; index += 1) {
       request.signal.throwIfAborted();
       const spec = resolution.candidates[index] as ModelSpec;

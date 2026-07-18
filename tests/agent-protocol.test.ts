@@ -15,7 +15,7 @@ import {
   usageFixture, validAgentEventFixture
 } from "./testkit/agent-event-fixtures.js";
 
-describe("AgentEventEnvelope V4 runtime boundary", () => {
+describe("AgentEventEnvelope V5 runtime boundary", () => {
   it("accepts a producer fixture for every declared durable event", () => {
     expect(Object.keys(fixtures).sort()).toEqual([...AGENT_EVENT_TYPES].sort());
     for (const type of AGENT_EVENT_TYPES) expect(isAgentEventEnvelope(validAgentEventFixture(type)), type).toBe(true);
@@ -113,7 +113,7 @@ describe("AgentEventEnvelope V4 runtime boundary", () => {
     expect(isSolverVisibleAuthority("external_verifier")).toBe(false);
   });
 
-  it("validates strict V4 snapshots independently", () => {
+  it("validates strict V5 snapshots independently", () => {
     const snapshot = {
       schemaVersion: SNAPSHOT_SCHEMA_VERSION, storeLayoutVersion: STORE_LAYOUT_VERSION,
       sessionId: "session", seq: 1, createdAt: fixtureOccurredAt, state: { value: 1 }

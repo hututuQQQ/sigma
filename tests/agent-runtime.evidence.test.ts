@@ -16,6 +16,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
+import { assuranceRequirement, validationClaimSatisfies } from "../packages/agent-runtime/src/assurance-engine.js";
 import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
@@ -209,7 +210,7 @@ const validationPlan: ToolCallPlan = {
 };
 
 const validationTargetIds = (): never => {
-  throw new Error("V3 evidence-ID validation scope was removed in V4.");
+  throw new Error("V3 evidence-ID validation scope remains removed in V5.");
 };
 
 describe.skip("V3 validation workspace-delta scope", () => {
@@ -238,7 +239,15 @@ describe.skip("V3 validation workspace-delta scope", () => {
   });
 });
 
-describe("V4 mutation frontier completion", () => {
+describe("V5 assurance-coordinated mutation completion", () => {
+  it("does not let a generic acceptance claim replace explicit semantic claims", () => {
+    expect(validationClaimSatisfies("acceptance", "acceptance")).toBe(true);
+    expect(validationClaimSatisfies("acceptance", "typecheck")).toBe(false);
+    expect(validationClaimSatisfies("acceptance", "lint")).toBe(false);
+    expect(validationClaimSatisfies("acceptance", "unit")).toBe(false);
+    expect(validationClaimSatisfies("integration", "unit")).toBe(true);
+  });
+
   function frontierSession(): RuntimeSession {
     const active = session([]);
     active.durable.state.mutationFrontier = {
@@ -257,19 +266,97 @@ describe("V4 mutation frontier completion", () => {
       status: "passed", createdAt: now, producer: { authority: "tool", id },
       summary: "passed", data: {
         validator: "command", command: "pnpm test", exitCode: 0,
-        frontierRevision: 4, stateDigest: "a".repeat(64), coveredPaths
+        frontierRevision: 4, stateDigest: "a".repeat(64), coveredPaths,
+        claim: {
+          kind: "typecheck", commandDigest: "f".repeat(64), status: "passed",
+          subject: { projectId: ".", configPaths: [], selectedTests: [], exactFiles: [] }
+        }
       }
     };
   }
 
-  it("derives coverage from approved read roots without model-visible IDs", () => {
+  it("derives coverage from semantic command subjects, not read roots", () => {
     const active = frontierSession();
-    expect(validationScope(active, {
-      id: "validate", name: "validate", arguments: {}
-    }, { ...validationPlan, readPaths: ["src"] })).toEqual({
+    const scope = validationScope(active, {
+      id: "validate", name: "validate", arguments: { executable: "tsc", args: ["--noEmit"] }
+    }, { ...validationPlan, readPaths: ["docs"] });
+    expect(scope).toMatchObject({
       frontierRevision: 4,
       stateDigest: "a".repeat(64),
-      coveredPaths: ["src/code.ts"]
+      coveredPaths: ["src/code.ts"],
+      claim: { kind: "typecheck", subject: { projectId: "." } }
+    });
+    expect(scope?.claim.commandDigest).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("recognizes Cargo validation subcommands and covers Rust changes", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "native/sigma-exec/src/main.rs", "docs/readme.md"
+    ];
+    const unit = validationScope(active, {
+      id: "cargo-test", name: "validate",
+      arguments: { executable: "cargo", args: ["+stable", "test", "--locked"] }
+    }, validationPlan);
+    expect(unit).toMatchObject({
+      coveredPaths: ["native/sigma-exec/src/main.rs"],
+      claim: { kind: "unit" }
+    });
+    const acceptance = validationScope(active, {
+      id: "cargo-build", name: "validate",
+      arguments: { executable: "cargo", args: ["build", "--locked"] }
+    }, validationPlan);
+    expect(acceptance).toMatchObject({
+      coveredPaths: ["native/sigma-exec/src/main.rs", "docs/readme.md"],
+      claim: { kind: "acceptance" }
+    });
+  });
+
+  it("requires unit evidence for non-source assets under tests", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["tests/fixtures/data.json"];
+
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      coveredPaths: [],
+      missingPaths: ["tests/fixtures/data.json"],
+      missingClaims: ["unit"]
+    });
+  });
+
+  it("limits node --check to its exact file and gives generic probes no coverage", () => {
+    const active = frontierSession();
+    const syntax = validationScope(active, {
+      id: "syntax", name: "validate",
+      arguments: { executable: "node", args: ["--check", "src/code.ts"] }
+    }, { ...validationPlan, readPaths: ["."] });
+    expect(syntax).toMatchObject({
+      coveredPaths: ["src/code.ts"],
+      claim: { kind: "syntax", subject: { exactFiles: ["src/code.ts"] } }
+    });
+    const probe = validationScope(active, {
+      id: "probe", name: "validate", arguments: { executable: "node", args: ["--version"] }
+    }, { ...validationPlan, readPaths: ["."] });
+    expect(probe).toMatchObject({ coveredPaths: [], claim: { kind: "probe" } });
+  });
+
+  it("honors an explicit node --check acceptance command as a syntax requirement", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Create provider-smoke.js and run node --check provider-smoke.js."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["provider-smoke.js"];
+
+    expect(assuranceRequirement(active)).toMatchObject({
+      requiredClaims: ["syntax"]
+    });
+    expect(validationScope(active, {
+      id: "syntax", name: "validate",
+      arguments: { executable: "node", args: ["--check", "provider-smoke.js"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["provider-smoke.js"],
+      claim: { kind: "syntax", subject: { exactFiles: ["provider-smoke.js"] } }
     });
   });
 
@@ -290,13 +377,13 @@ describe("V4 mutation frontier completion", () => {
     };
     expect(frontierValidationReadiness(active)).toMatchObject({
       ready: false,
-      missingPaths: ["src/code.ts", "docs/readme.md"]
+      missingPaths: ["src/code.ts"]
     });
   });
 
   it("keeps semantic validation hard while advisory review does not block", () => {
     const active = frontierSession();
-    const call: ModelToolCall = { id: "complete", name: "complete_task", arguments: { summary: "done" } };
+    const call: ModelToolCall = { id: "runtime_completion_intent_test", name: "runtime_finalize", arguments: { summary: "done" } };
     const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
     expect(completionFailure(active, call, descriptor, now)).toMatchObject({
       ok: false,
@@ -329,7 +416,7 @@ describe("V4 mutation frontier completion", () => {
     const substitute = inputAccess("generated-substitute", "passed", "fixture/generated.txt", "workspace");
     const target = session([failed, substitute]);
     target.durable.state.plan.goal = `Transform the user input at ${requiredPath}.`;
-    const call: ModelToolCall = { id: "complete", name: "complete_task", arguments: { summary: "done" } };
+    const call: ModelToolCall = { id: "runtime_completion_intent_test", name: "runtime_finalize", arguments: { summary: "done" } };
     const descriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
 
     expect(completionFailure(target, call, descriptor, now)).toMatchObject({
@@ -423,8 +510,8 @@ describe.runIf(process.platform !== "win32")("symlink-aware effect-plan enforcem
 
 const completionDescriptor = { possibleEffects: ["outcome.propose"] } as ToolDescriptor;
 const completionCall = {
-  id: "complete",
-  name: "complete_task",
+  id: "runtime_completion_intent_test",
+  name: "runtime_finalize",
   arguments: {
     summary: "done",
     criteria: [{
@@ -491,7 +578,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
     const failed = failedValidation("failed-validation", []);
     const call = (claim: "validation_executed" | "validation_passed" | "acceptance_met"): ModelToolCall => ({
       id: `complete-${claim}`,
-      name: "complete_task",
+      name: "runtime_finalize",
       arguments: {
         summary: "reported",
         criteria: [{
@@ -515,7 +602,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
           claims: ["validation_executed"]
         })]),
         nextActions: [{
-          tool: "complete_task",
+          tool: "runtime_finalize",
           action: "replace_invalid_evidence_references",
           rule: expect.stringContaining("Mixed reference claims within one criterion are valid")
         }]
@@ -546,7 +633,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
           }
         }],
         nextActions: [{
-          tool: "complete_task",
+          tool: "runtime_finalize",
           action: "cite_failed_validation_result",
           evidenceReferences: [{
             evidenceId: failed.evidenceId,
@@ -564,7 +651,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
     const approved = review("review", [changed.evidenceId], "run", [failed.evidenceId]);
     const call: ModelToolCall = {
       id: "complete-failed-validation",
-      name: "complete_task",
+      name: "runtime_finalize",
       arguments: {
         summary: "change applied; failed validation reported",
         criteria: [{
@@ -589,7 +676,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
     const approved = review("review", [changed.evidenceId], "run", [passed.evidenceId]);
     const call: ModelToolCall = {
       id: "complete-passed-validation",
-      name: "complete_task",
+      name: "runtime_finalize",
       arguments: {
         summary: "change applied and validation passed",
         criteria: [{
@@ -613,7 +700,7 @@ describe.skip("V3 run-scoped completion evidence", () => {
     const failed = failedValidation("later-failed-validation", [changed.evidenceId]);
     const call = (reviewEvidence: EvidenceRecord, includeFailure: boolean): ModelToolCall => ({
       id: `complete-latest-${includeFailure}`,
-      name: "complete_task",
+      name: "runtime_finalize",
       arguments: {
         summary: "latest validation outcome reported",
         criteria: [{

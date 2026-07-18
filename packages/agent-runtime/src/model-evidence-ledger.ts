@@ -8,7 +8,7 @@ function findingText(value: unknown): string {
   return rendered.length <= 1_000 ? rendered : `${rendered.slice(0, 1_000)}…`;
 }
 
-/** Model-visible V4 completion state. Internal evidence and checkpoint IDs are
+/** Model-visible V5 completion state. Internal evidence and checkpoint IDs are
  * deliberately absent: the runtime owns their association and final handoff. */
 export function evidenceLedger(session: RuntimeSession): ContextItem {
   const frontier = session.durable.state.mutationFrontier;
@@ -27,7 +27,7 @@ export function evidenceLedger(session: RuntimeSession): ContextItem {
     `- independent review mode: ${reviewMode}`,
     ...(review ? [`- latest review: ${review.data.verdict} (${review.status})`,
       ...review.data.findings.slice(0, 12).map((item) => `  - ${findingText(item)}`)] : []),
-    "When work is complete call complete_task with summary and optional warnings. If validation cannot be repaired after concrete attempts, call report_blocked. Use request_user_input only for a real user decision."
+    "When work is complete, stop naturally with the final user-facing summary. The runtime completion coordinator will evaluate assurance and review gates. If validation cannot be repaired after concrete attempts, call report_blocked. Use request_user_input only for a real user decision."
   ];
   const content = lines.join("\n");
   return {

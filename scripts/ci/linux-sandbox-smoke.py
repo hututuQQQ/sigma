@@ -99,7 +99,6 @@ def params(root: Path, command: str, *, pty: bool = False) -> dict:
             "readRoots": [str(root)],
             "writeRoots": [str(root / "out")],
             "protectedPaths": [str(root / ".git"), str(root / ".agent")],
-            "unsafeHostExecApproved": False,
         },
         "maxOutputBytes": 65536,
         "pty": pty,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -354,85 +354,6 @@ describe("sensitive per-call approvals", () => {
       && (event.payload as { diagnostics?: string[] }).diagnostics?.includes("permission_denied"))).toBe(true);
   });
 
-  it("binds unsafe-host authorization to the approved call", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-host-approval-"));
-    fixtures.push(root);
-    const workspace = path.join(root, "workspace");
-    await mkdir(workspace);
-    const requests: ExecutionRequest[] = [];
-    const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("host-one", "exec", { executable: "host-fixture", args: [] })]),
-        fakeFinalTurn()
-      ]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
-        runtimeCommands: fixtureRuntimeCommands
-      }),
-      store: new SegmentedJsonlStore({ rootDir: path.join(root, "state") }),
-      storeRootDir: path.join(root, "state"),
-      permissionMode: "auto",
-      runDeadlineMs: 60_000
-    });
-    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
-    const approval = approveEvery(runtime, session.sessionId, 1);
-    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Run the explicitly requested host command." });
-    await runtime.waitForOutcome(session.sessionId);
-    const approvedIds = await approval;
-    expect(approvedIds).toEqual(["host-one"]);
-    await expect(runtime.command({
-      type: "approve", sessionId: session.sessionId, requestId: approvedIds[0]!, decision: "allow"
-    })).rejects.toThrow("Unknown approval");
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.policy).toMatchObject({
-      sandbox: "unsafe",
-      unsafeHostExecApproved: true,
-      network: "none",
-      networkApproved: false
-    });
-  });
-
-  it("terminates with NeedsInput when human approval is unavailable", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-host-headless-"));
-    fixtures.push(root);
-    const workspace = path.join(root, "workspace");
-    await mkdir(workspace);
-    const requests: ExecutionRequest[] = [];
-    const store = new SegmentedJsonlStore({ rootDir: path.join(root, "state") });
-    const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([
-        fakeToolTurn([fakeToolCall("host-headless", "exec", { executable: "host-fixture", args: [] })])
-      ]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
-        runtimeCommands: fixtureRuntimeCommands
-      }),
-      store,
-      storeRootDir: path.join(root, "state"),
-      permissionMode: "auto",
-      interactiveApprovals: false,
-      runDeadlineMs: 60_000
-    });
-    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
-    await runtime.command({
-      type: "submit", sessionId: session.sessionId, text: "Request a human-only host command."
-    });
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "needs_input",
-      requestId: "host-headless",
-      message: expect.stringContaining("non-interactive")
-    });
-    expect(requests).toHaveLength(0);
-    const stored = await events(store, session.sessionId);
-    expect(stored.filter((event) => event.type === "tool.approval_requested")).toHaveLength(1);
-    expect(stored.find((event) => event.type === "tool.approval_requested")?.payload)
-      .toMatchObject({ requestId: "host-headless", approvalMode: "human" });
-    expect(stored.find((event) => event.type === "tool.approval_resolved")?.payload)
-      .toMatchObject({ requestId: "host-headless", decision: "cancelled" });
-    expect(stored.at(-1)?.type).toBe("run.suspended");
-    await expect(runtime.releaseSession(session.sessionId)).resolves.toBeUndefined();
-  });
-
   it.each([
     {
       label: "arguments",
@@ -670,89 +591,6 @@ describe("sensitive per-call approvals", () => {
     await runtime.waitForOutcome("sensitive-session");
     expect(requests).toHaveLength(1);
     expect(requests[0]?.policy.networkApproved).toBe(true);
-  });
-
-  it("re-prompts when a recovered approval no longer matches the replanned effects", async () => {
-    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-plan-workspace-"));
-    const storeRootDir = await mkdtemp(path.join(os.tmpdir(), "sigma-approval-plan-state-"));
-    fixtures.push(workspace, storeRootDir);
-    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
-    const call = fakeToolCall("replanned-host", "exec", {
-      executable: "host-fixture", args: []
-    });
-    const originallyApprovedPlan = {
-      exactEffects: ["process.spawn.readonly"],
-      readPaths: ["."],
-      writePaths: [],
-      network: "none",
-      processMode: "pipe",
-      checkpointScope: [],
-      idempotence: "non_replayable"
-    };
-    const stored: AgentEventEnvelope[] = [
-      fixtureEvent(1, "session.created", { workspacePath: workspace, mode: "change" }),
-      fixtureEvent(2, "plan.updated", { previousRevision: 0, plan: {
-        revision: 1, goal: "run approved command", activeNodeId: "root", nodes: [{
-          id: "root", title: "run", dependencies: [], status: "in_progress",
-          owner: { kind: "root" }, acceptanceCriteria: ["done"], evidence: []
-        }]
-      } }),
-      fixtureEvent(3, "run.started", { mode: "change" }),
-      fixtureEvent(4, "user.message", { text: "run" }),
-      fixtureEvent(5, "model.started", { turnId: 1, effectRevision: 4 }),
-      fixtureEvent(6, "model.completed", {
-        turnId: 1, effectRevision: 4,
-        message: { role: "assistant", content: "", toolCalls: [call] },
-        finishReason: "tool_calls", toolCalls: [call]
-      }),
-      fixtureEvent(7, "tool.requested", {
-        turnId: 1, effectRevision: 4, callId: call.id, name: call.name, arguments: call.arguments
-      }),
-      fixtureEvent(8, "execution.planned", {
-        executionId: call.id, toolCallId: call.id, plan: originallyApprovedPlan
-      }),
-      fixtureEvent(9, "tool.approval_requested", {
-        turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
-        toolName: call.name, arguments: call.arguments,
-        effects: ["process.spawn.readonly"], plan: originallyApprovedPlan
-      }),
-      fixtureEvent(10, "run.suspended", {
-        turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id,
-        message: "approval required", remainingDeadlineMs: 60_000
-      })
-    ];
-    for (const event of stored) await store.append(event, event.seq - 1);
-    const requests: ExecutionRequest[] = [];
-    const runtime = createRuntime({
-      gateway: new SmokeFakeGateway([]),
-      tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker: broker(requests), sandboxMode: "unsafe", networkMode: "none",
-        runtimeCommands: fixtureRuntimeCommands
-      }),
-      store,
-      storeRootDir,
-      permissionMode: "ask",
-      runDeadlineMs: 60_000
-    });
-    await runtime.command({ type: "resume", sessionId: "sensitive-session" });
-    const rePrompt = nextEventAfter(runtime, "sensitive-session", 10, ["tool.approval_requested", "tool.failed"]);
-    await runtime.command({
-      type: "approve", sessionId: "sensitive-session", requestId: call.id, decision: "allow"
-    });
-    await expect(rePrompt).resolves.toMatchObject({
-      payload: {
-        requestId: call.id,
-        effects: ["process.spawn.readonly", "open_world"],
-        plan: { exactEffects: ["process.spawn.readonly", "open_world"] }
-      }
-    });
-    expect(requests).toHaveLength(0);
-    await runtime.command({
-      type: "cancel", sessionId: "sensitive-session", reason: "changed plan was not approved"
-    });
-    await expect(runtime.waitForOutcome("sensitive-session")).resolves.toMatchObject({
-      kind: "cancelled"
-    });
   });
 
   it("elevates every sensitive child request to the parent session user", async () => {

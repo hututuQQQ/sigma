@@ -95,15 +95,24 @@ export function projectModelToolDescriptors(
 
 export async function providerSizedPlan(
   gateway: ModelGateway,
-  input: Omit<PlanContextOptions, "contextWindowTokens">
+  input: Omit<PlanContextOptions, "contextWindowTokens" | "promptCache"> & { maxInputTokens?: number }
 ): Promise<ContextPlan> {
   const providerLimit = gateway.capabilities.contextWindowTokens;
+  const { maxInputTokens, ...contextInput } = input;
+  const inputLimit = Math.min(providerLimit - input.outputReserveTokens, maxInputTokens ?? providerLimit);
+  // Begin with the provider window and use its tokenizer as the authority.
+  // Internal context estimates are intentionally conservative and must not
+  // reject a terminal turn that the provider tokenizer proves can fit.
   let planningLimit = providerLimit;
   while (planningLimit > input.outputReserveTokens) {
-    const plan = planContext({ ...input, contextWindowTokens: planningLimit });
+    const plan = planContext({
+      ...contextInput,
+      contextWindowTokens: planningLimit,
+      promptCache: gateway.capabilities.promptCache
+    });
     const tokens = await gateway.countTokens(plan.messages, input.tools);
-    if (tokens + input.outputReserveTokens <= providerLimit) return plan;
-    const ratio = providerLimit / (tokens + input.outputReserveTokens);
+    if (tokens <= inputLimit && tokens + input.outputReserveTokens <= providerLimit) return plan;
+    const ratio = Math.min(inputLimit / Math.max(1, tokens), providerLimit / (tokens + input.outputReserveTokens));
     const next = Math.min(planningLimit - 1, Math.floor(planningLimit * ratio * 0.98));
     if (next <= input.outputReserveTokens) break;
     planningLimit = next;

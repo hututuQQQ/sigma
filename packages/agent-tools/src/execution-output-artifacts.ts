@@ -102,7 +102,10 @@ function dependencyDiagnostics(result: ExecutionResult): string[] {
     /ClassNotFoundException\b/iu,
     /NoClassDefFoundError\b/iu
   ].some((pattern) => pattern.test(output));
-  return missing ? ["dependency_missing"] : [];
+  // This is the invoked application reporting a missing package, not the
+  // execution broker failing to start. Keep it model-visible without feeding
+  // the infrastructure fail-fast taxonomy.
+  return missing ? ["command_dependency_missing"] : [];
 }
 
 async function importOutputArtifacts(

@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
 import type { EvidenceRecord, ReviewEvidence, ValidationEvidence, WorkspaceDeltaEvidence } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 import { CHECKPOINT_INTEGRITY_VALIDATOR } from "./validation-policy.js";
+import {
+  assurancePathsForClaim, assuranceRequirement, validationClaimSatisfies
+} from "./assurance-engine.js";
 
 const MUTATION_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
 
@@ -27,6 +31,7 @@ export interface FrontierValidationReadiness {
   validations: ValidationEvidence[];
   coveredPaths: string[];
   missingPaths: string[];
+  missingClaims: string[];
   latestFailed?: ValidationEvidence;
   ready: boolean;
 }
@@ -34,30 +39,73 @@ export interface FrontierValidationReadiness {
 export function frontierValidationReadiness(session: RuntimeSession): FrontierValidationReadiness {
   const changed = session.durable.state.mutationFrontier.changedPaths;
   const validations = sessionMutationEvidence(session).filter((item) => isCurrentValidation(session, item));
-  const latestByPath = new Map<string, ValidationEvidence>();
-  for (const validation of validations) {
-    for (const path of validation.data.coveredPaths) {
-      if (changed.includes(path)) latestByPath.set(path, validation);
-    }
-  }
-  const coveredPaths = changed.filter((path) => latestByPath.get(path)?.status === "passed");
-  const missingPaths = changed.filter((path) => latestByPath.get(path)?.status !== "passed");
+  const requirement = assuranceRequirement(session);
+  const passed = validations.filter((item) => item.status === "passed");
+  const missingClaims = requirement.requiredClaims.filter((required) => {
+    const requiredPaths = assurancePathsForClaim(changed, required);
+    return requiredPaths.length > 0 && !requiredPaths.every((changedPath) => passed.some((validation) =>
+      validationClaimSatisfies(validation.data.claim?.kind, required)
+        && validation.data.coveredPaths.includes(changedPath)));
+  });
+  const coveredPaths = changed.filter((changedPath) => requirement.requiredClaims.every((required) => {
+    if (!assurancePathsForClaim([changedPath], required).includes(changedPath)) return true;
+    return passed.some((validation) => validationClaimSatisfies(validation.data.claim?.kind, required)
+      && validation.data.coveredPaths.includes(changedPath));
+  }));
+  const missingPaths = changed.filter((path) => !coveredPaths.includes(path));
   const latestFailed = [...validations].reverse().find((item) => item.status === "failed"
-    && item.data.coveredPaths.some((path) => changed.includes(path)));
+    && requirement.requiredClaims.some((required) =>
+      validationClaimSatisfies(item.data.claim?.kind, required)));
   return {
     validations,
     coveredPaths,
     missingPaths,
+    missingClaims,
     ...(latestFailed ? { latestFailed } : {}),
-    ready: missingPaths.length === 0
+    ready: missingPaths.length === 0 && missingClaims.length === 0
   };
 }
 
-export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
+function validationSemanticSignature(validation: ValidationEvidence): string {
+  return JSON.stringify({
+    status: validation.status,
+    validator: validation.data.validator,
+    command: validation.data.command ?? null,
+    exitCode: validation.data.exitCode ?? null,
+    termination: validation.data.termination ?? null,
+    coveredPaths: [...new Set(validation.data.coveredPaths)].sort(),
+    claim: validation.data.claim ?? null,
+    frontierRevision: validation.data.frontierRevision,
+    stateDigest: validation.data.stateDigest
+  });
+}
+
+export function reviewBasisDigest(
+  session: RuntimeSession,
+  validations = frontierValidationReadiness(session).validations
+): string {
+  const frontier = session.durable.state.mutationFrontier;
+  const signatures = [...new Set(validations.map(validationSemanticSignature))].sort();
+  return createHash("sha256").update(JSON.stringify({
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    validations: signatures
+  })).digest("hex");
+}
+
+export function latestFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
   const frontier = session.durable.state.mutationFrontier;
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
     && item.data.frontierRevision === frontier.revision
     && item.data.stateDigest === frontier.currentStateDigest).at(-1);
+}
+
+export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
+  const basisDigest = reviewBasisDigest(session);
+  return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
+    && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
+    && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest
+    && item.data.reviewBasisDigest === basisDigest).at(-1);
 }
 
 /** Compatibility projection for reviewer diff material. Only deltas that

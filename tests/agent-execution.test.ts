@@ -731,6 +731,17 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
+  it("can perform required sandbox setup as the initial broker operation", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("unavailable"));
+    await expect(client.setupSandbox()).resolves.toMatchObject({
+      sandbox: { available: true, selfTestPassed: true }
+    });
+    await expect(client.execute({ ...spawnRequest(), timeoutMs: 500 })).resolves.toMatchObject({
+      state: "exited", exitCode: 0
+    });
+    await client.close();
+  });
+
   it("hands off only deliverable handles and releases client ownership", async () => {
     const sessionClient = new SigmaExecBrokerClient(fixtureOptions("normal"));
     await sessionClient.connect();
@@ -1143,13 +1154,13 @@ describe("SigmaExecBrokerClient", () => {
     await expect(client.connect()).rejects.toBeInstanceOf(BrokerTimeoutError);
   });
 
-  it("requires explicit network and unsafe-host approvals", async () => {
+  it("requires explicit network approval and rejects unsafe-host policy", async () => {
     const client = new SigmaExecBrokerClient(fixtureOptions());
     await client.connect();
     const request = spawnRequest();
     await expect(client.spawn({ ...request, policy: { ...request.policy, network: "full" } })).rejects.toBeInstanceOf(BrokerPolicyError);
     await expect(client.spawn({
-      ...request, policy: { ...request.policy, sandbox: "unsafe", unsafeHostExecApproved: true }
+      ...request, policy: { ...request.policy, sandbox: "unsafe" }
     })).rejects.toBeInstanceOf(BrokerPolicyError);
     await client.close();
   });
@@ -1171,19 +1182,15 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
-  it("permits the explicit two-key unsafe escape and blocks required calls on unavailable backends", async () => {
-    const allowed = new SigmaExecBrokerClient(fixtureOptions("normal", {
-      sandboxMode: "unsafe", allowUnsafeHostExec: true
-    }));
-    await allowed.connect();
-    await expect(allowed.spawn({
-      ...spawnRequest(), policy: { ...requiredPolicy(), sandbox: "unsafe", unsafeHostExecApproved: true }
-    })).resolves.toMatchObject({ id: "fixture-process" });
-    await allowed.close();
-    const unavailable = new SigmaExecBrokerClient(fixtureOptions("unavailable", { sandboxMode: "unsafe" }));
-    await unavailable.connect();
-    await expect(unavailable.spawn(spawnRequest())).rejects.toBeInstanceOf(SandboxUnavailableError);
-    await unavailable.close();
+  it("has no unsafe-host escape and blocks unavailable required backends", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("normal"));
+    await client.connect();
+    await expect(client.spawn({
+      ...spawnRequest(), policy: { ...requiredPolicy(), sandbox: "unsafe" }
+    })).rejects.toThrow(/removed in V5/u);
+    await client.close();
+    const unavailable = new SigmaExecBrokerClient(fixtureOptions("unavailable"));
+    await expect(unavailable.connect()).rejects.toBeInstanceOf(SandboxUnavailableError);
   });
 
   it("serializes cursor-changing operations for the same background handle", async () => {
@@ -1418,6 +1425,7 @@ const healthyExecutionResult = (): ExecutionResult => ({
 class LifecycleBrokerFixture implements ExecutionBroker {
   readonly lostProcessHandles: ProcessHandle[] = [];
   connectCalls = 0;
+  setupCalls = 0;
   executeCalls = 0;
   spawnCalls = 0;
   pollCalls = 0;
@@ -1440,7 +1448,10 @@ class LifecycleBrokerFixture implements ExecutionBroker {
     return this.hooks.connect ? await this.hooks.connect() : healthyDoctorReport;
   }
   async doctor(): Promise<BrokerDoctorReport> { return healthyDoctorReport; }
-  async setupSandbox(): Promise<BrokerDoctorReport> { return healthyDoctorReport; }
+  async setupSandbox(): Promise<BrokerDoctorReport> {
+    this.setupCalls += 1;
+    return healthyDoctorReport;
+  }
   async execute(_request: ExecutionRequest): Promise<ExecutionResult> {
     this.executeCalls += 1;
     return await this.run();
@@ -1484,6 +1495,20 @@ function deferred<T>(): {
 describe("LazyExecutionBroker generations", () => {
   const executionRequest = (): ExecutionRequest => ({ ...spawnRequest(), timeoutMs: 500 });
 
+  it("initializes a fresh generation through explicit sandbox setup", async () => {
+    const client = new LifecycleBrokerFixture(async () => healthyExecutionResult());
+    const broker = new LazyExecutionBroker({
+      sandboxMode: "required",
+      clientFactory: () => client
+    });
+
+    await expect(broker.setupSandbox()).resolves.toEqual(healthyDoctorReport);
+    await expect(broker.execute(executionRequest())).resolves.toMatchObject({ stdout: "ok" });
+    expect(client.setupCalls).toBe(1);
+    expect(client.connectCalls).toBe(0);
+    await broker.close();
+  });
+
   it("rebuilds once and retries only a request rejected before dispatch", async () => {
     const stale = new LifecycleBrokerFixture(async () => {
       throw new BrokerConnectionError("closed before dispatch", { retrySafe: true });
@@ -1493,7 +1518,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1515,7 +1539,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1539,7 +1562,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1560,7 +1582,6 @@ describe("LazyExecutionBroker generations", () => {
     });
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => client
     });
     const controller = new AbortController();
@@ -1586,7 +1607,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1606,7 +1626,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => { factories += 1; return stale; }
     });
 
@@ -1640,7 +1659,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1681,7 +1699,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
     await broker.connect();
@@ -1709,7 +1726,6 @@ describe("LazyExecutionBroker generations", () => {
     });
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => client
     });
     await broker.connect();
@@ -1743,7 +1759,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1763,7 +1778,6 @@ describe("LazyExecutionBroker generations", () => {
     });
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => client
     });
 
@@ -1790,7 +1804,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 
@@ -1812,7 +1825,6 @@ describe("LazyExecutionBroker generations", () => {
     let factories = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factories++]!
     });
 

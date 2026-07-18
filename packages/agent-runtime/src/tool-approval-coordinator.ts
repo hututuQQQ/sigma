@@ -24,6 +24,42 @@ const internalTerminalEffects: ReadonlySet<ToolEffect> = new Set([
   "outcome.request_input"
 ]);
 
+function approvalCommand(call: ModelToolCall): string {
+  const value = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
+    ? call.arguments as Record<string, unknown> : {};
+  if (typeof value.executable === "string") {
+    const args = Array.isArray(value.args)
+      ? value.args.filter((item): item is string => typeof item === "string") : [];
+    return [value.executable, ...args].join(" ");
+  }
+  if (typeof value.command === "string") return value.command;
+  return call.name;
+}
+
+function approvalRisk(effects: readonly ToolEffect[], plan: ToolCallPlan): { level: string; reason: string } {
+  if (effects.includes("destructive") || effects.includes("repository.write") || plan.network === "full") {
+    return { level: "high", reason: "repository, destructive, or full-network capability" };
+  }
+  if (effects.includes("filesystem.write") || effects.includes("filesystem.read.external")) {
+    return { level: "medium", reason: "workspace mutation or external read capability" };
+  }
+  return { level: "low", reason: "read-only local capability" };
+}
+
+function semanticApprovalReason(
+  call: ModelToolCall,
+  effects: readonly ToolEffect[],
+  plan: ToolCallPlan,
+  backend: "native" | "oci",
+  automatic = false
+): string {
+  const risk = approvalRisk(effects, plan);
+  const read = plan.readPaths.join(", ") || "none";
+  const write = plan.writePaths.join(", ") || "none";
+  return `command=${approvalCommand(call)}; read=${read}; write=${write}; network=${plan.network}; `
+    + `backend=${backend}; risk=${risk.level} (${risk.reason})${automatic ? "; decision=automatic" : ""}`;
+}
+
 export interface ApprovalRequest {
   call: ModelToolCall;
   modelTurn: ActiveModelTurn;
@@ -33,8 +69,10 @@ export interface ApprovalRequest {
 
 function requiresPerCallApproval(plan: ToolCallPlan): boolean {
   return plan.network === "full"
-    || plan.exactEffects.includes("network")
     || plan.exactEffects.includes("filesystem.read.external")
+    || plan.exactEffects.includes("repository.write")
+    || plan.exactEffects.includes("destructive")
+    || plan.exactEffects.includes("checkpoint.restore")
     || plan.exactEffects.includes("process.handoff")
     || plan.exactEffects.includes("open_world");
 }
@@ -69,14 +107,15 @@ function immediateApprovalDecision(
   session: RuntimeSession,
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
-  permissionMode: ReturnType<typeof profilePermissionMode>
+  permissionMode: ReturnType<typeof profilePermissionMode>,
+  plan: ToolCallPlan
 ): "allow" | "deny" | undefined {
   const mandatory = mandatoryApprovalDecision(descriptor, effects, permissionMode);
   if (mandatory) return mandatory;
-  const perCall = effects.some((effect) => effect === "network"
-    || effect === "filesystem.read.external" || effect === "process.handoff" || effect === "open_world");
+  const perCall = requiresPerCallApproval(plan);
   const effectGrant = effects.slice().sort().join("\0");
   if (permissionMode === "auto" && !effects.includes("open_world")) return "allow";
+  if (permissionMode === "workspace-auto" && !perCall) return "allow";
   return !perCall && (descriptor.approval === "auto"
     || session.interaction.alwaysAllowedEffects.has(effectGrant)) ? "allow" : undefined;
 }
@@ -97,7 +136,7 @@ function validApprovalGrant(
       plan.exactEffects.includes("filesystem.read.external"), grant.externalReadApproved
     )
     && approvalSatisfied(plan.exactEffects.includes("process.handoff"), grant.processHandoffApproved)
-    && approvalSatisfied(plan.exactEffects.includes("open_world"), grant.unsafeHostExecApproved);
+    && approvalSatisfied(plan.exactEffects.includes("open_world"), grant.openWorldApproved);
 }
 
 async function cleanUpFailedApprovalRequest(
@@ -180,7 +219,7 @@ export class ToolApprovalCoordinator {
     session.interaction.callApprovals.delete(prepared.call.id);
     if (!requiresGrant) return undefined;
     if (!validApprovalGrant(grant, expectedBinding, prepared.plan)) {
-      throw Object.assign(new Error("Sensitive execution requires a fresh per-call human approval."), {
+      throw Object.assign(new Error("Sensitive execution requires a fresh per-call approval."), {
         code: "per_call_approval_required"
       });
     }
@@ -210,7 +249,9 @@ export class ToolApprovalCoordinator {
     const permissionMode = profilePermissionMode(this.options.runtime, session);
     const immediate = forcePrompt
       ? undefined
-      : immediateApprovalDecision(session, descriptor, effects, permissionMode);
+      : immediateApprovalDecision(
+          session, descriptor, effects, permissionMode, plan
+        );
     if (immediate) {
       return requiresPerCallApproval(plan)
         ? await this.resolveAutomatically(session, descriptor, effects, request, modelTurn, plan)
@@ -239,7 +280,12 @@ export class ToolApprovalCoordinator {
         effects,
         plan,
         approvalMode: "human",
-        reason: `Effects: ${effects.join(", ")}; writes: ${plan.writePaths.join(", ") || "none"}; rollback scope: ${plan.checkpointScope.join(", ") || "none"}${plan.checkpointAction ? `; checkpoint: ${plan.checkpointAction.checkpointId}` : ""}`,
+        reason: semanticApprovalReason(
+          request,
+          effects,
+          plan,
+          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native"
+        ),
         ...turnPayload(modelTurn)
       });
       requestWasDurable = true;
@@ -274,7 +320,13 @@ export class ToolApprovalCoordinator {
     await this.options.emit(session, "tool.approval_requested", "runtime", {
       requestId: request.id, callId: request.id, toolName: descriptor.name, arguments: request.arguments,
       effects, plan, approvalMode: "automatic",
-      reason: `Permission mode auto authorized the planned effects: ${effects.join(", ")}.`,
+      reason: semanticApprovalReason(
+        request,
+        effects,
+        plan,
+        this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native",
+        true
+      ),
       ...turnPayload(modelTurn)
     });
     await this.options.emit(session, "tool.approval_resolved", "runtime", {
@@ -286,7 +338,7 @@ export class ToolApprovalCoordinator {
       networkApproved: plan.network === "full",
       externalReadApproved: plan.exactEffects.includes("filesystem.read.external"),
       processHandoffApproved: plan.exactEffects.includes("process.handoff"),
-      unsafeHostExecApproved: false
+      openWorldApproved: false
     });
     return "allow";
   }
@@ -305,7 +357,12 @@ export class ToolApprovalCoordinator {
       await this.options.emit(session, "tool.approval_requested", "runtime", {
         requestId: request.id, callId: request.id, toolName: descriptor.name, arguments: request.arguments,
         effects, plan, approvalMode: "human",
-        reason: `Human approval is required for effects: ${effects.join(", ")}.`,
+        reason: semanticApprovalReason(
+          request,
+          effects,
+          plan,
+          this.options.runtime.runtimeEnvironment?.executionMode === "container" ? "oci" : "native"
+        ),
         ...turnPayload(modelTurn)
       });
       await this.options.emit(session, "tool.approval_resolved", "runtime", {

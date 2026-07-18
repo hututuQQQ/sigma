@@ -32,15 +32,8 @@ export function typedCompletion(
   return {
     message: {
       role: "assistant",
-      content: "",
-      toolCalls: [{
-        id: input.id,
-        name: "complete_task",
-        arguments: {
-          summary: input.summary
-        }
-      }]
+      content: input.summary
     },
-    finishReason: "tool_calls"
+    finishReason: "stop"
   };
 }

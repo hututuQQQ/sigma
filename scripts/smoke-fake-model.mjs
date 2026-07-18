@@ -19,10 +19,9 @@ export function fakeValidationTurn(id, checks) {
 
 export function fakeProcessValidationTurn(id, relativePath, expected) {
   return () => fakeToolTurn([fakeToolCall(id, "validate", {
-      executable: "./sigma-smoke-validate",
-      args: [relativePath, expected],
-      access: "readonly",
-      readRoots: ["."]
+      executable: "./pnpm",
+      args: ["run", "verify-smoke", relativePath, expected],
+      access: "readonly"
     })]);
 }
 
@@ -75,7 +74,11 @@ export function createSmokeExecutionBroker() {
     connect: async () => report,
     doctor: async () => report,
     execute: async (input) => {
-      const [relativePath, expected] = input.command.args;
+      const [run, script, relativePath, expected] = input.command.args;
+      if (path.basename(input.command.executable).replace(/\.(?:cmd|exe)$/iu, "").toLowerCase() !== "pnpm"
+        || run !== "run" || script !== "verify-smoke") {
+        return exited(false, "unexpected smoke validation command");
+      }
       try {
         const actual = await readFile(path.resolve(input.command.cwd, relativePath), "utf8");
         return exited(actual === expected, actual === expected ? "validation passed" : "content mismatch");
@@ -174,12 +177,9 @@ export function fakeFinalTurn(content = "done") {
   return () => ({
     message: {
       role: "assistant",
-      content: "",
-      toolCalls: [fakeToolCall("complete-smoke", "complete_task", {
-        summary: content
-      })]
+      content
     },
-    finishReason: "tool_calls",
+    finishReason: "stop",
     inputTokens: 1,
     outputTokens: 1
     });

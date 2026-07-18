@@ -147,8 +147,8 @@ function assertProtectedRepairState(state: KernelState): void {
   if (repair.kind === "protected_completion" && state.pendingTools.length > 0) {
     const terminalName = state.pendingTools[0]?.request.name;
     if (state.pendingTools.length !== 1
-      || (terminalName !== "complete_task" && terminalName !== "request_user_input")) {
-      throw new Error("A protected terminal-intent repair can pend only one complete_task or request_user_input call.");
+      || (terminalName !== "runtime_finalize" && terminalName !== "request_user_input")) {
+      throw new Error("A protected terminal-intent repair can pend only one runtime completion intent or request_user_input call.");
     }
   }
   assertProtectedInputState(state);

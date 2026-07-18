@@ -14,6 +14,8 @@ import {
   detectTaskSelectionFlag,
   formatMarkdownReport,
   generateBenchReport,
+  groupHarborTimeoutProbe,
+  assertComparableBenchmarkReports,
   harborEnvForRun,
   harborRuntimeDir,
   parseHarborTimeoutProbe,
@@ -75,6 +77,17 @@ describe("Terminal-Bench command construction", () => {
     ])).toThrow("--reuse-package requires --expected-archive-sha256");
   });
 
+  it("rejects comparisons across agent profiles and evaluation lanes", () => {
+    expect(() => assertComparableBenchmarkReports(
+      { agent_profile: "standard", evaluation_lane: "solving" },
+      { agent_profile: "strict", evaluation_lane: "strict_conformance" }
+    )).toThrow(/different agent profiles/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { tasks: [{ agent_profile: "standard" }], evaluation_lane: "solving" },
+      { agent_profile: "standard", evaluation_lane: "solving" }
+    )).not.toThrow();
+  });
+
   it("propagates the run-level network mode into Harbor agent configuration", () => {
     const options = resolveRunOptions(["--mode", "task", "--task-id", "generic-task", "--network", "full"]);
     expect(options.networkMode).toBe("full");
@@ -82,19 +95,35 @@ describe("Terminal-Bench command construction", () => {
       ...options,
       taskSelectionFlag: "--task-id",
       timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180, agent_timeout_multiplier: "1" }
-    })).toContain("network_mode:str=full");
-    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({ network_mode: "full" });
+    })).toEqual(expect.arrayContaining([
+      "network_mode:str=full",
+      "execution_mode:str=sandboxed",
+      "agent_profile:str=standard"
+    ]));
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
+      network_mode: "full",
+      execution_mode: "sandboxed",
+      agent_profile: "standard"
+    });
+  });
+
+  it("accepts loopback without promoting it to full network", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--network", "loopback"
+    ]);
+    expect(options.networkMode).toBe("loopback");
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
+      network_mode: "loopback",
+      execution_mode: "sandboxed"
+    });
   });
 
   it("keeps standard runs at task resources and marks relaxed runs diagnostic", () => {
-    const standard = resolveRunOptions([
-      "--mode", "task", "--task-id", "generic-task",
-      "--execution-mode", "disposable-container"
-    ]);
+    const standard = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"]);
     const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
     const config = buildHarborJobConfig(standard, "jobs", standardPlan);
     expect(standard).toMatchObject({
-      benchmarkClass: "standard", executionMode: "disposable-container"
+      benchmarkClass: "standard", executionMode: "sandboxed", agentProfile: "standard"
     });
     expect(standardPlan).toMatchObject({
       agent_wall_time_sec: 780,
@@ -104,7 +133,13 @@ describe("Terminal-Bench command construction", () => {
       environment_build_timeout_multiplier: null
     });
     expect(config).not.toHaveProperty("agent_timeout_multiplier");
-    expect(config.agents[0].kwargs.execution_mode).toBe("disposable-container");
+    expect(config.agents[0].kwargs.execution_mode).toBe("sandboxed");
+    expect(config.agents[0].kwargs.agent_profile).toBe("standard");
+
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--execution-mode", "sandboxed",
+      "--agent-profile", "strict"
+    ])).toMatchObject({ executionMode: "sandboxed", agentProfile: "strict" });
 
     const diagnostic = resolveRunOptions([
       "--mode", "task", "--task-id", "generic-task",
@@ -170,6 +205,8 @@ describe("Terminal-Bench command construction", () => {
       "--ak",
       "provider:str=deepseek",
       "--ak",
+      "agent_profile:str=standard",
+      "--ak",
       "model:str=deepseek-v4-pro",
       "--ak",
       "max_turns:int=200",
@@ -214,6 +251,8 @@ describe("Terminal-Bench command construction", () => {
       `agent_cli_tarball=${defaultAgentCliTarballForEnv()}`,
       "--ak",
       "provider=glm",
+      "--ak",
+      "agent_profile=standard",
       "--ak",
       "model=glm-5.2",
       "--ak",
@@ -276,7 +315,7 @@ describe("Terminal-Bench command construction", () => {
     ).toContain("max_wall_time_sec=2700");
   });
 
-  it("caps a run-wide child deadline below the smallest Harbor outer deadline", () => {
+  it("uses Harbor per-trial deadlines for heterogeneous timeout batches", () => {
     const timeoutProbe = {
       tasks: [
         { agent_timeout_sec: 900 },
@@ -284,25 +323,67 @@ describe("Terminal-Bench command construction", () => {
       ],
       max_agent_timeout_sec: 1200
     };
-    const plan = computeHarborTimeoutPlan({ agentTimeoutGraceSec: 120 }, timeoutProbe);
+    const plan = computeHarborTimeoutPlan({ benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, timeoutProbe);
 
     expect(plan).toMatchObject({
-      requested_agent_wall_time_sec: 1800,
-      agent_wall_time_sec: 1320,
-      child_deadline_sec: 1320,
-      outer_trial_deadline_sec: 1440,
+      requested_agent_wall_time_sec: 1080,
+      agent_wall_time_sec: 1080,
+      child_deadline_sec: 1080,
+      outer_trial_deadline_sec: null,
+      outer_trial_deadline_scope: "harbor_per_trial",
       deadline_cleanup_grace_sec: 120,
-      deadline_clamped: true
+      deadline_clamped: false
     });
-    expect(plan.agent_wall_time_sec).toBeLessThanOrEqual(
-      plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec
-    );
-    expect(buildHarborJobConfig({
+    const kwargs = buildHarborJobConfig({
       mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
-    }, "jobs", plan, timeoutProbe).agents[0].kwargs).toMatchObject({
-      max_wall_time_sec: 1320,
-      outer_trial_deadline_sec: 1440
+    }, "jobs", plan, timeoutProbe).agents[0].kwargs;
+    expect(kwargs).toMatchObject({ max_wall_time_sec: 1080 });
+    expect(kwargs).not.toHaveProperty("outer_trial_deadline_sec");
+  });
+
+  it("groups heterogeneous trials so each runtime receives its real deadline", () => {
+    const groups = groupHarborTimeoutProbe({
+      tasks: [
+        { task_name: "terminal-bench/short-a", agent_timeout_sec: 900, verifier_timeout_sec: 900 },
+        { task_name: "terminal-bench/long", agent_timeout_sec: 3600, verifier_timeout_sec: 3600 },
+        { task_name: "terminal-bench/short-b", agent_timeout_sec: 900, verifier_timeout_sec: 900 }
+      ],
+      resolved_tasks: [
+        { name: "terminal-bench/short-a" },
+        { name: "terminal-bench/long" },
+        { name: "terminal-bench/short-b" }
+      ]
     });
+
+    expect(groups.map((group) => ({
+      timeout: group.agent_timeout_sec,
+      tasks: group.tasks.map((task) => task.task_name),
+      plan: computeHarborTimeoutPlan(
+        { benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, group.timeout_probe
+      ).agent_wall_time_sec
+    }))).toEqual([
+      { timeout: 900, tasks: ["terminal-bench/short-a", "terminal-bench/short-b"], plan: 780 },
+      { timeout: 3600, tasks: ["terminal-bench/long"], plan: 3480 }
+    ]);
+  });
+
+  it("injects an exact outer deadline only when all task timeouts are uniform", () => {
+    const timeoutProbe = {
+      tasks: [{ agent_timeout_sec: 900 }, { agent_timeout_sec: 900 }],
+      max_agent_timeout_sec: 900
+    };
+    const plan = computeHarborTimeoutPlan(
+      { benchmarkClass: "standard", agentTimeoutGraceSec: 120 },
+      timeoutProbe
+    );
+
+    expect(plan).toMatchObject({
+      agent_wall_time_sec: 780,
+      outer_trial_deadline_sec: 900,
+      outer_trial_deadline_scope: "uniform_task_timeout",
+      deadline_cleanup_grace_sec: 120
+    });
+    expect(plan.agent_wall_time_sec).toBe(plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec);
   });
 
   it("gives long MVP tasks lenient wall time by default", () => {
@@ -738,6 +819,16 @@ describe("benchmark report generation", () => {
           provider: "deepseek",
           model: "deepseek-v4-pro",
           dataset: terminalBenchDataset,
+          agent_profile: "standard",
+          evaluation_lane: "solving",
+          timeout_probe: { tasks: [
+            { task_name: "passed-task", agent_timeout_sec: 900 },
+            { task_name: "api-task", agent_timeout_sec: 3600 }
+          ] },
+          timeout_groups: [
+            { task_names: ["passed-task"], timeout_plan: { agent_wall_time_sec: 780 } },
+            { task_names: ["api-task"], timeout_plan: { agent_wall_time_sec: 3480 } }
+          ],
           k: 2,
           command_text: "harbor run -k 2",
           exit_code: 1,
@@ -757,7 +848,7 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(passedDir, "metadata.json"), '{"task_id":"passed-task","status":"passed"}\n', "utf8");
     await writeFile(
       path.join(passedDir, "summary.json"),
-      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":3,"input_tokens":10,"output_tokens":5,"duration_ms":1000,"last_error":null}\n',
+      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":3,"input_tokens":10,"cache_tokens":8,"cache_read_tokens":8,"output_tokens":5,"reasoning_tokens":4,"length_finish_count":1,"converge_turns":2,"duration_ms":1000,"last_error":null}\n',
       "utf8"
     );
     await writeFile(path.join(passedDir, "trace.jsonl"), '{"type":"run_end","metadata":{}}\n', "utf8");
@@ -779,11 +870,26 @@ describe("benchmark report generation", () => {
     expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
     expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
+    expect(report).toMatchObject({
+      reasoning_tokens: 4,
+      agent_profile: "standard",
+      evaluation_lane: "solving",
+      cache_read_ratio: 8 / 22,
+      reasoning_output_ratio: 4 / 6,
+      length_finish_count: 1,
+      converge_turns: 2,
+      usage: { reasoning_tokens: 4, cache_read_tokens: 8 }
+    });
+    expect(report.lane_metrics).toMatchObject({ verifier_reached: 0, verifier_passed: 0 });
     const markdown = await readFile(path.join(runDir, "report.md"), "utf8");
     const jsonReport = JSON.parse(await readFile(path.join(runDir, "report.json"), "utf8"));
     expect(markdown).toContain("# Terminal-Bench Run synthetic-run");
     expect(markdown).toContain("| task | status | failure_category | suggested_owner |");
     expect(jsonReport.counts.api_error).toBe(1);
+    expect(jsonReport.tasks.find((task) => task.task_id === "passed-task")).toMatchObject({
+      harbor_deadline_sec: 900, sigma_deadline_sec: 780
+    });
+    expect(markdown).toContain("Evaluation lane: solving");
     expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
   });
 

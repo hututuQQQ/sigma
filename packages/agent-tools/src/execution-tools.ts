@@ -43,7 +43,7 @@ function networkProperty(options: ExecutionToolOptions): JsonValue {
   return {
     type: "string",
     enum: availableNetworkModes(options),
-    description: `Per-call network policy; configured default is '${options.networkMode}'. In a required sandbox, network=none denies every socket operation, including localhost bind/connect. Use network=full only for the smallest launch or probe that actually needs sockets; it requires fresh approval.`
+    description: `Per-call network policy; configured default is '${options.networkMode}'. none denies sockets, loopback is limited to local test services when supported, and full always requires fresh approval.`
   };
 }
 
@@ -293,11 +293,7 @@ function backgroundTools(options: ExecutionToolOptions): RegisteredEffectTool[] 
             description: "Use deliverable only for a service that must survive successful task completion; verify it through a separate interface probe, then call process_handoff."
           }
         } : {}),
-        access: { type: "string", enum: ["readonly"] },
-        readRoots: {
-          type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-          description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
-        }
+        access: { type: "string", enum: ["readonly"] }
       }, ["executable"], ["process.spawn.readonly", "filesystem.read", "filesystem.read.external", "network", "open_world"]),
       prepare(value, context) { return prepareExecutionCallPlan(value, context, options, false, true); }
     },

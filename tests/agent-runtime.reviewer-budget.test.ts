@@ -182,7 +182,18 @@ function validation(coveredPaths = ["src/code.ts"]): ValidationEvidence {
       artifactIds: [],
       frontierRevision: 1,
       stateDigest: "a".repeat(64),
-      coveredPaths
+      coveredPaths,
+      claim: {
+        kind: "typecheck",
+        commandDigest: "c".repeat(64),
+        subject: {
+          projectId: ".",
+          configPaths: [],
+          selectedTests: [],
+          exactFiles: []
+        },
+        status: "passed"
+      }
     }
   };
 }
@@ -489,7 +500,7 @@ describe("independent reviewer budget accounting", () => {
     });
   });
 
-  it("deduplicates repeated review requests when no new evidence exists", async () => {
+  it("caps explicit infrastructure retries at two per review basis", async () => {
     const target = runtimeSession();
     let calls = 0;
     const reviewer: ReviewerPort = {
@@ -518,13 +529,70 @@ describe("independent reviewer budget accounting", () => {
       }
     };
     const { emit } = harness(target);
+    await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal);
+    await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
+    await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
+    await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal, true);
+
+    expect(calls).toBe(3);
+  });
+
+  it("refreshes a rejected review only for substantively new validation evidence", async () => {
+    const target = runtimeSession();
+    let calls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "freshness-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        calls += 1;
+        return {
+          evidenceId: `review-${calls}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: calls === 1 ? "failed" : "passed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "freshness-reviewer" },
+          summary: calls === 1 ? "add stronger validation" : "approved",
+          data: {
+            reviewerId: "freshness-reviewer",
+            verdict: calls === 1 ? "changes_requested" : "approved",
+            findings: calls === 1
+              ? [{ actionable: true, severity: "error", summary: "Add a runtime check." }]
+              : [],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
     const coordinator = new ReviewCoordinator(reviewer, emit);
 
     await coordinator.maybeReview(target, new AbortController().signal);
-    await coordinator.maybeReview(target, new AbortController().signal, true);
-    await coordinator.maybeReview(target, new AbortController().signal, true);
+    const duplicate = { ...validation(), evidenceId: "duplicate-validation" };
+    target.durable.state.evidence.push(duplicate);
+    await coordinator.maybeReview(target, new AbortController().signal);
+    expect(calls).toBe(1);
+
+    const stronger = {
+      ...validation(),
+      evidenceId: "runtime-validation",
+      data: { ...validation().data, command: "pnpm test -- --integration" }
+    };
+    target.durable.state.evidence.push(stronger);
+    await coordinator.maybeReview(target, new AbortController().signal);
 
     expect(calls).toBe(2);
+    expect(target.durable.state.evidence.at(-1)).toMatchObject({
+      kind: "review",
+      status: "passed",
+      data: {
+        verdict: "approved",
+        reviewBasisDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        validationEvidenceIds: ["validation", "duplicate-validation", "runtime-validation"]
+      }
+    });
   });
 
   it("fails closed for non-strict JSON and incomplete review material", async () => {
@@ -660,6 +728,42 @@ describe("independent reviewer budget accounting", () => {
 
     expect(result).toMatchObject({ status: "passed", data: { verdict: "approved" } });
     expect(gateway.calls).toBe(1);
+  });
+
+  it("accepts content-omitted identities and returns a typed oversized-scope blocker", async () => {
+    const item = delta();
+    item.data.reviewDiff = "";
+    item.data.reviewDiffPaths = [];
+    item.data.opaqueArtifacts = [{
+      path: "src/code.ts",
+      representation: "content_omitted",
+      before: { digest: beforeDigest, sizeBytes: 300_000 },
+      after: { digest: afterDigest, sizeBytes: 300_001 }
+    }];
+    const gateway = new ReviewerGateway();
+    const approved = await new ModelReviewer(gateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      frontierRevision: 1, stateDigest: "a".repeat(64), reviewBasisDigest: "b".repeat(64),
+      workspaceDeltas: [item], validations: [validation()]
+    }, new AbortController().signal);
+    expect(approved).toMatchObject({ status: "passed", data: { verdict: "approved" } });
+
+    item.data.reviewProblem = {
+      code: "review_scope_too_large",
+      message: "Changed-path identity metadata exceeds the bounded review scope.",
+      action: "Remove temporary artifacts or split the change."
+    };
+    const blockedGateway = new ReviewerGateway();
+    const blocked = await new ModelReviewer(blockedGateway).review({
+      sessionId: "session", runId: "run", goal: "Review safely",
+      frontierRevision: 1, stateDigest: "a".repeat(64), reviewBasisDigest: "c".repeat(64),
+      workspaceDeltas: [item], validations: [validation()]
+    }, new AbortController().signal);
+    expect(blocked).toMatchObject({
+      status: "failed",
+      data: { verdict: "changes_requested", failureCode: "review_scope_too_large" }
+    });
+    expect(blockedGateway.calls).toBe(0);
   });
 
   it.each([

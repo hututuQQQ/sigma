@@ -16,7 +16,6 @@ async function connectVerifierBroker(context) {
   const broker = new api.SigmaExecBrokerClient({
     helperPath: context.brokerPath,
     sandboxMode: "required",
-    allowUnsafeHostExec: false,
     trustedToolchains: [verifierNodeToolchain(context.nodePath, api)],
     secrets: context.secrets
   });

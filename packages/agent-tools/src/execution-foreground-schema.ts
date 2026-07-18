@@ -10,10 +10,6 @@ type ForegroundKind = "exec" | "shell" | "validate";
 
 function writeContractProperties(): Record<string, JsonValue> {
   return {
-    readRoots: {
-      type: "array", items: { type: "string" }, minItems: 1, uniqueItems: true,
-      description: "Additional stable existing directories the process may read. Absolute host paths require external-read approval; the working directory remains inside the workspace."
-    },
     access: {
       type: "string", enum: ["readonly", "write"],
       description: "Explicit process filesystem access. Defaults to readonly; expectedChanges safely infers write access within the workspace."
@@ -90,7 +86,7 @@ export function foregroundExecutionSchema(
     ? ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "validation", "network", "open_world"]
     : ["process.spawn", "process.spawn.readonly", "filesystem.read", "filesystem.read.external", "filesystem.write", "network", "open_world"];
   const description = validation
-    ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The target exit code is recorded directly as durable typed evidence. The runtime binds it to the current mutation frontier and derives path coverage from cwd and readRoots; never supply evidence IDs."
+    ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime classifies semantic assurance from the command adapter and its exact subjects; working-directory and filesystem permissions never imply validation coverage."
     : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
   const base = executionToolSchema(kind, description, properties, required, effects);
   const schema = validation

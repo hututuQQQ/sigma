@@ -19,7 +19,7 @@ import {
 } from "./effect-runner-helpers.js";
 import { ModelEffectRunner } from "./model-effect-runner.js";
 import { convergenceAdmissionFailure } from "./convergence-policy.js";
-import type { RuntimeOptions, RuntimeSession } from "./types.js";
+import type { RuntimeOptions, RuntimePermissionMode, RuntimeSession } from "./types.js";
 import type { BudgetController } from "./budget-controller.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import { ReviewCoordinator } from "./review-coordinator.js";
@@ -33,7 +33,7 @@ import type { RunSuspensionContext } from "./runtime-session-finish.js";
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
   maxParallelTools: number;
-  permissionMode: "ask" | "auto" | "deny";
+  permissionMode: RuntimePermissionMode;
   outputReserveTokens: number;
   emit: RuntimeEventEmitter;
   finish(
@@ -79,7 +79,7 @@ function receiptToolName(
 
 function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "required"): boolean {
   if (name === "request_review") return true;
-  if (name === "complete_task") return reviewMode !== "off";
+  if (name === "runtime_finalize") return reviewMode !== "off";
   return reviewMode === "required" && name === "validate";
 }
 
@@ -119,8 +119,7 @@ export class EffectRunner {
   ): Promise<boolean> {
     const failure = convergenceAdmissionFailure(session, { kind: "model" });
     if (failure) return await this.options.finish(session, failure);
-    await this.models.request(session, signal, effect);
-    return false;
+    return await this.models.request(session, signal, effect);
   }
 
   private async requestTools(

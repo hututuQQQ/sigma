@@ -98,7 +98,7 @@ function providerSmokeReleaseChecks(providerSmoke, providerSmokePath) {
     check("providerSmoke:ok", providerSmoke.ok === true, providerSmoke.status ?? "unknown"),
     check("providerSmoke:doctorApi", providerSmoke.checks?.doctorApi === true, "doctor --check-api passed"),
     check("providerSmoke:runCompleted", providerSmoke.checks?.runCompleted === true, "live-provider run completed"),
-    check("providerSmoke:fileContent", providerSmoke.checks?.fileContent === true, "provider-smoke.md matched expected content"),
+    check("providerSmoke:fileContent", providerSmoke.checks?.fileContent === true, "provider-smoke.js matched expected content"),
     check("providerSmoke:inspect", providerSmoke.checks?.inspect === true, "session inspection succeeded")
   ];
 }
@@ -211,7 +211,7 @@ function replayPerformanceReleaseChecks(performance, performancePath) {
     check("replayPerformance:present", Boolean(performance), performancePath),
     check(
       "replayPerformance:100k",
-      performance?.schemaVersion === 1 && performance?.kind === "v4Replay100k"
+      performance?.schemaVersion === 1 && performance?.kind === "v5Replay100k"
         && performance?.ok === true && performance?.events === 100_000,
       `events=${String(performance?.events ?? "missing")}, ok=${String(performance?.ok ?? false)}`
     ),
@@ -275,7 +275,7 @@ function markdownReport(report) {
     `- package target: ${report.evidence.packageVerify.targetPlatform ?? "unknown"}`,
     `- sandbox smoke: ${report.evidence.sandboxSmoke.path}`,
     `- LSP sandbox smoke: ${report.evidence.lspSandboxSmoke.path}`,
-    `- V4 replay performance: ${report.evidence.replayPerformance.path}`,
+    `- V5 replay performance: ${report.evidence.replayPerformance.path}`,
     `- native protocol coverage: ${report.evidence.nativeProtocolCoverage.path}`,
     "",
     "## Checks",
@@ -310,7 +310,7 @@ export async function buildProductReadinessReport(options = {}) {
     ? targetedPackageVerifyPath
     : path.join(artifactsDir, "agent-cli-package-verify.json");
   const providerSmokePath = path.join(artifactsDir, "smoke-provider", "provider-smoke.json");
-  const replayPerformancePath = path.join(artifactsDir, "replay-v4-100k.json");
+  const replayPerformancePath = path.join(artifactsDir, "replay-v5-100k.json");
   const nativeProtocolCoveragePath = path.join(artifactsDir, "sigma-exec-branch-coverage.json");
   const checks = [];
 

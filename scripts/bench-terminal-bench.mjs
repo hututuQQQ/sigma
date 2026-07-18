@@ -17,6 +17,7 @@ import {
   detectTaskSelectionFlag,
   ensurePlaceholderTask,
   generateBenchReport,
+  groupHarborTimeoutProbe,
   harborPythonCommand,
   harborEnvForRun,
   loadDotEnv,
@@ -35,6 +36,10 @@ import {
 
 function statusFromExitCode(exitCode) {
   return exitCode === 0 ? "passed" : "failed";
+}
+
+function evaluationLane(agentProfile) {
+  return agentProfile === "strict" ? "strict_conformance" : "solving";
 }
 
 async function sha256File(filePath) {
@@ -104,6 +109,8 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     finished_at: null,
     mode: options.mode,
     benchmark_class: options.benchmarkClass,
+    agent_profile: options.agentProfile,
+    evaluation_lane: evaluationLane(options.agentProfile),
     execution_mode: options.executionMode,
     provider: options.provider,
     model: options.model ?? null,
@@ -272,37 +279,71 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     timeoutPlan = computeHarborTimeoutPlan(options, null);
   }
 
-  const resolvedJobConfigPath = path.join(runDir, "resolved-job.config.json");
   const attemptOptions = {
     ...options,
     agentCliTarball: env.AGENT_CLI_TARBALL
   };
-  const resolvedJobConfig = buildHarborJobConfig(attemptOptions, jobsDir, timeoutPlan, timeoutProbe);
-  await writeJson(resolvedJobConfigPath, resolvedJobConfig);
-  harborArgs = buildHarborArgs({
-    ...attemptOptions,
-    taskSelectionFlag,
-    capabilities,
-    jobsDir,
-    timeoutProbe,
-    timeoutPlan,
-    configPath: resolvedJobConfigPath
-  });
+  const timeoutGroups = options.mode === "smoke"
+    ? [{ tasks: [], resolved_tasks: [], configured_tasks: [], timeout_probe: null }]
+    : groupHarborTimeoutProbe(timeoutProbe, options.tasks);
+  const launchGroups = [];
+  for (let index = 0; index < timeoutGroups.length; index += 1) {
+    const group = timeoutGroups[index];
+    const groupPlan = computeHarborTimeoutPlan(options, group.timeout_probe);
+    const groupOptions = {
+      ...attemptOptions,
+      tasks: group.configured_tasks.length > 0 ? group.configured_tasks : group.resolved_tasks
+    };
+    const suffix = timeoutGroups.length === 1 ? "" : `-${String(index + 1).padStart(3, "0")}`;
+    const configPath = path.join(runDir, `resolved-job${suffix}.config.json`);
+    const jobConfig = buildHarborJobConfig(groupOptions, jobsDir, groupPlan, group.timeout_probe);
+    await writeJson(configPath, jobConfig);
+    const args = buildHarborArgs({
+      ...groupOptions,
+      taskSelectionFlag,
+      capabilities,
+      jobsDir,
+      timeoutProbe: group.timeout_probe,
+      timeoutPlan: groupPlan,
+      configPath
+    });
+    launchGroups.push({
+      index,
+      args,
+      configPath,
+      timeoutPlan: groupPlan,
+      taskNames: group.tasks.map((task) => task?.task_name).filter(Boolean)
+    });
+  }
+  harborArgs = launchGroups[0].args;
   config = {
     ...config,
     finished_at: null,
     exit_code: null,
     status: "running",
     command: [harborCommand, ...harborArgs],
-    command_text: commandText(harborCommand, harborArgs),
+    command_text: launchGroups.map((group) => commandText(harborCommand, group.args)).join("\n"),
     harbor_capabilities: capabilities,
     task_selection_flag: taskSelectionFlag,
     timeout_probe: timeoutProbe,
     timeout_plan: timeoutPlan,
+    timeout_groups: launchGroups.map((group) => ({
+      task_names: group.taskNames,
+      timeout_plan: group.timeoutPlan,
+      resolved_job_config_path: path.relative(runDir, group.configPath).replace(/\\/g, "/")
+    })),
     score_mode: options.benchmarkClass === "diagnostic" ? "diagnostic" : "standard_benchmark",
-    resolved_job_config_path: path.relative(runDir, resolvedJobConfigPath).replace(/\\/g, "/")
+    resolved_job_config_path: path.relative(runDir, launchGroups[0].configPath).replace(/\\/g, "/"),
+    resolved_job_config_paths: launchGroups.map((group) =>
+      path.relative(runDir, group.configPath).replace(/\\/g, "/")),
+    commands: launchGroups.map((group) => [harborCommand, ...group.args])
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
+  if (launchGroups.length > 1) {
+    await writeFile(path.join(runDir, "command.sh"), launchGroups
+      .map((group) => buildCommandScript(harborCommand, group.args, env).trimEnd())
+      .join("\n"), "utf8");
+  }
 
   const cleanupBefore = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
   await writeJson(path.join(runDir, "docker-cleanup-before.json"), cleanupBefore);
@@ -315,19 +356,32 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
-  process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, harborArgs)}\n`);
-  const harborResult = await runner(harborCommand, harborArgs, {
-    cwd: rootDir,
-    env,
-    stdoutPath: path.join(runDir, "harbor.stdout.log"),
-    stderrPath: path.join(runDir, "harbor.stderr.log"),
-    rawPath: path.join(runDir, "result.raw.log")
-  });
+  const harborResults = [];
+  for (const group of launchGroups) {
+    process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, group.args)}\n`);
+    const suffix = launchGroups.length === 1 ? "" : `-group-${String(group.index + 1).padStart(3, "0")}`;
+    harborResults.push(await runner(harborCommand, group.args, {
+      cwd: rootDir,
+      env,
+      stdoutPath: path.join(runDir, `harbor${suffix}.stdout.log`),
+      stderrPath: path.join(runDir, `harbor${suffix}.stderr.log`),
+      rawPath: path.join(runDir, suffix ? `result${suffix}.raw.log` : "result.raw.log")
+    }));
+  }
+  if (launchGroups.length > 1) {
+    await writeFile(path.join(runDir, "harbor.stdout.log"), harborResults
+      .map((result, index) => `[group ${index + 1}]\n${result.stdout ?? ""}`).join("\n"), "utf8");
+    await writeFile(path.join(runDir, "harbor.stderr.log"), harborResults
+      .map((result, index) => `[group ${index + 1}]\n${result.stderr ?? ""}`).join("\n"), "utf8");
+    await writeFile(path.join(runDir, "result.raw.log"), harborResults
+      .map((result, index) => `group: ${index + 1}\nexit_code: ${result.exitCode}\n`).join("\n"), "utf8");
+  }
+  const harborExitCode = harborResults.find((result) => result.exitCode !== 0)?.exitCode ?? 0;
   const cleanupAfter = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
   await writeJson(path.join(runDir, "docker-cleanup-after.json"), cleanupAfter);
 
   const finishedAt = new Date().toISOString();
-  const effectiveExitCode = cleanupAfter.clean ? harborResult.exitCode : 1;
+  const effectiveExitCode = cleanupAfter.clean ? harborExitCode : 1;
   config = {
     ...config,
     finished_at: finishedAt,
@@ -340,8 +394,8 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   };
   await writeJson(path.join(runDir, "config.json"), config);
   await ensurePlaceholderTask(runDir, {
-    status: statusFromExitCode(harborResult.exitCode),
-    exit_code: harborResult.exitCode,
+    status: statusFromExitCode(harborExitCode),
+    exit_code: harborExitCode,
     artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
   });
 

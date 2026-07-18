@@ -376,7 +376,7 @@ describe("execution broker cancellation containment", () => {
       const clients = [stale, fresh];
       let factoryCalls = 0;
       const broker = new LazyExecutionBroker({
-        sandboxMode: "required", allowUnsafeHostExec: false,
+        sandboxMode: "required",
         clientFactory: () => clients[factoryCalls++]!
       });
       const transport = (stale as unknown as {
@@ -443,7 +443,7 @@ describe("execution broker cancellation containment", () => {
       catch (error) { clientFailure = error; throw error; }
     };
     const broker = new LazyExecutionBroker({
-      sandboxMode: "required", allowUnsafeHostExec: false,
+        sandboxMode: "required",
       clientFactory: () => clients[factoryCalls++]!
     });
     try {
@@ -547,7 +547,6 @@ describe("execution broker cancellation containment", () => {
     let factoryCalls = 0;
     const broker = new LazyExecutionBroker({
       sandboxMode: "required",
-      allowUnsafeHostExec: false,
       clientFactory: () => clients[factoryCalls++]!
     });
     try {
@@ -582,7 +581,7 @@ describe("lazy broker lifecycle error preservation", () => {
       close: async () => { throw retirement; }
     });
     const broker = new LazyExecutionBroker({
-      sandboxMode: "required", allowUnsafeHostExec: false, clientFactory: () => client
+      sandboxMode: "required", clientFactory: () => client
     });
 
     const failure = await broker.execute(executionRequest()).catch((error: unknown) => error);
@@ -600,7 +599,7 @@ describe("lazy broker lifecycle error preservation", () => {
       close: async () => { throw retirement; }
     });
     const broker = new LazyExecutionBroker({
-      sandboxMode: "required", allowUnsafeHostExec: false, clientFactory: () => client
+      sandboxMode: "required", clientFactory: () => client
     });
 
     const failure = await broker.execute(executionRequest()).catch((error: unknown) => error);
@@ -618,7 +617,7 @@ describe("lazy broker lifecycle error preservation", () => {
       close: async () => { throw retirement; }
     });
     const broker = new LazyExecutionBroker({
-      sandboxMode: "required", allowUnsafeHostExec: false, clientFactory: () => client
+      sandboxMode: "required", clientFactory: () => client
     });
 
     const failure = await broker.execute(executionRequest()).catch((error: unknown) => error);
@@ -636,7 +635,7 @@ describe("lazy broker lifecycle error preservation", () => {
       close: async () => { throw retirement; }
     });
     const broker = new LazyExecutionBroker({
-      sandboxMode: "required", allowUnsafeHostExec: false, clientFactory: () => client
+      sandboxMode: "required", clientFactory: () => client
     });
     const handle = await broker.spawn(spawnRequest());
 

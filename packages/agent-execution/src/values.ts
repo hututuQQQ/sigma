@@ -252,12 +252,26 @@ function parseDoctorHardening(input: unknown): BrokerDoctorReport["sandbox"]["ha
 function parseDoctorSandbox(input: unknown): BrokerDoctorReport["sandbox"] {
   const sandbox = protocolRecord(input, "Broker sandbox report");
   const hardening = parseDoctorHardening(sandbox.hardening);
+  const lease = sandbox.lease === undefined || sandbox.lease === null
+    ? undefined : protocolRecord(sandbox.lease, "Broker sandbox lease");
+  if (lease && (lease.protocolVersion !== 1
+    || lease.readStrategy !== "persistent_workspace_root"
+    || lease.writerStrategy !== "root_lease_checkpointed"
+    || lease.recoveryJournal !== "writes_only")) {
+    throw new BrokerProtocolError("Broker sandbox lease metadata is invalid.");
+  }
   return {
     available: booleanValue(sandbox.available, "sandbox.available"),
     backend: stringValue(sandbox.backend, "sandbox.backend"),
     selfTestPassed: booleanValue(sandbox.selfTestPassed, "sandbox.selfTestPassed"),
     setupRequired: booleanValue(sandbox.setupRequired, "sandbox.setupRequired"),
     ...(typeof sandbox.reason === "string" ? { reason: sandbox.reason } : {}),
+    ...(lease ? { lease: {
+      protocolVersion: 1,
+      readStrategy: "persistent_workspace_root",
+      writerStrategy: "root_lease_checkpointed",
+      recoveryJournal: "writes_only"
+    } } : {}),
     ...(hardening ? { hardening } : {})
   };
 }
@@ -265,7 +279,8 @@ function parseDoctorSandbox(input: unknown): BrokerDoctorReport["sandbox"] {
 function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctorReport["capabilities"] {
   const capabilities = protocolRecord(input, "Broker capabilities");
   const networkModes = capabilities.networkModes;
-  if (!Array.isArray(networkModes) || networkModes.some((mode) => mode !== "none" && mode !== "full")) {
+  if (!Array.isArray(networkModes) || networkModes.some((mode) =>
+    mode !== "none" && mode !== "loopback" && mode !== "full")) {
     throw new BrokerProtocolError("Broker networkModes are invalid.");
   }
   const shells = verifiedShells(capabilities.shells, platform);
@@ -277,7 +292,7 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
     ...(capabilities.processHandoff === undefined ? {} : {
       processHandoff: booleanValue(capabilities.processHandoff, "capabilities.processHandoff")
     }),
-    networkModes: networkModes as Array<"none" | "full">,
+    networkModes: networkModes as Array<"none" | "loopback" | "full">,
     ...(capabilities.executionRoots === undefined ? {} : {
       executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
     }),

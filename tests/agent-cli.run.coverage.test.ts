@@ -126,10 +126,9 @@ function validationRequest(): ModelResponse {
         id: "validate-approval-result",
         name: "validate",
         arguments: {
-          executable: "node",
-          args: ["-e", "const fs=require('node:fs');process.exit(fs.readFileSync('approval-result.md','utf8')==='approved'?0:1)"],
+          shell: process.platform === "win32" ? "cmd" : "bash",
+          command: "npm run build",
           cwd: ".",
-          readRoots: ["."],
           network: "none"
         }
       }]
@@ -149,8 +148,7 @@ function networkExecutionRequest(): ModelResponse {
         arguments: {
           executable: "node",
           args: ["-e", "process.stdout.write('network-auto-ok')"],
-          network: "full",
-          readRoots: ["."]
+          network: "full"
         }
       }]
     },
@@ -301,7 +299,7 @@ describe("run command branch coverage", () => {
       const stdout = new Capture();
       const stderr = new Capture();
       const code = await runCommand([
-        "change files", "--workspace", root, "--output-format", format
+        "change files", "--workspace", root, "--output-format", format, "--permission-mode", "ask"
       ], { stdin, stdout, stderr });
       expect(code).toBe(2);
       if (format === "text") expect(stderr.text()).toContain("cannot resolve tool approvals");
@@ -334,6 +332,11 @@ describe("run command branch coverage", () => {
     ["n", false, "tool.failed"]
   ] as const)("handles interactive approval answer '%s'", async (answer, allowed, eventType) => {
     const root = await workspace("sigma-run-approval-");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({
+      scripts: {
+        build: "node -e \"const fs=require('node:fs');process.exit(fs.readFileSync('approval-result.md','utf8')==='approved'?0:1)\""
+      }
+    }), "utf8");
     const stdin = Object.assign(new PassThrough(), { isTTY: true });
     const stdout = new Capture();
     stdout.isTTY = true;
@@ -342,9 +345,7 @@ describe("run command branch coverage", () => {
     const script = allowed
       ? [writeRequest(), validationRequest(), completion]
       : [writeRequest(), evidenceRequest("denial-evidence"), completion];
-    // Each approval creates its own readline interface. Respond only after its
-    // prompt is visible so a line intended for validation cannot be consumed
-    // by the write approval's interface.
+    // Explicit ask mode prompts for both the mutation and its process validation.
     const responses = allowed ? [answer, "a"] : [answer];
     let sent = 0;
     const feeder = setInterval(() => {
@@ -365,6 +366,8 @@ describe("run command branch coverage", () => {
     });
     expect(code, `${stderr.text()}\nSTDOUT:\n${stdout.text()}`).toBe(0);
     expect(stderr.text()).toContain(eventType);
+    expect(stderr.text()).toContain("command=write; read=approval-result.md; write=approval-result.md");
+    expect(stderr.text()).toContain("backend=native; risk=medium");
     if (allowed) expect(await import("node:fs/promises").then((fs) => fs.readFile(path.join(root, "approval-result.md"), "utf8"))).toBe("approved");
   });
 
@@ -469,6 +472,24 @@ describe("run command branch coverage", () => {
       stderr
     })).resolves.toBe(1);
     expect(stderr.text()).toBeTruthy();
+  });
+
+  it("returns container_unavailable instead of running on the host", async () => {
+    const root = await workspace("sigma-run-container-unavailable-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+    const code = await runCommand([
+      "change one file", "--workspace", root, "--execution-mode", "container", "--output-format", "json"
+    ], { stdin, stdout, stderr, ...runDeps([]) });
+
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout.text())).toMatchObject({
+      status: "error",
+      finishReason: "container_unavailable",
+      finalMessage: expect.stringContaining("OCI execution backend is not installed")
+    });
+    expect(stderr.text()).toBe("");
   });
 
   it("emits a typed stream-json error envelope for pre-run failures", async () => {

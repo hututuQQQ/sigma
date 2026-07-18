@@ -2,8 +2,8 @@ export const BROKER_PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
-export type NetworkPolicy = "none" | "full";
-export type SandboxMode = "required" | "unsafe";
+export type NetworkPolicy = "none" | "loopback" | "full";
+export type SandboxMode = "required";
 export type ProcessState = "running" | "exited" | "terminated" | "lost";
 export type ProcessLifecycle = "session" | "deliverable";
 
@@ -31,7 +31,6 @@ export interface ExecutionPolicy {
   /** Read/execute-only roots for explicitly trusted absolute executables. */
   executionRoots?: string[];
   protectedPaths?: string[];
-  unsafeHostExecApproved?: boolean;
 }
 
 export interface ExecutionRequest {
@@ -121,6 +120,12 @@ export interface BrokerSandboxReport {
   selfTestPassed: boolean;
   setupRequired: boolean;
   reason?: string;
+  lease?: {
+    protocolVersion: 1;
+    readStrategy: "persistent_workspace_root";
+    writerStrategy: "root_lease_checkpointed";
+    recoveryJournal: "writes_only";
+  };
   hardening?: {
     landlockAbi?: number;
     noNewPrivileges: boolean;
@@ -165,6 +170,22 @@ export interface BrokerDoctorReport {
   capabilities: BrokerCapabilities;
 }
 
+export interface BrokerSandboxLeaseStatus {
+  leaseId: string;
+  workspaceIdentity: string;
+  generation: number;
+  principalId: string;
+  access: "read" | "write";
+  roots: string[];
+  state: "preparing" | "active" | "revoking" | "retired" | "tainted";
+}
+
+export interface BrokerSandboxRevokeResult {
+  revoked: boolean;
+  retiredPrincipalId: string;
+  generation: number;
+}
+
 /**
  * A package-verified runtime/toolchain that may execute inside the sandbox.
  * The broker treats every entry as trusted configuration, never as model- or
@@ -179,6 +200,10 @@ export interface TrustedToolchainManifestEntry {
   executable: string;
   /** Command aliases that higher layers may resolve to executable. */
   aliases?: string[];
+  /** Trusted argument prefixes keyed by alias. This lets a packaged runtime
+   * expose script-backed entry points (for example npm/pnpm through Node)
+   * without trusting shell shims or asking the model for host paths. */
+  aliasArguments?: Record<string, string[]>;
   /** Read/execute roots; defaults to the exact executable. */
   executionRoots?: string[];
   /** Read-only runtime dependency roots mounted only when this exact entry
@@ -212,6 +237,9 @@ export interface ExecutionBroker {
   doctor(signal?: AbortSignal): Promise<BrokerDoctorReport>;
   /** Performs the broker's controlled, platform-specific one-time preparation. */
   setupSandbox?(signal?: AbortSignal): Promise<BrokerDoctorReport>;
+  repairSandbox?(signal?: AbortSignal): Promise<BrokerDoctorReport>;
+  sandboxLeaseStatus?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus>;
+  revokeSandboxLease?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult>;
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle>;
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
@@ -227,7 +255,6 @@ export interface SigmaExecBrokerClientOptions {
   helperPath: string;
   helperArgs?: string[];
   sandboxMode?: SandboxMode;
-  allowUnsafeHostExec?: boolean;
   requestTimeoutMs?: number;
   /** Deadline for startup doctor/recovery and explicit sandbox setup. */
   startupTimeoutMs?: number;

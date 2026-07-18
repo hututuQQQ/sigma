@@ -97,16 +97,9 @@ class RecoveryGateway implements ModelGateway {
       return {
         message: {
           role: "assistant",
-          content: "",
-          toolCalls: [{
-            id: "recovered-completion",
-            name: "complete_task",
-            arguments: {
-              summary: "Recovered mutation is complete."
-            }
-          }]
+          content: "Recovered mutation is complete."
         },
-        finishReason: "tool_calls",
+        finishReason: "stop",
         usage: usage()
       };
     }
@@ -468,11 +461,22 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       artifactIds: [],
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
-      coveredPaths: ["target.ts"]
+      coveredPaths: ["target.ts"],
+      claim: {
+        kind: "typecheck",
+        commandDigest: "c".repeat(64),
+        subject: {
+          projectId: ".",
+          configPaths: [],
+          selectedTests: [],
+          exactFiles: []
+        },
+        status: "passed"
+      }
     }
   });
 
-  // V4 releases the mutation reservation as soon as semantic validation has
+  // V5 releases the mutation reservation as soon as semantic validation has
   // passed; optional review must not retain mutation capacity.
   const mutationCommitted = structuredClone(ledger);
   mutationCommitted.reserved.toolCalls = 0;
@@ -487,12 +491,40 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   if (!reached(boundary, "review_started")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const reviewerId = "fault-injection-reviewer";
+  const validationSignature = JSON.stringify({
+    status: "passed",
+    validator: "command",
+    command: null,
+    exitCode: null,
+    termination: null,
+    coveredPaths: ["target.ts"],
+    claim: {
+      kind: "typecheck",
+      commandDigest: "c".repeat(64),
+      subject: {
+        projectId: ".",
+        configPaths: [],
+        selectedTests: [],
+        exactFiles: []
+      },
+      status: "passed"
+    },
+    frontierRevision: sealedFrontier.revision,
+    stateDigest: sealedFrontier.currentStateDigest
+  });
+  const reviewBasisDigest = createHash("sha256").update(JSON.stringify({
+    frontierRevision: sealedFrontier.revision,
+    stateDigest: sealedFrontier.currentStateDigest,
+    validations: [validationSignature]
+  })).digest("hex");
   const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
     sessionId,
     runId,
     reviewerId,
     revision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest
+    stateDigest: sealedFrontier.currentStateDigest,
+    reviewBasisDigest,
+    attempt: 1
   })).digest("hex")}`;
   const reviewerAmount = {
     inputTokens: 1,
@@ -574,6 +606,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       findings: [],
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
+      reviewBasisDigest,
       validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
       checkpointId: checkpoint.checkpointId
     }
@@ -583,8 +616,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   const completionTurn = { turnId: 2, effectRevision: seq };
   await append("model.started", completionTurn);
   const completionCall = {
-    id: "durable-completion",
-    name: "complete_task",
+    id: "runtime_completion_intent_durable",
+    name: "runtime_finalize",
     arguments: { summary: "Durable recovery completed." }
   };
   await append("model.completed", {
@@ -618,14 +651,14 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   completionReserved.reserved.toolCalls = 1;
   completionReserved.reservations.push({
     reservationId: completionReservationId,
-    ownerId: "tool:durable-completion",
+    ownerId: "tool:runtime_completion_intent_durable",
     status: "reserved",
     requested: amount,
     consumed: { ...amount, toolCalls: 0 },
     createdAt: now
   });
   await append("budget.reserved", { reservationId: completionReservationId, ledger: completionReserved });
-  await append("tool.started", { callId: "durable-completion", name: "complete_task", ...completionTurn });
+  await append("tool.started", { callId: "runtime_completion_intent_durable", name: "runtime_finalize", ...completionTurn });
   const completionCommitted = structuredClone(completionReserved);
   completionCommitted.reserved.toolCalls = 0;
   completionCommitted.consumed.toolCalls = 2;
@@ -637,8 +670,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   };
   await append("budget.committed", { reservationId: completionReservationId, ledger: completionCommitted });
   await append("tool.completed", {
-    callId: "durable-completion",
-    name: "complete_task",
+    callId: "runtime_completion_intent_durable",
+    name: "runtime_finalize",
     ok: true,
     output: JSON.stringify(completionCall.arguments),
     observedEffects: ["outcome.propose"],

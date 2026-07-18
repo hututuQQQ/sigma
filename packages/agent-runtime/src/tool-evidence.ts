@@ -19,6 +19,7 @@ export interface ReceiptEvidenceScope {
     frontierRevision: number;
     stateDigest: string;
     coveredPaths: string[];
+    claim?: Omit<import("agent-protocol").ValidationClaimV1, "status">;
   };
 }
 
@@ -69,7 +70,16 @@ function sanitizeValidation(
       artifactIds: [...new Set(receipt.artifacts)],
       frontierRevision: frontier.frontierRevision,
       stateDigest: frontier.stateDigest,
-      coveredPaths: [...frontier.coveredPaths]
+      coveredPaths: [...frontier.coveredPaths],
+      ...(frontier.claim ? {
+        claim: {
+          ...frontier.claim,
+          subject: { ...frontier.claim.subject },
+          status: raw.data.termination?.processStarted === false
+            ? "unavailable" as const
+            : receipt.ok && raw.status === "passed" ? "passed" as const : "failed" as const
+        }
+      } : {})
     }
   };
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { CheckpointRef, ModelToolCall, ToolCallApproval, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
+import type { CheckpointRef, ModelToolCall, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
 import { isToolAllowed, prepareToolCallPlan, ResourceLockManager } from "agent-tools";
 import {
   completionFailure,
@@ -19,8 +19,7 @@ import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evid
 import {
   assertCheckpointActionAllowed,
   assertReceiptWithinPlan,
-  validationScope,
-  type FrozenValidationScope
+  validationScope
 } from "./tool-plan-enforcement.js";
 import type { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import type { RuntimeSession } from "./types.js";
@@ -38,14 +37,8 @@ import {
   isToolReceipt,
   settleNoChangeProbe
 } from "./tool-transaction-support.js";
-interface PreparedTool extends ToolAttempt {
-  descriptor: ToolDescriptor;
-  plan: ToolCallPlan;
-  startedAt: string;
-  approval?: ToolCallApproval;
-  validationScope?: FrozenValidationScope;
-}
-interface TransactionState { executionStarted: boolean }
+import { convergedToolFailure } from "./capability-failure-convergence.js";
+import type { PreparedTool, TransactionState } from "./tool-transaction-types.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -68,13 +61,7 @@ export class ToolTransactionRunner {
       if (isToolReceipt(prepared)) return prepared;
       return await this.executePrepared(session, prepared, signal);
     } catch (error) {
-      if ((error as { code?: unknown })?.code === "approval_needs_input") throw error;
-      return failed(
-        attempt.call,
-        startedAt,
-        error instanceof Error ? error.message : String(error),
-        failureCode(error, signal)
-      );
+      return convergedToolFailure(session, attempt.call, startedAt, error, signal);
     }
   }
 
@@ -99,6 +86,15 @@ export class ToolTransactionRunner {
     const { call, modelTurn } = attempt;
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
     if (!descriptor) return failed(call, startedAt, `Unknown tool '${call.name}'.`, "unknown_tool");
+    if (descriptor.possibleEffects.some((effect) => effect === "process.spawn" || effect === "process.spawn.readonly")
+      && [...session.interaction.capabilityFailures.values()].some((count) => count >= 2)) {
+      return failed(
+        call,
+        startedAt,
+        "Execution is blocked after the same sandbox capability failed twice. Do not substitute a weaker probe; report the typed environment blocker.",
+        "capability_retry_exhausted"
+      );
+    }
     await this.options.emit(session, "tool.requested", "runtime", {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });

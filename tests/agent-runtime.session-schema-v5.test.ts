@@ -21,9 +21,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (item) => await rm(item, { recursive: true, force: true })));
 });
 
-describe("V4 session compatibility boundary", () => {
-  it("lists and replays V3 sessions read-only but refuses execution resume", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v3-read-only-"));
+describe("V5 session isolation boundary", () => {
+  it("does not list, replay, or resume an older store", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-v5-legacy-read-only-"));
     roots.push(root);
     const sessionId = "legacy-v3-session";
     const directory = path.join(root, "stores", "v3", "sessions", sessionId);
@@ -52,18 +52,15 @@ describe("V4 session compatibility boundary", () => {
     }), "utf8");
     const store = new SegmentedJsonlStore({ rootDir: root });
 
-    const replayed = [];
-    for await (const event of currentSessionEvents(store, root, sessionId)) replayed.push(event);
-    expect(replayed).toHaveLength(events.length);
-    expect(replayed.every((event) => event.schemaVersion === 4)).toBe(true);
-    await expect(listCurrentSessions(store, root, 20)).resolves.toEqual([
-      expect.objectContaining({
-        sessionId, workspacePath: "D:/legacy", mode: "analyze",
-        status: "completed", lastMessage: "Legacy answer"
-      })
-    ]);
+    const replay = async () => {
+      const replayed = [];
+      for await (const event of currentSessionEvents(store, root, sessionId)) replayed.push(event);
+      return replayed;
+    };
+    await expect(replay()).rejects.toMatchObject({ code: "session_not_found" });
+    await expect(listCurrentSessions(store, root, 20)).resolves.toEqual([]);
     await expect(assertSessionStorageSupported(root, sessionId)).rejects.toMatchObject({
-      code: "incompatible_session_schema"
+      code: "session_not_found"
     });
   });
 });

@@ -2,6 +2,7 @@ import { lstat } from "node:fs/promises";
 import path from "node:path";
 import type { ExecutionPolicy } from "agent-execution";
 import type {
+  ExecutionIntentV1,
   JsonValue,
   LoadedSkillResourceAccess,
   ToolCallPlan,
@@ -17,11 +18,13 @@ import {
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
 
-function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "full" {
+function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "loopback" | "full" {
   const available = availableNetworkModes(options);
   const fallback = available.includes(options.networkMode) ? options.networkMode : available[0];
   const value = input.network ?? fallback;
-  if (value !== "none" && value !== "full") throw new Error("network must be none or full.");
+  if (value !== "none" && value !== "loopback" && value !== "full") {
+    throw new Error("network must be none, loopback, or full.");
+  }
   if (!available.includes(value)) {
     throw Object.assign(new Error(`Network mode '${value}' is not available for this execution broker.`), {
       code: "network_unavailable"
@@ -33,8 +36,7 @@ function network(input: Record<string, JsonValue>, options: ExecutionToolOptions
 function plannedEffects(
   writes: boolean,
   validation: boolean,
-  networkMode: "none" | "full",
-  sandboxMode: ExecutionToolOptions["sandboxMode"],
+  networkMode: "none" | "loopback" | "full",
   readsSkillResource: boolean,
   readsExternal: boolean
 ): ToolCallPlan["exactEffects"] {
@@ -43,16 +45,8 @@ function plannedEffects(
   if (readsExternal) effects.push("filesystem.read.external");
   if (writes) effects.push("filesystem.write");
   if (validation) effects.push("validation");
-  if (networkMode === "full") effects.push("network");
-  if (sandboxMode === "unsafe") effects.push("open_world");
+  if (networkMode !== "none") effects.push("network");
   return effects;
-}
-
-function assertSafeBackgroundMode(background: boolean, sandboxMode: ExecutionToolOptions["sandboxMode"]): void {
-  if (!background || sandboxMode !== "unsafe") return;
-  throw Object.assign(new Error(
-    "Unsafe host background processes are disabled because their lifetime cannot be covered by one sealed checkpoint."
-  ), { code: "policy_denied" });
 }
 
 function skillReference(input: Record<string, JsonValue>): { qualifiedName: string; relativePath: string } | undefined {
@@ -85,16 +79,6 @@ export async function loadedSkillResource(
 
 function readScopeError(message: string): Error {
   return Object.assign(new Error(message), { code: "policy_denied" });
-}
-
-function declaredReadRoots(input: Record<string, JsonValue>): string[] {
-  const value = input.readRoots;
-  if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length === 0
-    || value.some((item) => typeof item !== "string" || item.length === 0)) {
-    throw readScopeError("readRoots must be a non-empty array of directory paths.");
-  }
-  return [...new Set(value as string[])];
 }
 
 function portableWorkspacePath(workspaceRoot: string, target: string): string {
@@ -143,20 +127,19 @@ async function stableReadDirectory(
 async function plannedReadPaths(
   input: Record<string, JsonValue>,
   workspacePath: string,
-  skillResource: LoadedSkillResourceAccess | undefined,
-  options: ExecutionToolOptions
+  skillResource: LoadedSkillResourceAccess | undefined
 ): Promise<string[]> {
   if (input.cwd !== undefined && (typeof input.cwd !== "string" || input.cwd.length === 0)) {
     throw readScopeError("cwd must be a non-empty workspace directory path.");
   }
-  const cwd = typeof input.cwd === "string" ? input.cwd : ".";
   const workspaceRoot = await resolveWorkspacePath(workspacePath, ".");
-  const stableCwd = await stableReadDirectory(workspaceRoot, cwd, "workspace");
-  const paths = [stableCwd, ...await Promise.all(
-    declaredReadRoots(input).map(async (item) =>
-      await stableReadDirectory(workspaceRoot, item, options.readScope)
-    )
-  )];
+  // cwd is a launch location, not a read grant. Trusted workspace commands
+  // receive the workspace lease; toolchain/runtime roots are added by the
+  // broker from its trusted manifest and are never model-addressable.
+  if (typeof input.cwd === "string") {
+    await stableReadDirectory(workspaceRoot, input.cwd, "workspace");
+  }
+  const paths = ["."];
   if (skillResource) paths.push(skillResource.readRoot, skillResource.absolutePath);
   return [...new Set(paths)];
 }
@@ -169,6 +152,45 @@ function plannedProcessMode(
   return input.pty === true ? "pty" : "background";
 }
 
+function executionInvocation(input: Record<string, JsonValue>): ExecutionIntentV1["invocation"] {
+  const executable = typeof input.executable === "string"
+    ? input.executable
+    : typeof input.shell === "string" ? input.shell : "";
+  const args = Array.isArray(input.args)
+    ? input.args.filter((item): item is string => typeof item === "string")
+    : typeof input.command === "string" ? [input.command] : [];
+  return {
+    executable,
+    args,
+    cwd: typeof input.cwd === "string" ? input.cwd : "."
+  };
+}
+
+function executionPurpose(
+  invocation: ExecutionIntentV1["invocation"],
+  validation: boolean,
+  background: boolean
+): ExecutionIntentV1["purpose"] {
+  const command = [invocation.executable, ...invocation.args].join(" ").toLowerCase();
+  if (background) return "serve";
+  if (/\b(?:build|tsc)\b/u.test(command)) return "build";
+  if (/\b(?:lint|eslint|biome|ruff)\b/u.test(command)) return "lint";
+  if (/\b(?:test|vitest|jest|pytest)\b/u.test(command)) return "test";
+  return validation ? "custom" : "probe";
+}
+
+function capabilityProfile(executable: string): { id: string; dependencies: string[] } {
+  const name = path.basename(executable).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/u, "");
+  if (["node", "npm", "npx", "pnpm", "yarn", "bun", "tsc", "vitest", "jest"].includes(name)) {
+    return { id: "node-typescript", dependencies: ["node_modules"] };
+  }
+  if (["python", "python3", "py", "pytest"].includes(name)) {
+    return { id: "python", dependencies: [".venv"] };
+  }
+  if (name === "git") return { id: "git", dependencies: [".git"] };
+  return { id: "generic", dependencies: [] };
+}
+
 async function plannedCall(
   input: Record<string, JsonValue>,
   context: Pick<ToolPreparationContext, "runMode" | "workspacePath">,
@@ -177,8 +199,6 @@ async function plannedCall(
   validation = false,
   background = false
 ): Promise<ToolCallPlan> {
-  const sandboxMode = skillResource ? "required" : options.sandboxMode;
-  assertSafeBackgroundMode(background, sandboxMode);
   if (background && skillResource) {
     throw Object.assign(new Error(
       "Frozen skill resources require foreground execution so their path lease remains held until the interpreter exits."
@@ -192,21 +212,41 @@ async function plannedCall(
   const networkMode = network(input, options);
   const mutation = await processMutationContract(input, context.workspacePath, context.runMode, background);
   const writes = mutation.access === "write";
-  const readPaths = await plannedReadPaths(input, context.workspacePath, skillResource, options);
+  const readPaths = await plannedReadPaths(input, context.workspacePath, skillResource);
   const workspaceRoot = path.resolve(context.workspacePath);
   const readsExternal = readPaths.some((item) => path.isAbsolute(item)
     && !isInside(workspaceRoot, path.resolve(item))
     && (!skillResource || !isInside(skillResource.readRoot, path.resolve(item))));
+  const invocation = executionInvocation(input);
+  const profile = capabilityProfile(invocation.executable);
   return {
     exactEffects: plannedEffects(
-      writes, validation, networkMode, sandboxMode, Boolean(skillResource), readsExternal
+      writes, validation, networkMode, Boolean(skillResource), readsExternal
     ),
     readPaths,
     writePaths: mutation.expectedChanges,
     network: networkMode,
     processMode: plannedProcessMode(input, background),
-    checkpointScope: writes && sandboxMode === "unsafe" ? ["."] : mutation.writeRoots,
-    idempotence: validation && !writes ? "replay_safe" : "non_replayable"
+    checkpointScope: mutation.writeRoots,
+    idempotence: validation && !writes ? "replay_safe" : "non_replayable",
+    executionIntent: {
+      invocation,
+      access: mutation.access,
+      ...(mutation.expectedChanges.length > 0 ? { expectedChanges: mutation.expectedChanges } : {}),
+      network: networkMode,
+      purpose: executionPurpose(invocation, validation, background)
+    },
+    executionCapability: {
+      profileId: profile.id,
+      traversalRoots: [invocation.cwd],
+      workspaceReadRoots: ["."],
+      dependencyRoots: profile.dependencies,
+      runtimeRoots: [],
+      writeRoots: mutation.writeRoots,
+      tempRoots: [],
+      network: networkMode,
+      backend: "native"
+    }
   };
 }
 
@@ -218,7 +258,9 @@ function planSignature(plan: ToolCallPlan): string {
     network: plan.network,
     processMode: plan.processMode,
     checkpointScope: plan.checkpointScope,
-    idempotence: plan.idempotence
+    idempotence: plan.idempotence,
+    executionIntent: plan.executionIntent,
+    executionCapability: plan.executionCapability
   });
 }
 
@@ -270,7 +312,6 @@ export function executionPolicy(
   writeRoots: string[] = [],
   skillResource?: LoadedSkillResourceAccess
 ): ExecutionPolicy {
-  const required = Boolean(skillResource) || context.runMode === "analyze" || options.sandboxMode === "required";
   const networkMode = plan.network;
   const workspaceRoot = path.resolve(context.workspacePath);
   const skillRoot = skillResource ? path.resolve(skillResource.readRoot) : undefined;
@@ -282,7 +323,7 @@ export function executionPolicy(
     throw readScopeError(`Approved external process read path lacks a fresh grant: ${item}.`);
   });
   return {
-    sandbox: required ? "required" : "unsafe",
+    sandbox: "required",
     network: networkMode,
     networkApproved: networkMode === "full" && context.approval?.networkApproved === true,
     readRoots: [...new Set([
@@ -295,8 +336,7 @@ export function executionPolicy(
     // fail native root validation before the command can start.
     protectedPaths: [
       ...(skillResource ? [path.resolve(skillResource.readRoot)] : [])
-    ],
-    unsafeHostExecApproved: !required && context.approval?.unsafeHostExecApproved === true
+    ]
   };
 }
 

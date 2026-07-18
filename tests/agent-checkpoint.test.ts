@@ -351,7 +351,7 @@ describe("CheckpointManager", () => {
     expect(material.reviewDiff).toContain("[binary sha256=");
   });
 
-  it("omits a truncated text section from review diff coverage", async () => {
+  it("uses a content identity instead of truncating an oversized text section", async () => {
     const { workspace, manager } = await fixture();
     const checkpoint = await manager.create({
       sessionId: "session-text-coverage", runId: "run-text-coverage", workspacePath: workspace,
@@ -360,11 +360,16 @@ describe("CheckpointManager", () => {
     await writeFile(path.join(workspace, "existing.txt"), "long text ".repeat(1_024), "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
 
-    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 191);
+    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 512);
 
-    expect(material.reviewDiff).toContain("[review diff truncated]");
+    expect(material.reviewDiff).not.toContain("[review diff truncated]");
     expect(material.reviewDiffPaths).not.toContain("existing.txt");
-    expect(material.opaqueArtifacts).toEqual([]);
+    expect(material.opaqueArtifacts).toEqual([expect.objectContaining({
+      path: "existing.txt",
+      representation: "content_omitted",
+      before: expect.objectContaining({ digest: expect.stringMatching(/^[a-f0-9]{64}$/u) }),
+      after: expect.objectContaining({ digest: expect.stringMatching(/^[a-f0-9]{64}$/u) })
+    })]);
   });
 
   it("rejects an explicit scope whose parent link escapes the workspace", async () => {
@@ -964,7 +969,7 @@ describe("CheckpointManager", () => {
     await expect(readdir(path.join(limitedRoot, "checkpoints", "cas"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("keeps review output UTF-8 safe and visibly truncated within the exact byte budget", async () => {
+  it("keeps bounded review material UTF-8 safe without partial text", async () => {
     const { workspace, manager } = await fixture();
     await writeFile(path.join(workspace, "existing.txt"), "你好🙂".repeat(1024), "utf8");
     const checkpoint = await manager.create({
@@ -974,10 +979,32 @@ describe("CheckpointManager", () => {
     await writeFile(path.join(workspace, "existing.txt"), "再见🚀".repeat(1024), "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
 
-    const review = await manager.reviewDiff(checkpoint.sessionId, checkpoint.checkpointId, 191);
-    expect(Buffer.byteLength(review, "utf8")).toBeLessThanOrEqual(191);
-    expect(review.endsWith("[review diff truncated]")).toBe(true);
-    expect(review).not.toContain("\uFFFD");
+    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 512);
+    expect(Buffer.byteLength(material.reviewDiff, "utf8")
+      + Buffer.byteLength(JSON.stringify(material.opaqueArtifacts), "utf8")).toBeLessThanOrEqual(512);
+    expect(material.reviewDiff).not.toContain("[review diff truncated]");
+    expect(material.reviewDiff).not.toContain("\uFFFD");
+    expect(material.opaqueArtifacts).toEqual([expect.objectContaining({
+      path: "existing.txt", representation: "content_omitted"
+    })]);
+  });
+
+  it("returns a typed scope blocker when path identities cannot fit", async () => {
+    const { workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-review-scope", runId: "run-review-scope", workspacePath: workspace,
+      scopePaths: ["existing.txt"], baseSeq: 0
+    });
+    await writeFile(path.join(workspace, "existing.txt"), "changed text ".repeat(1_024), "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+
+    const material = await manager.reviewMaterial(checkpoint.sessionId, checkpoint.checkpointId, 64);
+    expect(material).toMatchObject({
+      reviewDiff: "",
+      reviewDiffPaths: [],
+      opaqueArtifacts: [],
+      reviewProblem: { code: "review_scope_too_large" }
+    });
   });
 
   it("fails review and CAS reuse when a content-addressed object was replaced", async () => {

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { canonicalJson } from "./common.mjs";
 import { archiveEvaluationEvidence } from "./evaluation-vault.mjs";
 import {
-  assertV4EventStream, listV4Sessions, readV4Session, resolveWorkspaceStateRoot
+  assertV5EventStream, listV5Sessions, readV5Session, resolveWorkspaceStateRoot
 } from "./event-store.mjs";
 import { reduceAgentEvents } from "./metrics.mjs";
 import { createOptimizerClusterCards, createOptimizerObservations } from "./optimizer-observation.mjs";
@@ -280,7 +280,7 @@ export function assertGenericConformanceEventStreamV1(input) {
     }
     return record.event;
   });
-  assertV4EventStream(events);
+  assertV5EventStream(events);
   rejectGenericEvaluatorKeys(events);
   return { value, events };
 }
@@ -345,7 +345,7 @@ async function readConformanceStream(filePath) {
 async function selectedSessionIds(stateRoot, options) {
   if (options.includeRealSessions === false) return [];
   if (options.sessionIds.length > 0) return [...new Set(options.sessionIds)];
-  const available = await listV4Sessions(stateRoot);
+  const available = await listV5Sessions(stateRoot);
   return available.slice(0, options.latest).map((item) => item.sessionId);
 }
 
@@ -419,7 +419,7 @@ export async function collectOptimizerObservations(options, dependencies = {}) {
   const created = [];
   const archives = [];
   for (const sessionId of sessionIds) {
-    const stored = await readV4Session(stateRoot, sessionId);
+    const stored = await readV5Session(stateRoot, sessionId);
     archives.push(await archiveSession(stored, workspace, vaultRoot));
     const metrics = reduceAgentEvents(stored.events, { sessionId });
     created.push(...createOptimizerObservations(metrics, {
@@ -465,10 +465,10 @@ function help() {
   return [
     "Usage: node scripts/eval/optimizer-observe.mjs [options]",
     "  --workspace <path>   Sigma workspace (default: .)",
-    "  --state-root <path>  Explicit V4 state root",
+    "  --state-root <path>  Explicit V5 state root",
     "  --latest <n>         Inspect latest N real sessions (default: 10)",
     "  --session <id>       Select an exact real session; repeatable",
-    "  --conformance-events <path>  Add a checksummed generic V4 event stream; repeatable",
+    "  --conformance-events <path>  Add a checksummed generic V5 event stream; repeatable",
     "  --generic-only       Skip real-session state when ingesting generic conformance events",
     "  --provider/--model/--surface  Assert (never supply) durable subject identity",
     "  --output <path>      Sanitized directory inside shared repository state",

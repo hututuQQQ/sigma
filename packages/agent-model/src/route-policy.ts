@@ -7,6 +7,9 @@ export interface ModelRouteConstraints {
   maxOutputTokens?: number;
   remainingBudgetMicroUsd?: number;
   requireExactTokenizer?: boolean;
+  /** Runtime budget convergence may intentionally reserve a smaller fallback
+   * prefix so one final terminal request remains possible. */
+  maxAttempts?: number;
 }
 
 export interface ModelRejection {
@@ -186,7 +189,8 @@ export function validateRouteConstraints(constraints: ModelRouteConstraints): vo
   for (const [label, value] of [
     ["estimatedInputTokens", constraints.estimatedInputTokens],
     ["maxOutputTokens", constraints.maxOutputTokens],
-    ["remainingBudgetMicroUsd", constraints.remainingBudgetMicroUsd]
+    ["remainingBudgetMicroUsd", constraints.remainingBudgetMicroUsd],
+    ["maxAttempts", constraints.maxAttempts]
   ] as const) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
       throw new Error(`Model route constraint '${label}' must be a non-negative safe integer.`);

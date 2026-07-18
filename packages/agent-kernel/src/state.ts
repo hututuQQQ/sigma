@@ -320,7 +320,7 @@ function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationR
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {
-  if (!isKernelState(value)) throw new Error("Invalid KernelState V4.");
+  if (!isKernelState(value)) throw new Error("Invalid KernelState V5.");
 }
 
 export function isTerminal(state: KernelState): boolean {

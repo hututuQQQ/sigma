@@ -7,3 +7,4 @@ export * from "./failure-policy.js";
 export * from "./usage.js";
 export * from "./routed-gateway.js";
 export * from "./provider-health.js";
+export * from "./provider-spi.js";

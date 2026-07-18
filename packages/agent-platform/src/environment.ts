@@ -7,7 +7,7 @@ export interface RuntimeEnvironment {
   availableShells: ShellKind[];
   availableRuntimeCommands: string[];
   executionCapabilitiesVerified: boolean;
-  executionMode?: "sandboxed" | "disposable-container";
+  executionMode?: "sandboxed" | "container";
   pathSeparator: string;
 }
 
@@ -29,7 +29,6 @@ export function runtimeEnvironment(platform: NodeJS.Platform = process.platform)
 }
 
 export function runtimePrompt(environment = runtimeEnvironment()): string {
-  const disposableContainer = environment.executionMode === "disposable-container";
   const verifiedShells = environment.executionCapabilitiesVerified
     ? environment.availableShells : [];
   const verifiedRuntimeCommands = environment.executionCapabilitiesVerified
@@ -45,11 +44,9 @@ export function runtimePrompt(environment = runtimeEnvironment()): string {
     `verifiedRuntimeCommands=${verifiedRuntimeCommands.join(",") || "none"}`,
     `pathSeparator=${environment.pathSeparator}.`,
     `executionMode=${environment.executionMode ?? "sandboxed"}`,
-    disposableContainer
-      ? "Execution capabilities are open-world inside this user-declared disposable container: native container commands and package managers may be used when required by the task."
+    environment.executionMode === "container"
+      ? "Execution uses a real OCI backend with staged workspace merge; if it is unavailable the run is blocked."
       : "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands.",
-    disposableContainer
-      ? "Writes outside the workspace are not covered by workspace checkpoint rollback; keep them limited to the disposable container."
-      : "Do not probe or retry unlisted host commands."
+    "Do not probe or retry unlisted host commands."
   ].join("; ");
 }

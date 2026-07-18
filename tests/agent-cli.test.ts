@@ -103,7 +103,9 @@ describe("Sigma CLI", () => {
     const stdout = new Capture();
     const stderr = new Capture();
     const stdin = Object.assign(new PassThrough(), { isTTY: false });
-    const code = await runCommand(["change something", "--workspace", workspace, "--output-format", "json"], { stdin, stdout, stderr });
+    const code = await runCommand([
+      "change something", "--workspace", workspace, "--output-format", "json", "--permission-mode", "ask"
+    ], { stdin, stdout, stderr });
     expect(code).toBe(2);
     expect(JSON.parse(stdout.text())).toMatchObject({ status: "needs_input" });
   });

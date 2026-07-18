@@ -110,7 +110,10 @@ export class StreamDecoder {
     this.inputTokens = hasInput ? usage.prompt_tokens as number : this.inputTokens;
     this.outputTokens = hasOutput ? usage.completion_tokens as number : this.outputTokens;
     this.reasoningTokens = numberOrPrevious(outputDetails.reasoning_tokens, this.reasoningTokens);
-    this.cacheReadTokens = numberOrPrevious(inputDetails.cached_tokens, this.cacheReadTokens);
+    const cacheReadTokens = typeof inputDetails.cached_tokens === "number"
+      ? inputDetails.cached_tokens
+      : usage.prompt_cache_hit_tokens;
+    this.cacheReadTokens = numberOrPrevious(cacheReadTokens, this.cacheReadTokens);
     this.cacheWriteTokens = numberOrPrevious(inputDetails.cache_creation_tokens, this.cacheWriteTokens);
     return [{ type: "usage", inputTokens: this.inputTokens, outputTokens: this.outputTokens }];
   }

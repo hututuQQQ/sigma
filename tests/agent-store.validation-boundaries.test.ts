@@ -5,15 +5,15 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   ContentAddressedArtifactStore,
-  isSessionMetaV4,
+  isSessionMetaV5,
   sessionDirectory
 } from "../packages/agent-store/src/index.js";
 import { atomicJson } from "../packages/agent-store/src/durable-file.js";
 
 describe("durable store failure boundaries", () => {
-  it("rejects non-object and array V4 metadata", () => {
-    expect(isSessionMetaV4(null)).toBe(false);
-    expect(isSessionMetaV4([])).toBe(false);
+  it("rejects non-object and array V5 metadata", () => {
+    expect(isSessionMetaV5(null)).toBe(false);
+    expect(isSessionMetaV5([])).toBe(false);
   });
 
   it("detects corruption when an existing CAS object is written again", async () => {

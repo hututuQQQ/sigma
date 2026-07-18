@@ -123,7 +123,7 @@ describe("terminal convergence properties", () => {
       "filesystem.write",
       "network"
     ), { maxLength: 5 });
-    const names = fc.constantFrom("complete_task", "request_user_input", "generated_terminal_tool");
+    const names = fc.constantFrom("runtime_finalize", "request_user_input", "generated_terminal_tool");
     fc.assert(fc.property(effects, effects, effects, names,
       (possibleEffects, maximumEffects, exactEffects, name) => {
       const tool = descriptor(possibleEffects, maximumEffects, name);

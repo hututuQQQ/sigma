@@ -82,11 +82,11 @@ export function protectedToolBatchFailure(
   calls: readonly ModelToolCall[]
 ): { code: "terminal_batch_conflict" | "terminal_protocol_invalid"; message: string } | null {
   if (state.completionRepair?.kind !== "protected_completion") return null;
-  const terminal = calls[0]?.name === "complete_task" || calls[0]?.name === "report_blocked"
+  const terminal = calls[0]?.name === "runtime_finalize" || calls[0]?.name === "report_blocked"
     || calls[0]?.name === "request_user_input";
   if (calls.length === 1 && terminal) return null;
   const terminalCount = calls.filter((call) =>
-    call.name === "complete_task" || call.name === "report_blocked" || call.name === "request_user_input").length;
+    call.name === "runtime_finalize" || call.name === "report_blocked" || call.name === "request_user_input").length;
   return calls.length > 1 && terminalCount > 0
     ? {
         code: "terminal_batch_conflict",
@@ -94,7 +94,7 @@ export function protectedToolBatchFailure(
       }
     : {
         code: "terminal_protocol_invalid",
-        message: "The protected terminal-intent repair did not choose exactly one complete_task or request_user_input call."
+        message: "The protected terminal-intent repair did not produce exactly one runtime completion intent or request_user_input call."
       };
 }
 
@@ -104,7 +104,7 @@ function terminalReceiptFailure(
   toolName: string,
   action: "complete" | "report_blocked" | "request_input"
 ): KernelState | null {
-  const expectedTool = action === "complete" ? "complete_task"
+  const expectedTool = action === "complete" ? "runtime_finalize"
     : action === "report_blocked" ? "report_blocked" : "request_user_input";
   if (toolName === expectedTool) return null;
   return proposedOutcomeState(progressed, {
@@ -183,7 +183,7 @@ const COMPLETION_PREREQUISITE_CODES = new Set([
 ]);
 
 function isCompletionPrerequisiteFailure(input: TerminalReceiptTransition): boolean {
-  if (input.toolName !== "complete_task" || input.receipt.ok || input.remainingTools !== 0) return false;
+  if (input.toolName !== "runtime_finalize" || input.receipt.ok || input.remainingTools !== 0) return false;
   return input.receipt.diagnostics.some((code) => COMPLETION_PREREQUISITE_CODES.has(code));
 }
 

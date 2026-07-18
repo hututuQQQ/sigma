@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { listV4Sessions, readV4Session, resolveWorkspaceStateRoot } from "../scripts/eval/event-store.mjs";
+import { listV5Sessions, readV5Session, resolveWorkspaceStateRoot } from "../scripts/eval/event-store.mjs";
 import { reduceAgentEvents, renderSessionMetricsMarkdown } from "../scripts/eval/metrics.mjs";
 import { auditSessions, renderSessionAuditMarkdown, writeSessionAudit } from "../scripts/eval/session-audit.mjs";
 
@@ -16,7 +16,7 @@ function eventFactory(sessionId = "session", runId = "run") {
     tick += advanceMs;
     seq += 1;
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       seq,
       eventId: `event-${seq}`,
       sessionId,
@@ -60,13 +60,13 @@ function storedLine(value: unknown) {
 }
 
 async function writeSession(root: string, sessionId: string, updatedAt: string, events: unknown[]) {
-  const directory = path.join(root, "stores", "v4", "sessions", sessionId);
+  const directory = path.join(root, "stores", "v5", "sessions", sessionId);
   await mkdir(path.join(directory, "events"), { recursive: true });
   await writeFile(path.join(directory, "events", "000001.jsonl"), events.map(storedLine).join(""), "utf8");
   await writeFile(path.join(directory, "meta.json"), `${JSON.stringify({
-    schemaVersion: 4,
-    eventSchemaVersion: 4,
-    snapshotSchemaVersion: 4,
+    schemaVersion: 5,
+    eventSchemaVersion: 5,
+    snapshotSchemaVersion: 5,
     sessionId,
     createdAt: events[0]?.occurredAt ?? updatedAt,
     updatedAt,
@@ -201,20 +201,20 @@ describe("agent experience event metrics", () => {
     });
   });
 
-  it("recognizes an answer paired with complete_task without counting protocol finalization as churn", () => {
+  it("recognizes an answer paired with runtime finalization without counting coordinator work as churn", () => {
     const make = eventFactory("completion-session");
     const events = [
       make("run.started", { mode: "change" }),
       make("model.completed", {
         text: "Done.",
-        toolCalls: [{ id: "complete", name: "complete_task", arguments: {} }],
+        toolCalls: [{ id: "complete", name: "runtime_finalize", arguments: {} }],
         turnId: 1,
         effectRevision: 1
       }),
-      make("tool.requested", { callId: "complete", name: "complete_task", arguments: {}, turnId: 1, effectRevision: 1 }),
+      make("tool.requested", { callId: "complete", name: "runtime_finalize", arguments: {}, turnId: 1, effectRevision: 1 }),
       make("execution.started", { executionId: "complete" }),
       make("execution.completed", { executionId: "complete" }),
-      make("tool.completed", { callId: "complete", name: "complete_task", output: "ok", turnId: 1, effectRevision: 1 }),
+      make("tool.completed", { callId: "complete", name: "runtime_finalize", output: "ok", turnId: 1, effectRevision: 1 }),
       make("run.completed", {})
     ];
 
@@ -392,7 +392,7 @@ describe("agent experience event metrics", () => {
   });
 });
 
-describe("V4 historical session audit", () => {
+describe("V5 historical session audit", () => {
   it("resolves workspace state, validates official records, selects latest or exact sessions, and writes versioned reports", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-workspace-"));
     const stateHome = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-state-"));
@@ -420,8 +420,8 @@ describe("V4 historical session audit", () => {
     await writeSession(stateRoot, "old-session", "2026-07-12T01:00:00.000Z", oldEvents);
     await writeSession(stateRoot, "new-session", "2026-07-12T02:00:00.000Z", newEvents);
 
-    expect((await listV4Sessions(stateRoot)).map((item) => item.sessionId)).toEqual(["new-session", "old-session"]);
-    await expect(readV4Session(stateRoot, "new-session")).resolves.toMatchObject({ meta: { lastSeq: 3 } });
+    expect((await listV5Sessions(stateRoot)).map((item) => item.sessionId)).toEqual(["new-session", "old-session"]);
+    await expect(readV5Session(stateRoot, "new-session")).resolves.toMatchObject({ meta: { lastSeq: 3 } });
 
     const latest = await auditSessions({
       workspace,
@@ -454,17 +454,17 @@ describe("V4 historical session audit", () => {
       strictWriteScope: true, modelRole: "orchestrator"
     })];
     await writeSession(root, "corrupt-session", "2026-07-12T01:00:00.000Z", events);
-    const file = path.join(root, "stores", "v4", "sessions", "corrupt-session", "events", "000001.jsonl");
+    const file = path.join(root, "stores", "v5", "sessions", "corrupt-session", "events", "000001.jsonl");
     const stored = JSON.parse((await readFile(file, "utf8")).trim());
     stored.checksum = "0".repeat(64);
     await writeFile(file, `${JSON.stringify(stored)}\n`, "utf8");
-    await expect(readV4Session(root, "corrupt-session")).rejects.toThrow("checksum mismatch");
+    await expect(readV5Session(root, "corrupt-session")).rejects.toThrow("checksum mismatch");
 
     await writeFile(file, storedLine(events[0]), "utf8");
-    const metaPath = path.join(root, "stores", "v4", "sessions", "corrupt-session", "meta.json");
+    const metaPath = path.join(root, "stores", "v5", "sessions", "corrupt-session", "meta.json");
     const meta = JSON.parse(await readFile(metaPath, "utf8"));
     meta.lastSeq = 2;
     await writeFile(metaPath, `${JSON.stringify(meta)}\n`, "utf8");
-    await expect(readV4Session(root, "corrupt-session")).rejects.toThrow("metadata/event mismatch");
+    await expect(readV5Session(root, "corrupt-session")).rejects.toThrow("metadata/event mismatch");
   });
 });

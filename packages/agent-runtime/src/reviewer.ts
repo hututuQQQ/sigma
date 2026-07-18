@@ -29,6 +29,7 @@ export interface ReviewerInput {
   goal: string;
   frontierRevision: number;
   stateDigest: string;
+  reviewBasisDigest: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
   inputAccesses?: InputAccessEvidence[];
@@ -111,7 +112,10 @@ export function reviewInputFailureEvidence(
       findings: [message],
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
-      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+      reviewBasisDigest: input.reviewBasisDigest,
+      validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+      ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
+        ? { failureCode: "review_scope_too_large" as const } : {})
     }
   };
 }
@@ -216,13 +220,14 @@ export class ModelReviewer implements ReviewerPort {
 function reviewMessages(input: ReviewerInput): ModelMessage[] {
   return [{
     role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
+    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, and validation evidence. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
   }, {
     role: "user",
     content: JSON.stringify({
       goal: input.goal,
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
+      reviewBasisDigest: input.reviewBasisDigest,
       inputAccesses: input.inputAccesses ?? [],
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
@@ -230,7 +235,8 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
         delta: item.data.delta,
         diff: item.data.reviewDiff ?? "[diff artifact unavailable]",
         reviewDiffPaths: item.data.reviewDiffPaths ?? [],
-        opaqueArtifacts: item.data.opaqueArtifacts ?? []
+        opaqueArtifacts: item.data.opaqueArtifacts ?? [],
+        reviewProblem: item.data.reviewProblem
       })),
       validations: input.validations.map((item) => ({ status: item.status, summary: item.summary, data: item.data }))
     })
@@ -277,7 +283,10 @@ function reviewEvidence(
         findings,
         frontierRevision: input.frontierRevision,
         stateDigest: input.stateDigest,
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+        reviewBasisDigest: input.reviewBasisDigest,
+        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+        ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
+          ? { failureCode: "review_scope_too_large" as const } : {})
       }
     };
 }

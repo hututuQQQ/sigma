@@ -82,6 +82,10 @@ function healthyBroker(close: () => Promise<void> = async () => undefined): Exec
     lostProcessHandles: [],
     connect: async () => report,
     doctor: async () => report,
+    sandboxLeaseStatus: async (workspacePath) => ({
+      leaseId: "lease", workspaceIdentity: "workspace", generation: 7,
+      principalId: "principal", access: "read", roots: [workspacePath], state: "active"
+    }),
     execute: async () => { throw new Error("not implemented"); },
     spawn: async () => { throw new Error("not implemented"); },
     poll: async () => { throw new Error("not implemented"); },
@@ -129,6 +133,10 @@ describe("doctor command branch coverage", () => {
       expect(report.protocolVersion).toBe(1);
       expect(report.capabilities.networkModes).toEqual(["none"]);
       expect(report.capabilities.processHandoff).toBe(false);
+      expect(report).toMatchObject({
+        workspaceLease: { state: "active", generation: 7 },
+        container: { available: false, backend: "oci" }
+      });
       expect(report.status).toBe("ok");
       expect(report.checks).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "node", status: "ok" }),

@@ -89,9 +89,10 @@ export function assertAvailableExecutable(
   ), { code: "executable_unavailable" });
 }
 
-export function availableNetworkModes(options: ExecutionToolOptions): Array<"none" | "full"> {
+export function availableNetworkModes(options: ExecutionToolOptions): Array<"none" | "loopback" | "full"> {
   return [...new Set((options.networkModes ?? ["none"])
-    .filter((mode): mode is "none" | "full" => mode === "none" || mode === "full"))];
+    .filter((mode): mode is "none" | "loopback" | "full" =>
+      mode === "none" || mode === "loopback" || mode === "full"))];
 }
 
 export function assertAvailableShell(input: Record<string, JsonValue>, options: ExecutionToolOptions): void {

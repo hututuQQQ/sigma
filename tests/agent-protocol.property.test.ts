@@ -41,7 +41,7 @@ function invalidOptional(type: string, field: string, value: unknown): Record<st
   };
 }
 
-describe("V4 protocol properties", () => {
+describe("V5 protocol properties", () => {
   it("round-trips every producer event through JSON and the consumer parser", () => {
     fc.assert(fc.property(
       fc.constantFrom(...AGENT_EVENT_TYPES),

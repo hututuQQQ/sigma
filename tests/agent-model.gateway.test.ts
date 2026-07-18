@@ -120,7 +120,12 @@ describe("OpenAI-compatible model gateway", () => {
         },
         finish_reason: "future_tool_reason"
       }],
-      usage: { prompt_tokens: 12, completion_tokens: 4 },
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+        prompt_cache_hit_tokens: 5,
+        completion_tokens_details: { reasoning_tokens: 3 }
+      },
       provider_meta: { finite: 1, infinite: Number.POSITIVE_INFINITY, unsupported: undefined, nested: [true] }
     };
     const model = createGateway((async (url, init) => {
@@ -184,6 +189,7 @@ describe("OpenAI-compatible model gateway", () => {
       finishReason: "tool_calls",
       inputTokens: 12,
       outputTokens: 4,
+      usage: { cacheReadTokens: 5, reasoningTokens: 3 },
       raw: { provider_meta: { finite: 1, infinite: null, unsupported: null, nested: [true] } }
     });
   });

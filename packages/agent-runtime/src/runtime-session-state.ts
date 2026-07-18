@@ -50,6 +50,7 @@ export function createRuntimeSessionAggregate(seed: RuntimeSessionSeed): Runtime
     approvals: seed.approvals,
     callApprovals: seed.callApprovals,
     alwaysAllowedEffects: seed.alwaysAllowedEffects,
+    capabilityFailures: seed.capabilityFailures,
     steeringPending: seed.steeringPending,
     followUps: seed.followUps,
     contextItems: seed.contextItems,

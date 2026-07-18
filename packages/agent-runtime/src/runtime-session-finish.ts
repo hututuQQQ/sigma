@@ -4,6 +4,7 @@ import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventLog } from "./runtime-event-log.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
+import { completionCoordinatorState } from "./completion-evidence-gate.js";
 
 export type RunSuspensionContext =
   | { processIds: string[] }
@@ -74,9 +75,16 @@ async function emitOutcome(
   suspensionContext?: RunSuspensionContext
 ): Promise<AgentEventEnvelope | undefined> {
   const type = outcomeEventType(outcome);
-  const payload = outcome.kind === "needs_input" && suspensionContext
-    ? { ...outcome, ...suspensionContext }
-    : outcome;
+  const payload = outcome.kind === "completed"
+    ? { ...outcome, coordinator: {
+        modelStopped: true as const,
+        assuranceSatisfied: true as const,
+        reviewSatisfied: true as const,
+        runCompleted: true as const
+      } }
+    : outcome.kind === "needs_input" && suspensionContext
+      ? { ...outcome, ...suspensionContext }
+      : outcome;
   if (outcomeRevision === undefined) {
     return await options.events.emit(session, type, "runtime", payload);
   }
@@ -106,7 +114,13 @@ export async function finishRuntimeSession(
   suspensionContext?: RunSuspensionContext
 ): Promise<boolean> {
   if (!isCurrentOutcomeRevision(session, outcomeRevision)) return false;
-  const finalOutcome = await applyFinishHooks(options.hooks, session, outcome);
+  const coordinator = outcome.kind === "completed" ? completionCoordinatorState(session) : undefined;
+  const coordinatedOutcome = coordinator && !coordinator.runCompleted ? {
+    kind: "recoverable_failure" as const,
+    code: "completion_coordinator_rejected",
+    message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
+  } : outcome;
+  const finalOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   await options.beforeOutcome?.(session, finalOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;

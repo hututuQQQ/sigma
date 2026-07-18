@@ -7,10 +7,14 @@ import type {
   BrokerDoctorReport,
   ExecutionBroker
 } from "../packages/agent-execution/src/index.js";
-import { withTrustedRuntimeCapabilities } from "../packages/agent-execution/src/lazy-execution-broker-runtime.js";
+import {
+  nodeRuntimeReadRoots,
+  withTrustedRuntimeCapabilities
+} from "../packages/agent-execution/src/lazy-execution-broker-runtime.js";
 import {
   assertTrustedToolchainsAvailable,
-  normalizeTrustedToolchains
+  normalizeTrustedToolchains,
+  resolveTrustedInvocation
 } from "../packages/agent-execution/src/trusted-toolchains.js";
 import { runtimeEnvironment, runtimePrompt } from "../packages/agent-platform/src/index.js";
 import { brokerRuntimeEnvironment } from "../packages/agent-runtime/src/execution-capabilities.js";
@@ -55,6 +59,17 @@ function fixtureBroker(connection: () => Promise<BrokerDoctorReport>): Execution
 }
 
 describe("connection-bound runtime capability reporting", () => {
+  it("grants Windows Node adjacent runtime assets without broadening executable trust", () => {
+    const executable = path.join("C:\\", "Sigma", "bin", "node.exe");
+    const packageRoot = path.join("C:\\", "Sigma", "bin", "node_modules", "pnpm");
+
+    expect(nodeRuntimeReadRoots(executable, "win32", [packageRoot])).toEqual([
+      path.dirname(executable), packageRoot
+    ]);
+    expect(nodeRuntimeReadRoots("/opt/sigma/bin/node", "linux", ["/opt/sigma/lib/pnpm"]))
+      .toEqual(["/opt/sigma/lib/pnpm"]);
+  });
+
   it("rejects an unavailable trusted runtime during connection preflight", () => {
     const missing = path.join(os.tmpdir(), `sigma-missing-runtime-${randomUUID()}`);
     const toolchains = normalizeTrustedToolchains([{
@@ -99,15 +114,14 @@ describe("connection-bound runtime capability reporting", () => {
     expect(prompt).toContain("verifiedRuntimeCommands=none");
   });
 
-  it("describes disposable-container execution as open-world without promising external rollback", () => {
-    const environment = { ...runtimeEnvironment("linux"), executionMode: "disposable-container" as const };
+  it("describes container execution as a real staged OCI backend", () => {
+    const environment = { ...runtimeEnvironment("linux"), executionMode: "container" as const };
     const prompt = runtimePrompt(environment);
 
-    expect(prompt).toContain("executionMode=disposable-container");
-    expect(prompt).toContain("open-world inside this user-declared disposable container");
-    expect(prompt).toContain("package managers may be used");
-    expect(prompt).toContain("outside the workspace are not covered by workspace checkpoint rollback");
-    expect(prompt).not.toContain("Do not probe or retry unlisted host commands");
+    expect(prompt).toContain("executionMode=container");
+    expect(prompt).toContain("real OCI backend with staged workspace merge");
+    expect(prompt).toContain("if it is unavailable the run is blocked");
+    expect(prompt).not.toContain("disposable-container");
   });
 
   it("does not fall back or interpolate malformed broker environment fields", () => {
@@ -135,6 +149,83 @@ describe("connection-bound runtime capability reporting", () => {
     expect(connect).toHaveBeenCalledOnce();
     expect(connected.capabilities.runtimeCommands).toEqual(["runtime-alias"]);
     expect(JSON.stringify(connected)).not.toContain(process.execPath);
+  });
+
+  it("resolves script-backed package-manager aliases through the trusted runtime", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-script-toolchain-"));
+    try {
+      const runtime = path.join(root, process.platform === "win32" ? "runtime.exe" : "runtime");
+      const packageRoot = path.join(root, "package-manager");
+      const entryPoint = path.join(packageRoot, "pnpm.cjs");
+      await import("node:fs/promises").then(async (fs) => {
+        await fs.mkdir(packageRoot, { recursive: true });
+        await fs.writeFile(runtime, "runtime", "utf8");
+        await fs.writeFile(entryPoint, "entry", "utf8");
+      });
+      const toolchains = normalizeTrustedToolchains([{
+        id: "script-runtime",
+        runtime: "generic",
+        executable: runtime,
+        aliases: ["runtime", "pnpm"],
+        aliasArguments: { pnpm: [entryPoint] },
+        executionRoots: [runtime],
+        runtimeRoots: [packageRoot]
+      }]);
+
+      expect(resolveTrustedInvocation("pnpm", ["test"], toolchains, root)).toEqual({
+        executable: path.resolve(runtime),
+        args: [entryPoint, "test"]
+      });
+      expect(() => normalizeTrustedToolchains([{
+        id: "escaped-script-runtime",
+        runtime: "generic",
+        executable: runtime,
+        aliases: ["pnpm"],
+        aliasArguments: { pnpm: [path.join(root, "outside.cjs")] },
+        runtimeRoots: [packageRoot]
+      }])).toThrow(/inside a declared runtime root/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards workspace lease maintenance through the capability wrapper", async () => {
+    const native = fixtureBroker(async () => report());
+    const status = vi.fn(async () => ({
+      leaseId: "lease", workspaceIdentity: "workspace", generation: 2,
+      principalId: "principal", access: "read" as const, roots: ["C:/workspace"], state: "active" as const
+    }));
+    const revoke = vi.fn(async () => ({ revoked: true, retiredPrincipalId: "principal", generation: 3 }));
+    native.sandboxLeaseStatus = status;
+    native.revokeSandboxLease = revoke;
+    const wrapped = withTrustedRuntimeCapabilities(native, undefined);
+
+    await expect(wrapped.sandboxLeaseStatus?.("C:/workspace")).resolves.toMatchObject({ generation: 2 });
+    await expect(wrapped.revokeSandboxLease?.("C:/workspace")).resolves.toMatchObject({ generation: 3 });
+    expect(status).toHaveBeenCalledWith("C:/workspace", undefined);
+    expect(revoke).toHaveBeenCalledWith("C:/workspace", undefined);
+  });
+
+  it("reports and forwards handoff only when the wrapped broker implements it", async () => {
+    const advertised = report();
+    advertised.capabilities.processHandoff = true;
+    const withoutHandoff = withTrustedRuntimeCapabilities(
+      fixtureBroker(async () => advertised), undefined
+    );
+    await expect(withoutHandoff.connect()).resolves.toMatchObject({
+      capabilities: { processHandoff: false }
+    });
+
+    const handoff = vi.fn(async () => ({ handoffId: "handoff-fixture" }));
+    const native = { ...fixtureBroker(async () => advertised), handoff };
+    const wrapped = withTrustedRuntimeCapabilities(native, undefined);
+    await expect(wrapped.connect()).resolves.toMatchObject({
+      capabilities: { processHandoff: true }
+    });
+    await expect(wrapped.handoff?.({ id: "process-fixture" })).resolves.toEqual({
+      handoffId: "handoff-fixture"
+    });
+    expect(handoff).toHaveBeenCalledWith({ id: "process-fixture" }, undefined);
   });
 
   it("does not manufacture a capability report when connection validation fails", async () => {

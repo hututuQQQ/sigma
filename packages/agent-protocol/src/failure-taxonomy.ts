@@ -70,8 +70,9 @@ export function normalizeInfrastructureFailureCodeV1(value: string): string {
 /**
  * Classify stable diagnostic codes without inferring infrastructure failure
  * from generic policy denials, exit statuses, messages, paths, or task data.
- * Execution adapters may emit dependency_missing after recognizing a
- * language-runtime's stable missing-dependency diagnostic syntax.
+ * Trusted broker/toolchain adapters may emit dependency_missing when their
+ * own launch dependency is unavailable. Child-command output must use a
+ * non-infrastructure diagnostic such as command_dependency_missing.
  */
 export function classifyInfrastructureFailureCodesV1(
   values: readonly string[]

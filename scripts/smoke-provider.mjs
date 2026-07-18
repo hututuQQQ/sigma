@@ -172,10 +172,12 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const instruction = [
-    "Create a file named provider-smoke.md in the workspace.",
-    "The file must contain exactly these two lines:",
-    "sigma provider smoke",
-    "ready"
+    "Create a file named provider-smoke.js in the workspace.",
+    "The file must contain exactly this line:",
+    'const sigmaProviderSmoke = "ready";',
+    "After writing the file, run node --check provider-smoke.js with this exact read-only tool call before finishing:",
+    'validate({"executable":"node","args":["--check","provider-smoke.js"],"access":"readonly"})',
+    "Do not pass expectedChanges or writeRoots to that validation call."
   ].join("\n");
   const run = await captureProcessWrites(async (stdout, stderr) => await runCommand([
     instruction,
@@ -198,9 +200,9 @@ async function main(argv = process.argv.slice(2)) {
   } catch {
     // Keep raw output in failure report.
   }
-  const filePath = path.join(workspace, "provider-smoke.md");
+  const filePath = path.join(workspace, "provider-smoke.js");
   const fileText = existsSync(filePath) ? await readFile(filePath, "utf8") : "";
-  const fileOk = fileText.trim() === "sigma provider smoke\nready";
+  const fileOk = fileText.trim() === 'const sigmaProviderSmoke = "ready";';
   const runOk = run.code === 0 && runResult?.status === "completed" && fileOk;
 
   const inspect = await captureProcessWrites(async (stdout, stderr) => await runSessionCommand([

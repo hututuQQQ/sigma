@@ -369,7 +369,7 @@ describe("execution output artifact receipts", () => {
     })]);
   });
 
-  it("emits a stable dependency diagnostic for authenticated runtime syntax", async () => {
+  it("keeps application dependency diagnostics out of infrastructure fail-fast", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-missing-dependency-"));
     const execution: ExecutionResult = {
       state: "exited", exitCode: 1, signal: null, durationMs: 8,
@@ -393,7 +393,8 @@ describe("execution output artifact receipts", () => {
     );
 
     expect(receipt).toMatchObject({ ok: false });
-    expect(receipt.diagnostics).toContain("dependency_missing");
+    expect(receipt.diagnostics).toContain("command_dependency_missing");
+    expect(receipt.diagnostics).not.toContain("dependency_missing");
   });
 
   it("preserves authenticated sandbox launch failures as stable diagnostics", async () => {

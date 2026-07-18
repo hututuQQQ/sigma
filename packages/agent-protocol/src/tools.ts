@@ -9,6 +9,7 @@ import type {
   PlanGraph
 } from "./domain.js";
 import type { RunMode } from "./outcomes.js";
+import type { ExecutionIntentV1, ResolvedExecutionCapabilityV1 } from "./execution-v5.js";
 
 export type ToolEffect =
   | "filesystem.read"
@@ -66,7 +67,7 @@ export interface ToolCallPlan {
    * changes below it; process tools may use a broader checkpointScope to make
    * every sandbox-authorized write recoverable. */
   writePaths: string[];
-  network: "none" | "full";
+  network: "none" | "loopback" | "full";
   processMode: "none" | "pipe" | "pty" | "background";
   /** Complete rollback scope for the call. For process tools this is also the
    * maximum filesystem scope granted write access by the execution broker. */
@@ -75,6 +76,10 @@ export interface ToolCallPlan {
    * a nested mutation checkpoint. The target is frozen during preparation. */
   checkpointAction?: { kind: "restore"; checkpointId: string };
   idempotence: "read_only" | "replay_safe" | "non_replayable";
+  /** V5 semantic process request and broker-resolved capability. Present for
+   * process tools; filesystem grants are never model-authored. */
+  executionIntent?: ExecutionIntentV1;
+  executionCapability?: ResolvedExecutionCapabilityV1;
 }
 
 export interface ToolRequest {
@@ -139,6 +144,8 @@ export interface RuntimeControlPort {
 
 export interface ReviewRequestResult {
   status: "review_requested" | "validation_required" | "changes_required" | "not_required";
+  reviewState: "none" | "current" | "stale";
+  reviewBasisDigest: string;
   frontierRevision: number;
   stateDigest: string;
   changedPaths: string[];
@@ -178,11 +185,13 @@ export interface ToolCallApproval {
   networkApproved: boolean;
   externalReadApproved: boolean;
   processHandoffApproved: boolean;
-  unsafeHostExecApproved: boolean;
+  openWorldApproved: boolean;
 }
 
 export interface ToolExecutor {
   descriptors(): readonly ToolDescriptor[];
+  /** Model-visible catalog. Runtime-only coordinator actions are omitted. */
+  modelDescriptors?(): readonly ToolDescriptor[];
   prepare?(request: ToolRequest, context: ToolPreparationContext): Promise<ToolCallPlan>;
   execute(request: ToolRequest, context: ToolExecutionContext): Promise<ToolReceipt>;
 }

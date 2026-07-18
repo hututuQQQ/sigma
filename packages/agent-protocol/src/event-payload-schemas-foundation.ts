@@ -49,14 +49,34 @@ export const toolCallPlanSchema = z.object({
   exactEffects: z.array(toolEffectSchema),
   readPaths: z.array(z.string()),
   writePaths: z.array(z.string()),
-  network: z.enum(["none", "full"]),
+  network: z.enum(["none", "loopback", "full"]),
   processMode: z.enum(["none", "pipe", "pty", "background"]),
   checkpointScope: z.array(z.string()),
   checkpointAction: z.object({
     kind: z.literal("restore"),
     checkpointId: nonEmptyStringSchema
   }).strict().optional(),
-  idempotence: z.enum(["read_only", "replay_safe", "non_replayable"])
+  idempotence: z.enum(["read_only", "replay_safe", "non_replayable"]),
+  executionIntent: z.object({
+    invocation: z.object({
+      executable: z.string(), args: z.array(z.string()), cwd: z.string()
+    }).strict(),
+    access: z.enum(["readonly", "write"]),
+    expectedChanges: z.array(z.string()).optional(),
+    network: z.enum(["none", "loopback", "full"]).optional(),
+    purpose: z.enum(["probe", "build", "lint", "test", "serve", "custom"])
+  }).strict().optional(),
+  executionCapability: z.object({
+    profileId: z.string(),
+    traversalRoots: z.array(z.string()),
+    workspaceReadRoots: z.array(z.string()),
+    dependencyRoots: z.array(z.string()),
+    runtimeRoots: z.array(z.string()),
+    writeRoots: z.array(z.string()),
+    tempRoots: z.array(z.string()),
+    network: z.enum(["none", "loopback", "full"]),
+    backend: z.enum(["native", "oci"])
+  }).strict().optional()
 }).strict();
 
 const artifactRefSchema = z.object({

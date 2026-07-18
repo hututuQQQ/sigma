@@ -39,19 +39,28 @@ export function verifiedRuntimeCommands(report: BrokerDoctorReport): string[] {
 }
 
 export interface VerifiedNetworkPolicy {
-  modes: Array<"none" | "full">;
-  defaultMode: "none" | "full";
+  modes: Array<"none" | "loopback" | "full">;
+  defaultMode: "none" | "loopback" | "full";
 }
 
 export function verifiedNetworkPolicy(
   report: BrokerDoctorReport,
-  configuredMode: "none" | "full"
+  configuredMode: "none" | "loopback" | "full"
 ): VerifiedNetworkPolicy {
   const brokerModes = new Set(report.capabilities.networkModes);
-  const modes = (["none", "full"] as const).filter((mode) => brokerModes.has(mode));
+  const modes = (["none", "loopback", "full"] as const).filter((mode) => brokerModes.has(mode));
+  if (!modes.includes(configuredMode)) {
+    throw Object.assign(new Error(
+      `Configured network mode '${configuredMode}' is not supported by the connected execution broker.`
+    ), {
+      code: "network_capability_unavailable",
+      requestedMode: configuredMode,
+      availableModes: [...modes]
+    });
+  }
   return {
     modes: [...modes],
-    defaultMode: modes.includes(configuredMode) ? configuredMode : modes[0] ?? "none"
+    defaultMode: configuredMode
   };
 }
 

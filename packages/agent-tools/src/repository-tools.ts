@@ -1,7 +1,7 @@
 import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
 import {
   runProcess,
-  selfContainedGitRoot,
+  repositoryTopology,
   type ProcessExecutionPort
 } from "agent-platform";
 import type { RegisteredEffectTool } from "./registry.js";
@@ -205,11 +205,32 @@ function gitReadTool(
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
-      const repositoryRoot = execution
-        ? await selfContainedGitRoot(context.workspacePath, context.signal, execution) : null;
-      if (!repositoryRoot) {
+      let topology;
+      try {
+        topology = execution
+          ? await repositoryTopology(context.workspacePath, context.signal, execution) : null;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = (error as { code?: unknown }).code === "git_probe_failed"
+          ? "git_probe_failed" : "repository_probe_failed";
+        return result(request, startedAt, message, false, [code]);
+      }
+      if (!topology) {
         return result(request, startedAt, "Workspace is not a self-contained Git repository.", false, ["workspace_not_git_root"]);
       }
+      if (!topology.worktreeRoot) {
+        return result(request, startedAt, "This operation requires a Git worktree.", false, ["repository_bare"]);
+      }
+      if (topology.trust === "external_untrusted") {
+        return result(
+          request,
+          startedAt,
+          `Git metadata is outside the trusted workspace: ${topology.commonDir}`,
+          false,
+          ["external_read_required"]
+        );
+      }
+      const repositoryRoot = topology.worktreeRoot;
       const output = await runProcess({
         execution: execution!,
         executable: "git", args, cwd: repositoryRoot, timeoutMs: 30_000,

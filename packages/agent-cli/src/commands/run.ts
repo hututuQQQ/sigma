@@ -254,12 +254,21 @@ function writeRunError(
   stderr: NodeJS.WritableStream
 ): void {
   const message = errorMessage(error);
+  const code = typeof (error as { code?: unknown })?.code === "string"
+    ? (error as { code: string }).code : "cli_error";
+  if (output?.outputFormat === "json") {
+    stdout.write(`${JSON.stringify(outputResult({
+      status: "error",
+      finishReason: code,
+      sessionId: "",
+      finalMessage: message
+    }, output.outputSchema))}\n`);
+    return;
+  }
   if (output?.outputFormat !== "stream-json") {
     stderr.write(`${message}\n`);
     return;
   }
-  const code = typeof (error as { code?: unknown })?.code === "string"
-    ? (error as { code: string }).code : "cli_error";
   for (const line of outputJsonLines(
     outputError({ code, message }, output.outputSchema), `error:${code}`, output.streamJsonMaxLineBytes
   )) stdout.write(`${line}\n`);

@@ -3,10 +3,10 @@ import type { ShellKind } from "agent-platform";
 
 export interface ExecutionToolOptions {
   broker: ExecutionBroker;
-  sandboxMode: "required" | "unsafe";
+  sandboxMode: "required";
   readScope: "workspace" | "host";
   processHandoff: "allow" | "deny";
-  networkMode: "none" | "full";
+  networkMode: "none" | "loopback" | "full";
   shells?: readonly ShellKind[];
   runtimeCommands?: readonly string[];
   foreground?: boolean;
@@ -14,5 +14,5 @@ export interface ExecutionToolOptions {
   stdin?: boolean;
   pty?: boolean;
   handoff?: boolean;
-  networkModes?: readonly ("none" | "full")[];
+  networkModes?: readonly ("none" | "loopback" | "full")[];
 }

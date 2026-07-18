@@ -54,17 +54,15 @@ sidecars as development outputs rather than official releases.
 
 ## Runtime capability defaults
 
-Configuration schema v4 keeps `sandbox=required` and workspace-only writes, but
-defaults declared read access to `read_scope=host`, sandbox networking to
-`network=full`, and Linux process transfer to `process_handoff=allow`. External
-reads, network access, and handoff are sensitive per-call effects: `ask` requires
-confirmation for each call, `auto` issues a fresh call-bound grant, and `deny`
-rejects them. These settings never authorize unsafe host execution.
+Configuration schema v5 defaults to `permission_mode=workspace-auto`,
+`sandbox=required`, `read_scope=workspace`, and `network=none`. Workspace-scoped
+offline work is automatic; external reads, full network, and repository metadata
+writes remain separately authorized. No setting enables unsafe host execution.
 
 Use the following configuration for the strict capability posture:
 
 ```toml
-schema_version = 4
+schema_version = 5
 
 [security]
 sandbox = "required"

@@ -60,6 +60,16 @@ async function transact(
   const context: ToolExecutionContext = {
     ...base,
     callPlan,
+    ...(callPlan.exactEffects.includes("filesystem.read.external") ? {
+      approval: {
+        callId: request.callId,
+        authority: "user" as const,
+        networkApproved: false,
+        externalReadApproved: true,
+        processHandoffApproved: false,
+        openWorldApproved: false
+      }
+    } : {}),
     signal: new AbortController().signal,
     progress: async () => undefined,
     createArtifact: async ({ name }) => name
@@ -172,7 +182,7 @@ describe("controlled Git transactions", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   }, 60_000);
 
-  it("rejects broad arguments, workspace escapes, external gitdirs, and local helpers", async () => {
+  it("supports approved external gitdirs while rejecting broad arguments, escapes, and local helpers", async () => {
     const root = await repository();
     const tools = registry();
     await expect(transact(tools, root, [{ op: "add", paths: ["seed.txt"], argv: ["status"] }]))
@@ -184,8 +194,13 @@ describe("controlled Git transactions", () => {
     workspaces.push(linked);
     await mkdir(path.join(linked, "repo"), { recursive: true });
     await writeFile(path.join(linked, "repo", ".git"), `gitdir: ${path.join(root, ".git")}\n`, "utf8");
-    await expect(transact(tools, path.join(linked, "repo"), [{ op: "gc" }], "linked-session"))
-      .rejects.toMatchObject({ code: "repository_gitdir_unsupported" });
+    await expect(transact(tools, path.join(linked, "repo"), [
+      { op: "branch", action: "create", name: "linked-approved" }
+    ], "linked-session")).resolves.toMatchObject({
+      ok: true,
+      observedEffects: expect.arrayContaining(["repository.write", "filesystem.read.external"])
+    });
+    expect(git(root, ["show-ref", "--verify", "refs/heads/linked-approved"])).toContain("refs/heads/linked-approved");
 
     git(root, ["config", "commit.gpgSign", "true"]);
     await expect(transact(tools, root, [{ op: "gc" }], "helper-session"))

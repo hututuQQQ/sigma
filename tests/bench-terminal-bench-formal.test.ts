@@ -24,6 +24,8 @@ function report(taskCount: number, passed: number) {
   const tasks = Array.from({ length: taskCount }, (_unused, index) => ({
     task_id: `task-${index}`,
     status: index < passed ? "passed" : "failed",
+    validity: "valid",
+    verifier_outcome: index < passed ? "passed" : "failed",
     failure_category: index < passed ? null : "verifier_failed",
     input_tokens: 10,
     cache_tokens: 8,
@@ -31,6 +33,8 @@ function report(taskCount: number, passed: number) {
     cost_usd: 0.01
   }));
   return {
+    agent_profile: "standard",
+    evaluation_lane: "solving",
     incomplete_reason: null,
     trial_accounting: {
       expected: taskCount, observed: taskCount, scored: taskCount, errored: 0, missing: 0,
@@ -67,12 +71,28 @@ describe("formal benchmark controller", () => {
     expect(aggregate).toMatchObject({
       status: "complete",
       acceptance: "passed",
+      agent_profile: "standard",
+      evaluation_lane: "solving",
+      lane_metrics: { verifier_reached: 3, verifier_passed: 2, verifier_pass_rate: 2 / 3 },
       trial_accounting: { expected: 3, observed: 3, missing: 0 },
       counts: { passed: 2, failed: 1 },
       failure_categories: { verifier_failed: 1 },
       usage: { input_tokens: 30, cache_tokens: 24, output_tokens: 6 },
       cost_usd: 0.03
     });
+  });
+
+  it("refuses to aggregate batches from different profiles or evaluation lanes", () => {
+    const validated = validateFormalPlan(plan(), {
+      taskCommit: "a".repeat(40), expectedTasks: 3, expectedBatches: 2, batchSize: 2
+    });
+    expect(() => aggregateFormalReports(validated, [
+      { batch: "001", report: report(2, 1) },
+      {
+        batch: "002",
+        report: { ...report(1, 1), agent_profile: "strict", evaluation_lane: "strict_conformance" }
+      }
+    ], 2)).toThrow(/different agent profiles/u);
   });
 
   it("runs exactly one frozen batch per invocation and writes a resumable aggregate report", async () => {

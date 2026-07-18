@@ -121,6 +121,54 @@ describe("deny-mode internal terminal approval", () => {
 });
 
 describe("sensitive external-read and handoff approval", () => {
+  it("workspace-auto permits local writes but prompts for authority expansion", async () => {
+    const emit = vi.fn(async () => ({}));
+    const coordinator = new ToolApprovalCoordinator({
+      runtime: { permissionMode: "workspace-auto", interactiveApprovals: true } as never,
+      emit: emit as never,
+      finish: vi.fn() as never
+    });
+    const session = runtimeSessionFixture();
+    const localWrite = {
+      call,
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      descriptor: descriptor(["filesystem.write"]),
+      plan: plan(["filesystem.write"])
+    };
+    await expect(coordinator.decision(
+      session, localWrite, new AbortController().signal
+    )).resolves.toBe("allow");
+    expect(emit).not.toHaveBeenCalled();
+
+    for (const [effect, network] of [
+      ["filesystem.read.external", "none"],
+      ["repository.write", "none"],
+      ["destructive", "none"],
+      ["checkpoint.restore", "none"],
+      ["process.handoff", "none"],
+      ["network", "full"]
+    ] as const) {
+      const sensitivePlan = plan([effect], network);
+      const pending = coordinator.decision(session, {
+        call,
+        modelTurn: { turnId: 1, effectRevision: 1 },
+        descriptor: descriptor([effect]),
+        plan: sensitivePlan
+      }, new AbortController().signal);
+      await vi.waitFor(() => expect(session.interaction.approvals.has(call.id)).toBe(true));
+      const waiter = session.interaction.approvals.get(call.id)!;
+      session.interaction.approvals.delete(call.id);
+      waiter.resolve("deny");
+      await expect(pending).resolves.toBe("deny");
+    }
+    expect(emit).toHaveBeenCalledWith(
+      session,
+      "tool.approval_requested",
+      "runtime",
+      expect.objectContaining({ approvalMode: "human" })
+    );
+  });
+
   it.each([
     ["external read", "filesystem.read.external", "externalReadApproved"],
     ["process handoff", "process.handoff", "processHandoffApproved"]
@@ -151,7 +199,7 @@ describe("sensitive external-read and handoff approval", () => {
       networkApproved: false,
       externalReadApproved: effect === "filesystem.read.external",
       processHandoffApproved: effect === "process.handoff",
-      unsafeHostExecApproved: false
+      openWorldApproved: false
     });
     session.interaction.approvals.delete(call.id);
     waiter.resolve("allow");

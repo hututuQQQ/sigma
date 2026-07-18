@@ -55,7 +55,7 @@ function request(callId: string, name: string, args: JsonValue): ToolRequest {
 }
 
 describe("context, platform, and repository tool capabilities", () => {
-  it("accepts only the V4 runtime-owned completion shape", () => {
+  it("accepts only the V5 runtime-owned completion shape", () => {
     expect(parseCompletionProposal({
       summary: "bypass",
       criteria: [{
@@ -106,7 +106,7 @@ describe("context, platform, and repository tool capabilities", () => {
 
   it("keeps completion, blocked-report, and user-input terminal capabilities orthogonal", async () => {
     const tools = registerCompletionTool(new EffectToolRegistry());
-    const completion = tools.descriptor("complete_task")!;
+    const completion = tools.descriptor("runtime_finalize")!;
     const input = tools.descriptor("request_user_input")!;
     const blocked = tools.descriptor("report_blocked")!;
     expect(completion.inputSchema).toMatchObject({
@@ -136,7 +136,7 @@ describe("context, platform, and repository tool capabilities", () => {
     });
     const completed = await tools.execute(request(
       "complete",
-      "complete_task",
+      "runtime_finalize",
       { summary: "done", warnings: ["advisory review was unavailable"] }
     ), context("."));
     expect(completed).toMatchObject({
@@ -209,14 +209,15 @@ describe("context, platform, and repository tool capabilities", () => {
       ],
       tools: [{ name: "read", description: "read", inputSchema: { type: "object" } }],
       contextWindowTokens: 200,
-      outputReserveTokens: 20
+      outputReserveTokens: 20,
+      promptCache: false
     });
     expect(planned.messages.at(-1)?.content).toBe("new");
     expect(planned.budget.toolTokens).toBeGreaterThan(0);
     const withoutReasoning = planContext({
       system: [], dynamic: [],
       history: [{ role: "user", content: "question" }, { role: "assistant", content: "answer" }],
-      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: false
     });
     const withReasoning = planContext({
       system: [], dynamic: [],
@@ -224,13 +225,28 @@ describe("context, platform, and repository tool capabilities", () => {
         { role: "user", content: "question" },
         { role: "assistant", content: "answer", reasoningContent: "reasoning ".repeat(20) }
       ],
-      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: false
     });
     expect(withReasoning.budget.historyTokens).toBe(withoutReasoning.budget.historyTokens);
     expect(withReasoning.messages.at(-1)?.reasoningContent).toBeUndefined();
+    const toolReasoning = planContext({
+      system: [], dynamic: [],
+      history: [
+        { role: "user", content: "question" },
+        {
+          role: "assistant", content: "", reasoningContent: "required reasoning ".repeat(20),
+          toolCalls: [{ id: "read-1", name: "read", arguments: { path: "file.txt" } }]
+        },
+        { role: "tool", content: "contents", toolCallId: "read-1" }
+      ],
+      tools: [], contextWindowTokens: 1_000, outputReserveTokens: 0, promptCache: true
+    });
+    const replayedCall = toolReasoning.messages.find((message) => message.toolCalls?.[0]?.id === "read-1");
+    expect(replayedCall?.reasoningContent).toContain("required reasoning");
+    expect(toolReasoning.budget.historyTokens).toBeGreaterThan(withoutReasoning.budget.historyTokens);
     expect(() => planContext({
       system: [], dynamic: [], history: [{ role: "user", content: "x".repeat(1_000) }], tools: [],
-      contextWindowTokens: 10, outputReserveTokens: 0
+      contextWindowTokens: 10, outputReserveTokens: 0, promptCache: false
     })).toThrow("newest user turn");
 
     const authorities = planContext({
@@ -239,7 +255,8 @@ describe("context, platform, and repository tool capabilities", () => {
         { id: "project", authority: "project", provenance: "AGENTS.md", content: "instructions", tokenCount: 2, priority: 9 }
       ],
       dynamic: [{ id: "diff", authority: "tool", provenance: "repository diff", content: "untrusted", tokenCount: 2, priority: 8 }],
-      history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 100, outputReserveTokens: 0
+      history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 100, outputReserveTokens: 0,
+      promptCache: false
     });
     expect(authorities.messages.map((message) => message.role)).toEqual(["system", "developer", "user", "user"]);
     const compacted = planContext({
@@ -248,13 +265,14 @@ describe("context, platform, and repository tool capabilities", () => {
         role: index % 2 === 0 ? "user" as const : "assistant" as const,
         content: `${index}: ${"history ".repeat(20)}`
       })),
-      tools: [], contextWindowTokens: 160, outputReserveTokens: 20
+      tools: [], contextWindowTokens: 160, outputReserveTokens: 20, promptCache: false
     });
     expect(compacted.omittedHistoryTurns).toBeGreaterThan(0);
     expect(compacted.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
     expect(() => planContext({
       system: [{ id: "required", authority: "system", provenance: "required", content: "required", tokenCount: 90, priority: 1 }],
-      dynamic: [], history: [{ role: "user", content: "request" }], tools: [], contextWindowTokens: 95, outputReserveTokens: 0
+      dynamic: [], history: [{ role: "user", content: "request" }], tools: [],
+      contextWindowTokens: 95, outputReserveTokens: 0, promptCache: false
     })).toThrow("Mandatory context and the newest user turn");
 
     const cache = new VersionedContextCache<number>();
@@ -292,7 +310,8 @@ describe("context, platform, and repository tool capabilities", () => {
       repositoryStatistics: repositoryStatisticsJson,
       repositoryTextSearch: repositoryTextSearchJsonLines
     });
-    expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["complete_task", "request_user_input"]));
+    expect(tools.descriptors().map((item) => item.name)).toEqual(expect.arrayContaining(["runtime_finalize", "request_user_input"]));
+    expect(tools.modelDescriptors().map((item) => item.name)).not.toContain("runtime_finalize");
     expect(tools.descriptor("exec")).toMatchObject({ timeoutMs: 750_000 });
     expect(tools.descriptor("exec")?.idleTimeoutMs).toBeUndefined();
     const supervisor: SupervisorPort = {
@@ -378,7 +397,7 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(validation).toMatchObject({ ok: true, observedEffects: validationPlan.exactEffects });
     expect(validation.output).toBe("validated");
     expect(validationPlan).toMatchObject({
-      exactEffects: ["process.spawn.readonly", "validation", "network"],
+      exactEffects: ["process.spawn.readonly", "validation"],
       writePaths: [],
       checkpointScope: []
     });
@@ -388,9 +407,22 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(scopedProcessPlan).toMatchObject({
-      exactEffects: ["process.spawn", "filesystem.write", "network"],
+      exactEffects: ["process.spawn", "filesystem.write"],
       writePaths: ["src"],
-      checkpointScope: ["src"]
+      checkpointScope: ["src"],
+      executionIntent: {
+        access: "write",
+        expectedChanges: ["src"],
+        network: "none",
+        purpose: "probe"
+      },
+      executionCapability: {
+        profileId: "node-typescript",
+        workspaceReadRoots: ["."],
+        dependencyRoots: ["node_modules"],
+        writeRoots: ["src"],
+        backend: "native"
+      }
     });
     const ptyPlan = await tools.prepare!(request("pty-process", "process_spawn", {
       executable: process.execPath, pty: true
@@ -398,14 +430,27 @@ describe("context, platform, and repository tool capabilities", () => {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
     });
     expect(ptyPlan).toMatchObject({ processMode: "pty", writePaths: [], checkpointScope: [] });
-    const unsafeTools = registerBuiltinTools(new EffectToolRegistry(), {
-      broker: execution, sandboxMode: "unsafe"
-    });
-    await expect(unsafeTools.prepare!(request("unsafe-background", "process_spawn", {
-      executable: process.execPath
+    const pnpmExecutable = path.join(workspace, "bin", process.platform === "win32" ? "pnpm.cmd" : "pnpm");
+    const packageTestPlan = await tools.prepare!(request("package-test", "validate", {
+      executable: pnpmExecutable, args: ["test"]
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "change"
-    })).rejects.toMatchObject({ code: "policy_denied" });
+    });
+    expect(packageTestPlan).toMatchObject({
+      network: "none",
+      executionIntent: {
+        invocation: { executable: pnpmExecutable, args: ["test"], cwd: "." },
+        access: "readonly",
+        network: "none",
+        purpose: "test"
+      },
+      executionCapability: {
+        profileId: "node-typescript",
+        workspaceReadRoots: ["."],
+        dependencyRoots: ["node_modules"],
+        network: "none"
+      }
+    });
     await expect(tools.execute(request("missing", "missing", {}), context(workspace))).rejects.toThrow("Unknown tool");
     expect(isToolAllowed(tools.descriptor("write")!, "analyze")).toBe(false);
     expect(isToolAllowed(tools.descriptor("validate")!, "analyze")).toBe(true);
@@ -414,7 +459,7 @@ describe("context, platform, and repository tool capabilities", () => {
     }), {
       sessionId: "session", runId: "run", workspacePath: workspace, runMode: "analyze"
     });
-    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation", "network"]);
+    expect(analyzeValidationPlan.exactEffects).toEqual(["process.spawn.readonly", "validation"]);
     expect(analyzeValidationPlan.writePaths).toEqual([]);
     expect(isToolAllowed(tools.descriptor("read")!, "analyze")).toBe(true);
     expect(isToolAllowed({ ...tools.descriptor("read")!, approval: "deny" }, "change")).toBe(false);

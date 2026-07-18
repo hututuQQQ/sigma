@@ -34,6 +34,12 @@ struct HelloParams {
     redaction_secrets: Vec<RedactionSecret>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SandboxWorkspaceParams {
+    workspace_path: std::path::PathBuf,
+}
+
 fn decode<T: DeserializeOwned>(value: Value, label: &str) -> Result<T, RpcError> {
     serde_json::from_value(value).map_err(|error| {
         RpcError::new("broker_protocol_error", format!("invalid {label}: {error}"))
@@ -55,6 +61,15 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
         }
         "doctor" => Ok(sandbox::doctor_report()),
         "sandbox.setup" => sandbox::setup_sandbox(),
+        "sandbox.repair" => sandbox::repair_sandbox(),
+        "sandbox.status" => {
+            let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox status params")?;
+            sandbox::sandbox_lease_status(&params.workspace_path)
+        }
+        "sandbox.revoke" => {
+            let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox revoke params")?;
+            sandbox::revoke_sandbox(&params.workspace_path)
+        }
         "exec" => state.execute(
             request.request_id,
             decode::<ProcessParams>(request.params, "exec params")?,
@@ -254,10 +269,9 @@ fn main() {
     if let Some(code) = try_run_mcp_readonly_probe() {
         std::process::exit(code);
     }
-    let allow_unsafe = std::env::args()
-        .skip(1)
-        .any(|argument| argument == "--allow-unsafe-host-exec");
-    let state = Arc::new(BrokerState::new(instance_id(), allow_unsafe));
+    // V5 has no host-execution escape hatch. Unsafe policy requests remain
+    // fail-closed in the lower layer, and no command-line switch can enable them.
+    let state = Arc::new(BrokerState::new(instance_id(), false));
     let writer: SharedWriter = Arc::new(Mutex::new(Box::new(io::stdout())));
     let mut stdin = io::stdin().lock();
     loop {

@@ -1,6 +1,4 @@
-import {
-  attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError
-} from "./errors.js";
+import { attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError } from "./errors.js";
 import {
   awaitWithSignal, cancellationError, errorIdentity, lifecycleFailure,
   preserveConnectionFailure, retireTerminalGenerationError
@@ -8,10 +6,13 @@ import {
 import { defaultBrokerClientFactory } from "./lazy-execution-broker-runtime.js";
 import { LazyExecutionHandleRegistry, type LazyProcessHandleOwner } from "./lazy-execution-handles.js";
 import type {
-  BrokerDoctorReport, BrokerRequestOptions, ExecutionBroker, ExecutionRequest, ExecutionResult,
-  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  TrustedToolchainManifestEntry
+  BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
+  ExecutionBroker, ExecutionRequest, ExecutionResult,
+  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest
 } from "./types.js";
+import type {
+  BrokerGeneration, ConnectedGeneration, GenerationResult, LazyExecutionBrokerOptions
+} from "./lazy-execution-broker-types.js";
 export {
   defaultSigmaExecPath,
   runtimeNodeBinding,
@@ -20,33 +21,7 @@ export {
   type RuntimeNodeBinding
 } from "./lazy-execution-broker-runtime.js";
 
-export interface LazyExecutionBrokerOptions {
-  sandboxMode: "required" | "unsafe";
-  allowUnsafeHostExec: boolean;
-  helperPath?: string;
-  env?: NodeJS.ProcessEnv;
-  trustedToolchains?: TrustedToolchainManifestEntry[];
-  clientFactory?: () => ExecutionBroker;
-}
-
-interface BrokerGeneration {
-  readonly id: number;
-  readonly client: ExecutionBroker;
-  connecting?: Promise<BrokerDoctorReport>;
-  failure?: Error;
-  retiring?: boolean;
-  retired?: boolean;
-}
-
-interface ConnectedGeneration {
-  readonly generation: BrokerGeneration;
-  readonly report: BrokerDoctorReport;
-}
-
-interface GenerationResult<T> {
-  readonly generation: BrokerGeneration;
-  readonly value: T;
-}
+export type { LazyExecutionBrokerOptions } from "./lazy-execution-broker-types.js";
 
 /**
  * Owns replaceable broker generations. A connection failure retires only the
@@ -82,9 +57,32 @@ export class LazyExecutionBroker implements ExecutionBroker {
   }
 
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+    return await this.initializeGeneration(this.generation, async (client) =>
+      client.setupSandbox ? await client.setupSandbox() : await client.connect(), signal);
+  }
+
+  async repairSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+    return await this.initializeGeneration(this.generation, async (client) =>
+      client.repairSandbox
+        ? await client.repairSandbox()
+        : client.setupSandbox ? await client.setupSandbox() : await client.connect(), signal);
+  }
+
+  async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
     return (await this.invokeFresh(async (client) => {
-      if (!client.setupSandbox) return await client.doctor(signal);
-      return await client.setupSandbox(signal);
+      if (!client.sandboxLeaseStatus) throw Object.assign(new Error("Sandbox lease status is unavailable."), {
+        code: "sandbox_recovery_required"
+      });
+      return await client.sandboxLeaseStatus(workspacePath, signal);
+    }, signal)).value;
+  }
+
+  async revokeSandboxLease(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult> {
+    return (await this.invokeFresh(async (client) => {
+      if (!client.revokeSandboxLease) throw Object.assign(new Error("Sandbox lease revoke is unavailable."), {
+        code: "sandbox_recovery_required"
+      });
+      return await client.revokeSandboxLease(workspacePath, signal);
     }, signal)).value;
   }
 
@@ -211,8 +209,14 @@ export class LazyExecutionBroker implements ExecutionBroker {
     return { id: ++this.generationSequence, client };
   }
 
-  private async connectGeneration(
+  private async connectGeneration(generation: BrokerGeneration, signal?: AbortSignal):
+  Promise<BrokerDoctorReport> {
+    return await this.initializeGeneration(generation, async (client) => await client.connect(), signal);
+  }
+
+  private async initializeGeneration(
     generation: BrokerGeneration,
+    initialize: (client: ExecutionBroker) => Promise<BrokerDoctorReport>,
     signal?: AbortSignal
   ): Promise<BrokerDoctorReport> {
     if (this.closed) throw new BrokerConnectionError("Execution broker is closed.", { retrySafe: true });
@@ -221,7 +225,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
       throw generation.failure ?? new BrokerConnectionError("Execution broker generation is retiring.");
     }
     if (generation.failure) throw generation.failure;
-    generation.connecting ??= generation.client.connect().catch((error: unknown) => {
+    generation.connecting ??= initialize(generation.client).catch((error: unknown) => {
       generation.failure = error instanceof Error
         ? error
         : new BrokerConnectionError("sigma-exec could not be started.", {

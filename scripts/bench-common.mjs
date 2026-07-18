@@ -229,14 +229,16 @@ function asNonNegativeInt(value, fallback, name) {
 
 function networkMode(value, fallback = "none") {
   const mode = asString(value, fallback);
-  if (mode !== "none" && mode !== "full") throw new Error("network mode must be none or full.");
+  if (mode !== "none" && mode !== "loopback" && mode !== "full") {
+    throw new Error("network mode must be none, loopback, or full.");
+  }
   return mode;
 }
 
 function executionMode(value, fallback = "sandboxed") {
   const mode = asString(value, fallback);
-  if (mode !== "sandboxed" && mode !== "disposable-container") {
-    throw new Error("execution mode must be sandboxed or disposable-container.");
+  if (mode !== "sandboxed" && mode !== "container") {
+    throw new Error("execution mode must be sandboxed or container.");
   }
   return mode;
 }
@@ -329,6 +331,7 @@ export function resolveRunOptions(argv, env = process.env) {
     benchmarkClass: runClass,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
+    agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "standard"),
     networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
     executionMode: executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE),
     runLabel: asString(flags["run-label"]),
@@ -500,25 +503,36 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     harnessTimeoutSec > recommendedAgentTimeoutSec
       ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
       : null;
-  const taskAgentTimeouts = (Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [])
-    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec))
-    .filter((value) => value !== null);
+  const timeoutTasks = Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [];
+  const taskAgentTimeouts = timeoutTasks
+    .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec));
+  const knownTaskAgentTimeouts = taskAgentTimeouts.filter((value) => value !== null);
   const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
-  const minimumOuterTrialDeadlineSec = taskAgentTimeouts.length > 0
-    ? Math.min(...taskAgentTimeouts) * appliedAgentTimeoutMultiplier
+  const allTaskTimeoutsAvailable = timeoutTasks.length > 0
+    && knownTaskAgentTimeouts.length === timeoutTasks.length;
+  const uniformTaskTimeout = allTaskTimeoutsAvailable
+    && knownTaskAgentTimeouts.every((value) => value === knownTaskAgentTimeouts[0]);
+  const outerTrialDeadlineSec = uniformTaskTimeout
+    ? knownTaskAgentTimeouts[0] * appliedAgentTimeoutMultiplier
     : null;
-  const safeChildDeadlineSec = minimumOuterTrialDeadlineSec === null
+  const outerTrialDeadlineScope = uniformTaskTimeout
+    ? "uniform_task_timeout"
+    : allTaskTimeoutsAvailable && knownTaskAgentTimeouts.length > 1
+      ? "harbor_per_trial"
+      : "unavailable";
+  const safeChildDeadlineSec = outerTrialDeadlineSec === null
     ? agentWallTimeSec
-    : Math.max(1, Math.floor(minimumOuterTrialDeadlineSec - cleanupGraceSec));
+    : Math.max(1, Math.floor(outerTrialDeadlineSec - cleanupGraceSec));
   const effectiveAgentWallTimeSec = Math.min(agentWallTimeSec, safeChildDeadlineSec);
 
   return {
     requested_agent_wall_time_sec: agentWallTimeSec,
     agent_wall_time_sec: effectiveAgentWallTimeSec,
     child_deadline_sec: effectiveAgentWallTimeSec,
-    outer_trial_deadline_sec: minimumOuterTrialDeadlineSec === null
+    outer_trial_deadline_sec: outerTrialDeadlineSec === null
       ? null
-      : Math.floor(minimumOuterTrialDeadlineSec),
+      : Math.floor(outerTrialDeadlineSec),
+    outer_trial_deadline_scope: outerTrialDeadlineScope,
     deadline_cleanup_grace_sec: cleanupGraceSec,
     deadline_clamped: effectiveAgentWallTimeSec < agentWallTimeSec,
     agent_timeout_grace_sec: graceSec,
@@ -574,6 +588,7 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
   const agentKwargs = {
     agent_cli_tarball: resolveAgentCliTarballPath(options, options.env ?? process.env),
     provider: options.provider,
+    agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "none",
     execution_mode: options.executionMode ?? "sandboxed"
   };
@@ -689,6 +704,55 @@ export function parseHarborTimeoutProbe(stdout) {
   }
 }
 
+/** Partitions resolved trials by their Harbor agent timeout. Each partition
+ * can be launched with one truthful runtime deadline without exposing task
+ * identity to the solving agent. If metadata is incomplete, the original
+ * single group is retained so the caller fails conservatively. */
+export function groupHarborTimeoutProbe(timeoutProbe, configuredTasks = []) {
+  const tasks = Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [];
+  const resolved = Array.isArray(timeoutProbe?.resolved_tasks) ? timeoutProbe.resolved_tasks : [];
+  if (tasks.length === 0 || resolved.length !== tasks.length
+    || tasks.some((task) => asFinitePositiveNumber(task?.agent_timeout_sec) === null)) {
+    return [{
+      agent_timeout_sec: maxProbeNumber(timeoutProbe, "agent_timeout_sec"),
+      task_indexes: tasks.map((_task, index) => index),
+      tasks,
+      resolved_tasks: resolved,
+      configured_tasks: configuredTasks.length === tasks.length ? configuredTasks : [],
+      timeout_probe: timeoutProbe
+    }];
+  }
+  const groups = new Map();
+  for (let index = 0; index < tasks.length; index += 1) {
+    const timeout = asFinitePositiveNumber(tasks[index]?.agent_timeout_sec);
+    const group = groups.get(timeout) ?? { indexes: [], tasks: [], resolved: [], configured: [] };
+    group.indexes.push(index);
+    group.tasks.push(tasks[index]);
+    group.resolved.push(resolved[index]);
+    if (configuredTasks.length === tasks.length) group.configured.push(configuredTasks[index]);
+    groups.set(timeout, group);
+  }
+  return [...groups.entries()].sort(([left], [right]) => left - right).map(([timeout, group]) => {
+    const probe = {
+      tasks: group.tasks,
+      resolved_tasks: group.resolved,
+      max_agent_timeout_sec: timeout,
+      max_verifier_timeout_sec: Math.max(...group.tasks
+        .map((task) => asFinitePositiveNumber(task?.verifier_timeout_sec) ?? 0)),
+      max_environment_build_timeout_sec: Math.max(...group.tasks
+        .map((task) => asFinitePositiveNumber(task?.environment_build_timeout_sec) ?? 0))
+    };
+    return {
+      agent_timeout_sec: timeout,
+      task_indexes: group.indexes,
+      tasks: group.tasks,
+      resolved_tasks: group.resolved,
+      configured_tasks: group.configured,
+      timeout_probe: probe
+    };
+  });
+}
+
 export function buildHarborArgs(options) {
   const capabilities = options.capabilities ?? {};
   if (options.configPath) {
@@ -738,6 +802,7 @@ export function buildHarborArgs(options) {
 
   args.push("--ak", formatAgentKwarg("agent_cli_tarball", "str", resolveAgentCliTarballPath(options, options.env ?? process.env), capabilities));
   args.push("--ak", formatAgentKwarg("provider", "str", options.provider, capabilities));
+  args.push("--ak", formatAgentKwarg("agent_profile", "str", options.agentProfile ?? "standard", capabilities));
   if (options.networkMode !== undefined) {
     args.push("--ak", formatAgentKwarg("network_mode", "str", options.networkMode, capabilities));
   }
@@ -1183,9 +1248,20 @@ function summarizeTraceEvents(events) {
     commands_executed: 0,
     input_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    termination_source: null,
+    execution_mode: null,
+    agent_profile: null,
+    harbor_deadline_sec: null,
+    sigma_deadline_sec: null,
     last_error: null
   };
 
@@ -1195,9 +1271,19 @@ function summarizeTraceEvents(events) {
       const usage = metadata.usage ?? {};
       summary.input_tokens += Number(usage.inputTokens ?? usage.input_tokens ?? 0);
       summary.output_tokens += Number(usage.outputTokens ?? usage.output_tokens ?? 0);
+      summary.reasoning_tokens += Number(usage.reasoningTokens ?? usage.reasoning_tokens ?? 0);
       summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens ?? 0);
+      summary.cache_read_tokens += Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
       const usageCost = Number(usage.costUsd ?? usage.cost_usd);
       if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
+    }
+    if (event?.type === "model_end"
+      && (metadata.finishReason ?? metadata.finish_reason) === "length") {
+      summary.length_finish_count += 1;
+    }
+    if (event?.type === "diagnostic") {
+      const payload = metadata.payload ?? metadata;
+      if (payload.kind === "deadline.stage" && payload.stage === "converge") summary.converge_turns += 1;
     }
     if (event?.type === "tool_end" && metadata.toolName === "bash") {
       summary.commands_executed += 1;
@@ -1212,10 +1298,25 @@ function summarizeTraceEvents(events) {
       summary.commands_executed = Number(result.commandsExecuted ?? result.commands_executed ?? summary.commands_executed);
       summary.input_tokens = Number(result.usage?.inputTokens ?? result.input_tokens ?? summary.input_tokens);
       summary.output_tokens = Number(result.usage?.outputTokens ?? result.output_tokens ?? summary.output_tokens);
+      summary.reasoning_tokens = Number(
+        result.usage?.reasoningTokens ?? result.reasoning_tokens ?? summary.reasoning_tokens
+      );
       summary.cache_tokens = Number(result.usage?.cacheTokens ?? result.cache_tokens ?? summary.cache_tokens);
+      summary.cache_read_tokens = Number(
+        result.usage?.cacheReadTokens ?? result.cache_read_tokens ?? summary.cache_read_tokens
+      );
+      summary.length_finish_count = Number(result.length_finish_count ?? summary.length_finish_count);
+      summary.converge_turns = Number(result.converge_turns ?? summary.converge_turns);
       const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
       summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
+      summary.suspension_to_exit_ms = result.suspension_to_exit_ms ?? summary.suspension_to_exit_ms;
+      summary.terminal_origin = result.terminal_origin ?? summary.terminal_origin;
+      summary.termination_source = result.termination_source ?? summary.termination_source;
+      summary.execution_mode = result.execution_mode ?? summary.execution_mode;
+      summary.agent_profile = result.agent_profile ?? summary.agent_profile;
+      summary.harbor_deadline_sec = result.harbor_deadline_sec ?? summary.harbor_deadline_sec;
+      summary.sigma_deadline_sec = result.sigma_deadline_sec ?? summary.sigma_deadline_sec;
       summary.last_error = result.lastError ?? result.last_error ?? summary.last_error;
     }
   }
@@ -1385,6 +1486,18 @@ async function readHarborJobAccounting(runDir) {
 }
 
 async function resolvedJobConfigForReport(runDir, config) {
+  if (Array.isArray(config.resolved_job_config_paths) && config.resolved_job_config_paths.length > 1) {
+    const records = await Promise.all(config.resolved_job_config_paths.map(async (configured) => {
+      const filePath = path.isAbsolute(configured) ? configured : path.join(runDir, configured);
+      return existsSync(filePath) ? await readJsonSafe(filePath) : null;
+    }));
+    const available = records.filter(Boolean);
+    return {
+      n_concurrent_trials: config.n_concurrent_trials,
+      tasks: available.flatMap((record) => Array.isArray(record.tasks) ? record.tasks : []),
+      datasets: available.flatMap((record) => Array.isArray(record.datasets) ? record.datasets : [])
+    };
+  }
   const configured = typeof config.resolved_job_config_path === "string"
     ? config.resolved_job_config_path
     : "resolved-job.config.json";
@@ -1449,9 +1562,20 @@ function emptyTaskForTrial(trialResult, index) {
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    termination_source: null,
+    execution_mode: null,
+    agent_profile: null,
+    harbor_deadline_sec: null,
+    sigma_deadline_sec: null,
     last_error: null,
     trial_name: null,
     harbor_result_path: null,
@@ -1553,11 +1677,33 @@ function mergeHarborTrialResult(task, trialResult) {
     ),
     input_tokens: Number(agentResult.n_input_tokens ?? (task.input_tokens || traceSummary.input_tokens || 0)),
     cache_tokens: Number(agentResult.n_cache_tokens ?? (task.cache_tokens || traceSummary.cache_tokens || 0)),
+    cache_read_tokens: Number(
+      task.cache_read_tokens || traceSummary.cache_read_tokens || agentResult.n_cache_read_tokens
+      || 0
+    ),
     output_tokens: Number(agentResult.n_output_tokens ?? (task.output_tokens || traceSummary.output_tokens || 0)),
+    reasoning_tokens: Number(
+      task.reasoning_tokens || traceSummary.reasoning_tokens || agentResult.n_reasoning_tokens || 0
+    ),
+    length_finish_count: Number(
+      task.length_finish_count || traceSummary.length_finish_count || agentResult.length_finish_count || 0
+    ),
+    converge_turns: Number(task.converge_turns || traceSummary.converge_turns || agentResult.converge_turns || 0),
     cost_usd: Number.isFinite(Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd))
       ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
       : null,
     duration_ms: task.duration_ms || Number(traceSummary.duration_ms ?? 0),
+    suspension_to_exit_ms: task.suspension_to_exit_ms
+      ?? traceSummary.suspension_to_exit_ms ?? agentMetadata.suspension_to_exit_ms ?? null,
+    terminal_origin: task.terminal_origin ?? traceSummary.terminal_origin ?? agentMetadata.terminal_origin ?? null,
+    termination_source: task.termination_source ?? traceSummary.termination_source
+      ?? agentMetadata.termination_source ?? null,
+    execution_mode: task.execution_mode ?? traceSummary.execution_mode ?? agentMetadata.execution_mode ?? null,
+    agent_profile: task.agent_profile ?? traceSummary.agent_profile ?? agentMetadata.agent_profile ?? null,
+    harbor_deadline_sec: task.harbor_deadline_sec ?? traceSummary.harbor_deadline_sec
+      ?? agentMetadata.harbor_deadline_sec ?? null,
+    sigma_deadline_sec: task.sigma_deadline_sec ?? traceSummary.sigma_deadline_sec
+      ?? agentMetadata.sigma_deadline_sec ?? null,
     last_error: agentErrorMessage ?? task.last_error ?? traceSummary.last_error ?? null,
     verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
@@ -1728,11 +1874,22 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     commands_executed: Number(summary.commands_executed ?? metadata.commands_executed ?? 0),
     input_tokens: Number(summary.input_tokens ?? metadata.n_input_tokens ?? 0),
     cache_tokens: Number(summary.cache_tokens ?? metadata.n_cache_tokens ?? 0),
+    cache_read_tokens: Number(summary.cache_read_tokens ?? metadata.n_cache_read_tokens ?? 0),
     output_tokens: Number(summary.output_tokens ?? metadata.n_output_tokens ?? 0),
+    reasoning_tokens: Number(summary.reasoning_tokens ?? metadata.n_reasoning_tokens ?? 0),
+    length_finish_count: Number(summary.length_finish_count ?? metadata.length_finish_count ?? 0),
+    converge_turns: Number(summary.converge_turns ?? metadata.converge_turns ?? 0),
     cost_usd: Number.isFinite(Number(summary.cost_usd ?? metadata.cost_usd))
       ? Number(summary.cost_usd ?? metadata.cost_usd)
       : null,
     duration_ms: Number(summary.duration_ms ?? metadata.duration_ms ?? 0),
+    suspension_to_exit_ms: summary.suspension_to_exit_ms ?? metadata.suspension_to_exit_ms ?? null,
+    terminal_origin: summary.terminal_origin ?? metadata.terminal_origin ?? null,
+    termination_source: summary.termination_source ?? metadata.termination_source ?? null,
+    execution_mode: summary.execution_mode ?? metadata.execution_mode ?? null,
+    agent_profile: summary.agent_profile ?? metadata.agent_profile ?? null,
+    harbor_deadline_sec: summary.harbor_deadline_sec ?? metadata.harbor_deadline_sec ?? null,
+    sigma_deadline_sec: summary.sigma_deadline_sec ?? metadata.sigma_deadline_sec ?? null,
     last_error: summary.last_error ?? metadata.error_message ?? null,
     trial_name: null,
     harbor_result_path: null,
@@ -1776,9 +1933,20 @@ function syntheticRunTask(config, globalLogText) {
     commands_executed: 0,
     input_tokens: 0,
     cache_tokens: 0,
+    cache_read_tokens: 0,
     output_tokens: 0,
+    reasoning_tokens: 0,
+    length_finish_count: 0,
+    converge_turns: 0,
     cost_usd: null,
     duration_ms: 0,
+    suspension_to_exit_ms: null,
+    terminal_origin: null,
+    termination_source: null,
+    execution_mode: null,
+    agent_profile: null,
+    harbor_deadline_sec: null,
+    sigma_deadline_sec: null,
     last_error: status === "passed" ? null : "No per-task artifacts were available; inspect harbor logs.",
     trial_name: null,
     harbor_result_path: null,
@@ -1795,6 +1963,85 @@ function markdownEscape(value) {
   return String(value ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
+function normalizedTaskKey(value) {
+  const normalized = String(value ?? "").replaceAll("\\", "/").replace(/\/+$/u, "");
+  return normalized.split("/").at(-1) ?? normalized;
+}
+
+function deadlineFieldsForTask(task, config) {
+  const key = normalizedTaskKey(task.task_id);
+  const timeoutRecord = (Array.isArray(config.timeout_probe?.tasks) ? config.timeout_probe.tasks : [])
+    .find((item) => normalizedTaskKey(item?.task_name ?? item?.task_path) === key);
+  const timeoutGroup = (Array.isArray(config.timeout_groups) ? config.timeout_groups : [])
+    .find((group) => Array.isArray(group?.task_names)
+      && group.task_names.some((name) => normalizedTaskKey(name) === key));
+  const harborDeadline = Number(timeoutRecord?.agent_timeout_sec);
+  const sigmaDeadline = Number(timeoutGroup?.timeout_plan?.agent_wall_time_sec
+    ?? (config.timeout_plan?.outer_trial_deadline_scope === "uniform_task_timeout"
+      ? config.timeout_plan?.agent_wall_time_sec : NaN));
+  return {
+    harbor_deadline_sec: task.harbor_deadline_sec
+      ?? (Number.isFinite(harborDeadline) ? harborDeadline : null),
+    sigma_deadline_sec: task.sigma_deadline_sec
+      ?? (Number.isFinite(sigmaDeadline) ? sigmaDeadline : null),
+    termination_source: task.termination_source ?? task.terminal_origin
+      ?? (task.verifier_status ? "harbor_verifier" : null)
+  };
+}
+
+function reportProfile(report) {
+  if (typeof report?.agent_profile === "string" && report.agent_profile) return report.agent_profile;
+  const profiles = [...new Set((Array.isArray(report?.tasks) ? report.tasks : [])
+    .map((task) => task?.agent_profile).filter(Boolean))];
+  return profiles.length === 1 ? profiles[0] : null;
+}
+
+/** Comparison consumers must never combine solving and conformance lanes. */
+export function assertComparableBenchmarkReports(...reports) {
+  const profiles = [...new Set(reports.map(reportProfile).filter(Boolean))];
+  if (profiles.length > 1) {
+    throw Object.assign(new Error(
+      `Benchmark reports use different agent profiles (${profiles.join(", ")}) and cannot be combined.`
+    ), { code: "benchmark_profile_mismatch" });
+  }
+  const lanes = [...new Set(reports.map((report) => report?.evaluation_lane).filter(Boolean))];
+  if (lanes.length > 1) {
+    throw Object.assign(new Error(
+      `Benchmark reports use different evaluation lanes (${lanes.join(", ")}) and cannot be combined.`
+    ), { code: "benchmark_lane_mismatch" });
+  }
+}
+
+function taskHasSignal(task, pattern) {
+  return pattern.test(JSON.stringify({
+    category: task.failure_category,
+    signals: task.failure_signals,
+    error: task.last_error
+  }));
+}
+
+export function laneMetrics(tasks, evaluationLane) {
+  const valid = tasks.filter((task) => task.validity === "valid");
+  const verifierReached = valid.filter((task) => task.verifier_outcome === "passed"
+    || task.verifier_outcome === "failed");
+  const verifierPassed = verifierReached.filter((task) => task.verifier_outcome === "passed").length;
+  if (evaluationLane !== "strict_conformance") {
+    return {
+      verifier_reached: verifierReached.length,
+      verifier_passed: verifierPassed,
+      verifier_pass_rate: verifierReached.length > 0 ? verifierPassed / verifierReached.length : null
+    };
+  }
+  return {
+    review_blocked: valid.filter((task) => taskHasSignal(task, /review_evidence|required review|strict review/iu)).length,
+    validation_blocked: valid.filter((task) => taskHasSignal(task, /validation_evidence|validation_failed|semantic validation/iu)).length,
+    deadline_blocked: valid.filter((task) => task.failure_category === "timeout"
+      || taskHasSignal(task, /max_wall_time|deadline|timed out/iu)).length,
+    budget_blocked: valid.filter((task) => taskHasSignal(task, /budget_exhausted|budget.*remain/iu)).length,
+    total: valid.length
+  };
+}
+
 export function formatMarkdownReport(report) {
   const lines = [
     `# Terminal-Bench Run ${report.run_id}`,
@@ -1805,6 +2052,8 @@ export function formatMarkdownReport(report) {
     `- Provider: ${report.provider}`,
     `- Model: ${report.model ?? "default"}`,
     `- Dataset: ${report.dataset}`,
+    `- Agent profile: ${report.agent_profile ?? "unknown"}`,
+    `- Evaluation lane: ${report.evaluation_lane ?? "unknown"}`,
     `- Score mode: ${report.score_mode ?? "standard_benchmark"}`,
     `- Started: ${report.started_at ?? "unknown"}`,
     `- Finished: ${report.finished_at ?? "unknown"}`,
@@ -1824,8 +2073,14 @@ export function formatMarkdownReport(report) {
     `- Mean reward: ${report.trial_accounting?.meanReward ?? "unknown"}`,
     `- Input tokens: ${report.usage?.input_tokens ?? 0}`,
     `- Cache tokens: ${report.usage?.cache_tokens ?? 0}`,
+    `- Cache read ratio: ${report.cache_read_ratio ?? "unknown"}`,
     `- Output tokens: ${report.usage?.output_tokens ?? 0}`,
+    `- Reasoning tokens: ${report.reasoning_tokens ?? report.usage?.reasoning_tokens ?? 0}`,
+    `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
+    `- Length finishes: ${report.length_finish_count ?? 0}`,
+    `- Converge turns: ${report.converge_turns ?? 0}`,
     `- Cost USD: ${report.cost_usd ?? 0}`,
+    `- Lane metrics: ${markdownEscape(JSON.stringify(report.lane_metrics ?? {}))}`,
     "",
     "## Timeout Plan",
     "",
@@ -1834,6 +2089,7 @@ export function formatMarkdownReport(report) {
     `- Agent wall time sec: ${report.timeout_plan?.agent_wall_time_sec ?? "unknown"}`,
     `- Harness timeout sec: ${report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
     `- Effective harness timeout sec: ${report.timeout_plan?.effective_harness_timeout_sec ?? report.timeout_plan?.harness_timeout_sec ?? "unknown"}`,
+    `- Outer trial deadline scope: ${report.timeout_plan?.outer_trial_deadline_scope ?? "unavailable"}`,
     `- Agent timeout multiplier: ${report.timeout_plan?.agent_timeout_multiplier ?? "none"}`,
     "",
     "## Counts",
@@ -1844,8 +2100,8 @@ export function formatMarkdownReport(report) {
     "",
     "## Tasks",
     "",
-    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | last_error |",
-    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| task | status | failure_category | suggested_owner | warnings | verifier_status | failure_signals | commands | input_tokens | cache_tokens | output_tokens | cost_usd | duration_ms | harbor_deadline_sec | sigma_deadline_sec | termination_source | execution_mode | agent_profile | last_error |",
+    "| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
   ];
 
   for (const task of report.tasks) {
@@ -1853,7 +2109,7 @@ export function formatMarkdownReport(report) {
     const suggestedOwner = task.suggested_owner ?? suggestedOwnerForTask(task.status, task.failure_category, task.failure_signals) ?? "";
     const warningCount = Array.isArray(task.infra_warnings) ? task.infra_warnings.length : 0;
     lines.push(
-      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${markdownEscape(task.last_error ?? "")} |`
+      `| ${markdownEscape(task.task_id)} | ${task.status} | ${task.failure_category ?? ""} | ${markdownEscape(suggestedOwner)} | ${warningCount} | ${task.verifier_status ?? ""} | ${markdownEscape(failureSignals)} | ${task.commands_executed} | ${task.input_tokens} | ${task.cache_tokens ?? 0} | ${task.output_tokens} | ${task.cost_usd ?? ""} | ${task.duration_ms} | ${task.harbor_deadline_sec ?? ""} | ${task.sigma_deadline_sec ?? ""} | ${task.termination_source ?? ""} | ${task.execution_mode ?? ""} | ${task.agent_profile ?? ""} | ${markdownEscape(task.last_error ?? "")} |`
     );
   }
 
@@ -1992,8 +2248,14 @@ export async function generateBenchReport(runDir) {
     verifier_outcome: task.verifier_outcome ?? (task.verifier_status ?? "not_run"),
     validity: task.validity ?? "valid",
     verifier_infrastructure_evidence: task.verifier_infrastructure_evidence ?? [],
-    ...task
+    ...task,
+    agent_profile: task.agent_profile ?? config.agent_profile ?? null,
+    ...deadlineFieldsForTask(task, config)
   }));
+  const taskProfiles = [...new Set(tasks.map((task) => task.agent_profile).filter(Boolean))];
+  if (taskProfiles.length > 1) {
+    incompleteReason.push(`Benchmark report contains mixed agent profiles: ${taskProfiles.join(", ")}.`);
+  }
 
   const counts = Object.fromEntries(COUNT_KEYS.map((key) => [key, 0]));
   for (const task of tasks) {
@@ -2035,8 +2297,16 @@ export async function generateBenchReport(runDir) {
   const usage = tasks.reduce((total, task) => ({
     input_tokens: total.input_tokens + Number(task.input_tokens ?? 0),
     cache_tokens: total.cache_tokens + Number(task.cache_tokens ?? 0),
-    output_tokens: total.output_tokens + Number(task.output_tokens ?? 0)
-  }), { input_tokens: 0, cache_tokens: 0, output_tokens: 0 });
+    cache_read_tokens: total.cache_read_tokens + Number(task.cache_read_tokens ?? 0),
+    output_tokens: total.output_tokens + Number(task.output_tokens ?? 0),
+    reasoning_tokens: total.reasoning_tokens + Number(task.reasoning_tokens ?? 0)
+  }), { input_tokens: 0, cache_tokens: 0, cache_read_tokens: 0, output_tokens: 0, reasoning_tokens: 0 });
+  const cacheReadRatio = usage.input_tokens > 0 ? usage.cache_read_tokens / usage.input_tokens : null;
+  const reasoningOutputRatio = usage.output_tokens > 0 ? usage.reasoning_tokens / usage.output_tokens : null;
+  const lengthFinishCount = tasks.reduce(
+    (total, task) => total + Number(task.length_finish_count ?? 0), 0
+  );
+  const convergeTurns = tasks.reduce((total, task) => total + Number(task.converge_turns ?? 0), 0);
   const costUsd = tasks.reduce((total, task) => {
     const value = Number(task.cost_usd);
     return total + (Number.isFinite(value) ? value : 0);
@@ -2048,6 +2318,10 @@ export async function generateBenchReport(runDir) {
     provider: config.provider ?? "unknown",
     model: config.model ?? null,
     dataset: config.dataset ?? terminalBenchDataset,
+    agent_profile: taskProfiles.length === 1 ? taskProfiles[0] : config.agent_profile ?? null,
+    evaluation_lane: config.evaluation_lane
+      ?? ((taskProfiles.length === 1 ? taskProfiles[0] : config.agent_profile) === "strict"
+        ? "strict_conformance" : "solving"),
     k: config.k ?? null,
     command: config.command_text ?? commandScript.trim(),
     harbor_command: config.harbor_command ?? config.command?.[0] ?? null,
@@ -2070,6 +2344,11 @@ export async function generateBenchReport(runDir) {
     harbor_job_accounting: harborJobAccounting,
     orphan_artifacts: orphanArtifacts,
     usage,
+    reasoning_tokens: usage.reasoning_tokens,
+    cache_read_ratio: cacheReadRatio,
+    reasoning_output_ratio: reasoningOutputRatio,
+    length_finish_count: lengthFinishCount,
+    converge_turns: convergeTurns,
     cost_usd: costUsd,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
     exit_code: exitCode,
@@ -2089,6 +2368,7 @@ export async function generateBenchReport(runDir) {
     tasks,
     notes
   };
+  report.lane_metrics = laneMetrics(tasks, report.evaluation_lane);
 
   await writeText(path.join(runDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
   await writeText(path.join(runDir, "report.md"), formatMarkdownReport(report));

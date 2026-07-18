@@ -240,7 +240,7 @@ describe("typed workspace mutation contracts", () => {
     });
   });
 
-  it("limits every process tool to its approved cwd and explicit read roots", async () => {
+  it("grants every process tool the workspace lease without exposing readRoots", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-scope-"));
     await mkdir(path.join(workspace, "work"));
     await mkdir(path.join(workspace, "inputs"));
@@ -251,30 +251,30 @@ describe("typed workspace mutation contracts", () => {
     });
     const calls = [
       request("read-exec", "exec", {
-        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+        executable: process.execPath, cwd: "work"
       }),
       request("read-shell", "shell", {
-        shell: "powershell", command: "Get-Location", cwd: "work", readRoots: ["inputs"]
+        shell: "powershell", command: "Get-Location", cwd: "work"
       }),
       request("read-validate", "validate", {
-        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+        executable: process.execPath, cwd: "work"
       }),
       request("read-spawn", "process_spawn", {
-        executable: process.execPath, cwd: "work", readRoots: ["inputs"]
+        executable: process.execPath, cwd: "work"
       })
     ];
 
     for (const call of calls) {
       await expect(tools.prepare(call, preparation(workspace))).resolves.toMatchObject({
-        readPaths: ["work", "inputs"]
+        readPaths: ["."]
       });
       await expect(tools.execute(call, execution(workspace))).resolves.toMatchObject({ ok: true });
     }
-    const expected = [path.join(workspace, "work"), path.join(workspace, "inputs")];
+    const expected = [workspace];
     expect(fixture.executions).toHaveLength(3);
     for (const item of fixture.executions) {
       expect(item.policy.readRoots).toEqual(expected);
-      expect(item.policy.readRoots).not.toContain(workspace);
+      expect(item.command.cwd).toBe(path.join(workspace, "work"));
       expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
       expect(item.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     }
@@ -283,15 +283,13 @@ describe("typed workspace mutation contracts", () => {
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".git"));
     expect(fixture.spawns[0]?.policy.protectedPaths).not.toContain(path.join(workspace, ".agent"));
     for (const name of ["exec", "shell", "validate", "process_spawn"]) {
-      expect(tools.descriptor(name)?.inputSchema).toMatchObject({
-        properties: { readRoots: { type: "array", minItems: 1, uniqueItems: true } }
-      });
+      const properties = tools.descriptor(name)?.inputSchema.properties as Record<string, unknown>;
+      expect(properties).not.toHaveProperty("readRoots");
     }
   });
 
-  it("mounts only approved stable external read roots and requires an external-read grant", async () => {
+  it("rejects model-supplied external read roots before capability planning", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-workspace-"));
-    const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-external-input-"));
     const fixture = brokerFixture();
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       broker: fixture.broker,
@@ -300,32 +298,14 @@ describe("typed workspace mutation contracts", () => {
     });
     const call = request("external-read-exec", "exec", {
       executable: process.execPath,
-      readRoots: [external]
+      readRoots: [path.dirname(workspace)]
     });
-    const plan = await tools.prepare(call, preparation(workspace));
-
-    expect(plan).toMatchObject({
-      exactEffects: ["process.spawn.readonly", "filesystem.read", "filesystem.read.external"],
-      readPaths: [".", external]
-    });
-    await expect(tools.execute(call, { ...execution(workspace), callPlan: plan }))
-      .rejects.toMatchObject({ code: "policy_denied" });
-
-    const approved = request("external-read-approved", "exec", {
-      executable: process.execPath,
-      readRoots: [external]
-    });
-    const approvedPlan = await tools.prepare(approved, preparation(workspace));
-    await expect(tools.execute(approved, {
-      ...execution(workspace),
-      callPlan: approvedPlan,
-      approval: { externalReadApproved: true }
-    })).resolves.toMatchObject({ ok: true });
-    expect(fixture.executions).toHaveLength(1);
-    expect(fixture.executions[0]?.policy.readRoots).toEqual([workspace, external]);
+    await expect(tools.prepare(call, preparation(workspace)))
+      .rejects.toMatchObject({ code: "tool_arguments_invalid" });
+    expect(fixture.executions).toHaveLength(0);
   });
 
-  it("rejects linked ancestors in external process read roots", async () => {
+  it("rejects linked cwd ancestors even though cwd is not a read grant", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-workspace-"));
     const external = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-input-"));
     const parent = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-link-parent-"));
@@ -338,18 +318,18 @@ describe("typed workspace mutation contracts", () => {
     const exec = executionTools({
       broker: brokerFixture().broker,
       sandboxMode: "required",
-      readScope: "host",
+      readScope: "workspace",
       processHandoff: "deny",
       networkMode: "none"
     }).find((tool) => tool.descriptor.name === "exec")!;
 
     await expect(exec.descriptor.prepare!({
       executable: process.execPath,
-      readRoots: [linked]
+      cwd: linked
     }, preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
   });
 
-  it("rejects escaping or unstable read roots and binds approved read paths into the plan signature", async () => {
+  it("rejects escaping or unstable cwd and binds the workspace lease into the plan signature", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-guards-"));
     const approvedRoot = path.join(workspace, "approved");
     const replacement = path.join(workspace, "replacement");
@@ -361,10 +341,10 @@ describe("typed workspace mutation contracts", () => {
       broker: fixture.broker, sandboxMode: "required", networkMode: "none"
     }).find((tool) => tool.descriptor.name === "exec")!;
 
-    for (const readRoot of ["../outside", "missing", "file.txt"]) {
+    for (const cwd of ["../outside", "missing", "file.txt"]) {
       await expect(exec.descriptor.prepare!({
         executable: process.execPath,
-        readRoots: [readRoot]
+        cwd
       }, preparation(workspace))).rejects.toMatchObject({ code: "policy_denied" });
     }
 
@@ -372,7 +352,7 @@ describe("typed workspace mutation contracts", () => {
     const approvedPlan = await exec.descriptor.prepare!(originalInput, preparation(workspace));
     await expect(exec.execute(request("forged-read-plan", "exec", originalInput), {
       ...execution(workspace),
-      callPlan: { ...approvedPlan, readPaths: ["."] }
+      callPlan: { ...approvedPlan, readPaths: ["approved"] }
     })).rejects.toMatchObject({ code: "write_plan_stale" });
 
     await rename(approvedRoot, path.join(workspace, "approved-original"));
@@ -520,7 +500,7 @@ describe("typed workspace mutation contracts", () => {
   );
 
   it.skipIf(process.platform !== "win32")(
-    "pins approved Windows read roots through foreground and background dispatch",
+    "passes one workspace lease through foreground and background dispatch",
     async () => {
       const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-read-pin-"));
       const foreground = path.join(workspace, "foreground");
@@ -554,13 +534,9 @@ describe("typed workspace mutation contracts", () => {
         .resolves.toMatchObject({ ok: true });
       await expect(tools.execute(backgroundCall, execution(workspace)))
         .resolves.toMatchObject({ ok: true });
-      expect(renameFailures).toHaveLength(2);
-      expect(renameFailures).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u),
-        expect.stringMatching(/^(?:EACCES|EBUSY|EPERM)$/u)
-      ]));
-      await expect(rename(foreground, `${foreground}-moved`)).resolves.toBeUndefined();
-      await expect(rename(background, `${background}-moved`)).resolves.toBeUndefined();
+      expect(renameFailures).toHaveLength(0);
+      expect(fixture.executions[0]?.policy.readRoots).toEqual([workspace]);
+      expect(fixture.spawns[0]?.policy.readRoots).toEqual([workspace]);
     }
   );
 

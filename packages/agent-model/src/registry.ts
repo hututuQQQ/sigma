@@ -1,7 +1,9 @@
-import type { ModelGateway } from "agent-protocol";
+import type { ModelCapabilities, ModelGateway } from "agent-protocol";
 import { OpenAIModelGateway } from "./openai-gateway.js";
 import type { OpenAIWireProfile } from "./openai-wire.js";
 import { builtinModelSpec, type ModelSpec } from "./catalog.js";
+import { classifyModelFailure } from "./failure-policy.js";
+import type { ProviderSpiV1 } from "./provider-spi.js";
 
 export type SupportedProvider = "deepseek" | "glm";
 
@@ -21,14 +23,13 @@ export interface CreateGatewayOptions {
 export type CreateCatalogGatewayOptions = Omit<CreateGatewayOptions, "provider" | "model">;
 
 export function defaultModel(provider: SupportedProvider, env: NodeJS.ProcessEnv = process.env): string {
-  return provider === "deepseek" ? env.DEEPSEEK_MODEL ?? "deepseek-v4-pro" : env.GLM_MODEL ?? "glm-5.2";
+  return providerAdapter(provider).defaultModel(env);
 }
 
 export function createModelGateway(options: CreateGatewayOptions): ModelGateway {
   const selectedModel = options.model ?? defaultModel(options.provider);
   const spec = builtinModelSpec(options.provider, selectedModel);
-  if (options.provider === "deepseek") return deepseekGateway(options, selectedModel, spec);
-  return glmGateway(options, selectedModel, spec);
+  return providerAdapter(options.provider).prepare(options, selectedModel, spec);
 }
 
 export function createModelGatewayForSpec(
@@ -40,9 +41,7 @@ export function createModelGatewayForSpec(
     provider: spec.providerId,
     model: spec.upstreamModel
   };
-  return spec.providerId === "deepseek"
-    ? deepseekGateway(gatewayOptions, spec.upstreamModel, spec)
-    : glmGateway(gatewayOptions, spec.upstreamModel, spec);
+  return providerAdapter(spec.providerId).prepare(gatewayOptions, spec.upstreamModel, spec);
 }
 
 function deepseekGateway(options: CreateGatewayOptions, model: string, spec?: ModelSpec): ModelGateway {
@@ -87,4 +86,46 @@ function commonGatewayOptions(options: CreateGatewayOptions) {
     activeStreamTimeoutMs: options.activeStreamTimeoutMs,
     fetchImpl: options.fetchImpl
   };
+}
+
+const defaultCapabilities: ModelCapabilities = {
+  contextWindowTokens: 128_000,
+  maxOutputTokens: 8_192,
+  tools: true,
+  parallelTools: false,
+  reasoning: true,
+  structuredOutput: false,
+  promptCache: false,
+  tokenizer: "approximate"
+};
+
+function sharedAdapter(id: SupportedProvider): Pick<
+  ProviderSpiV1,
+  "id" | "capabilities" | "stream" | "cancel" | "normalizeUsage" | "classifyError"
+> {
+  return {
+    id,
+    capabilities: (spec) => spec?.capabilities ?? defaultCapabilities,
+    stream: (gateway, request) => gateway.stream(request),
+    cancel: (controller, reason) => controller.abort(reason),
+    normalizeUsage: (usage) => ({ ...usage }),
+    classifyError: classifyModelFailure
+  };
+}
+
+const providerAdapters: Readonly<Record<SupportedProvider, ProviderSpiV1>> = {
+  deepseek: {
+    ...sharedAdapter("deepseek"),
+    defaultModel: (env) => env.DEEPSEEK_MODEL ?? "deepseek-v4-pro",
+    prepare: deepseekGateway
+  },
+  glm: {
+    ...sharedAdapter("glm"),
+    defaultModel: (env) => env.GLM_MODEL ?? "glm-5.2",
+    prepare: glmGateway
+  }
+};
+
+export function providerAdapter(provider: SupportedProvider): ProviderSpiV1 {
+  return providerAdapters[provider];
 }

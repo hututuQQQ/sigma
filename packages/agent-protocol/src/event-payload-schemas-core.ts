@@ -105,6 +105,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("deadline.stage"),
     stage: z.enum(["normal", "converge", "stop"]),
+    budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
     remainingMs: z.number(),
     nextModelEstimateMs: z.number().int().nonnegative(),
     outputReserveTokens: z.number().int().positive()
@@ -119,10 +120,13 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     historyTokens: z.number().int().nonnegative(),
     latestHistoryBlockTokens: z.number().int().nonnegative(),
     omittedHistoryTurns: z.number().int().nonnegative(),
+    cacheMode: z.enum(["prefix_cache", "proactive_window"]),
+    historyTokenLimit: z.number().int().nonnegative(),
+    dynamicSuffixTokens: z.number().int().nonnegative(),
     modelVisibleOutputTruncatedBytes: z.number().int().nonnegative(),
     reviewCount: z.number().int().nonnegative(),
     deadlineStage: z.enum(["normal", "converge", "stop"]),
-    executionMode: z.enum(["sandboxed", "disposable-container"])
+    executionMode: z.enum(["sandboxed", "container"])
   }).strict(),
   z.object({
     kind: z.literal("recovery.reset_tool"),
@@ -155,6 +159,12 @@ export const coreEventPayloadSchemas = {
     kind: z.literal("completed"),
     message: z.string(),
     evidence: z.array(sharedSchemas.evidenceRecordSchema),
+    coordinator: z.object({
+      modelStopped: z.literal(true),
+      assuranceSatisfied: z.literal(true),
+      reviewSatisfied: z.literal(true),
+      runCompleted: z.literal(true)
+    }).strict().optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "run.cancelled": z.object({

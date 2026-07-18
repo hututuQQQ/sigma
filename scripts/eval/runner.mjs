@@ -7,7 +7,7 @@ import {
   artifactSecretValues as collectArtifactSecretValues, createRedactor, digest, evalRootDir, fixtureRootDir, loadEvalSecrets,
   makeRunId, relativeArtifact, rootDir, subjectEnvironment, writeJson
 } from "./common.mjs";
-import { listV4Sessions, readV4Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
+import { listV5Sessions, readV5Session, resolveWorkspaceStateRoot } from "./event-store.mjs";
 import { reduceAgentEvents } from "./metrics.mjs";
 import { writeEvalReport } from "./report.mjs";
 import { loadEvalManifestV2, toSubjectDriverSpecV2 } from "./schema.mjs";
@@ -419,11 +419,11 @@ async function scanArtifactTree(directory, secretValues) {
 
 async function durableEvents(workspace, stateHome, subjectResult) {
   const stateRoot = await resolveWorkspaceStateRoot(workspace, { env: { SIGMA_STATE_HOME: stateHome } });
-  const sessions = await listV4Sessions(stateRoot);
+  const sessions = await listV5Sessions(stateRoot);
   const sessionId = subjectResult.sessionId ?? sessions[0]?.sessionId;
   if (!sessionId) return { stateRoot, sessionId: null, events: subjectResult.events ?? [] };
   try {
-    const stored = await readV4Session(stateRoot, sessionId);
+    const stored = await readV5Session(stateRoot, sessionId);
     return { stateRoot, sessionId, events: stored.events };
   } catch (error) {
     if ((subjectResult.events ?? []).length === 0) throw error;

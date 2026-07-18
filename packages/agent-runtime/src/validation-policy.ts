@@ -6,7 +6,7 @@ function deltaPaths(delta: WorkspaceDeltaEvidence): string[] {
   return [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
 }
 
-/** Compatibility helper for reviewer inputs. V4 authority is frontier/path
+/** Compatibility helper for reviewer inputs. V5 authority is assurance/path
  * based; this answers only whether the validation passed and overlaps the
  * delta's human-readable paths. */
 export function validationCoversDelta(validation: ValidationEvidence, delta: WorkspaceDeltaEvidence): boolean {
