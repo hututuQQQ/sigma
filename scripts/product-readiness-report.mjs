@@ -98,7 +98,7 @@ function providerSmokeReleaseChecks(providerSmoke, providerSmokePath) {
     check("providerSmoke:ok", providerSmoke.ok === true, providerSmoke.status ?? "unknown"),
     check("providerSmoke:doctorApi", providerSmoke.checks?.doctorApi === true, "doctor --check-api passed"),
     check("providerSmoke:runCompleted", providerSmoke.checks?.runCompleted === true, "live-provider run completed"),
-    check("providerSmoke:fileContent", providerSmoke.checks?.fileContent === true, "provider-smoke.md matched expected content"),
+    check("providerSmoke:fileContent", providerSmoke.checks?.fileContent === true, "provider-smoke.js matched expected content"),
     check("providerSmoke:inspect", providerSmoke.checks?.inspect === true, "session inspection succeeded")
   ];
 }

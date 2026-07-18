@@ -55,9 +55,11 @@ describe("package script semantics", () => {
     expect(windows.find((stage) => stage.id === "readiness")?.args).not.toContain("--require-release-ready");
     expect(linux.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
       SIGMA_EXEC_PATH: ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
+      SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-linux-x64/bin/node"),
     });
     expect(windows.find((stage) => stage.id === "provider-smoke")?.environment).toEqual({
       SIGMA_EXEC_PATH: ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
+      SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-win32-x64/bin/node.exe"),
     });
     expect(releaseStageGraph("verify-package-linux").at(-1)?.args).toContain("--require-target-wrapper");
     expect(releaseStageGraph("verify-package-windows").at(-1)?.args).toContain("--require-target-wrapper");
@@ -78,6 +80,7 @@ describe("package script semantics", () => {
     )).toEqual({
       ...source,
       SIGMA_EXEC_PATH: ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
+      SIGMA_RUNTIME_NODE_PATH: path.resolve(".artifacts/agent-cli-linux-x64/bin/node"),
     });
     expect(() => releaseStageEnvironment({
       secretEnvironment: [],

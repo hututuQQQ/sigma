@@ -77,7 +77,12 @@ export async function runConfigCommand(argv: string[], deps: ConfigCommandDeps =
 async function migrateConfig(argv: string[], deps: ConfigCommandDeps): Promise<ConfigMigrationResult> {
   const { flags, positionals } = parseArgs(argv);
   assertMigrationArguments(positionals, flags);
-  const config = loadCliConfig(flags, { env: deps.env, cwd: deps.cwd, homeDir: deps.homeDir });
+  const config = loadCliConfig(flags, {
+    env: deps.env,
+    cwd: deps.cwd,
+    homeDir: deps.homeDir,
+    allowLegacyMigrationKeys: true
+  });
   const configPath = path.join(config.workspace, ".agent", "config.toml");
   const source = await readFile(configPath, "utf8");
   const currentVersion = configVersion(parseToml(source) as Record<string, unknown>);

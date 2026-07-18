@@ -15,6 +15,7 @@ function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:typecheck|check-types)\b|\btsc\b/u.test(lower)) claims.push("typecheck");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test\b|\b(?:vitest|jest|pytest)\b/u.test(lower)) claims.push("unit");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build\b/u.test(lower)) claims.push("acceptance");
+  if (/\bnode(?:\.exe)?\s+--check\b/u.test(lower)) claims.push("syntax");
   return claims;
 }
 
@@ -49,7 +50,9 @@ export function assurancePathsForClaim(
   claim: ValidationClaimKindV1
 ): string[] {
   if (claim === "typecheck") return paths.filter((item) => /\.[cm]?tsx?$/iu.test(item));
-  if (claim === "unit" || claim === "integration") return paths.filter((item) => SOURCE_PATH.test(item));
+  if (claim === "unit" || claim === "integration") {
+    return paths.filter((item) => SOURCE_PATH.test(item) || TEST_PATH.test(item));
+  }
   if (claim === "lint") return paths.filter((item) => SOURCE_PATH.test(item) || /\.(?:json|ya?ml|toml)$/iu.test(item));
   return [...paths];
 }

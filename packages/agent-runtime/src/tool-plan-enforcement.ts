@@ -66,11 +66,40 @@ function scriptName(executable: string, args: string[]): string | undefined {
   return candidate?.toLowerCase();
 }
 
+function cargoSubcommand(args: string[]): string | undefined {
+  const optionsWithValues = new Set(["--color", "--config", "-C", "-Z"]);
+  let skipValue = false;
+  for (const argument of args) {
+    if (skipValue) {
+      skipValue = false;
+      continue;
+    }
+    if (argument.startsWith("+")) continue;
+    const option = argument.split("=", 1)[0] ?? argument;
+    if (optionsWithValues.has(option)) {
+      skipValue = !argument.includes("=");
+      continue;
+    }
+    if (argument.startsWith("-")) continue;
+    return argument.toLowerCase();
+  }
+  return undefined;
+}
+
+function cargoClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
+  const subcommand = cargoSubcommand(args);
+  if (subcommand === "test") return "unit";
+  if (subcommand === "clippy" || subcommand === "fmt") return "lint";
+  if (["build", "check", "bench"].includes(subcommand ?? "")) return "acceptance";
+  return undefined;
+}
+
 function claimKind(executable: string, args: string[]): ValidationClaimKindV1 {
   if (executable === "node" && args[0] === "--check") return "syntax";
   if (executable === "tsc" || args.some((item) => executableName(item) === "tsc")) return "typecheck";
   if (["eslint", "biome", "stylelint", "ruff"].includes(executable)) return "lint";
   if (["vitest", "jest", "mocha", "pytest", "cargo-test"].includes(executable)) return "unit";
+  if (executable === "cargo") return cargoClaimKind(args) ?? "probe";
   const script = scriptName(executable, args);
   if (!script) return "probe";
   if (/integration|e2e/u.test(script)) return "integration";

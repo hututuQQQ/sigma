@@ -386,7 +386,9 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // so this is only a fail-fast check and does not weaken the TOCTOU guard.
     resolve_executable(&params)?;
     if params.policy.write_roots.is_empty() {
-        return run_with_workspace_read_lease(&params);
+        if let Some(workspace) = eligible_workspace_read_lease_root(&params)? {
+            return run_with_workspace_read_lease(&params, &workspace);
+        }
     }
     let profile_name = ephemeral_profile_name()?;
     // Persist the profile intent before profile creation. A hard kill in the
@@ -425,16 +427,19 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     result
 }
 
-/// Read-only commands use a stable AppContainer identity bound to the opened
-/// workspace object. Its root ACEs are durable leases, so warm launches do no
-/// repository traversal and do not create per-object recovery entries.
-fn run_with_workspace_read_lease(params: &ProcessParams) -> Result<i32, RpcError> {
-    let workspace = workspace_lease_root(params)?;
+/// Workspace-confined read-only commands use a stable AppContainer identity
+/// bound to the opened workspace object. Requests with external read or
+/// execution capabilities use the ephemeral journaled path instead, so a
+/// per-call approval cannot become a durable capability of the workspace SID.
+fn run_with_workspace_read_lease(
+    params: &ProcessParams,
+    workspace: &RecoveryRootIdentity,
+) -> Result<i32, RpcError> {
     let recovery = base_recovery_directory()?;
     let (profile, generation) = {
         let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
-        let generation = workspace_read_generation(&recovery, &workspace)?;
-        let profile_name = workspace_read_profile_name(&workspace, generation)?;
+        let generation = workspace_read_generation(&recovery, workspace)?;
+        let profile_name = workspace_read_profile_name(workspace, generation)?;
         let profile = open_or_create_profile(&profile_name)?;
         let appcontainer_profile = appcontainer_folder(profile.sid)?;
         let user_profile = host_user_profile(&appcontainer_profile)?;
@@ -464,6 +469,19 @@ fn workspace_lease_root(params: &ProcessParams) -> Result<RecoveryRootIdentity, 
             )
         })?;
     workspace_root_identity(root)
+}
+
+fn eligible_workspace_read_lease_root(
+    params: &ProcessParams,
+) -> Result<Option<RecoveryRootIdentity>, RpcError> {
+    let workspace = workspace_lease_root(params)?;
+    let mut declared = params.policy.read_roots.clone();
+    declared.extend(params.policy.execution_roots.iter().cloned());
+    let roots = canonical_unique(&declared)?;
+    Ok(roots
+        .iter()
+        .all(|root| windows_path_within(&workspace.path, root))
+        .then_some(workspace))
 }
 
 fn workspace_root_identity(root: &Path) -> Result<RecoveryRootIdentity, RpcError> {
@@ -6411,6 +6429,70 @@ mod tests {
         std::fs::remove_file(&inside).expect("remove inside hardlink");
         std::fs::remove_dir_all(&root).expect("remove deep hardlink root");
         std::fs::remove_file(&outside).expect("remove external hardlink");
+    }
+
+    #[test]
+    fn stable_read_lease_excludes_external_capability_roots() {
+        let unique = ephemeral_profile_name()
+            .expect("create read lease selection fixture name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-read-lease-selection-{unique}"));
+        let workspace = fixture.join("workspace");
+        let internal = workspace.join("bin");
+        let external = fixture.join("external");
+        std::fs::create_dir_all(&internal).expect("create internal capability root");
+        std::fs::create_dir_all(&external).expect("create external capability root");
+        let params = |read_roots: Vec<PathBuf>, execution_roots: Vec<PathBuf>| ProcessParams {
+            command: crate::sandbox::CommandSpec {
+                executable: std::env::current_exe()
+                    .expect("resolve test executable")
+                    .to_string_lossy()
+                    .into_owned(),
+                args: Vec::new(),
+                cwd: workspace.clone(),
+                env: BTreeMap::new(),
+                stdin: None,
+            },
+            policy: crate::sandbox::ExecutionPolicy {
+                sandbox: SandboxMode::Required,
+                network: NetworkMode::None,
+                network_approved: false,
+                read_roots,
+                write_roots: Vec::new(),
+                execution_roots,
+                executable_sha256: None,
+                protected_paths: Vec::new(),
+                unsafe_host_exec_approved: false,
+            },
+            max_output_bytes: 1_024,
+            timeout_ms: Some(1_000),
+            idle_timeout_ms: None,
+            lifecycle: crate::sandbox::ProcessLifecycle::Session,
+            pty: false,
+            pty_columns: 80,
+            pty_rows: 24,
+        };
+
+        assert!(
+            eligible_workspace_read_lease_root(&params(vec![workspace.clone()], vec![internal],))
+                .expect("evaluate workspace-confined read lease")
+                .is_some()
+        );
+        assert!(
+            eligible_workspace_read_lease_root(&params(
+                vec![workspace.clone(), external.clone()],
+                Vec::new(),
+            ))
+            .expect("evaluate external read root")
+            .is_none()
+        );
+        assert!(
+            eligible_workspace_read_lease_root(&params(vec![workspace.clone()], vec![external],))
+                .expect("evaluate external execution root")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(&fixture).expect("remove read lease selection fixture");
     }
 
     #[test]

@@ -69,6 +69,7 @@ export interface CliConfigLoadOptions {
   homeDir?: string;
   trustStorePath?: string;
   customizationTrustStorePath?: string;
+  allowLegacyMigrationKeys?: boolean;
 }
 
 interface TomlDocument {
@@ -82,6 +83,21 @@ function readToml(filePath: string): TomlDocument | undefined {
   const parsed = parseToml(source);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Configuration must be a TOML table: ${filePath}`);
   return { source, values: parsed as Record<string, unknown> };
+}
+
+function withoutRemovedMigrationKeys(document: TomlDocument | undefined): TomlDocument | undefined {
+  if (!document) return undefined;
+  const version = document.values.schema_version;
+  if (version !== undefined && version !== 2 && version !== 3 && version !== 4) return document;
+  const security = document.values.security;
+  if (!security || typeof security !== "object" || Array.isArray(security)
+    || !Object.hasOwn(security, "allow_unsafe_host_exec")) return document;
+  const migratedSecurity = { ...security as Record<string, unknown> };
+  delete migratedSecurity.allow_unsafe_host_exec;
+  return {
+    ...document,
+    values: { ...document.values, security: migratedSecurity }
+  };
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -137,12 +153,16 @@ function configInputs(flags: Record<string, unknown>, options: CliConfigLoadOpti
     : env.SIGMA_WORKSPACE ?? options.cwd ?? process.cwd();
   const workspace = path.resolve(workspaceHint);
   const homeDir = options.homeDir ?? os.homedir();
+  const workspaceDocument = readToml(path.join(workspace, ".agent", "config.toml"));
+  const homeDocument = readToml(path.join(homeDir, ".sigma", "config.toml"));
   return {
     env,
     workspace,
     homeDir,
-    workspaceDocument: readToml(path.join(workspace, ".agent", "config.toml")),
-    homeDocument: readToml(path.join(homeDir, ".sigma", "config.toml"))
+    workspaceDocument: options.allowLegacyMigrationKeys
+      ? withoutRemovedMigrationKeys(workspaceDocument) : workspaceDocument,
+    homeDocument: options.allowLegacyMigrationKeys
+      ? withoutRemovedMigrationKeys(homeDocument) : homeDocument
   };
 }
 

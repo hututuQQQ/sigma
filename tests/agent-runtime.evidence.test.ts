@@ -16,7 +16,7 @@ import type {
   WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
-import { validationClaimSatisfies } from "../packages/agent-runtime/src/assurance-engine.js";
+import { assuranceRequirement, validationClaimSatisfies } from "../packages/agent-runtime/src/assurance-engine.js";
 import { evidenceLedger } from "../packages/agent-runtime/src/model-evidence-ledger.js";
 import { beginNextRun } from "../packages/agent-runtime/src/run-transitions.js";
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
@@ -289,6 +289,41 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(scope?.claim.commandDigest).toMatch(/^[a-f0-9]{64}$/u);
   });
 
+  it("recognizes Cargo validation subcommands and covers Rust changes", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "native/sigma-exec/src/main.rs", "docs/readme.md"
+    ];
+    const unit = validationScope(active, {
+      id: "cargo-test", name: "validate",
+      arguments: { executable: "cargo", args: ["+stable", "test", "--locked"] }
+    }, validationPlan);
+    expect(unit).toMatchObject({
+      coveredPaths: ["native/sigma-exec/src/main.rs"],
+      claim: { kind: "unit" }
+    });
+    const acceptance = validationScope(active, {
+      id: "cargo-build", name: "validate",
+      arguments: { executable: "cargo", args: ["build", "--locked"] }
+    }, validationPlan);
+    expect(acceptance).toMatchObject({
+      coveredPaths: ["native/sigma-exec/src/main.rs", "docs/readme.md"],
+      claim: { kind: "acceptance" }
+    });
+  });
+
+  it("requires unit evidence for non-source assets under tests", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["tests/fixtures/data.json"];
+
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      coveredPaths: [],
+      missingPaths: ["tests/fixtures/data.json"],
+      missingClaims: ["unit"]
+    });
+  });
+
   it("limits node --check to its exact file and gives generic probes no coverage", () => {
     const active = frontierSession();
     const syntax = validationScope(active, {
@@ -303,6 +338,26 @@ describe("V5 assurance-coordinated mutation completion", () => {
       id: "probe", name: "validate", arguments: { executable: "node", args: ["--version"] }
     }, { ...validationPlan, readPaths: ["."] });
     expect(probe).toMatchObject({ coveredPaths: [], claim: { kind: "probe" } });
+  });
+
+  it("honors an explicit node --check acceptance command as a syntax requirement", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Create provider-smoke.js and run node --check provider-smoke.js."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["provider-smoke.js"];
+
+    expect(assuranceRequirement(active)).toMatchObject({
+      requiredClaims: ["syntax"]
+    });
+    expect(validationScope(active, {
+      id: "syntax", name: "validate",
+      arguments: { executable: "node", args: ["--check", "provider-smoke.js"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["provider-smoke.js"],
+      claim: { kind: "syntax", subject: { exactFiles: ["provider-smoke.js"] } }
+    });
   });
 
   it("allows one final validation set and invalidates it after a later revision", () => {

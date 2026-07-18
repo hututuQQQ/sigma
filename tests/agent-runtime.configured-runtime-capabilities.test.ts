@@ -24,6 +24,7 @@ import {
   createConfiguredRuntime,
   type RuntimeCompositionConfig
 } from "../packages/agent-runtime/src/testing.js";
+import { verifiedNetworkPolicy } from "../packages/agent-runtime/src/execution-capabilities.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fixtures: string[] = [];
@@ -284,6 +285,17 @@ afterEach(async () => {
 });
 
 describe("configured runtime execution capabilities", () => {
+  it("rejects a configured network mode the broker did not advertise", () => {
+    expect(() => verifiedNetworkPolicy(doctorReport([], [], {
+      foreground: true, background: true, stdin: true, pty: true,
+      networkModes: ["none", "full"]
+    }), "loopback")).toThrow(expect.objectContaining({
+      code: "network_capability_unavailable",
+      requestedMode: "loopback",
+      availableModes: ["none", "full"]
+    }));
+  });
+
   it("closes an eagerly connected broker when later runtime composition fails", async () => {
     const root = await workspace();
     const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-capabilities-state-"));
@@ -437,19 +449,6 @@ describe("configured runtime execution capabilities", () => {
       expectedNetworkModes: ["none", "full"] as Array<"none" | "full">
     },
     {
-      name: "broker narrows configured network support",
-      shells: [] as BrokerVerifiedShell[],
-      expectedShells: [],
-      expectedDefault: "none",
-      runtimeCommands: ["node"],
-      expectedRuntimeCommands: ["node"],
-      processCapabilities: {
-        foreground: true, background: true, stdin: true, pty: true, networkModes: ["none"]
-      },
-      configuredNetworkMode: "full" as const,
-      expectedNetworkModes: ["none"] as Array<"none" | "full">
-    },
-    {
       name: "background execution without the network mode required by code intelligence",
       shells: [] as BrokerVerifiedShell[],
       expectedShells: [],
@@ -460,19 +459,6 @@ describe("configured runtime execution capabilities", () => {
         foreground: true, background: true, stdin: true, pty: true, networkModes: ["full"]
       },
       configuredNetworkMode: "full" as const,
-      expectedNetworkModes: ["full"] as Array<"none" | "full">
-    },
-    {
-      name: "broker full-only support remains available with a none configured default",
-      shells: [] as BrokerVerifiedShell[],
-      expectedShells: [],
-      expectedDefault: "none",
-      runtimeCommands: ["node"],
-      expectedRuntimeCommands: ["node"],
-      processCapabilities: {
-        foreground: true, background: true, stdin: true, pty: true, networkModes: ["full"]
-      },
-      configuredNetworkMode: "none" as const,
       expectedNetworkModes: ["full"] as Array<"none" | "full">
     }
   ])("uses doctor capabilities for tools and runtime context with $name", async ({

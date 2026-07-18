@@ -1,4 +1,5 @@
 import { sigmaManifest } from "../lib/sigma-manifest.ts";
+import path from "node:path";
 
 export interface ReleaseStage {
   readonly id: string;
@@ -18,13 +19,16 @@ function stage(id: string, command: string, ...args: string[]): ReleaseStage {
   return { id, command, args, secretEnvironment: noSecrets, environment: {} };
 }
 
-function providerStage(sigmaExecPath: string): ReleaseStage {
+function providerStage(sigmaExecPath: string, runtimeNodePath: string): ReleaseStage {
   return {
     id: "provider-smoke",
     command: "pnpm",
     args: ["smoke:provider", "--", "--provider", sigmaManifest.evaluation.provider],
     secretEnvironment: providerSecrets,
-    environment: { SIGMA_EXEC_PATH: sigmaExecPath }
+    environment: {
+      SIGMA_EXEC_PATH: sigmaExecPath,
+      SIGMA_RUNTIME_NODE_PATH: path.resolve(runtimeNodePath)
+    }
   };
 }
 
@@ -53,7 +57,10 @@ const linuxRelease = [
   stage("lsp-sandbox", "node", "scripts/ci/lsp-sandbox-smoke.mjs", "--bundle",
     ".artifacts/agent-cli-linux-x64", "--broker", ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
     "--target-platform", "linux", "--output", ".artifacts/lsp-sandbox-smoke-linux-x64.json"),
-  providerStage(".artifacts/agent-cli-linux-x64/bin/sigma-exec"),
+  providerStage(
+    ".artifacts/agent-cli-linux-x64/bin/sigma-exec",
+    ".artifacts/agent-cli-linux-x64/bin/node"
+  ),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "linux",
     "--target-arch", "x64", "--require-release-ready", "--require-provider-smoke")
 ] as const;
@@ -67,7 +74,10 @@ const windowsRelease = [
   stage("lsp-sandbox", "node", "scripts/ci/lsp-sandbox-smoke.mjs", "--bundle",
     ".artifacts/agent-cli-win32-x64", "--broker", ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
     "--target-platform", "win32", "--output", ".artifacts/lsp-sandbox-smoke-win32-x64.json"),
-  providerStage(".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe"),
+  providerStage(
+    ".artifacts/agent-cli-win32-x64/bin/sigma-exec.exe",
+    ".artifacts/agent-cli-win32-x64/bin/node.exe"
+  ),
   stage("readiness", "node", "scripts/product-readiness-report.mjs", "--target-platform", "win32",
     "--target-arch", "x64", "--require-preview-ready", "--require-provider-smoke")
 ] as const;

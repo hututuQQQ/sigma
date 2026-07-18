@@ -54,8 +54,8 @@ async function main() {
   const gateway = new SmokeFakeGateway([
       fakeToolTurn([fakeToolCall("write-smoke", "write", { path: "hello.txt", content: "hello world" })]),
       fakeProcessValidationTurn("validate-smoke", "hello.txt", "hello world"),
-      fakeReviewerTurn(),
-      fakeFinalTurn("TUI smoke completed.")
+      fakeFinalTurn("TUI smoke completed."),
+      fakeReviewerTurn()
     ]);
   const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {
     gatewayFactory: () => gateway,

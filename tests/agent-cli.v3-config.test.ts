@@ -126,4 +126,27 @@ describe("Sigma config", () => {
     expect(migrated).toContain('network = "none"');
     expect(migrated).toContain('process_handoff = "allow"');
   });
+
+  it("migrates a V4 config containing the removed unsafe host execution key", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-config-v4-migrate-"));
+    await mkdir(path.join(root, ".agent"));
+    const configPath = path.join(root, ".agent", "config.toml");
+    const original = [
+      "schema_version = 4", "[workspace]", "path = \".\"", "[security]",
+      "sandbox = \"required\"", "network = \"none\"", "allow_unsafe_host_exec = true"
+    ].join("\n");
+    await writeFile(configPath, original, "utf8");
+
+    expect(await runConfigCommand(["migrate", "--workspace", root, "--write"], {
+      stdout: new Capture() as unknown as NodeJS.WritableStream,
+      env: {}, homeDir: path.join(root, "home")
+    })).toBe(0);
+    await expect(readFile(`${configPath}.v4.bak`, "utf8")).resolves.toBe(original);
+    const migrated = await readFile(configPath, "utf8");
+    expect(migrated).toContain("schema_version = 5");
+    expect(migrated).not.toContain("allow_unsafe_host_exec");
+    expect(() => loadCliConfig({ workspace: root }, {
+      env: {}, homeDir: path.join(root, "home")
+    })).not.toThrow();
+  });
 });

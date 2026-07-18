@@ -49,9 +49,18 @@ export function verifiedNetworkPolicy(
 ): VerifiedNetworkPolicy {
   const brokerModes = new Set(report.capabilities.networkModes);
   const modes = (["none", "loopback", "full"] as const).filter((mode) => brokerModes.has(mode));
+  if (!modes.includes(configuredMode)) {
+    throw Object.assign(new Error(
+      `Configured network mode '${configuredMode}' is not supported by the connected execution broker.`
+    ), {
+      code: "network_capability_unavailable",
+      requestedMode: configuredMode,
+      availableModes: [...modes]
+    });
+  }
   return {
     modes: [...modes],
-    defaultMode: modes.includes(configuredMode) ? configuredMode : modes[0] ?? "none"
+    defaultMode: configuredMode
   };
 }
 
