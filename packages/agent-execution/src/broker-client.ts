@@ -79,11 +79,14 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   get stderr(): string { return this.transport.stderr; }
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot connect broker client in '${this.state}' state.`);
-    const operation = this.connectOnce(signal);
+    const operation = this.connectOnce("doctor", signal);
     this.connectOperation = operation;
     return await operation;
   }
-  private async connectOnce(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+  private async connectOnce(
+    initialReport: "doctor" | "sandbox.setup",
+    signal?: AbortSignal
+  ): Promise<BrokerDoctorReport> {
     this.state = "connecting";
     try {
       assertTrustedToolchainsAvailable(this.trustedToolchains, this.options.sandboxMode);
@@ -94,11 +97,10 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       }, { signal, timeoutMs: 5_000 }));
       this.instanceId = hello.instanceId;
       await this.outputArtifacts.configureRoot(hello.artifactRoot);
-      const report = parseDoctor(await this.transport.request("doctor", {}, {
+      const report = parseDoctor(await this.transport.request(initialReport, {}, {
         signal,
-        timeoutMs: this.options.startupTimeoutMs
-          ?? this.options.requestTimeoutMs
-          ?? DEFAULT_STARTUP_TIMEOUT_MS
+        timeoutMs: this.options.startupTimeoutMs ?? this.options.requestTimeoutMs
+          ?? (initialReport === "sandbox.setup" ? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS : DEFAULT_STARTUP_TIMEOUT_MS)
       }));
       assertRequiredSandbox(report, this.options.sandboxMode);
       if (this.closeRequested) {
@@ -144,6 +146,11 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     return report;
   }
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
+    if (this.state === "new") {
+      const operation = this.connectOnce("sandbox.setup", signal);
+      this.connectOperation = operation;
+      return await operation;
+    }
     this.assertReady();
     const report = await requestVerifiedSandboxReport({
       transport: this.transport, method: "sandbox.setup",

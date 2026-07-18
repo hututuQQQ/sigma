@@ -19,15 +19,13 @@ export const linuxPackageFakeModelSmokeScript = fileURLToPath(import.meta.url);
 function realSandboxValidationTurn() {
   return fakeToolTurn([fakeToolCall("validate-package-smoke", "validate", {
     executable: "node",
-    args: [
-      "-e",
-      "const fs=require('node:fs');process.exit(fs.readFileSync('hello.txt','utf8')==='hello from package\\n'?0:1)"
-    ],
+    args: ["--check", "hello.js"],
     access: "readonly"
   })]);
 }
 
 export async function runLinuxPackageFakeModelSmoke() {
+  const instruction = "Create hello.js and run node --check hello.js.";
   const [{ runAgentCommand }, { createConfiguredRuntime }] = await Promise.all([
     import(pathToFileURL(path.join(packageRoot, "packages", "agent-cli", "dist", "index.js")).href),
     import(pathToFileURL(path.join(packageRoot, "packages", "agent-runtime", "dist", "index.js")).href)
@@ -40,11 +38,11 @@ export async function runLinuxPackageFakeModelSmoke() {
 
   const gateway = new SmokeFakeGateway([
     fakeToolTurn([fakeToolCall("write-package-smoke", "write", {
-      path: "hello.txt", content: "hello from package\n"
+      path: "hello.js", content: "const helloFromPackage = true;\n"
     })]),
     realSandboxValidationTurn,
-    fakeReviewerTurn(),
-    fakeFinalTurn("Portable package fake-model smoke completed.")
+    fakeFinalTurn("Portable package fake-model smoke completed."),
+    fakeReviewerTurn()
   ]);
   const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {
     gatewayFactory: () => gateway,
@@ -54,7 +52,8 @@ export async function runLinuxPackageFakeModelSmoke() {
     const session = await composition.runtime.createSession({
       workspacePath: workspace,
       mode: "change",
-      title: "portable package fake-model smoke"
+      title: "portable package fake-model smoke",
+      goal: instruction
     });
     const events = [];
     const subscriptionController = new AbortController();
@@ -71,7 +70,7 @@ export async function runLinuxPackageFakeModelSmoke() {
     await composition.runtime.command({
       type: "submit",
       sessionId: session.sessionId,
-      text: "Create hello.txt and validate it.",
+      text: instruction,
       mode: "change"
     });
     const outcome = await composition.runtime.waitForOutcome(session.sessionId);
@@ -83,7 +82,7 @@ export async function runLinuxPackageFakeModelSmoke() {
         + `events=${JSON.stringify(events)}`
       );
     }
-    if (await readFile(path.join(workspace, "hello.txt"), "utf8") !== "hello from package\n") {
+    if (await readFile(path.join(workspace, "hello.js"), "utf8") !== "const helloFromPackage = true;\n") {
       throw new Error("portable package smoke file did not match");
     }
     const report = {

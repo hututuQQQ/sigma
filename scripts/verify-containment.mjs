@@ -34,7 +34,6 @@ async function main() {
     }]
   });
   try {
-    await execution.connect();
     await execution.setupSandbox();
     await writeFile(path.join(external, "secret.txt"), "secret", "utf8");
     await resolveWorkspacePath(workspace, "safe.txt");

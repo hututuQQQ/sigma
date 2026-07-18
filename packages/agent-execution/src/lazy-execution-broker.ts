@@ -59,17 +59,21 @@ export class LazyExecutionBroker implements ExecutionBroker {
   }
 
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
-    return (await this.invokeFresh(async (client) => {
-      if (!client.setupSandbox) return await client.doctor(signal);
-      return await client.setupSandbox(signal);
-    }, signal)).value;
+    return await this.initializeGeneration(
+      this.generation,
+      async (client) => client.setupSandbox ? await client.setupSandbox() : await client.connect(),
+      signal
+    );
   }
 
   async repairSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
-    return (await this.invokeFresh(async (client) => {
-      if (!client.repairSandbox) return client.setupSandbox ? await client.setupSandbox(signal) : await client.doctor(signal);
-      return await client.repairSandbox(signal);
-    }, signal)).value;
+    return await this.initializeGeneration(
+      this.generation,
+      async (client) => client.repairSandbox
+        ? await client.repairSandbox()
+        : client.setupSandbox ? await client.setupSandbox() : await client.connect(),
+      signal
+    );
   }
 
   async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
@@ -217,13 +221,21 @@ export class LazyExecutionBroker implements ExecutionBroker {
     generation: BrokerGeneration,
     signal?: AbortSignal
   ): Promise<BrokerDoctorReport> {
+    return await this.initializeGeneration(generation, async (client) => await client.connect(), signal);
+  }
+
+  private async initializeGeneration(
+    generation: BrokerGeneration,
+    initialize: (client: ExecutionBroker) => Promise<BrokerDoctorReport>,
+    signal?: AbortSignal
+  ): Promise<BrokerDoctorReport> {
     if (this.closed) throw new BrokerConnectionError("Execution broker is closed.", { retrySafe: true });
     if (signal?.aborted) throw cancellationError(signal);
     if (generation.retiring || generation.retired) {
       throw generation.failure ?? new BrokerConnectionError("Execution broker generation is retiring.");
     }
     if (generation.failure) throw generation.failure;
-    generation.connecting ??= generation.client.connect().catch((error: unknown) => {
+    generation.connecting ??= initialize(generation.client).catch((error: unknown) => {
       generation.failure = error instanceof Error
         ? error
         : new BrokerConnectionError("sigma-exec could not be started.", {

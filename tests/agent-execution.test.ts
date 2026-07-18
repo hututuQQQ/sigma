@@ -731,6 +731,17 @@ describe("SigmaExecBrokerClient", () => {
     await client.close();
   });
 
+  it("can perform required sandbox setup as the initial broker operation", async () => {
+    const client = new SigmaExecBrokerClient(fixtureOptions("unavailable"));
+    await expect(client.setupSandbox()).resolves.toMatchObject({
+      sandbox: { available: true, selfTestPassed: true }
+    });
+    await expect(client.execute({ ...spawnRequest(), timeoutMs: 500 })).resolves.toMatchObject({
+      state: "exited", exitCode: 0
+    });
+    await client.close();
+  });
+
   it("hands off only deliverable handles and releases client ownership", async () => {
     const sessionClient = new SigmaExecBrokerClient(fixtureOptions("normal"));
     await sessionClient.connect();
@@ -1414,6 +1425,7 @@ const healthyExecutionResult = (): ExecutionResult => ({
 class LifecycleBrokerFixture implements ExecutionBroker {
   readonly lostProcessHandles: ProcessHandle[] = [];
   connectCalls = 0;
+  setupCalls = 0;
   executeCalls = 0;
   spawnCalls = 0;
   pollCalls = 0;
@@ -1436,7 +1448,10 @@ class LifecycleBrokerFixture implements ExecutionBroker {
     return this.hooks.connect ? await this.hooks.connect() : healthyDoctorReport;
   }
   async doctor(): Promise<BrokerDoctorReport> { return healthyDoctorReport; }
-  async setupSandbox(): Promise<BrokerDoctorReport> { return healthyDoctorReport; }
+  async setupSandbox(): Promise<BrokerDoctorReport> {
+    this.setupCalls += 1;
+    return healthyDoctorReport;
+  }
   async execute(_request: ExecutionRequest): Promise<ExecutionResult> {
     this.executeCalls += 1;
     return await this.run();
@@ -1479,6 +1494,20 @@ function deferred<T>(): {
 
 describe("LazyExecutionBroker generations", () => {
   const executionRequest = (): ExecutionRequest => ({ ...spawnRequest(), timeoutMs: 500 });
+
+  it("initializes a fresh generation through explicit sandbox setup", async () => {
+    const client = new LifecycleBrokerFixture(async () => healthyExecutionResult());
+    const broker = new LazyExecutionBroker({
+      sandboxMode: "required",
+      clientFactory: () => client
+    });
+
+    await expect(broker.setupSandbox()).resolves.toEqual(healthyDoctorReport);
+    await expect(broker.execute(executionRequest())).resolves.toMatchObject({ stdout: "ok" });
+    expect(client.setupCalls).toBe(1);
+    expect(client.connectCalls).toBe(0);
+    await broker.close();
+  });
 
   it("rebuilds once and retries only a request rejected before dispatch", async () => {
     const stale = new LifecycleBrokerFixture(async () => {

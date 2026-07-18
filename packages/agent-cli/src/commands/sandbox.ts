@@ -39,9 +39,7 @@ function writeResult(
 }
 
 async function prepareSandbox(broker: ExecutionBroker): Promise<Awaited<ReturnType<ExecutionBroker["doctor"]>>> {
-  const current = await broker.doctor();
-  if (current.sandbox.available && current.sandbox.selfTestPassed) return current;
-  return broker.setupSandbox ? await broker.setupSandbox() : current;
+  return broker.setupSandbox ? await broker.setupSandbox() : await broker.doctor();
 }
 
 function errorText(error: unknown): string {
