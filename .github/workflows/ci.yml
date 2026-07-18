@@ -160,7 +160,7 @@ jobs:
       - name: Product readiness
         run: pnpm product:readiness -- --target-platform linux --target-arch x64
       - name: Upload Linux x64 release evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sigma-code-linux-x64
           if-no-files-found: error
@@ -286,7 +286,7 @@ jobs:
       - name: Product readiness
         run: pnpm product:readiness -- --target-platform win32 --target-arch x64
       - name: Upload Windows x64 preview evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sigma-code-win32-x64-preview
           if-no-files-found: error
