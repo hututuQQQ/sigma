@@ -1,6 +1,4 @@
-import {
-  attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError
-} from "./errors.js";
+import { attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError } from "./errors.js";
 import {
   awaitWithSignal, cancellationError, errorIdentity, lifecycleFailure,
   preserveConnectionFailure, retireTerminalGenerationError
@@ -59,21 +57,15 @@ export class LazyExecutionBroker implements ExecutionBroker {
   }
 
   async setupSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
-    return await this.initializeGeneration(
-      this.generation,
-      async (client) => client.setupSandbox ? await client.setupSandbox() : await client.connect(),
-      signal
-    );
+    return await this.initializeGeneration(this.generation, async (client) =>
+      client.setupSandbox ? await client.setupSandbox() : await client.connect(), signal);
   }
 
   async repairSandbox(signal?: AbortSignal): Promise<BrokerDoctorReport> {
-    return await this.initializeGeneration(
-      this.generation,
-      async (client) => client.repairSandbox
+    return await this.initializeGeneration(this.generation, async (client) =>
+      client.repairSandbox
         ? await client.repairSandbox()
-        : client.setupSandbox ? await client.setupSandbox() : await client.connect(),
-      signal
-    );
+        : client.setupSandbox ? await client.setupSandbox() : await client.connect(), signal);
   }
 
   async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
@@ -217,10 +209,8 @@ export class LazyExecutionBroker implements ExecutionBroker {
     return { id: ++this.generationSequence, client };
   }
 
-  private async connectGeneration(
-    generation: BrokerGeneration,
-    signal?: AbortSignal
-  ): Promise<BrokerDoctorReport> {
+  private async connectGeneration(generation: BrokerGeneration, signal?: AbortSignal):
+  Promise<BrokerDoctorReport> {
     return await this.initializeGeneration(generation, async (client) => await client.connect(), signal);
   }
 

@@ -1,8 +1,6 @@
 import { BrokerTransport } from "./broker-transport.js";
-import {
-  requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport,
-  requestVerifiedSandboxReport
-} from "./broker-sandbox-operations.js";
+import { requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport,
+  requestVerifiedSandboxReport } from "./broker-sandbox-operations.js";
 import {
   assertRequestSandbox, assertRequiredSandbox, cancellationError,
   BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
@@ -14,21 +12,18 @@ import {
 } from "./broker-client-support.js";
 import { settleCancelledSpawn } from "./broker-client-cancellation.js";
 import {
-  BrokerCancelledError, BrokerConnectionError, BrokerPolicyError,
-  BrokerProcessLostError, BrokerTimeoutError,
-  attachBrokerLifecycleFailure
+  attachBrokerLifecycleFailure, BrokerCancelledError, BrokerConnectionError,
+  BrokerPolicyError, BrokerProcessLostError, BrokerTimeoutError
 } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
 import { positiveInteger, redactionSecrets, requestParams } from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
-import {
-  assertTrustedToolchainsAvailable, normalizeTrustedToolchains, type NormalizedTrustedToolchain
-} from "./trusted-toolchains.js";
+import { assertTrustedToolchainsAvailable, normalizeTrustedToolchains,
+  type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
 import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
-  ProcessPollResult, ProcessSpawnRequest, SigmaExecBrokerClientOptions
-} from "./types.js";
+  ProcessPollResult, ProcessSpawnRequest, SigmaExecBrokerClientOptions } from "./types.js";
 import { parseDoctor, parseHello, parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
 export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly transport: BrokerTransport;
@@ -83,10 +78,8 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.connectOperation = operation;
     return await operation;
   }
-  private async connectOnce(
-    initialReport: "doctor" | "sandbox.setup",
-    signal?: AbortSignal
-  ): Promise<BrokerDoctorReport> {
+  private async connectOnce(initialReport: "doctor" | "sandbox.setup", signal?: AbortSignal):
+  Promise<BrokerDoctorReport> {
     this.state = "connecting";
     try {
       assertTrustedToolchainsAvailable(this.trustedToolchains, this.options.sandboxMode);
