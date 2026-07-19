@@ -8,10 +8,7 @@ import {
 import type { KernelEffect } from "agent-kernel";
 import { RepositoryContextProvider, type ContextPlan } from "agent-context";
 import { isToolAllowed } from "agent-tools";
-import {
-  sessionSkillProjectionCapabilities,
-  steeringRestart
-} from "./effect-helpers.js";
+import { steeringRestart } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
 import {
@@ -29,6 +26,7 @@ import {
   streamModelResponse
 } from "./model-effect-support.js";
 import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
+import { refreshValidationCapabilityProfile } from "./validation-capability-profile.js";
 import {
   availableModelBudget,
   budgetFailure,
@@ -38,12 +36,20 @@ import {
   type BudgetStage,
   type PreparedModelTurn
 } from "./model-budget-convergence.js";
+import { budgetStageForCapacity, projectedToolCapabilities } from "./model-tool-capabilities.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
 interface ModelReservationState {
   settled: boolean;
   response?: ModelResponse; consumed?: Partial<BudgetAmounts>;
+}
+
+interface PreparedAttempt {
+  turn: PreparedModelTurn;
+  plan: ContextPlan;
+  forecast: DeadlineForecast;
+  budgetStage: BudgetStage;
 }
 
 function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
@@ -177,44 +183,45 @@ export class ModelEffectRunner {
     });
   }
 
-  private async attempt(
+  private async prepareTurn(
     session: RuntimeSession,
     turnId: number,
-    effectRevision: number,
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
-  ): Promise<RunOutcome | null> {
+  ): Promise<PreparedAttempt | RunOutcome> {
+    const repairPhase = completionRepairPhase(session);
     const modelDescriptors = this.options.runtime.tools.modelDescriptors?.()
       ?? this.options.runtime.tools.descriptors();
-    const availableDescriptors = modelDescriptors.filter((item) =>
+    const stageInternal = repairPhase === "no_change_confirmation"
+      ? this.options.runtime.tools.descriptors().filter((item) => item.name === "confirm_no_change")
+      : [];
+    const ordinaryDescriptors = modelDescriptors.filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
-    const repairPhase = completionRepairPhase(session);
-    // Every protocol-repair phase is a tool sub-turn, including recovery after
-    // a failed terminal action. Keeping the choice forced prevents a provider
-    // from silently switching modes between the repair call and its recovery.
+    const availableDescriptors = [...new Map([...ordinaryDescriptors, ...stageInternal]
+      .map((item) => [item.name, item])).values()];
+    // Once a completion prerequisite has new durable evidence, the model must
+    // be able to stop naturally so the runtime-owned completion intent can be
+    // generated. Other repair phases remain forced tool sub-turns.
     const repairPending = repairPhase !== "none";
+    const allowNaturalCompletion = repairPhase === "protected_completion";
+    await refreshValidationCapabilityProfile(session, signal);
     const ledger = evidenceLedger(session);
     const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);
     const available = availableModelBudget(session);
-    const capabilities = sessionSkillProjectionCapabilities({
-      frozenCustomization: session.durable.frozenCustomization,
-      liveSkillDescriptors: this.options.runtime.skills?.descriptors,
-      loadedSkills: session.durable.state.frozenSkills,
-      profileSkillNames: session.services.profile?.profile.skills
-    });
-
-    let budgetStage: BudgetStage = forecast.stage === "converge" ? "converge" : "normal";
+    const projectedCapabilities = projectedToolCapabilities(
+      session, modelDescriptors, this.options.runtime.skills?.descriptors
+    );
     const preparation = {
-      session, forecast, turnId, descriptors, capabilities, dynamic, hookContext,
-      ledger, available, repairPending, defaultOutputReserveTokens: this.options.outputReserveTokens
+      session, forecast, turnId, descriptors, capabilities: projectedCapabilities, dynamic, hookContext,
+      ledger, available, repairPending, allowNaturalCompletion,
+      defaultOutputReserveTokens: this.options.outputReserveTokens
     };
     let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
     const capacity = requestCapacity(available, prepared.turn.budget);
-    if (capacity <= 1) budgetStage = "terminal";
-    else if (capacity === 2) budgetStage = "converge";
+    const budgetStage = budgetStageForCapacity(forecast, capacity);
     if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
     const fittedBudget = fitPreparedBudget(
       prepared.turn.budget,
@@ -226,8 +233,24 @@ export class ModelEffectRunner {
         `The remaining budget cannot fund one ${budgetStage === "terminal" ? "terminal " : ""}model request after bounded context compaction.`
       );
     }
-    const turn: PreparedModelTurn = { ...prepared.turn, budget: fittedBudget };
-    const plan = prepared.plan;
+    return {
+      turn: { ...prepared.turn, budget: fittedBudget },
+      plan: prepared.plan,
+      forecast,
+      budgetStage
+    };
+  }
+
+  private async attempt(
+    session: RuntimeSession,
+    turnId: number,
+    effectRevision: number,
+    signal: AbortSignal,
+    hookContext: readonly ContextItem[]
+  ): Promise<RunOutcome | null> {
+    const prepared = await this.prepareTurn(session, turnId, signal, hookContext);
+    if ("kind" in prepared) return prepared;
+    const { turn, plan, forecast, budgetStage } = prepared;
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,

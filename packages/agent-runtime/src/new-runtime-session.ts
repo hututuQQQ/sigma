@@ -62,6 +62,7 @@ export async function newRuntimeSession(
     contextItems: [...base, ...project],
     loadedContextIds: new Set([...base.map((item) => item.id), ...project.map((item) => item.id)]),
     outcomeWaiters: [],
-    idleWaiters: []
+    idleWaiters: [],
+    ...(environment ? { runtimeEnvironment: environment } : {})
   });
 }

@@ -81,20 +81,22 @@ export function protectedToolBatchFailure(
   state: KernelState,
   calls: readonly ModelToolCall[]
 ): { code: "terminal_batch_conflict" | "terminal_protocol_invalid"; message: string } | null {
-  if (state.completionRepair?.kind !== "protected_completion") return null;
-  const terminal = calls[0]?.name === "runtime_finalize" || calls[0]?.name === "report_blocked"
-    || calls[0]?.name === "request_user_input";
+  const noChange = state.completionRepair?.kind === "no_change_confirmation";
+  if (!noChange && state.completionRepair?.kind !== "protected_completion") return null;
+  const allowed = noChange
+    ? new Set(["confirm_no_change", "report_blocked", "request_user_input"])
+    : new Set(["runtime_finalize", "report_blocked", "request_user_input"]);
+  const terminal = allowed.has(calls[0]?.name ?? "");
   if (calls.length === 1 && terminal) return null;
-  const terminalCount = calls.filter((call) =>
-    call.name === "runtime_finalize" || call.name === "report_blocked" || call.name === "request_user_input").length;
+  const terminalCount = calls.filter((call) => allowed.has(call.name)).length;
   return calls.length > 1 && terminalCount > 0
     ? {
         code: "terminal_batch_conflict",
-        message: "The protected terminal-intent repair mixed a terminal action with another call."
+        message: "The protected terminal-intent phase mixed a terminal action with another call."
       }
     : {
         code: "terminal_protocol_invalid",
-        message: "The protected terminal-intent repair did not produce exactly one runtime completion intent or request_user_input call."
+        message: `The protected terminal-intent phase did not produce exactly one of: ${[...allowed].join(", ")}.`
       };
 }
 
@@ -104,7 +106,8 @@ function terminalReceiptFailure(
   toolName: string,
   action: "complete" | "report_blocked" | "request_input"
 ): KernelState | null {
-  const expectedTool = action === "complete" ? "runtime_finalize"
+  const expectedTool = action === "complete"
+    ? state.completionRepair?.kind === "no_change_confirmation" ? "confirm_no_change" : "runtime_finalize"
     : action === "report_blocked" ? "report_blocked" : "request_user_input";
   if (toolName === expectedTool) return null;
   return proposedOutcomeState(progressed, {
@@ -155,25 +158,39 @@ function hasCurrentFailedValidation(state: KernelState): boolean {
     && item.data.stateDigest === state.mutationFrontier.currentStateDigest);
 }
 
-function invalidBlockedReportState(state: KernelState, progressed: KernelState): KernelState | null {
-  if (hasCurrentFailedValidation(progressed)) return null;
-  if (state.completionRepairAttempts >= 2) {
-    return proposedOutcomeState(progressed, {
-      kind: "recoverable_failure",
-      code: "convergence_no_progress",
-      message: "report_blocked was repeated without a failed validation on the current workspace state."
-    });
+function currentFrontierEvidence(state: KernelState) {
+  return state.evidence.filter((item) => {
+    if (item.kind !== "validation" && item.kind !== "review") return true;
+    return item.data.frontierRevision === state.mutationFrontier.revision
+      && item.data.stateDigest === state.mutationFrontier.currentStateDigest;
+  });
+}
+
+const CAPABILITY_FAILURE_FAMILIES = new Set([
+  "container_unavailable",
+  "executable_unavailable",
+  "filesystem_acl_unsupported",
+  "network_capability_unavailable",
+  "sandbox_recovery_required",
+  "toolchain_unavailable"
+]);
+
+/** Runtime-owned stable taxonomy for a model-reported durable blocker. */
+export function canonicalReportedBlockerCode(state: KernelState): string {
+  if (hasCurrentFailedValidation(state)) return "validation_failed";
+  const evidence = currentFrontierEvidence(state);
+  const reviewBlocked = evidence.some((item) => item.kind === "review"
+    && (item.status === "failed" || item.data.verdict === "changes_requested"));
+  if (reviewBlocked) return "review_blocked";
+  const capabilityBlocked = evidence.some((item) => item.kind === "validation"
+    && item.data.claim?.status === "unavailable")
+    || CAPABILITY_FAILURE_FAMILIES.has(state.semanticFailureCluster?.family ?? "")
+    || /(?:^|_)(?:capability|executable|toolchain)_unavailable$/u.test(state.semanticFailureCluster?.family ?? "");
+  if (capabilityBlocked) return "capability_unavailable";
+  if (evidence.some((item) => item.kind === "input_access" && item.status === "failed")) {
+    return "input_unavailable";
   }
-  return {
-    ...progressed,
-    phase: "ready_model",
-    completionRepairAttempts: state.completionRepairAttempts + 1,
-    completionRepair: { kind: "terminal_action" },
-    messages: [...progressed.messages, {
-      role: "developer",
-      content: "report_blocked requires a failed semantic validation on the current workspace state. Continue repair or validation, complete if the frontier is ready, or request user input only for a genuine user decision."
-    }]
-  };
+  return "reported_blocker";
 }
 
 const COMPLETION_PREREQUISITE_CODES = new Set([
@@ -181,6 +198,39 @@ const COMPLETION_PREREQUISITE_CODES = new Set([
   "validation_result_reporting_required",
   "review_evidence_required"
 ]);
+
+function prerequisiteFingerprint(receipt: ToolReceipt): string {
+  const result = receipt.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return JSON.stringify({ diagnostics: [...new Set(receipt.diagnostics)].sort() });
+  }
+  const strings = (value: JsonValue | undefined): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").sort() : [];
+  return JSON.stringify({
+    code: typeof result.code === "string" ? result.code : null,
+    frontierRevision: typeof result.frontierRevision === "number" ? result.frontierRevision : null,
+    stateDigest: typeof result.stateDigest === "string" ? result.stateDigest : null,
+    missingClaims: strings(result.missingClaims),
+    missingPaths: strings(result.missingPaths),
+    diagnostics: [...new Set(receipt.diagnostics)].sort()
+  });
+}
+
+function previousPrerequisiteReceipt(state: KernelState): ToolReceipt | undefined {
+  return [...state.receipts].reverse().find((receipt) =>
+    receipt.diagnostics.some((code) => COMPLETION_PREREQUISITE_CODES.has(code)));
+}
+
+function prerequisiteRetryCount(
+  state: KernelState,
+  receipt: ToolReceipt,
+  previous: { retryCount: number } | undefined
+): number {
+  if (!previous) return 0;
+  const prior = previousPrerequisiteReceipt(state);
+  return prior && prerequisiteFingerprint(prior) === prerequisiteFingerprint(receipt)
+    ? previous.retryCount + 1 : 0;
+}
 
 function isCompletionPrerequisiteFailure(input: TerminalReceiptTransition): boolean {
   if (input.toolName !== "runtime_finalize" || input.receipt.ok || input.remainingTools !== 0) return false;
@@ -193,7 +243,7 @@ function completionPrerequisiteRepair(input: TerminalReceiptTransition): KernelS
   if (!pending) return null;
   const previous = input.state.completionRepair?.kind === "completion_prerequisite"
     ? input.state.completionRepair : undefined;
-  const retryCount = previous ? previous.retryCount + 1 : 0;
+  const retryCount = prerequisiteRetryCount(input.state, input.receipt, previous);
   if (retryCount >= 2) {
     return proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
@@ -251,11 +301,9 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
   if (blocked) {
     const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "report_blocked");
     if (failure) return failure;
-    const invalid = invalidBlockedReportState(input.state, input.progressed);
-    if (invalid) return invalid;
     return proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
-      code: blocked.code,
+      code: canonicalReportedBlockerCode(input.progressed),
       message: blocked.message
     });
   }
@@ -263,15 +311,23 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
   if (summary) {
     const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
     if (failure) return failure;
+    if (input.toolName === "confirm_no_change"
+      && input.state.completionRepair?.kind === "no_change_confirmation") {
+      return proposedOutcomeState(input.progressed, {
+        kind: "completed",
+        message: input.state.completionRepair.answer,
+        evidence: input.progressed.evidence
+      });
+    }
     const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
+    const latestAnswer = ordinaryCompletionMessage(sameTurnAnswer, summary);
     return proposedOutcomeState(input.progressed, {
       kind: "completed",
       // A protected substantive answer is intentionally immutable during its
       // terminal repair. On an ordinary completion, retain both handoff
       // surfaces so a generic same-turn status cannot hide
       // the structured completion summary.
-      message: `${protectedCompletionAnswer(input.state)
-        || ordinaryCompletionMessage(sameTurnAnswer, summary)}${advisoryReviewWarnings(input.progressed)}`,
+      message: `${ordinaryCompletionMessage(protectedCompletionAnswer(input.state), latestAnswer)}${advisoryReviewWarnings(input.progressed)}`,
       evidence: input.progressed.evidence
     });
   }

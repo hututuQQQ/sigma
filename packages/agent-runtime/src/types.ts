@@ -13,6 +13,7 @@ import type {
   ToolExecutor
 } from "agent-protocol";
 import type { KernelState } from "agent-kernel";
+import type { RepositoryValidationCapabilityProfile } from "agent-context";
 import type {
   FrozenAgentProfile,
   FrozenSessionCustomization,
@@ -164,6 +165,8 @@ export interface RuntimeSessionInteractionState {
   /** Runtime-local convergence guard; infrastructure failures are summarized
    * instead of being replayed through durable model history. */
   capabilityFailures: Map<string, number>;
+  /** Safe repository-derived assurance capabilities, cached for one workspace state digest. */
+  validationCapabilities?: RepositoryValidationCapabilityProfile;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];
@@ -183,6 +186,7 @@ export interface RuntimeSessionServices {
   modelRole: ModelExecutionRole;
   profile?: FrozenAgentProfile;
   profileSource?: "home" | "workspace" | "builtin";
+  runtimeEnvironment?: RuntimeEnvironment;
 }
 
 export interface RuntimeSession {

@@ -64,4 +64,26 @@ describe("session model-tool capability projection", () => {
       profileSkillNames: ["home:frozen"]
     })).toEqual({ skillsAvailable: true, executableSkillResourcesLoaded: false });
   });
+
+  it("exposes Git and LSP only when their exact session capability is available", () => {
+    const descriptorsWithLsp = [...descriptors, { ...descriptors[0]!, name: "lsp" }];
+    const hidden = projectModelToolDescriptors(descriptorsWithLsp, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      gitAvailable: false,
+      lspAvailable: false
+    });
+    expect(hidden.some((item) => item.name === "git_status" || item.name === "git_diff")).toBe(false);
+    expect(hidden.some((item) => item.name === "lsp")).toBe(false);
+
+    const visible = projectModelToolDescriptors(descriptorsWithLsp, {
+      skillsAvailable: false,
+      executableSkillResourcesLoaded: false,
+      gitAvailable: true,
+      lspAvailable: true
+    });
+    expect(visible.some((item) => item.name === "git_status")).toBe(true);
+    expect(visible.some((item) => item.name === "git_diff")).toBe(true);
+    expect(visible.some((item) => item.name === "lsp")).toBe(true);
+  });
 });

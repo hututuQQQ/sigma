@@ -9,3 +9,4 @@ export * from "./repository-safe-read.js";
 export * from "./repository-statistics.js";
 export * from "./repository-text-search.js";
 export * from "./repository-path-safety.js";
+export * from "./repository-validation-capabilities.js";

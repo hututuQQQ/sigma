@@ -14,7 +14,7 @@ export interface CompletionProposal {
 }
 
 export interface BlockedReport {
-  code: string;
+  code?: string;
   summary: string;
   recoveryAttempted?: string;
 }
@@ -43,6 +43,16 @@ function stringList(value: JsonValue | undefined): string[] | null {
   return [...new Set(value as string[])];
 }
 
+function optionalString(
+  input: Record<string, JsonValue>,
+  key: string
+): { valid: boolean; value?: string } {
+  const raw = input[key];
+  if (raw === undefined) return { valid: true };
+  if (typeof raw !== "string" || !raw.trim()) return { valid: false };
+  return { valid: true, value: raw.trim() };
+}
+
 export function parseCompletionProposal(value: JsonValue): CompletionProposal | null {
   const input = record(value);
   if (input && Object.keys(input).some((key) => key !== "summary" && key !== "warnings")) return null;
@@ -54,14 +64,18 @@ export function parseCompletionProposal(value: JsonValue): CompletionProposal | 
 
 export function parseBlockedReport(value: JsonValue): BlockedReport | null {
   const input = record(value);
+  if (!input) return null;
   if (input && Object.keys(input).some((key) =>
     key !== "code" && key !== "summary" && key !== "recoveryAttempted")) return null;
-  const code = typeof input?.code === "string" ? input.code.trim() : "";
-  const summary = typeof input?.summary === "string" ? input.summary.trim() : "";
-  const recoveryAttempted = typeof input?.recoveryAttempted === "string"
-    ? input.recoveryAttempted.trim() : undefined;
-  if (!code || !summary || (input?.recoveryAttempted !== undefined && !recoveryAttempted)) return null;
-  return { code, summary, ...(recoveryAttempted ? { recoveryAttempted } : {}) };
+  const summary = typeof input.summary === "string" ? input.summary.trim() : "";
+  const code = optionalString(input, "code");
+  const recovery = optionalString(input, "recoveryAttempted");
+  if (!summary || !code.valid || !recovery.valid) return null;
+  return {
+    ...(code.value ? { code: code.value } : {}),
+    summary,
+    ...(recovery.value ? { recoveryAttempted: recovery.value } : {})
+  };
 }
 
 /** @deprecated V5 completion evidence is selected by the runtime. */
@@ -128,6 +142,38 @@ function completionTool(): RegisteredEffectTool {
   };
 }
 
+function confirmNoChangeTool(): RegisteredEffectTool {
+  const descriptor: ToolDescriptor = {
+    name: "confirm_no_change",
+    description: "Confirm that the protected original answer correctly explains why no workspace change is required.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    possibleEffects: ["outcome.propose"],
+    executionMode: "sequential",
+    resourceKeys: ["run:outcome"],
+    approval: "auto",
+    idempotent: true,
+    timeoutMs: 5_000
+  };
+  return {
+    descriptor,
+    modelVisible: false,
+    async execute(request): Promise<ToolReceipt> {
+      const startedAt = new Date().toISOString();
+      return terminalReceipt(
+        request,
+        startedAt,
+        { summary: "No workspace change is required." },
+        "outcome.propose",
+        "invalid_no_change_confirmation"
+      );
+    }
+  };
+}
+
 function reportBlockedTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
     name: "report_blocked",
@@ -135,11 +181,14 @@ function reportBlockedTool(): RegisteredEffectTool {
     inputSchema: {
       type: "object",
       properties: {
-        code: { type: "string", description: "Stable, task-independent blocker code." },
+        code: {
+          type: "string",
+          description: "Optional backward-compatible blocker hint. The runtime assigns the durable failure taxonomy."
+        },
         summary: { type: "string", description: "What remains blocked and why." },
         recoveryAttempted: { type: "string", description: "Optional concise repair attempts already made." }
       },
-      required: ["code", "summary"],
+      required: ["summary"],
       additionalProperties: false
     },
     possibleEffects: ["outcome.report_blocked"],
@@ -198,6 +247,7 @@ function requestUserInputTool(): RegisteredEffectTool {
 
 export function registerCompletionTool(registry: EffectToolRegistry): EffectToolRegistry {
   registry.register(completionTool());
+  registry.register(confirmNoChangeTool());
   registry.register(reportBlockedTool());
   registry.register(requestUserInputTool());
   return registry;

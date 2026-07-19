@@ -17,6 +17,7 @@ import {
 } from "./execution-tool-values.js";
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
+import { executionCommandSemantics } from "./execution-command-semantics.js";
 
 function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "loopback" | "full" {
   const available = availableNetworkModes(options);
@@ -169,14 +170,16 @@ function executionInvocation(input: Record<string, JsonValue>): ExecutionIntentV
 function executionPurpose(
   invocation: ExecutionIntentV1["invocation"],
   validation: boolean,
-  background: boolean
+  background: boolean,
+  shellCommand?: string
 ): ExecutionIntentV1["purpose"] {
-  const command = [invocation.executable, ...invocation.args].join(" ").toLowerCase();
   if (background) return "serve";
-  if (/\b(?:build|tsc)\b/u.test(command)) return "build";
-  if (/\b(?:lint|eslint|biome|ruff)\b/u.test(command)) return "lint";
-  if (/\b(?:test|vitest|jest|pytest)\b/u.test(command)) return "test";
-  return validation ? "custom" : "probe";
+  return executionCommandSemantics({
+    executable: invocation.executable,
+    args: invocation.args,
+    validation,
+    ...(shellCommand === undefined ? {} : { shellCommand })
+  }).purpose;
 }
 
 function capabilityProfile(executable: string): { id: string; dependencies: string[] } {
@@ -218,6 +221,7 @@ async function plannedCall(
     && !isInside(workspaceRoot, path.resolve(item))
     && (!skillResource || !isInside(skillResource.readRoot, path.resolve(item))));
   const invocation = executionInvocation(input);
+  const shellCommand = typeof input.command === "string" ? input.command : undefined;
   const profile = capabilityProfile(invocation.executable);
   return {
     exactEffects: plannedEffects(
@@ -234,7 +238,7 @@ async function plannedCall(
       access: mutation.access,
       ...(mutation.expectedChanges.length > 0 ? { expectedChanges: mutation.expectedChanges } : {}),
       network: networkMode,
-      purpose: executionPurpose(invocation, validation, background)
+      purpose: executionPurpose(invocation, validation, background, shellCommand)
     },
     executionCapability: {
       profileId: profile.id,

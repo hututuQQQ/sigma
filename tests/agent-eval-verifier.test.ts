@@ -2,7 +2,12 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runPostVerifier, verifierNodeToolchain } from "../scripts/eval/verifier.mjs";
+import {
+  integerFactsFromAnswer,
+  runPostVerifier,
+  verifierNodeToolchain,
+  verifierSandboxPolicy
+} from "../scripts/eval/verifier.mjs";
 
 const temporary: string[] = [];
 
@@ -11,6 +16,27 @@ afterEach(async () => {
 });
 
 describe("agent evaluation verifier isolation", () => {
+  it("recognizes standalone integer facts across common grouping separators", () => {
+    expect(integerFactsFromAnswer("440\n79,200 79.200 79\u00a0200 79\u202f200")).toEqual([
+      440, 79_200, 79_200, 79_200, 79_200
+    ]);
+    expect(integerFactsFromAnswer("4400 and 12.34 and x440")).not.toContain(440);
+  });
+
+  it("keeps copied workspace evidence read-only and isolates verifier writes", () => {
+    const workspace = path.resolve("controller", "verifier-workspace");
+    const manifestDir = path.resolve("controller", "verifier-manifest");
+    const home = path.resolve("controller", "verifier-home");
+    const nodePath = path.resolve("portable", "bin", "node.exe");
+
+    expect(verifierSandboxPolicy({ workspace, manifestDir, home }, nodePath)).toEqual({
+      sandbox: "required",
+      network: "none",
+      readRoots: [workspace, manifestDir, path.dirname(nodePath), path.dirname(home)],
+      writeRoots: [home]
+    });
+  });
+
   it("binds command verification to one exact Node toolchain", () => {
     const nodePath = path.resolve("portable", "bin", "node.exe");
     const compatibility = { kind: "test-proof", executableSha256: "a".repeat(64) };
@@ -99,5 +125,48 @@ describe("agent evaluation verifier isolation", () => {
 
     expect(result.status).toBe("pass");
     expect(result.checks[0]).toMatchObject({ type: "event_count", passed: true, count: 1 });
+  });
+
+  it("passes only the expected recoverable failure code", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-expected-error-"));
+    temporary.push(root);
+    const workspace = path.join(root, "workspace");
+    const artifactDir = path.join(root, "artifacts");
+    await Promise.all([mkdir(workspace), mkdir(artifactDir)]);
+    const context = {
+      scenario: {
+        expectedTerminal: "error",
+        expectedFailureCode: "validation_failed",
+        verifier: { checks: [{ type: "answer", numericValues: [440, 79_200] }] }
+      },
+      workspace,
+      manifestDir: root,
+      delta: { added: [], modified: [], deleted: [] },
+      initialGit: { status: "", diff: "" },
+      finalGit: { status: "", diff: "" },
+      events: [],
+      artifactDir,
+      redactor: String
+    };
+    const matching = await runPostVerifier({
+      ...context,
+      subjectResult: { result: { status: "error", finalMessage: "440 files\n79,200 lines" } },
+      metrics: { terminal: { type: "run.failed", code: "validation_failed" } }
+    });
+    expect(matching.status).toBe("pass");
+    expect(matching.delivery.status).toBe("pass");
+    expect(matching.terminal).toEqual({
+      expected: "error",
+      actual: "error",
+      expectedCode: "validation_failed",
+      actualCode: "validation_failed"
+    });
+
+    const wrongCode = await runPostVerifier({
+      ...context,
+      subjectResult: { result: { status: "error", finalMessage: "440 files\n79.200 lines" } },
+      metrics: { terminal: { type: "run.failed", code: "reported_blocker" } }
+    });
+    expect(wrongCode.delivery.status).toBe("fail");
   });
 });

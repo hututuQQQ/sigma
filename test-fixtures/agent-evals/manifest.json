@@ -791,7 +791,8 @@
       ],
       "surface": "cli",
       "permissionPolicy": "auto",
-      "expectedTerminal": "completed",
+      "expectedTerminal": "error",
+      "expectedFailureCode": "validation_failed",
       "allowedChanges": [
         "service.mjs"
       ],
@@ -933,8 +934,10 @@
           },
           {
             "type": "answer",
-            "pattern": "(?:440)[^\\n]*(?:79[,.]?200|79200)|(?:79[,.]?200|79200)[^\\n]*(?:440)",
-            "flags": "iu"
+            "numericValues": [
+              440,
+              79200
+            ]
           },
           {
             "type": "git_diff",
@@ -1021,28 +1024,43 @@
           },
           {
             "type": "answer",
-            "pattern": "(?:TypeScript|\\.ts)[^\\n]*170",
-            "flags": "iu"
+            "pattern": "(?:TypeScript|\\.ts)",
+            "flags": "iu",
+            "numericValues": [
+              170
+            ]
           },
           {
             "type": "answer",
-            "pattern": "(?:JavaScript|\\.js)[^\\n]*130",
-            "flags": "iu"
+            "pattern": "(?:JavaScript|\\.js)",
+            "flags": "iu",
+            "numericValues": [
+              130
+            ]
           },
           {
             "type": "answer",
-            "pattern": "(?:Python|\\.py)[^\\n]*80",
-            "flags": "iu"
+            "pattern": "(?:Python|\\.py)",
+            "flags": "iu",
+            "numericValues": [
+              80
+            ]
           },
           {
             "type": "answer",
-            "pattern": "(?:Rust|\\.rs)[^\\n]*60",
-            "flags": "iu"
+            "pattern": "(?:Rust|\\.rs)",
+            "flags": "iu",
+            "numericValues": [
+              60
+            ]
           },
           {
             "type": "answer",
-            "pattern": "(?:total|\\u603b\\u8ba1)[^\\n]*440",
-            "flags": "iu"
+            "pattern": "(?:total|\\u603b\\u8ba1)",
+            "flags": "iu",
+            "numericValues": [
+              440
+            ]
           },
           {
             "type": "git_diff",
@@ -1129,13 +1147,21 @@
           },
           {
             "type": "answer",
-            "pattern": "(?:source|production|\\u6e90\\u7801)[^\\n]*(?:380)[^\\n]*(?:68[,.]?400|68400)",
-            "flags": "iu"
+            "pattern": "(?:source|production|\\u6e90\\u7801)",
+            "flags": "iu",
+            "numericValues": [
+              380,
+              68400
+            ]
           },
           {
             "type": "answer",
-            "pattern": "(?:test|tests|\\u6d4b\\u8bd5)[^\\n]*(?:60)[^\\n]*(?:10[,.]?800|10800)",
-            "flags": "iu"
+            "pattern": "(?:test|tests|\\u6d4b\\u8bd5)",
+            "flags": "iu",
+            "numericValues": [
+              60,
+              10800
+            ]
           },
           {
             "type": "git_diff",

@@ -45,6 +45,9 @@ export interface PendingTool {
   modelTurn: ActiveModelTurn;
   approval: "not_required" | "pending" | "allowed" | "denied";
   started: boolean;
+  /** Records who created the pending call. Runtime-owned calls are never
+   * accepted merely because a provider guessed their private name or ID. */
+  origin?: "model" | "runtime";
 }
 
 export interface SemanticProgressWatermark {
@@ -72,6 +75,7 @@ export interface SemanticFailureCluster {
 export type CompletionRepairState =
   | { kind: "evidence_acquisition" }
   | { kind: "terminal_action" }
+  | { kind: "no_change_confirmation"; answer: string }
   | { kind: "protected_completion"; answer: string }
   | { kind: "protected_recovery"; answer: string }
   | {
@@ -232,7 +236,9 @@ export function isCompletionRepairState(value: unknown): value is CompletionRepa
     return Object.keys(repair).length === 1;
   }
   if (repair.kind === "completion_prerequisite") return isCompletionPrerequisiteRepair(repair);
-  return (repair.kind === "protected_completion" || repair.kind === "protected_recovery")
+  return (repair.kind === "no_change_confirmation"
+      || repair.kind === "protected_completion"
+      || repair.kind === "protected_recovery")
     && typeof repair.answer === "string"
     && repair.answer.trim().length > 0
     && Object.keys(repair).every((key) => key === "kind" || key === "answer");

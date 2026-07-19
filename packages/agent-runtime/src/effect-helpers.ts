@@ -24,6 +24,8 @@ export function modelTools(descriptors: readonly ToolDescriptor[]): ModelToolDef
 export interface ModelToolProjectionCapabilities {
   skillsAvailable: boolean;
   executableSkillResourcesLoaded: boolean;
+  gitAvailable?: boolean;
+  lspAvailable?: boolean;
 }
 
 /** Frozen sessions never acquire capabilities from changed live state.
@@ -62,9 +64,16 @@ export function projectModelToolDescriptors(
   descriptors: readonly ToolDescriptor[],
   capabilities: ModelToolProjectionCapabilities
 ): ToolDescriptor[] {
+  const sessionVisible = descriptors.filter((descriptor) => {
+    if (descriptor.name === "git_status" || descriptor.name === "git_diff") {
+      return capabilities.gitAvailable === true;
+    }
+    if (descriptor.name === "lsp") return capabilities.lspAvailable === true;
+    return true;
+  });
   const visible = capabilities.skillsAvailable
-    ? descriptors
-    : descriptors.filter((descriptor) => descriptor.name !== "load_skill");
+    ? sessionVisible
+    : sessionVisible.filter((descriptor) => descriptor.name !== "load_skill");
   return visible.map((descriptor) => {
     const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
     const unavailable = descriptor.name === "process_spawn"

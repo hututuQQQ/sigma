@@ -62,6 +62,7 @@ export async function hydrateRuntimeSession(
     loadedContextIds: new Set(allContext.map((item) => item.id)),
     outcomeWaiters: [],
     idleWaiters: [],
-    lastOutcome: state.outcome
+    lastOutcome: state.outcome,
+    ...(environment ? { runtimeEnvironment: environment } : {})
   });
 }

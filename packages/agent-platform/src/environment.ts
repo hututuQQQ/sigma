@@ -6,6 +6,8 @@ export interface RuntimeEnvironment {
   defaultShell: ShellKind | "none";
   availableShells: ShellKind[];
   availableRuntimeCommands: string[];
+  /** Trusted launcher-discovered language-server presets that are actually executable. */
+  availableLanguageServers?: string[];
   executionCapabilitiesVerified: boolean;
   executionMode?: "sandboxed" | "container";
   pathSeparator: string;

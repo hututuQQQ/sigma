@@ -8,7 +8,7 @@ import type {
 import type { JsonValue, ModelGateway, RunStore, RuntimeClient } from "agent-protocol";
 import { LazyExecutionBroker, type BrokerDoctorReport, type ExecutionBroker } from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
-import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
+import { defaultBundledLanguageServerRoot, discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { ensurePrivateStateDirectory, isInside } from "agent-platform";
@@ -139,7 +139,8 @@ export async function createConfiguredRuntime(
       : undefined;
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
     const supervisor = createSupervisor(config, execution, runtimeReference);
-    const tools = createTools(config, execution, supervisor, executionReport, storeRootDir);
+    const languageServers = discoverLanguageServers();
+    const tools = createTools(config, execution, supervisor, executionReport, storeRootDir, languageServers);
     mcpClients = options.connectMcp === false
       ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
@@ -160,7 +161,9 @@ export async function createConfiguredRuntime(
       availableProfiles: customization.availableProfiles,
       gatewayForRole: gateways.forRole,
       execution,
-      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? "sandboxed" },
+      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport),
+        executionMode: config.executionMode ?? "sandboxed",
+        availableLanguageServers: languageServers.filter((preset) => preset.available).map((preset) => preset.id) },
       subjectAttestation,
       skills: customization.skills,
       hooks: customization.hookDefinitions,
@@ -357,13 +360,9 @@ function createSupervisor(
   );
 }
 
-function createTools(
-  config: RuntimeCompositionConfig,
-  execution: ExecutionBroker,
-  supervisor: AgentSupervisor,
-  executionReport: BrokerDoctorReport,
-  storeRootDir: string
-): EffectToolRegistry {
+function createTools(config: RuntimeCompositionConfig, execution: ExecutionBroker,
+  supervisor: AgentSupervisor, executionReport: BrokerDoctorReport,
+  storeRootDir: string, languageServers: LanguageServerPreset[]): EffectToolRegistry {
   const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
@@ -387,7 +386,7 @@ function createTools(
       && executionReport.capabilities.stdin
       && network.modes.includes("none") ? {
       codeIntel: {
-        presets: discoverLanguageServers(),
+        presets: languageServers,
         additionalReadRoots: [defaultBundledLanguageServerRoot()]
           .filter((value): value is string => Boolean(value))
       }

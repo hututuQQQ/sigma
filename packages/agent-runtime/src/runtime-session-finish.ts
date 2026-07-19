@@ -5,6 +5,7 @@ import type { RuntimeEventLog } from "./runtime-event-log.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
 import { completionCoordinatorState } from "./completion-evidence-gate.js";
+import { refreshValidationCapabilityProfile } from "./validation-capability-profile.js";
 
 export type RunSuspensionContext =
   | { processIds: string[] }
@@ -106,6 +107,23 @@ async function cancelChildrenAfterFailure(
   await options.cancelChildren?.(session.identity.sessionId, `Parent run ended as ${outcome.kind}.`);
 }
 
+async function completionCoordinatedOutcome(
+  session: RuntimeSession,
+  outcome: RunOutcome
+): Promise<RunOutcome> {
+  if (outcome.kind !== "completed") return outcome;
+  // Recovery may arrive directly at outcome_pending without another model
+  // turn. Re-derive the non-durable capability profile before applying the
+  // same completion gates used during a live run.
+  await refreshValidationCapabilityProfile(session, new AbortController().signal);
+  const coordinator = completionCoordinatorState(session);
+  return coordinator.runCompleted ? outcome : {
+    kind: "recoverable_failure",
+    code: "completion_coordinator_rejected",
+    message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
+  };
+}
+
 export async function finishRuntimeSession(
   options: RuntimeSessionFinishOptions,
   session: RuntimeSession,
@@ -114,12 +132,7 @@ export async function finishRuntimeSession(
   suspensionContext?: RunSuspensionContext
 ): Promise<boolean> {
   if (!isCurrentOutcomeRevision(session, outcomeRevision)) return false;
-  const coordinator = outcome.kind === "completed" ? completionCoordinatorState(session) : undefined;
-  const coordinatedOutcome = coordinator && !coordinator.runCompleted ? {
-    kind: "recoverable_failure" as const,
-    code: "completion_coordinator_rejected",
-    message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
-  } : outcome;
+  const coordinatedOutcome = await completionCoordinatedOutcome(session, outcome);
   const finalOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   await options.beforeOutcome?.(session, finalOutcome);

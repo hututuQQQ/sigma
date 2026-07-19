@@ -43,10 +43,10 @@ function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): P
     request: { callId: call.id, name: call.name, arguments: call.arguments },
     modelTurn,
     approval: "not_required",
-    started: false
+    started: false,
+    origin: "model"
   }));
 }
-
 type EventReducer = KernelEventReducer;
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,

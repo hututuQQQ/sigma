@@ -118,6 +118,29 @@ describe("trusted toolchain boundaries", () => {
     )).toThrow(BrokerExecutableUnavailableError);
   });
 
+  it.runIf(process.platform !== "win32")(
+    "canonicalizes an absolute symlink only when its target is an exact verified executable",
+    async () => {
+      const root = await temporaryRoot("sigma-verified-executable-alias-");
+      const workspace = path.join(root, "workspace");
+      const verified = path.join(root, "verified-shell");
+      const alias = path.join(root, "shell-alias");
+      const untrusted = path.join(root, "untrusted-shell");
+      const untrustedAlias = path.join(root, "untrusted-alias");
+      await mkdir(workspace);
+      await writeFile(verified, "verified\n");
+      await writeFile(untrusted, "untrusted\n");
+      await symlink(verified, alias);
+      await symlink(untrusted, untrustedAlias);
+
+      const wired = requestParams(request(alias, workspace), clientOptions("required"), [], [verified]);
+      expect(wired).toMatchObject({ command: { executable: await realpath(verified) } });
+      expect(() => requestParams(
+        request(untrustedAlias, workspace), clientOptions("required"), [], [verified]
+      )).toThrow(BrokerExecutableUnavailableError);
+    }
+  );
+
   it("does not let a broad descendant root establish a sibling as the primary executable", async () => {
     const root = await temporaryRoot("sigma-toolchain-primary-");
     const entryPoint = path.join(root, process.platform === "win32" ? "compiler.exe" : "compiler");

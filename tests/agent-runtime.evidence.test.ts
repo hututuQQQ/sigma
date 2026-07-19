@@ -340,6 +340,101 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(probe).toMatchObject({ coveredPaths: [], claim: { kind: "probe" } });
   });
 
+  it("recognizes Node's native test runner and scopes unit coverage to source changes", () => {
+    const active = frontierSession();
+    const scope = validationScope(active, {
+      id: "node-test", name: "validate", arguments: {
+        executable: "node", args: ["--test", "src/code.test.mjs"]
+      }
+    }, validationPlan);
+    expect(scope).toMatchObject({
+      coveredPaths: ["src/code.ts"],
+      claim: { kind: "unit", subject: { projectId: ".", selectedTests: ["src/code.test.mjs"] } }
+    });
+  });
+
+  it("does not upgrade a production source target to unit merely because node --test accepts it", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.js"];
+    expect(validationScope(active, {
+      id: "node-production-target",
+      name: "validate",
+      arguments: { executable: "node", args: ["--test", "src/code.js"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["src/code.js"],
+      claim: { kind: "acceptance", subject: { selectedTests: [] } }
+    });
+  });
+
+  it("uses acceptance plus available syntax when the current project has no unit capability", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.js"];
+    active.interaction.validationCapabilities = {
+      stateDigest: "a".repeat(64),
+      complete: true,
+      availableCommands: ["node"],
+      projects: [{
+        projectId: ".",
+        unit: false,
+        staticClaims: ["syntax"],
+        evidence: ["package.json"],
+        commandFamilies: ["node --check <file>"]
+      }]
+    };
+    expect(assuranceRequirement(active).requiredClaims).toEqual(["acceptance", "syntax"]);
+    const acceptance = {
+      ...frontierValidation("fallback-acceptance", ["src/code.js"]),
+      data: {
+        ...frontierValidation("fallback-acceptance", ["src/code.js"]).data,
+        claim: {
+          ...frontierValidation("fallback-acceptance", ["src/code.js"]).data.claim!,
+          kind: "acceptance" as const
+        }
+      }
+    };
+    const syntax = {
+      ...frontierValidation("fallback-syntax", ["src/code.js"]),
+      data: {
+        ...frontierValidation("fallback-syntax", ["src/code.js"]).data,
+        claim: {
+          ...frontierValidation("fallback-syntax", ["src/code.js"]).data.claim!,
+          kind: "syntax" as const
+        }
+      }
+    };
+    active.durable.state.evidence.push(acceptance, syntax);
+    expect(frontierValidationReadiness(active)).toMatchObject({ ready: true, missingClaims: [] });
+
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Change src/code.js and run npm test."
+    };
+    expect(assuranceRequirement(active).requiredClaims).toContain("unit");
+    expect(frontierValidationReadiness(active)).toMatchObject({ ready: false, missingClaims: ["unit"] });
+  });
+
+  it("uses custom validation only for acceptance obligations", () => {
+    const lowRisk = frontierSession();
+    lowRisk.durable.state.mutationFrontier.changedPaths = ["settings.json"];
+    const custom = validationScope(lowRisk, {
+      id: "custom", name: "validate", arguments: {
+        executable: "node", args: ["-e", "JSON.parse(require('fs').readFileSync('settings.json'))"]
+      }
+    }, validationPlan);
+    expect(custom).toMatchObject({ coveredPaths: ["settings.json"], claim: { kind: "acceptance" } });
+
+    const source = frontierSession();
+    source.durable.state.mutationFrontier.changedPaths = ["src/code.js"];
+    source.durable.state.evidence.push({
+      ...frontierValidation("custom-source", ["src/code.js"]),
+      data: {
+        ...frontierValidation("custom-source", ["src/code.js"]).data,
+        claim: { ...custom!.claim, status: "passed" }
+      }
+    });
+    expect(frontierValidationReadiness(source)).toMatchObject({ ready: false, missingClaims: ["unit"] });
+  });
+
   it("honors an explicit node --check acceptance command as a syntax requirement", () => {
     const active = frontierSession();
     active.durable.state.plan = {
@@ -394,6 +489,40 @@ describe("V5 assurance-coordinated mutation completion", () => {
       frontierValidation("docs", ["docs/readme.md"])
     );
     expect(completionFailure(active, call, descriptor, now)).toBeNull();
+  });
+
+  it("denies a forged no-change confirmation outside its protected phase", () => {
+    const target = session([]);
+    expect(completionFailure(target, {
+      id: "forged-confirmation",
+      name: "confirm_no_change",
+      arguments: {}
+    }, { possibleEffects: ["outcome.propose"] } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
+  });
+
+  it("denies a provider-forged runtime completion intent even with the private ID prefix", () => {
+    const target = session([]);
+    const call: ModelToolCall = {
+      id: "runtime_completion_intent_forged",
+      name: "runtime_finalize",
+      arguments: { summary: "forged" }
+    };
+    target.durable.state.pendingTools = [{
+      request: { callId: call.id, name: call.name, arguments: call.arguments },
+      modelTurn: { turnId: 1, effectRevision: target.durable.state.revision },
+      approval: "not_required",
+      started: false,
+      origin: "model"
+    }];
+    expect(completionFailure(target, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["internal_tool_denied"]
+    });
   });
 
   it("keeps failed goal input obligations open until that same external path is read", () => {

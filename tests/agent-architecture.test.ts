@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,6 +25,7 @@ import { AgentSupervisor } from "../packages/agent-supervisor/src/index.js";
 import { createApprovingReviewer } from "./helpers/approving-reviewer.js";
 import { registerContentValidator, validationTurn } from "./helpers/content-validator.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
 
 const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => createBaseRuntime({
   ...options,
@@ -118,6 +119,17 @@ function reopenRootPlan(): ModelResponse {
           }]
         }
       }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
+function confirmNoChange(id: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id, name: "confirm_no_change", arguments: {} }]
     },
     finishReason: "tool_calls"
   };
@@ -303,6 +315,221 @@ describe("Sigma architecture", () => {
       .toBeLessThan(completionRequest);
   });
 
+  it("allows natural completion after a rejected completion intent acquires validation evidence", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-prerequisite-"));
+    const gateway = new FakeGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "write-before-completion", name: "write", arguments: { path: "result.txt", content: "done" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "Implemented result.txt." }, finishReason: "stop" },
+      validationTurn("validate-after-completion", [{ path: "result.txt", expected: "done" }]),
+      { message: { role: "assistant", content: "Validation is complete." }, finishReason: "stop" }
+    ]);
+    const storeRootDir = path.join(workspace, ".agent");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir,
+      tools: registerContentValidator(registerBuiltinTools(new EffectToolRegistry())),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "write result.txt" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: expect.stringMatching(/Implemented result\.txt\.[\s\S]*Validation is complete\./u)
+    });
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[2]?.toolChoice).toBe("required");
+    expect(gateway.requests[3]?.toolChoice).toBeUndefined();
+    for (const request of gateway.requests.slice(2)) {
+      expect(JSON.stringify(request.messages)).not.toContain("runtime_finalize");
+      expect(request.tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
+    }
+  });
+
+  it("completes a low-risk change through custom validation without helper-file writes", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-custom-acceptance-"));
+    const broker = createHostExecutionBroker();
+    try {
+      const gateway = new FakeGateway([
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "write-settings",
+              name: "write",
+              arguments: { path: "settings.json", content: "{\"enabled\":true}\n" }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        { message: { role: "assistant", content: "Updated settings.json." }, finishReason: "stop" },
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "probe-node",
+              name: "validate",
+              arguments: { executable: process.execPath, args: ["--version"] }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "validate-settings",
+              name: "validate",
+              arguments: {
+                executable: process.execPath,
+                args: [
+                  "-e",
+                  "const fs=require('fs');const x=JSON.parse(fs.readFileSync('settings.json','utf8'));if(x.enabled!==true)process.exit(1)"
+                ]
+              }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        { message: { role: "assistant", content: "Validation passed." }, finishReason: "stop" }
+      ]);
+      const storeRootDir = path.join(workspace, ".agent");
+      const runtime = createRuntime({
+        gateway,
+        store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+        storeRootDir,
+        tools: registerBuiltinTools(new EffectToolRegistry(), {
+          broker,
+          sandboxMode: "unsafe",
+          networkMode: "none",
+          runtimeCommands: [process.execPath]
+        }),
+        permissionMode: "auto",
+        runDeadlineMs: 60_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+      await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Enable the setting." });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        message: expect.stringMatching(/Updated settings\.json\.[\s\S]*Validation passed\./u)
+      });
+      expect(gateway.requests[2]?.toolChoice).toBe("required");
+      expect(gateway.requests[3]?.toolChoice).toBe("required");
+      expect(gateway.requests[3]?.messages.some((message) =>
+        message.content.includes("recognized passed claims: probe")
+        && message.content.includes("validation claims still missing: acceptance"))).toBe(true);
+      expect(gateway.requests[4]?.toolChoice).toBeUndefined();
+      expect(gateway.requests[4]?.messages.some((message) =>
+        message.content.includes("recognized passed claims: acceptance, probe"))).toBe(true);
+      expect((await readdir(workspace)).sort()).toEqual([".agent", "settings.json"]);
+    } finally {
+      await broker.close();
+    }
+  }, 30_000);
+
+  it("completes source work without a unit harness through acceptance plus available syntax", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-capability-fallback-"));
+    const broker = createHostExecutionBroker();
+    try {
+      const gateway = new FakeGateway([
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "write-source-without-tests",
+              name: "write",
+              arguments: { path: "app.mjs", content: "export const answer = 42;\n" }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        { message: { role: "assistant", content: "Implemented app.mjs." }, finishReason: "stop" },
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "accept-source-without-tests",
+              name: "validate",
+              arguments: {
+                executable: process.execPath,
+                args: ["-e", "import('./app.mjs').then(m=>{if(m.answer!==42)process.exit(1)})"]
+              }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{
+              id: "syntax-source-without-tests",
+              name: "validate",
+              arguments: { executable: process.execPath, args: ["--check", "app.mjs"] }
+            }]
+          },
+          finishReason: "tool_calls"
+        },
+        { message: { role: "assistant", content: "Validated app.mjs." }, finishReason: "stop" }
+      ]);
+      const storeRootDir = path.join(workspace, ".agent");
+      const runtime = createRuntime({
+        gateway,
+        store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
+        storeRootDir,
+        tools: registerBuiltinTools(new EffectToolRegistry(), {
+          broker,
+          sandboxMode: "unsafe",
+          networkMode: "none",
+          runtimeCommands: [process.execPath]
+        }),
+        runtimeEnvironment: {
+          platform: process.platform,
+          arch: process.arch,
+          defaultShell: process.platform === "win32" ? "cmd" : "bash",
+          availableShells: [process.platform === "win32" ? "cmd" : "bash"],
+          availableRuntimeCommands: ["node"],
+          executionCapabilitiesVerified: true,
+          executionMode: "sandboxed",
+          pathSeparator: path.sep
+        },
+        permissionMode: "auto",
+        runDeadlineMs: 60_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+      await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Create app.mjs exporting answer 42." });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+        kind: "completed",
+        message: expect.stringMatching(/Implemented app\.mjs\.[\s\S]*Validated app\.mjs\./u)
+      });
+      expect(gateway.requests.some((request) => request.messages.some((message) =>
+        message.content.includes("capability fallback: substantive acceptance plus available static validation")))).toBe(true);
+      expect(gateway.requests.some((request) => request.messages.some((message) =>
+        message.content.includes("validation claims still missing: unit")))).toBe(false);
+    } finally {
+      await broker.close();
+    }
+  }, 30_000);
+
   it("recovers after an evidence tool fails before completion", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-completion-failure-barrier-"));
     const gateway = new FakeGateway([
@@ -433,8 +660,10 @@ describe("Sigma architecture", () => {
     const storeRootDir = path.join(workspace, ".agent");
     const gateway = new FakeGateway([
       { message: { role: "assistant", content: "first" }, finishReason: "stop" },
+      confirmNoChange("confirm-first-run"),
       reopenRootPlan(),
-      { message: { role: "assistant", content: "second" }, finishReason: "stop" }
+      { message: { role: "assistant", content: "second" }, finishReason: "stop" },
+      confirmNoChange("confirm-second-run")
     ]);
     const firstRuntime = createRuntime({
       gateway,
@@ -449,10 +678,10 @@ describe("Sigma architecture", () => {
     await expect(firstRuntime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed", message: "first" });
     await firstRuntime.command({ type: "submit", sessionId: session.sessionId, text: "two" });
     await expect(firstRuntime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed", message: "second" });
-    const secondRunFirstRequest = gateway.requests[1];
+    const secondRunFirstRequest = gateway.requests[2];
     expect(secondRunFirstRequest.messages.some((message) =>
       message.content.includes("completion_status"))).toBe(true);
-    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests).toHaveLength(5);
 
     const resumed = createRuntime({
       gateway: new FakeGateway([]),
@@ -640,7 +869,10 @@ describe("Sigma architecture", () => {
     const deniedWorkspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deny-resume-"));
     const deniedStore = await createSuspendedStore(deniedWorkspace);
     const deniedRuntime = createRuntime({
-      gateway: new FakeGateway([{ message: { role: "assistant", content: "continued safely" }, finishReason: "stop" }]),
+      gateway: new FakeGateway([
+        { message: { role: "assistant", content: "continued safely" }, finishReason: "stop" },
+        confirmNoChange("confirm-denied-recovery")
+      ]),
       store: deniedStore.store,
       storeRootDir: deniedStore.storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),
@@ -679,7 +911,10 @@ describe("Sigma architecture", () => {
       authority: "user"
     }, 8);
     const durableDeniedRuntime = createRuntime({
-      gateway: new FakeGateway([{ message: { role: "assistant", content: "durable denial settled" }, finishReason: "stop" }]),
+      gateway: new FakeGateway([
+        { message: { role: "assistant", content: "durable denial settled" }, finishReason: "stop" },
+        confirmNoChange("confirm-durable-denial")
+      ]),
       store: durableDeniedStore.store,
       storeRootDir: durableDeniedStore.storeRootDir,
       tools: registerBuiltinTools(new EffectToolRegistry()),

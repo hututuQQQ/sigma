@@ -86,7 +86,7 @@ function evidence(): EvidenceRecord {
 }
 
 function protectedAnswer(answer: string): KernelState {
-  let state = apply(initial(), "user.message", { text: "answer with evidence" });
+  let state = apply({ ...initial(), mode: "analyze" }, "user.message", { text: "answer with evidence" });
   state = apply(state, "evidence.recorded", evidence());
   return settleModel(startModel(state, 1), {
     message: { role: "assistant", content: answer },

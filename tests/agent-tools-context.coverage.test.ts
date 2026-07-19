@@ -147,6 +147,18 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(JSON.parse(completed.output)).toEqual({
       summary: "done", warnings: ["advisory review was unavailable"]
     });
+    expect(blocked.inputSchema).toMatchObject({ required: ["summary"] });
+    const reported = await tools.execute(request(
+      "blocked",
+      "report_blocked",
+      { summary: "The required executable is unavailable." }
+    ), context("."));
+    expect(reported).toMatchObject({
+      ok: true,
+      observedEffects: ["outcome.report_blocked"],
+      diagnostics: []
+    });
+    expect(JSON.parse(reported.output)).toEqual({ summary: "The required executable is unavailable." });
   });
 
   it("loads instructions for an existing extensionless file from its parent directory", async () => {

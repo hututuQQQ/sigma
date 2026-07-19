@@ -112,11 +112,16 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("container", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
+            self.assertEqual(command[command.index("--permission-mode") + 1], "auto")
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertEqual(
+                session_command[session_command.index("--permission-mode") + 1],
+                "auto",
+            )
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
 
     async def test_container_setup_never_manufactures_host_persistence(self):
@@ -363,7 +368,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             command, kwargs = main_commands[0]
             self.assertIn("--prompt-file /tmp/agent/instruction.md", command)
             self.assertIn("--run-deadline-sec 600", command)
-            self.assertIn("--permission-mode workspace-auto", command)
+            self.assertIn("--permission-mode auto", command)
             self.assertIn("--agent-profile standard", command)
             self.assertIn("--output-format stream-json", command)
             self.assertIn("--output-schema 3", command)

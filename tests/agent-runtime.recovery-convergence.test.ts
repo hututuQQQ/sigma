@@ -17,6 +17,7 @@ import { restoreStoredSession } from "../packages/agent-runtime/src/restore-sess
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
 import { convergedToolFailure } from "../packages/agent-runtime/src/capability-failure-convergence.js";
 import { resolveToolIdleWatchdogMs } from "../packages/agent-runtime/src/tool-execution-monitor.js";
+import { completionRepairPhase } from "../packages/agent-runtime/src/tool-turn-policy.js";
 import type { RuntimeOptions } from "../packages/agent-runtime/src/types.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -59,6 +60,64 @@ describe("runtime recovery convergence", () => {
     expect(convergedToolFailure(
       session, { ...first, id: "retry" }, "2026-01-01T00:00:00.000Z", failure, signal
     ).diagnostics).toContain("capability_retry_exhausted");
+  });
+
+  it("converges repeated unavailable executables without merging different invocations", () => {
+    const session = runtimeSessionFixture();
+    session.interaction.capabilityFailures = new Map();
+    const signal = new AbortController().signal;
+    const failure = Object.assign(new Error("executable is not trusted"), { code: "executable_unavailable" });
+    const shell = { id: "shell-1", name: "exec", arguments: { executable: "/bin/shell", args: [] } };
+    const other = { id: "other-1", name: "exec", arguments: { executable: "/bin/other", args: [] } };
+
+    expect(convergedToolFailure(
+      session, shell, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("executable_unavailable");
+    expect(convergedToolFailure(
+      session, other, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("executable_unavailable");
+    expect(convergedToolFailure(
+      session, { ...shell, id: "shell-2" }, "2026-01-01T00:00:00.000Z", failure, signal
+    ).diagnostics).toContain("capability_retry_exhausted");
+  });
+
+  it("allows natural completion only after assurance readiness actually advances", () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.mutationFrontier = {
+      revision: 1,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "a".repeat(64),
+      changedPaths: ["src/code.js"],
+      sourceCheckpointIds: ["checkpoint"]
+    };
+    session.durable.state.completionRepairAttempts = 1;
+    session.durable.state.completionRepair = {
+      kind: "completion_prerequisite",
+      answer: "done",
+      arguments: { summary: "done" },
+      originalCallId: "complete",
+      evidenceCount: 0,
+      retryCount: 0,
+      modelTurn: { turnId: 1, effectRevision: 1 }
+    };
+    const validation = (kind: "probe" | "unit", coveredPaths: string[]): ValidationEvidence => ({
+      evidenceId: kind, sessionId: session.identity.sessionId, runId: session.durable.runId,
+      kind: "validation", status: "passed", createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool", id: kind }, summary: kind,
+      data: {
+        validator: "command", command: kind, exitCode: 0, artifactIds: [], frontierRevision: 1,
+        stateDigest: "a".repeat(64), coveredPaths,
+        claim: {
+          kind, commandDigest: kind.padEnd(64, "0"), status: "passed",
+          subject: { projectId: ".", configPaths: [], selectedTests: [], exactFiles: [] }
+        }
+      }
+    });
+
+    session.durable.state.evidence = [validation("probe", [])];
+    expect(completionRepairPhase(session)).toBe("evidence");
+    session.durable.state.evidence.push(validation("unit", ["src/code.js"]));
+    expect(completionRepairPhase(session)).toBe("protected_completion");
   });
 
   it("keeps the outer idle watchdog behind a tool-owned idle deadline and allows an explicit policy", () => {

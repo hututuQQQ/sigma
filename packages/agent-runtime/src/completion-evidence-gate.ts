@@ -95,6 +95,27 @@ function commonTerminalFailure(
   return null;
 }
 
+function runtimeOwnsCompletion(session: RuntimeSession, call: ModelToolCall): boolean {
+  if (call.name !== "runtime_finalize" || !call.id.startsWith("runtime_completion_intent_")) return false;
+  const pending = session.durable.state.pendingTools.find((item) => item.request.callId === call.id);
+  // Snapshots written before the origin marker are still resumable. New
+  // provider-created calls are explicitly marked as model-owned.
+  return pending?.origin === "runtime" || pending?.origin === undefined;
+}
+
+function completionAuthorityFailure(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  startedAt: string
+): ToolReceipt | null {
+  const noChangeConfirmation = call.name === "confirm_no_change"
+    && session.durable.state.completionRepair?.kind === "no_change_confirmation";
+  if (noChangeConfirmation || runtimeOwnsCompletion(session, call)) return null;
+  return failed(call, startedAt,
+    "Completion is owned by the runtime coordinator and cannot be invoked as a model tool.",
+    "internal_tool_denied", { status: "rejected", code: "internal_tool_denied" });
+}
+
 export function completionFailure(
   session: RuntimeSession,
   call: ModelToolCall,
@@ -107,12 +128,9 @@ export function completionFailure(
   const common = commonTerminalFailure(session, call, startedAt);
   if (common) return common;
   if (!descriptor.possibleEffects.includes("outcome.propose")) return null;
-  if (call.name !== "runtime_finalize" || !call.id.startsWith("runtime_completion_intent_")) {
-    return failed(call, startedAt,
-      "Completion is owned by the runtime coordinator and cannot be invoked as a model tool.",
-      "internal_tool_denied", { status: "rejected", code: "internal_tool_denied" });
-  }
-  if (!parseCompletionProposal(call.arguments)) {
+  const authorityFailure = completionAuthorityFailure(session, call, startedAt);
+  if (authorityFailure) return authorityFailure;
+  if (call.name === "runtime_finalize" && !parseCompletionProposal(call.arguments)) {
     return failed(call, startedAt, "Completion proposal does not match the V5 schema.", "invalid_completion_proposal", {
       status: "rejected", code: "invalid_completion_proposal"
     });
@@ -144,10 +162,14 @@ function validationOrReviewFailure(
   const frontier = session.durable.state.mutationFrontier;
   const validation = frontierValidationReadiness(session);
   if (!validation.ready) {
+    const observedClaims = [...new Set(validation.validations
+      .filter((item) => item.status === "passed")
+      .map((item) => item.data.claim?.kind ?? "untyped"))].sort();
+    const observed = observedClaims.length > 0 ? observedClaims.join(", ") : "none";
     return failed(call, startedAt,
       validation.latestFailed
-        ? `Current-state semantic validation failed; repair and validate again, or use report_blocked. Missing claims: ${validation.missingClaims.join(", ")}; missing coverage: ${validation.missingPaths.join(", ")}.`
-        : `Current-state semantic validation is required. Missing claims: ${validation.missingClaims.join(", ")}; paths: ${validation.missingPaths.join(", ")}.`,
+        ? `Current-state semantic validation failed; repair and validate again, or use report_blocked. Recognized passed claims: ${observed}; missing claims: ${validation.missingClaims.join(", ")}; missing coverage: ${validation.missingPaths.join(", ")}.`
+        : `Current-state semantic validation is required. Recognized passed claims: ${observed}; missing claims: ${validation.missingClaims.join(", ")}; paths: ${validation.missingPaths.join(", ")}.`,
       validation.latestFailed ? "validation_failed" : "validation_evidence_required",
       {
         status: "rejected",
@@ -156,6 +178,7 @@ function validationOrReviewFailure(
         stateDigest: frontier.currentStateDigest,
         missingPaths: validation.missingPaths,
         missingClaims: validation.missingClaims,
+        observedClaims,
         nextActions: validation.latestFailed
           ? [{ tool: "report_blocked", when: "repair is exhausted" }, { tool: "validate", after: "repair" }]
           : [{ tool: "validate", deriveCoverageFrom: ["semantic_command_adapter"] }]

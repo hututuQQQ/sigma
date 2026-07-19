@@ -91,6 +91,17 @@ function complete(summary: string): (request: ModelRequest) => ModelResponse {
   });
 }
 
+function confirmNoChange(id: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id, name: "confirm_no_change", arguments: {} }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function evidenceRequest(callId: string): ModelResponse {
   return {
     message: {
@@ -229,7 +240,7 @@ describe("run command branch coverage", () => {
       "--permission-mode", "auto",
       "--output-format", "stream-json"
     ], { stdin, stdout, stderr, ...runDeps([
-      evidenceRequest("stream-evidence"), complete("stream complete")
+      evidenceRequest("stream-evidence"), complete("stream complete"), confirmNoChange("confirm-stream")
     ]) });
     expect(code).toBe(0);
     const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
@@ -344,7 +355,7 @@ describe("run command branch coverage", () => {
     const completion = allowed ? complete("approved complete") : complete("denied complete");
     const script = allowed
       ? [writeRequest(), validationRequest(), completion]
-      : [writeRequest(), evidenceRequest("denial-evidence"), completion];
+      : [writeRequest(), evidenceRequest("denial-evidence"), completion, confirmNoChange("confirm-denial")];
     // Explicit ask mode prompts for both the mutation and its process validation.
     const responses = allowed ? [answer, "a"] : [answer];
     let sent = 0;

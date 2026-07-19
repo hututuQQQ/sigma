@@ -6,6 +6,7 @@ import type { RuntimeSession } from "./types.js";
 const CAPABILITY_FAILURE_CODES = new Set([
   "filesystem_acl_unsupported", "external_read_required", "write_scope_invalid",
   "network_capability_unavailable", "network_unavailable", "toolchain_unavailable",
+  "executable_unavailable",
   "container_unavailable", "sandbox_recovery_required", "sandbox_unavailable",
   "sandbox_recovery_failed"
 ]);

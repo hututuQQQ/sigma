@@ -901,40 +901,65 @@ async function verifyAttempt(context, lifecycle, prepared, subjectResult, collec
   return { verifier, verifierDelta };
 }
 
-function attemptReliabilitySignals(collected, verified, expectedActual, subjectResult) {
-  const { rawMetrics, events, stored } = collected;
-  const { verifier, verifierDelta } = verified;
-  const reliabilitySignals = [
-    ...(subjectResult.productFailure ? [{ severity: "blocker", ...subjectResult.productFailure }] : []),
-    ...(subjectResult.orphanCleanupError ? [{
-      severity: "blocker", code: "orphan_process_cleanup_failed", owner: "subject", phase: "subject_cleanup"
-    }] : []),
-    ...rawMetrics.hardFailures.map((failure) => ({ severity: "blocker", ...failure }))
-  ];
+function matchedExpectedFailureCode(scenario, expectedActual, verifier) {
+  return scenario.expectedTerminal === "error"
+    && expectedActual === "error"
+    && verifier.delivery.status === "pass"
+    ? scenario.expectedFailureCode ?? null
+    : null;
+}
+
+function convergenceReliabilitySignals(rawMetrics, expectedFailureCode) {
+  const signals = [];
   for (const episode of rawMetrics.failureConvergence.episodes) {
-    if (episode.status === "failed") reliabilitySignals.push({
+    if (episode.status === "failed" && episode.family !== expectedFailureCode) signals.push({
       severity: "blocker", code: episode.family, owner: "subject", phase: "sandbox_launch",
       firstSeq: episode.firstSeq, evidenceSeq: episode.evidenceSeq
     });
-    if (episode.failFastMissed) reliabilitySignals.push({
+    if (episode.failFastMissed) signals.push({
       severity: "blocker", code: "fail_fast_missed", owner: "subject", phase: "failure_convergence",
       seq: episode.missedSeq, attempts: episode.attempts, overshoot: episode.overshoot
     });
   }
-  const substantiveVerifierFailures = verifier.checks.filter((check) => check.type !== "terminal" && !check.passed);
-  if (verifier.validity !== "invalid" && expectedActual === "completed" && substantiveVerifierFailures.length > 0) reliabilitySignals.push({
-    severity: "blocker",
-    code: "completion_verifier_mismatch",
-    failedChecks: substantiveVerifierFailures.map((check) => ({ index: check.index, type: check.type }))
+  return signals;
+}
+
+function verifierReliabilitySignals(verifier, verifierDelta, expectedActual) {
+  const signals = [];
+  const substantiveFailures = verifier.checks.filter((check) => check.type !== "terminal" && !check.passed);
+  if (verifier.validity !== "invalid" && expectedActual === "completed" && substantiveFailures.length > 0) {
+    signals.push({
+      severity: "blocker",
+      code: "completion_verifier_mismatch",
+      failedChecks: substantiveFailures.map((check) => ({ index: check.index, type: check.type }))
+    });
+  }
+  const changes = verifierDelta.added.length + verifierDelta.modified.length + verifierDelta.deleted.length;
+  if (changes > 0) signals.push({
+    severity: "warning", code: "verifier_workspace_mutation", delta: verifierDelta
   });
+  return signals;
+}
+
+function attemptReliabilitySignals(collected, verified, expectedActual, subjectResult, scenario) {
+  const { rawMetrics, events, stored } = collected;
+  const { verifier, verifierDelta } = verified;
+  const expectedFailureCode = matchedExpectedFailureCode(scenario, expectedActual, verifier);
+  const unexpectedFailure = (failure) => !expectedFailureCode || failure?.code !== expectedFailureCode;
+  const reliabilitySignals = [
+    ...(subjectResult.productFailure && unexpectedFailure(subjectResult.productFailure)
+      ? [{ severity: "blocker", ...subjectResult.productFailure }] : []),
+    ...(subjectResult.orphanCleanupError ? [{
+      severity: "blocker", code: "orphan_process_cleanup_failed", owner: "subject", phase: "subject_cleanup"
+    }] : []),
+    ...rawMetrics.hardFailures.filter(unexpectedFailure).map((failure) => ({ severity: "blocker", ...failure })),
+    ...convergenceReliabilitySignals(rawMetrics, expectedFailureCode),
+    ...verifierReliabilitySignals(verifier, verifierDelta, expectedActual)
+  ];
   if (rawMetrics.consecutiveToolFailures.longest >= 3) reliabilitySignals.push({
     severity: "warning", code: "consecutive_tool_failures",
     count: rawMetrics.consecutiveToolFailures.longest,
     evidence: rawMetrics.consecutiveToolFailures.streaks[0]
-  });
-  const verifierChanges = verifierDelta.added.length + verifierDelta.modified.length + verifierDelta.deleted.length;
-  if (verifierChanges > 0) reliabilitySignals.push({
-    severity: "warning", code: "verifier_workspace_mutation", delta: verifierDelta
   });
   if (events.length === 0) reliabilitySignals.push({ severity: "blocker", code: "missing_durable_events" });
   if (stored.storeError) reliabilitySignals.push({
@@ -1007,7 +1032,8 @@ function workspaceMutationCause(rawMetrics, safetyViolations) {
   });
 }
 
-function terminalCause(rawMetrics, subjectResult, expectedActual) {
+function terminalCause(rawMetrics, subjectResult, expectedActual, expectedFailureSatisfied = false) {
+  if (expectedFailureSatisfied) return null;
   if (rawMetrics.terminal.status === "failed") return failureCause({
     code: rawMetrics.terminal.code ?? "run_failed", owner: "subject", phase: "terminal", seq: rawMetrics.terminal.seq
   });
@@ -1019,9 +1045,17 @@ function terminalCause(rawMetrics, subjectResult, expectedActual) {
     : null;
 }
 
-export function buildFailureChainV2(rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, invalidCause = null) {
+export function buildFailureChainV2(
+  rawMetrics,
+  safetyViolations,
+  reliabilitySignals,
+  subjectResult,
+  expectedActual,
+  invalidCause = null,
+  expectedFailureSatisfied = false
+) {
   if (invalidCause) return { primary: invalidCause, contributing: [], terminal: invalidCause };
-  const terminal = terminalCause(rawMetrics, subjectResult, expectedActual);
+  const terminal = terminalCause(rawMetrics, subjectResult, expectedActual, expectedFailureSatisfied);
   const terminalCodes = new Set([terminal?.code, "deadline_exceeded"]);
   const canonicalAliases = new Set(["read_only_workspace_mutation"]);
   const otherBlockers = reliabilitySignals
@@ -1046,6 +1080,51 @@ export function buildFailureChainV2(rawMetrics, safetyViolations, reliabilitySig
   };
 }
 
+function attemptValidity(stored, verifier) {
+  const cause = stored.storeError
+    ? { code: "event_store_read_failed", owner: "evaluator", phase: "event_collection" }
+    : verifier.validity === "invalid"
+      ? { code: "verifier_infrastructure_error", owner: "verifier", phase: "verifier" }
+      : null;
+  return { cause, status: cause ? "invalid" : "valid" };
+}
+
+function attemptOutcome(scenario, expectedActual, expectedFailureSatisfied, subjectResult, rawMetrics, stored) {
+  return {
+    status: expectedActual,
+    finishReason: subjectResult.result?.finishReason ?? rawMetrics.terminal.code ?? rawMetrics.terminal.type,
+    sessionId: stored.sessionId,
+    exitCode: subjectResult.exitCode,
+    expectedTerminal: scenario.expectedTerminal,
+    ...(scenario.expectedFailureCode ? {
+      expectedFailureCode: scenario.expectedFailureCode,
+      failureCode: rawMetrics.terminal.code ?? subjectResult.productFailure?.code ?? null
+    } : {}),
+    expected: expectedActual === scenario.expectedTerminal
+      && (!scenario.expectedFailureCode || expectedFailureSatisfied)
+  };
+}
+
+function attemptDimensions(input) {
+  const { validity, verifier, safetyViolations, experienceViolations, reliabilitySignals, rawMetrics, scenario } = input;
+  return {
+    correctness: {
+      status: validity === "valid" ? verifier.status : "not_observed",
+      checks: verifier.checks.filter((check) => check.type !== "terminal")
+    },
+    delivery: { status: validity === "valid" ? verifier.delivery.status : "not_observed", checks: [verifier.delivery.check] },
+    safety: { status: safetyViolations.length === 0 ? "pass" : "fail", violations: safetyViolations },
+    experience: {
+      status: experienceViolations.length === 0 ? "pass" : "fail", violations: experienceViolations,
+      warnings: experienceWarnings(rawMetrics, scenario)
+    },
+    reliability: {
+      status: reliabilitySignals.some((signal) => signal.severity === "blocker") ? "fail" : "pass",
+      signals: reliabilitySignals
+    }
+  };
+}
+
 function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
   const { runId, runDir, scenario, repetition } = context;
   const { attemptId, attemptArtifactDir, startedAt } = lifecycle;
@@ -1053,44 +1132,28 @@ function buildAttemptReport(context, lifecycle, collected, verified, evidence) {
     reliabilitySignals, subjectConfig, finalWorkspaceArtifact } = evidence;
   const { stored, rawMetrics, metrics } = collected;
   const { verifier } = verified;
-  const validityCause = stored.storeError
-    ? { code: "event_store_read_failed", owner: "evaluator", phase: "event_collection" }
-    : verifier.validity === "invalid"
-      ? { code: "verifier_infrastructure_error", owner: "verifier", phase: "verifier" }
-      : null;
-  const validity = validityCause ? "invalid" : "valid";
+  const expectedFailureSatisfied = scenario.expectedTerminal === "error"
+    && expectedActual === "error"
+    && verifier.delivery.status === "pass";
+  const validity = attemptValidity(stored, verifier);
   return {
     schemaVersion: 2, kind: "eval_attempt", runId, attemptId,
     scenarioId: scenario.id, suites: scenario.suites, repetition, startedAt,
     finishedAt: new Date().toISOString(), subject: subjectConfig,
-    validity,
-    ...(validity === "invalid" ? {
-      validityDetail: validityCause
+    validity: validity.status,
+    ...(validity.status === "invalid" ? {
+      validityDetail: validity.cause
     } : {}),
-    outcome: {
-      status: expectedActual,
-      finishReason: subjectResult.result?.finishReason ?? rawMetrics.terminal.code ?? rawMetrics.terminal.type,
-      sessionId: stored.sessionId, exitCode: subjectResult.exitCode,
-      expectedTerminal: scenario.expectedTerminal, expected: expectedActual === scenario.expectedTerminal
-    },
-    dimensions: {
-      correctness: {
-        status: validity === "valid" ? verifier.status : "not_observed",
-        checks: verifier.checks.filter((check) => check.type !== "terminal")
-      },
-      delivery: { status: validity === "valid" ? verifier.delivery.status : "not_observed", checks: [verifier.delivery.check] },
-      safety: { status: safetyViolations.length === 0 ? "pass" : "fail", violations: safetyViolations },
-      experience: {
-        status: experienceViolations.length === 0 ? "pass" : "fail", violations: experienceViolations,
-        warnings: experienceWarnings(rawMetrics, scenario)
-      },
-      reliability: {
-        status: reliabilitySignals.some((signal) => signal.severity === "blocker") ? "fail" : "pass",
-        signals: reliabilitySignals
-      }
-    },
+    outcome: attemptOutcome(
+      scenario, expectedActual, expectedFailureSatisfied, subjectResult, rawMetrics, stored
+    ),
+    dimensions: attemptDimensions({
+      validity: validity.status, verifier, safetyViolations, experienceViolations,
+      reliabilitySignals, rawMetrics, scenario
+    }),
     failureChain: buildFailureChainV2(
-      rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, validityCause
+      rawMetrics, safetyViolations, reliabilitySignals, subjectResult, expectedActual, validity.cause,
+      expectedFailureSatisfied
     ),
     metrics,
     artifacts: attemptArtifactPaths(runDir, attemptArtifactDir, scenario.surface, finalWorkspaceArtifact),
@@ -1120,7 +1183,7 @@ async function runAttemptCore(context, deps, lifecycle) {
   await copyWorkspaceEvidence(prepared.workspace, finalWorkspaceArtifact);
   const experienceViolations = experienceViolationsFromEvidence(scenario, subjectResult, collected.metrics, collected.events);
   const expectedActual = actualTerminal(collected.metrics, subjectResult);
-  const reliabilitySignals = attemptReliabilitySignals(collected, verified, expectedActual, subjectResult);
+  const reliabilitySignals = attemptReliabilitySignals(collected, verified, expectedActual, subjectResult, scenario);
   const subjectConfig = subjectConfiguration(context, prepared.fixtureSnapshot);
   lifecycle.phase = "report";
   const attempt = buildAttemptReport(context, lifecycle, collected, verified, {

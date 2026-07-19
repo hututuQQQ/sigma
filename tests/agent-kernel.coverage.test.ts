@@ -25,6 +25,7 @@ import {
   rehydrate,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
+import { canonicalReportedBlockerCode } from "../packages/agent-kernel/src/terminal-reducer-helpers.js";
 
 function diagnosticEvidence(id = "evidence"): EvidenceRecord {
   return {
@@ -50,6 +51,50 @@ function initial(): KernelState {
   });
 }
 
+function frontierEvidence(
+  state: KernelState,
+  kind: "validation" | "review",
+  status: "passed" | "failed" = "failed"
+): EvidenceRecord {
+  const base = {
+    evidenceId: `${kind}-${status}`,
+    sessionId: state.sessionId,
+    runId: state.runId,
+    kind,
+    status,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    producer: { authority: "runtime" as const },
+    summary: `${kind} ${status}`
+  };
+  if (kind === "review") return {
+    ...base,
+    kind,
+    data: {
+      reviewerId: "reviewer",
+      verdict: status === "failed" ? "changes_requested" : "approved",
+      findings: [],
+      frontierRevision: state.mutationFrontier.revision,
+      stateDigest: state.mutationFrontier.currentStateDigest
+    }
+  };
+  return {
+    ...base,
+    kind,
+    data: {
+      validator: "test",
+      frontierRevision: state.mutationFrontier.revision,
+      stateDigest: state.mutationFrontier.currentStateDigest,
+      coveredPaths: [],
+      claim: {
+        kind: "unit",
+        commandDigest: "a".repeat(64),
+        subject: { configPaths: [], selectedTests: [], exactFiles: [] },
+        status: status === "failed" ? "failed" : "passed"
+      }
+    }
+  };
+}
+
 function envelope(state: KernelState, type: AgentEventType, payload: JsonValue = {}): AgentEventEnvelope {
   return {
     schemaVersion: EVENT_SCHEMA_VERSION,
@@ -67,6 +112,44 @@ function envelope(state: KernelState, type: AgentEventType, payload: JsonValue =
 function apply(state: KernelState, type: AgentEventType, payload: JsonValue = {}): KernelState {
   return evolve(state, envelope(state, type, payload));
 }
+
+describe("runtime-owned blocker taxonomy", () => {
+  it("prefers current validation and maps other durable blocker families", () => {
+    const validation = initial();
+    validation.evidence.push(frontierEvidence(validation, "validation"));
+    expect(canonicalReportedBlockerCode(validation)).toBe("validation_failed");
+
+    const review = initial();
+    review.evidence.push(frontierEvidence(review, "review"));
+    expect(canonicalReportedBlockerCode(review)).toBe("review_blocked");
+
+    const capability = initial();
+    capability.semanticFailureCluster = {
+      family: "executable_unavailable",
+      attempts: 2,
+      firstRevision: 0,
+      lastRevision: 0,
+      diagnosticCodes: ["executable_unavailable"],
+      progress: capability.semanticProgress
+    };
+    expect(canonicalReportedBlockerCode(capability)).toBe("capability_unavailable");
+
+    const input = initial();
+    input.evidence.push({
+      evidenceId: "input-failed",
+      sessionId: input.sessionId,
+      runId: input.runId,
+      kind: "input_access",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime" },
+      summary: "input unavailable",
+      data: { path: "required.txt", scope: "workspace", failureCode: "not_found" }
+    });
+    expect(canonicalReportedBlockerCode(input)).toBe("input_unavailable");
+    expect(canonicalReportedBlockerCode(initial())).toBe("reported_blocker");
+  });
+});
 
 function startModel(state: KernelState, turnId = 1): KernelState {
   return apply(state, "model.started", { turnId, effectRevision: state.revision });
@@ -208,7 +291,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
   });
 
-  it("converts an evidence-backed ordinary text stop into a completion intent", () => {
+  it("converts a zero-change question into a typed terminal input decision", () => {
     let state = apply(initial(), "user.message", { text: "inspect the current state" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
     state = settleModel(startModel(state), "model.completed", {
@@ -217,17 +300,22 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       finishReason: "stop"
     });
     expect(state).toMatchObject({
-      phase: "tool_pending",
-      completionRepairAttempts: 0,
-      pendingTools: [{ request: { name: "runtime_finalize", arguments: {
-        summary: "Which target should I change?"
-      } } }]
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "no_change_confirmation",
+        answer: "Which target should I change?"
+      }
     });
-    const callId = state.pendingTools[0]!.request.callId;
-    state = toolEvent(state, "tool.completed", callId, {
+    state = proposeToolBatch(state, 2, [{
+      id: "confirm-input-needed",
+      name: "request_user_input",
+      arguments: { message: "Which target should I change?" }
+    }]);
+    state = toolEvent(state, "tool.completed", "confirm-input-needed", {
       ok: true,
-      output: JSON.stringify({ summary: "Which target should I change?" }),
-      observedEffects: ["outcome.propose"],
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
       artifacts: [],
       diagnostics: [],
       startedAt: "start",
@@ -236,15 +324,42 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "outcome_pending",
       proposedOutcome: {
-        kind: "completed",
+        kind: "needs_input",
+        requestId: "confirm-input-needed",
         message: "Which target should I change?"
       }
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
+  });
 
+  it("preserves the original no-change answer after explicit confirmation", () => {
+    let state = apply(initial(), "user.message", { text: "make the already-satisfied change" });
+    state = settleModel(startModel(state), "model.completed", {
+      message: { role: "assistant", content: "The requested state is already satisfied." },
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    state = proposeToolBatch(state, 2, [{
+      id: "confirm-no-change",
+      name: "confirm_no_change",
+      arguments: {}
+    }]);
+    state = toolEvent(state, "tool.completed", "confirm-no-change", {
+      ok: true,
+      output: JSON.stringify({ summary: "No workspace change is required." }),
+      observedEffects: ["outcome.propose"],
+      artifacts: [],
+      diagnostics: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    expect(state.proposedOutcome).toMatchObject({
+      kind: "completed",
+      message: "The requested state is already satisfied."
+    });
     const outcomeRevision = state.revision;
     state = apply(state, "run.completed", {
-      message: "Which target should I change?",
+      message: "The requested state is already satisfied.",
       outcomeRevision
     });
     expect(state).toMatchObject({
@@ -252,7 +367,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       completionRepairAttempts: 0,
       outcome: {
         kind: "completed",
-        message: "Which target should I change?"
+        message: "The requested state is already satisfied."
       }
     });
     expect(state.completionRepair).toBeUndefined();
@@ -287,7 +402,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
   });
 
   it("returns ordinary tools after a real completion blocker", () => {
-    let state = apply(initial(), "user.message", { text: "finish after settling blockers" });
+    let state = apply({ ...initial(), mode: "analyze" }, "user.message", { text: "finish after settling blockers" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("protected-blocker-evidence"));
     state = settleModel(startModel(state), "model.completed", {
       message: { role: "assistant", content: "The inspected result is stable." },
@@ -552,8 +667,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
     expect(conversational).toMatchObject({
-      phase: "tool_pending",
-      completionRepairAttempts: 0,
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "no_change_confirmation", answer: "answer" },
       proposedOutcome: undefined
     });
     const receipt = {
@@ -564,8 +680,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       message: { role: "assistant", content: "premature answer" }, toolCalls: [], finishReason: "stop"
     });
     expect(incomplete).toMatchObject({
-      phase: "tool_pending",
-      pendingTools: [{ request: { name: "runtime_finalize", arguments: { summary: "premature answer" } } }]
+      phase: "ready_model",
+      completionRepair: { kind: "no_change_confirmation", answer: "premature answer" }
     });
     const failedEvidence = settleModel({
       ...inFlight(),
@@ -575,7 +691,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(failedEvidence).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "runtime_finalize" } }] });
+    expect(failedEvidence).toMatchObject({
+      phase: "ready_model", completionRepair: { kind: "no_change_confirmation" }
+    });
     const provenanceOnly = settleModel({
       ...inFlight(),
       evidence: [{
@@ -587,7 +705,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       toolCalls: [],
       finishReason: "stop"
     });
-    expect(provenanceOnly).toMatchObject({ phase: "tool_pending", pendingTools: [{ request: { name: "runtime_finalize" } }] });
+    expect(provenanceOnly).toMatchObject({
+      phase: "ready_model", completionRepair: { kind: "no_change_confirmation" }
+    });
     const evidenceBacked = settleModel({
       ...inFlight(),
       evidence: [diagnosticEvidence("current-run-evidence")]
@@ -597,8 +717,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       finishReason: "stop"
     });
     expect(evidenceBacked).toMatchObject({
-      phase: "tool_pending",
-      pendingTools: [{ request: { name: "runtime_finalize", arguments: { summary: "evidence-backed answer" } } }]
+      phase: "ready_model",
+      completionRepair: { kind: "no_change_confirmation", answer: "evidence-backed answer" }
     });
     const protocolError = settleModel(inFlight(), "model.completed", {
       message: { role: "assistant", content: "invalid boundary" },
@@ -769,7 +889,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       startedAt: "start", completedAt: "end"
     });
     expect(repairedCompletion).toMatchObject({
-      proposedOutcome: { kind: "completed", message: "Detailed final answer." }
+      proposedOutcome: {
+        kind: "completed",
+        message: "Detailed final answer.\n\nResult: short summary"
+      }
     });
     const committedRevision = completion.revision;
     expect(apply(completion, "run.completed", {
@@ -903,6 +1026,51 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(decide(state).map((effect) => effect.type)).toEqual(["request_model"]);
     expect(() => assertKernelInvariants(state)).not.toThrow();
+  });
+
+  it("resets prerequisite stagnation when the structured completion deficit changes", () => {
+    const failure = (claims: string[], paths: string[]): Record<string, JsonValue> => ({
+      ok: false,
+      output: `Completion requires validation: ${claims.join(",")}; ${paths.join(",")}.`,
+      result: {
+        status: "rejected",
+        code: "validation_evidence_required",
+        frontierRevision: 2,
+        stateDigest: "a".repeat(64),
+        missingClaims: claims,
+        missingPaths: paths
+      },
+      outcome: {
+        status: "failed",
+        output: `Completion requires validation: ${claims.join(",")}; ${paths.join(",")}.`,
+        diagnosticCodes: ["validation_evidence_required"]
+      },
+      observedEffects: ["outcome.propose"],
+      artifacts: [],
+      diagnostics: ["validation_evidence_required"],
+      evidence: [],
+      startedAt: "start",
+      completedAt: "end"
+    });
+    const proposeCompletion = (state: KernelState, id: string, turn: number): KernelState =>
+      proposeToolBatch(state, turn, [{ id, name: "runtime_finalize", arguments: { summary: "done" } }]);
+
+    let state = withPendingTool("complete-initial", "runtime_finalize", { summary: "done" });
+    state = toolEvent(state, "tool.failed", "complete-initial", failure(
+      ["unit", "acceptance"], ["src/code.js", "settings.json"]
+    ));
+    expect(state.completionRepair).toMatchObject({ kind: "completion_prerequisite", retryCount: 0 });
+
+    state = proposeCompletion(state, "complete-progress", 2);
+    state = toolEvent(state, "tool.failed", "complete-progress", failure(["acceptance"], ["settings.json"]));
+    expect(state.completionRepair).toMatchObject({ kind: "completion_prerequisite", retryCount: 0 });
+
+    state = proposeCompletion(state, "complete-repeat-one", 3);
+    state = toolEvent(state, "tool.failed", "complete-repeat-one", failure(["acceptance"], ["settings.json"]));
+    expect(state.completionRepair).toMatchObject({ kind: "completion_prerequisite", retryCount: 1 });
+
+    state = proposeCompletion(state, "complete-repeat-two", 4);
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
   });
 
   it("advances a user-resolved checkpoint recovery out of NeedsInput", () => {

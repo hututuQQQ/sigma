@@ -52,7 +52,9 @@ export function resolveTrustedExecutable(
   toolchains: NormalizedTrustedToolchain[],
   cwd?: string
 ): string {
-  if (path.isAbsolute(executable)) return executable;
+  if (path.isAbsolute(executable)) {
+    return process.platform === "win32" ? executable : existingCanonicalFile(executable) ?? executable;
+  }
   const key = aliasKey(executable);
   const match = toolchains.find((toolchain) => toolchain.aliases.some((alias) => aliasKey(alias) === key));
   return match?.executable ?? resolveToolchainPathExecutable(executable, cwd, toolchains) ?? executable;

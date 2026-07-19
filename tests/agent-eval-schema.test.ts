@@ -208,6 +208,37 @@ describe("agent evaluation scenario schema", () => {
     })).toThrow(/not a valid regular expression/);
   });
 
+  it("supports expected failure codes only for error terminals", async () => {
+    const manifest = await loadEvalManifestV2(manifestPath);
+    const base = structuredClone(manifest.scenarios[0]);
+    expect(() => assertEvalScenarioV2({
+      ...base,
+      expectedTerminal: "error",
+      expectedFailureCode: "validation_failed"
+    })).not.toThrow();
+    expect(() => assertEvalScenarioV2({
+      ...base,
+      expectedFailureCode: "validation_failed"
+    })).toThrow(/requires expectedTerminal "error"/);
+  });
+
+  it("accepts numeric answer facts without requiring a regex", async () => {
+    const manifest = await loadEvalManifestV2(manifestPath);
+    const base = structuredClone(manifest.scenarios[0]);
+    expect(() => assertEvalScenarioV2({
+      ...base,
+      verifier: { checks: [{ type: "answer", numericValues: [440, 79_200] }] }
+    })).not.toThrow();
+    expect(() => assertEvalScenarioV2({
+      ...base,
+      verifier: { checks: [{ type: "answer" }] }
+    })).toThrow(/pattern or numericValues/);
+    expect(() => assertEvalScenarioV2({
+      ...base,
+      verifier: { checks: [{ type: "answer", numericValues: [1.5] }] }
+    })).toThrow(/safe integer/);
+  });
+
   it("runs the generic hidden Node verifier without mutating a fixture", async () => {
     const workspace = path.resolve(manifestDir, "scenarios/line-count-readonly/workspace");
     const verifier = path.resolve(manifestDir, "_shared/verify-workspace.mjs");

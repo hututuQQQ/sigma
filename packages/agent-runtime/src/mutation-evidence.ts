@@ -42,13 +42,13 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
   const requirement = assuranceRequirement(session);
   const passed = validations.filter((item) => item.status === "passed");
   const missingClaims = requirement.requiredClaims.filter((required) => {
-    const requiredPaths = assurancePathsForClaim(changed, required);
+    const requiredPaths = assurancePathsForClaim(changed, required, session);
     return requiredPaths.length > 0 && !requiredPaths.every((changedPath) => passed.some((validation) =>
       validationClaimSatisfies(validation.data.claim?.kind, required)
         && validation.data.coveredPaths.includes(changedPath)));
   });
   const coveredPaths = changed.filter((changedPath) => requirement.requiredClaims.every((required) => {
-    if (!assurancePathsForClaim([changedPath], required).includes(changedPath)) return true;
+    if (!assurancePathsForClaim([changedPath], required, session).includes(changedPath)) return true;
     return passed.some((validation) => validationClaimSatisfies(validation.data.claim?.kind, required)
       && validation.data.coveredPaths.includes(changedPath));
   }));

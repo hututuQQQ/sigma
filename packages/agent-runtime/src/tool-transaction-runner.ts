@@ -101,10 +101,11 @@ export class ToolTransactionRunner {
     if (!isToolAllowed(descriptor, session.durable.mode)) {
       return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.durable.mode} mode.`, "mode_denied");
     }
-    if (!profileAllowsTool(session, descriptor)) {
+    const repairPhase = completionRepairPhase(session);
+    const phaseInternal = repairPhase === "no_change_confirmation" && call.name === "confirm_no_change";
+    if (!phaseInternal && !profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
-    const repairPhase = completionRepairPhase(session);
     if (!descriptorAllowedForRepair(descriptor, repairPhase)) {
       return failed(
         call,

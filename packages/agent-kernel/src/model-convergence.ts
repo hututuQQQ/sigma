@@ -25,7 +25,8 @@ function propose(state: KernelState, outcome: RunOutcome): KernelState {
 }
 
 export function protectedCompletionAnswer(state: KernelState): string | null {
-  return state.completionRepair?.kind === "protected_completion"
+  return state.completionRepair?.kind === "no_change_confirmation"
+    || state.completionRepair?.kind === "protected_completion"
     || state.completionRepair?.kind === "protected_recovery"
     || state.completionRepair?.kind === "completion_prerequisite"
     ? state.completionRepair.answer
@@ -43,7 +44,8 @@ export function completionRepairRequiresTerminalAction(state: KernelState): bool
     return state.pendingTools.some((item) => item.request.name === "runtime_finalize");
   }
   if (state.completionRepair?.kind === "terminal_action"
-    || state.completionRepair?.kind === "protected_completion") return true;
+    || state.completionRepair?.kind === "protected_completion"
+    || state.completionRepair?.kind === "no_change_confirmation") return true;
   // Compatibility for snapshots written before the explicit repair intent was
   // introduced. Newly reduced states always carry completionRepair.
   return state.completionRepairAttempts > 0 && hasCurrentRunEvidence(state);
@@ -87,14 +89,17 @@ export function requestedInput(receipt: ToolReceipt): string | null {
   }
 }
 
-export function blockedReport(receipt: ToolReceipt): { code: string; message: string } | null {
+export function blockedReport(receipt: ToolReceipt): { codeHint?: string; message: string } | null {
   if (!receipt.ok || !receipt.observedEffects.includes("outcome.report_blocked")) return null;
   try {
     const value = JSON.parse(receipt.output) as { code?: unknown; summary?: unknown; recoveryAttempted?: unknown };
-    if (typeof value.code !== "string" || typeof value.summary !== "string") return null;
+    if (typeof value.summary !== "string") return null;
     const attempted = typeof value.recoveryAttempted === "string" && value.recoveryAttempted
       ? `\n\nRecovery attempted: ${value.recoveryAttempted}` : "";
-    return { code: value.code, message: `${value.summary}${attempted}` };
+    return {
+      ...(typeof value.code === "string" ? { codeHint: value.code } : {}),
+      message: `${value.summary}${attempted}`
+    };
   } catch { return null; }
 }
 
@@ -144,9 +149,10 @@ export function conflictingTerminalBatch(
   repairPending: boolean
 ): boolean {
   const completionCount = calls.filter((call) => call.name === "runtime_finalize").length;
+  const noChangeCount = calls.filter((call) => call.name === "confirm_no_change").length;
   const blockedCount = calls.filter((call) => call.name === "report_blocked").length;
   const inputRequestCount = calls.filter((call) => call.name === "request_user_input").length;
-  const terminalCount = completionCount + blockedCount + inputRequestCount;
+  const terminalCount = completionCount + noChangeCount + blockedCount + inputRequestCount;
   if (terminalCount === 0) return false;
   if (repairPending) return calls.length > 1 || terminalCount > 1;
   return inputRequestCount > 0 ? calls.length > 1 : terminalCount > 1;
@@ -252,6 +258,40 @@ export function incompleteModelCompletion(
       )
     });
   }
+  if (state.completionRepair?.kind === "no_change_confirmation") {
+    if (state.completionRepairAttempts >= 2) {
+      return propose({ ...state, messages }, {
+        kind: "recoverable_failure",
+        code: "convergence_no_progress",
+        message: completionRepairFailureMessage(
+          state,
+          "The no-change terminal confirmation was skipped twice without choosing a typed outcome."
+        )
+      });
+    }
+    return {
+      ...state,
+      messages: [...messages, {
+        role: "developer",
+        content: "Choose exactly one terminal intent: confirm_no_change, request_user_input, or report_blocked. Do not answer naturally in this confirmation phase."
+      }],
+      completionRepairAttempts: state.completionRepairAttempts + 1,
+      phase: "ready_model"
+    };
+  }
+  if (state.mode === "change" && state.mutationFrontier.changedPaths.length === 0) {
+    return {
+      ...state,
+      messages,
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "no_change_confirmation",
+        answer: protectedCompletionAnswer(state) ?? response
+      },
+      continuationAttempts: 0,
+      phase: "ready_model"
+    };
+  }
   const turnId = typeof payload.turnId === "number" ? payload.turnId : 0;
   const effectRevision = typeof payload.effectRevision === "number" ? payload.effectRevision : state.revision;
   const call = {
@@ -268,7 +308,8 @@ export function incompleteModelCompletion(
       request: { callId: call.id, name: call.name, arguments: call.arguments },
       modelTurn: { turnId, effectRevision },
       approval: "not_required",
-      started: false
+      started: false,
+      origin: "runtime"
     }],
     toolCallIds: [...state.toolCallIds, call.id],
     phase: "tool_pending"

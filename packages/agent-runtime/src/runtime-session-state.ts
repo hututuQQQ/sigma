@@ -51,6 +51,7 @@ export function createRuntimeSessionAggregate(seed: RuntimeSessionSeed): Runtime
     callApprovals: seed.callApprovals,
     alwaysAllowedEffects: seed.alwaysAllowedEffects,
     capabilityFailures: seed.capabilityFailures,
+    ...(seed.validationCapabilities ? { validationCapabilities: seed.validationCapabilities } : {}),
     steeringPending: seed.steeringPending,
     followUps: seed.followUps,
     contextItems: seed.contextItems,
@@ -66,6 +67,7 @@ export function createRuntimeSessionAggregate(seed: RuntimeSessionSeed): Runtime
   const services = {
     gateway: seed.gateway,
     modelRole: seed.modelRole,
+    ...(seed.runtimeEnvironment ? { runtimeEnvironment: seed.runtimeEnvironment } : {}),
     ...(seed.profile ? { profile: seed.profile } : {}),
     ...(seed.profileSource ? { profileSource: seed.profileSource } : {})
   };

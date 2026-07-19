@@ -47,6 +47,7 @@ async function manifest(options: {
   verifierCrash?: boolean;
   initialDirty?: boolean;
   repeat?: number;
+  expectedFailureCode?: string;
 } = {}): Promise<{ root: string; manifestPath: string }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-runner-"));
   temporary.push(root);
@@ -80,7 +81,8 @@ async function manifest(options: {
       userMessages: ["Inspect the value and report completion."],
       surface: "cli",
       permissionPolicy: "auto",
-      expectedTerminal: "completed",
+      expectedTerminal: options.expectedFailureCode ? "error" : "completed",
+      ...(options.expectedFailureCode ? { expectedFailureCode: options.expectedFailureCode } : {}),
       allowedChanges: [],
       interactions: [],
       capabilities: ["filesystem.read"],
@@ -366,6 +368,46 @@ describe("agent experience evaluation runner", () => {
     expect(result.run.attempts[0]).toMatchObject({
       validity: "valid",
       dimensions: { correctness: { status: "pass" }, delivery: { status: "fail" } }
+    });
+  });
+
+  it("treats an exact expected recoverable failure as reliable but preserves extra blockers", async () => {
+    const runExpectedFailure = async (name: string, message: string) => {
+      const fixture = await manifest({ expectedFailureCode: "validation_failed" });
+      return await runEvaluation({
+        suite: "quick",
+        manifestPath: fixture.manifestPath,
+        runDir: path.join(fixture.root, name)
+      }, {
+        secrets: { DEEPSEEK_API_KEY: "test-secret-value-12345" },
+        prepareSubject: async () => ({ subjectKind: "fake", cliEntry: "fake", nodePath: "fake" }),
+        runSubject: async (input: Record<string, unknown>) => {
+          await writeFile(path.join(String(input.artifactDir), "subject.stdout.log"), "", "utf8");
+          await writeFile(path.join(String(input.artifactDir), "subject.stderr.log"), "", "utf8");
+          return {
+            exitCode: 1,
+            result: { status: "error", finishReason: "validation_failed", finalMessage: "Validation failed." },
+            events: [
+              event(1, "run.started", { mode: "change" }),
+              event(2, "model.completed", { text: "Validation failed.", finishReason: "stop", toolCalls: [] }),
+              event(3, "run.failed", { code: "validation_failed", message })
+            ]
+          };
+        }
+      });
+    };
+
+    const expected = await runExpectedFailure("expected-error", "Validation failed.");
+    expect(expected.run.attempts[0]).toMatchObject({
+      outcome: { status: "error", expectedFailureCode: "validation_failed", expected: true },
+      dimensions: { delivery: { status: "pass" }, reliability: { status: "pass" } },
+      failureChain: { primary: null, terminal: null }
+    });
+
+    const withExtraBlocker = await runExpectedFailure("expected-error-with-deadline", "validation_failed plus budget_exhausted");
+    expect(withExtraBlocker.run.attempts[0]).toMatchObject({
+      dimensions: { delivery: { status: "pass" }, reliability: { status: "fail" } },
+      failureChain: { primary: expect.objectContaining({ code: "deadline_exceeded" }) }
     });
   });
 

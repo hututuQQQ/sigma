@@ -34,7 +34,7 @@ export const EVAL_AB_ORDERS_V1 = Object.freeze(["interleaved_baseline_first", "i
  *
  * @typedef {{type: "command", argv: string[], expectedExitCode?: number, timeoutMs?: number}} EvalCommandCheckV1
  * @typedef {{type: "file", path: string, exists?: boolean, equals?: string, contains?: string, notContains?: string}} EvalFileCheckV1
- * @typedef {{type: "answer", pattern: string, flags?: string, minMatches?: number, maxMatches?: number}} EvalAnswerCheckV1
+ * @typedef {{type: "answer", pattern?: string, numericValues?: number[], flags?: string, minMatches?: number, maxMatches?: number}} EvalAnswerCheckV1
  * @typedef {{type: "event_count", eventType: string, toolName?: string, minCount?: number, maxCount?: number}} EvalEventCountCheckV1
  * @typedef {{type: "git_diff", allowedPaths?: string[], requireClean?: boolean, preserveInitial?: boolean}} EvalGitDiffCheckV1
  * @typedef {EvalCommandCheckV1 | EvalFileCheckV1 | EvalAnswerCheckV1 | EvalEventCountCheckV1 | EvalGitDiffCheckV1} EvalVerifierCheckV1
@@ -49,6 +49,7 @@ export const EVAL_AB_ORDERS_V1 = Object.freeze(["interleaved_baseline_first", "i
  * @property {EvalSurfaceV1} surface
  * @property {EvalPermissionPolicyV1} permissionPolicy
  * @property {EvalTerminalV1} expectedTerminal
+ * @property {string} [expectedFailureCode]
  * @property {EvalBudgetV1} budget
  * @property {string[]} allowedChanges
  * @property {EvalInteractionV1[]} interactions
@@ -59,7 +60,7 @@ export const EVAL_AB_ORDERS_V1 = Object.freeze(["interleaved_baseline_first", "i
 
 const scenarioKeys = new Set([
   "schemaVersion", "id", "title", "suites", "fixture", "userMessages", "surface",
-  "permissionPolicy", "expectedTerminal", "budget", "allowedChanges", "interactions", "verifier"
+  "permissionPolicy", "expectedTerminal", "expectedFailureCode", "budget", "allowedChanges", "interactions", "verifier"
 ]);
 
 function isRecord(value) {
@@ -232,11 +233,18 @@ function validateFileCheck(check, label) {
   }
 }
 
-function validateAnswerCheck(check, label) {
-  rejectUnknownKeys(check, new Set(["type", "pattern", "flags", "minMatches", "maxMatches"]), label);
+function validateAnswerPattern(check, label) {
+  if (!own(check, "pattern")) {
+    if (["flags", "minMatches", "maxMatches"].some((key) => own(check, key))) {
+      throw new TypeError(`${label} match flags and bounds require pattern`);
+    }
+    return;
+  }
   const pattern = requireString(check.pattern, `${label}.pattern`);
   const flags = own(check, "flags") ? check.flags : "iu";
-  if (typeof flags !== "string" || /[^dgimsuvy]/.test(flags)) throw new TypeError(`${label}.flags contains unsupported regular-expression flags`);
+  if (typeof flags !== "string" || /[^dgimsuvy]/.test(flags)) {
+    throw new TypeError(`${label}.flags contains unsupported regular-expression flags`);
+  }
   try {
     new RegExp(pattern, flags);
   } catch (error) {
@@ -244,7 +252,36 @@ function validateAnswerCheck(check, label) {
   }
   const minimum = own(check, "minMatches") ? requireInteger(check.minMatches, `${label}.minMatches`) : 1;
   const maximum = own(check, "maxMatches") ? requireInteger(check.maxMatches, `${label}.maxMatches`) : undefined;
-  if (maximum !== undefined && maximum < minimum) throw new TypeError(`${label}.maxMatches must be >= minMatches`);
+  if (maximum !== undefined && maximum < minimum) {
+    throw new TypeError(`${label}.maxMatches must be >= minMatches`);
+  }
+}
+
+function validateNumericValues(check, label) {
+  if (!own(check, "numericValues")) return;
+  if (!Array.isArray(check.numericValues) || check.numericValues.length === 0) {
+    throw new TypeError(`${label}.numericValues must be a non-empty integer array`);
+  }
+  for (const [index, value] of check.numericValues.entries()) {
+    if (!Number.isSafeInteger(value)) throw new TypeError(`${label}.numericValues[${index}] must be a safe integer`);
+  }
+}
+
+function validateAnswerCheck(check, label) {
+  rejectUnknownKeys(check, new Set(["type", "pattern", "numericValues", "flags", "minMatches", "maxMatches"]), label);
+  if (!own(check, "pattern") && !own(check, "numericValues")) {
+    throw new TypeError(`${label} must declare pattern or numericValues`);
+  }
+  validateAnswerPattern(check, label);
+  validateNumericValues(check, label);
+}
+
+function validateExpectedFailureCode(scenario, label) {
+  if (!own(scenario, "expectedFailureCode")) return;
+  requireString(scenario.expectedFailureCode, `${label}.expectedFailureCode`);
+  if (scenario.expectedTerminal !== "error") {
+    throw new TypeError(`${label}.expectedFailureCode requires expectedTerminal "error"`);
+  }
 }
 
 function validateEventCountCheck(check, label) {
@@ -298,6 +335,7 @@ export function assertEvalScenarioV1(value, label = "scenario") {
   requireEnum(scenario.surface, EVAL_SURFACES_V1, `${label}.surface`);
   requireEnum(scenario.permissionPolicy, EVAL_PERMISSION_POLICIES_V1, `${label}.permissionPolicy`);
   requireEnum(scenario.expectedTerminal, EVAL_TERMINALS_V1, `${label}.expectedTerminal`);
+  validateExpectedFailureCode(scenario, label);
   requireEnum(scenario.budget, Object.keys(EVAL_BUDGETS_V1), `${label}.budget`);
   requireStringArray(scenario.allowedChanges, `${label}.allowedChanges`, { path: true, allowGlob: true });
   validateInteractions(scenario.interactions, `${label}.interactions`);
@@ -353,7 +391,7 @@ export function toSubjectDriverSpecV1(value) {
 
 const scenarioKeysV2 = new Set([
   "schemaVersion", "id", "title", "suites", "fixture", "userMessages", "surface",
-  "permissionPolicy", "expectedTerminal", "allowedChanges", "interactions", "verifier",
+  "permissionPolicy", "expectedTerminal", "expectedFailureCode", "allowedChanges", "interactions", "verifier",
   "capabilities", "repoScale", "riskClass", "platforms", "toolchainDigest"
 ]);
 const WRITE_CAPABILITY = /(?:^|[._-])(?:write|edit|create|delete|remove|rename|move|copy|mutate|patch|append|truncate|chmod|chown)(?:$|[._-])/u;
@@ -457,6 +495,7 @@ export function assertEvalScenarioV2(value, label = "scenario", suiteNames) {
   validateFixtureV2(scenario.fixture, `${label}.fixture`);
   validateScenarioDriverFieldsV2(scenario, label);
   requireEnum(scenario.expectedTerminal, EVAL_TERMINALS_V1, `${label}.expectedTerminal`);
+  validateExpectedFailureCode(scenario, label);
   requireStringArray(scenario.allowedChanges, `${label}.allowedChanges`, { path: true, allowGlob: true });
   validateVerifier(scenario.verifier, `${label}.verifier`);
   validateScenarioMetadataV2(scenario, label);

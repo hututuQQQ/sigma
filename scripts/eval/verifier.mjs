@@ -68,12 +68,7 @@ async function execute(broker, executable, args, options) {
         }
       }
     },
-    policy: {
-      sandbox: "required",
-      network: "none",
-      readRoots: [...new Set([options.workspace, options.manifestDir, path.dirname(executable), options.home])],
-      writeRoots: [options.workspace, options.home]
-    },
+    policy: verifierSandboxPolicy(options, executable),
     timeoutMs,
     maxOutputBytes: OUTPUT_LIMIT
   }, { timeoutMs: timeoutMs + 10_000 });
@@ -84,6 +79,22 @@ async function execute(broker, executable, args, options) {
     stderr: result.stderr,
     timedOut: result.timedOut,
     outputTruncated: result.outputTruncated
+  };
+}
+
+export function verifierSandboxPolicy(options, executable) {
+  return {
+    sandbox: "required",
+    network: "none",
+    // The copied subject workspace is immutable verifier evidence. A separate
+    // home is the only writable root and already grants read access to itself.
+    readRoots: [...new Set([
+      options.workspace,
+      options.manifestDir,
+      path.dirname(executable),
+      path.dirname(options.home)
+    ])],
+    writeRoots: [options.home]
   };
 }
 
@@ -168,6 +179,7 @@ function answerCheck(check, answer) {
   if (typeof check.matches === "string" && !new RegExp(check.matches, check.flags ?? "u").test(answer)) failures.push("answer did not match regex");
   if (typeof check.notMatches === "string" && new RegExp(check.notMatches, check.flags ?? "u").test(answer)) failures.push("answer matched forbidden regex");
   failures.push(...answerPatternFailures(check, answer));
+  failures.push(...answerNumericFailures(check, answer));
   return { passed: failures.length === 0, message: failures.length === 0 ? "Final answer matched." : failures.join("; ") };
 }
 
@@ -180,6 +192,23 @@ function answerPatternFailures(check, answer) {
   const maximum = Number.isInteger(check.maxMatches) ? check.maxMatches : Number.POSITIVE_INFINITY;
   return matches < minimum || matches > maximum
     ? [`answer regex matched ${matches} times; expected ${minimum}..${maximum}`] : [];
+}
+
+const INTEGER_FACT = /(?<![\p{L}\p{N}.,])[+-]?(?:\d{1,3}(?:[,. \u00a0\u202f]\d{3})+|\d+)(?![\p{L}\p{N}]|[.,]\d)/gu;
+
+export function integerFactsFromAnswer(answer) {
+  return [...String(answer).matchAll(INTEGER_FACT)].flatMap((match) => {
+    const normalized = match[0].replace(/[,. \u00a0\u202f]/gu, "");
+    const value = Number(normalized);
+    return Number.isSafeInteger(value) ? [value] : [];
+  });
+}
+
+function answerNumericFailures(check, answer) {
+  if (!Array.isArray(check.numericValues)) return [];
+  const recognized = new Set(integerFactsFromAnswer(answer));
+  const missing = check.numericValues.filter((value) => !recognized.has(value));
+  return missing.length === 0 ? [] : [`answer missed integer facts: ${missing.join(", ")}`];
 }
 
 function eventCountCheck(check, events) {
@@ -283,11 +312,8 @@ async function executeVerifierCheck(check, context, answer, broker) {
   throw new Error(`Unknown verifier check type '${String(check.type)}'.`);
 }
 
-export async function runPostVerifier(context) {
-  const {
-    scenario, workspace, manifestDir, delta, subjectResult, events, metrics, artifactDir, redactor
-  } = context;
-  const answer = finalAnswerFrom(subjectResult, events);
+async function executeVerifierChecks(context, answer) {
+  const { scenario, workspace, manifestDir, delta, events } = context;
   const checks = [];
   let brokerPromise;
   try {
@@ -313,21 +339,56 @@ export async function runPostVerifier(context) {
     const broker = await brokerPromise?.catch(() => null);
     await broker?.close();
   }
+  return checks;
+}
+
+function terminalVerification(scenario, subjectResult, metrics, index) {
   const expectedTerminal = scenario.expectedTerminal ?? "completed";
+  const expectedFailureCode = scenario.expectedFailureCode ?? null;
   const actualTerminal = terminalStatus(subjectResult, metrics);
+  const actualFailureCode = metrics?.terminal?.code
+    ?? subjectResult.result?.code
+    ?? subjectResult.productFailure?.code
+    ?? null;
+  const terminalMatched = actualTerminal === expectedTerminal;
+  const failureCodeMatched = expectedFailureCode === null || actualFailureCode === expectedFailureCode;
   const terminalCheck = {
-    index: checks.length,
+    index,
     type: "terminal",
-    passed: actualTerminal === expectedTerminal,
-    message: `Terminal status was ${actualTerminal}; expected ${expectedTerminal}.`
+    passed: terminalMatched && failureCodeMatched,
+    message: expectedFailureCode === null
+      ? `Terminal status was ${actualTerminal}; expected ${expectedTerminal}.`
+      : `Terminal status was ${actualTerminal} with code ${actualFailureCode ?? "missing"}; expected ${expectedTerminal} with code ${expectedFailureCode}.`
   };
-  checks.push(terminalCheck);
-  const log = checks.map((check) => [
+  return {
+    check: terminalCheck,
+    details: {
+      expected: expectedTerminal,
+      actual: actualTerminal,
+      ...(expectedFailureCode === null ? {} : {
+        expectedCode: expectedFailureCode,
+        actualCode: actualFailureCode
+      })
+    }
+  };
+}
+
+function verifierLog(checks) {
+  return checks.map((check) => [
     `${check.infrastructureError ? "INVALID" : check.passed ? "PASS" : "FAIL"} ${check.type}: ${check.message}`,
     check.command ? `command: ${check.command.join(" ")}` : "",
     check.stdout ? `stdout:\n${check.stdout}` : "",
     check.stderr ? `stderr:\n${check.stderr}` : ""
   ].filter(Boolean).join("\n")).join("\n\n");
+}
+
+export async function runPostVerifier(context) {
+  const { scenario, subjectResult, events, metrics, artifactDir, redactor } = context;
+  const answer = finalAnswerFrom(subjectResult, events);
+  const checks = await executeVerifierChecks(context, answer);
+  const terminal = terminalVerification(scenario, subjectResult, metrics, checks.length);
+  checks.push(terminal.check);
+  const log = verifierLog(checks);
   await writeFile(path.join(artifactDir, "verifier.log"), redactor(log), "utf8");
   const productChecks = checks.filter((check) => check.type !== "terminal");
   const invalid = productChecks.some((check) => check.infrastructureError);
@@ -340,7 +401,7 @@ export async function runPostVerifier(context) {
       ...(stderr ? { stderr: redactor(stderr) } : {})
     })),
     finalAnswer: redactor(answer),
-    terminal: { expected: expectedTerminal, actual: actualTerminal },
-    delivery: { status: terminalCheck.passed ? "pass" : "fail", check: terminalCheck }
+    terminal: terminal.details,
+    delivery: { status: terminal.check.passed ? "pass" : "fail", check: terminal.check }
   };
 }

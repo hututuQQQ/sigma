@@ -135,21 +135,39 @@ function assertProtectedInputState(state: KernelState): void {
   }
 }
 
+function assertProtectedCompletionEvidence(state: KernelState): void {
+  if (state.completionRepair?.kind === "no_change_confirmation") return;
+  if (state.evidence.some((item) =>
+    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) return;
+  throw new Error("A protected completion repair requires current-run referenceable evidence.");
+}
+
+function assertSinglePendingTool(
+  state: KernelState,
+  allowedNames: readonly string[],
+  message: string
+): void {
+  if (state.pendingTools.length === 0) return;
+  const terminalName = state.pendingTools[0]?.request.name ?? "";
+  if (state.pendingTools.length === 1 && allowedNames.includes(terminalName)) return;
+  throw new Error(message);
+}
+
 function assertProtectedRepairState(state: KernelState): void {
   const repair = state.completionRepair;
   if (!repair) return;
-  const protectedAnswer = repair.kind === "protected_completion" || repair.kind === "protected_recovery";
+  const protectedAnswer = repair.kind === "no_change_confirmation"
+    || repair.kind === "protected_completion"
+    || repair.kind === "protected_recovery";
   if (!protectedAnswer) return;
-  if (!state.evidence.some((item) =>
-    isCompletionReferenceableEvidence(item, state.sessionId, state.runId))) {
-    throw new Error("A protected completion repair requires current-run referenceable evidence.");
+  assertProtectedCompletionEvidence(state);
+  if (repair.kind === "protected_completion") {
+    assertSinglePendingTool(state, ["runtime_finalize", "request_user_input"],
+      "A protected terminal-intent repair can pend only one runtime completion intent or request_user_input call.");
   }
-  if (repair.kind === "protected_completion" && state.pendingTools.length > 0) {
-    const terminalName = state.pendingTools[0]?.request.name;
-    if (state.pendingTools.length !== 1
-      || (terminalName !== "runtime_finalize" && terminalName !== "request_user_input")) {
-      throw new Error("A protected terminal-intent repair can pend only one runtime completion intent or request_user_input call.");
-    }
+  if (repair.kind === "no_change_confirmation") {
+    assertSinglePendingTool(state, ["confirm_no_change", "request_user_input", "report_blocked"],
+      "A no-change confirmation can pend only one typed terminal-intent call.");
   }
   assertProtectedInputState(state);
 }

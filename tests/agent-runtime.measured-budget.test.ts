@@ -13,8 +13,38 @@ import type {
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import { providerVisibleHistory } from "../packages/agent-runtime/src/model-budget-convergence.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
+
+describe("provider-visible runtime history", () => {
+  it("removes synthetic runtime completion calls and receipts while preserving the answer", () => {
+    const history: ModelMessage[] = [
+      { role: "user", content: "finish" },
+      {
+        role: "assistant",
+        content: "Original answer.",
+        toolCalls: [{
+          id: "runtime_completion_intent_1_2",
+          name: "runtime_finalize",
+          arguments: { summary: "Original answer." }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: "runtime_completion_intent_1_2",
+        content: "Failed tool receipt ID: runtime_completion_intent_1_2"
+      },
+      { role: "developer", content: "Obtain current validation evidence." }
+    ];
+    expect(providerVisibleHistory(history)).toEqual([
+      { role: "user", content: "finish" },
+      { role: "assistant", content: "Original answer.", toolCalls: undefined },
+      { role: "developer", content: "Obtain current validation evidence." }
+    ]);
+    expect(JSON.stringify(providerVisibleHistory(history))).not.toContain("runtime_finalize");
+  });
+});
 
 class UnderestimatedGateway implements ModelGateway {
   readonly provider = "fake";

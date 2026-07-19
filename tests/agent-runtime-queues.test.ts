@@ -63,6 +63,17 @@ function completion(summary: string): (request: ModelRequest) => ModelResponse {
   });
 }
 
+function confirmNoChange(id: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id, name: "confirm_no_change", arguments: {} }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 function validationFailureReport(_request: ModelRequest): ModelResponse {
   return {
     message: {
@@ -213,12 +224,24 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("runtime queues and non-blocking instruction steering", () => {
-  it("treats a conversational natural stop as completion intent", async () => {
+  it("turns a zero-change question into a typed input terminal", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-stop-"));
     const gateway = new ScriptedGateway([
       {
-        message: { role: "assistant", content: "Hello. What would you like me to work on?" },
+        message: { role: "assistant", content: "Which target should I change?" },
         finishReason: "stop"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: "confirm-needs-target",
+            name: "request_user_input",
+            arguments: { message: "Which target should I change?" }
+          }]
+        },
+        finishReason: "tool_calls"
       }
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
@@ -227,16 +250,56 @@ describe("runtime queues and non-blocking instruction steering", () => {
       tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
-    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "hi" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Change the selected target." });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
+      kind: "needs_input",
+      requestId: "confirm-needs-target",
+      message: "Which target should I change?"
+    });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]?.toolChoice).toBe("required");
+    expect(gateway.requests[1]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "confirm_no_change", "report_blocked", "request_user_input"
+    ]);
+    expect(JSON.stringify(gateway.requests[1]?.messages)).not.toContain("runtime_finalize");
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.filter((event) => event.type === "model.started")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
+  });
+
+  it("preserves a zero-change answer after explicit confirmation", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-no-change-confirmation-"));
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "The requested state is already satisfied." },
+        finishReason: "stop"
+      },
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "confirm-no-change", name: "confirm_no_change", arguments: {} }]
+        },
+        finishReason: "tool_calls"
+      }
+    ]);
+    const runtime = createRuntime({
+      gateway,
+      store: new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") }),
+      storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Apply the requested state if needed." });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "completed",
-      message: "Hello. What would you like me to work on?"
+      message: "The requested state is already satisfied."
     });
-    expect(gateway.requests).toHaveLength(1);
-    const events = await storedEvents(store, session.sessionId);
-    expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
-    expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(2);
   });
 
   it("allows a no-change analysis to complete from ordinary text", async () => {
@@ -1049,7 +1112,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(restored.state.completionRepairAttempts).toBe(1);
   });
 
-  it("does not synthesize a V3 completion-repair state while rebuilding V5 events", async () => {
+  it("recovers the V5 no-change confirmation phase from an older snapshot", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-legacy-completion-repair-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const sessionId = "legacy-completion-session";
@@ -1109,8 +1172,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await store.writeSnapshot({ ...rebuilt, state: legacyState });
 
     const restored = await restoreStoredSession(store, sessionId, 30_000);
-    expect(restored.state.completionRepair).toBeUndefined();
-    expect(restored.state.completionRepairAttempts).toBe(0);
+    expect(restored.state.completionRepair).toEqual({
+      kind: "no_change_confirmation",
+      answer: "Legacy protected answer."
+    });
+    expect(restored.state.completionRepairAttempts).toBe(1);
     expect(restored.state.messages.at(-1)).toMatchObject({
       role: "assistant",
       content: "Legacy protected answer."
@@ -1423,7 +1489,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "tool_calls"
       },
-      completion("new steering completed")
+      completion("new steering completed"),
+      confirmNoChange("confirm-steering-completed")
     ]);
     const runtime = createRuntime({
       gateway, store, storeRootDir, tools, permissionMode: "auto", runDeadlineMs: 60_000
@@ -1525,7 +1592,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
         message: { role: "assistant", content: "", toolCalls: [{ id: "corrected-read", name: "read", arguments: { path: "seed.txt" } }] },
         finishReason: "tool_calls"
       },
-      completion("approval steering completed")
+      completion("approval steering completed"),
+      confirmNoChange("confirm-approval-steering")
     ]);
     const storeRootDir = path.join(workspace, ".agent");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });

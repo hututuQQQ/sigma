@@ -42,6 +42,17 @@ function completion(): (request: ModelRequest) => ModelResponse {
   });
 }
 
+function confirmNoChange(): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "confirm-second", name: "confirm_no_change", arguments: {} }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
 
 class ChildGateway implements ModelGateway {
@@ -142,7 +153,8 @@ describe("child cancellation cleanup ordering", () => {
       gateway: new ChildGateway([
         toolTurn("slow-call", "slow_writer", { path: "first.txt" }),
         toolTurn("quick-call", "quick_observation", {}),
-        completion()
+        completion(),
+        confirmNoChange()
       ]),
       store: new SegmentedJsonlStore({ rootDir: storeRootDir }),
       storeRootDir,
