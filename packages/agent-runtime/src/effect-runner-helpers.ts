@@ -1,11 +1,17 @@
+import { createHash } from "node:crypto";
 import type {
+  CompletionLimitationV1,
   EvidenceRecord,
   JsonValue,
   ModelToolCall,
-  ToolCallPlan
+  ToolCallPlan,
+  ValidationEvidence
 } from "agent-protocol";
 import type { ActiveModelTurn, KernelEffect } from "agent-kernel";
-import type { RuntimeSession } from "./types.js";
+import type {
+  ChildLimitationEvidenceSource,
+  RuntimeSession
+} from "./types.js";
 
 export type ExecuteToolEffect = Extract<KernelEffect, { type: "execute_tool" }>;
 
@@ -34,6 +40,73 @@ export function childOutcomeEvidence(
     summary: `Child '${childId}' completed and was joined into this run.`,
     data: { childId, outcome: "completed", planNodeIds: [] }
   };
+}
+
+function limitationKey(limitation: CompletionLimitationV1): string {
+  return JSON.stringify([
+    limitation.kind,
+    limitation.claim,
+    limitation.attemptedCommandSummary,
+    limitation.capabilityEvidenceId,
+    limitation.reason
+  ]);
+}
+
+function importedEvidenceId(
+  session: RuntimeSession,
+  source: ChildLimitationEvidenceSource
+): string {
+  const digest = createHash("sha256").update(JSON.stringify([
+    source.childId,
+    source.evidence.sessionId,
+    source.evidence.runId,
+    source.evidence.evidenceId
+  ])).digest("hex");
+  return `child-capability:${session.durable.runId}:${digest}`;
+}
+
+export interface ImportedChildLimitationsV1 {
+  evidence: ValidationEvidence[];
+  limitations: CompletionLimitationV1[];
+}
+
+/** Maps child-owned validation records to parent-owned proxy evidence and
+ * rewrites every limitation reference. Missing, extra, or mismatched sources
+ * fail closed so a parent outcome can never contain a dangling evidence ID. */
+export function importedChildLimitations(
+  session: RuntimeSession,
+  limitations: readonly CompletionLimitationV1[],
+  sources: readonly ChildLimitationEvidenceSource[]
+): ImportedChildLimitationsV1 | null {
+  if (limitations.length !== sources.length) return null;
+  const remaining = [...sources];
+  const evidence = new Map<string, ValidationEvidence>();
+  const remapped: CompletionLimitationV1[] = [];
+  for (const limitation of limitations) {
+    const index = remaining.findIndex((source) => limitationKey(source.limitation) === limitationKey(limitation));
+    if (index < 0) return null;
+    const source = remaining.splice(index, 1)[0]!;
+    if (source.evidence.evidenceId !== limitation.capabilityEvidenceId) return null;
+    const evidenceId = importedEvidenceId(session, source);
+    if (!evidence.has(evidenceId)) {
+      evidence.set(evidenceId, {
+        ...source.evidence,
+        evidenceId,
+        sessionId: session.identity.sessionId,
+        runId: session.durable.runId,
+        createdAt: new Date().toISOString(),
+        producer: { authority: "runtime", id: "child-supervisor" },
+        summary: `Child '${source.childId}' validation capability was imported for parent completion.`,
+        data: {
+          ...source.evidence.data,
+          sourceSessionId: source.evidence.sessionId,
+          childId: source.childId
+        }
+      });
+    }
+    remapped.push({ ...limitation, capabilityEvidenceId: evidenceId });
+  }
+  return { evidence: [...evidence.values()], limitations: remapped };
 }
 
 export function mutatingPlan(plan: ToolCallPlan): boolean {

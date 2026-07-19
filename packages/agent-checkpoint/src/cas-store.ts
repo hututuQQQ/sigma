@@ -126,9 +126,14 @@ export class CheckpointCasStore {
     return { digest, size, identity: verified.identity };
   }
 
-  async readVerifiedAll(digest: string): Promise<Buffer> {
+  async readVerifiedAll(digest: string, maxBytes = Number.POSITIVE_INFINITY): Promise<Buffer> {
+    validateReadLimit(maxBytes);
+    const inspected = await this.inspect(digest);
+    if (inspected.size > maxBytes) {
+      throw new CheckpointConflictError(`Checkpoint CAS object exceeds its bounded read limit: ${digest}`);
+    }
     const chunks: Buffer[] = [];
-    const verified = await this.verify(digest, undefined, (chunk) => chunks.push(chunk));
+    const verified = await this.verify(digest, inspected.size, (chunk) => chunks.push(chunk));
     return Buffer.concat(chunks, verified.size);
   }
 

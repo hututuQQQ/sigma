@@ -4,7 +4,11 @@ import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventLog } from "./runtime-event-log.js";
 import type { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import type { SessionCommandBus } from "./session-command-bus.js";
-import { completionCoordinatorState } from "./completion-evidence-gate.js";
+import {
+  completionCoordinatorState,
+  completionLimitations,
+  currentRunEvidence
+} from "./completion-evidence-gate.js";
 import { refreshValidationCapabilityProfile } from "./validation-capability-profile.js";
 
 export type RunSuspensionContext =
@@ -41,7 +45,7 @@ async function applyFinishHooks(
   outcome: RunOutcome
 ): Promise<RunOutcome> {
   try {
-    if (outcome.kind === "completed") {
+    if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") {
       await hooks.dispatch(session, "pre_complete", {
         sessionId: session.identity.sessionId,
         runId: session.durable.runId,
@@ -62,7 +66,7 @@ async function applyFinishHooks(
 function outcomeEventType(
   outcome: RunOutcome
 ): "run.completed" | "run.cancelled" | "run.suspended" | "run.failed" {
-  if (outcome.kind === "completed") return "run.completed";
+  if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") return "run.completed";
   if (outcome.kind === "cancelled") return "run.cancelled";
   if (outcome.kind === "needs_input") return "run.suspended";
   return "run.failed";
@@ -76,13 +80,22 @@ async function emitOutcome(
   suspensionContext?: RunSuspensionContext
 ): Promise<AgentEventEnvelope | undefined> {
   const type = outcomeEventType(outcome);
+  const reviewed = completionCoordinatorState(session).reviewSatisfied;
   const payload = outcome.kind === "completed"
     ? { ...outcome, coordinator: {
         modelStopped: true as const,
         assuranceSatisfied: true as const,
-        reviewSatisfied: true as const,
+        reviewSatisfied: reviewed,
         runCompleted: true as const
       } }
+    : outcome.kind === "completed_with_limitations"
+      ? { ...outcome, coordinator: {
+          modelStopped: true as const,
+          assuranceSatisfied: false as const,
+          reviewSatisfied: reviewed,
+          limitationsAccepted: true as const,
+          runCompleted: true as const
+        } }
     : outcome.kind === "needs_input" && suspensionContext
       ? { ...outcome, ...suspensionContext }
       : outcome;
@@ -103,7 +116,7 @@ async function cancelChildrenAfterFailure(
   session: RuntimeSession,
   outcome: RunOutcome
 ): Promise<void> {
-  if (outcome.kind === "completed") return;
+  if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") return;
   await options.cancelChildren?.(session.identity.sessionId, `Parent run ended as ${outcome.kind}.`);
 }
 
@@ -111,17 +124,54 @@ async function completionCoordinatedOutcome(
   session: RuntimeSession,
   outcome: RunOutcome
 ): Promise<RunOutcome> {
-  if (outcome.kind !== "completed") return outcome;
+  if (outcome.kind !== "completed" && outcome.kind !== "completed_with_limitations") return outcome;
   // Recovery may arrive directly at outcome_pending without another model
   // turn. Re-derive the non-durable capability profile before applying the
   // same completion gates used during a live run.
   await refreshValidationCapabilityProfile(session, new AbortController().signal);
   const coordinator = completionCoordinatorState(session);
-  return coordinator.runCompleted ? outcome : {
+  if (coordinator.actualValidationFailed) {
+    return {
+      kind: "recoverable_failure",
+      code: "validation_failed",
+      message: "Model stopped, but a current-frontier required validation has an actual failure. Repair and validate again before completion."
+    };
+  }
+  if (coordinator.runCompleted) return {
+    ...outcome,
+    evidence: coordinatedCompletionEvidence(session, outcome)
+  };
+  const limitations = completionLimitations(session);
+  if (limitations) {
+    const combined = [
+      ...(outcome.kind === "completed_with_limitations" ? outcome.limitations : []),
+      ...limitations
+    ];
+    const limited: RunOutcome = {
+      kind: "completed_with_limitations",
+      message: outcome.message,
+      evidence: [],
+      limitations: combined
+    };
+    return { ...limited, evidence: coordinatedCompletionEvidence(session, limited) };
+  }
+  return {
     kind: "recoverable_failure",
     code: "completion_coordinator_rejected",
     message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
   };
+}
+
+function coordinatedCompletionEvidence(session: RuntimeSession, outcome: RunOutcome) {
+  const ordinary = currentRunEvidence(session);
+  if (outcome.kind !== "completed_with_limitations") return ordinary;
+  const limitationIds = new Set(outcome.limitations.map((item) => item.capabilityEvidenceId));
+  const capability = session.durable.state.evidence.filter((item) =>
+    limitationIds.has(item.evidenceId)
+    && item.kind === "validation"
+    && item.status === "failed"
+    && item.data.claim?.status === "unavailable");
+  return [...new Map([...ordinary, ...capability].map((item) => [item.evidenceId, item])).values()];
 }
 
 export async function finishRuntimeSession(

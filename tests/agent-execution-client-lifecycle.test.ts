@@ -106,6 +106,34 @@ async function waitForPath(filePath: string): Promise<void> {
 }
 
 describe("SigmaExecBrokerClient shutdown lifecycle", () => {
+  it("accepts broker spools only beneath the configured shared artifact parent", async () => {
+    const trustedParent = await mkdtemp(path.join(process.cwd(), ".sigma-oci-artifacts-trusted-"));
+    const untrustedParent = await mkdtemp(path.join(process.cwd(), ".sigma-oci-artifacts-untrusted-"));
+    const trustedRoot = await mkdtemp(path.join(trustedParent, "sigma-exec-artifacts-"));
+    const untrustedRoot = await mkdtemp(path.join(untrustedParent, "sigma-exec-artifacts-"));
+    const systemTemporaryRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-untrusted-"));
+    const importer = new BrokerOutputArtifactImporter(
+      new SecretRedactor({}),
+      async () => undefined,
+      undefined,
+      trustedParent
+    );
+    try {
+      await expect(importer.configureRoot(untrustedRoot)).rejects.toThrow(
+        "Broker artifactRoot resolves outside its trusted parent."
+      );
+      await expect(importer.configureRoot(systemTemporaryRoot)).rejects.toThrow(
+        "Broker artifactRoot resolves outside its trusted parent."
+      );
+      await expect(importer.configureRoot(trustedRoot)).resolves.toBeUndefined();
+    } finally {
+      await importer.cleanup().catch(() => undefined);
+      await rm(trustedParent, { recursive: true, force: true });
+      await rm(untrustedParent, { recursive: true, force: true });
+      await rm(systemTemporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("marks active handles lost before waiting, then removes spool only after helper exit", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-exec-artifacts-shutdown-"));
     const observationPath = `${artifactRoot}.shutdown-observation`;

@@ -28,6 +28,8 @@ const suspensionSchema = z.object({
   effectRevision: z.number().int().nonnegative().optional()
 }).strict();
 
+const validationRequirementSchema = z.enum(["default", "required"]);
+
 const approvalRequestedSchema = z.object({
   requestId: nonEmptyStringSchema,
   callId: nonEmptyStringSchema,
@@ -82,6 +84,29 @@ const modelFailureDiagnosticsSchema = z.object({
   timeoutReason: z.string().min(1).max(800).optional()
 }).strict();
 
+const completionLimitationSchema = z.object({
+  kind: z.literal("validation_capability_unavailable"),
+  claim: z.enum(["probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"]),
+  attemptedCommandSummary: nonEmptyStringSchema,
+  capabilityEvidenceId: nonEmptyStringSchema,
+  reason: nonEmptyStringSchema
+}).strict();
+
+const completedCoordinatorSchema = z.object({
+  modelStopped: z.literal(true),
+  assuranceSatisfied: z.literal(true),
+  reviewSatisfied: z.boolean(),
+  runCompleted: z.literal(true)
+}).strict();
+
+const limitedCompletedCoordinatorSchema = z.object({
+  modelStopped: z.literal(true),
+  assuranceSatisfied: z.literal(false),
+  reviewSatisfied: z.boolean(),
+  limitationsAccepted: z.literal(true),
+  runCompleted: z.literal(true)
+}).strict();
+
 const diagnosticSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("steering.restart"), ...turnSchema }).strict(),
   z.object({
@@ -108,6 +133,7 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
     remainingMs: z.number(),
     nextModelEstimateMs: z.number().int().nonnegative(),
+    nextConvergenceModelEstimateMs: z.number().int().nonnegative().optional(),
     outputReserveTokens: z.number().int().positive()
   }).strict(),
   z.object({
@@ -153,20 +179,29 @@ export const coreEventPayloadSchemas = {
     modelRole: sharedSchemas.modelExecutionRoleSchema,
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
-  "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema }).strict(),
-  "run.suspended": suspensionSchema,
-  "run.completed": z.object({
-    kind: z.literal("completed"),
-    message: z.string(),
-    evidence: z.array(sharedSchemas.evidenceRecordSchema),
-    coordinator: z.object({
-      modelStopped: z.literal(true),
-      assuranceSatisfied: z.literal(true),
-      reviewSatisfied: z.literal(true),
-      runCompleted: z.literal(true)
-    }).strict().optional(),
-    outcomeRevision: z.number().int().nonnegative().optional()
+  "run.started": z.object({
+    mode: runModeSchema,
+    deadlineAt: dateTimeSchema,
+    validationRequirement: validationRequirementSchema.optional()
   }).strict(),
+  "run.suspended": suspensionSchema,
+  "run.completed": z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("completed"),
+      message: z.string(),
+      evidence: z.array(sharedSchemas.evidenceRecordSchema),
+      coordinator: completedCoordinatorSchema.optional(),
+      outcomeRevision: z.number().int().nonnegative().optional()
+    }).strict(),
+    z.object({
+      kind: z.literal("completed_with_limitations"),
+      message: z.string(),
+      evidence: z.array(sharedSchemas.evidenceRecordSchema),
+      limitations: z.array(completionLimitationSchema).min(1),
+      coordinator: limitedCompletedCoordinatorSchema.optional(),
+      outcomeRevision: z.number().int().nonnegative().optional()
+    }).strict()
+  ]),
   "run.cancelled": z.object({
     kind: z.literal("cancelled"),
     reason: z.string(),
@@ -180,9 +215,12 @@ export const coreEventPayloadSchemas = {
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "user.message": z.object({ text: z.string() }).strict(),
-  "user.steer": z.object({ text: z.string() }).strict(),
+  "user.steer": z.object({
+    text: z.string(), validationRequirement: validationRequirementSchema.optional()
+  }).strict(),
   "user.follow_up": z.object({
-    text: z.string(), queueId: nonEmptyStringSchema, status: z.enum(["queued", "delivered"])
+    text: z.string(), queueId: nonEmptyStringSchema, status: z.enum(["queued", "delivered"]),
+    validationRequirement: validationRequirementSchema.optional()
   }).strict(),
   "model.started": z.object({
     provider: nonEmptyStringSchema, model: nonEmptyStringSchema, ...turnSchema

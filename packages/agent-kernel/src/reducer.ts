@@ -1,20 +1,26 @@
-import type { AgentEventEnvelope, AgentEventType, JsonValue, ModelMessage, ModelToolCall, RunOutcome } from "agent-protocol";
+import type {
+  AgentEventEnvelope,
+  AgentEventType,
+  CompletionLimitationV1,
+  JsonValue,
+  ModelMessage,
+  ModelToolCall,
+  RunOutcome
+} from "agent-protocol";
 import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
 import {
   completionRepairFailureMessage,
-  completionRepairRequiresTerminalAction,
   conflictingTerminalBatch,
   hasCompletionRepair,
   incompleteModelCompletion,
   protectedCompletionAnswer,
   repairConflictingTerminalBatch
 } from "./model-convergence.js";
-import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
-import { recordSemanticToolResult } from "./semantic-failures.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
-import { completedToolBatchProgress, repeatsCompletedToolBatch } from "./tool-batch-progress.js";
+import { repeatsCompletedToolBatch } from "./tool-batch-progress.js";
+import { toolFinished } from "./tool-finished-reducer.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
@@ -22,7 +28,6 @@ import {
   pendingForEvent,
   protectedToolBatchFailure,
   proposedOutcomeState,
-  terminalReceiptTransition,
   terminalState
 } from "./terminal-reducer-helpers.js";
 function objectPayload(value: unknown): Record<string, JsonValue> {
@@ -53,12 +58,15 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   mode: payload.mode === "analyze" || payload.mode === "change" ? payload.mode : state.mode,
   phase: state.messages.length > 0 ? "ready_model" : "idle",
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
+  validationRequirement: payload.validationRequirement === "default" ? "default" : "required",
   deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   completionRepairAttempts: 0,
   completionRepair: undefined,
   continuationAttempts: 0,
+  lengthFinishDebt: 0,
+  lengthProgressFingerprint: undefined,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
   semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: state.revision },
@@ -75,9 +83,15 @@ const userInput: EventReducer = (state, _event, payload) => ({
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   messages: [...state.messages, { role: "user", content: text(payload.text) }],
+  // A delivered user message is the trusted authority for the current run's
+  // goal. Model-owned update_plan calls may restructure the DAG but cannot
+  // later rewrite this validation-bearing text.
+  plan: { ...state.plan, goal: text(payload.text) },
   completionRepairAttempts: 0,
   completionRepair: undefined,
   continuationAttempts: 0,
+  lengthFinishDebt: 0,
+  lengthProgressFingerprint: undefined,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
   semanticFailureCluster: undefined,
@@ -89,6 +103,8 @@ const userInput: EventReducer = (state, _event, payload) => ({
 
 const steeringInput: EventReducer = (state, _event, payload) => ({
   ...state,
+  validationRequirement: payload.validationRequirement === "default" ? "default" : "required",
+  plan: { ...state.plan, goal: text(payload.text) },
   messages: [
     ...state.messages,
     ...supersededToolMessages(state),
@@ -101,6 +117,8 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   completionRepairAttempts: 0,
   completionRepair: undefined,
   continuationAttempts: 0,
+  lengthFinishDebt: 0,
+  lengthProgressFingerprint: undefined,
   repeatedToolBatchCount: 0,
   receiptCountAtLastUserInput: state.receipts.length,
   semanticFailureCluster: undefined,
@@ -226,43 +244,6 @@ const toolStarted: EventReducer = (state, _event, payload) => {
   return { ...state, pendingTools, phase: "tool_in_flight" };
 };
 
-const toolFinished: EventReducer = (state, event) => {
-  const receipt = toolReceipt(event.payload);
-  const pending = pendingForEvent(state, objectPayload(event.payload));
-  if (!receipt || !pending || pending.request.callId !== receipt.callId) return state;
-  const pendingTools = state.pendingTools.filter((item) => item !== pending);
-  const repairPending = hasCompletionRepair(state);
-  const terminalRepairPending = completionRepairRequiresTerminalAction(state);
-  const next: KernelState = {
-    ...state,
-    messages: [...state.messages, {
-      role: "tool",
-      content: receiptContent(receipt),
-      toolCallId: receipt.callId
-    }],
-    pendingTools,
-    receipts: [...state.receipts, receipt],
-    // Receipt evidence is untrusted tool output. Only separately emitted,
-    // authority-checked evidence.recorded/review events enter the ledger.
-    evidence: state.evidence,
-    continuationAttempts: 0,
-    phase: nextPhase(pendingTools)
-  };
-  const completedBatch = pendingTools.length === 0 ? completedToolBatchProgress(next, receipt.callId) : {};
-  const semantic = recordSemanticToolResult({ ...next, ...completedBatch }, receipt, pending.request.name);
-  const progressed = semantic.state;
-  return terminalReceiptTransition({
-    state,
-    progressed,
-    receipt,
-    toolName: pending.request.name,
-    remainingTools: pendingTools.length,
-    repairPending,
-    terminalRepairPending,
-    semanticLimitReached: semantic.limitReached
-  }) ?? progressed;
-};
-
 function isApprovalSuspension(state: KernelState, payload: Record<string, JsonValue>): boolean {
   return pendingForEvent(state, payload)?.approval === "pending";
 }
@@ -310,10 +291,18 @@ const runFailed: EventReducer = (state, _event, payload) => {
 const runCompleted: EventReducer = (state, _event, payload) => {
   if (!Number.isInteger(payload.outcomeRevision) || !acceptsOutcomeRevision(state, payload)
     || state.proposedOutcome?.kind !== "completed") return state;
+  const outcome: RunOutcome = payload.kind === "completed_with_limitations" && Array.isArray(payload.limitations)
+    ? {
+      kind: "completed_with_limitations",
+      message: state.proposedOutcome.message,
+      evidence: state.evidence,
+      limitations: payload.limitations as unknown as CompletionLimitationV1[]
+    }
+    : { ...state.proposedOutcome, evidence: state.evidence };
   return terminalState({
     ...state,
     mutationFrontier: acceptMutationFrontier(state.mutationFrontier)
-  }, { ...state.proposedOutcome, evidence: state.evidence });
+  }, outcome);
 };
 
 const diagnostic: EventReducer = (state, _event, payload) => {

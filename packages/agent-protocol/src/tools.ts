@@ -100,6 +100,23 @@ export interface ToolOutcome {
   diagnosticCodes: string[];
 }
 
+/** Kernel-derived advisory attached after a successful tool result when the
+ * surrounding trusted state proves that repeating the action made no progress.
+ * This is deliberately separate from ToolOutcome: an advisory never rewrites
+ * the executor's success/failure result. */
+export interface NoProgressToolAdvisoryV1 {
+  schemaVersion: 1;
+  code: "no_progress";
+  repeatCount: number;
+  unchangedDimensions: Array<"workspace" | "validation_frontier" | "process_state" | "evidence">;
+  repair: {
+    kind: "change_action_or_converge";
+    suggestions: Array<"change_tool_or_arguments" | "repair_blocker" | "validate_or_finish">;
+  };
+}
+
+export type ToolReceiptRuntimeAdvisoryV1 = NoProgressToolAdvisoryV1;
+
 export interface ToolReceipt {
   callId: string;
   ok: boolean;
@@ -116,6 +133,9 @@ export interface ToolReceipt {
   artifacts: string[];
   artifactRefs?: ArtifactRef[];
   diagnostics: string[];
+  /** Runtime-owned diagnostics derived by the kernel while reducing the
+   * receipt. They are not accepted from tool event payloads. */
+  runtimeAdvisories?: ToolReceiptRuntimeAdvisoryV1[];
   /** Typed durable evidence. Optional only while V2 tool executors migrate. */
   evidence?: EvidenceRecord[];
   startedAt: string;
@@ -127,7 +147,7 @@ export interface RuntimeControlPort {
   updatePlan(input: { expectedRevision: number; plan: PlanGraph }): Promise<PlanGraph>;
   readBudget(): Promise<BudgetLedgerState>;
   listCheckpoints(): Promise<CheckpointRef[]>;
-  createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
+  createCheckpoint(scopePaths: string[], policy?: CheckpointCreatePolicyV1): Promise<CheckpointRef>;
   restoreRunCheckpoint(checkpointId: string): Promise<CheckpointRef>;
   requestReview(): Promise<ReviewRequestResult>;
   loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
@@ -140,6 +160,14 @@ export interface RuntimeControlPort {
   settleChildBudget(childId: string, consumed?: Partial<BudgetAmounts>): Promise<void>;
   releaseChildBudget(childId: string): Promise<void>;
   rollbackChildPlanAssignment(childId: string, nodeIds: string[], previousPlan: PlanGraph): Promise<PlanGraph>;
+}
+
+/** Trusted runtime-only capture hints. These paths are derived from a frozen
+ * execution capability and are never accepted as model-authored rollback
+ * shortcuts. */
+export interface CheckpointCreatePolicyV1 {
+  reproducibleRootPaths?: string[];
+  explicitDeliverablePaths?: string[];
 }
 
 export interface ReviewRequestResult {

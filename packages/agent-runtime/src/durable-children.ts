@@ -1,15 +1,22 @@
 import {
   isBudgetLedgerState,
+  isEvidenceRecord,
   type AgentEventEnvelope,
   type BudgetAmounts,
   type BudgetLedgerState,
+  type CompletionLimitationV1,
   type JsonValue,
   type RunOutcome,
-  type RunStore
+  type RunStore,
+  type ValidationEvidence
 } from "agent-protocol";
 import { finalizeChildCompletion, handleChildEvent } from "./child-event-handler.js";
 import type { RuntimeControlService } from "./runtime-control.js";
-import type { ChildJoinSummary, RuntimeSession } from "./types.js";
+import type {
+  ChildJoinSummary,
+  ChildLimitationEvidenceSource,
+  RuntimeSession
+} from "./types.js";
 
 export interface DurableChild {
   childId: string;
@@ -79,11 +86,92 @@ function failure(child: DurableChild): string | null {
   if (!child.completed) return `Child ${child.childId} was interrupted before a durable terminal outcome; spawn a replacement or resolve it explicitly.`;
   const status = typeof child.completed.status === "string" ? child.completed.status : "unknown";
   if (status !== "completed") return `Child ${child.childId} ended as ${status}.`;
+  const outcome = record(child.completed.outcome ?? null);
+  if (outcome.kind === "completed_with_limitations") {
+    const declared = Array.isArray(outcome.limitations) ? outcome.limitations : [];
+    if (declared.length === 0 || childLimitations(child).length !== declared.length
+      || childLimitationEvidence(child).length !== declared.length) {
+      return `Child ${child.childId} reported malformed completion limitations.`;
+    }
+  }
   const isolation = record(child.completed.isolation ?? null);
   if (isolation.kind === "git_worktree" && isolation.cleanup === "retained" && !child.integrated) {
     return `Child ${child.childId} has an unintegrated worktree at ${String(isolation.worktreePath ?? "unknown")}.`;
   }
   return null;
+}
+
+const VALIDATION_CLAIMS = new Set([
+  "probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"
+]);
+
+function completionLimitation(value: JsonValue): CompletionLimitationV1 | null {
+  const item = record(value);
+  return item.kind === "validation_capability_unavailable"
+    && typeof item.claim === "string" && VALIDATION_CLAIMS.has(item.claim)
+    && typeof item.attemptedCommandSummary === "string" && item.attemptedCommandSummary.length > 0
+    && typeof item.capabilityEvidenceId === "string" && item.capabilityEvidenceId.length > 0
+    && typeof item.reason === "string" && item.reason.length > 0
+    ? item as CompletionLimitationV1 : null;
+}
+
+function childLimitations(child: DurableChild): CompletionLimitationV1[] {
+  const outcome = record(child.completed?.outcome ?? null);
+  if (outcome.kind !== "completed_with_limitations" || !Array.isArray(outcome.limitations)) return [];
+  return outcome.limitations.flatMap((value) => {
+    const limitation = completionLimitation(value);
+    return limitation ? [limitation] : [];
+  });
+}
+
+function validationWithId(value: JsonValue, evidenceId: string): value is ValidationEvidence {
+  return isEvidenceRecord(value) && value.kind === "validation" && value.evidenceId === evidenceId;
+}
+
+function limitationMatchesValidation(
+  candidate: ValidationEvidence,
+  limitation: CompletionLimitationV1
+): boolean {
+  const claim = candidate.data.claim;
+  const compatibleClaim = claim?.kind === limitation.claim
+    || (claim?.kind === "integration" && limitation.claim === "unit");
+  return candidate.status === "failed"
+    && claim?.status === "unavailable"
+    && compatibleClaim
+    && candidate.data.termination?.processStarted === false
+    && typeof candidate.data.command === "string"
+    && candidate.data.command.trim().length > 0;
+}
+
+function sourceValidation(
+  outcome: Record<string, JsonValue>,
+  limitation: CompletionLimitationV1
+): ValidationEvidence | null {
+  if (!Array.isArray(outcome.evidence)) return null;
+  const candidate = outcome.evidence.find((value) =>
+    validationWithId(value, limitation.capabilityEvidenceId));
+  return candidate && validationWithId(candidate, limitation.capabilityEvidenceId)
+    && limitationMatchesValidation(candidate, limitation) ? candidate : null;
+}
+
+export function childLimitationEvidenceSources(
+  childId: string,
+  outcomeValue: JsonValue
+): ChildLimitationEvidenceSource[] {
+  const outcome = record(outcomeValue);
+  if (outcome.kind !== "completed_with_limitations") return [];
+  const limitations = Array.isArray(outcome.limitations) ? outcome.limitations.flatMap((value) => {
+    const limitation = completionLimitation(value);
+    return limitation ? [limitation] : [];
+  }) : [];
+  return limitations.flatMap((limitation) => {
+    const evidence = sourceValidation(outcome, limitation);
+    return evidence ? [{ childId, limitation, evidence }] : [];
+  });
+}
+
+function childLimitationEvidence(child: DurableChild): ChildLimitationEvidenceSource[] {
+  return childLimitationEvidenceSources(child.childId, child.completed?.outcome ?? null);
 }
 
 export async function auditDurableChildren(
@@ -103,7 +191,9 @@ export async function auditDurableChildren(
     failures: joined.flatMap((child) => {
       const value = failure(child);
       return value ? [value] : [];
-    })
+    }),
+    limitations: joined.flatMap(childLimitations),
+    limitationEvidence: joined.flatMap(childLimitationEvidence)
   };
 }
 
@@ -117,7 +207,8 @@ function eventOutcome(event: AgentEventEnvelope): ChildLedgerSnapshot["terminal"
   if (!["run.completed", "run.failed", "run.cancelled"].includes(event.type)) return undefined;
   const value = record(event.payload);
   if (event.type === "run.completed") {
-    return { status: "completed", outcome: { ...value, kind: "completed" } as RunOutcome };
+    const kind = value.kind === "completed_with_limitations" ? "completed_with_limitations" : "completed";
+    return { status: "completed", outcome: { ...value, kind } as RunOutcome };
   }
   if (event.type === "run.cancelled") {
     return {

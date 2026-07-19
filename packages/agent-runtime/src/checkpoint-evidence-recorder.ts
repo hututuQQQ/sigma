@@ -52,6 +52,7 @@ export class CheckpointEvidenceRecorder {
           checkpointStatus: "sealed",
           preManifestDigest: sealed.preManifestDigest,
           postManifestDigest: sealed.postManifestDigest,
+          ...(sealed.deltaDigest ? { deltaDigest: sealed.deltaDigest } : {}),
           sourceSessionId,
           childId
         }
@@ -116,6 +117,7 @@ export class CheckpointEvidenceRecorder {
           modified: [...checkpointDelta.modified],
           deleted: [...checkpointDelta.deleted]
         },
+        ...(sealed.deltaDigest ? { deltaDigest: sealed.deltaDigest } : {}),
         reviewDiff: material.reviewDiff,
         reviewDiffPaths: material.reviewDiffPaths,
         ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {}),
@@ -141,7 +143,8 @@ export class CheckpointEvidenceRecorder {
         checkpointId,
         checkpointStatus: "sealed",
         preManifestDigest: sealed.preManifestDigest,
-        ...(sealed.postManifestDigest ? { postManifestDigest: sealed.postManifestDigest } : {})
+        ...(sealed.postManifestDigest ? { postManifestDigest: sealed.postManifestDigest } : {}),
+        ...(sealed.deltaDigest ? { deltaDigest: sealed.deltaDigest } : {})
       }
     };
     await this.emit(session, "evidence.recorded", "runtime", evidence);
@@ -201,6 +204,7 @@ export class CheckpointEvidenceRecorder {
           modified: [...sealed.delta!.modified],
           deleted: [...sealed.delta!.deleted]
         },
+        ...(sealed.deltaDigest ? { deltaDigest: sealed.deltaDigest } : {}),
         reviewDiff: material.reviewDiff,
         reviewDiffPaths: material.reviewDiffPaths,
         ...(material.opaqueArtifacts.length > 0 ? { opaqueArtifacts: material.opaqueArtifacts } : {}),

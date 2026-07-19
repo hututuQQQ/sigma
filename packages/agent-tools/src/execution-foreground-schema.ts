@@ -1,5 +1,5 @@
 import type { JsonValue, ToolDescriptor } from "agent-protocol";
-import type { ExecutionToolOptions } from "./execution-tool-types.js";
+import { resolveCommandTimeoutSec, type ExecutionToolOptions } from "./execution-tool-types.js";
 import {
   availableShells,
   executableCapabilitySchema,
@@ -73,12 +73,13 @@ export function foregroundExecutionSchema(
   network: JsonValue
 ): { schema: ToolDescriptor; validation: boolean } {
   const validation = kind === "validate";
+  const commandTimeoutMs = resolveCommandTimeoutSec(options.commandTimeoutSec) * 1_000;
   const properties = {
     ...invocationProperties(kind, options),
     cwd: { type: "string" },
     network,
     env: { type: "object", additionalProperties: { type: "string" } },
-    timeoutMs: { type: "integer", minimum: 1, maximum: 600000 },
+    timeoutMs: { type: "integer", minimum: 1, maximum: commandTimeoutMs },
     ...writeContractProperties()
   };
   const required = validation ? [] : kind === "shell" ? ["shell", "command"] : ["executable"];
@@ -88,7 +89,10 @@ export function foregroundExecutionSchema(
   const description = validation
     ? "Run a sandboxed validation using exactly one form: {executable,args} or {shell,command}. The runtime classifies semantic assurance from the command adapter and its exact subjects; working-directory and filesystem permissions never imply validation coverage."
     : `Run a sandboxed ${kind} command. With skill and skillScript, the frozen script is prepended to interpreter args.`;
-  const base = executionToolSchema(kind, description, properties, required, effects);
+  const base = {
+    ...executionToolSchema(kind, description, properties, required, effects),
+    timeoutMs: Math.min(2_147_483_647, commandTimeoutMs + 150_000)
+  };
   const schema = validation
     ? { ...base, inputSchema: validationSchema(base, availableShells(options).length > 0) }
     : base;

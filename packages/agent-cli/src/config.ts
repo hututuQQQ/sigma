@@ -29,6 +29,9 @@ export interface CliConfig {
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";
   executionMode: "sandboxed" | "container";
+  containerEngine: "auto" | "docker" | "podman";
+  containerTarget: "owned" | "managed";
+  containerImage?: string;
   readScope: "workspace" | "host";
   networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
@@ -37,6 +40,7 @@ export interface CliConfig {
   modelSpecs: ModelSpecConfigValue[];
   modelRoutes: ModelRouteConfigValue[];
   runDeadlineSec: number;
+  commandTimeoutSec: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
   streamActiveSec: number;
@@ -223,6 +227,9 @@ function cliConfig(
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
     executionMode: values.executionMode as CliConfig["executionMode"],
+    containerEngine: values.containerEngine as CliConfig["containerEngine"],
+    containerTarget: values.containerTarget as CliConfig["containerTarget"],
+    ...(String(values.containerImage) ? { containerImage: String(values.containerImage) } : {}),
     readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],
@@ -231,6 +238,7 @@ function cliConfig(
     modelSpecs: values.modelSpecs as ModelSpecConfigValue[],
     modelRoutes: values.modelRoutes as ModelRouteConfigValue[],
     runDeadlineSec: Number(values.runDeadlineSec),
+    commandTimeoutSec: Number(values.commandTimeoutSec),
     modelDeadlineSec: Number(values.modelDeadlineSec),
     streamIdleSec: Number(values.streamIdleSec),
     streamActiveSec: Number(values.streamActiveSec),

@@ -45,11 +45,20 @@ export function isCompletionEligibleEvidence(
 ): boolean {
   if (evidence.sessionId !== sessionId || evidence.runId !== runId || evidence.status === "failed") return false;
   if (evidence.kind === "input_access") return false;
+  if (evidence.kind === "validation") return passedValidationSupportsClaim(evidence);
   return evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source);
 }
 
-function passedValidationSupportsClaim(evidence: Extract<EvidenceRecord, { kind: "validation" }>): boolean {
+/** A passed process is assurance only when the trusted runtime classified its
+ * method and found an explicit failure contract. Legacy/unclassified and
+ * exit-code-only records remain useful diagnostics, but cannot prove success. */
+export function passedValidationSupportsClaim(
+  evidence: Extract<EvidenceRecord, { kind: "validation" }>
+): boolean {
   if (evidence.status !== "passed") return false;
+  const claim = evidence.data.claim;
+  if (!claim || claim.kind === "probe" || claim.assertionMode !== "explicit"
+    || claim.strength === undefined || claim.independence === undefined) return false;
   const termination = evidence.data.termination;
   return termination === undefined || (termination.processStarted
     && termination.state === "exited"
@@ -72,6 +81,7 @@ export function evidenceSupportsClaim(
   claim: EvidenceClaim = "acceptance_met"
 ): boolean {
   if (claim === "acceptance_met") {
+    if (evidence.kind === "validation") return passedValidationSupportsClaim(evidence);
     return evidence.status !== "failed"
       && (evidence.kind !== "diagnostic" || !NON_ACTIONABLE_DIAGNOSTIC_SOURCES.has(evidence.data.source));
   }

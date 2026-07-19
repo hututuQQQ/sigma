@@ -55,6 +55,20 @@ struct PathBeneathAttr {
     parent_fd: libc::c_int,
 }
 
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
 struct OwnedFd(libc::c_int);
 
 impl Drop for OwnedFd {
@@ -71,6 +85,7 @@ struct LauncherSpec {
     write_roots: Vec<PathBuf>,
     cwd_pin: PathBuf,
     argv0: OsString,
+    loopback: bool,
     command: Vec<OsString>,
 }
 
@@ -116,6 +131,10 @@ fn launch(spec: LauncherSpec) -> io::Result<i32> {
             io::ErrorKind::PermissionDenied,
             "hardened launcher must be sandbox PID 1",
         ));
+    }
+    if spec.loopback {
+        enable_loopback()?;
+        drop_capabilities()?;
     }
     attest_directory_identity(Path::new("."), &spec.cwd_pin)?;
     apply_landlock_and_seccomp(&spec.read_roots, &spec.write_roots)?;
@@ -185,6 +204,7 @@ fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
     let mut write_roots = Vec::new();
     let mut cwd_pin = None;
     let mut argv0 = None;
+    let mut loopback = false;
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == OsStr::new("--") {
@@ -206,6 +226,7 @@ fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
                 write_roots: canonical_roots(write_roots)?,
                 cwd_pin: canonical_directory(cwd_pin, "cwd pin")?,
                 argv0,
+                loopback,
                 command,
             });
         }
@@ -245,9 +266,16 @@ fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
                 argv0 = Some(value.clone());
                 index += 1;
             }
+            Some("--loopback") => {
+                if loopback {
+                    return Err(invalid("hardening launcher accepts only one loopback flag"));
+                }
+                loopback = true;
+                index += 1;
+            }
             _ => {
                 return Err(invalid(
-                    "hardening launcher accepts only --argv0/--cwd-pin/--read/--write roots",
+                    "hardening launcher accepts only --argv0/--cwd-pin/--loopback/--read/--write roots",
                 ));
             }
         }
@@ -255,6 +283,44 @@ fn parse_launcher(arguments: Vec<OsString>) -> io::Result<LauncherSpec> {
     Err(invalid(
         "hardening launcher is missing the '--' command delimiter",
     ))
+}
+
+fn enable_loopback() -> io::Result<()> {
+    let descriptor =
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let socket = OwnedFd(descriptor);
+    let mut request = unsafe { std::mem::zeroed::<libc::ifreq>() };
+    request.ifr_name[0] = b'l' as libc::c_char;
+    request.ifr_name[1] = b'o' as libc::c_char;
+    if unsafe { libc::ioctl(socket.0, libc::SIOCGIFFLAGS as _, &mut request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = unsafe { request.ifr_ifru.ifru_flags };
+    request.ifr_ifru.ifru_flags = flags | libc::IFF_UP as libc::c_short;
+    if unsafe { libc::ioctl(socket.0, libc::SIOCSIFFLAGS as _, &request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drop_capabilities() -> io::Result<()> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let header = CapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn canonical_directory(path: PathBuf, label: &str) -> io::Result<PathBuf> {
@@ -670,6 +736,8 @@ fn self_test_arguments(
         OsString::from("--new-session"),
         OsString::from("--unshare-all"),
         OsString::from("--as-pid-1"),
+        OsString::from("--cap-add"),
+        OsString::from("CAP_NET_ADMIN"),
         OsString::from("--ro-bind"),
         OsString::from("/"),
         OsString::from("/"),
@@ -697,6 +765,7 @@ fn self_test_arguments(
         OsString::from(INTERNAL_CWD_PIN_MOUNT),
         OsString::from("--argv0"),
         helper.as_os_str().to_owned(),
+        OsString::from("--loopback"),
         OsString::from("--read"),
         OsString::from("/"),
         OsString::from("--write"),
@@ -784,6 +853,7 @@ mod tests {
             "/".into(),
             "--argv0".into(),
             "true".into(),
+            "--loopback".into(),
             "--read".into(),
             "/".into(),
             "--write".into(),
@@ -794,6 +864,7 @@ mod tests {
         .expect("valid launcher");
         assert_eq!(parsed.command[0], OsStr::new("/bin/true"));
         assert_eq!(parsed.argv0, OsStr::new("true"));
+        assert!(parsed.loopback);
         assert!(
             parse_launcher(vec![
                 "--cwd-pin".into(),

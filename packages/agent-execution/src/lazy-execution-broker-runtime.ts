@@ -44,6 +44,7 @@ function reportWithRuntimeCommands(
       // The native doctor report does not own package toolchain trust. Replace
       // any lower-layer claim with aliases from this connection's manifest.
       runtimeCommands: [...runtimeCommands],
+      runtimeCommandSnapshotComplete: true,
       processHandoff: report.capabilities.processHandoff === true && processHandoffAvailable
     }
   };

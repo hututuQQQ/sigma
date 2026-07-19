@@ -67,6 +67,7 @@ export const workspaceDeltaEvidenceSchema = z.object({
   kind: z.literal("workspace_delta"),
   data: z.object({
     delta: checkpointDeltaSchema,
+    deltaDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
     checkpointId: nonEmptyStringSchema,
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional(),
@@ -148,6 +149,9 @@ export const validationEvidenceSchema = z.object({
     claim: z.object({
       kind: z.enum(["probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"]),
       commandDigest: digestSchema,
+      strength: z.enum(["structural", "self_consistency", "behavioral", "source_grounded"]).optional(),
+      independence: z.enum(["same_method", "cross_method", "external_reference"]).optional(),
+      assertionMode: z.enum(["explicit", "exit_code_only"]).optional(),
       subject: z.object({
         projectId: z.string().optional(),
         configPaths: z.array(z.string()),
@@ -192,7 +196,9 @@ export const reviewEvidenceSchema = z.object({
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
     reviewBasisDigest: digestSchema.optional(),
+    reviewBasisVersion: z.literal(2).optional(),
     validationEvidenceIds: z.array(z.string()).optional(),
+    reviewRelevantEvidenceIds: z.array(z.string()).optional(),
     failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
     failureCode: z.literal("review_scope_too_large").optional(),
     checkpointId: z.string().optional()
@@ -207,6 +213,7 @@ export const checkpointEvidenceSchema = z.object({
     checkpointStatus: z.enum(["open", "sealed", "restored"]),
     preManifestDigest: nonEmptyStringSchema,
     postManifestDigest: z.string().optional(),
+    deltaDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
     sourceSessionId: nonEmptyStringSchema.optional(),
     childId: nonEmptyStringSchema.optional()
   }).strict()
@@ -385,5 +392,6 @@ export const checkpointRefSchema = z.object({
   restoredAt: dateTimeSchema.optional(),
   preManifestDigest: nonEmptyStringSchema,
   postManifestDigest: z.string().min(1).optional(),
+  deltaDigest: digestSchema.optional(),
   delta: checkpointDeltaSchema.optional()
 }).strict();

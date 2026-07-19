@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import importlib
 import json
@@ -60,8 +61,12 @@ def import_portable_agent_module():
     return importlib.import_module("portable.harbor.sigma_harbor_agent")
 
 
-def current_doctor_payload(network_modes: list[str] | None = None) -> str:
-    return json.dumps({
+def current_doctor_payload(
+    network_modes: list[str] | None = None,
+    *,
+    container: bool = False,
+) -> str:
+    payload = {
         "doctorSchemaVersion": 1,
         "status": "ok",
         "strict": True,
@@ -75,10 +80,147 @@ def current_doctor_payload(network_modes: list[str] | None = None) -> str:
             "processHandoff": True,
         },
         "checks": [],
-    })
+    }
+    if container:
+        payload["sandbox"]["backend"] = "oci"
+        payload["container"] = {
+            "available": True,
+            "backend": "oci",
+            "engine": "docker",
+            "target": "managed",
+            "targetId": "main-container-id",
+            "targetStartedAt": "2026-07-19T00:00:00Z",
+            "imageId": "sha256:" + "1" * 64,
+            "imageDigest": "sha256:" + "2" * 64,
+            "helperDigest": "sha256:" + "4" * 64,
+            "attestationDigest": "sha256:" + "3" * 64,
+        }
+    return json.dumps(payload)
+
+
+def completed_stream(session_id: str = "test-session", message: str = "done") -> str:
+    event = {
+        "kind": "event",
+        "event": {
+            "eventId": f"{session_id}-completed",
+            "sessionId": session_id,
+            "type": "run.completed",
+            "payload": {
+                "kind": "completed",
+                "message": message,
+                "evidence": [],
+            },
+        },
+    }
+    result = {
+        "kind": "result",
+        "result": {
+            "status": "completed",
+            "finishReason": "completed",
+            "sessionId": session_id,
+            "finalMessage": message,
+        },
+    }
+    return json.dumps(event) + "\n" + json.dumps(result) + "\n"
 
 
 class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
+    def test_preserves_completed_with_limitations_as_successful_distinct_terminal(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            limitation = {
+                "kind": "validation_capability_unavailable",
+                "claim": "unit",
+                "attemptedCommandSummary": "pnpm test",
+                "capabilityEvidenceId": "validation-proof",
+                "reason": "The test runner is unavailable.",
+            }
+            event = {
+                "type": "run.completed",
+                "sessionId": "session-limited",
+                "payload": {
+                    "kind": "completed_with_limitations",
+                    "message": "artifact produced",
+                    "evidence": [],
+                    "limitations": [limitation],
+                },
+            }
+
+            terminal = agent._terminal_result([event], "session-limited")
+            self.assertEqual(terminal["status"], "completed_with_limitations")
+            self.assertEqual(terminal["finishReason"], "completed_with_limitations")
+            wrapped = agent._result_with_payload(SimpleNamespace(stdout="", stderr=""), terminal)
+            self.assertEqual(wrapped["return_code"], 0)
+            summary = agent._summary_from_events([event], terminal)
+            self.assertEqual(summary["status"], "completed_with_limitations")
+            self.assertEqual(summary["limitation_count"], 1)
+            self.assertEqual(summary["limitations"], [limitation])
+            context = SimpleNamespace()
+            agent._populate_context(context, wrapped, summary, None)
+            self.assertEqual(context.completion_limitation_count, 1)
+            self.assertEqual(context.completion_limitations, [limitation])
+
+    def test_rejects_malformed_or_inconsistent_limited_completion_protocol(self):
+        module = import_portable_agent_module()
+        agent = module.SigmaCliHarborAgent()
+        malformed = {
+            "type": "run.completed",
+            "sessionId": "session-malformed",
+            "payload": {
+                "kind": "completed_with_limitations",
+                "message": "done",
+                "evidence": [],
+                "limitations": [],
+            },
+        }
+
+        terminal = agent._terminal_result([malformed], "session-malformed")
+        self.assertEqual(terminal["status"], "failed")
+        self.assertIn("non-empty limitations", terminal["protocolError"])
+
+        limitation = {
+            "kind": "validation_capability_unavailable",
+            "claim": "unit",
+            "attemptedCommandSummary": "make test",
+            "capabilityEvidenceId": "validation-proof",
+            "reason": "make is unavailable",
+        }
+        limited_event = {
+            "type": "run.completed",
+            "sessionId": "session-mismatch",
+            "payload": {
+                "kind": "completed_with_limitations",
+                "message": "done",
+                "evidence": [],
+                "limitations": [limitation],
+            },
+        }
+        recorded = agent._recorded_terminal_result([limited_event], {
+            "status": "completed",
+            "finishReason": "completed",
+            "sessionId": "session-mismatch",
+        })
+        self.assertEqual(recorded["status"], "failed")
+        self.assertIn("disagree about completion status", recorded["protocolError"])
+
+        missing_event = agent._recorded_terminal_result([], {
+            "status": "completed_with_limitations",
+            "finishReason": "completed_with_limitations",
+            "sessionId": "session-no-event",
+            "limitations": [limitation],
+        })
+        self.assertEqual(missing_event["status"], "failed")
+        self.assertIn("matching run.completed", missing_event["protocolError"])
+
+        missing_ordinary_event = agent._recorded_terminal_result([], {
+            "status": "completed",
+            "finishReason": "completed",
+            "sessionId": "session-no-ordinary-event",
+        })
+        self.assertEqual(missing_ordinary_event["status"], "failed")
+        self.assertIn("matching run.completed", missing_ordinary_event["protocolError"])
+
     async def test_model_name_is_used_unless_model_is_explicit(self):
         module = import_portable_agent_module()
 
@@ -94,6 +236,10 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.SigmaCliHarborAgent(network_mode="loopback").network_mode, "loopback")
         with self.assertRaisesRegex(ValueError, "agent_profile"):
             module.SigmaCliHarborAgent(agent_profile="untrusted")
+        for key in ("max_turns", "command_timeout_sec"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, key):
+                    module.SigmaCliHarborAgent(**{key: 0})
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -101,19 +247,23 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
                 execution_mode="container",
+                max_turns=37,
+                command_timeout_sec=91,
             )
             agent._workspace = "/app"
 
             command = agent._agent_command()
             session_command = agent._session_command("resume", "session-fixture")
 
-            self.assertEqual(command[0], "/usr/local/bin/agent")
+            self.assertEqual(command[0], "/opt/sigma-control/agent-cli/bin/agent")
             self.assertIn("--execution-mode", command)
             self.assertIn("container", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
             self.assertEqual(command[command.index("--permission-mode") + 1], "auto")
-            self.assertEqual(session_command[0], "/usr/local/bin/agent")
+            self.assertEqual(command[command.index("--max-model-turns") + 1], "37")
+            self.assertEqual(command[command.index("--command-timeout-sec") + 1], "91")
+            self.assertEqual(session_command[0], "/opt/sigma-control/agent-cli/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
             self.assertIn("--agent-profile", session_command)
@@ -122,15 +272,19 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 session_command[session_command.index("--permission-mode") + 1],
                 "auto",
             )
+            self.assertEqual(session_command[session_command.index("--max-model-turns") + 1], "37")
+            self.assertEqual(session_command[session_command.index("--command-timeout-sec") + 1], "91")
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
+            self.assertEqual(command[command.index("--container-target") + 1], "managed")
+            self.assertEqual(session_command[session_command.index("--container-target") + 1], "managed")
 
     async def test_container_setup_never_manufactures_host_persistence(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             logs_dir = Path(tmp) / "logs"
-            env = SimpleNamespace(exec=AsyncMock(side_effect=[
+            env = SimpleNamespace(service_exec=AsyncMock(side_effect=[
                 SimpleNamespace(return_code=0, stdout="usage", stderr=""),
-                SimpleNamespace(return_code=0, stdout=current_doctor_payload(), stderr=""),
+                SimpleNamespace(return_code=0, stdout=current_doctor_payload(container=True), stderr=""),
             ]))
             agent = module.SigmaCliHarborAgent(
                 logs_dir=logs_dir,
@@ -140,16 +294,391 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
 
             await agent._verify_agent_ready(env)
 
-            commands = [call.args[0] for call in env.exec.await_args_list]
+            commands = [call.args[0] for call in env.service_exec.await_args_list]
             self.assertTrue(all("disposable" not in command for command in commands))
+            self.assertTrue(all(call.kwargs["service"] == "sigma-control" for call in env.service_exec.await_args_list))
             record = json.loads((logs_dir / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["classification"], "passed")
             self.assertEqual(record["execution_mode"], "container")
             self.assertEqual(record["agent_profile"], "standard")
+            self.assertEqual(record["execution_backend"], "oci:docker")
+            self.assertEqual(record["container_engine"], "docker")
+            self.assertEqual(record["container_target"], "managed")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
                 ["help", "strict_doctor"],
             )
+
+    async def test_container_setup_uses_control_package_and_only_trusted_main_setup(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            tarball = Path(tmp) / "must-not-be-uploaded.tgz"
+            tarball.write_bytes(b"unused")
+            identity = "77:88\n"
+            service_exec = AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="", stderr=""),
+                SimpleNamespace(return_code=0, stdout=identity, stderr=""),
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=current_doctor_payload(container=True), stderr=""),
+            ])
+            env = SimpleNamespace(
+                exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout=identity, stderr="")),
+                service_exec=service_exec,
+                service_download_file=AsyncMock(),
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                agent_cli_tarball=tarball,
+                execution_mode="container",
+            )
+
+            await agent.setup(env)
+
+            env.exec.assert_awaited_once()
+            main_command = env.exec.await_args.args[0]
+            self.assertIn("test \"$(pwd -P)\" = /app", main_command)
+            self.assertIn(
+                "ln -sfn /opt/sigma-helper/bin/bwrap /usr/local/bin/bwrap",
+                main_command,
+            )
+            self.assertNotIn("agent-cli.tgz", main_command)
+            self.assertNotIn("DEEPSEEK", main_command)
+            self.assertNotIn("/opt/sigma-control", main_command)
+            self.assertNotIn("env", env.exec.await_args.kwargs)
+
+            self.assertEqual(service_exec.await_count, 4)
+            self.assertTrue(all(
+                call.kwargs.get("service") == "sigma-control"
+                for call in service_exec.await_args_list
+            ))
+            package_command = service_exec.await_args_list[0].args[0]
+            self.assertIn("/opt/sigma-package/agent-cli.tgz", package_command)
+            self.assertIn("/opt/sigma-control/agent-cli", package_command)
+            self.assertIn("test -x /opt/sigma-helper/bin/sigma-exec", main_command)
+            self.assertIn("test -x /opt/sigma-helper/bin/sigma-exec", package_command)
+            self.assertIn(
+                "if ( : > /opt/sigma-helper/.sigma-control-write-probe ) "
+                "2>/dev/null; then",
+                package_command,
+            )
+            self.assertNotIn(
+                "if : > /opt/sigma-helper/.sigma-control-write-probe",
+                package_command,
+            )
+            self.assertIn(
+                "rm -f /opt/sigma-helper/.sigma-control-write-probe",
+                package_command,
+            )
+            self.assertIn(
+                'echo "control unexpectedly has write access to the trusted helper" >&2\n'
+                "  exit 1",
+                package_command,
+            )
+            self.assertNotIn("/opt/sigma-helper/.sigma-stage", package_command)
+            self.assertNotIn("install -m 0555", package_command)
+            self.assertNotIn("cp -R", package_command)
+            self.assertIn("test ! -e /opt/sigma-helper/node_modules", package_command)
+            self.assertNotIn(str(tarball), package_command)
+            env.upload_file.assert_not_awaited()
+            env.download_file.assert_not_awaited()
+
+            setup_record = json.loads(
+                (Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(setup_record["classification"], "passed")
+            self.assertEqual(
+                [check["stage"] for check in setup_record["checks"]],
+                [
+                    "control_package", "main_boundary", "control_workspace",
+                    "help", "strict_doctor",
+                ],
+            )
+            self.assertEqual(setup_record["container"]["targetId"], "main-container-id")
+
+    async def test_container_setup_rejects_missing_service_capability_without_main_fallback(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(),
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "requires Harbor compose service_exec"):
+                await agent.setup(env)
+
+            env.exec.assert_not_awaited()
+            env.upload_file.assert_not_awaited()
+            env.download_file.assert_not_awaited()
+
+            env_without_download = SimpleNamespace(
+                exec=AsyncMock(),
+                service_exec=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            agent_without_download = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs-without-download",
+                execution_mode="container",
+            )
+            with self.assertRaisesRegex(RuntimeError, "requires Harbor compose service_download_file"):
+                await agent_without_download.setup(env_without_download)
+            env_without_download.exec.assert_not_awaited()
+            env_without_download.service_exec.assert_not_awaited()
+            env_without_download.download_file.assert_not_awaited()
+
+    async def test_container_doctor_requires_managed_attested_identity(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            payload = json.loads(current_doctor_payload(container=True))
+            del payload["container"]["targetStartedAt"]
+            env = SimpleNamespace(service_exec=AsyncMock(side_effect=[
+                SimpleNamespace(return_code=0, stdout="usage", stderr=""),
+                SimpleNamespace(return_code=0, stdout=json.dumps(payload), stderr=""),
+            ]))
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+            )
+            agent._workspace = "/app"
+
+            with self.assertRaisesRegex(RuntimeError, "container.targetStartedAt"):
+                await agent._verify_agent_ready(env)
+
+            self.assertTrue(all(
+                call.kwargs.get("service") == "sigma-control"
+                for call in env.service_exec.await_args_list
+            ))
+
+    async def test_container_run_and_artifacts_never_fall_back_to_main(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            instruction = "modify /app and validate it"
+            encoded_instruction = base64.b64encode(
+                instruction.encode("utf-8")
+            ).decode("ascii")
+
+            async def service_exec_side_effect(command, **_kwargs):
+                if "/opt/sigma-control/agent-cli/bin/agent run" in command:
+                    return SimpleNamespace(
+                        return_code=0,
+                        stdout="\n".join([
+                            json.dumps({
+                                "kind": "event",
+                                "event": {
+                                    "eventId": "completed",
+                                    "sessionId": "container-session",
+                                    "seq": 1,
+                                    "type": "run.completed",
+                                    "payload": {"kind": "completed", "message": "done", "evidence": []},
+                                },
+                            }),
+                            json.dumps({
+                                "kind": "result",
+                                "result": {
+                                    "status": "completed",
+                                    "finishReason": "completed",
+                                    "sessionId": "container-session",
+                                },
+                            }),
+                        ]) + "\n",
+                        stderr="",
+                    )
+                if command.startswith("test -f ") or command.startswith("test -d "):
+                    return SimpleNamespace(return_code=1, stdout="", stderr="")
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(),
+                service_exec=AsyncMock(side_effect=service_exec_side_effect),
+                service_download_file=AsyncMock(),
+                upload_file=AsyncMock(),
+                download_file=AsyncMock(),
+            )
+            context = SimpleNamespace(task_id="container-routing")
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+                extra_env={"SIGMA_TEST_MARKER": "control-only"},
+            )
+            agent._workspace = "/app"
+            agent.execution_backend = "oci:docker"
+            agent.container_metadata = json.loads(current_doctor_payload(container=True))["container"]
+
+            await agent.run(instruction, env, context)
+
+            env.exec.assert_not_awaited()
+            env.upload_file.assert_not_awaited()
+            env.download_file.assert_not_awaited()
+            env.service_download_file.assert_not_awaited()
+            self.assertTrue(all(
+                call.kwargs.get("service") == "sigma-control"
+                for call in env.service_exec.await_args_list
+            ))
+            commands = [call.args[0] for call in env.service_exec.await_args_list]
+            instruction_command = next(command for command in commands if "base64 -d" in command)
+            self.assertIn(encoded_instruction, instruction_command)
+            self.assertNotIn(instruction, instruction_command)
+            run_call = next(
+                call for call in env.service_exec.await_args_list
+                if "/opt/sigma-control/agent-cli/bin/agent run" in call.args[0]
+            )
+            self.assertEqual(run_call.kwargs["env"]["SIGMA_TEST_MARKER"], "control-only")
+            self.assertEqual(context.execution_backend, "oci:docker")
+            self.assertEqual(context.container_target, "managed")
+            self.assertEqual(context.target_image_id, "sha256:" + "1" * 64)
+            summary = json.loads(
+                (Path(tmp) / "logs" / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["execution_backend"], "oci:docker")
+            self.assertEqual(summary["container_target_id"], "main-container-id")
+            self.assertEqual(summary["task_image_digest"], "sha256:" + "2" * 64)
+            self.assertEqual(summary["max_turns"], 256)
+            self.assertEqual(summary["command_timeout_sec"], 600)
+
+    async def test_container_session_observation_uses_control_service(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(
+                exec=AsyncMock(),
+                service_exec=AsyncMock(return_value=SimpleNamespace(
+                    return_code=0,
+                    stdout=json.dumps({"events": [{"type": "run.completed"}]}) + "\n",
+                    stderr="",
+                )),
+            )
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+            )
+            agent._workspace = "/app"
+
+            events, error = await agent._read_session_events(
+                env, "session-fixture", {"SIGMA_TEST_MARKER": "control-only"}
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(events, [{"type": "run.completed"}])
+            env.exec.assert_not_awaited()
+            call = env.service_exec.await_args
+            self.assertEqual(call.kwargs["service"], "sigma-control")
+            self.assertEqual(call.kwargs["env"]["SIGMA_TEST_MARKER"], "control-only")
+            self.assertIn(
+                "/opt/sigma-control/agent-cli/bin/agent session show",
+                call.args[0],
+            )
+
+    async def test_container_artifact_download_and_cleanup_use_control_service(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "logs" / "summary.json"
+
+            async def download_side_effect(_remote_path, target_path, **_kwargs):
+                Path(target_path).write_text("{}\n", encoding="utf-8")
+
+            env = SimpleNamespace(
+                exec=AsyncMock(),
+                download_file=AsyncMock(),
+                service_exec=AsyncMock(side_effect=[
+                    SimpleNamespace(return_code=0, stdout="", stderr=""),
+                    SimpleNamespace(
+                        return_code=0,
+                        stdout='{"pid_recorded":true,"pid":42,"pgid":42,"status":"terminated"}\n',
+                        stderr="",
+                    ),
+                ]),
+                service_download_file=AsyncMock(side_effect=download_side_effect),
+            )
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+            )
+
+            downloaded = await agent._download_if_present(
+                env, "/tmp/agent/summary.json", "summary.json"
+            )
+            cleanup = await agent._cleanup_remote_process(env)
+
+            self.assertEqual(downloaded, target)
+            self.assertEqual(cleanup["pid"], 42)
+            env.exec.assert_not_awaited()
+            env.download_file.assert_not_awaited()
+            env.service_download_file.assert_awaited_once_with(
+                "/tmp/agent/summary.json", target, service="sigma-control"
+            )
+            self.assertTrue(all(
+                call.kwargs.get("service") == "sigma-control"
+                for call in env.service_exec.await_args_list
+            ))
+
+    async def test_sandboxed_mode_observes_broker_image_identity_without_using_oci_execution(self):
+        module = import_portable_agent_module()
+        attestation = {
+            "protocolVersion": 1,
+            "engine": "docker",
+            "selector": "compose-project/main",
+            "targetId": "main-container-id",
+            "targetStartedAt": "2026-07-19T00:00:00Z",
+            "imageId": "sha256:" + "a" * 64,
+            "imageDigest": "sha256:" + "b" * 64,
+            "labelsDigest": "c" * 64,
+            "helperDigest": "sha256:" + "e" * 64,
+            "attestationDigest": "d" * 64,
+            "workspace": "/app",
+        }
+        env = SimpleNamespace(service_exec=AsyncMock(return_value=SimpleNamespace(
+            return_code=0, stdout=json.dumps(attestation), stderr=""
+        )))
+        agent = module.SigmaCliHarborAgent(
+            execution_mode="sandboxed", managed_provenance=True
+        )
+
+        check = await agent._observe_managed_target_identity(env)
+
+        self.assertEqual(check["stage"], "managed_target_identity")
+        self.assertEqual(agent.container_metadata["imageId"], attestation["imageId"])
+        self.assertEqual(agent.container_metadata["imageDigest"], attestation["imageDigest"])
+        self.assertEqual(agent.container_metadata["target"], "managed")
+        env.service_exec.assert_awaited_once_with(
+            "cat /run/sigma-oci/attestation.json", service="sigma-control", timeout_sec=30
+        )
+
+    async def test_sandboxed_main_only_skips_missing_control_service(self):
+        module = import_portable_agent_module()
+        env = SimpleNamespace(service_exec=AsyncMock(
+            side_effect=RuntimeError("service sigma-control is not running")
+        ))
+        agent = module.SigmaCliHarborAgent(execution_mode="sandboxed")
+
+        check = await agent._observe_managed_target_identity(env)
+
+        self.assertIsNone(check)
+        env.service_exec.assert_not_awaited()
+
+    async def test_requested_managed_provenance_fails_closed_without_attestation(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            env = SimpleNamespace(service_exec=AsyncMock(return_value=SimpleNamespace(
+                return_code=1, stdout="", stderr="attestation unavailable"
+            )))
+            logs_dir = Path(tmp) / "logs"
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=logs_dir,
+                execution_mode="sandboxed",
+                managed_provenance=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "managed_target_identity"):
+                await agent._observe_managed_target_identity(env)
+
+            setup_check = json.loads((logs_dir / "setup-check.json").read_text())
+            self.assertEqual(setup_check["classification"], "agent_setup_failed")
+            self.assertTrue(setup_check["managed_provenance"])
 
     async def test_setup_prefers_uploaded_tarball(self):
         module = import_portable_agent_module()
@@ -338,7 +867,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(
                         return_code=0,
-                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stdout=completed_stream("forward-v2"),
                         stderr="",
                     )
                 if command.startswith("test -f "):
@@ -434,7 +963,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(
                         return_code=0,
-                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stdout=completed_stream("forward-provider"),
                         stderr="",
                     )
                 if command.startswith("test -f ") or command.startswith("test -d "):
@@ -704,7 +1233,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(
                         return_code=0,
-                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stdout=completed_stream("no-legacy-flags"),
                         stderr="",
                     )
                 if command.startswith("test -f ") or command.startswith("test -d "):
@@ -734,11 +1263,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             old_run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
             os.environ["SIGMA_BENCH_RUN_DIR"] = tmp
             logs_dir = Path(tmp) / "logs"
-            result_json = {"status": "completed", "finishReason": "completed", "sessionId": "session", "finalMessage": "done"}
-
             async def exec_side_effect(command, **kwargs):
                 if "/usr/local/bin/agent run" in command:
-                    return SimpleNamespace(return_code=0, stdout=json.dumps(result_json) + "\n", stderr="")
+                    return SimpleNamespace(return_code=0, stdout=completed_stream("session"), stderr="")
                 if command.startswith("test -f ") or command.startswith("test -d "):
                     return SimpleNamespace(return_code=1, stdout="", stderr="")
                 return SimpleNamespace(return_code=0, stdout="", stderr="")
@@ -800,7 +1327,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 json.dumps(event(4, "diagnostic", {"kind": "deadline.stage", "stage": "converge"})),
                 json.dumps(event(5, "tool.requested", {"callId": "tool-1", "name": "execute"})),
                 json.dumps(event(6, "tool.completed", {"callId": "tool-1", "name": "execute"})),
-                json.dumps(event(7, "run.completed", {"message": "done"})),
+                json.dumps(event(7, "run.completed", {
+                    "kind": "completed", "message": "done", "evidence": []
+                })),
                 json.dumps({
                     "kind": "result",
                     "result": {
@@ -954,7 +1483,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                         "sessionId": "recover-session",
                         "seq": 3,
                         "type": "run.completed",
-                        "payload": {"message": "done"},
+                        "payload": {"kind": "completed", "message": "done", "evidence": []},
                     },
                 ]
             }
@@ -998,7 +1527,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 if "/usr/local/bin/agent run" in command:
                     return SimpleNamespace(
                         return_code=0,
-                        stdout=json.dumps({"status": "completed", "finishReason": "completed"}) + "\n",
+                        stdout=completed_stream("reviewer-waiver"),
                         stderr="",
                     )
                 if command.startswith("test -f ") or command.startswith("test -d "):
@@ -1100,7 +1629,21 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "payload": {"turnId": 1},
                 },
             }
-            result = {"kind": "result", "result": {"status": "completed", "sessionId": "callback-session"}}
+            completed_event = {
+                "kind": "event",
+                "event": {
+                    "eventId": "callback-completed",
+                    "sessionId": "callback-session",
+                    "seq": 3,
+                    "type": "run.completed",
+                    "payload": {"kind": "completed", "message": "done", "evidence": []},
+                },
+            }
+            result = {"kind": "result", "result": {
+                "status": "completed",
+                "finishReason": "completed",
+                "sessionId": "callback-session",
+            }}
 
             @contextlib.contextmanager
             def scoped_output_callback(callback):
@@ -1126,6 +1669,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                             "payload": {"inputTokens": 3, "outputTokens": 2},
                         },
                     }) + "\n", "stdout")
+                    await active_callback(json.dumps(completed_event) + "\n", "stdout")
                     await active_callback(json.dumps(result) + "\n", "stdout")
                     return SimpleNamespace(return_code=0, stdout="", stderr="")
                 if command.startswith("test -f ") or command.startswith("test -d "):

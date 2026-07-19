@@ -10,6 +10,7 @@ import { completionCoordinatorState } from "./completion-evidence-gate.js";
 export type CompletionRepairPhase =
   | "none"
   | "evidence"
+  | "review_repair"
   | "terminal"
   | "failed_validation_terminal"
   | "no_change_confirmation"
@@ -48,6 +49,7 @@ function evidenceAcquisitionPhase(session: RuntimeSession): CompletionRepairPhas
 function explicitRepairPhase(session: RuntimeSession): CompletionRepairPhase | null {
   const repair = session.durable.state.completionRepair;
   if (repair?.kind === "evidence_acquisition") return evidenceAcquisitionPhase(session);
+  if (repair?.kind === "review_changes_requested") return "review_repair";
   if (repair?.kind === "terminal_action") return terminalRepairPhase(session, "terminal");
   if (repair?.kind === "no_change_confirmation") return "no_change_confirmation";
   if (repair?.kind === "protected_completion") return terminalRepairPhase(session, "protected_completion");

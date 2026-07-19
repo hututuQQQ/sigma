@@ -1,4 +1,5 @@
 import { BrokerTransport } from "./broker-transport.js";
+import { verifiedShellExecutables, verifiedTargetExecutableEnvironment } from "./broker-doctor-projection.js";
 import { requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport,
   requestVerifiedSandboxReport } from "./broker-sandbox-operations.js";
 import {
@@ -11,12 +12,17 @@ import {
   type ClientState, type Cursor, type ProcessRedaction
 } from "./broker-client-support.js";
 import { settleCancelledSpawn } from "./broker-client-cancellation.js";
+import { decodedProcessPollResult } from "./broker-process-result.js";
 import {
   attachBrokerLifecycleFailure, BrokerCancelledError, BrokerConnectionError,
   BrokerPolicyError, BrokerProcessLostError, BrokerTimeoutError
 } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
-import { positiveInteger, redactionSecrets, requestParams } from "./broker-request-policy.js";
+import {
+  positiveInteger,
+  redactionSecrets,
+  requestParams
+} from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
 import { assertTrustedToolchainsAvailable, normalizeTrustedToolchains,
   type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
@@ -44,14 +50,21 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   private closeRequested = false;
   private doctorValue?: BrokerDoctorReport;
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
-    if (!options.helperPath) throw new BrokerPolicyError("sigma-exec helperPath is required.");
+    const transports = [options.helperPath, options.socketPath, options.trustedStream].filter(Boolean);
+    if (transports.length !== 1) {
+      throw new BrokerPolicyError(
+        "Exactly one sigma-exec helperPath, trusted socketPath, or trusted stream is required."
+      );
+    }
     positiveInteger(options.cancellationGraceMs, 10_000, "cancellationGraceMs");
     this.trustedToolchains = normalizeTrustedToolchains(options.trustedToolchains);
     this.redactor = new SecretRedactor(options.secrets);
     this.transport = new BrokerTransport(options, (error) =>
       containTransportFailure(error, () => this.markProcessesLost(), async () => await this.lifecycle.close()));
     this.outputArtifacts = new BrokerOutputArtifactImporter(this.redactor, async (artifactIds) =>
-      await this.transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 })
+      await this.transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 }),
+      undefined,
+      options.artifactRootParent
     );
     this.lifecycle = new BrokerClientLifecycle(
       () => { this.closeRequested = true; },
@@ -175,7 +188,13 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     assertRequestSandbox(request.policy, this.doctorValue);
     const timeoutMs = positiveInteger(request.timeoutMs, 120_000, "timeoutMs");
     const params = {
-      ...requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()), timeoutMs,
+      ...requestParams(
+        request,
+        this.options,
+        this.trustedToolchains,
+        verifiedShellExecutables(this.doctorValue),
+        verifiedTargetExecutableEnvironment(this.options.executionBackend, this.doctorValue)
+      ), timeoutMs,
       ...(request.idleTimeoutMs === undefined ? {} : {
         idleTimeoutMs: positiveInteger(request.idleTimeoutMs, 30_000, "idleTimeoutMs")
       })
@@ -212,7 +231,13 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
         spawned = await parsePostDispatchValue(
           await this.transport.request(
             "process.spawn",
-            requestParams(request, this.options, this.trustedToolchains, this.verifiedShellExecutables()),
+            requestParams(
+              request,
+              this.options,
+              this.trustedToolchains,
+              verifiedShellExecutables(this.doctorValue),
+              verifiedTargetExecutableEnvironment(this.options.executionBackend, this.doctorValue)
+            ),
             { ...options, signal: undefined }
           ), parseSpawnedProcess, async () => await this.close()
         );
@@ -336,33 +361,13 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     const streams = this.processRedaction.get(handle.id) ?? createProcessRedaction(this.redactor);
     this.processRedaction.set(handle.id, streams);
     const final = value.state !== "running";
-    const stdout = streams.stdout.push(value.stdout.data, {
-      final, discontinuity: value.stdout.droppedBytes > 0
-    });
-    let stderr = streams.stderr.push(value.stderr.data, {
-      final, discontinuity: value.stderr.droppedBytes > 0
-    });
-    const failure = value.failure ? {
-      ...value.failure,
-      message: this.redactor.redactText(value.failure.message)
-    } : undefined;
-    if (failure) {
-      stderr = `sigma-exec sandbox launch failed [${failure.code}]: ${failure.message}`;
-    }
     if (final) this.processRedaction.delete(handle.id);
     const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts).catch(
       async (error: unknown) => await containPostDispatchFailure(
         error, async () => await this.closeForActiveOperation()
       )
     );
-    const result: ProcessPollResult = {
-      handle, state: value.state, exitCode: value.exitCode, signal: value.signal, durationMs: value.durationMs,
-      stdout, stderr,
-      stdoutDroppedBytes: value.stdout.droppedBytes, stderrDroppedBytes: value.stderr.droppedBytes,
-      outputTruncated: value.stdout.droppedBytes > 0 || value.stderr.droppedBytes > 0,
-      ...(failure ? { failure } : {}),
-      ...(outputArtifacts.length > 0 ? { outputArtifacts } : {})
-    };
+    const result = decodedProcessPollResult(handle, value, streams, this.redactor, outputArtifacts);
     if (final) {
       await this.transport.request("process.release", { handleId: handle.id }, { timeoutMs: 5_000 }).catch(
         async (error: unknown) => await containPostDispatchFailure(
@@ -373,11 +378,6 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
       this.activeProcesses.delete(handle.id);
     }
     return result;
-  }
-  private verifiedShellExecutables(): string[] {
-    return this.doctorValue?.capabilities.shells
-      ?.filter((shell) => shell.verified)
-      .map((shell) => shell.executable) ?? [];
   }
   private assertHandle(handle: ProcessHandle): void {
     if (handle.brokerInstanceId !== this.instanceId) throw new BrokerProcessLostError(handle.id);

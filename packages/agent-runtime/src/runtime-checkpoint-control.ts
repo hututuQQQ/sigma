@@ -1,5 +1,5 @@
 import { CheckpointConflictError, type CheckpointRecord } from "agent-checkpoint";
-import type { CheckpointRef } from "agent-protocol";
+import type { CheckpointCreatePolicyV1, CheckpointRef } from "agent-protocol";
 import { CheckpointEvidenceRecorder } from "./checkpoint-evidence-recorder.js";
 import { checkpointRef, type OpenCheckpointRecoveryResult, type RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
 import type { ChildCheckpointRecovery, RuntimeSession } from "./types.js";
@@ -11,13 +11,23 @@ export class RuntimeCheckpointControl {
     this.evidence = new CheckpointEvidenceRecorder(options.checkpoints, options.emit);
   }
 
-  async create(session: RuntimeSession, scopePaths: string[]): Promise<CheckpointRef> {
+  async create(
+    session: RuntimeSession,
+    scopePaths: string[],
+    policy?: CheckpointCreatePolicyV1
+  ): Promise<CheckpointRef> {
     const created = checkpointRef(await this.options.checkpoints.create({
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
       workspacePath: session.identity.workspacePath,
       scopePaths,
-      baseSeq: session.durable.seq
+      baseSeq: session.durable.seq,
+      ...(policy?.reproducibleRootPaths
+        ? { reproducibleRootPaths: policy.reproducibleRootPaths }
+        : {}),
+      ...(policy?.explicitDeliverablePaths
+        ? { explicitDeliverablePaths: policy.explicitDeliverablePaths }
+        : {})
     }));
     await this.options.emit(session, "checkpoint.created", "runtime", created);
     return created;

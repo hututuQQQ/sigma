@@ -342,7 +342,8 @@ export class AgentSupervisor implements SupervisorPort {
     }).then(
       (result) => {
         job.public.result = result;
-        job.public.status = result.outcome.kind === "completed" ? "completed"
+        job.public.status = result.outcome.kind === "completed"
+          || result.outcome.kind === "completed_with_limitations" ? "completed"
           : result.outcome.kind === "cancelled" ? "cancelled" : "failed";
       },
       (error) => {

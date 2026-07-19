@@ -168,11 +168,14 @@ export class RuntimeCommandHandler {
     await recordReviewerWaiver(session, command, this.options.emit);
   }
 
-  async steer(session: RuntimeSession, text: string): Promise<void> {
+  async steer(session: RuntimeSession, command: Extract<RunCommand, { type: "steer" }>): Promise<void> {
     if (session.interaction.steeringPending >= 256) throw new Error("Steering queue is full (256 messages).");
     session.interaction.steeringPending += 1;
     try {
-      await this.options.emit(session, "user.steer", "user", { text });
+      await this.options.emit(session, "user.steer", "user", {
+        text: command.text,
+        ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
+      });
       const reason = Object.assign(new Error("Active model/tool turn was superseded by user steering."), {
         code: "steering_restart"
       });
@@ -183,13 +186,18 @@ export class RuntimeCommandHandler {
     }
   }
 
-  async followUp(session: RuntimeSession, text: string): Promise<void> {
+  async followUp(session: RuntimeSession, command: Extract<RunCommand, { type: "follow_up" }>): Promise<void> {
     if (session.interaction.followUps.length >= 256) throw new Error("Follow-up queue is full (256 messages).");
     await waitForTerminalRunSettlement(session);
     if (session.execution.running) {
-      const followUp = { id: randomUUID(), text };
+      const followUp = {
+        id: randomUUID(),
+        text: command.text,
+        ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
+      };
       await this.options.emit(session, "user.follow_up", "user", {
-        text, queueId: followUp.id, status: "queued"
+        text: command.text, queueId: followUp.id, status: "queued",
+        ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
       });
       session.interaction.followUps.push(followUp);
       return;
@@ -202,10 +210,12 @@ export class RuntimeCommandHandler {
       session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt,
+      ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
     });
     await this.options.emit(session, "user.follow_up", "user", {
-      text, queueId: randomUUID(), status: "delivered"
+      text: command.text, queueId: randomUUID(), status: "delivered",
+      ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
     });
     this.options.start(session);
   }
@@ -213,7 +223,12 @@ export class RuntimeCommandHandler {
   async submit(session: RuntimeSession, command: Extract<RunCommand, { type: "submit" }>): Promise<void> {
     await waitForTerminalRunSettlement(session);
     if (session.execution.running) {
-      await this.steer(session, command.text);
+      await this.steer(session, {
+        type: "steer",
+        sessionId: command.sessionId,
+        text: command.text,
+        ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
+      });
       return;
     }
     if (session.durable.state.phase === "terminal") {
@@ -224,7 +239,8 @@ export class RuntimeCommandHandler {
       session.recovery.lastOutcome = undefined;
     }
     await this.options.emit(session, "run.started", "runtime", {
-      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+      mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt,
+      ...(command.validationRequirement ? { validationRequirement: command.validationRequirement } : {})
     });
     await this.options.emit(session, "user.message", "user", { text: command.text });
     this.options.start(session);

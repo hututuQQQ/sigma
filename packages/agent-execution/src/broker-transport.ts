@@ -1,4 +1,3 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   BrokerCancelledError,
   BrokerConnectionError,
@@ -7,10 +6,12 @@ import {
   BrokerPolicyError,
   BrokerProtocolError,
   BrokerTimeoutError,
+  ContainerAttestationInvalidError,
+  ContainerUnavailableError,
   SandboxUnavailableError,
   attachBrokerLifecycleFailure
 } from "./errors.js";
-import { createMinimalEnvironment } from "./environment.js";
+import { BrokerTransportEndpoint } from "./broker-transport-endpoint.js";
 import { BrokerFrameDecoder, encodeBrokerFrame } from "./framing.js";
 import { brokerRequest, parseBrokerResponse } from "./protocol.js";
 import { SecretRedactor } from "./redaction.js";
@@ -56,6 +57,8 @@ function transportWideFailure(error: Error): Error {
 
 function rpcError(code: string, message: string, data?: unknown): BrokerError {
   if (code === "sandbox_unavailable") return new SandboxUnavailableError(message, data);
+  if (code === "container_unavailable") return new ContainerUnavailableError(message, data);
+  if (code === "container_attestation_invalid") return new ContainerAttestationInvalidError(message, data);
   if (code === "executable_unavailable") return new BrokerExecutableUnavailableError(message, data);
   if (code === "policy_denied") return new BrokerPolicyError(message, data);
   if (code === "cancelled") return new BrokerCancelledError(message);
@@ -66,14 +69,13 @@ export class BrokerTransport {
   private readonly decoder: BrokerFrameDecoder;
   private readonly stderrBuffer: BoundedByteRingBuffer;
   private readonly redactor: SecretRedactor;
+  private readonly endpoint: BrokerTransportEndpoint;
   private readonly pending = new Map<number, PendingRequest>();
-  private child?: ChildProcessWithoutNullStreams;
   private nextId = 1;
   private state: TransportState = "new";
   private writeChain = Promise.resolve();
   private closePromise?: Promise<void>;
   private closingRequested = false;
-  private childClosed = false;
   private terminalFailure?: Error;
 
   constructor(
@@ -83,25 +85,22 @@ export class BrokerTransport {
     this.decoder = new BrokerFrameDecoder(options.maximumFrameBytes);
     this.stderrBuffer = new BoundedByteRingBuffer(options.maximumStderrBytes ?? 256 * 1024);
     this.redactor = new SecretRedactor(options.secrets);
+    this.endpoint = new BrokerTransportEndpoint({
+      data: (chunk) => this.onStdout(chunk),
+      stderr: (chunk) => this.stderrBuffer.append(chunk),
+      error: (error) => this.fail(error),
+      close: (message, diagnostic) => this.onEndpointClose(message, diagnostic)
+    });
   }
 
   get stderr(): string { return this.redactor.redactText(this.stderrBuffer.text()); }
   get running(): boolean { return this.state === "running"; }
+  private get child(): ChildProcessWithoutNullStreams | undefined { return this.endpoint.childProcess; }
 
   start(): void {
     if (this.state !== "new") throw new BrokerConnectionError(`Cannot start broker transport in '${this.state}' state.`);
-    const args = [...(this.options.helperArgs ?? [])];
-    const child = spawn(this.options.helperPath, args, {
-      cwd: process.cwd(), env: createMinimalEnvironment(), windowsHide: true, shell: false,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    this.child = child;
-    this.childClosed = false;
+    this.endpoint.start(this.options);
     this.state = "running";
-    child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
-    child.stderr.on("data", (chunk: Buffer) => this.stderrBuffer.append(chunk));
-    child.on("error", (error) => this.fail(new BrokerConnectionError("Failed to start sigma-exec.", { cause: error })));
-    child.on("close", (code, signal) => this.onClose(code, signal));
   }
 
   async request(method: string, params: Record<string, unknown>, options: BrokerRequestOptions = {}): Promise<unknown> {
@@ -148,21 +147,13 @@ export class BrokerTransport {
     if (this.state === "closed") return;
     try {
       this.closingRequested = true;
-      const child = this.child;
       const grace = this.options.shutdownGraceMs ?? 750;
       if (this.state === "running") {
         try { await this.request("shutdown", {}, { timeoutMs: grace }); } catch { /* terminate below */ }
       }
       this.state = "closing";
-      if (!child || this.childClosed) {
-        this.rejectPending(new BrokerConnectionError("Broker transport closed."));
-        this.state = "closed";
-        return;
-      }
-      if (!await this.waitForChildClose(child, grace)) child.kill();
-      if (!await this.waitForChildClose(child, 5_000)) {
-        throw new BrokerConnectionError("sigma-exec did not release its process handle during shutdown.");
-      }
+      await this.endpoint.close(grace, async (child, timeoutMs) =>
+        await this.waitForChildClose(child, timeoutMs));
       this.rejectPending(new BrokerConnectionError("Broker transport closed."));
       this.state = "closed";
     } catch (error) {
@@ -179,23 +170,18 @@ export class BrokerTransport {
   }
 
   private async waitForChildClose(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
-    if (this.childClosed) return true;
-    return await new Promise<boolean>((resolve) => {
-      const done = (): void => { clearTimeout(timer); resolve(true); };
-      const timer = setTimeout(() => { child.removeListener("close", done); resolve(false); }, timeoutMs);
-      child.once("close", done);
-    });
+    return await this.endpoint.waitForChildClose(child, timeoutMs);
   }
 
   private async writeFrame(frame: Buffer, pending?: PendingRequest): Promise<void> {
     this.writeChain = this.writeChain.then(async () => await new Promise<void>((resolve, reject) => {
       if (pending && !this.pending.has(pending.id)) return resolve();
-      const stdin = this.child?.stdin;
-      if (!stdin?.writable) {
+      const writable = this.endpoint.writable;
+      if (!writable?.writable) {
         return reject(new BrokerConnectionError("Broker stdin is not writable.", { retrySafe: true }));
       }
       if (pending) pending.dispatched = true;
-      stdin.write(frame, (error) => error
+      writable.write(frame, (error) => error
         ? reject(new BrokerConnectionError("Failed to write a broker request frame.", { cause: error }))
         : resolve());
     }));
@@ -319,16 +305,11 @@ export class BrokerTransport {
     if (this.state === "closing" || this.state === "closed" || this.state === "failed") return;
     this.state = "failed";
     this.terminalFailure = error;
-    const child = this.child;
-    const mustConfirmExit = Boolean(child && !this.childClosed && child.pid !== undefined
-      && child.exitCode === null);
-    if (mustConfirmExit && child) child.kill();
-    else this.rejectPending(error);
+    if (!this.endpoint.terminate()) this.rejectPending(error);
     this.onUnexpectedFailure(error);
   }
 
-  private onClose(code: number | null, signal: NodeJS.Signals | null): void {
-    this.childClosed = true;
+  private onEndpointClose(message: string, diagnostic: Record<string, unknown>): void {
     if (this.terminalFailure) {
       this.rejectPending(this.terminalFailure);
       if (this.closingRequested || this.state === "closing") this.state = "closed";
@@ -343,8 +324,8 @@ export class BrokerTransport {
       this.decoder.end();
       const stderr = this.stderr.trim();
       this.fail(new BrokerConnectionError(
-        `sigma-exec exited unexpectedly (code=${String(code)}, signal=${String(signal)}).${stderr ? ` stderr: ${stderr.slice(-8_192)}` : ""}`,
-        { diagnostic: { exitCode: code, signal, stderrTail: stderr.slice(-8_192) } }
+        `${message}.${stderr ? ` stderr: ${stderr.slice(-8_192)}` : ""}`,
+        { diagnostic: { ...diagnostic, stderrTail: stderr.slice(-8_192) } }
       ));
     } catch (error) {
       this.fail(error instanceof Error ? error : new BrokerProtocolError(String(error)));
@@ -367,3 +348,4 @@ export class BrokerTransport {
     );
   }
 }
+import type { ChildProcessWithoutNullStreams } from "node:child_process";

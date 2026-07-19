@@ -6,6 +6,19 @@ const PROJECT_MANIFEST = /(?:^|\/)(?:package\.json|pyproject\.toml|pytest\.ini|s
 const TEST_FILE = /(?:^|\/)(?:tests?|specs?|__tests__)(?:\/|$)|(?:^|\/)(?:test_[^/]+|[^/]+_test)\.py$|_test\.go$|\.(?:test|spec)\.[cm]?[jt]sx?$/iu;
 const TEST_CONFIG = /(?:^|\/)(?:vitest|jest|playwright|pytest|tox|nose|mocha)(?:\.config)?\.[^/]+$|(?:^|\/)conftest\.py$/iu;
 const SOURCE_EXTENSION = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|cs|fs|vb)$/iu;
+const SOURCE_WITHOUT_VALIDATION_CAPABILITY = /\.(?:swift|c|cc|cpp|h|hpp)$/iu;
+
+export function isRepositorySourcePath(file: string): boolean {
+  return SOURCE_EXTENSION.test(file) || SOURCE_WITHOUT_VALIDATION_CAPABILITY.test(file);
+}
+
+/** False means the structural profile has no language-specific evidence model
+ * for this path, so it must not be used as a negative capability proof. This
+ * deliberately excludes configuration, unknown, and known-but-unsupported
+ * source formats; absence of a recognized validator is not proof for them. */
+export function repositoryValidationCapabilityCoversPath(file: string): boolean {
+  return SOURCE_EXTENSION.test(file);
+}
 
 export interface ProjectValidationCapabilities {
   projectId: string;
@@ -19,12 +32,14 @@ export interface RepositoryValidationCapabilityProfile {
   stateDigest: string;
   complete: boolean;
   availableCommands: string[];
+  availableCommandsComplete: boolean;
   projects: ProjectValidationCapabilities[];
 }
 
 export interface ValidationCapabilityOptions {
   stateDigest: string;
   availableCommands: readonly string[];
+  availableCommandsComplete?: boolean;
   deadlineMs?: number;
 }
 
@@ -108,6 +123,11 @@ function projectManifest(root: string, name: string): string {
   return root === "." ? name : `${root}/${name}`;
 }
 
+function projectWrapper(input: ProjectCapabilityInput, names: readonly string[]): string | undefined {
+  return names.map((name) => projectManifest(input.root, name))
+    .find((candidate) => input.files.includes(candidate));
+}
+
 function addUnitCapability(
   target: CapabilityAccumulator,
   available: boolean,
@@ -169,14 +189,25 @@ function manifestUnitCapabilities(
     hasTests && commands.has("dotnet")
       && projectManifestMatches(input, /\.(?:csproj|fsproj|vbproj|sln)$/iu),
     "dotnet test");
-  addUnitCapability(target,
-    hasTests && manifests.has(projectManifest(root, "pom.xml"))
-      && commandAvailable(commands, "mvn", "mvnw"),
-    "maven test");
-  addUnitCapability(target,
-    hasTests && commandAvailable(commands, "gradle", "gradlew")
-      && projectManifestMatches(input, /(?:^|\/)build\.gradle(?:\.kts)?$/iu),
-    "gradle test");
+  const pom = projectManifest(root, "pom.xml");
+  const mavenWrapper = projectWrapper(input, ["mvnw", "mvnw.cmd"]);
+  const maven = manifests.has(pom) && (commandAvailable(commands, "mvn") || mavenWrapper !== undefined);
+  if (maven) {
+    target.commandFamilies.add("maven build/check");
+    target.evidence.push(pom, ...(mavenWrapper ? [mavenWrapper] : []));
+  }
+  addUnitCapability(target, hasTests && maven, "maven test");
+
+  const gradleManifest = [...manifests.keys()].find((file) =>
+    withinProject(file, root) && /(?:^|\/)build\.gradle(?:\.kts)?$/iu.test(file));
+  const gradleWrapper = projectWrapper(input, ["gradlew", "gradlew.bat"]);
+  const gradle = gradleManifest !== undefined
+    && (commandAvailable(commands, "gradle") || gradleWrapper !== undefined);
+  if (gradle) {
+    target.commandFamilies.add("gradle build/check");
+    target.evidence.push(gradleManifest, ...(gradleWrapper ? [gradleWrapper] : []));
+  }
+  addUnitCapability(target, hasTests && gradle, "gradle test");
 }
 
 function staticCapabilities(
@@ -263,8 +294,10 @@ export async function deriveRepositoryValidationCapabilities(
   return await withHostRepositorySnapshot(workspace, signal, { deadline }, async (snapshot, access) => {
     const manifestPaths = snapshot.files.filter((file) => PROJECT_MANIFEST.test(file));
     const manifests = new Map<string, string | null>();
+    let manifestsComplete = true;
     for (const file of manifestPaths) {
       const loaded = await access.readText(file, MAX_MANIFEST_BYTES, signal);
+      if (loaded.rejected) manifestsComplete = false;
       manifests.set(file, loaded.rejected ? null : loaded.content);
     }
     const roots = [...new Set([".", ...manifestPaths.map(portableDirectory)])]
@@ -273,8 +306,10 @@ export async function deriveRepositoryValidationCapabilities(
     for (const file of snapshot.files) filesByRoot.get(nearestProject(file, roots))!.push(file);
     return {
       stateDigest: options.stateDigest,
-      complete: !snapshot.truncated && !snapshot.deadlineReached,
+      complete: options.availableCommandsComplete === true
+        && manifestsComplete && !snapshot.truncated && !snapshot.deadlineReached,
       availableCommands: [...commands].sort(),
+      availableCommandsComplete: options.availableCommandsComplete === true,
       projects: roots.map((root) => projectCapabilities({
         root,
         files: filesByRoot.get(root) ?? [],

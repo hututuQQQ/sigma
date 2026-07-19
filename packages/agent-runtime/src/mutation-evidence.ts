@@ -1,10 +1,17 @@
 import { createHash } from "node:crypto";
-import type { EvidenceRecord, ReviewEvidence, ValidationEvidence, WorkspaceDeltaEvidence } from "agent-protocol";
+import {
+  passedValidationSupportsClaim,
+  type EvidenceRecord,
+  type ReviewEvidence,
+  type ValidationEvidence,
+  type WorkspaceDeltaEvidence
+} from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 import { CHECKPOINT_INTEGRITY_VALIDATOR } from "./validation-policy.js";
 import {
   assurancePathsForClaim, assuranceRequirement, validationClaimSatisfies
 } from "./assurance-engine.js";
+import { reviewObservationProjection } from "./review-observations.js";
 
 const MUTATION_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
 
@@ -22,6 +29,7 @@ export function sessionMutationEvidence(session: RuntimeSession): EvidenceRecord
 function isCurrentValidation(session: RuntimeSession, item: EvidenceRecord): item is ValidationEvidence {
   const frontier = session.durable.state.mutationFrontier;
   return item.kind === "validation"
+    && item.runId === session.durable.runId
     && item.data.validator !== CHECKPOINT_INTEGRITY_VALIDATOR
     && item.data.frontierRevision === frontier.revision
     && item.data.stateDigest === frontier.currentStateDigest;
@@ -40,7 +48,7 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
   const changed = session.durable.state.mutationFrontier.changedPaths;
   const validations = sessionMutationEvidence(session).filter((item) => isCurrentValidation(session, item));
   const requirement = assuranceRequirement(session);
-  const passed = validations.filter((item) => item.status === "passed");
+  const passed = validations.filter(passedValidationSupportsClaim);
   const missingClaims = requirement.requiredClaims.filter((required) => {
     const requiredPaths = assurancePathsForClaim(changed, required, session);
     return requiredPaths.length > 0 && !requiredPaths.every((changedPath) => passed.some((validation) =>
@@ -54,6 +62,7 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
   }));
   const missingPaths = changed.filter((path) => !coveredPaths.includes(path));
   const latestFailed = [...validations].reverse().find((item) => item.status === "failed"
+    && item.data.claim?.status !== "unavailable"
     && requirement.requiredClaims.some((required) =>
       validationClaimSatisfies(item.data.claim?.kind, required)));
   return {
@@ -86,16 +95,20 @@ export function reviewBasisDigest(
 ): string {
   const frontier = session.durable.state.mutationFrontier;
   const signatures = [...new Set(validations.map(validationSemanticSignature))].sort();
+  const observations = reviewObservationProjection(session, validations);
   return createHash("sha256").update(JSON.stringify({
+    schemaVersion: 2,
     frontierRevision: frontier.revision,
     stateDigest: frontier.currentStateDigest,
-    validations: signatures
+    validations: signatures,
+    evidenceTailSha256: observations.contentSha256
   })).digest("hex");
 }
 
 export function latestFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
   const frontier = session.durable.state.mutationFrontier;
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
+    && item.runId === session.durable.runId
     && item.data.frontierRevision === frontier.revision
     && item.data.stateDigest === frontier.currentStateDigest).at(-1);
 }
@@ -103,8 +116,10 @@ export function latestFrontierReview(session: RuntimeSession): ReviewEvidence | 
 export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
   const basisDigest = reviewBasisDigest(session);
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
+    && item.runId === session.durable.runId
     && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
     && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest
+    && item.data.reviewBasisVersion === 2
     && item.data.reviewBasisDigest === basisDigest).at(-1);
 }
 

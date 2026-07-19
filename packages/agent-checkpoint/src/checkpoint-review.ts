@@ -37,6 +37,7 @@ async function renderedContent(
 ): Promise<string> {
   if (!entry) return "[absent]";
   if (entry.kind === "directory") return "[directory]";
+  if (entry.kind === "reproducible_root") return "[reproducible dependency root; contents omitted]";
   if (entry.kind === "symlink") return `[symlink -> ${entry.linkTarget ?? ""}]`;
   if (opaque) return `[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`;
   if (!entry.casIdentity || !entry.digest) {
@@ -69,6 +70,9 @@ async function renderSection(
 function renderedContentBytes(entry: CheckpointEntry | undefined, opaque: OpaqueIdentity | undefined): number {
   if (!entry) return Buffer.byteLength("[absent]", "utf8");
   if (entry.kind === "directory") return Buffer.byteLength("[directory]", "utf8");
+  if (entry.kind === "reproducible_root") {
+    return Buffer.byteLength("[reproducible dependency root; contents omitted]", "utf8");
+  }
   if (entry.kind === "symlink") return Buffer.byteLength(`[symlink -> ${entry.linkTarget ?? ""}]`, "utf8");
   if (opaque) return Buffer.byteLength(`[binary sha256=${opaque.digest} size=${opaque.sizeBytes}]`, "utf8");
   return entry.size;

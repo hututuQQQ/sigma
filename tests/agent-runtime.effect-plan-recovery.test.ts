@@ -125,7 +125,7 @@ describe("effect-plan recovery", () => {
     }));
   });
 
-  it("detects a process write outside expectedChanges and restores the complete write root", async () => {
+  it("allows generator output outside expectedChanges but within the trusted checkpoint scope", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-effect-plan-recovery-"));
     const workspace = path.join(root, "workspace");
     const source = path.join(workspace, "src");
@@ -151,11 +151,9 @@ describe("effect-plan recovery", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "exec", {
           executable: "fixture",
-          access: "write",
-          writeRoots: ["src"],
           expectedChanges: ["src/expected.txt"]
         })]),
-        fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Violation handled." })])
+        fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Generator output handled." })])
       ]),
       tools: registerBuiltinTools(new EffectToolRegistry(), {
         broker, runtimeCommands: ["fixture"]
@@ -172,16 +170,13 @@ describe("effect-plan recovery", () => {
       kind: "needs_input",
       requestId: "done"
     });
-    await expect(readFile(path.join(source, "sibling.txt"), "utf8")).resolves.toBe("before");
+    await expect(readFile(path.join(source, "sibling.txt"), "utf8")).resolves.toBe("violation");
 
     const stored = await events(store, session.sessionId);
-    expect(stored).toContainEqual(expect.objectContaining({
-      type: "execution.failed",
-      payload: expect.objectContaining({ code: "effect_plan_violation" })
-    }));
-    expect(stored.some((event) => event.type === "checkpoint.restored"
-      && event.authority === "runtime")).toBe(true);
-    expect(stored.some((event) => event.type === "checkpoint.sealed")).toBe(false);
+    expect(stored.some((event) => event.type === "execution.failed"
+      && (event.payload as { code?: string }).code === "effect_plan_violation")).toBe(false);
+    expect(stored.some((event) => event.type === "checkpoint.restored")).toBe(false);
+    expect(stored.some((event) => event.type === "checkpoint.sealed")).toBe(true);
   });
 
   it("allows only regular parent directories needed to create an approved nested file", async () => {
@@ -211,8 +206,6 @@ describe("effect-plan recovery", () => {
       gateway: new SmokeFakeGateway([
         fakeToolTurn([fakeToolCall("write", "exec", {
           executable: "fixture",
-          access: "write",
-          writeRoots: ["src"],
           expectedChanges: ["src/generated/nested/file.ts"]
         })]),
         fakeToolTurn([fakeToolCall("done", "request_user_input", { message: "Nested write handled." })])
@@ -242,38 +235,57 @@ describe("effect-plan recovery", () => {
     const source = path.join(workspace, "src");
     await mkdir(source, { recursive: true });
     await writeFile(path.join(source, "sibling.txt"), "before", "utf8");
-    const broker: ExecutionBroker = {
-      lostProcessHandles: [],
-      connect: async () => report,
-      doctor: async () => report,
-      execute: async () => {
-        await writeFile(path.join(source, "sibling.txt"), "violation", "utf8");
-        return exited;
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "scoped_writer",
+        description: "Fixture whose explicit write leaf is narrower than its rollback scope.",
+        inputSchema: { type: "object" },
+        possibleEffects: ["filesystem.write"],
+        availableModes: ["change"],
+        executionMode: "exclusive",
+        resourceKeys: ["workspace"],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 1_000,
+        prepare: async () => ({
+          exactEffects: ["filesystem.write"],
+          readPaths: [],
+          writePaths: ["src/expected.txt"],
+          network: "none",
+          processMode: "none",
+          checkpointScope: ["src"],
+          idempotence: "non_replayable"
+        })
       },
-      spawn: async () => ({ id: "process", brokerInstanceId: "broker" }),
-      poll: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
-      write: async () => undefined,
-      terminate: async () => ({ ...exited, handle: { id: "process", brokerInstanceId: "broker" } }),
-      close: async () => undefined
-    };
+      execute: async (request) => {
+        await writeFile(path.join(source, "sibling.txt"), "violation", "utf8");
+        const timestamp = new Date().toISOString();
+        return {
+          callId: request.callId,
+          ok: true,
+          output: "wrote sibling",
+          observedEffects: ["filesystem.write"],
+          actualEffects: ["filesystem.write"],
+          artifacts: [],
+          diagnostics: [],
+          evidence: [],
+          startedAt: timestamp,
+          completedAt: timestamp
+        };
+      }
+    });
     const storeRootDir = path.join(root, "state");
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
     const gateway = new SmokeFakeGateway([
-      fakeToolTurn([fakeToolCall("write", "exec", {
-        executable: "fixture",
-        access: "write",
-        writeRoots: ["src"],
-        expectedChanges: ["src/expected.txt"]
-      })]),
+      fakeToolTurn([fakeToolCall("write", "scoped_writer", {})]),
       fakeToolTurn([fakeToolCall("must-not-run", "request_user_input", {
         message: "Rollback failure was ignored."
       })])
     ]);
     const runtime = createRuntimeForTesting({
       gateway,
-      tools: registerBuiltinTools(new EffectToolRegistry(), {
-        broker, runtimeCommands: ["fixture"]
-      }),
+      tools,
       store,
       storeRootDir,
       permissionMode: "auto",

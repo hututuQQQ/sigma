@@ -1,7 +1,8 @@
-import type {
-  OpaqueArtifactEvidence,
-  ValidationEvidence,
-  WorkspaceDeltaEvidence
+import {
+  passedValidationSupportsClaim,
+  type OpaqueArtifactEvidence,
+  type ValidationEvidence,
+  type WorkspaceDeltaEvidence
 } from "agent-protocol";
 import type { ReviewerInput } from "./reviewer.js";
 
@@ -26,7 +27,7 @@ function binaryReviewEvidenceFailure(
   if (sections.length === 0 || sections.some((section) => section && !changedPaths.has(section))) {
     return `Delta ${delta.evidenceId} is missing an opaque artifact path bound to its workspace delta.`;
   }
-  const validated = validations.some((item) => item.status === "passed"
+  const validated = validations.some((item) => passedValidationSupportsClaim(item)
     && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
       .some((path) => item.data.coveredPaths.includes(path)));
   if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
@@ -59,7 +60,7 @@ function legacyOpaqueArtifactReviewEvidenceFailure(
   if (![...changedPaths].every((item) => seen.has(item))) {
     return `Delta ${delta.evidenceId} has incomplete opaque artifact evidence.`;
   }
-  const validated = validations.some((item) => item.status === "passed"
+  const validated = validations.some((item) => passedValidationSupportsClaim(item)
     && [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted]
       .some((path) => item.data.coveredPaths.includes(path)));
   if (!validated) return `Delta ${delta.evidenceId} has no passed validation evidence for its opaque artifact.`;
@@ -117,7 +118,7 @@ function hasPassedValidation(
   validations: readonly ValidationEvidence[]
 ): boolean {
   const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
-  return validations.some((item) => item.status === "passed"
+  return validations.some((item) => passedValidationSupportsClaim(item)
     && paths.some((path) => item.data.coveredPaths.includes(path)));
 }
 

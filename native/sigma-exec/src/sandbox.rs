@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{create_dir, read_dir, read_to_string, remove_dir, remove_file, write};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(target_os = "linux", test))]
@@ -221,12 +223,16 @@ pub fn revoke_sandbox(workspace: &Path) -> Result<Value, RpcError> {
 
 pub fn doctor_report() -> Value {
     let status = sandbox_status();
-    let network_modes = if status.available {
+    let network_modes = if status.available && cfg!(target_os = "linux") {
+        json!(["none", "loopback", "full"])
+    } else if status.available {
         json!(["none", "full"])
     } else {
         json!([])
     };
     let shells = verified_shells(&status);
+    let executable_paths = executable_search_path_snapshot();
+    let runtime_commands = runtime_command_snapshot(&executable_paths);
     json!({
         "protocolVersion": crate::protocol::PROTOCOL_VERSION,
         "brokerVersion": env!("CARGO_PKG_VERSION"),
@@ -254,6 +260,14 @@ pub fn doctor_report() -> Value {
                 "networkNamespace": status.network_namespace,
             },
         },
+        // This helper instance is the native sandbox broker. A product may
+        // launch a separate sigma-exec-derived OCI broker, but container mode
+        // must never reinterpret this native process boundary as OCI.
+        "container": {
+            "available": false,
+            "backend": "oci",
+            "reason": "native sigma-exec instance; a trusted OCI launcher and attested target are required",
+        },
         "capabilities": {
             "foreground": true,
             "background": true,
@@ -263,8 +277,125 @@ pub fn doctor_report() -> Value {
             "networkModes": network_modes,
             "executionRoots": true,
             "shells": shells,
+            "runtimeCommands": runtime_commands.commands,
+            "runtimeCommandSnapshotComplete": runtime_commands.complete,
+            // OCI clients must resolve bare names against the attested target,
+            // never against the control process that transports this report.
+            "executableSearchPaths": executable_paths.serialized,
         }
     })
+}
+
+const MAX_EXECUTABLE_SEARCH_PATHS: usize = 128;
+// This is a generic, closed probe used by repository validation capability
+// discovery. It intentionally contains no task, package, or benchmark identity.
+const RUNTIME_COMMAND_PROBE: &[&str] = &[
+    "bun", "cargo", "deno", "dotnet", "git", "go", "gradle", "gradlew", "java", "javac", "kotlinc",
+    "mvn", "mvnw", "node", "npm", "pnpm", "py", "pytest", "python", "python3", "rustc", "tsc",
+    "yarn",
+];
+
+struct ExecutableSearchPathSnapshot {
+    paths: Vec<PathBuf>,
+    serialized: Vec<String>,
+    complete: bool,
+}
+
+struct RuntimeCommandSnapshot {
+    commands: Vec<String>,
+    complete: bool,
+}
+
+fn executable_search_path_snapshot() -> ExecutableSearchPathSnapshot {
+    let Some(value) = std::env::var_os("PATH") else {
+        return ExecutableSearchPathSnapshot {
+            paths: Vec::new(),
+            serialized: Vec::new(),
+            complete: false,
+        };
+    };
+    let mut paths = Vec::new();
+    let mut serialized = Vec::new();
+    let mut complete = true;
+    for (index, entry) in std::env::split_paths(&value).enumerate() {
+        if index >= MAX_EXECUTABLE_SEARCH_PATHS {
+            complete = false;
+            break;
+        }
+        let Some(text) = entry.to_str().map(str::to_owned) else {
+            complete = false;
+            continue;
+        };
+        if !entry.is_absolute() {
+            complete = false;
+            continue;
+        }
+        if paths.contains(&entry) {
+            continue;
+        }
+        paths.push(entry);
+        serialized.push(text);
+    }
+    ExecutableSearchPathSnapshot {
+        paths,
+        serialized,
+        complete,
+    }
+}
+
+fn runtime_command_snapshot(paths: &ExecutableSearchPathSnapshot) -> RuntimeCommandSnapshot {
+    let mut commands = Vec::new();
+    let mut complete = paths.complete;
+    for command in RUNTIME_COMMAND_PROBE {
+        let (present, inspected) = command_on_search_path(command, &paths.paths);
+        complete &= inspected;
+        if present {
+            commands.push((*command).to_owned());
+        }
+    }
+    RuntimeCommandSnapshot { commands, complete }
+}
+
+fn command_on_search_path(command: &str, paths: &[PathBuf]) -> (bool, bool) {
+    let mut present = false;
+    let mut complete = true;
+    for directory in paths {
+        for candidate in command_candidates(directory, command) {
+            match std::fs::metadata(candidate) {
+                Ok(metadata) => present |= executable_metadata(&metadata),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(_) => complete = false,
+            }
+        }
+    }
+    (present, complete)
+}
+
+#[cfg(windows)]
+fn command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    ["", ".exe", ".com", ".bat", ".cmd"]
+        .into_iter()
+        .map(|suffix| directory.join(format!("{command}{suffix}")))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    vec![directory.join(command)]
+}
+
+#[cfg(unix)]
+fn executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 fn verified_shells(status: &SandboxStatus) -> Value {
@@ -906,6 +1037,12 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     command.args(["--new-session", "--unshare-all", "--as-pid-1"]);
     if params.policy.network == NetworkMode::Full {
         command.arg("--share-net");
+    } else if params.policy.network == NetworkMode::Loopback {
+        // bubblewrap drops capabilities before the hardened launcher. Grant
+        // only CAP_NET_ADMIN long enough to raise `lo`; the launcher clears
+        // all effective/permitted/inheritable capabilities before applying
+        // no-new-privileges, Landlock and seccomp or executing user code.
+        command.args(["--cap-add", "CAP_NET_ADMIN"]);
     }
     let system_roots = linux_system_roots();
     // Resolve every policy mount into one identity snapshot before opening any
@@ -1006,6 +1143,9 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         } else {
             executable.invocation_arg0.as_os_str()
         });
+    if params.policy.network == NetworkMode::Loopback {
+        command.arg("--loopback");
+    }
     for root in system_roots
         .iter()
         .map(PathBuf::as_path)
@@ -1401,11 +1541,18 @@ fn resolve_protected(
 
 #[cfg(target_os = "linux")]
 fn trusted_bwrap() -> Result<PathBuf, String> {
-    trusted_bwrap_from(&[
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            candidates.push(directory.join("bwrap"));
+        }
+    }
+    candidates.extend([
         PathBuf::from("/usr/bin/bwrap"),
         PathBuf::from("/bin/bwrap"),
         PathBuf::from("/usr/local/bin/bwrap"),
-    ])
+    ]);
+    trusted_bwrap_from(&candidates)
 }
 
 #[cfg(target_os = "linux")]
@@ -1718,6 +1865,96 @@ mod tests {
         assert!(secret_key("accessToken"));
         assert!(!secret_key("PATH"));
         assert!(!secret_key("TOKENIZERS_PARALLELISM"));
+    }
+
+    #[test]
+    fn native_doctor_never_claims_an_oci_boundary() {
+        let report = doctor_report();
+        assert_eq!(report["container"]["backend"], "oci");
+        assert_eq!(report["container"]["available"], false);
+        assert!(
+            report["container"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("trusted OCI launcher"))
+        );
+    }
+
+    #[test]
+    fn doctor_reports_only_absolute_executable_search_paths() {
+        let report = doctor_report();
+        let search_paths = report["capabilities"]["executableSearchPaths"]
+            .as_array()
+            .expect("doctor executable search paths");
+        assert!(search_paths.len() <= 128);
+        assert!(search_paths.iter().all(|value| {
+            value
+                .as_str()
+                .is_some_and(|entry| Path::new(entry).is_absolute())
+        }));
+        assert!(
+            report["capabilities"]["runtimeCommands"]
+                .as_array()
+                .is_some_and(|commands| commands.len() <= RUNTIME_COMMAND_PROBE.len())
+        );
+        assert!(report["capabilities"]["runtimeCommandSnapshotComplete"].is_boolean());
+    }
+
+    #[test]
+    fn runtime_command_snapshot_proves_present_and_absent_known_commands() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-runtime-command-snapshot-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create runtime probe directory");
+        let executable = root.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let git = root.join(if cfg!(windows) { "git.exe" } else { "git" });
+        std::fs::write(&executable, b"fixture").expect("write runtime probe executable");
+        std::fs::write(&git, b"fixture").expect("write git runtime probe executable");
+        #[cfg(unix)]
+        {
+            let mut permissions = std::fs::metadata(&executable)
+                .expect("runtime probe metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions)
+                .expect("make runtime probe executable");
+            let mut git_permissions = std::fs::metadata(&git)
+                .expect("git runtime probe metadata")
+                .permissions();
+            git_permissions.set_mode(0o755);
+            std::fs::set_permissions(&git, git_permissions)
+                .expect("make git runtime probe executable");
+        }
+        let paths = ExecutableSearchPathSnapshot {
+            paths: vec![root.clone()],
+            serialized: vec![root.to_string_lossy().into_owned()],
+            complete: true,
+        };
+        let present = runtime_command_snapshot(&paths);
+        assert!(present.complete);
+        assert!(present.commands.iter().any(|command| command == "node"));
+        assert!(present.commands.iter().any(|command| command == "git"));
+        assert!(!present.commands.iter().any(|command| command == "python"));
+
+        std::fs::remove_file(executable).expect("remove runtime probe executable");
+        std::fs::remove_file(git).expect("remove git runtime probe executable");
+        let absent = runtime_command_snapshot(&paths);
+        assert!(absent.complete);
+        assert!(absent.commands.is_empty());
+        std::fs::remove_dir(root).expect("remove runtime probe directory");
+    }
+
+    #[test]
+    fn incomplete_search_path_never_proves_command_absence() {
+        let paths = ExecutableSearchPathSnapshot {
+            paths: Vec::new(),
+            serialized: Vec::new(),
+            complete: false,
+        };
+        let snapshot = runtime_command_snapshot(&paths);
+        assert!(!snapshot.complete);
+        assert!(snapshot.commands.is_empty());
     }
 
     #[test]

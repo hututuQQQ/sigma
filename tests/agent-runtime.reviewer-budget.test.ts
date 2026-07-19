@@ -21,6 +21,7 @@ import {
 import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
 import { BudgetController, BudgetExceededError } from "../packages/agent-runtime/src/budget-controller.js";
 import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
+import { currentFrontierReview } from "../packages/agent-runtime/src/mutation-evidence.js";
 import { ModelReviewer, type ReviewerPort } from "../packages/agent-runtime/src/reviewer.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -186,6 +187,9 @@ function validation(coveredPaths = ["src/code.ts"]): ValidationEvidence {
       claim: {
         kind: "typecheck",
         commandDigest: "c".repeat(64),
+        strength: "structural",
+        independence: "cross_method",
+        assertionMode: "explicit",
         subject: {
           projectId: ".",
           configPaths: [],
@@ -537,7 +541,7 @@ describe("independent reviewer budget accounting", () => {
     expect(calls).toBe(3);
   });
 
-  it("refreshes a rejected review only for substantively new validation evidence", async () => {
+  it("refreshes a rejected review when ordered validation evidence changes", async () => {
     const target = runtimeSession();
     let calls = 0;
     const reviewer: ReviewerPort = {
@@ -573,7 +577,7 @@ describe("independent reviewer budget accounting", () => {
     const duplicate = { ...validation(), evidenceId: "duplicate-validation" };
     target.durable.state.evidence.push(duplicate);
     await coordinator.maybeReview(target, new AbortController().signal);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
 
     const stronger = {
       ...validation(),
@@ -583,7 +587,7 @@ describe("independent reviewer budget accounting", () => {
     target.durable.state.evidence.push(stronger);
     await coordinator.maybeReview(target, new AbortController().signal);
 
-    expect(calls).toBe(2);
+    expect(calls).toBe(3);
     expect(target.durable.state.evidence.at(-1)).toMatchObject({
       kind: "review",
       status: "passed",
@@ -593,6 +597,104 @@ describe("independent reviewer budget accounting", () => {
         validationEvidenceIds: ["validation", "duplicate-validation", "runtime-validation"]
       }
     });
+  });
+
+  it("passes a bounded projection of post-validation observations to the reviewer model", async () => {
+    const target = runtimeSession();
+    target.durable.state.evidence.push(...Array.from({ length: 20 }, (_, index) => ({
+      evidenceId: `observation-${index}`,
+      sessionId: "session",
+      runId: "run",
+      kind: "diagnostic" as const,
+      status: "informational" as const,
+      createdAt: `2026-07-11T00:00:${String(index).padStart(2, "0")}.000Z`,
+      producer: { authority: "tool" as const, id: `inspection-${index}` },
+      summary: `generic post-validation observation ${index}`,
+      data: {
+        source: `inspection-${index}`,
+        diagnostic: { output: `observation-${index}:${"x".repeat(3_000)}` }
+      }
+    })));
+    const gateway = new ReviewerGateway();
+    const { emit } = harness(target);
+
+    await new ReviewCoordinator(new ModelReviewer(gateway), emit)
+      .maybeReview(target, new AbortController().signal);
+
+    expect(gateway.calls).toBe(1);
+    const reviewerInput = JSON.parse(gateway.requests[0]!.messages[1]!.content) as {
+      observations: {
+        items: Array<{ evidenceId: string; outputExcerpt?: string }>;
+        totalCount: number;
+        omittedCount: number;
+        contentSha256: string;
+      };
+    };
+    expect(reviewerInput.observations.totalCount).toBe(20);
+    expect(reviewerInput.observations.items.length).toBeLessThanOrEqual(8);
+    expect(reviewerInput.observations.omittedCount)
+      .toBe(20 - reviewerInput.observations.items.length);
+    expect(reviewerInput.observations.contentSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(Buffer.byteLength(JSON.stringify(reviewerInput.observations), "utf8"))
+      .toBeLessThanOrEqual(4 * 1_024);
+  });
+
+  it("fails closed when the durable review basis changes while review is in flight", async () => {
+    const target = runtimeSession();
+    let requestedBasis: string | undefined;
+    const reviewer: ReviewerPort = {
+      reviewerId: "racing-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        requestedBasis = input.reviewBasisDigest;
+        target.durable.state.evidence.push({
+          evidenceId: "evidence-arriving-during-review",
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "diagnostic",
+          status: "informational",
+          createdAt: "2026-07-11T00:00:01.000Z",
+          producer: { authority: "tool", id: "concurrent-inspection" },
+          summary: "A new semantic observation arrived while review was running.",
+          data: { source: "concurrent-inspection", diagnostic: { changed: true } }
+        });
+        return {
+          evidenceId: "approval-for-stale-basis",
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "passed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "racing-reviewer" },
+          summary: "approved",
+          data: {
+            reviewerId: "racing-reviewer",
+            verdict: "approved",
+            findings: [],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+
+    await new ReviewCoordinator(reviewer, emit).maybeReview(target, new AbortController().signal);
+
+    expect(requestedBasis).toMatch(/^[a-f0-9]{64}$/u);
+    expect(target.durable.state.evidence.at(-1)).toMatchObject({
+      kind: "review",
+      status: "failed",
+      data: {
+        verdict: "changes_requested",
+        failureKind: "interrupted",
+        reviewBasisVersion: 2,
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        reviewBasisDigest: requestedBasis
+      }
+    });
+    expect(currentFrontierReview(target)).toBeUndefined();
   });
 
   it("fails closed for non-strict JSON and incomplete review material", async () => {

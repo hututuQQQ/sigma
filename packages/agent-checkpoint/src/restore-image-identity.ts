@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readlink, readdir } from "node:fs/promises";
 import path from "node:path";
-import { CheckpointConflictError, type CheckpointEntry, type CheckpointManifest } from "./types.js";
+import {
+  CheckpointConflictError,
+  type CheckpointEntry,
+  type CheckpointManifest,
+  type CheckpointRootIdentity
+} from "./types.js";
 import { windowsLinkType } from "./windows-link-type.js";
 
 export interface RestoreImageIdentity {
@@ -44,16 +49,32 @@ function digestLink(entry: Pick<CheckpointEntry, "mode" | "size" | "linkTarget" 
   ])).digest("hex");
 }
 
+function digestReproducibleRoot(mode: number, identity: CheckpointRootIdentity): string {
+  return createHash("sha256").update(JSON.stringify([
+    "reproducible_root", mode, identity.dev, identity.ino, identity.birthtimeMs
+  ])).digest("hex");
+}
+
 function directoryDigest(entries: readonly CheckpointEntry[], root: string): string {
-  const values = entries
+  const relevant = entries
     .filter((entry) => root === "." || entry.path === root || entry.path.startsWith(`${root}/`))
-    .sort((left, right) => compareText(left.path, right.path))
-    .map((entry) => [
+    .sort((left, right) => compareText(left.path, right.path));
+  // Keep the historical JSON-array digest byte-for-byte compatible while
+  // feeding one entry at a time. Large trees never become one giant string.
+  const hash = createHash("sha256");
+  hash.update("[");
+  for (const [index, entry] of relevant.entries()) {
+    if (index > 0) hash.update(",");
+    const value: unknown[] = [
       entry.path === root ? "." : path.posix.relative(root, entry.path),
       entry.kind, entry.mode, entry.size, entry.digest ?? null,
       entry.linkTarget ?? null, entry.linkType ?? null
-    ]);
-  return createHash("sha256").update(JSON.stringify(values)).digest("hex");
+    ];
+    if (entry.kind === "reproducible_root") value.push(entry.rootIdentity ?? null);
+    hash.update(JSON.stringify(value));
+  }
+  hash.update("]");
+  return hash.digest("hex");
 }
 
 /** Derives the exact image a single rename operation is expected to replace or install. */
@@ -65,7 +86,8 @@ export function restoreImageFromManifest(
   if (!entry) return undefined;
   const digest = entry.kind === "file" ? entry.digest!
     : entry.kind === "symlink" ? digestLink(entry)
-      : directoryDigest(manifest.entries, root);
+      : entry.kind === "reproducible_root" ? digestReproducibleRoot(entry.mode, entry.rootIdentity!)
+        : directoryDigest(manifest.entries, root);
   return { kind: entry.kind, mode: entry.mode, size: entry.size, digest };
 }
 
@@ -176,7 +198,7 @@ async function inspectActualEntries(
 }
 
 /** Reads a no-follow, race-checked identity suitable for commit and recovery CAS. */
-export async function inspectRestoreImage(target: string): Promise<RestoreImageIdentity | undefined> {
+async function inspectExactRestoreImage(target: string): Promise<RestoreImageIdentity | undefined> {
   const exists = await lstat(target).then(() => true, (error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return false;
     throw error;
@@ -189,6 +211,40 @@ export async function inspectRestoreImage(target: string): Promise<RestoreImageI
     : root.kind === "symlink" ? digestLink(root)
       : directoryDigest(entries, ".");
   return { kind: root.kind, mode: root.mode, size: root.size, digest };
+}
+
+async function inspectReproducibleRoot(target: string): Promise<RestoreImageIdentity | undefined> {
+  const info = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!info) return undefined;
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    return {
+      kind: info.isSymbolicLink() ? "symlink" : info.isFile() ? "file" : "directory",
+      mode: Number(info.mode),
+      size: Number(info.size),
+      digest: "invalid-reproducible-root"
+    };
+  }
+  const mode = Number(info.mode);
+  const identity = {
+    dev: String(info.dev),
+    ino: String(info.ino),
+    birthtimeMs: String(info.birthtimeMs)
+  };
+  return { kind: "reproducible_root", mode, size: 0, digest: digestReproducibleRoot(mode, identity) };
+}
+
+/** Uses a shallow, type-and-mode identity only for an already-attested
+ * reproducible root. All other images retain exact recursive inspection. */
+export async function inspectRestoreImage(
+  target: string,
+  expected?: RestoreImageIdentity
+): Promise<RestoreImageIdentity | undefined> {
+  return expected?.kind === "reproducible_root"
+    ? await inspectReproducibleRoot(target)
+    : await inspectExactRestoreImage(target);
 }
 
 export function restoreImagesEqual(
@@ -205,7 +261,8 @@ export async function assertRestoreImage(
   expected: RestoreImageIdentity | undefined,
   message: string
 ): Promise<void> {
-  if (!restoreImagesEqual(await inspectRestoreImage(target), expected)) {
+  const actual = await inspectRestoreImage(target, expected);
+  if (!restoreImagesEqual(actual, expected)) {
     throw new CheckpointConflictError(message);
   }
 }

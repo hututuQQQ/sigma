@@ -1,6 +1,6 @@
 import type { ToolDescriptor } from "agent-protocol";
 import { sessionSkillProjectionCapabilities, type ModelToolProjectionCapabilities } from "./effect-helpers.js";
-import type { DeadlineForecast } from "./convergence-policy.js";
+import { monotonicBudgetStage, type DeadlineForecast } from "./convergence-policy.js";
 import type { BudgetStage } from "./model-budget-convergence.js";
 import type { RuntimeSession } from "./types.js";
 
@@ -29,7 +29,10 @@ export function projectedToolCapabilities(
 }
 
 export function budgetStageForCapacity(forecast: DeadlineForecast, capacity: number): BudgetStage {
-  if (capacity <= 1) return "terminal";
-  if (capacity === 2 || forecast.stage === "converge") return "converge";
-  return "normal";
+  const requested: BudgetStage = capacity <= 1 || forecast.stage === "stop"
+    || forecast.remainingMs <= forecast.terminalProjectionThresholdMs ? "terminal"
+    : capacity === 2 || forecast.stage === "converge" || forecast.actionDebt >= 2
+      ? "converge"
+      : "normal";
+  return monotonicBudgetStage(forecast, requested);
 }

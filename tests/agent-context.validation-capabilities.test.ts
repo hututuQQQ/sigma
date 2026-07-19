@@ -35,7 +35,8 @@ describe("safe repository validation capability profiles", () => {
 
     const profile = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
       stateDigest: "a".repeat(64),
-      availableCommands: ["node"]
+      availableCommands: ["node"],
+      availableCommandsComplete: true
     });
     expect(profile.complete).toBe(true);
     expect(projectCapabilitiesForPath(profile, "src/app.mjs")).toMatchObject({
@@ -52,7 +53,7 @@ describe("safe repository validation capability profiles", () => {
     await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: {} }), "utf8");
     const signal = new AbortController().signal;
     const before = await deriveRepositoryValidationCapabilities(root, signal, {
-      stateDigest: "a".repeat(64), availableCommands: ["node"]
+      stateDigest: "a".repeat(64), availableCommands: ["node"], availableCommandsComplete: true
     });
     expect(projectCapabilitiesForPath(before, "src/app.mjs")?.unit).toBe(false);
 
@@ -60,7 +61,7 @@ describe("safe repository validation capability profiles", () => {
     const testPath = path.join(root, "tests", "app.test.mjs");
     await writeFile(testPath, "import { test } from 'node:test'; test('ok', () => {});\n", "utf8");
     const added = await deriveRepositoryValidationCapabilities(root, signal, {
-      stateDigest: "b".repeat(64), availableCommands: ["node"]
+      stateDigest: "b".repeat(64), availableCommands: ["node"], availableCommandsComplete: true
     });
     expect(projectCapabilitiesForPath(added, "src/app.mjs")).toMatchObject({
       unit: true,
@@ -69,7 +70,7 @@ describe("safe repository validation capability profiles", () => {
 
     await rm(testPath);
     const removed = await deriveRepositoryValidationCapabilities(root, signal, {
-      stateDigest: "c".repeat(64), availableCommands: ["node"]
+      stateDigest: "c".repeat(64), availableCommands: ["node"], availableCommandsComplete: true
     });
     expect(projectCapabilitiesForPath(removed, "src/app.mjs")?.unit).toBe(false);
   });
@@ -80,12 +81,65 @@ describe("safe repository validation capability profiles", () => {
       scripts: { test: "node --test" }
     }), "utf8");
     const unavailable = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
-      stateDigest: "a".repeat(64), availableCommands: []
+      stateDigest: "a".repeat(64), availableCommands: [], availableCommandsComplete: true
     });
+    expect(unavailable.complete).toBe(true);
+    expect(unavailable.availableCommandsComplete).toBe(true);
     expect(projectCapabilitiesForPath(unavailable, "src/app.mjs")?.unit).toBe(false);
     const available = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
-      stateDigest: "b".repeat(64), availableCommands: ["node"]
+      stateDigest: "b".repeat(64), availableCommands: ["node"], availableCommandsComplete: true
     });
     expect(projectCapabilitiesForPath(available, "src/app.mjs")?.unit).toBe(true);
+
+    const unknown = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "c".repeat(64), availableCommands: []
+    });
+    expect(unknown.complete).toBe(false);
+    expect(unknown.availableCommandsComplete).toBe(false);
+  });
+
+  it("keeps the profile incomplete when a discovered manifest cannot be read completely", async () => {
+    const root = await workspace();
+    await writeFile(path.join(root, "package.json"), " ".repeat(256_001), "utf8");
+
+    const profile = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "d".repeat(64), availableCommands: [], availableCommandsComplete: true
+    });
+
+    expect(profile.complete).toBe(false);
+    expect(profile.availableCommandsComplete).toBe(true);
+  });
+
+  it("treats workspace build wrappers as possible validation capabilities", async () => {
+    const root = await workspace();
+    await Promise.all([
+      writeFile(path.join(root, "pom.xml"), "<project/>", "utf8"),
+      writeFile(path.join(root, "mvnw"), "#!/bin/sh\n", "utf8"),
+      mkdir(path.join(root, "tests"))
+    ]);
+    await writeFile(path.join(root, "tests", "AppTest.java"), "class AppTest {}\n", "utf8");
+
+    const maven = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "e".repeat(64), availableCommands: [], availableCommandsComplete: true
+    });
+    expect(projectCapabilitiesForPath(maven, "tests/AppTest.java")).toMatchObject({
+      unit: true,
+      commandFamilies: expect.arrayContaining(["maven build/check", "maven test"]),
+      evidence: expect.arrayContaining(["pom.xml", "mvnw"])
+    });
+
+    await Promise.all([
+      writeFile(path.join(root, "build.gradle"), "plugins {}\n", "utf8"),
+      writeFile(path.join(root, "gradlew"), "#!/bin/sh\n", "utf8"),
+      rm(path.join(root, "tests"), { recursive: true, force: true })
+    ]);
+    const gradle = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "f".repeat(64), availableCommands: [], availableCommandsComplete: true
+    });
+    expect(projectCapabilitiesForPath(gradle, "src/app.mjs")).toMatchObject({
+      unit: false,
+      commandFamilies: expect.arrayContaining(["gradle build/check"]),
+      evidence: expect.arrayContaining(["build.gradle", "gradlew"])
+    });
   });
 });

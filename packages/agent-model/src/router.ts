@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   ModelGateway,
   ModelRequest,
@@ -60,6 +61,55 @@ export type RoutedModelStreamEvent =
       attempt: number;
     }
   | { type: "done"; response: RoutedModelResponse };
+
+const ROUTE_REJECTION_MAX_ENTRIES = 8;
+const ROUTE_REJECTION_MAX_BYTES = 4 * 1024;
+
+export interface ModelRejectionProjection {
+  entries: ModelRejection[];
+  totalCount: number;
+  omittedCount: number;
+  digest: string;
+}
+
+function redactedRejectionText(value: string): string {
+  const redacted = value
+    .replace(/Bearer\s+[^\s,;]+/giu, "Bearer [redacted]")
+    .replace(/((?:api[_ -]?key|access[_ -]?token|password|secret)\s*[:=]\s*)[^\s,;]+/giu, "$1[redacted]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^:/\s]+:)[^@\s]+@/giu, "$1[redacted]@");
+  return [...redacted].map((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code < 32 || code === 127 ? JSON.stringify(character).slice(1, -1) : character;
+  }).join("");
+}
+
+function rejectionProjection(
+  values: readonly ModelRejection[]
+): ModelRejectionProjection {
+  const digest = createHash("sha256").update(JSON.stringify(values), "utf8").digest("hex");
+  const entries: ModelRejection[] = [];
+  for (const value of values.slice(0, ROUTE_REJECTION_MAX_ENTRIES)) {
+    const visible = {
+      ...value,
+      modelSpecId: redactedRejectionText(value.modelSpecId),
+      detail: redactedRejectionText(value.detail)
+    };
+    const candidate: ModelRejectionProjection = {
+      entries: [...entries, visible],
+      totalCount: values.length,
+      omittedCount: values.length - entries.length - 1,
+      digest
+    };
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > ROUTE_REJECTION_MAX_BYTES) break;
+    entries.push(visible);
+  }
+  return {
+    entries,
+    totalCount: values.length,
+    omittedCount: values.length - entries.length,
+    digest
+  };
+}
 
 export type ModelGatewayFactory = (spec: ModelSpec) => ModelGateway;
 
@@ -134,9 +184,12 @@ function incompleteRoutedStreamError(
 
 export class ModelRoutingError extends Error {
   readonly code = "model_route_unavailable";
+  readonly rejectionDiagnostics: ModelRejectionProjection;
   constructor(readonly routeId: string, readonly rejected: readonly ModelRejection[]) {
-    super(`Model route '${routeId}' has no eligible candidates.`);
+    const diagnostics = rejectionProjection(rejected);
+    super(`Model route '${routeId}' has no eligible candidates. Rejection diagnostics: ${JSON.stringify(diagnostics)}`);
     this.name = "ModelRoutingError";
+    this.rejectionDiagnostics = diagnostics;
   }
 }
 

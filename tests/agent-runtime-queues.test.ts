@@ -13,7 +13,8 @@ import type {
   ModelResponse,
   ModelStreamEvent,
   ModelToolDefinition,
-  ToolReceipt
+  ToolReceipt,
+  ValidationEvidence
 } from "../packages/agent-protocol/src/index.js";
 import {
   EVENT_SCHEMA_VERSION,
@@ -40,6 +41,43 @@ const createRuntime = (options: Parameters<typeof createBaseRuntime>[0]) => crea
   ...options,
   reviewer: createApprovingReviewer()
 });
+
+function unavailableChildValidationEvidence(evidenceId: string): ValidationEvidence {
+  return {
+    evidenceId,
+    sessionId: "child-session",
+    runId: "child-run",
+    kind: "validation",
+    status: "failed",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    producer: { authority: "tool", id: "validate" },
+    summary: "The child test runner is unavailable.",
+    data: {
+      validator: "command",
+      command: "pnpm test",
+      exitCode: null,
+      termination: {
+        processStarted: false,
+        state: "terminated",
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        idleTimedOut: false,
+        cancelled: false,
+        failureCode: "executable_not_found"
+      },
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      coveredPaths: ["tests/example.test.ts"],
+      claim: {
+        kind: "unit",
+        commandDigest: "b".repeat(64),
+        status: "unavailable",
+        subject: { projectId: ".", configPaths: [], selectedTests: [], exactFiles: [] }
+      }
+    }
+  };
+}
 
 async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -935,16 +973,36 @@ describe("runtime queues and non-blocking instruction steering", () => {
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
       runDeadlineMs: 60_000,
-      joinChildren: async () => ({ evidence: [{ childId: "durable-child", status: "completed" }], failures: [] })
+      joinChildren: async () => {
+        const limitation = {
+          kind: "validation_capability_unavailable",
+          claim: "unit",
+          attemptedCommandSummary: "pnpm test",
+          capabilityEvidenceId: "child-validation-proof",
+          reason: "The child test runner is unavailable."
+        } as const;
+        const evidence = unavailableChildValidationEvidence("child-validation-proof");
+        return {
+          evidence: [{ childId: "durable-child", status: "completed_with_limitations" }],
+          failures: [],
+          limitations: [limitation],
+          limitationEvidence: [{ childId: "durable-child", limitation, evidence }]
+        };
+      }
     });
     const session = await first.createSession({ workspacePath: workspace, mode: "analyze" });
     await first.command({ type: "submit", sessionId: session.sessionId, text: "inspect with child evidence" });
     await expect(first.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
+      kind: "completed_with_limitations",
+      limitations: [{ capabilityEvidenceId: expect.stringMatching(/^child-capability:/u) }],
       evidence: expect.arrayContaining([expect.objectContaining({
         kind: "child_outcome",
         status: "passed",
         data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      }), expect.objectContaining({
+        kind: "validation",
+        status: "failed",
+        data: expect.objectContaining({ sourceSessionId: "child-session", childId: "durable-child" })
       })])
     });
 
@@ -958,11 +1016,16 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     await resumed.command({ type: "resume", sessionId: session.sessionId });
     await expect(resumed.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
+      kind: "completed_with_limitations",
+      limitations: [{ capabilityEvidenceId: expect.stringMatching(/^child-capability:/u) }],
       evidence: expect.arrayContaining([expect.objectContaining({
         kind: "child_outcome",
         status: "passed",
         data: expect.objectContaining({ childId: "durable-child", outcome: "completed" })
+      }), expect.objectContaining({
+        kind: "validation",
+        status: "failed",
+        data: expect.objectContaining({ sourceSessionId: "child-session", childId: "durable-child" })
       })])
     });
   });
@@ -1095,6 +1158,11 @@ describe("runtime queues and non-blocking instruction steering", () => {
         data: { source: "recovery-test", diagnostic: { ok: true } }
       }]
     };
+    // Exercise replay compatibility with a snapshot written before
+    // incremental evidence-progress fields were introduced.
+    delete snapshotState.progressEvidenceDigest;
+    delete snapshotState.progressEvidenceFingerprints;
+    delete snapshotState.progressEvidenceRecordCount;
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       storeLayoutVersion: STORE_LAYOUT_VERSION,
@@ -1346,6 +1414,35 @@ describe("runtime queues and non-blocking instruction steering", () => {
     });
     await append("child.message", { kind: "integrated" });
     await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({ failures: [] });
+    await append("child.completed", {
+      status: "completed",
+      outcome: { kind: "completed_with_limitations", limitations: [{ kind: "unknown" }] }
+    });
+    await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({
+      failures: [expect.stringContaining("malformed completion limitations")]
+    });
+    await append("child.completed", {
+      status: "completed",
+      outcome: {
+        kind: "completed_with_limitations",
+        evidence: [unavailableChildValidationEvidence("child-capability-evidence")],
+        limitations: [{
+          kind: "validation_capability_unavailable",
+          claim: "unit",
+          attemptedCommandSummary: "pnpm test",
+          capabilityEvidenceId: "child-capability-evidence",
+          reason: "The child environment has no unit-test capability."
+        }]
+      }
+    });
+    await expect(auditDurableChildren(store, parentSessionId)).resolves.toMatchObject({
+      failures: [],
+      limitations: [{ capabilityEvidenceId: "child-capability-evidence" }],
+      limitationEvidence: [{
+        childId: "child-1",
+        evidence: { evidenceId: "child-capability-evidence", kind: "validation" }
+      }]
+    });
   });
 
   it("preserves 100 steering messages and rejects the superseded model turn", async () => {

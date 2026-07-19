@@ -21,7 +21,8 @@ import {
   type RunOutcome,
   type ToolRequest,
   type ToolReceipt,
-  type UsageRecord
+  type UsageRecord,
+  type ValidationRequirementV1
 } from "agent-protocol";
 import { emptyMutationFrontier } from "./mutation-frontier.js";
 
@@ -66,6 +67,9 @@ export interface SemanticFailureCluster {
   firstRevision: number;
   lastRevision: number;
   diagnosticCodes: string[];
+  /** Last model turn whose completed tool batch contributed an attempt. Calls
+   * issued in parallel by that turn share one recovery attempt. */
+  lastModelTurnId?: number;
   /** Latest global progress watermark. Execution clusters are rebased across
    * unrelated evidence or workspace progress. Capability clusters clear after
    * a successful process launch; dependency clusters retain their retry bound. */
@@ -75,6 +79,7 @@ export interface SemanticFailureCluster {
 export type CompletionRepairState =
   | { kind: "evidence_acquisition" }
   | { kind: "terminal_action" }
+  | { kind: "review_changes_requested"; reviewEvidenceId: string }
   | { kind: "no_change_confirmation"; answer: string }
   | { kind: "protected_completion"; answer: string }
   | { kind: "protected_recovery"; answer: string }
@@ -98,6 +103,9 @@ export interface KernelState {
   lastSeq: number;
   startedAt: string;
   deadlineAt: string;
+  /** Trusted control-plane classification. Missing values from older snapshots
+   * are fail-closed and therefore behave as `required`. */
+  validationRequirement?: ValidationRequirementV1;
   /** Active runtime milliseconds preserved while waiting for explicit user approval. */
   deadlineRemainingMs?: number;
   activeModelTurn?: ActiveModelTurn;
@@ -128,14 +136,24 @@ export interface KernelState {
    * typed terminal intent: finalize it or request concrete user input. */
   completionRepair?: CompletionRepairState;
   continuationAttempts: number;
+  /** Output-limit debt persists across tool turns until trusted execution,
+   * workspace, validation, or evidence state materially advances. */
+  lengthFinishDebt?: number;
+  lengthProgressFingerprint?: string;
   repeatedToolBatchCount: number;
   receiptCountAtLastUserInput: number;
   semanticProgress: SemanticProgressWatermark;
   semanticFailureCluster?: SemanticFailureCluster;
   /** Signature of the most recently fully completed tool-call batch. */
   lastToolBatchSignature?: string;
-  /** Stable receipt semantics for that completed batch; excludes call IDs and timestamps. */
+  /** Stable batch plus trusted progress-state fingerprint; excludes call IDs,
+   * timestamps and volatile raw stdout/stderr. */
   lastToolBatchOutcomeSignature?: string;
+  /** Incremental, order-independent semantic evidence projection used by the
+   * no-progress fingerprint. Optional for replay compatibility with older V5 states. */
+  progressEvidenceDigest?: string;
+  progressEvidenceFingerprints?: string[];
+  progressEvidenceRecordCount?: number;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -174,7 +192,11 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     childIds: [],
     completionRepairAttempts: 0,
     continuationAttempts: 0,
+    lengthFinishDebt: 0,
     repeatedToolBatchCount: 0,
+    progressEvidenceDigest: "0".repeat(64),
+    progressEvidenceFingerprints: [],
+    progressEvidenceRecordCount: 0,
     receiptCountAtLastUserInput: 0,
     semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
   };
@@ -193,13 +215,32 @@ function nonNegativeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function validEvidenceProgressState(state: Record<string, unknown>): boolean {
+  const evidenceProgressAbsent = state.progressEvidenceDigest === undefined
+    && state.progressEvidenceFingerprints === undefined && state.progressEvidenceRecordCount === undefined;
+  const evidenceProgressPresent = typeof state.progressEvidenceDigest === "string"
+    && /^[a-f0-9]{64}$/u.test(state.progressEvidenceDigest)
+    && Array.isArray(state.progressEvidenceFingerprints)
+    && state.progressEvidenceFingerprints.every((item) => typeof item === "string" && /^[a-f0-9]{64}$/u.test(item))
+    && new Set(state.progressEvidenceFingerprints).size === state.progressEvidenceFingerprints.length
+    && nonNegativeInteger(state.progressEvidenceRecordCount)
+    && Array.isArray(state.evidence) && Number(state.progressEvidenceRecordCount) <= state.evidence.length;
+  return evidenceProgressAbsent || evidenceProgressPresent;
+}
+
 function validToolBatchProgressState(state: Record<string, unknown>): boolean {
+  if (!validEvidenceProgressState(state)) return false;
   if (state.lastToolBatchSignature !== undefined && typeof state.lastToolBatchSignature !== "string") return false;
   if (state.lastToolBatchOutcomeSignature === undefined) return true;
   return typeof state.lastToolBatchSignature === "string" && state.lastToolBatchSignature.length > 0
     && typeof state.lastToolBatchOutcomeSignature === "string"
     && /^[a-f0-9]{64}$/u.test(state.lastToolBatchOutcomeSignature)
     && Number.isSafeInteger(state.repeatedToolBatchCount) && Number(state.repeatedToolBatchCount) >= 1;
+}
+
+function validLengthProgressState(state: Record<string, unknown>): boolean {
+  return (state.lengthFinishDebt === undefined || nonNegativeInteger(state.lengthFinishDebt))
+    && (state.lengthProgressFingerprint === undefined || typeof state.lengthProgressFingerprint === "string");
 }
 
 export function isSemanticProgressWatermark(value: unknown): value is SemanticProgressWatermark {
@@ -214,6 +255,7 @@ export function isSemanticFailureCluster(value: unknown): value is SemanticFailu
     && typeof cluster.family === "string" && cluster.family.length > 0
     && Number.isSafeInteger(cluster.attempts) && Number(cluster.attempts) >= 1
     && [cluster.firstRevision, cluster.lastRevision].every(nonNegativeInteger)
+    && (cluster.lastModelTurnId === undefined || nonNegativeInteger(cluster.lastModelTurnId))
     && Array.isArray(cluster.diagnosticCodes)
     && cluster.diagnosticCodes.every((item) => typeof item === "string" && item.length > 0)
     && isSemanticProgressWatermark(cluster.progress));
@@ -235,6 +277,11 @@ export function isCompletionRepairState(value: unknown): value is CompletionRepa
   if (repair.kind === "evidence_acquisition" || repair.kind === "terminal_action") {
     return Object.keys(repair).length === 1;
   }
+  if (repair.kind === "review_changes_requested") {
+    return typeof repair.reviewEvidenceId === "string"
+      && repair.reviewEvidenceId.length > 0
+      && Object.keys(repair).every((key) => key === "kind" || key === "reviewEvidenceId");
+  }
   if (repair.kind === "completion_prerequisite") return isCompletionPrerequisiteRepair(repair);
   return (repair.kind === "no_change_confirmation"
       || repair.kind === "protected_completion"
@@ -254,6 +301,11 @@ function validSemanticState(state: Record<string, unknown>): boolean {
     && state.semanticFailureCluster.lastRevision <= revision;
 }
 
+function validEvidenceCollections(state: Record<string, unknown>): boolean {
+  return Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord)
+    && Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord);
+}
+
 export function isKernelState(value: unknown): value is KernelState {
   const state = record(value);
   if (!state || state.schemaVersion !== KERNEL_STATE_VERSION) return false;
@@ -266,14 +318,16 @@ export function isKernelState(value: unknown): value is KernelState {
     Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
     typeof state.startedAt === "string",
     validDeadlineState(state),
+    state.validationRequirement === undefined
+      || state.validationRequirement === "default"
+      || state.validationRequirement === "required",
     state.activeModelSemanticDelta === undefined || typeof state.activeModelSemanticDelta === "boolean",
     Array.isArray(state.messages),
     Array.isArray(state.pendingTools),
     Array.isArray(state.toolCallIds),
     Array.isArray(state.receipts),
-    Array.isArray(state.mutationEvidence) && state.mutationEvidence.every(isEvidenceRecord),
+    validEvidenceCollections(state),
     isMutationFrontier(state.mutationFrontier),
-    Array.isArray(state.evidence) && state.evidence.every(isEvidenceRecord),
     Array.isArray(state.usage) && state.usage.every(isUsageRecord),
     isPlanGraph(state.plan),
     isBudgetLedgerState(state.budget),
@@ -284,6 +338,7 @@ export function isKernelState(value: unknown): value is KernelState {
     state.completionRepair === undefined || isCompletionRepairState(state.completionRepair),
     validSemanticState(state),
     validToolBatchProgressState(state),
+    validLengthProgressState(state),
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
       state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
   ].every(Boolean);

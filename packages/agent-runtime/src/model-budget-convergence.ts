@@ -1,13 +1,15 @@
 import {
   type BudgetAmounts,
   type ContextItem,
+  type ModelCapabilities,
   type ModelMessage,
   type ModelRequest,
   type ModelToolDefinition,
   type RunOutcome,
   type ToolDescriptor
 } from "agent-protocol";
-import { type ContextPlan } from "agent-context";
+import { type ContextPlan, type PlanContextOptions } from "agent-context";
+import { lengthConvergenceRequired, stickyLengthDebt } from "agent-kernel";
 import { APPROXIMATE_TOKEN_RESERVATION_MARGIN } from "agent-model";
 import {
   modelTools,
@@ -28,6 +30,15 @@ export interface PreparedModelTurn {
 }
 
 export type BudgetStage = "normal" | "converge" | "terminal";
+
+export const REASONING_OUTPUT_RESERVE_TOKENS = 32_768;
+export const FIRST_LENGTH_CONTINUATION_TOKENS = 16_384;
+export const CONVERGENCE_OUTPUT_RESERVE_TOKENS = 4_096;
+
+export function defaultModelOutputReserveTokens(capabilities: ModelCapabilities): number {
+  const preferred = capabilities.reasoning ? REASONING_OUTPUT_RESERVE_TOKENS : 8_192;
+  return Math.min(preferred, capabilities.maxOutputTokens);
+}
 
 interface ActionPolicy {
   required: boolean;
@@ -72,16 +83,60 @@ export interface TurnPreparationInput {
   defaultOutputReserveTokens: number;
 }
 
-function actionPolicy(input: TurnPreparationInput): ActionPolicy {
-  const {
-    session, forecast, turnId, defaultOutputReserveTokens, budgetStage, allowNaturalCompletion
-  } = input;
-  const lengthRecovery = session.durable.state.continuationAttempts > 0;
-  const required = lengthRecovery || forecast.stage === "converge" || budgetStage !== "normal";
-  const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
+function adaptiveOutputReserve(
+  preferred: number,
+  firstLengthContinuation: boolean,
+  required: boolean
+): number {
+  if (required) return Math.min(CONVERGENCE_OUTPUT_RESERVE_TOKENS, preferred);
+  if (firstLengthContinuation) return Math.min(FIRST_LENGTH_CONTINUATION_TOKENS, preferred);
+  return preferred;
+}
+
+function requiredActionContent(
+  repeatedLength: boolean,
+  forecast: DeadlineForecast,
+  budgetStage: BudgetStage
+): string {
+  if (repeatedLength) {
+    return "The model reached its output limit in consecutive turns. Its private reasoning is not replayed. Choose one concrete tool action now from durable state; do not restart or narrate the analysis.";
+  }
+  if (budgetStage === "terminal") {
+    return "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work.";
+  }
+  if (forecast.actionDebt >= 2) {
+    return "Repeated semantically similar tool actions have not changed the workspace, validation frontier, plan obligations, or process state. Use one focused tool action now to produce or validate the best available deliverable, then immediately choose the appropriate terminal outcome. Do not continue exploratory variants.";
+  }
+  if (forecast.stage === "converge") {
+    return "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work.";
+  }
+  if (budgetStage === "converge") {
+    return "Budget stage is converge. Choose one focused action now and preserve the next model turn for a terminal outcome. Do not start exploratory work.";
+  }
+  return "Convergence requires one focused tool action now, followed immediately by the appropriate terminal tool.";
+}
+
+function specialActionPolicy(
+  input: TurnPreparationInput,
+  outputReserveTokens: number,
+  firstLengthContinuation: boolean
+): ActionPolicy | null {
+  const { session, turnId, budgetStage, allowNaturalCompletion } = input;
+  if (budgetStage === "terminal" && !input.descriptors.some(terminalDescriptor)) return {
+    required: false,
+    outputReserveTokens,
+    context: [{
+      id: `runtime:natural-terminal:${session.durable.runId}:${turnId}`,
+      authority: "runtime",
+      provenance: "terminal fallback",
+      content: "No terminal tool is available in this runtime. Answer directly now; the runtime will apply the same assurance and completion gates to the natural stop. Do not start or describe additional work.",
+      tokenCount: 32,
+      priority: 10_000
+    }]
+  };
   if (session.durable.state.completionRepair?.kind === "no_change_confirmation") return {
     required: true,
-    outputReserveTokens: Math.min(2_048, defaultOutputReserveTokens),
+    outputReserveTokens: Math.min(2_048, input.defaultOutputReserveTokens),
     context: [{
       id: `runtime:no-change-confirmation:${session.durable.runId}:${turnId}`,
       authority: "runtime",
@@ -103,24 +158,68 @@ function actionPolicy(input: TurnPreparationInput): ActionPolicy {
       priority: 10_000
     }]
   };
+  if (firstLengthContinuation) return {
+    required: false,
+    outputReserveTokens,
+    context: [{
+      id: `runtime:length-continuation:${session.durable.runId}:${turnId}`,
+      authority: "runtime",
+      provenance: "length continuation",
+      content: "The previous response reached its output limit, and its private reasoning is not replayed. Continue from the durable conversation and evidence without reconstructing that reasoning. Use a concrete tool action when more work is needed, or answer directly when the task is complete.",
+      tokenCount: 45,
+      priority: 10_000
+    }]
+  };
+  return null;
+}
+
+function actionPolicy(input: TurnPreparationInput): ActionPolicy {
+  const {
+    session, forecast, turnId, defaultOutputReserveTokens, budgetStage
+  } = input;
+  const lengthDebt = stickyLengthDebt(session.durable.state);
+  const repeatedLength = lengthConvergenceRequired(session.durable.state);
+  const firstLengthContinuation = lengthDebt === 1;
+  const convergence = forecast.stage === "converge" || budgetStage !== "normal";
+  const required = repeatedLength || convergence;
+  const outputReserveTokens = adaptiveOutputReserve(
+    defaultOutputReserveTokens,
+    firstLengthContinuation,
+    required
+  );
+  const special = specialActionPolicy(input, outputReserveTokens, firstLengthContinuation && !required);
+  if (special) return special;
   if (!required) return { required, outputReserveTokens, context: [] };
-  const content = lengthRecovery
-    ? "The previous response reached its output limit, and its private reasoning is not replayed. Do not reconstruct or continue that reasoning. Choose one concrete tool action now, based on the durable conversation and evidence."
-    : budgetStage === "terminal"
-      ? "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work."
-      : forecast.stage === "converge"
-        ? "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work."
-        : budgetStage === "converge"
-          ? "Budget stage is converge. Choose one focused action now and preserve the next model turn for a terminal outcome. Do not start exploratory work."
-          : "Convergence requires one focused tool action now, followed immediately by the appropriate terminal tool.";
+  const content = requiredActionContent(repeatedLength, forecast, budgetStage);
+  const actionDebt = !repeatedLength && budgetStage !== "terminal" && forecast.actionDebt >= 2;
   return { required, outputReserveTokens, context: [{
     id: `runtime:action-required:${session.durable.runId}:${turnId}`,
     authority: "runtime",
-    provenance: lengthRecovery ? "length recovery" : "deadline stage",
+    provenance: repeatedLength ? "repeated length recovery" : actionDebt ? "action debt" : "deadline stage",
     content,
-    tokenCount: lengthRecovery ? 42 : 30,
+    tokenCount: repeatedLength ? 37 : actionDebt ? 48 : 30,
     priority: 10_000
   }] };
+}
+
+type HistoryPlanPolicy = Pick<PlanContextOptions,
+  "historyTokenLimit" | "rawHistoryBlockTokenLimit"
+  | "historySummaryTokenLimit" | "maximumRawHistoryBlocks">;
+
+function historyPlanPolicy(session: RuntimeSession, stage: BudgetStage): Partial<HistoryPlanPolicy> {
+  if (stage === "terminal") return {
+    historyTokenLimit: 12_000, rawHistoryBlockTokenLimit: 8_192,
+    historySummaryTokenLimit: 4_000, maximumRawHistoryBlocks: 4
+  };
+  if (stage === "converge") return {
+    historyTokenLimit: 24_000, rawHistoryBlockTokenLimit: 8_192,
+    historySummaryTokenLimit: 8_000, maximumRawHistoryBlocks: 6
+  };
+  if (stickyLengthDebt(session.durable.state) === 1) return {
+    historyTokenLimit: 48_000, rawHistoryBlockTokenLimit: 8_192,
+    historySummaryTokenLimit: 8_000, maximumRawHistoryBlocks: 8
+  };
+  return {};
 }
 
 export function availableModelBudget(session: RuntimeSession): BudgetAmounts {
@@ -216,15 +315,16 @@ export async function prepareBudgetedModelTurn(
     available, repairPending, allowNaturalCompletion, budgetStage
   } = input;
   const stageDescriptors = budgetStage === "terminal" ? descriptors.filter(terminalDescriptor) : descriptors;
-  if (budgetStage === "terminal" && stageDescriptors.length === 0) {
-    throw Object.assign(new Error("No terminal tool is available for the final budgeted turn."), {
-      code: "budget_exhausted"
-    });
-  }
   const tools = modelTools(projectModelToolDescriptors(stageDescriptors, capabilities));
-  const policy = actionPolicy(input);
-  const outputReserveTokens = budgetStage === "normal" ? policy.outputReserveTokens : Math.max(1, Math.min(
+  // A runtime can legitimately expose no terminal model tool (for example an
+  // analysis-only embedding). Natural stop is still safe because the runtime
+  // synthesizes completion intent and applies the identical assurance gate.
+  // Do not mask an upstream model/protocol failure as budget exhaustion merely
+  // because deadline projection entered the terminal stage first.
+  const policy = actionPolicy({ ...input, descriptors: stageDescriptors });
+  const outputReserveTokens = Math.max(1, Math.min(
     policy.outputReserveTokens,
+    session.services.gateway.capabilities.maxOutputTokens,
     Math.floor(available.outputTokens / APPROXIMATE_TOKEN_RESERVATION_MARGIN)
   ));
   const turnsToReserve = budgetStage === "converge" ? 2 : 1;
@@ -239,6 +339,7 @@ export async function prepareBudgetedModelTurn(
       dynamic: [...dynamic, ...hookContext, ledger, ...policy.context],
       tools,
       outputReserveTokens,
+      ...historyPlanPolicy(session, budgetStage),
       ...(maxInputTokens ? { maxInputTokens } : {})
     });
   } catch (error) {

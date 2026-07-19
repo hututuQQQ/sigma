@@ -21,9 +21,11 @@ import {
   type ModelStreamEvent,
   type ModelToolDefinition,
   type ReviewEvidence,
+  type ValidationEvidence,
   type UsageRecord
 } from "../packages/agent-protocol/src/index.js";
-import { emptyMutationFrontier, frontierAfterCheckpoint } from "../packages/agent-kernel/src/index.js";
+import { createKernelState, emptyMutationFrontier, frontierAfterCheckpoint } from "../packages/agent-kernel/src/index.js";
+import { reviewBasisDigest } from "../packages/agent-runtime/src/mutation-evidence.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import type {
   AccountableReviewerPort,
@@ -33,6 +35,7 @@ import type {
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
 type Boundary =
   | "plan"
@@ -447,7 +450,31 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   }, "tool");
   if (!reached(boundary, "validation_evidence")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
-  await append("evidence.recorded", {
+  // Once review has started, checkpoint integrity must already precede the
+  // semantic validation in the durable ledger. Recovery may backfill it at
+  // earlier boundaries, but appending it after review would correctly create
+  // a new ordered evidence basis and invalidate the in-flight reservation.
+  if (reached(boundary, "review_started")) {
+    await append("evidence.recorded", {
+      evidenceId: `checkpoint-validation:${checkpoint.checkpointId}`,
+      sessionId,
+      runId,
+      kind: "validation",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "checkpoint-manager" },
+      summary: "Checkpoint postimage was captured and content-addressed successfully.",
+      data: {
+        validator: "checkpoint_postimage_integrity",
+        artifactIds: [],
+        frontierRevision: sealedFrontier.revision,
+        stateDigest: sealedFrontier.currentStateDigest,
+        coveredPaths: []
+      }
+    });
+  }
+
+  const validationEvidence: ValidationEvidence = {
     evidenceId: `command-validation:${checkpoint.checkpointId}`,
     sessionId,
     runId,
@@ -463,8 +490,16 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       stateDigest: sealedFrontier.currentStateDigest,
       coveredPaths: ["target.ts"],
       claim: {
-        kind: "acceptance",
+        // A TypeScript source mutation requires the generic static typecheck
+        // claim when no complete repository capability profile is available.
+        // Keep this recovery fixture aligned with the same assurance contract
+        // used by live runs so it exercises durability rather than a stale
+        // under-strength validation assertion.
+        kind: "typecheck",
         commandDigest: "c".repeat(64),
+        strength: "behavioral",
+        independence: "cross_method",
+        assertionMode: "explicit",
         subject: {
           projectId: ".",
           configPaths: [],
@@ -474,7 +509,8 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
         status: "passed"
       }
     }
-  });
+  };
+  await append("evidence.recorded", validationEvidence as JsonValue);
 
   // V5 releases the mutation reservation as soon as semantic validation has
   // passed; optional review must not retain mutation capacity.
@@ -491,39 +527,26 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
   if (!reached(boundary, "review_started")) return { workspace, storeRootDir, store, sessionId, runId, checkpoint };
 
   const reviewerId = "fault-injection-reviewer";
-  const validationSignature = JSON.stringify({
-    status: "passed",
-    validator: "command",
-    command: null,
-    exitCode: null,
-    termination: null,
-    coveredPaths: ["target.ts"],
-    claim: {
-      kind: "acceptance",
-      commandDigest: "c".repeat(64),
-      subject: {
-        projectId: ".",
-        configPaths: [],
-        selectedTests: [],
-        exactFiles: []
-      },
-      status: "passed"
-    },
-    frontierRevision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest
+  const reviewState = createKernelState({
+    sessionId,
+    runId,
+    mode: "change",
+    startedAt: now,
+    deadlineAt: new Date(Date.now() + 60_000).toISOString()
   });
-  const reviewBasisDigest = createHash("sha256").update(JSON.stringify({
-    frontierRevision: sealedFrontier.revision,
-    stateDigest: sealedFrontier.currentStateDigest,
-    validations: [validationSignature]
-  })).digest("hex");
+  reviewState.mutationFrontier = sealedFrontier;
+  reviewState.evidence = [validationEvidence];
+  const reviewBasisDigestValue = reviewBasisDigest(
+    runtimeSessionFixture({ state: reviewState, workspacePath: workspace }),
+    [validationEvidence]
+  );
   const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
     sessionId,
     runId,
     reviewerId,
     revision: sealedFrontier.revision,
     stateDigest: sealedFrontier.currentStateDigest,
-    reviewBasisDigest,
+    reviewBasisDigest: reviewBasisDigestValue,
     attempt: 1
   })).digest("hex")}`;
   const reviewerAmount = {
@@ -606,8 +629,10 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       findings: [],
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
-      reviewBasisDigest,
+      reviewBasisDigest: reviewBasisDigestValue,
+      reviewBasisVersion: 2,
       validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
+      reviewRelevantEvidenceIds: [],
       checkpointId: checkpoint.checkpointId
     }
   });

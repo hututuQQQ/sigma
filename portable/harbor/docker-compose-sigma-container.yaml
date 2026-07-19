@@ -1,0 +1,141 @@
+services:
+  main:
+    working_dir: /app
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - type: volume
+        source: sigma-workspace
+        target: /app
+      - type: volume
+        source: sigma-target-helper
+        target: /opt/sigma-helper
+        read_only: true
+      - type: volume
+        source: sigma-oci-artifacts
+        target: /run/sigma-oci/artifacts
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+      com.sigma.oci-target: managed-main-v1
+
+  sigma-control:
+    image: __SIGMA_CONTROL_IMAGE__
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /app
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
+    depends_on:
+      main:
+        condition: service_started
+      sigma-oci-broker:
+        condition: service_healthy
+    environment:
+      HOME: /var/lib/sigma
+    volumes:
+      - type: bind
+        source: __SIGMA_AGENT_CLI_TARBALL__
+        target: /opt/sigma-package/agent-cli.tgz
+        read_only: true
+      - type: volume
+        source: sigma-workspace
+        target: /app
+        volume:
+          nocopy: true
+      - type: volume
+        source: sigma-control-state
+        target: /var/lib/sigma
+      - type: volume
+        source: sigma-control-runtime
+        target: /opt/sigma-control
+      - type: volume
+        source: sigma-target-helper
+        target: /opt/sigma-helper
+        read_only: true
+      - type: volume
+        source: sigma-oci-ipc
+        target: /run/sigma-oci
+        read_only: true
+      - type: volume
+        source: sigma-oci-artifacts
+        target: /run/sigma-oci/artifacts
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+      com.sigma.control-plane: v1
+
+  sigma-oci-broker:
+    image: __SIGMA_CONTROL_IMAGE__
+    command: ["node", "/opt/sigma-broker/sigma-oci-broker.mjs"]
+    user: "0:0"
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
+    depends_on:
+      main:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "const fs=require('node:fs');const a=fs.statSync('/run/sigma-oci/attestation.json');const s=fs.statSync('/run/sigma-oci/broker.sock');if(!a.isFile()||!s.isSocket())process.exit(1)"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+    volumes:
+      - type: bind
+        source: __SIGMA_CONTAINER_ENGINE_SOCKET__
+        target: /var/run/docker.sock
+      - type: bind
+        source: __SIGMA_OCI_BROKER_SOURCE__
+        target: /opt/sigma-broker/sigma-oci-broker.mjs
+        read_only: true
+      - type: bind
+        source: __SIGMA_AGENT_CLI_TARBALL__
+        target: /opt/sigma-package/agent-cli.tgz
+        read_only: true
+      - type: volume
+        source: sigma-target-helper
+        target: /opt/sigma-helper
+      - type: volume
+        source: sigma-oci-ipc
+        target: /run/sigma-oci
+      - type: volume
+        source: sigma-oci-artifacts
+        target: /run/sigma-oci/artifacts
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+      com.sigma.oci-broker: v1
+
+volumes:
+  sigma-workspace:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+  sigma-control-state:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+  sigma-control-runtime:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+  sigma-target-helper:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+  sigma-oci-ipc:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+  sigma-oci-artifacts:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"
+
+networks:
+  default:
+    labels:
+      com.sigma.harbor-run: "${SIGMA_HARBOR_RUN_ID:-sigma-harbor}"

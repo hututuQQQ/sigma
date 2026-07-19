@@ -1,4 +1,5 @@
 import type { BrokerDoctorReport } from "agent-execution";
+import type { LanguageServerPreset } from "agent-code-intel";
 import {
   runtimeEnvironment,
   type RuntimeEnvironment,
@@ -36,6 +37,14 @@ export function verifiedRuntimeCommands(report: BrokerDoctorReport): string[] {
   return [...new Set((report.capabilities.runtimeCommands ?? [])
     .filter((command) => /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(command)))]
     .sort((left, right) => left.localeCompare(right));
+}
+
+export function verifiedRuntimeCommandSnapshotComplete(report: BrokerDoctorReport): boolean {
+  const ociTarget = report.container?.available === true && report.container.backend === "oci";
+  return (report.capabilities.foreground || report.capabilities.background)
+    && report.capabilities.runtimeCommands !== undefined
+    && report.capabilities.runtimeCommandSnapshotComplete === true
+    && (!ociTarget || report.capabilities.executableSearchPaths !== undefined);
 }
 
 export interface VerifiedNetworkPolicy {
@@ -77,6 +86,25 @@ export function brokerRuntimeEnvironment(report: BrokerDoctorReport): RuntimeEnv
     defaultShell: availableShells[0] ?? "none",
     availableShells,
     availableRuntimeCommands: verifiedRuntimeCommands(report),
+    runtimeCommandSnapshotComplete: verifiedRuntimeCommandSnapshotComplete(report),
     executionCapabilitiesVerified: true
+  };
+}
+
+export function verifiedExecutionBackend(report: BrokerDoctorReport): "native" | "oci" {
+  return report.container?.available === true && report.container.backend === "oci"
+    ? "oci" : "native";
+}
+
+export function configuredRuntimeEnvironment(
+  report: BrokerDoctorReport,
+  executionMode: "sandboxed" | "container",
+  languageServers: readonly LanguageServerPreset[]
+): RuntimeEnvironment {
+  const environment = brokerRuntimeEnvironment(report);
+  return {
+    ...environment,
+    executionMode,
+    availableLanguageServers: languageServers.filter((preset) => preset.available).map((preset) => preset.id)
   };
 }

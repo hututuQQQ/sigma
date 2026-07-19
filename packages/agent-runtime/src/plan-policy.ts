@@ -27,6 +27,9 @@ export function assertPlanTransition(
 ): void {
   if (!isPlanGraph(next)) throw new Error("Plan graph is invalid, too large, or cyclic.");
   if (next.revision !== previous.revision + 1) throw new Error(`Plan revision must be ${previous.revision + 1}.`);
+  if (next.goal !== previous.goal) {
+    throw new Error("The durable plan goal is user-owned and cannot be rewritten by update_plan.");
+  }
   const nextById = new Map(next.nodes.map((node) => [node.id, node]));
   assertCompletedNodesStable(previous, nextById);
   assertChildNodesStable(previous, nextById, allowChildOwnedChanges);

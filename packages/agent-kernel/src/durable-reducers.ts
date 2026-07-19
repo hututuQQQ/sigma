@@ -11,10 +11,12 @@ import {
   type EvidenceRecord,
   type JsonValue
 } from "agent-protocol";
+import { isDeepStrictEqual } from "node:util";
 import type { KernelState } from "./state.js";
 import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
 import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
+import { refreshCompletedToolBatchProgress } from "./tool-batch-progress.js";
 
 export type KernelEventReducer = (
   state: KernelState,
@@ -48,6 +50,16 @@ function isEvidenceAcquisitionRepair(state: KernelState): boolean {
       isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
 }
 
+function isCurrentBatchSidecarEvidence(state: KernelState, evidence: EvidenceRecord): boolean {
+  if (evidence.producer.authority !== "tool") return false;
+  const calls = [...state.messages].reverse().find((message) => message.role === "assistant"
+    && message.toolCalls?.length)?.toolCalls;
+  if (!calls?.some((call) => call.id === evidence.producer.id)) return false;
+  const receipt = state.receipts.find((item) => item.callId === evidence.producer.id);
+  return receipt?.evidence?.some((item) => item.evidenceId === evidence.evidenceId
+    && isDeepStrictEqual(item, evidence)) ?? false;
+}
+
 const evidenceRecorded: KernelEventReducer = (state, event) => {
   const evidence = event.payload;
   if (!isEvidenceRecord(evidence) || evidence.sessionId !== state.sessionId || evidence.runId !== state.runId
@@ -72,7 +84,10 @@ const evidenceRecorded: KernelEventReducer = (state, event) => {
       ? { ...progressed, completionRepairAttempts: 0, completionRepair: undefined }
       : { ...progressed, completionRepairAttempts: Math.max(1, state.completionRepairAttempts), completionRepair: { kind: "terminal_action" } }
     : progressed;
-  return repaired;
+  return {
+    ...repaired,
+    ...refreshCompletedToolBatchProgress(repaired, isCurrentBatchSidecarEvidence(state, evidence))
+  };
 };
 
 const usageRecorded: KernelEventReducer = (state, event) => {
@@ -143,7 +158,7 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
   if (event.payload.status !== requiredStatus) return state;
   if (requiredStatus !== "restored") {
     if (event.authority !== "runtime" || event.payload.runId !== state.runId) return state;
-    return {
+    const updated = {
       ...state,
       checkpointHead: event.payload,
       ...(requiredStatus === "sealed" ? {
@@ -154,12 +169,13 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
         )
       } : {})
     };
+    return { ...updated, ...refreshCompletedToolBatchProgress(updated) };
   }
   if (event.authority !== "runtime" && event.authority !== "user") return state;
   const checkpointHead = event.payload.runId === state.runId
     ? event.payload : { ...event.payload, runId: state.runId };
   const pruned = pruneRestoredCheckpointEvidence(state, event.payload.checkpointId);
-  return recordSemanticWorkspaceRestore({
+  const restored = recordSemanticWorkspaceRestore({
     ...state,
     ...pruned,
     ...checkpointRepairUpdate(state, pruned.evidence),
@@ -170,6 +186,7 @@ const checkpointUpdated: KernelEventReducer = (state, event) => {
       pruned.mutationEvidence
     )
   });
+  return { ...restored, ...refreshCompletedToolBatchProgress(restored) };
 };
 
 const checkpointRecoveryResolved: KernelEventReducer = (state, event) => {
@@ -236,15 +253,25 @@ const skillLoaded: KernelEventReducer = (state, event, payload) => {
 };
 
 const processSpawned: KernelEventReducer = (state, event, payload) => {
-  if (event.authority !== "runtime" || event.runId !== state.runId
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId || event.runId !== state.runId
     || typeof payload.processId !== "string" || !payload.processId
     || state.activeProcessIds.includes(payload.processId)) return state;
-  return { ...state, activeProcessIds: [...state.activeProcessIds, payload.processId] };
+  const progressed = { ...state, activeProcessIds: [...state.activeProcessIds, payload.processId] };
+  return { ...progressed, ...refreshCompletedToolBatchProgress(progressed) };
 };
 
 const processSettled: KernelEventReducer = (state, event, payload) => {
-  if (event.authority !== "runtime" || typeof payload.processId !== "string") return state;
-  return { ...state, activeProcessIds: state.activeProcessIds.filter((id) => id !== payload.processId) };
+  if (event.authority !== "runtime" || event.sessionId !== state.sessionId || event.runId !== state.runId
+    || typeof payload.processId !== "string") return state;
+  const progressed = { ...state, activeProcessIds: state.activeProcessIds.filter((id) => id !== payload.processId) };
+  return { ...progressed, ...refreshCompletedToolBatchProgress(progressed) };
+};
+
+const childObserved: KernelEventReducer = (state, event, payload) => {
+  if (event.authority !== "runtime" || event.runId !== state.runId
+    || typeof payload.childId !== "string" || !payload.childId
+    || state.childIds.includes(payload.childId)) return state;
+  return { ...state, childIds: [...state.childIds, payload.childId] };
 };
 
 export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>> = {
@@ -268,5 +295,8 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "process.spawned": processSpawned,
   "process.exited": processSettled,
   "process.lost": processSettled,
-  "process.handed_off": processSettled
+  "process.handed_off": processSettled,
+  "child.spawned": childObserved,
+  "child.message": childObserved,
+  "child.completed": childObserved
 };

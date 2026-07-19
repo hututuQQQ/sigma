@@ -94,6 +94,37 @@ describe("agent evaluation verifier isolation", () => {
     expect(result.checks[0].message).toMatch(/symbolic link|junction/iu);
   });
 
+  it("keeps completed-with-limitations verifier-reachable while preserving the public result", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-limited-completion-"));
+    temporary.push(root);
+    const workspace = path.join(root, "workspace");
+    const artifactDir = path.join(root, "artifacts");
+    await Promise.all([mkdir(workspace), mkdir(artifactDir)]);
+    const result = await runPostVerifier({
+      scenario: { expectedTerminal: "completed", verifier: { checks: [] } },
+      workspace,
+      manifestDir: root,
+      delta: { added: [], modified: [], deleted: [] },
+      initialGit: { status: "", diff: "" },
+      finalGit: { status: "", diff: "" },
+      subjectResult: {
+        result: {
+          status: "completed_with_limitations",
+          finishReason: "completed_with_limitations",
+          finalMessage: "Artifact produced with a declared validation limitation."
+        }
+      },
+      events: [],
+      metrics: { terminal: { type: "run.completed" } },
+      artifactDir,
+      redactor: String
+    });
+
+    expect(result.delivery.status).toBe("pass");
+    expect(result.terminal).toMatchObject({ expected: "completed", actual: "completed" });
+    expect(result.finalAnswer).toContain("declared validation limitation");
+  });
+
   it("verifies one user interruption by event count even when the message has multiple question marks", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-eval-event-check-"));
     temporary.push(root);

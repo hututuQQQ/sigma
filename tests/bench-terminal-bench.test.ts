@@ -1,9 +1,13 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { runTerminalBenchCli } from "../scripts/bench-terminal-bench.mjs";
+import {
+  allocateBenchmarkRunDirectory,
+  assembleGroupedLogs,
+  runTerminalBenchCli
+} from "../scripts/bench-terminal-bench.mjs";
 
 async function writeRunnerLogs(options: Record<string, string | undefined>, result: { exitCode: number; stdout: string; stderr: string }) {
   if (options.stdoutPath) await writeFile(options.stdoutPath, result.stdout, "utf8");
@@ -19,12 +23,20 @@ async function writeRunnerLogs(options: Record<string, string | undefined>, resu
 
 async function writeAttemptArtifacts(configPath: string, attempt: number, passed: boolean) {
   const runDir = path.dirname(configPath);
+  const jobConfig = JSON.parse(await readFile(configPath, "utf8"));
+  const managedProvenance = jobConfig.agents?.[0]?.kwargs?.managed_provenance === true;
   const trialDir = path.join(runDir, "harbor-jobs", "job-1", `trial-${attempt}`);
   const taskDir = path.join(runDir, "tasks", "selected-task");
   await mkdir(taskDir, { recursive: true });
   await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
     task_id: "terminal-bench/selected-task",
-    source_logs_dir: path.join(trialDir, "agent")
+    source_logs_dir: path.join(trialDir, "agent"),
+    execution_backend: "sandbox:bwrap",
+    ...(managedProvenance ? {
+      container_engine: "docker",
+      container_target: "managed",
+      target_image_id: `sha256:${"a".repeat(64)}`
+    } : {})
   })}\n`, "utf8");
   await writeFile(
     path.join(taskDir, "summary.json"),
@@ -76,6 +88,79 @@ function cleanDockerResources() {
 }
 
 describe("Terminal-Bench CLI verifier result handling", () => {
+  it("allocates collision-resistant run directories exclusively", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-run-id-"));
+    const nonces = ["same", "same", "different"];
+    try {
+      const first = await allocateBenchmarkRunDirectory(
+        directory, "20260719-120000-deepseek-model", "candidate", () => nonces.shift() ?? "fallback"
+      );
+      const second = await allocateBenchmarkRunDirectory(
+        directory, "20260719-120000-deepseek-model", "candidate", () => nonces.shift() ?? "fallback"
+      );
+      expect(first.runId).not.toBe(second.runId);
+      expect(first.runDir).not.toBe(second.runDir);
+      expect((await stat(first.runDir)).isDirectory()).toBe(true);
+      expect((await stat(second.runDir)).isDirectory()).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("assembles complete group logs from files instead of concatenating returned output", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-group-logs-"));
+    const first = "a".repeat(256 * 1024);
+    const second = "b".repeat(256 * 1024);
+    try {
+      await Promise.all([
+        writeFile(path.join(directory, "harbor-group-001.stdout.log"), first, "utf8"),
+        writeFile(path.join(directory, "harbor-group-001.stderr.log"), "first-error", "utf8"),
+        writeFile(path.join(directory, "harbor-group-002.stdout.log"), second, "utf8"),
+        writeFile(path.join(directory, "harbor-group-002.stderr.log"), "second-error", "utf8")
+      ]);
+      await assembleGroupedLogs(
+        directory,
+        [{}, {}],
+        [
+          { exitCode: 0, stdout: "bounded-first", stderr: "bounded-first-error" },
+          { exitCode: 1, stdout: "bounded-second", stderr: "bounded-second-error" }
+        ]
+      );
+      const stdout = await readFile(path.join(directory, "harbor.stdout.log"), "utf8");
+      expect(stdout).toContain(first);
+      expect(stdout).toContain(second);
+      expect(stdout).not.toContain("bounded-first");
+      expect((await stat(path.join(directory, "harbor.stdout.log"))).size)
+        .toBeGreaterThanOrEqual(512 * 1024);
+      expect(await readFile(path.join(directory, "result.raw.log"), "utf8"))
+        .toContain("stdout_log: harbor-group-002.stdout.log");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("marks a pre-Harbor failure incomplete instead of scoring a synthetic zero", async () => {
+    const result = await runTerminalBenchCli([
+      "--mode", "task", "--task-id", "selected-task", "--run-label", "pre-harbor-incomplete"
+    ], {
+      repositorySourceIdentity: () => ({ revision: "b".repeat(40), dirty: false }),
+      resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
+      packageAgentCli: async () => ({ exitCode: 1, stdout: "", stderr: "build failed" })
+    });
+
+    try {
+      expect(result.report.status).toBe("incomplete");
+      expect(result.report.score_status).toBe("incomplete");
+      expect(result.report).toMatchObject({
+        managed_provenance: false,
+        harbor_topology: "main_only"
+      });
+      expect(result.report.incomplete_reason.join("\n")).toMatch(/trial result count 0 does not match expected 1/iu);
+    } finally {
+      await rm(result.runDir, { recursive: true, force: true });
+    }
+  });
+
   it("reuses only an archive matching the frozen SHA-256", async () => {
     const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-archive-"));
     const tarball = path.join(fixtureDir, "agent-cli-linux-x64.tgz");
@@ -87,8 +172,11 @@ describe("Terminal-Bench CLI verifier result handling", () => {
 
     const result = await runTerminalBenchCli([
       "--mode", "task", "--task-id", "selected-task", "--reuse-package",
-      "--expected-archive-sha256", sha, "--run-label", "reuse-test"
+      "--expected-archive-sha256", sha, "--run-label", "reuse-test",
+      "--managed-provenance"
     ], {
+      repositorySourceIdentity: () => ({ revision: "c".repeat(40), dirty: false }),
+      agentCliArchiveSourceIdentity: () => ({ revision: "c".repeat(40), dirty: false }),
       resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
       packageAgentCli: async () => {
         packageCalls += 1;
@@ -117,6 +205,27 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(packageCalls).toBe(0);
       expect(result.report.agent_cli_sha256).toBe(sha);
       expect(result.report.package_reused).toBe(true);
+      expect(result.report.source_revision).toBe("c".repeat(40));
+      expect(result.report.source_dirty).toBe(false);
+      expect(result.report).toMatchObject({
+        managed_provenance: true,
+        harbor_topology: "managed_three_role"
+      });
+      const runConfig = JSON.parse(await readFile(path.join(result.runDir, "config.json"), "utf8"));
+      expect(runConfig).toMatchObject({
+        execution_mode: "sandboxed",
+        managed_provenance: true,
+        harbor_topology: "managed_three_role"
+      });
+      const resolvedJob = JSON.parse(
+        await readFile(path.join(result.runDir, "resolved-job.config.json"), "utf8")
+      );
+      expect(resolvedJob.agents[0].kwargs).toMatchObject({
+        execution_mode: "sandboxed",
+        managed_provenance: true
+      });
+      expect(resolvedJob.environment.extra_docker_compose[0])
+        .toMatch(/docker-compose-sigma-container\.yaml$/u);
     } finally {
       await rm(result.runDir, { recursive: true, force: true });
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;
@@ -136,6 +245,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
     const result = await runTerminalBenchCli(
       ["--mode", "task", "--task-id", "selected-task", "--provider", "deepseek", "--model", "retry-test-model"],
       {
+        agentCliArchiveSourceIdentity: () => ({ revision: "d".repeat(40), dirty: true }),
         resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
         packageAgentCli: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
         packageHarborRuntime: async () => ({ exitCode: 0, stdout: "", stderr: "" }),

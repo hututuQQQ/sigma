@@ -6,20 +6,27 @@ import type {
   WorkspaceMcpTrustAttestation
 } from "agent-config";
 import type { JsonValue, ModelGateway, RunStore, RuntimeClient } from "agent-protocol";
-import { LazyExecutionBroker, type BrokerDoctorReport, type ExecutionBroker } from "agent-execution";
+import type {
+  BrokerDoctorReport,
+  ContainerEngine,
+  ContainerTarget,
+  ExecutionBroker,
+  TrustedContainerLauncherV1
+} from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
 import { defaultBundledLanguageServerRoot, discoverLanguageServers, type LanguageServerPreset } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
-import { ensurePrivateStateDirectory, isInside } from "agent-platform";
 import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
 import { createRuntime } from "./create-runtime.js";
 import type { InProcessRuntimeClient } from "./runtime-client.js";
 import type { ChildJoinSummary } from "./types.js";
-import { auditDurableChildren } from "./durable-children.js";
+import { auditDurableChildren, childLimitationEvidenceSources } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
+import { configuredExecutionBroker } from "./container-runtime-execution.js";
+import { prepareRuntimeStoreRoot } from "./runtime-store-root.js";
 import { runtimeStateRoot } from "./runtime-state.js";
 import { resolveRuntimeCustomization, type RuntimeCustomization } from "./customization.js";
 import { BrokerCommandHookRunner } from "./hook-runner.js";
@@ -32,14 +39,15 @@ import { subjectConfigurationV1 } from "./subject-configuration.js";
 import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
 import { repositoryTransactionTool } from "./repository-transaction-tool.js";
 import {
-  brokerRuntimeEnvironment, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
+  brokerRuntimeEnvironment, configuredRuntimeEnvironment, verifiedExecutionBackend,
+  verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
 } from "./execution-capabilities.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: "deepseek" | "glm";
   model: string;
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
-  runDeadlineSec: number;
+  runDeadlineSec: number; commandTimeoutSec?: number;
   modelDeadlineSec: number;
   streamIdleSec: number;
   streamActiveSec?: number;
@@ -53,6 +61,9 @@ export interface RuntimeCompositionConfig {
   agentProfile?: string;
   sandboxMode?: "required";
   executionMode?: "sandboxed" | "container";
+  containerEngine?: ContainerEngine;
+  containerTarget?: ContainerTarget;
+  containerImage?: string;
   readScope?: "workspace" | "host";
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
@@ -71,6 +82,9 @@ export interface RuntimeFactoryDeps {
     requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;
+  /** Trusted product launcher input. This must never be populated from CLI,
+   * environment, workspace configuration, task metadata, or model output. */
+  containerLauncher?: TrustedContainerLauncherV1;
   hookDefinitions?: readonly HookDefinition[];
   hookRunner?: HookRunnerPort;
   agentProfileHookRunner?: HookRunnerPort;
@@ -86,7 +100,6 @@ export interface ConfiguredRuntime {
   close(): Promise<void>;
 }
 export interface RuntimeFactoryOptions { connectMcp?: boolean; surface?: "cli" | "tui"; interactiveApprovals?: boolean; }
-
 interface PreparedComposition {
   workspace: string;
   storeRootDir: string;
@@ -100,20 +113,40 @@ async function joinChildren(supervisor: AgentSupervisor, store: RunStore, parent
   const evidence: JsonValue[] = jobs.map((job) => JSON.parse(JSON.stringify({
     childId: job.id,
     status: job.status,
-    outcome: job.result?.outcome.kind ?? null,
+    outcome: job.result?.outcome ?? null,
     report: job.result?.report ?? null,
     isolation: job.isolation ?? null,
     error: job.error ?? null
   })) as JsonValue);
+  const limitations = jobs.flatMap((job) => job.result?.outcome.kind === "completed_with_limitations"
+    ? job.result.outcome.limitations : []);
+  const limitationEvidence = jobs.flatMap((job) => job.result
+    ? childLimitationEvidenceSources(
+      job.id,
+      JSON.parse(JSON.stringify(job.result.outcome)) as JsonValue
+    ) : []);
   const failures = jobs.flatMap((job) => {
-    if (job.status !== "completed" || job.result?.outcome.kind !== "completed") {
+    if (job.status !== "completed" || (job.result?.outcome.kind !== "completed"
+      && job.result?.outcome.kind !== "completed_with_limitations")) {
       return [`Child ${job.id} ended as ${job.result?.outcome.kind ?? job.status}: ${job.error ?? "no report"}`];
+    }
+    if (job.result?.outcome.kind === "completed_with_limitations"
+      && childLimitationEvidenceSources(
+        job.id,
+        JSON.parse(JSON.stringify(job.result.outcome)) as JsonValue
+      ).length !== job.result.outcome.limitations.length) {
+      return [`Child ${job.id} reported a limitation without resolvable validation evidence.`];
     }
     return job.isolation?.kind === "git_worktree" && job.isolation.cleanup === "retained"
       ? [`Child ${job.id} has an unintegrated worktree at ${job.isolation.worktreePath}`] : [];
   });
   const durable = await auditDurableChildren(store, parentId, new Set(jobs.map((job) => job.id)));
-  return { evidence: [...evidence, ...durable.evidence], failures: [...failures, ...durable.failures] };
+  return {
+    evidence: [...evidence, ...durable.evidence],
+    failures: [...failures, ...durable.failures],
+    limitations: [...limitations, ...(durable.limitations ?? [])],
+    limitationEvidence: [...limitationEvidence, ...(durable.limitationEvidence ?? [])]
+  };
 }
 
 export async function createConfiguredRuntime(
@@ -161,9 +194,9 @@ export async function createConfiguredRuntime(
       availableProfiles: customization.availableProfiles,
       gatewayForRole: gateways.forRole,
       execution,
-      runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport),
-        executionMode: config.executionMode ?? "sandboxed",
-        availableLanguageServers: languageServers.filter((preset) => preset.available).map((preset) => preset.id) },
+      runtimeEnvironment: configuredRuntimeEnvironment(
+        executionReport, config.executionMode ?? "sandboxed", languageServers
+      ),
       subjectAttestation,
       skills: customization.skills,
       hooks: customization.hookDefinitions,
@@ -240,22 +273,15 @@ async function prepareComposition(
   deps: RuntimeFactoryDeps,
   options: RuntimeFactoryOptions
 ): Promise<PreparedComposition> {
-  if (config.executionMode === "container") {
-    throw Object.assign(new Error(
-      "The OCI execution backend is not installed for this Sigma build; host execution is never used as a fallback."
-    ), { code: "container_unavailable" });
-  }
   const workspace = await realpath(path.resolve(config.workspace));
   await verifyMcpTrust(config, options, workspace);
-  const storeRootDir = await prepareStoreRoot(
+  const storeRootDir = await prepareRuntimeStoreRoot(
     deps.stateRootDir ?? runtimeStateRoot(workspace),
     workspace
   );
   const customization = await resolveRuntimeCustomization(config, workspace, undefined, deps.hookDefinitions);
   verifyCustomization(config, workspace, customization);
-  const execution = deps.executionBroker ?? new LazyExecutionBroker({
-    sandboxMode: "required"
-  });
+  const execution = await configuredExecutionBroker(config, deps, workspace);
   try {
     const hookRunner = createHookRunner(config, deps, workspace, storeRootDir, customization, execution);
     const executionReport = await execution.connect();
@@ -279,34 +305,6 @@ async function verifyMcpTrust(
 ): Promise<void> {
   if (options.connectMcp === false || config.mcpServers.length === 0) return;
   await verifyWorkspaceMcpTrust(workspace, config.mcpSource, config.workspaceMcpTrust);
-}
-
-async function canonicalPathAllowMissing(target: string): Promise<string> {
-  let ancestor = path.resolve(target);
-  while (true) {
-    try {
-      const canonical = await realpath(ancestor);
-      return path.resolve(canonical, path.relative(ancestor, target));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = path.dirname(ancestor);
-      if (parent === ancestor) throw error;
-      ancestor = parent;
-    }
-  }
-}
-
-async function prepareStoreRoot(configuredRoot: string, workspace: string): Promise<string> {
-  const storeRootDir = path.resolve(configuredRoot);
-  if (isInside(workspace, await canonicalPathAllowMissing(storeRootDir))) {
-    throw new Error("Runtime state root must be outside the workspace.");
-  }
-  await ensurePrivateStateDirectory(storeRootDir);
-  const canonicalStoreRoot = await realpath(storeRootDir);
-  if (isInside(workspace, canonicalStoreRoot)) {
-    throw new Error("Runtime state root must remain outside the workspace after creation.");
-  }
-  return canonicalStoreRoot;
 }
 
 function verifyCustomization(
@@ -364,10 +362,13 @@ function createTools(config: RuntimeCompositionConfig, execution: ExecutionBroke
   supervisor: AgentSupervisor, executionReport: BrokerDoctorReport,
   storeRootDir: string, languageServers: LanguageServerPreset[]): EffectToolRegistry {
   const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
+  const executionBackend = verifiedExecutionBackend(executionReport);
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
     broker: execution,
+    executionBackend,
+    executionPlatform: brokerRuntimeEnvironment(executionReport).platform,
     atomicPatchStateRootDir: storeRootDir,
-    sandboxMode: "required",
+    sandboxMode: "required", commandTimeoutSec: config.commandTimeoutSec ?? 600,
     readScope: config.readScope ?? "workspace",
     processHandoff: config.processHandoff ?? "allow",
     networkMode: network.defaultMode,

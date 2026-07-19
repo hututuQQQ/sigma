@@ -96,9 +96,9 @@ async function recoverOperation(
     const stagePath = path.join(transactionPath, "stage", String(operation.index));
     const backupPath = path.join(transactionPath, "backup", String(operation.index));
     const [targetImage, stageImage, backupImage] = await Promise.all([
-      inspectRestoreImage(pinned.targetPath),
-      inspectRestoreImage(stagePath),
-      inspectRestoreImage(backupPath)
+      inspectRestoreImage(pinned.targetPath, operation.installedImage ?? operation.currentImage),
+      inspectRestoreImage(stagePath, operation.installedImage),
+      inspectRestoreImage(backupPath, operation.currentImage)
     ]);
     validateRecoveryImages(transactionPath, operation, stageImage, backupImage);
     if (targetImage && restoreImagesEqual(targetImage, operation.installedImage)) {
@@ -112,8 +112,8 @@ async function recoverOperation(
     await clearRecoveryFlag(transactionPath, parsed, operation, "installed");
     await clearRecoveryFlag(transactionPath, parsed, operation, "installIntent");
 
-    const currentTarget = await inspectRestoreImage(pinned.targetPath);
-    const currentBackup = await inspectRestoreImage(backupPath);
+    const currentTarget = await inspectRestoreImage(pinned.targetPath, operation.currentImage);
+    const currentBackup = await inspectRestoreImage(backupPath, operation.currentImage);
     if (operation.currentImage) {
       if (!restoreImagesEqual(currentTarget, operation.currentImage)) {
         if (currentTarget || !restoreImagesEqual(currentBackup, operation.currentImage)) {

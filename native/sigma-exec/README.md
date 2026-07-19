@@ -23,3 +23,12 @@ profile. A failed setup or self-test is never replaced with host execution.
 
 V5 has no unsafe host-execution switch. Commands must use the native sandbox;
 an OCI execution mode must be backed by a real container runtime or fail closed.
+The native doctor report therefore advertises `container.available=false`.
+Container-capable product launchers must supply a distinct OCI broker whose
+doctor report includes the engine, ownership mode, target/container ID, start
+identity, image ID/digest, and launcher-attestation digest. Higher layers pin
+that identity and re-check it before every operation; a native broker is never
+upgraded to container mode by a flag or workspace setting.
+The product OCI bridge uses the existing framed protocol over the fixed Unix
+socket `/run/sigma-oci/broker.sock`; native `sigma-exec` itself does not open an
+engine socket or accept a managed target selector.

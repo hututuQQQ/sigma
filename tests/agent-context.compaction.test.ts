@@ -46,6 +46,17 @@ function toolLoop(index: number, output: string): ModelMessage[] {
   ];
 }
 
+function cachedPlan(toolLoops: number): ContextPlan {
+  const history: ModelMessage[] = [{ role: "user", content: "Keep working from durable evidence." }];
+  for (let index = 0; index < toolLoops; index += 1) {
+    history.push(...toolLoop(index, `observation-${index} ${"details ".repeat(32)}`));
+  }
+  return planContext({
+    system: [], dynamic: [], history, tools: [],
+    contextWindowTokens: 512_000, outputReserveTokens: 8_000, promptCache: true
+  });
+}
+
 describe("ContextPlanner long-running tool history compaction", () => {
   it("textualizes a latest tool-call/result block that cannot fit atomically", () => {
     const hugeOutput = "0123456789abcdef".repeat(65_536);
@@ -134,7 +145,7 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expectWireSafe(retained);
   });
 
-  it("keeps append-only history beyond 24K for prompt-cache providers", () => {
+  it("bounds and summarizes raw history even for prompt-cache providers", () => {
     const history: ModelMessage[] = [{ role: "user", content: "Keep working from durable evidence." }];
     for (let index = 0; index < 96; index += 1) {
       history.push(...toolLoop(index, `observation-${index} ${"large output ".repeat(500)}`));
@@ -146,11 +157,49 @@ describe("ContextPlanner long-running tool history compaction", () => {
     });
 
     expect(result.cacheMode).toBe("prefix_cache");
-    expect(result.historyTokenLimit).toBe(504_000);
+    expect(result.historyTokenLimit).toBe(96_000);
     expect(result.budget.historyTokens).toBeGreaterThan(24_000);
-    expect(result.omittedHistoryTurns).toBe(0);
-    expect(result.summary).toBeUndefined();
+    expect(result.budget.historyTokens).toBeLessThanOrEqual(112_000);
+    expect(result.omittedHistoryTurns).toBeGreaterThan(0);
+    expect(result.summary?.tokenCount).toBeLessThanOrEqual(16_000);
+    expect(result.messages.filter((message) => message.role === "tool")).toHaveLength(11);
     expectWireSafe(result.messages);
+  });
+
+  it("keeps the completed cache archive immutable within an epoch and append-only across epochs", () => {
+    // The user block occupies one of the 12 raw slots, leaving 11 raw tool
+    // blocks. Nineteen loops therefore produce the first complete 8-block
+    // archive epoch; loops 20-26 only grow the separate recent delta.
+    const firstEpoch = cachedPlan(19);
+    const withinEpoch = cachedPlan(26);
+    const secondEpoch = cachedPlan(27);
+
+    expect(firstEpoch.omittedHistoryTurns).toBe(8);
+    expect(withinEpoch.omittedHistoryTurns).toBe(15);
+    expect(secondEpoch.omittedHistoryTurns).toBe(16);
+    expect(firstEpoch.summary).toBeDefined();
+    expect(withinEpoch.summary).toMatchObject({
+      id: firstEpoch.summary?.id,
+      content: firstEpoch.summary?.content
+    });
+    expect(secondEpoch.summary?.id).not.toBe(firstEpoch.summary?.id);
+    expect(secondEpoch.summary?.content.startsWith(`${firstEpoch.summary?.content}\n`)).toBe(true);
+    const archivePrefix = "[lossy conversation compaction archive]\n";
+    const firstVisibleArchive = firstEpoch.messages.find((message) => message.content.startsWith(archivePrefix));
+    const withinVisibleArchive = withinEpoch.messages.find((message) => message.content.startsWith(archivePrefix));
+    const secondVisibleArchive = secondEpoch.messages.find((message) => message.content.startsWith(archivePrefix));
+    expect(withinVisibleArchive?.content).toBe(firstVisibleArchive?.content);
+    expect(secondVisibleArchive?.content.startsWith(`${firstVisibleArchive?.content}\n`)).toBe(true);
+    expect(firstEpoch.messages.filter((message) => message.role === "tool")).toHaveLength(11);
+    expect(withinEpoch.messages.filter((message) => message.role === "tool")).toHaveLength(11);
+    expect(secondEpoch.messages.filter((message) => message.role === "tool")).toHaveLength(11);
+    for (const result of [firstEpoch, withinEpoch, secondEpoch]) {
+      const summaryTokens = result.included
+        .filter((item) => item.provenance.startsWith("lossy conversation compaction"))
+        .reduce((total, item) => total + item.tokenCount, 0);
+      expect(summaryTokens).toBeLessThanOrEqual(16_000);
+      expectWireSafe(result.messages);
+    }
   });
 
   it("keeps stable context and durable history before low-to-high priority dynamic suffixes", () => {
@@ -241,5 +290,31 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expect(retained.some((message) => message.toolCalls?.length)).toBe(false);
     expect(result.summary).toMatchObject({ authority: "tool" });
     expectWireSafe(retained);
+  });
+
+  it("applies stage history ceilings without truncating the latest user authority", () => {
+    const latestAuthority = `Preserve these exact requirements: ${"authority-bearing detail ".repeat(160)}`;
+    const history: ModelMessage[] = [{ role: "user", content: "Earlier task framing." }];
+    for (let index = 0; index < 10; index += 1) {
+      history.push(...toolLoop(index, `old observation ${index} ${"detail ".repeat(64)}`));
+    }
+    history.push({ role: "user", content: latestAuthority });
+
+    const result = planContext({
+      system: [], dynamic: [], history, tools: [],
+      contextWindowTokens: 32_000, outputReserveTokens: 1_000, promptCache: true,
+      historyTokenLimit: 32,
+      rawHistoryBlockTokenLimit: 16,
+      historySummaryTokenLimit: 64,
+      maximumRawHistoryBlocks: 2
+    });
+
+    expect(result.historyTokenLimit).toBe(32);
+    expect(result.messages.some((message) => message.role === "user"
+      && message.content === latestAuthority)).toBe(true);
+    expect(result.budget.historyTokens).toBeGreaterThan(32);
+    expect(result.included.filter((item) => item.provenance.startsWith("lossy conversation compaction"))
+      .reduce((total, item) => total + item.tokenCount, 0)).toBeLessThanOrEqual(64);
+    expect(result.messages.filter((message) => message.role === "tool")).toHaveLength(0);
   });
 });

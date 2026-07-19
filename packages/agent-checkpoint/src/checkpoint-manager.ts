@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
-import {
-  mkdir, readFile, readdir
-} from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
-import { durableReplaceFile, workspaceTransactionRoot } from "agent-platform";
+import { workspaceTransactionRoot } from "agent-platform";
 import type {
   CheckpointManagerOptions,
   CheckpointOpaqueArtifact,
@@ -14,13 +12,13 @@ import type {
   OpenCheckpointInspection,
   SealedCheckpointInspection
 } from "./types.js";
-import { CheckpointConflictError, isCheckpointRecord } from "./types.js";
-import { checkpointDelta } from "./manifest.js";
+import { CheckpointConflictError } from "./types.js";
 import { normalizeCheckpointScopes, safeCheckpointId as safeId } from "./path-safety.js";
 import { restoreCheckpointTransaction } from "./restore-transaction.js";
 import { recoverCheckpointTransactions } from "./restore-recovery.js";
 import { captureCheckpointManifest } from "./safe-capture.js";
-import { CheckpointCasStore } from "./cas-store.js";
+import { CheckpointStateStore } from "./checkpoint-state-store.js";
+import { selectReproducibleRoots } from "./reproducible-roots.js";
 import { buildCheckpointReviewMaterial } from "./checkpoint-review.js";
 import { checkpointOpaqueArtifacts } from "./opaque-artifacts.js";
 import type { CheckpointRestoreFaultInjector } from "./fault-injection.js";
@@ -32,14 +30,14 @@ export class CheckpointManager {
   private readonly maxBytes: number;
   private readonly excludedNames: ReadonlySet<string>;
   private readonly restoreFaultInjector: CheckpointRestoreFaultInjector | undefined;
-  private readonly cas: CheckpointCasStore;
+  private readonly store: CheckpointStateStore;
   constructor(options: CheckpointManagerOptions, restoreFaultInjector?: CheckpointRestoreFaultInjector) {
     this.rootDir = path.resolve(options.rootDir);
     this.maxFiles = options.maxFiles ?? 250_000;
     this.maxBytes = options.maxBytes ?? 2 * 1024 * 1024 * 1024;
     this.excludedNames = new Set(options.excludedNames ?? [".git", ".agent"]);
     this.restoreFaultInjector = restoreFaultInjector;
-    this.cas = new CheckpointCasStore(this.rootDir);
+    this.store = new CheckpointStateStore(this.rootDir);
   }
   async create(input: CreateCheckpointInput): Promise<CheckpointRecord> {
     const { workspacePath, scopePaths } = await normalizeCheckpointScopes(input.workspacePath, input.scopePaths);
@@ -50,8 +48,14 @@ export class CheckpointManager {
         `Checkpoint ${open.checkpointId} is still open; resolve it before creating another checkpoint.`
       );
     }
-    const pre = await this.capture(workspacePath, scopePaths);
-    const preManifestDigest = await this.putManifest(pre);
+    const reproducibleRootPaths = await selectReproducibleRoots({
+      workspacePath,
+      scopePaths,
+      requestedPaths: input.reproducibleRootPaths ?? [],
+      explicitDeliverablePaths: input.explicitDeliverablePaths ?? [],
+      excludedNames: this.excludedNames
+    });
+    const preManifestDigest = await this.captureDigest(workspacePath, scopePaths, reproducibleRootPaths);
     const record: CheckpointRecord = {
       schemaVersion: 1,
       checkpointId: `${Date.now().toString(36)}-${randomUUID()}`,
@@ -62,9 +66,10 @@ export class CheckpointManager {
       scopePaths,
       baseSeq: input.baseSeq,
       createdAt: new Date().toISOString(),
-      preManifestDigest
+      preManifestDigest,
+      ...(reproducibleRootPaths.length > 0 ? { reproducibleRootPaths } : {})
     };
-    await this.writeRecord(record);
+    await this.store.writeRecord(record);
     return record;
   }
   async seal(
@@ -72,62 +77,71 @@ export class CheckpointManager {
     checkpointId: string,
     expectedCurrentManifestDigest?: string
   ): Promise<CheckpointRecord> {
-    let record = await this.readRecord(sessionId, checkpointId);
+    let record = await this.store.readRecord(sessionId, checkpointId);
     await this.recover(record.workspacePath);
-    record = await this.readRecord(sessionId, checkpointId);
+    record = await this.store.readRecord(sessionId, checkpointId);
     if (record.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
     await this.assertLatestUnresolved(sessionId, checkpointId, "open");
-    const before = await this.getManifest(record.preManifestDigest);
-    const after = await this.capture(record.workspacePath, record.scopePaths);
-    const postManifestDigest = await this.putManifest(after);
+    const postManifestDigest = await this.captureDigest(
+      record.workspacePath,
+      record.scopePaths,
+      record.reproducibleRootPaths ?? []
+    );
     if (expectedCurrentManifestDigest !== undefined && postManifestDigest !== expectedCurrentManifestDigest) {
       throw new CheckpointConflictError(
         `Workspace changed after checkpoint ${checkpointId} recovery was offered; keep was not started.`
       );
     }
+    const delta = await this.store.deltaBetween(record.preManifestDigest, postManifestDigest);
     const sealed: CheckpointRecord = {
       ...record,
       status: "sealed",
       sealedAt: new Date().toISOString(),
       postManifestDigest,
-      delta: checkpointDelta(before, after)
+      deltaDigest: await this.store.putDelta(delta),
+      delta
     };
-    await this.writeRecord(sealed);
+    await this.store.writeRecord(sealed);
     return sealed;
   }
   async list(sessionId: string): Promise<CheckpointRecord[]> {
-    const directory = this.sessionDirectory(sessionId);
+    const directory = this.store.sessionDirectory(sessionId);
     const names = (await readdir(directory).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
     const records = await Promise.all(names.map(async (name) =>
-      await this.readRecord(sessionId, name.slice(0, -5))));
+      await this.store.readRecord(sessionId, name.slice(0, -5))));
     return records.sort((left, right) => left.baseSeq - right.baseSeq
       || left.createdAt.localeCompare(right.createdAt)
       || left.checkpointId.localeCompare(right.checkpointId));
   }
   async inspectOpen(sessionId: string, checkpointId: string): Promise<OpenCheckpointInspection> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    let checkpoint = await this.store.readRecord(sessionId, checkpointId);
     await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
+    checkpoint = await this.store.readRecord(sessionId, checkpointId);
     if (checkpoint.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
-    const before = await this.getManifest(checkpoint.preManifestDigest);
-    const current = await this.capture(checkpoint.workspacePath, checkpoint.scopePaths);
-    const currentManifestDigest = await this.putManifest(current);
+    const currentManifestDigest = await this.captureDigest(
+      checkpoint.workspacePath,
+      checkpoint.scopePaths,
+      checkpoint.reproducibleRootPaths ?? []
+    );
     return {
       checkpoint,
       currentManifestDigest,
       changed: currentManifestDigest !== checkpoint.preManifestDigest,
-      delta: checkpointDelta(before, current)
+      delta: await this.store.deltaBetween(checkpoint.preManifestDigest, currentManifestDigest)
     };
   }
   async inspectSealed(sessionId: string, checkpointId: string): Promise<SealedCheckpointInspection> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    let checkpoint = await this.store.readRecord(sessionId, checkpointId);
     await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
+    checkpoint = await this.store.readRecord(sessionId, checkpointId);
     if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest) {
       throw new Error(`Checkpoint ${checkpointId} is not sealed.`);
     }
-    const current = await this.capture(checkpoint.workspacePath, checkpoint.scopePaths);
-    const currentManifestDigest = await this.putManifest(current);
+    const currentManifestDigest = await this.captureDigest(
+      checkpoint.workspacePath,
+      checkpoint.scopePaths,
+      checkpoint.reproducibleRootPaths ?? []
+    );
     return {
       checkpoint,
       currentManifestDigest,
@@ -144,12 +158,12 @@ export class CheckpointManager {
     maxBytes = 256 * 1024
   ): Promise<CheckpointReviewMaterial> {
     const { checkpoint, before, after } = await this.sealedReviewState(sessionId, checkpointId);
-    const opaqueArtifacts = await checkpointOpaqueArtifacts(checkpoint, before, after, this.cas);
+    const opaqueArtifacts = await checkpointOpaqueArtifacts(checkpoint, before, after, this.store.cas);
     return await buildCheckpointReviewMaterial(
       checkpoint,
       before,
       after,
-      this.cas,
+      this.store.cas,
       maxBytes,
       opaqueArtifacts
     );
@@ -160,7 +174,7 @@ export class CheckpointManager {
    * preview, so a truncated preview cannot invalidate binary evidence. */
   async opaqueArtifacts(sessionId: string, checkpointId: string): Promise<CheckpointOpaqueArtifact[]> {
     const { checkpoint, before, after } = await this.sealedReviewState(sessionId, checkpointId);
-    return await checkpointOpaqueArtifacts(checkpoint, before, after, this.cas);
+    return await checkpointOpaqueArtifacts(checkpoint, before, after, this.store.cas);
   }
 
   async undoLatest(sessionId: string): Promise<CheckpointRecord> {
@@ -177,15 +191,18 @@ export class CheckpointManager {
       );
     }
     if (!latest?.postManifestDigest) throw new Error(`Session ${sessionId} has no sealed checkpoint to undo.`);
-    const current = await this.capture(latest.workspacePath, latest.scopePaths);
-    const currentDigest = await this.putManifest(current);
+    const currentDigest = await this.captureDigest(
+      latest.workspacePath,
+      latest.scopePaths,
+      latest.reproducibleRootPaths ?? []
+    );
     if (currentDigest !== latest.postManifestDigest) {
       throw new CheckpointConflictError(
         `Workspace no longer matches checkpoint ${latest.checkpointId} postimage; undo was not started.`
       );
     }
-    const before = await this.getManifest(latest.preManifestDigest);
-    const after = await this.getManifest(latest.postManifestDigest);
+    const before = await this.store.getManifest(latest.preManifestDigest);
+    const after = await this.store.getManifest(latest.postManifestDigest);
     const restored: CheckpointRecord = {
       ...latest,
       status: "restored",
@@ -206,25 +223,31 @@ export class CheckpointManager {
     checkpointId: string,
     expectedCurrentManifestDigest: string
   ): Promise<CheckpointRecord> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    let checkpoint = await this.store.readRecord(sessionId, checkpointId);
     await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
+    checkpoint = await this.store.readRecord(sessionId, checkpointId);
     if (checkpoint.status !== "open") throw new Error(`Checkpoint ${checkpointId} is not open.`);
     await this.assertLatestUnresolved(sessionId, checkpointId, "open");
-    const before = await this.getManifest(checkpoint.preManifestDigest);
-    const current = await this.capture(checkpoint.workspacePath, checkpoint.scopePaths);
-    const currentManifestDigest = await this.putManifest(current);
+    const currentManifestDigest = await this.captureDigest(
+      checkpoint.workspacePath,
+      checkpoint.scopePaths,
+      checkpoint.reproducibleRootPaths ?? []
+    );
     if (currentManifestDigest !== expectedCurrentManifestDigest) {
       throw new CheckpointConflictError(
         `Workspace changed after checkpoint ${checkpointId} recovery was offered; restore was not started.`
       );
     }
+    const delta = await this.store.deltaBetween(checkpoint.preManifestDigest, currentManifestDigest);
+    const before = await this.store.getManifest(checkpoint.preManifestDigest);
+    const current = await this.store.getManifest(currentManifestDigest);
     const restored: CheckpointRecord = {
       ...checkpoint,
       status: "restored",
       restoredAt: new Date().toISOString(),
       postManifestDigest: currentManifestDigest,
-      delta: checkpointDelta(before, current)
+      deltaDigest: await this.store.putDelta(delta),
+      delta
     };
     await this.restore(
       checkpoint.workspacePath,
@@ -252,6 +275,7 @@ export class CheckpointManager {
   private async capture(
     workspacePath: string,
     scopePaths: readonly string[],
+    reproducibleRootPaths: readonly string[] = [],
     ignoredRootName?: string
   ): Promise<CheckpointManifest> {
     return await captureCheckpointManifest({
@@ -260,8 +284,30 @@ export class CheckpointManager {
       maxFiles: this.maxFiles,
       maxBytes: this.maxBytes,
       excludedNames: this.excludedNames,
+      ...(reproducibleRootPaths.length > 0
+        ? { reproducibleRootPaths: new Set(reproducibleRootPaths) }
+        : {}),
       ...(ignoredRootName ? { ignoredRootName } : {}),
-      putCas: async (content) => await this.cas.putStream(content)
+      putCas: async (content) => await this.store.cas.putStream(content)
+    });
+  }
+
+  private async captureDigest(
+    workspacePath: string,
+    scopePaths: readonly string[],
+    reproducibleRootPaths: readonly string[] = [],
+    ignoredRootName?: string
+  ): Promise<string> {
+    return await this.store.captureManifest({
+      workspacePath,
+      scopePaths,
+      maxFiles: this.maxFiles,
+      maxBytes: this.maxBytes,
+      excludedNames: this.excludedNames,
+      ...(reproducibleRootPaths.length > 0
+        ? { reproducibleRootPaths: new Set(reproducibleRootPaths) }
+        : {}),
+      ...(ignoredRootName ? { ignoredRootName } : {})
     });
   }
 
@@ -269,16 +315,16 @@ export class CheckpointManager {
     sessionId: string,
     checkpointId: string
   ): Promise<{ checkpoint: CheckpointRecord; before: CheckpointManifest; after: CheckpointManifest }> {
-    let checkpoint = await this.readRecord(sessionId, checkpointId);
+    let checkpoint = await this.store.readRecord(sessionId, checkpointId);
     await this.recover(checkpoint.workspacePath);
-    checkpoint = await this.readRecord(sessionId, checkpointId);
+    checkpoint = await this.store.readRecord(sessionId, checkpointId);
     if (checkpoint.status !== "sealed" || !checkpoint.postManifestDigest || !checkpoint.delta) {
       throw new Error(`Checkpoint ${checkpointId} is not sealed for review.`);
     }
     return {
       checkpoint,
-      before: await this.getManifest(checkpoint.preManifestDigest),
-      after: await this.getManifest(checkpoint.postManifestDigest)
+      before: await this.store.getManifest(checkpoint.preManifestDigest),
+      after: await this.store.getManifest(checkpoint.postManifestDigest)
     };
   }
 
@@ -294,42 +340,20 @@ export class CheckpointManager {
       transactionRootDir: await this.transactionRoot(workspacePath),
       desired,
       current,
-      readCas: (digest) => this.cas.stream(digest),
-      capture: async (ignoredRootName) => await this.capture(workspacePath, scopePaths, ignoredRootName),
-      finalization: { record: restored, desiredManifestDigest: restored.preManifestDigest },
-      finalize: async () => await this.writeRecord(restored),
+      readCas: (digest) => this.store.cas.stream(digest),
+      capture: async (ignoredRootName) => await this.capture(
+        workspacePath,
+        scopePaths,
+        restored.reproducibleRootPaths ?? [],
+        ignoredRootName
+      ),
+      finalization: {
+        record: this.store.persistedRecord(restored),
+        desiredManifestDigest: restored.preManifestDigest
+      },
+      finalize: async () => await this.store.writeRecord(restored),
       ...(this.restoreFaultInjector ? { faultInjector: this.restoreFaultInjector } : {})
     });
-  }
-
-  private sessionDirectory(sessionId: string): string {
-    return path.join(this.rootDir, "checkpoints", "sessions", safeId(sessionId, "session identifier"));
-  }
-
-  private recordPath(sessionId: string, checkpointId: string): string {
-    return path.join(this.sessionDirectory(sessionId), `${safeId(checkpointId, "checkpoint identifier")}.json`);
-  }
-
-  private async writeRecord(record: CheckpointRecord): Promise<void> {
-    const target = this.recordPath(record.sessionId, record.checkpointId);
-    await mkdir(path.dirname(target), { recursive: true });
-    await durableReplaceFile(target, JSON.stringify(record, null, 2), { mode: 0o600 });
-  }
-
-  private async readRecord(sessionId: string, checkpointId: string): Promise<CheckpointRecord> {
-    const value: unknown = JSON.parse(await readFile(this.recordPath(sessionId, checkpointId), "utf8"));
-    if (!isCheckpointRecord(value) || value.sessionId !== sessionId || value.checkpointId !== checkpointId) {
-      throw new CheckpointConflictError("Persisted checkpoint record is invalid.");
-    }
-    return value;
-  }
-
-  private async putManifest(manifest: CheckpointManifest): Promise<string> {
-    return await this.cas.putBytes(Buffer.from(JSON.stringify(manifest), "utf8"));
-  }
-
-  private async getManifest(digest: string): Promise<CheckpointManifest> {
-    return JSON.parse((await this.cas.readVerifiedAll(digest)).toString("utf8")) as CheckpointManifest;
   }
 
   private async recover(workspacePath: string): Promise<void> {
@@ -344,13 +368,16 @@ export class CheckpointManager {
           throw new CheckpointConflictError("Checkpoint recovery finalization identity is invalid.");
         }
         // Recompute the target through validated identifiers; never trust a path from the workspace journal.
-        this.recordPath(record.sessionId, record.checkpointId);
-        const current = await this.capture(canonical, record.scopePaths);
-        const currentDigest = await this.putManifest(current);
+        this.store.recordPath(record.sessionId, record.checkpointId);
+        const currentDigest = await this.captureDigest(
+          canonical,
+          record.scopePaths,
+          record.reproducibleRootPaths ?? []
+        );
         if (currentDigest !== desiredManifestDigest) {
           throw new CheckpointConflictError("Verified checkpoint recovery no longer matches its desired manifest.");
         }
-        await this.writeRecord(record);
+        await this.store.writeRecord(record);
       }
     });
   }

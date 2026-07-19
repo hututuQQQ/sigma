@@ -1,4 +1,4 @@
-import { lstat, readFile, readdir, rename, rm, rmdir } from "node:fs/promises";
+import { lstat, readFile, readdir, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
 import {
   cleanupWorkspaceTransactionRoot,
@@ -16,6 +16,7 @@ import {
   type AtomicPatchJournalOperation
 } from "./atomic-patch-journal-schema.js";
 import { pinPatchParent } from "./atomic-patch-path-safety.js";
+import { moveAtomicPatchPath, type AtomicPatchRename } from "./atomic-patch-move.js";
 import type { AtomicPatchMutation } from "./atomic-patch-types.js";
 
 export { AtomicPatchRecoveryError, createPatchJournal, writePatchJournal } from "./atomic-patch-journal-schema.js";
@@ -63,10 +64,15 @@ async function removeInstalled(
     await pinned.verify();
     const stageExists = await exists(stagePath);
     const targetExists = await exists(pinned.targetPath);
+    // A cross-mount fallback durably publishes the target before removing its
+    // staged source. Process loss may therefore leave two identical images.
+    // Both are authenticated by the journal before rollback removes the target.
     if (stageExists && targetExists && operation.installIntent) {
-      throw new AtomicPatchRecoveryError(`Atomic patch install state is ambiguous: ${operation.target}`, transactionPath);
+      await assertExpected(stagePath, operation.target, {
+        kind: operation.targetKind, mode: operation.targetMode, digest: operation.targetDigest
+      }, transactionPath);
     }
-    const occurred = operation.installed || (operation.installIntent && !stageExists && targetExists);
+    const occurred = operation.installed || (operation.installIntent && targetExists);
     if (occurred && targetExists) {
       await beforeMutation?.({
         direction: "rollback", phase: "remove_installed",
@@ -99,13 +105,40 @@ function assertRestoreDestinationUnoccupied(
   }
 }
 
+async function discardVerifiedDuplicateBackup(
+  pinnedTarget: string,
+  backupPath: string,
+  transactionPath: string,
+  operation: AtomicPatchJournalOperation,
+  occurred: boolean,
+  backupExists: boolean,
+  sourceExists: boolean
+): Promise<boolean> {
+  if (!occurred || !backupExists || !sourceExists || !operation.source
+    || !operation.sourceKind || operation.sourceMode === undefined || !operation.sourceDigest) return false;
+  await assertExpected(pinnedTarget, operation.source, {
+    kind: operation.sourceKind, mode: operation.sourceMode, digest: operation.sourceDigest
+  }, transactionPath);
+  await assertExpected(backupPath, operation.source, {
+    kind: operation.sourceKind, mode: operation.sourceMode, digest: operation.sourceDigest
+  }, transactionPath);
+  await rm(backupPath, { force: true, recursive: false });
+  await syncDirectory(path.dirname(backupPath));
+  return true;
+}
+
+function backupMoveOccurred(operation: AtomicPatchJournalOperation, backupExists: boolean): boolean {
+  return operation.backupMoved || (operation.backupIntent && backupExists);
+}
+
 async function restoreBackup(
   workspace: string,
   transactionPath: string,
   journal: AtomicPatchJournal,
   operation: AtomicPatchJournalOperation,
   beforeMutation?: RecoveryHook,
-  verifyTransaction: () => Promise<void> = async () => undefined
+  verifyTransaction: () => Promise<void> = async () => undefined,
+  renamePath?: AtomicPatchRename
 ): Promise<void> {
   if (!operation.source || !operation.sourceKind || operation.sourceMode === undefined || !operation.sourceDigest) return;
   const backupPath = path.join(transactionPath, "backup", String(operation.changeIndex));
@@ -114,8 +147,14 @@ async function restoreBackup(
     await pinned.verify();
     const backupExists = await exists(backupPath);
     const sourceExists = await exists(pinned.targetPath);
-    const occurred = operation.backupMoved || (operation.backupIntent && backupExists);
-    if (occurred && backupExists) {
+    const occurred = backupMoveOccurred(operation, backupExists);
+    if (await discardVerifiedDuplicateBackup(
+      pinned.targetPath, backupPath, transactionPath, operation, occurred, backupExists, sourceExists
+    )) {
+      // The EXDEV fallback can be interrupted after publishing the backup but
+      // before removing its source. Verify both copies, keep the workspace
+      // source, and discard only the private duplicate.
+    } else if (occurred && backupExists) {
       assertRestoreDestinationUnoccupied(sourceExists, operation.source, transactionPath);
       await assertExpected(backupPath, operation.source, {
         kind: operation.sourceKind, mode: operation.sourceMode, digest: operation.sourceDigest
@@ -125,7 +164,7 @@ async function restoreBackup(
         changeIndex: operation.changeIndex, relativePath: operation.source
       });
       await verifyTransaction();
-      await rename(backupPath, pinned.targetPath);
+      await moveAtomicPatchPath(backupPath, pinned.targetPath, renamePath);
       await syncDirectory(path.dirname(backupPath));
       await syncDirectory(path.dirname(pinned.targetPath));
     } else if (occurred && !backupExists) {
@@ -196,7 +235,8 @@ async function removeCreatedParents(
 export async function recoverAtomicPatchTransaction(
   workspace: string,
   transactionPath: string,
-  beforeMutation?: RecoveryHook
+  beforeMutation?: RecoveryHook,
+  renamePath?: AtomicPatchRename
 ): Promise<void> {
   let raw: string;
   try {
@@ -250,7 +290,7 @@ export async function recoverAtomicPatchTransaction(
       await removeInstalled(workspace, transactionPath, journal, operation, beforeMutation, verify);
     }
     for (const operation of [...journal.operations].reverse()) {
-      await restoreBackup(workspace, transactionPath, journal, operation, beforeMutation, verify);
+      await restoreBackup(workspace, transactionPath, journal, operation, beforeMutation, verify, renamePath);
     }
     await removeCreatedParents(workspace, transactionPath, journal, beforeMutation, verify);
   } finally {

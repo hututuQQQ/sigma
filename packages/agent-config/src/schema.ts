@@ -56,8 +56,7 @@ export interface ConfigSources {
   workspace?: Record<string, unknown>;
   home?: Record<string, unknown>;
 }
-export type ResolvedConfig = Record<string, ConfigValue>;
-export const CONFIG_SCHEMA_VERSION = 5 as const;
+export type ResolvedConfig = Record<string, ConfigValue>; export const CONFIG_SCHEMA_VERSION = 5 as const;
 function stringValue(raw: unknown, key: string, allowEmpty = false): string {
   if (typeof raw !== "string" || (!allowEmpty && !raw.trim())) throw new Error(`Configuration '${key}' requires a${allowEmpty ? "" : " non-empty"} string.`);
   return raw;
@@ -166,10 +165,14 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
   { key: "permissionMode", flag: "permission-mode", env: "SIGMA_PERMISSION_MODE", toml: "permissions.mode", description: "Tool permission mode (workspace-auto automatically permits workspace-scoped offline operations)", defaultValue: "workspace-auto", parse: (raw) => enumValue(raw, "permissionMode", ["workspace-auto", "ask", "auto", "deny"] as const) },
   { key: "sandboxMode", flag: "sandbox", env: "SIGMA_SANDBOX", toml: "security.sandbox", description: "Process sandbox policy", defaultValue: "required", parse: (raw) => enumValue(raw, "sandboxMode", ["required"] as const) },
   { key: "executionMode", flag: "execution-mode", description: "Execution backend for this run", defaultValue: "sandboxed", parse: (raw) => enumValue(raw, "executionMode", ["sandboxed", "container"] as const) },
+  { key: "containerEngine", flag: "container-engine", description: "OCI engine selected by the trusted container launcher", defaultValue: "auto", parse: (raw) => enumValue(raw, "containerEngine", ["auto", "docker", "podman"] as const) },
+  { key: "containerTarget", flag: "container-target", description: "OCI target ownership mode", defaultValue: "managed", parse: (raw) => enumValue(raw, "containerTarget", ["owned", "managed"] as const) },
+  { key: "containerImage", flag: "container-image", description: "Immutable OCI image digest reference (required for owned targets)", defaultValue: "", parse: (raw) => stringValue(raw, "containerImage", true) },
   { key: "readScope", flag: "read-scope", env: "SIGMA_READ_SCOPE", toml: "security.read_scope", description: "Filesystem read scope", defaultValue: "workspace", parse: (raw) => enumValue(raw, "readScope", ["workspace", "host"] as const) },
   { key: "networkMode", flag: "network", env: "SIGMA_NETWORK", toml: "security.network", description: "Default process network policy", defaultValue: "none", parse: (raw) => enumValue(raw, "networkMode", ["none", "loopback", "full"] as const) },
   { key: "processHandoff", flag: "process-handoff", env: "SIGMA_PROCESS_HANDOFF", toml: "security.process_handoff", description: "Persistent process handoff policy", defaultValue: "allow", parse: (raw) => enumValue(raw, "processHandoff", ["allow", "deny"] as const) },
   { key: "runDeadlineSec", flag: "run-deadline-sec", env: "SIGMA_RUN_DEADLINE_SEC", toml: "runtime.run_deadline_sec", description: "Whole-run hard deadline in seconds", defaultValue: 900, parse: (raw) => numberValue(raw, "runDeadlineSec", 1) },
+  { key: "commandTimeoutSec", flag: "command-timeout-sec", env: "SIGMA_COMMAND_TIMEOUT_SEC", toml: "tools.command_timeout_sec", description: "Global foreground command timeout cap in seconds", defaultValue: 600, parse: (raw) => { const value = numberValue(raw, "commandTimeoutSec", 1, 2_147_000); if (!Number.isInteger(value)) throw new Error("Configuration 'commandTimeoutSec' requires a positive integer."); return value; } },
   { key: "modelDeadlineSec", flag: "model-deadline-sec", env: "SIGMA_MODEL_DEADLINE_SEC", toml: "runtime.model_deadline_sec", description: "Model first-byte and non-stream request deadline in seconds", defaultValue: 120, parse: (raw) => numberValue(raw, "modelDeadlineSec", 1) },
   { key: "streamIdleSec", flag: "stream-idle-sec", env: "SIGMA_STREAM_IDLE_SEC", toml: "runtime.stream_idle_sec", description: "Model stream idle timeout in seconds", defaultValue: 45, parse: (raw) => numberValue(raw, "streamIdleSec", 1) },
   { key: "streamActiveSec", flag: "stream-active-sec", env: "SIGMA_STREAM_ACTIVE_SEC", toml: "runtime.stream_active_sec", description: "Optional active model stream deadline in seconds (0 uses only the Agent/session deadline)", defaultValue: 0, parse: (raw) => numberValue(raw, "streamActiveSec", 0) },
@@ -257,7 +260,7 @@ function validateTomlKeys(source: Record<string, unknown> | undefined, schema: r
 }
 
 const WORKSPACE_NUMERIC_CAPS = new Set([
-  "runDeadlineSec", "modelDeadlineSec", "streamIdleSec", "streamActiveSec", "maxModelRetries", "maxParallelTools", "maxParallelAgents",
+  "runDeadlineSec", "commandTimeoutSec", "modelDeadlineSec", "streamIdleSec", "streamActiveSec", "maxModelRetries", "maxParallelTools", "maxParallelAgents",
   "maxInputTokens", "maxOutputTokens", "maxCostMicroUsd", "maxModelTurns", "maxToolCalls",
   "maxChildren", "maxDepth", "checkpointMaxFiles", "checkpointMaxBytes"
 ]);

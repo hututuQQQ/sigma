@@ -34,6 +34,7 @@ function overrides(config: CliConfig): Partial<Record<string, ConfigValue>> {
     networkMode: config.networkMode,
     processHandoff: config.processHandoff,
     runDeadlineSec: config.runDeadlineSec,
+    commandTimeoutSec: config.commandTimeoutSec,
     modelDeadlineSec: config.modelDeadlineSec,
     streamIdleSec: config.streamIdleSec,
     streamActiveSec: config.streamActiveSec,

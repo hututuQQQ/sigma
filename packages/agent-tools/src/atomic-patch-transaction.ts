@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, open, rename, rm, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 import {
   durableReplaceFile,
@@ -15,6 +15,7 @@ import {
   type AtomicPatchJournalOperation
 } from "./atomic-patch-journal.js";
 import { AtomicPatchError } from "./atomic-patch-parser.js";
+import { moveAtomicPatchPath, type AtomicPatchRename } from "./atomic-patch-move.js";
 import { pinPatchParent } from "./atomic-patch-path-safety.js";
 import type {
   AtomicPatchMutation, AtomicPatchTransactionHooks, AtomicPatchTransactionValidators, PreparedPatchChange
@@ -32,6 +33,8 @@ export interface AtomicPatchTransactionOptions extends AtomicPatchTransactionHoo
   beforeCommit?: () => Promise<void>;
   verifyTransaction?: () => Promise<void>;
   validators: AtomicPatchTransactionValidators;
+  /** Test/integration injection point; production uses rename(2) with an EXDEV fallback. */
+  renamePath?: AtomicPatchRename;
 }
 
 export class AtomicPatchRollbackError extends AtomicPatchError {
@@ -202,7 +205,7 @@ async function moveSource(
       direction: "commit", phase: "backup_source_pinned", changeIndex, relativePath: change.source!
     });
     await options.verifyTransaction?.();
-    await rename(pinned.targetPath, saved);
+    await moveAtomicPatchPath(pinned.targetPath, saved, options.renamePath);
     await syncDirectory(path.dirname(pinned.targetPath));
     await syncDirectory(path.dirname(saved));
     await runHook(options.beforeMutation, {
@@ -256,7 +259,7 @@ async function installTarget(
       direction: "commit", phase: "install_target_pinned", changeIndex, relativePath: change.target!
     });
     await options.verifyTransaction?.();
-    await rename(candidate, pinned.targetPath);
+    await moveAtomicPatchPath(candidate, pinned.targetPath, options.renamePath);
     await syncDirectory(path.dirname(candidate));
     await syncDirectory(path.dirname(pinned.targetPath));
     await runHook(options.beforeMutation, {
@@ -353,7 +356,12 @@ export async function commitPreparedPatch(
     lease = undefined;
     options.verifyTransaction = undefined;
     try {
-      await recoverAtomicPatchTransaction(options.workspace, options.transaction, options.beforeMutation);
+      await recoverAtomicPatchTransaction(
+        options.workspace,
+        options.transaction,
+        options.beforeMutation,
+        options.renamePath
+      );
     } catch (rollbackError) {
       throw new AtomicPatchRollbackError(
         error,

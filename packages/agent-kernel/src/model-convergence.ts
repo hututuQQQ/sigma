@@ -1,5 +1,6 @@
 import { isCompletionReferenceableEvidence, type JsonValue, type ModelMessage, type ModelToolCall, type RunOutcome, type ToolReceipt } from "agent-protocol";
 import type { KernelState } from "./state.js";
+import { stickyLengthDebt, trustedProgressFingerprint } from "./length-convergence.js";
 
 const TERMINAL_PROTOCOL_FAILURE_CODES = new Set([
   "invalid_completion_proposal",
@@ -37,9 +38,12 @@ export function hasCompletionRepair(state: KernelState): boolean {
   return state.completionRepair !== undefined || state.completionRepairAttempts > 0;
 }
 
+const NON_TERMINAL_REPAIR_KINDS = new Set([
+  "evidence_acquisition", "review_changes_requested", "protected_recovery"
+]);
+
 export function completionRepairRequiresTerminalAction(state: KernelState): boolean {
-  if (state.completionRepair?.kind === "evidence_acquisition") return false;
-  if (state.completionRepair?.kind === "protected_recovery") return false;
+  if (state.completionRepair && NON_TERMINAL_REPAIR_KINDS.has(state.completionRepair.kind)) return false;
   if (state.completionRepair?.kind === "completion_prerequisite") {
     return state.pendingTools.some((item) => item.request.name === "runtime_finalize");
   }
@@ -208,7 +212,8 @@ function earlyFinishReasonState(
   messages: ModelMessage[]
 ): KernelState | null {
   if (payload.finishReason === "length") {
-    if (state.continuationAttempts >= 2) {
+    const lengthDebt = stickyLengthDebt(state);
+    if (lengthDebt >= 2) {
       return propose({ ...state, messages }, {
         kind: "recoverable_failure",
         code: "model_output_limit",
@@ -218,7 +223,14 @@ function earlyFinishReasonState(
         )
       });
     }
-    return { ...state, messages, continuationAttempts: state.continuationAttempts + 1, phase: "ready_model" };
+    return {
+      ...state,
+      messages,
+      continuationAttempts: state.continuationAttempts + 1,
+      lengthFinishDebt: lengthDebt + 1,
+      lengthProgressFingerprint: trustedProgressFingerprint(state),
+      phase: "ready_model"
+    };
   }
   if (payload.finishReason === "content_filter") {
     return propose({ ...state, messages }, {

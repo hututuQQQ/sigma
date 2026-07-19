@@ -1,14 +1,13 @@
 import {
   type BudgetAmounts,
   type ContextItem,
-  type ModelExecutionRole,
   type ModelResponse,
   type RunOutcome
 } from "agent-protocol";
-import type { KernelEffect } from "agent-kernel";
+import { lengthConvergenceRequired, type KernelEffect } from "agent-kernel";
 import { RepositoryContextProvider, type ContextPlan } from "agent-context";
 import { isToolAllowed } from "agent-tools";
-import { steeringRestart } from "./effect-helpers.js";
+import { completionLimitations, steeringRestart } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
 import {
@@ -25,11 +24,16 @@ import {
   modelFailureMessage,
   streamModelResponse
 } from "./model-effect-support.js";
-import { deadlineForecast, type DeadlineForecast } from "./convergence-policy.js";
+import {
+  convergenceAdmissionFailure,
+  deadlineForecast,
+  type DeadlineForecast
+} from "./convergence-policy.js";
 import { refreshValidationCapabilityProfile } from "./validation-capability-profile.js";
 import {
   availableModelBudget,
   budgetFailure,
+  defaultModelOutputReserveTokens,
   fitPreparedBudget,
   prepareBudgetedModelTurn,
   requestCapacity,
@@ -37,6 +41,11 @@ import {
   type PreparedModelTurn
 } from "./model-budget-convergence.js";
 import { budgetStageForCapacity, projectedToolCapabilities } from "./model-tool-capabilities.js";
+import { descriptorsAvailableToModel } from "./model-tool-availability.js";
+import {
+  emitModelContextComposition,
+  emitResolvedModelRoute
+} from "./model-effect-telemetry.js";
 
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
 
@@ -50,15 +59,6 @@ interface PreparedAttempt {
   plan: ContextPlan;
   forecast: DeadlineForecast;
   budgetStage: BudgetStage;
-}
-
-function modelVisibleOutputTruncatedBytes(session: RuntimeSession): number {
-  return session.durable.state.receipts
-    .flatMap((receipt) => receipt.diagnostics)
-    .reduce((total, diagnostic) => {
-      const match = /^model_output_truncated:(?:stdout|stderr):(\d+)$/u.exec(diagnostic);
-      return total + (match ? Number(match[1]) : 0);
-    }, 0);
 }
 
 function takeUnloadedSummary(session: RuntimeSession, plan: ContextPlan): ContextItem | undefined {
@@ -163,26 +163,6 @@ export class ModelEffectRunner {
     });
   }
 
-  private async emitContextComposition(
-    session: RuntimeSession,
-    plan: ContextPlan,
-    forecast: DeadlineForecast
-  ): Promise<void> {
-    await this.options.emit(session, "diagnostic", "runtime", {
-      kind: "context.composition",
-      ...plan.budget,
-      latestHistoryBlockTokens: plan.latestHistoryBlockTokens,
-      omittedHistoryTurns: plan.omittedHistoryTurns,
-      cacheMode: plan.cacheMode,
-      historyTokenLimit: plan.historyTokenLimit,
-      dynamicSuffixTokens: plan.dynamicSuffixTokens,
-      modelVisibleOutputTruncatedBytes: modelVisibleOutputTruncatedBytes(session),
-      reviewCount: session.durable.state.evidence.filter((item) => item.kind === "review").length,
-      deadlineStage: forecast.stage,
-      executionMode: this.options.runtime.runtimeEnvironment?.executionMode ?? "sandboxed"
-    });
-  }
-
   private async prepareTurn(
     session: RuntimeSession,
     turnId: number,
@@ -195,7 +175,7 @@ export class ModelEffectRunner {
     const stageInternal = repairPhase === "no_change_confirmation"
       ? this.options.runtime.tools.descriptors().filter((item) => item.name === "confirm_no_change")
       : [];
-    const ordinaryDescriptors = modelDescriptors.filter((item) =>
+    const ordinaryDescriptors = descriptorsAvailableToModel(session, modelDescriptors).filter((item) =>
       isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
     const availableDescriptors = [...new Map([...ordinaryDescriptors, ...stageInternal]
       .map((item) => [item.name, item])).values()];
@@ -203,8 +183,9 @@ export class ModelEffectRunner {
     // be able to stop naturally so the runtime-owned completion intent can be
     // generated. Other repair phases remain forced tool sub-turns.
     const repairPending = repairPhase !== "none";
-    const allowNaturalCompletion = repairPhase === "protected_completion";
     await refreshValidationCapabilityProfile(session, signal);
+    const allowNaturalCompletion = repairPhase === "protected_completion"
+      || completionLimitations(session) !== null;
     const ledger = evidenceLedger(session);
     const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
@@ -217,11 +198,14 @@ export class ModelEffectRunner {
     const preparation = {
       session, forecast, turnId, descriptors, capabilities: projectedCapabilities, dynamic, hookContext,
       ledger, available, repairPending, allowNaturalCompletion,
-      defaultOutputReserveTokens: this.options.outputReserveTokens
+      defaultOutputReserveTokens: this.options.runtime.outputReserveTokens
+        ?? defaultModelOutputReserveTokens(session.services.gateway.capabilities)
     };
     let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
     const capacity = requestCapacity(available, prepared.turn.budget);
-    const budgetStage = budgetStageForCapacity(forecast, capacity);
+    const stageCapacity = lengthConvergenceRequired(session.durable.state)
+      ? Math.min(capacity, 2) : capacity;
+    const budgetStage = budgetStageForCapacity(forecast, stageCapacity);
     if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
     const fittedBudget = fitPreparedBudget(
       prepared.turn.budget,
@@ -233,6 +217,11 @@ export class ModelEffectRunner {
         `The remaining budget cannot fund one ${budgetStage === "terminal" ? "terminal " : ""}model request after bounded context compaction.`
       );
     }
+    const admissionFailure = convergenceAdmissionFailure(session, {
+      kind: "model",
+      stage: budgetStage
+    });
+    if (admissionFailure) return admissionFailure;
     return {
       turn: { ...prepared.turn, budget: fittedBudget },
       plan: prepared.plan,
@@ -257,9 +246,10 @@ export class ModelEffectRunner {
       budgetStage,
       remainingMs: forecast.remainingMs,
       nextModelEstimateMs: forecast.nextModelEstimateMs,
+      nextConvergenceModelEstimateMs: forecast.nextConvergenceModelEstimateMs,
       outputReserveTokens: turn.outputReserveTokens
     });
-    await this.emitContextComposition(session, plan, forecast);
+    await emitModelContextComposition(this.options.emit, this.options.runtime, session, plan, forecast);
     const summary = takeUnloadedSummary(session, plan);
     if (summary) {
       await this.options.emit(session, "context.compacted", "runtime", {
@@ -332,7 +322,7 @@ export class ModelEffectRunner {
     state.consumed = consumedBudget(usage, turn.budget);
     await this.options.budgets.commitMeasured(session, reservationId, state.consumed);
     state.settled = true;
-    await this.emitResolvedRoute(session, response);
+    await emitResolvedModelRoute(this.options.emit, session, response);
     await this.options.emit(session, "usage.recorded", "runtime", usage);
     await this.options.emit(session, "model.completed", "runtime", {
       model: usage.modelId,
@@ -356,25 +346,6 @@ export class ModelEffectRunner {
       toolCallCount: response.message.toolCalls?.length ?? 0,
       usage
     }, signal);
-  }
-
-  private async emitResolvedRoute(session: RuntimeSession, response: ModelResponse): Promise<void> {
-    const routed = response as ModelResponse & {
-      routeId?: string; role?: string; modelSpecId?: string; attempt?: number; tokenizerAssetDigest?: string
-    };
-    if (!routed.routeId || !routed.modelSpecId) return;
-    const roles: readonly ModelExecutionRole[] = [
-      "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"
-    ];
-    const role = roles.includes(routed.role as ModelExecutionRole)
-      ? routed.role as ModelExecutionRole : "orchestrator";
-    await this.options.emit(session, "model.route_resolved", "runtime", {
-      role,
-      routeId: routed.routeId,
-      modelSpecId: routed.modelSpecId,
-      attempt: (routed.attempt ?? 0) + 1,
-      ...(routed.tokenizerAssetDigest ? { tokenizerAssetDigest: routed.tokenizerAssetDigest } : {})
-    });
   }
 
   private async commitFailure(

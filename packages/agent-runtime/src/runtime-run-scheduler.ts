@@ -37,10 +37,12 @@ export class RuntimeRunScheduler {
         await this.options.commandBus.claim(session.identity.sessionId);
         beginNextRun(session, session.durable.mode, this.options.runDeadlineMs);
         await this.options.emit(session, "run.started", "runtime", {
-          mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt
+          mode: session.durable.mode, deadlineAt: session.durable.state.deadlineAt,
+          ...(next.validationRequirement ? { validationRequirement: next.validationRequirement } : {})
         });
         await this.options.emit(session, "user.follow_up", "user", {
-          text: next.text, queueId: next.id, status: "delivered"
+          text: next.text, queueId: next.id, status: "delivered",
+          ...(next.validationRequirement ? { validationRequirement: next.validationRequirement } : {})
         });
       } catch (error) {
         if (session.durable.state.phase === "terminal") {

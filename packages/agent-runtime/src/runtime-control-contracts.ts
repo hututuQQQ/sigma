@@ -33,6 +33,7 @@ export function checkpointRef(record: CheckpointRecord): CheckpointRef {
     ...(record.sealedAt ? { sealedAt: record.sealedAt } : {}),
     ...(record.restoredAt ? { restoredAt: record.restoredAt } : {}),
     ...(record.postManifestDigest ? { postManifestDigest: record.postManifestDigest } : {}),
+    ...(record.deltaDigest ? { deltaDigest: record.deltaDigest } : {}),
     ...(record.delta ? { delta: {
       added: [...record.delta.added], modified: [...record.delta.modified], deleted: [...record.delta.deleted]
     } } : {})

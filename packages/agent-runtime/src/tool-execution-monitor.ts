@@ -18,7 +18,7 @@ import { turnPayload } from "./effect-runner-helpers.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
-import { ACTION_SETTLEMENT_GRACE_MS } from "./convergence-policy.js";
+import { ACTION_SETTLEMENT_GRACE_MS, deadlineForecast } from "./convergence-policy.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -47,12 +47,24 @@ function processTimeout(message: string, code: "process_deadline" | "process_idl
   return Object.assign(new Error(message), { name: "TimeoutError", code });
 }
 
-function deadlineBoundedToolTimeoutMs(session: RuntimeSession, descriptor: ToolDescriptor): number {
+function terminalOnlyPlan(plan: ToolCallPlan): boolean {
+  return plan.exactEffects.every((effect) => effect === "outcome.propose"
+    || effect === "outcome.report_blocked" || effect === "outcome.request_input");
+}
+
+export function deadlineBoundedToolTimeoutMs(
+  session: RuntimeSession,
+  descriptor: ToolDescriptor,
+  plan: ToolCallPlan
+): number {
   const remainingMs = session.durable.state.deadlineRemainingMs
     ?? Date.parse(session.durable.state.deadlineAt) - Date.now();
+  const terminalModelReserveMs = terminalOnlyPlan(plan)
+    ? 0
+    : deadlineForecast(session).nextConvergenceModelEstimateMs;
   return Math.max(1, Math.min(
     descriptor.timeoutMs,
-    Math.max(1, remainingMs - ACTION_SETTLEMENT_GRACE_MS)
+    Math.max(1, remainingMs - ACTION_SETTLEMENT_GRACE_MS - terminalModelReserveMs)
   ));
 }
 
@@ -87,7 +99,7 @@ export class ToolExecutionMonitor {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort(signal.reason ?? new Error("Run cancelled."));
     if (signal.aborted) onAbort(); else signal.addEventListener("abort", onAbort, { once: true });
-    const timeoutMs = deadlineBoundedToolTimeoutMs(session, descriptor);
+    const timeoutMs = deadlineBoundedToolTimeoutMs(session, descriptor, plan);
     const timer = setTimeout(() => controller.abort(processTimeout(
       `Tool '${call.name}' exceeded its ${timeoutMs}ms deadline-bounded timeout.`, "process_deadline"
     )), timeoutMs);

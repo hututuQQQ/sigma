@@ -1,4 +1,4 @@
-import type { JsonValue, ModelToolCall, RunOutcome, ToolReceipt } from "agent-protocol";
+import type { JsonValue, ModelToolCall, ReviewEvidence, RunOutcome, ToolReceipt } from "agent-protocol";
 import {
   completionRepairFailureMessage,
   completionSummary,
@@ -14,6 +14,11 @@ import {
 } from "./semantic-failures.js";
 import { isCurrentModelTurn, modelTurn } from "./model-event-parsing.js";
 import type { KernelState, PendingTool } from "./state.js";
+import {
+  actionableReview,
+  advisoryReviewWarnings,
+  boundedReviewFindings
+} from "./terminal-review-helpers.js";
 
 export function nextPhase(pending: readonly PendingTool[]): KernelState["phase"] {
   if (pending.some((item) => item.approval === "pending")) return "needs_input";
@@ -140,20 +145,38 @@ function ordinaryCompletionMessage(answer: string | null, summary: string): stri
   return `${answer}\n\nResult: ${summary}`;
 }
 
-function advisoryReviewWarnings(state: KernelState): string {
-  const frontier = state.mutationFrontier;
-  const review = state.evidence.filter((item): item is Extract<typeof item, { kind: "review" }> => item.kind === "review"
-    && item.data.frontierRevision === frontier.revision
-    && item.data.stateDigest === frontier.currentStateDigest).at(-1);
-  if (!review || (review.status === "passed" && review.data.findings.length === 0)) return "";
-  const findings = review.data.findings.slice(0, 20).map((item) =>
-    `- ${typeof item === "string" ? item : JSON.stringify(item)}`).join("\n");
-  return `\n\nAdvisory review warnings:\n${findings || `- ${review.summary}`}`;
+function reviewRepairState(
+  state: KernelState,
+  progressed: KernelState,
+  review: ReviewEvidence
+): KernelState {
+  const findings = boundedReviewFindings(review);
+  if (state.completionRepair?.kind === "review_changes_requested") {
+    return proposedOutcomeState(progressed, {
+      kind: "recoverable_failure",
+      code: "review_changes_requested",
+      message: `Independent review still has actionable error findings after the bounded correction opportunity.\n\n${findings}`
+    });
+  }
+  return {
+    ...progressed,
+    phase: "ready_model",
+    completionRepairAttempts: Math.max(1, state.completionRepairAttempts),
+    completionRepair: {
+      kind: "review_changes_requested",
+      reviewEvidenceId: review.evidenceId
+    },
+    messages: [...progressed.messages, {
+      role: "developer",
+      content: `Independent review requested changes before completion. You have one bounded correction opportunity: repair the actionable errors or add independent current-frontier evidence that rebuts them, validate the result, and then finalize once. Do not repeat an unchanged completion proposal.\n\nReview evidence ${review.evidenceId}:\n${findings}`
+    }]
+  };
 }
 
-function hasCurrentFailedValidation(state: KernelState): boolean {
+function hasCurrentActualFailedValidation(state: KernelState): boolean {
   return state.evidence.some((item) => item.kind === "validation"
     && item.status === "failed"
+    && item.data.claim?.status !== "unavailable"
     && item.data.frontierRevision === state.mutationFrontier.revision
     && item.data.stateDigest === state.mutationFrontier.currentStateDigest);
 }
@@ -177,7 +200,7 @@ const CAPABILITY_FAILURE_FAMILIES = new Set([
 
 /** Runtime-owned stable taxonomy for a model-reported durable blocker. */
 export function canonicalReportedBlockerCode(state: KernelState): string {
-  if (hasCurrentFailedValidation(state)) return "validation_failed";
+  if (hasCurrentActualFailedValidation(state)) return "validation_failed";
   const evidence = currentFrontierEvidence(state);
   const reviewBlocked = evidence.some((item) => item.kind === "review"
     && (item.status === "failed" || item.data.verdict === "changes_requested"));
@@ -286,6 +309,35 @@ export interface TerminalReceiptTransition {
   semanticLimitReached: boolean;
 }
 
+function completionReceiptTransition(input: TerminalReceiptTransition): KernelState | null {
+  const summary = completionSummary(input.receipt);
+  if (!summary) return null;
+  const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
+  if (failure) return failure;
+  if (input.toolName === "confirm_no_change"
+    && input.state.completionRepair?.kind === "no_change_confirmation") {
+    return proposedOutcomeState(input.progressed, {
+      kind: "completed",
+      message: input.state.completionRepair.answer,
+      evidence: input.progressed.evidence
+    });
+  }
+  const blockingReview = input.toolName === "runtime_finalize"
+    ? actionableReview(input.progressed) : undefined;
+  if (blockingReview) return reviewRepairState(input.state, input.progressed, blockingReview);
+  const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
+  const latestAnswer = ordinaryCompletionMessage(sameTurnAnswer, summary);
+  return proposedOutcomeState(input.progressed, {
+    kind: "completed",
+    // A protected substantive answer is intentionally immutable during its
+    // terminal repair. On an ordinary completion, retain both handoff
+    // surfaces so a generic same-turn status cannot hide
+    // the structured completion summary.
+    message: `${ordinaryCompletionMessage(protectedCompletionAnswer(input.state), latestAnswer)}${advisoryReviewWarnings(input.progressed)}`,
+    evidence: input.progressed.evidence
+  });
+}
+
 export function terminalReceiptTransition(input: TerminalReceiptTransition): KernelState | null {
   const inputMessage = requestedInput(input.receipt);
   if (inputMessage) {
@@ -307,30 +359,8 @@ export function terminalReceiptTransition(input: TerminalReceiptTransition): Ker
       message: blocked.message
     });
   }
-  const summary = completionSummary(input.receipt);
-  if (summary) {
-    const failure = terminalReceiptFailure(input.state, input.progressed, input.toolName, "complete");
-    if (failure) return failure;
-    if (input.toolName === "confirm_no_change"
-      && input.state.completionRepair?.kind === "no_change_confirmation") {
-      return proposedOutcomeState(input.progressed, {
-        kind: "completed",
-        message: input.state.completionRepair.answer,
-        evidence: input.progressed.evidence
-      });
-    }
-    const sameTurnAnswer = assistantBodyForToolCall(input.state, input.receipt.callId);
-    const latestAnswer = ordinaryCompletionMessage(sameTurnAnswer, summary);
-    return proposedOutcomeState(input.progressed, {
-      kind: "completed",
-      // A protected substantive answer is intentionally immutable during its
-      // terminal repair. On an ordinary completion, retain both handoff
-      // surfaces so a generic same-turn status cannot hide
-      // the structured completion summary.
-      message: `${ordinaryCompletionMessage(protectedCompletionAnswer(input.state), latestAnswer)}${advisoryReviewWarnings(input.progressed)}`,
-      evidence: input.progressed.evidence
-    });
-  }
+  const completion = completionReceiptTransition(input);
+  if (completion) return completion;
   const prerequisiteRepair = completionPrerequisiteRepair(input);
   if (prerequisiteRepair) return prerequisiteRepair;
   const failedRepair = failedTerminalRepairState(

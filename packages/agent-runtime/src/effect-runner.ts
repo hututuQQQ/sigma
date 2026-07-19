@@ -1,24 +1,23 @@
 import type {
+  CompletionLimitationV1,
   ModelToolCall,
   RunOutcome,
   ToolDescriptor,
-  ToolOutcome,
   ToolReceipt
 } from "agent-protocol";
 import { decide, type ActiveModelTurn, type KernelEffect } from "agent-kernel";
 import { loadNestedInstructions } from "agent-context";
-import {
-  failed, requestTargets, requiresInstructionReplan, steeringRestart
-} from "./effect-helpers.js";
+import { failed, requestTargets, requiresInstructionReplan, steeringRestart } from "./effect-helpers.js";
 import {
   attemptFromEffect,
   childOutcomeEvidence,
+  importedChildLimitations,
   turnPayload,
   type ExecuteToolEffect,
   type ToolAttempt
 } from "./effect-runner-helpers.js";
 import { ModelEffectRunner } from "./model-effect-runner.js";
-import { convergenceAdmissionFailure } from "./convergence-policy.js";
+import { convergenceAdmissionDecision } from "./convergence-policy.js";
 import type { RuntimeOptions, RuntimePermissionMode, RuntimeSession } from "./types.js";
 import type { BudgetController } from "./budget-controller.js";
 import type { RuntimeControlService } from "./runtime-control.js";
@@ -29,12 +28,14 @@ import { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RunSuspensionContext } from "./runtime-session-finish.js";
+import {
+  durableToolReceipt, receiptToolName, runtimeSignal, shouldReviewReceipt, type DurableToolReceipt
+} from "./effect-receipt-helpers.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
   maxParallelTools: number;
   permissionMode: RuntimePermissionMode;
-  outputReserveTokens: number;
   emit: RuntimeEventEmitter;
   finish(
     session: RuntimeSession,
@@ -48,39 +49,6 @@ export interface EffectRunnerOptions {
   reviewer: ReviewerPort;
   reviewerForSession?: (session: RuntimeSession) => ReviewerPort;
   hooks: RuntimeHookCoordinator;
-}
-
-type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
-
-function durableToolReceipt(receipt: ToolReceipt): DurableToolReceipt {
-  const diagnosticCodes = [...new Set([
-    ...(receipt.outcome?.diagnosticCodes ?? []),
-    ...receipt.diagnostics
-  ])];
-  return {
-    ...receipt,
-    outcome: {
-      status: receipt.ok ? "succeeded" : "failed",
-      output: receipt.output,
-      diagnosticCodes
-    }
-  };
-}
-
-function receiptToolName(
-  session: RuntimeSession,
-  receipt: ToolReceipt,
-  modelTurn: ActiveModelTurn
-): string {
-  return session.durable.state.pendingTools.find((item) => item.request.callId === receipt.callId
-    && item.modelTurn.turnId === modelTurn.turnId
-    && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request.name ?? "tool";
-}
-
-function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "required"): boolean {
-  if (name === "request_review") return true;
-  if (name === "runtime_finalize") return reviewMode !== "off";
-  return reviewMode === "required" && name === "validate";
 }
 
 export class EffectRunner {
@@ -117,8 +85,6 @@ export class EffectRunner {
     signal: AbortSignal,
     effect: Extract<KernelEffect, { type: "request_model" }>
   ): Promise<boolean> {
-    const failure = convergenceAdmissionFailure(session, { kind: "model" });
-    if (failure) return await this.options.finish(session, failure);
     return await this.models.request(session, signal, effect);
   }
 
@@ -132,12 +98,80 @@ export class EffectRunner {
       .find((item) => item.name === effect.request.name)
           ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.report_blocked"
             || item === "outcome.request_input") === true);
-    const failure = convergenceAdmissionFailure(session, {
+    const admission = convergenceAdmissionDecision(session, {
       kind: "tool", count: effects.length, terminalOnly
     });
-    if (failure) return await this.options.finish(session, failure);
+    if (admission?.reason === "deadline" && !terminalOnly && admission.forecast
+      && admission.forecast.remainingMs > admission.forecast.terminalActionReserveMs) {
+      await this.handoffToTerminalTurn(session, effects);
+      return false;
+    }
+    if (admission) return await this.options.finish(session, admission.failure);
     await this.executeTools(session, effects.map(attemptFromEffect), signal);
     return false;
+  }
+
+  private async handoffToTerminalTurn(session: RuntimeSession, effects: ExecuteToolEffect[]): Promise<void> {
+    const startedAt = new Date().toISOString();
+    for (const effect of effects) {
+      const { call, modelTurn } = attemptFromEffect(effect);
+      await this.options.emit(session, "tool.requested", "runtime", {
+        callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
+      });
+      await this.emitReceipt(session, failed(
+        call,
+        startedAt,
+        "The non-terminal tool was not started because the remaining active time is reserved for a terminal outcome. Choose one currently offered terminal tool.",
+        "deadline_terminal_handoff"
+      ), modelTurn);
+    }
+  }
+
+  private async joinCompletion(
+    session: RuntimeSession,
+    signal: AbortSignal,
+    outcome: RunOutcome,
+    outcomeRevision: number
+  ): Promise<{ outcome: RunOutcome; outcomeRevision: number } | null> {
+    if (outcome.kind !== "completed" || !this.options.runtime.joinChildren) {
+      return { outcome, outcomeRevision };
+    }
+    const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
+    if (children.failures.length > 0) {
+      await this.options.emit(session, "diagnostic", "runtime", {
+        kind: "child.join_failed",
+        failures: children.failures,
+        evidence: children.evidence
+      });
+      return null;
+    }
+    const limitations: CompletionLimitationV1[] = children.limitations ?? [];
+    const imported = importedChildLimitations(session, limitations, children.limitationEvidence ?? []);
+    if (!imported) {
+      await this.options.emit(session, "diagnostic", "runtime", {
+        kind: "child.join_failed",
+        failures: ["A child completion limitation did not have one matching, resolvable validation evidence record."],
+        evidence: children.evidence
+      });
+      return null;
+    }
+    for (const [index, value] of children.evidence.entries()) {
+      await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
+    }
+    for (const evidence of imported.evidence) {
+      await this.options.emit(session, "evidence.recorded", "runtime", evidence);
+    }
+    return {
+      outcome: imported.limitations.length > 0
+        ? {
+          kind: "completed_with_limitations",
+          message: outcome.message,
+          evidence: [...session.durable.state.evidence],
+          limitations: imported.limitations
+        }
+        : { ...outcome, evidence: [...session.durable.state.evidence] },
+      outcomeRevision: session.durable.state.revision
+    };
   }
 
   async run(session: RuntimeSession, signal: AbortSignal): Promise<void> {
@@ -146,25 +180,9 @@ export class EffectRunner {
       const effects = decide(session.durable.state);
       const terminal = effects.find((effect): effect is Extract<KernelEffect, { type: "finish_run" }> => effect.type === "finish_run");
       if (terminal) {
-        let outcome = terminal.outcome;
-        let outcomeRevision = terminal.revision;
-        if (outcome.kind === "completed" && this.options.runtime.joinChildren) {
-          const children = await this.options.runtime.joinChildren(session.identity.sessionId, signal);
-          if (children.failures.length > 0) {
-            await this.options.emit(session, "diagnostic", "runtime", {
-              kind: "child.join_failed",
-              failures: children.failures,
-              evidence: children.evidence
-            });
-            continue;
-          }
-          for (const [index, value] of children.evidence.entries()) {
-            await this.options.emit(session, "evidence.recorded", "runtime", childOutcomeEvidence(session, value, index));
-          }
-          outcome = { ...outcome, evidence: [...session.durable.state.evidence] };
-          outcomeRevision = session.durable.state.revision;
-        }
-        if (await this.options.finish(session, outcome, outcomeRevision)) return;
+        const joined = await this.joinCompletion(session, signal, terminal.outcome, terminal.revision);
+        if (!joined) continue;
+        if (await this.options.finish(session, joined.outcome, joined.outcomeRevision)) return;
         continue;
       }
       if (effects.some((effect) => effect.type === "publish_outcome")) return;
@@ -309,35 +327,68 @@ export class EffectRunner {
     return { loaded: true };
   }
 
-  private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
-    const name = receiptToolName(session, receipt, modelTurn);
-    const durableReceipt = durableToolReceipt(receipt);
+  private async maybeReviewBeforeReceipt(
+    session: RuntimeSession,
+    receipt: ToolReceipt,
+    name: string,
+    reviewMode: "off" | "advisory" | "required"
+  ): Promise<boolean> {
+    const required = receipt.ok && name === "runtime_finalize" && reviewMode !== "off";
+    if (!required) return false;
+    // A successful completion intent is a proposal, not a committed outcome.
+    // Make the independent verdict durable before reducing the terminal receipt.
+    await this.reviews.maybeReview(session, runtimeSignal(session));
+    return true;
+  }
+
+  private async emitDurableReceipt(
+    session: RuntimeSession,
+    receipt: ToolReceipt,
+    durableReceipt: DurableToolReceipt,
+    name: string,
+    modelTurn: ActiveModelTurn
+  ): Promise<void> {
     await this.options.emit(session, receipt.ok ? "tool.completed" : "tool.failed", "tool", {
       ...durableReceipt, name, ...turnPayload(modelTurn)
     });
     for (const evidence of receipt.evidence ?? []) {
       await this.options.emit(session, "evidence.recorded", "tool", evidence);
     }
+  }
+
+  private async dispatchPostTool(session: RuntimeSession, receipt: ToolReceipt, name: string): Promise<void> {
+    await this.options.hooks.dispatch(session, "post_tool", {
+      sessionId: session.identity.sessionId,
+      runId: session.durable.runId,
+      callId: receipt.callId,
+      toolName: name,
+      ok: receipt.ok,
+      diagnostics: receipt.diagnostics,
+      actualEffects: receipt.actualEffects ?? receipt.observedEffects,
+      evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
+      artifactRefs: receipt.artifactRefs ?? []
+    }, runtimeSignal(session));
+  }
+
+  private async maybeReviewAfterReceipt(
+    session: RuntimeSession,
+    name: string,
+    reviewMode: "off" | "advisory" | "required",
+    reviewedBefore: boolean
+  ): Promise<void> {
+    if (reviewedBefore || !shouldReviewReceipt(name, reviewMode)) return;
+    await this.reviews.maybeReview(session, runtimeSignal(session), name === "request_review");
+  }
+
+  private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
+    const name = receiptToolName(session, receipt, modelTurn);
+    const durableReceipt = durableToolReceipt(receipt);
+    const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
     try {
-      await this.options.hooks.dispatch(session, "post_tool", {
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        callId: receipt.callId,
-        toolName: name,
-        ok: receipt.ok,
-        diagnostics: receipt.diagnostics,
-        actualEffects: receipt.actualEffects ?? receipt.observedEffects,
-        evidenceIds: (receipt.evidence ?? []).map((item) => item.evidenceId),
-        artifactRefs: receipt.artifactRefs ?? []
-      }, session.execution.controller?.signal ?? new AbortController().signal);
-      const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
-      if (shouldReviewReceipt(name, reviewMode)) {
-        await this.reviews.maybeReview(
-          session,
-          session.execution.controller?.signal ?? new AbortController().signal,
-          name === "request_review"
-        );
-      }
+      const reviewedBefore = await this.maybeReviewBeforeReceipt(session, receipt, name, reviewMode);
+      await this.emitDurableReceipt(session, receipt, durableReceipt, name, modelTurn);
+      await this.dispatchPostTool(session, receipt, name);
+      await this.maybeReviewAfterReceipt(session, name, reviewMode, reviewedBefore);
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

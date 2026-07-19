@@ -1,7 +1,7 @@
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventEnvelope,
   ModelCapabilities,
@@ -95,18 +95,21 @@ class InspectableGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "inspectable";
   readonly requests: ModelRequest[] = [];
-  readonly capabilities: ModelCapabilities = {
-    contextWindowTokens: 128_000,
-    maxOutputTokens: 4_096,
-    tools: true,
-    parallelTools: false,
-    reasoning: true,
-    structuredOutput: false,
-    promptCache: true,
-    tokenizer: "approximate"
-  };
+  readonly capabilities: ModelCapabilities;
 
-  constructor(private readonly responses: ModelResponse[]) {}
+  constructor(private readonly responses: ModelResponse[], capabilities: Partial<ModelCapabilities> = {}) {
+    this.capabilities = {
+      contextWindowTokens: 128_000,
+      maxOutputTokens: 4_096,
+      tools: true,
+      parallelTools: false,
+      reasoning: true,
+      structuredOutput: false,
+      promptCache: true,
+      tokenizer: "approximate",
+      ...capabilities
+    };
+  }
 
   async complete(_request: ModelRequest): Promise<never> {
     throw new Error("This test consumes the streaming path.");
@@ -117,6 +120,54 @@ class InspectableGateway implements ModelGateway {
     const response = this.responses[this.requests.length - 1];
     if (!response) throw new Error("Unexpected model request.");
     yield { type: "done", response };
+  }
+
+  async countTokens(): Promise<number> { return 100; }
+}
+
+class DeadlineCrossingGateway implements ModelGateway {
+  readonly provider = "fake";
+  readonly model = "deadline-crossing";
+  readonly requests: ModelRequest[] = [];
+  private firstStartedResolve!: () => void;
+  private secondStartedResolve!: () => void;
+  readonly firstStarted = new Promise<void>((resolve) => { this.firstStartedResolve = resolve; });
+  readonly secondStarted = new Promise<void>((resolve) => { this.secondStartedResolve = resolve; });
+  readonly capabilities: ModelCapabilities = {
+    contextWindowTokens: 128_000,
+    maxOutputTokens: 64_000,
+    tools: true,
+    parallelTools: false,
+    reasoning: true,
+    structuredOutput: false,
+    promptCache: true,
+    tokenizer: "approximate"
+  };
+
+  async complete(_request: ModelRequest): Promise<never> {
+    throw new Error("This test consumes the streaming path.");
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    if (this.requests.length === 1) {
+      this.firstStartedResolve();
+      await new Promise((resolve) => setTimeout(resolve, 22_000));
+      yield {
+        type: "done",
+        response: {
+          message: {
+            role: "assistant", content: "", toolCalls: [{
+              id: "late-read", name: "read", arguments: { path: "not-started.txt" }
+            }]
+          },
+          finishReason: "tool_calls", inputTokens: 100, outputTokens: 10
+        }
+      };
+      return;
+    }
+    this.secondStartedResolve();
+    yield { type: "done", response: requestInputResponse() };
   }
 
   async countTokens(): Promise<number> { return 100; }
@@ -146,60 +197,121 @@ async function storedEvents(store: SegmentedJsonlStore, sessionId: string): Prom
 }
 
 describe("provider-measured model budget settlement", () => {
-  it("uses one transient forced-tool turn after a length finish", async () => {
+  it("uses 32K normally, one 16K continuation, then a forced 4K action after consecutive lengths", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-length-recovery-state-"));
     const gateway = new InspectableGateway([{
       message: { role: "assistant", content: "partial", reasoningContent: "private truncated reasoning" },
       finishReason: "length",
       inputTokens: 100,
-      outputTokens: 4_096
-    }, requestInputResponse()]);
+      outputTokens: 32_768
+    }, {
+      message: { role: "assistant", content: "still partial", reasoningContent: "more private reasoning" },
+      finishReason: "length",
+      inputTokens: 100,
+      outputTokens: 16_384
+    }, requestInputResponse()], { maxOutputTokens: 64_000 });
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: state }),
       storeRootDir: state,
       tools: registerBuiltinTools(new EffectToolRegistry()),
-      permissionMode: "auto",
-      outputReserveTokens: 4_096
+      permissionMode: "auto"
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect recovery" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests).toHaveLength(2);
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 32_768 });
     expect(gateway.requests[0].toolChoice).toBeUndefined();
-    expect(gateway.requests[1]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
+    expect(gateway.requests[1]).toMatchObject({ maxOutputTokens: 16_384 });
+    expect(gateway.requests[1].toolChoice).toBeUndefined();
+    expect(gateway.requests[2]).toMatchObject({ maxOutputTokens: 4_096, toolChoice: "required" });
     const recoveryPrompts = gateway.requests[1].messages.filter((message) =>
       message.content.includes("private reasoning is not replayed"));
     expect(recoveryPrompts).toHaveLength(1);
+    expect(gateway.requests[2].messages.some((message) => message.content.includes("consecutive turns")))
+      .toBe(true);
     expect(gateway.requests[0].messages.some((message) => message.content.includes("private reasoning is not replayed")))
       .toBe(false);
     expect(gateway.requests[1].messages.some((message) => message.reasoningContent === "private truncated reasoning"))
       .toBe(false);
+    expect(gateway.requests[2].messages.some((message) => message.reasoningContent === "more private reasoning"))
+      .toBe(false);
   });
 
-  it("forces a bounded tool action during deadline convergence", async () => {
+  it("forces a terminal-only bounded turn before deadline settlement", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-workspace-"));
     const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-converge-state-"));
-    const gateway = new InspectableGateway([requestInputResponse()]);
+    const gateway = new InspectableGateway([requestInputResponse()], { maxOutputTokens: 64_000 });
     const runtime = createRuntime({
       gateway,
       store: new SegmentedJsonlStore({ rootDir: state }),
       storeRootDir: state,
       tools: registerBuiltinTools(new EffectToolRegistry()),
       permissionMode: "auto",
-      outputReserveTokens: 4_096,
       runDeadlineMs: 40_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 2_048, toolChoice: "required" });
-    expect(gateway.requests[0].messages.some((message) => message.content.includes("Deadline stage is converge")))
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096, toolChoice: "required" });
+    expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input"
+    ]);
+    expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
       .toBe(true);
+  });
+
+  it("durably hands a late non-terminal call to a final terminal-only turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-handoff-workspace-"));
+      const state = await mkdtemp(path.join(os.tmpdir(), "sigma-deadline-handoff-state-"));
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      const gateway = new DeadlineCrossingGateway();
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools: registerBuiltinTools(new EffectToolRegistry()),
+        permissionMode: "auto",
+        runDeadlineMs: 60_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" }, {
+        inputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+        costMicroUsd: 100_000_000,
+        modelTurns: 200,
+        toolCalls: 1_000,
+        children: 32,
+        maxDepth: 4
+      });
+      await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish before the deadline" });
+      const outcome = runtime.waitForOutcome(session.sessionId);
+      await gateway.firstStarted;
+      await vi.advanceTimersByTimeAsync(22_000);
+      await gateway.secondStarted;
+
+      await expect(outcome).resolves.toMatchObject({ kind: "needs_input" });
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[0]!.tools.some((tool) => tool.name === "read")).toBe(true);
+      expect(gateway.requests[1]!.tools.map((tool) => tool.name).sort()).toEqual([
+        "report_blocked", "request_user_input"
+      ]);
+      const events = await storedEvents(store, session.sessionId);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "tool.failed",
+        payload: expect.objectContaining({ diagnostics: ["deadline_terminal_handoff"] })
+      }));
+      expect(events.some((event) => event.type === "tool.started"
+        && (event.payload as { callId?: unknown }).callId === "late-read")).toBe(false);
+      expect(events.some((event) => event.type === "run.failed")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps a successful response when provider usage exceeds the admission reservation", async () => {

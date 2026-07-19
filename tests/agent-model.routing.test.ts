@@ -10,6 +10,7 @@ import type { ModelSpecConfigValue } from "../packages/agent-config/src/index.js
 import {
   BUILTIN_MODEL_SPECS,
   ModelRouteExecutionError,
+  ModelRoutingError,
   ModelRouter,
   OpenAIModelGateway,
   RoutedModelGateway,
@@ -106,6 +107,24 @@ function gateway(id: string, complete: () => Promise<ModelResponse>): ModelGatew
 }
 
 describe("capability-aware model routing", () => {
+  it("keeps exact route rejections internally but bounds and redacts diagnostics", () => {
+    const rejected = Array.from({ length: 20 }, (_, index) => ({
+      modelSpecId: `deepseek/candidate-${index}`,
+      reason: "capability" as const,
+      detail: index === 0 ? "api_key=do-not-expose" : `candidate ${index} is unavailable`
+    }));
+    const error = new ModelRoutingError("main", rejected);
+
+    expect(error.rejected).toHaveLength(20);
+    expect(error.rejected[0]?.detail).toContain("do-not-expose");
+    expect(error.rejectionDiagnostics.entries).toHaveLength(8);
+    expect(error.rejectionDiagnostics).toMatchObject({ totalCount: 20, omittedCount: 12 });
+    expect(error.rejectionDiagnostics.digest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(Buffer.byteLength(JSON.stringify(error.rejectionDiagnostics), "utf8")).toBeLessThanOrEqual(4 * 1024);
+    expect(error.message).not.toContain("do-not-expose");
+    expect(error.message).toContain("[redacted]");
+  });
+
   it("classifies transport codes without treating configuration failures as retryable", () => {
     expect(classifyModelFailure(Object.assign(new Error("reset"), { code: "ECONNRESET" }))).toBe("network");
     expect(classifyModelFailure(Object.assign(new Error("slow"), { code: "ETIMEDOUT" }))).toBe("timeout");

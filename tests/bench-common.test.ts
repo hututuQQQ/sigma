@@ -1,8 +1,10 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  agentCliArchiveSourceIdentity,
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
@@ -16,14 +18,18 @@ import {
   generateBenchReport,
   groupHarborTimeoutProbe,
   assertComparableBenchmarkReports,
+  harborContainerComposePath,
   harborEnvForRun,
   harborRuntimeDir,
+  harborSandboxComposePath,
   parseHarborTimeoutProbe,
   portableAgentImportPath,
   removedHarborAdapterErrorMessage,
   removedHarborPackageName,
+  repositorySourceIdentity,
   resolveHarborCommand,
   resolveRunOptions,
+  runProcess,
   suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
@@ -39,6 +45,138 @@ async function writeHarborJobResult(jobDir: string, total: number, errored = 0, 
     }
   })}\n`, "utf8");
 }
+
+function completeReportConfig(values: Record<string, unknown>) {
+  return {
+    finished_at: "2026-07-19T00:00:00.000Z",
+    agent_cli_sha256: "a".repeat(64),
+    source_revision: "b".repeat(40),
+    execution_mode: "sandboxed",
+    docker_cleanup: { clean: true },
+    ...values
+  };
+}
+
+async function createAgentArchive(bundleRoots: string[]) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-agent-archive-"));
+  const source = path.join(directory, "source");
+  const archive = path.join(directory, "agent.tgz");
+  await mkdir(source, { recursive: true });
+  for (const [index, bundleRoot] of bundleRoots.entries()) {
+    const bundle = path.join(source, bundleRoot);
+    await mkdir(bundle, { recursive: true });
+    await writeFile(path.join(bundle, "package-metadata.json"), `${JSON.stringify({
+      source: { revision: String(index + 1).repeat(40), dirty: index % 2 === 0 }
+    })}\n`, "utf8");
+  }
+  const result = spawnSync("tar", ["-czf", archive, "-C", source, ...bundleRoots], {
+    encoding: "utf8", windowsHide: true
+  });
+  if (result.status !== 0) throw new Error(result.stderr || "Could not create test archive.");
+  return { archive, directory };
+}
+
+describe("benchmark package provenance", () => {
+  it("discovers a safe ARM64 bundle root before reading source metadata", async () => {
+    const fixture = await createAgentArchive(["agent-cli-linux-arm64"]);
+    try {
+      expect(agentCliArchiveSourceIdentity(fixture.archive)).toEqual({
+        revision: "1".repeat(40), dirty: true
+      });
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects archives with more than one top-level bundle root", async () => {
+    const fixture = await createAgentArchive([
+      "agent-cli-linux-x64", "agent-cli-linux-arm64"
+    ]);
+    try {
+      expect(() => agentCliArchiveSourceIdentity(fixture.archive))
+        .toThrow(/exactly one top-level directory/iu);
+    } finally {
+      await rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("benchmark child process capture", () => {
+  it("streams complete logs while retaining only a bounded in-memory tail", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-process-capture-"));
+    const stdoutPath = path.join(directory, "stdout.log");
+    const stderrPath = path.join(directory, "stderr.log");
+    try {
+      const result = await runProcess(process.execPath, [
+        "-e",
+        "process.stdout.write('a'.repeat(262144)); process.stderr.write('b'.repeat(131072));"
+      ], { stdoutPath, stderrPath, captureLimitBytes: 1024 });
+
+      expect(result).toMatchObject({
+        exitCode: 0,
+        stdoutBytes: 262_144,
+        stderrBytes: 131_072,
+        stdoutTruncated: true,
+        stderrTruncated: true
+      });
+      expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024);
+      expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(1024);
+      expect((await stat(stdoutPath)).size).toBe(262_144);
+      expect((await stat(stderrPath)).size).toBe(131_072);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("interrupts an entire descendant tree within a bounded deadline", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-process-tree-"));
+    const pidPath = path.join(directory, "descendant.pid");
+    const descendantSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+    const parentSource = [
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
+      `writeFileSync(${JSON.stringify(pidPath)}, String(descendant.pid));`,
+      "process.on('SIGTERM', () => {});",
+      "setInterval(() => {}, 1000);"
+    ].join("\n");
+    const controller = new AbortController();
+    let descendantPid = 0;
+    try {
+      const pending = runProcess(process.execPath, ["-e", parentSource], {
+        signal: controller.signal,
+        abortGraceMs: 100,
+        abortKillWaitMs: 2_000,
+        logFlushMs: 1_000
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try {
+          descendantPid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
+          if (Number.isSafeInteger(descendantPid) && descendantPid > 0) break;
+        } catch { /* child has not published its pid yet */ }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(descendantPid).toBeGreaterThan(0);
+      const interruptedAt = Date.now();
+      controller.abort(new Error("test interrupt"));
+      const result = await pending;
+      expect(Date.now() - interruptedAt).toBeLessThan(4_000);
+      expect(result).toMatchObject({ exitCode: 1, interrupted: true });
+
+      let descendantAlive = true;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try { process.kill(descendantPid, 0); } catch { descendantAlive = false; break; }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(descendantAlive).toBe(false);
+    } finally {
+      if (descendantPid > 0) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
+});
 
 describe("Terminal-Bench command construction", () => {
   it("loads an exact pinned external task batch without losing Git provenance", async () => {
@@ -71,10 +209,106 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
+  it("selects the Compose overlay from the generic execution backend", () => {
+    const common = {
+      mode: "k",
+      k: 1,
+      provider: "deepseek",
+      model: "deepseek-v4-pro"
+    };
+    const sandboxed = buildHarborJobConfig(
+      { ...common, executionMode: "sandboxed" },
+      "sandboxed-jobs"
+    );
+    const container = buildHarborJobConfig(
+      { ...common, executionMode: "container" },
+      "container-jobs"
+    );
+    const sandboxedWithProvenance = buildHarborJobConfig(
+      { ...common, executionMode: "sandboxed", managedProvenance: true },
+      "sandboxed-provenance-jobs"
+    );
+
+    expect(sandboxed.environment.extra_docker_compose).toEqual([
+      path.resolve(harborSandboxComposePath)
+    ]);
+    expect(container.environment.extra_docker_compose).toEqual([
+      path.resolve(harborContainerComposePath)
+    ]);
+    expect(sandboxedWithProvenance.environment.extra_docker_compose).toEqual([
+      path.resolve(harborContainerComposePath)
+    ]);
+    expect(sandboxedWithProvenance.agents[0].kwargs).toMatchObject({
+      execution_mode: "sandboxed",
+      managed_provenance: true
+    });
+    expect(sandboxed.agents[0].kwargs.managed_provenance).toBe(false);
+    expect(sandboxed.environment.extra_docker_compose)
+      .not.toEqual(container.environment.extra_docker_compose);
+  });
+
+  it("parses managed provenance as an explicit launcher switch", () => {
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task"
+    ])).toMatchObject({ managedProvenance: false, executionMode: "sandboxed" });
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task", "--managed-provenance"
+    ])).toMatchObject({ managedProvenance: true, executionMode: "sandboxed" });
+    expect(buildHarborArgs({
+      mode: "k",
+      k: 1,
+      provider: "deepseek",
+      maxTurns: 200,
+      commandTimeoutSec: 180,
+      maxWallTimeSec: 7200,
+      executionMode: "sandboxed",
+      managedProvenance: true
+    })).toEqual(expect.arrayContaining(["managed_provenance:bool=true"]));
+  });
+
+  it("binds every batch task directly to the declared Terminal-Bench revision", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-batch-revision-"));
+    const revision = "a".repeat(40);
+    const tasksFile = path.join(directory, "tasks.json");
+    try {
+      await writeFile(tasksFile, `${JSON.stringify([
+        {
+          path: "tasks/one", git_url: "https://example.test/tasks.git", git_commit_id: revision
+        },
+        {
+          path: "tasks/two", git_url: "https://example.test/tasks.git", git_commit_id: revision
+        }
+      ])}\n`, "utf8");
+      expect(resolveRunOptions([
+        "--mode", "batch", "--tasks-file", tasksFile,
+        "--terminal-bench-revision", revision
+      ]).terminalBenchRevision).toBe(revision);
+
+      await writeFile(tasksFile, `${JSON.stringify([
+        { name: "registry/alias" },
+        {
+          path: "tasks/two", git_url: "https://example.test/tasks.git",
+          git_commit_id: "b".repeat(40)
+        }
+      ])}\n`, "utf8");
+      expect(() => resolveRunOptions([
+        "--mode", "batch", "--tasks-file", tasksFile,
+        "--terminal-bench-revision", revision
+      ])).toThrow(/every batch task git_commit_id.*invalid indexes: 0, 1/iu);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("requires a frozen archive digest when reusing a package", () => {
     expect(() => resolveRunOptions([
       "--mode", "task", "--task-id", "one", "--reuse-package"
     ])).toThrow("--reuse-package requires --expected-archive-sha256");
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "one", "--reuse-package",
+      "--expected-archive-sha256", "a".repeat(64),
+      "--expected-source-revision", "b".repeat(40)
+    ])).toMatchObject({ expectedArchiveSha256: "a".repeat(64), expectedSourceRevision: "b".repeat(40) });
   });
 
   it("rejects comparisons across agent profiles and evaluation lanes", () => {
@@ -86,6 +320,24 @@ describe("Terminal-Bench command construction", () => {
       { tasks: [{ agent_profile: "standard" }], evaluation_lane: "solving" },
       { agent_profile: "standard", evaluation_lane: "solving" }
     )).not.toThrow();
+    expect(() => assertComparableBenchmarkReports(
+      { agent_cli_sha256: "a".repeat(64), execution_backend: "oci:docker" },
+      { agent_cli_sha256: "b".repeat(64), execution_backend: "oci:docker" }
+    )).toThrow(/different agent CLI archives/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { agent_cli_sha256: "a".repeat(64), execution_backend: "oci:docker" },
+      { agent_cli_sha256: "a".repeat(64), execution_backend: "native" }
+    )).toThrow(/different execution backends/iu);
+    expect(() => assertComparableBenchmarkReports(
+      { harbor_topology: "main_only" },
+      { harbor_topology: "managed_three_role" }
+    )).toThrow(/different Harbor topologies/iu);
+  });
+
+  it("records the repository revision and dirty state used for packaging", () => {
+    const identity = repositorySourceIdentity();
+    expect(identity.revision).toMatch(/^[a-f0-9]{40}$/u);
+    expect(typeof identity.dirty).toBe("boolean");
   });
 
   it("propagates the run-level network mode into Harbor agent configuration", () => {
@@ -538,9 +790,11 @@ describe("Terminal-Bench command construction", () => {
     expect(path.isAbsolute(config.agents[0].kwargs.agent_cli_tarball)).toBe(true);
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
-      max_wall_time_sec: 2700
+      max_wall_time_sec: 2700,
+      max_turns: 200,
+      command_timeout_sec: 180
     });
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
+    expect(JSON.stringify(config.agents[0].kwargs)).not.toContain("long-runtime-task");
     expect(config.agents[0].kwargs.validation_retry_limit).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
     expect(config.agents[0].kwargs.post_run_cleanup_globs).toBeUndefined();
@@ -573,7 +827,9 @@ describe("Terminal-Bench command construction", () => {
     });
     expect(config.agents[0].kwargs).toMatchObject({
       agent_cli_tarball: defaultAgentCliTarballForEnv(),
-      max_wall_time_sec: 2700
+      max_wall_time_sec: 2700,
+      max_turns: 200,
+      command_timeout_sec: 180
     });
     expect(config.agents[0].kwargs.validation_mode).toBeUndefined();
     expect(config.agents[0].kwargs.precheck_command).toBeUndefined();
@@ -598,7 +854,7 @@ describe("Terminal-Bench command construction", () => {
     expect(plan).toMatchObject({ agent_wall_time_sec: 2700, harness_timeout_sec: 2820 });
   });
 
-  it("does not expose fixed turn limits to the solver", () => {
+  it("propagates the frozen turn and command timeout controls to the adapter", () => {
     const timeoutProbe = {
       resolved_tasks: [{ name: "terminal-bench/long-runtime-task" }],
       tasks: [{ task_name: "terminal-bench/long-runtime-task", agent_timeout_sec: 1800 }],
@@ -620,7 +876,10 @@ describe("Terminal-Bench command construction", () => {
       timeoutProbe
     );
 
-    expect(config.agents[0].kwargs.max_turns).toBeUndefined();
+    expect(config.agents[0].kwargs).toMatchObject({
+      max_turns: 200,
+      command_timeout_sec: 180
+    });
   });
 
   it("rejects removed Harbor import paths", () => {
@@ -848,7 +1107,7 @@ describe("benchmark report generation", () => {
     await writeFile(path.join(passedDir, "metadata.json"), '{"task_id":"passed-task","status":"passed"}\n', "utf8");
     await writeFile(
       path.join(passedDir, "summary.json"),
-      '{"status":"completed","finish_reason":"assistant_stop","commands_executed":3,"input_tokens":10,"cache_tokens":8,"cache_read_tokens":8,"output_tokens":5,"reasoning_tokens":4,"length_finish_count":1,"converge_turns":2,"duration_ms":1000,"last_error":null}\n',
+      '{"status":"completed_with_limitations","finish_reason":"completed_with_limitations","limitations":[{"kind":"validation_capability_unavailable","claim":"unit","attemptedCommandSummary":"pnpm test","capabilityEvidenceId":"validation-proof","reason":"runner unavailable"}],"limitation_count":1,"commands_executed":3,"input_tokens":10,"cache_tokens":8,"cache_read_tokens":8,"output_tokens":5,"reasoning_tokens":4,"length_finish_count":1,"converge_turns":2,"duration_ms":1000,"last_error":null}\n',
       "utf8"
     );
     await writeFile(path.join(passedDir, "trace.jsonl"), '{"type":"run_end","metadata":{}}\n', "utf8");
@@ -868,6 +1127,11 @@ describe("benchmark report generation", () => {
     expect(report.counts.passed).toBe(1);
     expect(report.counts.api_error).toBe(1);
     expect(report.tasks.find((task) => task.task_id === "passed-task")?.suggested_owner).toBeNull();
+    expect(report.tasks.find((task) => task.task_id === "passed-task")).toMatchObject({
+      agent_outcome: "completed_with_limitations",
+      completion_limitation_count: 1,
+      completion_limitations: [{ capabilityEvidenceId: "validation-proof" }]
+    });
     expect(report.tasks.find((task) => task.task_id === "api-task")?.failure_category).toBe("api_error");
     expect(report.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
     expect(report).toMatchObject({
@@ -878,6 +1142,7 @@ describe("benchmark report generation", () => {
       reasoning_output_ratio: 4 / 6,
       length_finish_count: 1,
       converge_turns: 2,
+      completion_limitations: { tasks: 1, total: 1 },
       usage: { reasoning_tokens: 4, cache_read_tokens: 8 }
     });
     expect(report.lane_metrics).toMatchObject({ verifier_reached: 0, verifier_passed: 0 });
@@ -898,7 +1163,7 @@ describe("benchmark report generation", () => {
     await writeFile(
       path.join(runDir, "config.json"),
       `${JSON.stringify(
-        {
+        completeReportConfig({
           run_id: "harbor-reward-run",
           provider: "deepseek",
           model: "deepseek-v4-pro",
@@ -907,7 +1172,7 @@ describe("benchmark report generation", () => {
           command_text: "harbor run -l 1",
           exit_code: 0,
           status: "passed"
-        },
+        }),
         null,
         2
       )}\n`,
@@ -921,7 +1186,8 @@ describe("benchmark report generation", () => {
     const taskDir = path.join(runDir, "tasks", "task-a");
     await mkdir(taskDir, { recursive: true });
     await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
-      task_id: "task-a", status: "passed", source_logs_dir: path.join(trialDir, "agent")
+      task_id: "task-a", status: "passed", source_logs_dir: path.join(trialDir, "agent"),
+      execution_backend: "sandbox:bwrap"
     })}\n`, "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
@@ -1025,7 +1291,7 @@ describe("benchmark report generation", () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-harbor-warning-"));
     await writeFile(
       path.join(runDir, "config.json"),
-      `${JSON.stringify({
+      `${JSON.stringify(completeReportConfig({
         run_id: "harbor-warning-run",
         provider: "deepseek",
         model: "deepseek-v4-pro",
@@ -1034,7 +1300,7 @@ describe("benchmark report generation", () => {
         command_text: "harbor run -l 1",
         exit_code: 1,
         status: "failed"
-      })}\n`,
+      }))}\n`,
       "utf8"
     );
     await writeFile(path.join(runDir, "harbor.stdout.log"), "", "utf8");
@@ -1045,7 +1311,8 @@ describe("benchmark report generation", () => {
     const taskDir = path.join(runDir, "tasks", "task-a");
     await mkdir(taskDir, { recursive: true });
     await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
-      task_id: "task-a", status: "failed", source_logs_dir: path.join(trialDir, "agent")
+      task_id: "task-a", status: "failed", source_logs_dir: path.join(trialDir, "agent"),
+      execution_backend: "sandbox:bwrap"
     })}\n`, "utf8");
     await writeFile(
       path.join(taskDir, "summary.json"),
@@ -1529,7 +1796,7 @@ describe("benchmark report generation", () => {
 
   it("accounts for every Harbor trial and keeps UUID mirror orphans out of scoring", async () => {
     const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-five-trials-"));
-    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify(completeReportConfig({
       run_id: "five-trials",
       provider: "deepseek",
       model: "deepseek-v4-pro",
@@ -1540,7 +1807,7 @@ describe("benchmark report generation", () => {
       finished_at: "2026-07-15T00:00:00.000Z",
       exit_code: 0,
       status: "passed"
-    })}\n`, "utf8");
+    }))}\n`, "utf8");
     await writeFile(path.join(runDir, "resolved-job.config.json"), `${JSON.stringify({
       n_concurrent_trials: 5,
       tasks: Array.from({ length: 5 }, (_value, index) => ({ name: `terminal-bench/task-${index + 1}` }))
@@ -1559,7 +1826,10 @@ describe("benchmark report generation", () => {
       await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
         trial_name: `trial-${index + 1}`,
         task_name: `terminal-bench/task-${index + 1}`,
-        agent_result: setupError ? null : { metadata: { exit_code: 0 }, n_input_tokens: 10, n_output_tokens: 2 },
+        agent_result: {
+          metadata: { exit_code: setupError ? index + 1 : 0, execution_backend: "sandbox:bwrap" },
+          ...(setupError ? {} : { n_input_tokens: 10, n_output_tokens: 2 })
+        },
         verifier_result: setupError ? null : { rewards: { reward: 0 } },
         exception_info: setupError ? {
           exception_type: "RuntimeError",

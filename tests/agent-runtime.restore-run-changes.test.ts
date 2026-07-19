@@ -130,7 +130,9 @@ describe("restore_run_changes transaction control", () => {
       store,
       storeRootDir,
       permissionMode: "auto",
-      runDeadlineMs: 60_000
+      // Keep this transaction-control test outside deadline convergence so
+      // the restore request reaches the active-process safety preflight.
+      runDeadlineMs: 300_000
     });
     const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
 
@@ -174,8 +176,13 @@ describe("restore_run_changes transaction control", () => {
       type: "tool.failed",
       payload: expect.objectContaining({
         callId: "invalid-write-plan",
-        diagnostics: ["write_scope_required"],
-        outcome: expect.objectContaining({ diagnosticCodes: ["write_scope_required"] })
+        diagnostics: ["tool_arguments_stale"],
+        outcome: expect.objectContaining({ diagnosticCodes: ["tool_arguments_stale"] }),
+        result: {
+          status: "rejected",
+          code: "tool_arguments_stale",
+          nextArguments: { executable: "fixture", expectedChanges: ["src"] }
+        }
       })
     }));
   });

@@ -236,8 +236,9 @@ describe("semantic execution failure convergence", () => {
     const content = state.messages.at(-1)?.content ?? "";
     expect(content).toContain("Failed tool receipt ID: modern");
     expect(content).toContain("Receipt summary (JSON):");
-    expect(content).toContain('"diagnosticCodes":["executable_not_found"]');
-    expect(content).toContain('"evidenceId":"diagnostic-proof"');
+    expect(content).toContain('"diagnosticCodes":{"version":"bounded_projection_v1"');
+    expect(content).toContain('"entries":["executable_not_found"]');
+    expect(content).toContain("evidenceId=diagnostic-proof");
     expect(content).toContain("Output:\nnode was unavailable");
     expect(state.receipts[0]).toMatchObject({
       outcome: { status: "failed", diagnosticCodes: ["executable_not_found"] }
@@ -266,6 +267,58 @@ describe("semantic execution failure convergence", () => {
     expect(content).toContain("artifact-1");
     expect(content).toContain("sha256=");
     expect(content).toContain("tail");
+  });
+
+  it("projects large result and workspace lists with counts, digests, and evidence references", () => {
+    const receipt = toolReceipt({
+      callId: "large-lists",
+      ok: true,
+      output: "ok",
+      result: {
+        checkpoints: Array.from({ length: 10_000 }, (_unused, index) => ({
+          checkpointId: `checkpoint-${index}`, status: "ready", paths: [`path-${index}`]
+        }))
+      },
+      outcome: { status: "succeeded", output: "ok", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      workspaceDelta: {
+        added: Array.from({ length: 10_000 }, (_unused, index) => `generated/${index}.txt`),
+        modified: [],
+        deleted: []
+      },
+      artifacts: [], diagnostics: [], evidence: [], startedAt: "start", completedAt: "end"
+    });
+
+    const content = receiptContent(receipt!);
+    expect(content.length).toBeLessThan(40_000);
+    expect(content).toContain('"version":"bounded_projection_v1"');
+    expect(content).toContain('"totalCount":10000');
+    expect(content).toContain('"omittedCount":9936');
+    expect(content).toContain('"evidenceRef":"tool-receipt:large-lists"');
+    expect(content).toMatch(/"digest":"[a-f0-9]{64}"/u);
+    expect(content).not.toContain("generated/9999.txt");
+  });
+
+  it("enforces one aggregate receipt budget across nested lists and hostile diagnostic strings", () => {
+    const nested = Object.fromEntries(Array.from({ length: 64 }, (_unused, outer) => [
+      `list-${outer}`,
+      Array.from({ length: 64 }, (_inner, index) => ({ id: `${outer}-${index}`, detail: "x".repeat(1_000) }))
+    ]));
+    const receipt = toolReceipt({
+      callId: "aggregate-budget",
+      ok: false,
+      output: "😀".repeat(20_000),
+      result: nested,
+      outcome: { status: "failed", output: "failed", diagnosticCodes: ["o".repeat(1_000_000)] },
+      observedEffects: [], artifacts: ["a".repeat(1_000_000)],
+      diagnostics: ["d".repeat(1_000_000)], evidence: [], startedAt: "start", completedAt: "end"
+    });
+
+    const content = receiptContent(receipt!);
+    expect(Buffer.byteLength(content, "utf8")).toBeLessThan(46 * 1024);
+    expect(content).toContain('"version":"bounded_projection_v1"');
+    expect(content).toMatch(/sha256=[a-f0-9]{64}/u);
+    expect(content).toContain("receipt output omitted; bytes=");
   });
 
   it("clusters equivalent infrastructure diagnostics across different tools and stops after three attempts", () => {
@@ -318,7 +371,7 @@ describe("semantic execution failure convergence", () => {
     });
   });
 
-  it("latches a reached cluster across another failure family and same-call evidence", () => {
+  it("counts parallel failure probes once and converges only across later model batches", () => {
     let state = queueTools(initial(), [
       { id: "infra-one", name: "shell" },
       { id: "infra-two", name: "exec" },
@@ -330,6 +383,14 @@ describe("semantic execution failure convergence", () => {
     state = failedReceipt(state, "infra-three", "shell_unavailable");
     expect(state.phase).toBe("tool_pending");
     state = failedReceipt(state, "other-family-last", "broker_timeout");
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      semanticFailureCluster: { family: "execution_capability", attempts: 1 }
+    });
+
+    state = failAlternative(state, "later-batch-two", "exec", "executable_not_found");
+    expect(state.semanticFailureCluster).toMatchObject({ family: "execution_capability", attempts: 2 });
+    state = failAlternative(state, "later-batch-three", "shell", "shell_unavailable");
     expect(state).toMatchObject({
       phase: "outcome_pending",
       semanticFailureCluster: { family: "execution_capability", attempts: 3 },
@@ -467,7 +528,7 @@ describe("semantic execution failure convergence", () => {
     });
   });
 
-  it("preserves the reached execution cluster through a fourth receipt and failed workspace delta", () => {
+  it("rebases parallel failure progress and reaches the limit only in later model batches", () => {
     const events: AgentEventEnvelope[] = [];
     let state = queueTools(initial(), [
       { id: "first", name: "exec" },
@@ -483,19 +544,26 @@ describe("semantic execution failure convergence", () => {
     expect(state).toMatchObject({
       phase: "tool_pending",
       semanticProgress: { workspaceChanges: 1 },
-      semanticFailureCluster: { family: "execution_capability", attempts: 3 }
+      semanticFailureCluster: { family: "execution_capability", attempts: 1 }
     });
 
     state = failedReceipt(state, "fourth", "process_spawn_failed", events, {
       added: [], modified: ["src/transient-fourth.ts"], deleted: []
     });
     expect(state).toMatchObject({
-      phase: "outcome_pending",
+      phase: "ready_model",
       semanticProgress: { workspaceChanges: 2 },
+      semanticFailureCluster: { family: "execution_capability", attempts: 1 }
+    });
+    expect(state.semanticFailureCluster?.progress).toEqual(state.semanticProgress);
+
+    state = failAlternative(state, "later-fifth", "exec", "executable_not_found", events);
+    state = failAlternative(state, "later-sixth", "shell", "shell_unavailable", events);
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
       semanticFailureCluster: { family: "execution_capability", attempts: 3 },
       proposedOutcome: { code: SEMANTIC_INFRASTRUCTURE_FAILURE_CODE }
     });
-    expect(state.semanticFailureCluster?.progress).toEqual(state.semanticProgress);
 
     const replayed = rehydrate(initial(), events);
     assertKernelInvariants(replayed);
@@ -516,7 +584,7 @@ describe("semantic execution failure convergence", () => {
     state = failedReceipt(state, "first", "process_spawn_failed");
     state = failedReceipt(state, "second", "executable_not_found");
     state = failedReceipt(state, "third", "shell_unavailable");
-    expect(state.semanticFailureCluster?.attempts).toBe(3);
+    expect(state.semanticFailureCluster?.attempts).toBe(1);
     state = completePendingTool(state, "recovery", {
       observedEffects: ["process.spawn.readonly"], actualEffects: ["process.spawn.readonly"]
     });

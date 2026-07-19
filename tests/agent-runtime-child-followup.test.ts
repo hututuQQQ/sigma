@@ -39,7 +39,7 @@ function completeTurn(id: string, summary: string): (request: ModelRequest) => M
 
 type ScriptedResponse = ModelResponse | ((request: ModelRequest) => ModelResponse);
 
-function reopenPlanTurn(): ModelResponse {
+function reopenPlanTurn(goal: string): ModelResponse {
   return {
     message: {
       role: "assistant",
@@ -49,7 +49,9 @@ function reopenPlanTurn(): ModelResponse {
         name: "update_plan",
         arguments: {
           expectedRevision: 2,
-          goal: "Complete the accepted follow-up request.",
+          // The delivered user follow-up owns the durable goal. The model may
+          // reopen/restructure the plan, but it cannot paraphrase that goal.
+          goal,
           activeNodeId: "root",
           nodes: [{
             id: "root",
@@ -126,11 +128,12 @@ describe("child follow-up lifecycle", () => {
     git(repository, "add", "tracked.txt");
     git(repository, "commit", "-m", "initial");
 
+    const followUp = "also write second.txt before finishing";
     const gateway = new FollowUpGateway([
       writeTurn("write-first", "first.txt", "first"),
       validationTurn("validate-first", [{ path: "first.txt", expected: "first" }]),
       completeTurn("complete-first", "first run complete"),
-      reopenPlanTurn(),
+      reopenPlanTurn(followUp),
       writeTurn("write-second", "second.txt", "second"),
       validationTurn("validate-second", [{ path: "second.txt", expected: "second" }]),
       completeTurn("complete-second", "follow-up run complete")
@@ -165,7 +168,7 @@ describe("child follow-up lifecycle", () => {
       metadata: { mode: "change" }
     });
     await gateway.firstStarted;
-    supervisor.followUp(child.id, "also write second.txt before finishing");
+    supervisor.followUp(child.id, followUp);
     gateway.release();
 
     const completed = await supervisor.join(child.id);

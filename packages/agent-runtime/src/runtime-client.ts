@@ -95,7 +95,6 @@ export class InProcessRuntimeClient implements RuntimeClient {
       runtime: options,
       maxParallelTools: options.maxParallelTools ?? 4,
       permissionMode: options.permissionMode ?? "ask",
-      outputReserveTokens: options.outputReserveTokens ?? Math.min(8_192, options.gateway.capabilities.maxOutputTokens),
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
       finish: async (session, outcome, outcomeRevision, suspensionContext) =>
         await this.finish(session, outcome, outcomeRevision, suspensionContext),
@@ -227,8 +226,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (command.type === "reviewer_waiver") return await this.commands.reviewerWaiver(session, command);
     if (command.type === "cancel") return await this.commands.cancel(session, command);
     if (command.type === "approve") return await this.commands.approval(session, command);
-    if (command.type === "steer") return await this.commands.steer(session, command.text);
-    if (command.type === "follow_up") return await this.commands.followUp(session, command.text);
+    if (command.type === "steer") return await this.commands.steer(session, command);
+    if (command.type === "follow_up") return await this.commands.followUp(session, command);
     await this.commands.submit(session, command);
   }
   private async handleResume(command: Extract<RunCommand, { type: "resume" }>): Promise<void> {

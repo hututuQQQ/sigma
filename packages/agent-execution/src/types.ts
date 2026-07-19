@@ -4,6 +4,9 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 export type NetworkPolicy = "none" | "loopback" | "full";
 export type SandboxMode = "required";
+export type ContainerEngine = "auto" | "docker" | "podman";
+export type ResolvedContainerEngine = Exclude<ContainerEngine, "auto">;
+export type ContainerTarget = "owned" | "managed";
 export type ProcessState = "running" | "exited" | "terminated" | "lost";
 export type ProcessLifecycle = "session" | "deliverable";
 
@@ -148,9 +151,15 @@ export interface BrokerCapabilities {
   executionRoots?: boolean;
   /** Shells listed here have passed the native sandbox self-test. */
   shells?: BrokerVerifiedShell[];
-  /** Bare executable aliases from package-trusted toolchains accepted during
-   * this broker connection. Absolute host paths are deliberately omitted. */
+  /** Bare executables proved present in the execution target for this connection. */
   runtimeCommands?: string[];
+  /** True only when omission proves unavailability in this connection's bounded
+   * executable namespace (the target-PATH probe for OCI, the manifest allowlist for native). */
+  runtimeCommandSnapshotComplete?: boolean;
+  /** Absolute PATH entries observed by the broker process. OCI clients use
+   * this connection-bound value instead of inheriting the control process's
+   * PATH when the target resolves a bare executable name. */
+  executableSearchPaths?: string[];
 }
 
 export interface BrokerVerifiedShell {
@@ -168,6 +177,63 @@ export interface BrokerDoctorReport {
   architecture: string;
   sandbox: BrokerSandboxReport;
   capabilities: BrokerCapabilities;
+  /** OCI availability, or the authenticated identity when this is an OCI broker. */
+  container?: BrokerContainerReport;
+}
+
+/** Authenticated OCI identity returned by the broker. A report is diagnostic;
+ * the broker must independently re-attest the target before every launch. */
+export interface BrokerContainerReport {
+  available: boolean;
+  backend: "oci";
+  engine?: ResolvedContainerEngine;
+  target?: ContainerTarget;
+  targetId?: string;
+  targetStartedAt?: string;
+  imageId?: string;
+  imageDigest?: string;
+  helperDigest?: string;
+  attestationDigest?: string;
+  reason?: string;
+}
+
+export interface ContainerExecutionConfig {
+  engine: ContainerEngine;
+  target: ContainerTarget;
+  /** Maximum network capability granted to the target container. */
+  network?: NetworkPolicy;
+  /** Immutable digest reference. Required for an owned target. */
+  image?: string;
+}
+
+/** Launcher-owned proof. It is deliberately absent from CLI/config types so a
+ * workspace, model, or evaluator cannot select a managed engine target. */
+export interface TrustedManagedContainerAttestationV1 {
+  protocolVersion: 1;
+  engine: ResolvedContainerEngine;
+  selector: string;
+  targetId: string;
+  targetStartedAt: string;
+  imageId: string;
+  imageDigest?: string;
+  labelsDigest: string;
+  /** Digest of the exact root-owned, read-only helper tree executed in the managed target. */
+  helperDigest: string;
+  attestationDigest: string;
+}
+
+export interface TrustedContainerBrokerRequest {
+  workspace: string;
+  config: ContainerExecutionConfig;
+  managedAttestation?: TrustedManagedContainerAttestationV1;
+}
+
+/** Product/launcher dependency only. Never construct this value from CLI,
+ * environment, workspace configuration, task metadata, or model output. */
+export interface TrustedContainerLauncherV1 {
+  protocolVersion: 1;
+  managedAttestation?: TrustedManagedContainerAttestationV1;
+  createBroker(request: TrustedContainerBrokerRequest): ExecutionBroker;
 }
 
 export interface BrokerSandboxLeaseStatus {
@@ -252,8 +318,15 @@ export interface ExecutionBroker {
 }
 
 export interface SigmaExecBrokerClientOptions {
-  helperPath: string;
+  /** Exactly one transport is required. socketPath/trustedStream are trusted
+   * product boundaries and must never come from model/workspace configuration. */
+  helperPath?: string;
+  socketPath?: string;
+  trustedStream?: Duplex;
   helperArgs?: string[];
+  /** Additional fixed parent for shared broker output artifacts. */
+  artifactRootParent?: string;
+  executionBackend?: "native" | "oci";
   sandboxMode?: SandboxMode;
   requestTimeoutMs?: number;
   /** Deadline for startup doctor/recovery and explicit sandbox setup. */
@@ -273,3 +346,4 @@ export interface SigmaExecBrokerClientOptions {
    */
   trustedToolchains?: TrustedToolchainManifestEntry[];
 }
+import type { Duplex } from "node:stream";

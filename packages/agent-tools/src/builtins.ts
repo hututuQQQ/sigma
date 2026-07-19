@@ -10,6 +10,7 @@ import {
   unavailableExecutionBroker,
   type ExecutionToolOptions
 } from "./execution-tools.js";
+import { resolveCommandTimeoutSec } from "./execution-tool-types.js";
 import { codeIntelTool, type CodeIntelToolOptions } from "./lsp-tools.js";
 import type { EffectToolRegistry, RegisteredEffectTool } from "./registry.js";
 import {
@@ -131,6 +132,9 @@ function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOpti
   const defaultShell = runtimeEnvironment().defaultShell;
   return {
     broker: options.broker ?? unavailableExecutionBroker(),
+    executionBackend: options.executionBackend,
+    executionPlatform: options.executionPlatform,
+    commandTimeoutSec: resolveCommandTimeoutSec(options.commandTimeoutSec),
     sandboxMode: options.sandboxMode ?? "required",
     readScope: options.readScope ?? "workspace",
     processHandoff: options.processHandoff ?? "allow",

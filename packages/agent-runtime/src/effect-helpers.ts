@@ -11,6 +11,7 @@ import { failed } from "./tool-receipt.js";
 
 export {
   completionFailure,
+  completionLimitations,
   completionPlan,
   completionPlanError,
   currentRunEvidence
@@ -26,6 +27,52 @@ export interface ModelToolProjectionCapabilities {
   executableSkillResourcesLoaded: boolean;
   gitAvailable?: boolean;
   lspAvailable?: boolean;
+}
+
+const FOREGROUND_EXECUTION_TOOLS = new Set(["exec", "validate"]);
+const SIMPLIFIED_EXECUTION_TOOLS = new Set(["exec", "shell", "validate"]);
+
+function hiddenProjectionFields(
+  descriptor: ToolDescriptor,
+  capabilities: ModelToolProjectionCapabilities
+): { fields: Set<string>; skillUnavailable: boolean } {
+  const foregroundExecution = FOREGROUND_EXECUTION_TOOLS.has(descriptor.name);
+  const skillUnavailable = descriptor.name === "process_spawn"
+    || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
+  const skillFields = skillUnavailable ? ["skill", "skillScript"] : [];
+  const accessFields = SIMPLIFIED_EXECUTION_TOOLS.has(descriptor.name)
+    ? ["access", "writeRoots", "writePaths"] : [];
+  return { fields: new Set([...skillFields, ...accessFields]), skillUnavailable };
+}
+
+function projectedDescriptor(
+  descriptor: ToolDescriptor,
+  capabilities: ModelToolProjectionCapabilities
+): ToolDescriptor {
+  const hiddenProjection = hiddenProjectionFields(descriptor, capabilities);
+  if (hiddenProjection.fields.size === 0) return descriptor;
+  const rawProperties = descriptor.inputSchema.properties;
+  if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
+  const properties = { ...(rawProperties as Record<string, JsonValue>) };
+  for (const key of hiddenProjection.fields) delete properties[key];
+  const required = Array.isArray(descriptor.inputSchema.required)
+    ? descriptor.inputSchema.required.filter((item) =>
+      typeof item !== "string" || !hiddenProjection.fields.has(item))
+    : undefined;
+  return {
+    ...descriptor,
+    description: hiddenProjection.skillUnavailable
+      ? descriptor.description.replace(
+        " With skill and skillScript, the frozen script is prepended to interpreter args.",
+        ""
+      )
+      : descriptor.description,
+    inputSchema: {
+      ...descriptor.inputSchema,
+      properties,
+      ...(required ? { required } : {})
+    }
+  };
 }
 
 /** Frozen sessions never acquire capabilities from changed live state.
@@ -74,32 +121,7 @@ export function projectModelToolDescriptors(
   const visible = capabilities.skillsAvailable
     ? sessionVisible
     : sessionVisible.filter((descriptor) => descriptor.name !== "load_skill");
-  return visible.map((descriptor) => {
-    const foregroundExecution = descriptor.name === "exec" || descriptor.name === "validate";
-    const unavailable = descriptor.name === "process_spawn"
-      || (foregroundExecution && !capabilities.executableSkillResourcesLoaded);
-    if (!unavailable) return descriptor;
-    const rawProperties = descriptor.inputSchema.properties;
-    if (!rawProperties || typeof rawProperties !== "object" || Array.isArray(rawProperties)) return descriptor;
-    const properties = { ...(rawProperties as Record<string, JsonValue>) };
-    delete properties.skill;
-    delete properties.skillScript;
-    const required = Array.isArray(descriptor.inputSchema.required)
-      ? descriptor.inputSchema.required.filter((item) => item !== "skill" && item !== "skillScript")
-      : undefined;
-    return {
-      ...descriptor,
-      description: descriptor.description.replace(
-        " With skill and skillScript, the frozen script is prepended to interpreter args.",
-        ""
-      ),
-      inputSchema: {
-        ...descriptor.inputSchema,
-        properties,
-        ...(required ? { required } : {})
-      }
-    };
-  });
+  return visible.map((descriptor) => projectedDescriptor(descriptor, capabilities));
 }
 
 export async function providerSizedPlan(

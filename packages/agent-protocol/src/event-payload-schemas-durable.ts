@@ -184,7 +184,8 @@ export const durableEventPayloadSchemas = {
     reviewerId: nonEmptyStringSchema,
     requestId: nonEmptyStringSchema.optional(),
     workspaceDeltaEvidenceIds: z.array(nonEmptyStringSchema),
-    validationEvidenceIds: z.array(nonEmptyStringSchema).optional()
+    validationEvidenceIds: z.array(nonEmptyStringSchema).optional(),
+    reviewRelevantEvidenceIds: z.array(nonEmptyStringSchema).optional()
   }).strict(),
   "review.completed": sharedSchemas.reviewEvidenceSchema,
   "review.waived": sharedSchemas.userWaiverEvidenceSchema

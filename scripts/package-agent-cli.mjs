@@ -57,6 +57,37 @@ const portableLanguageAssets = Object.freeze({
   pyrightServer: "node_modules/pyright/langserver.index.js"
 });
 
+function sourceRevisionOverride(env) {
+  const override = String(env.SIGMA_SOURCE_REVISION ?? "").trim().toLowerCase();
+  if (override && !/^[a-f0-9]{40}$/u.test(override)) {
+    throw new Error("SIGMA_SOURCE_REVISION must be a 40-character Git commit.");
+  }
+  return override;
+}
+
+function sourceDirtyOverride(env) {
+  const override = String(env.SIGMA_SOURCE_DIRTY ?? "").trim().toLowerCase();
+  if (override && override !== "true" && override !== "false") {
+    throw new Error("SIGMA_SOURCE_DIRTY must be true or false when supplied.");
+  }
+  return override;
+}
+
+export function repositoryBuildIdentity(rootDir, env = process.env, spawn = spawnSync) {
+  const override = sourceRevisionOverride(env);
+  const revisionResult = override ? null : spawn("git", ["rev-parse", "HEAD"], {
+    cwd: rootDir, encoding: "utf8", windowsHide: true
+  });
+  const detected = revisionResult?.status === 0 ? String(revisionResult.stdout).trim().toLowerCase() : "";
+  const revision = override || (/^[a-f0-9]{40}$/u.test(detected) ? detected : null);
+  const dirtyOverride = sourceDirtyOverride(env);
+  if (dirtyOverride) return { revision, dirty: dirtyOverride === "true" };
+  const status = spawn("git", ["status", "--porcelain", "--untracked-files=normal"], {
+    cwd: rootDir, encoding: "utf8", windowsHide: true
+  });
+  return { revision, dirty: status.status === 0 ? String(status.stdout).trim().length > 0 : null };
+}
+
 function bufferOccurrenceCount(buffer, marker) {
   let count = 0;
   let offset = 0;
@@ -1862,7 +1893,7 @@ function v3PackageMetadata(context, runtime, evidence) {
 }
 
 async function writePackageMetadata(context, runtime, evidence) {
-  const { release, targetPlatform, targetArch, bundleDir } = context;
+  const { release, targetPlatform, targetArch, bundleDir, rootDir, env } = context;
   const releaseChannel = targetPlatform === "win32" && evidence.signing?.policyVerified !== true
     ? "preview"
     : release.version.includes("-")
@@ -1875,6 +1906,7 @@ async function writePackageMetadata(context, runtime, evidence) {
     tier: "tier1",
     targetPlatform,
     targetArch,
+    source: repositoryBuildIdentity(rootDir, env),
     node: nodePackageMetadata(runtime, evidence.integrity),
     ...(evidence.integrity ? v3PackageMetadata(context, runtime, evidence) : {})
   };

@@ -431,12 +431,21 @@ describe("Sigma architecture", () => {
       });
       expect(gateway.requests[2]?.toolChoice).toBe("required");
       expect(gateway.requests[3]?.toolChoice).toBe("required");
-      expect(gateway.requests[3]?.messages.some((message) =>
-        message.content.includes("recognized passed claims: probe")
-        && message.content.includes("validation claims still missing: acceptance"))).toBe(true);
+      const afterProbe = gateway.requests[3]?.messages.map((message) => message.content).join("\n") ?? "";
+      expect(afterProbe).toMatch(
+        /recognized passed claims projection: version=bounded_projection_v1; totalCount=1; omittedCount=0; sha256=[a-f0-9]{64}; evidenceRef=runtime:validation-frontier:[^;\n]+:passed-claims/u
+      );
+      expect(afterProbe).toContain("visible entries: probe");
+      expect(afterProbe).toMatch(
+        /validation claims still missing projection: version=bounded_projection_v1; totalCount=1; omittedCount=0; sha256=[a-f0-9]{64}; evidenceRef=runtime:validation-frontier:[^;\n]+:missing-claims/u
+      );
+      expect(afterProbe).toContain("visible entries: acceptance");
       expect(gateway.requests[4]?.toolChoice).toBeUndefined();
-      expect(gateway.requests[4]?.messages.some((message) =>
-        message.content.includes("recognized passed claims: acceptance, probe"))).toBe(true);
+      const afterAcceptance = gateway.requests[4]?.messages.map((message) => message.content).join("\n") ?? "";
+      expect(afterAcceptance).toMatch(
+        /recognized passed claims projection: version=bounded_projection_v1; totalCount=2; omittedCount=0; sha256=[a-f0-9]{64}; evidenceRef=runtime:validation-frontier:[^;\n]+:passed-claims/u
+      );
+      expect(afterAcceptance).toContain("visible entries: acceptance, probe");
       expect((await readdir(workspace)).sort()).toEqual([".agent", "settings.json"]);
     } finally {
       await broker.close();
@@ -507,6 +516,7 @@ describe("Sigma architecture", () => {
           defaultShell: process.platform === "win32" ? "cmd" : "bash",
           availableShells: [process.platform === "win32" ? "cmd" : "bash"],
           availableRuntimeCommands: ["node"],
+          runtimeCommandSnapshotComplete: true,
           executionCapabilitiesVerified: true,
           executionMode: "sandboxed",
           pathSeparator: path.sep
@@ -521,10 +531,15 @@ describe("Sigma architecture", () => {
         kind: "completed",
         message: expect.stringMatching(/Implemented app\.mjs\.[\s\S]*Validated app\.mjs\./u)
       });
-      expect(gateway.requests.some((request) => request.messages.some((message) =>
-        message.content.includes("capability fallback: substantive acceptance plus available static validation")))).toBe(true);
-      expect(gateway.requests.some((request) => request.messages.some((message) =>
-        message.content.includes("validation claims still missing: unit")))).toBe(false);
+      const modelContext = gateway.requests.flatMap((request) => request.messages)
+        .map((message) => message.content).join("\n");
+      expect(modelContext).toMatch(
+        /capability fallback paths \(acceptance plus available static validation\) projection: version=bounded_projection_v1; totalCount=1; omittedCount=0; sha256=[a-f0-9]{64}; evidenceRef=runtime:validation-capabilities:[^;\n]+:fallback-paths/u
+      );
+      expect(modelContext).toContain("visible entries: app.mjs");
+      expect(modelContext).toMatch(
+        /validation claims still missing projection: version=bounded_projection_v1; totalCount=0; omittedCount=0; sha256=[a-f0-9]{64}; evidenceRef=runtime:validation-frontier:[^;\n]+:missing-claims/u
+      );
     } finally {
       await broker.close();
     }

@@ -11,7 +11,11 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { runCommand } from "../packages/agent-cli/src/commands/run.js";
+import {
+  runCommand,
+  runOutcomeExitCode,
+  runOutcomeResult
+} from "../packages/agent-cli/src/commands/run.js";
 import { createModelGateway } from "../packages/agent-model/src/index.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
@@ -195,6 +199,29 @@ function runDeps(script: ScriptedResponse[]) {
 }
 
 describe("run command branch coverage", () => {
+  it("preserves completed-with-limitations status while returning success", () => {
+    const outcome = {
+      kind: "completed_with_limitations" as const,
+      message: "artifact produced",
+      evidence: [],
+      limitations: [{
+        kind: "validation_capability_unavailable" as const,
+        claim: "unit" as const,
+        attemptedCommandSummary: "pnpm test",
+        capabilityEvidenceId: "validation-proof",
+        reason: "The test runner is unavailable."
+      }]
+    };
+    expect(runOutcomeExitCode(outcome)).toBe(0);
+    expect(runOutcomeResult(outcome, "session-limited")).toMatchObject({
+      status: "completed_with_limitations",
+      finishReason: "completed_with_limitations",
+      sessionId: "session-limited",
+      finalMessage: "artifact produced",
+      limitations: [{ capabilityEvidenceId: "validation-proof" }]
+    });
+  });
+
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
     await expect(runCommand(["--help"], { stdout: runHelp })).resolves.toBe(0);
@@ -243,7 +270,12 @@ describe("run command branch coverage", () => {
       evidenceRequest("stream-evidence"), complete("stream complete"), confirmNoChange("confirm-stream")
     ]) });
     expect(code).toBe(0);
-    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as { type: string });
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      payload?: { validationRequirement?: string };
+    });
+    expect(records.find((record) => record.type === "run.started")?.payload)
+      .toMatchObject({ validationRequirement: "default" });
     expect(records.some((record) => record.type === "model.started")).toBe(true);
     expect(records.some((record) => record.type === "run.completed")).toBe(true);
     expect(records.at(-1)?.type).toBe("result");

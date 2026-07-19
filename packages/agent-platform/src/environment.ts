@@ -6,6 +6,8 @@ export interface RuntimeEnvironment {
   defaultShell: ShellKind | "none";
   availableShells: ShellKind[];
   availableRuntimeCommands: string[];
+  /** Whether absence from availableRuntimeCommands is a trusted negative result. */
+  runtimeCommandSnapshotComplete: boolean;
   /** Trusted launcher-discovered language-server presets that are actually executable. */
   availableLanguageServers?: string[];
   executionCapabilitiesVerified: boolean;
@@ -24,6 +26,7 @@ export function runtimeEnvironment(platform: NodeJS.Platform = process.platform)
     defaultShell,
     availableShells: [defaultShell],
     availableRuntimeCommands: [],
+    runtimeCommandSnapshotComplete: false,
     executionCapabilitiesVerified: false,
     executionMode: "sandboxed",
     pathSeparator: platform === "win32" ? "\\" : "/"
@@ -44,11 +47,11 @@ export function runtimePrompt(environment = runtimeEnvironment()): string {
     `defaultShell=${defaultShell}`,
     `verifiedShells=${verifiedShells.join(",") || "none"}`,
     `verifiedRuntimeCommands=${verifiedRuntimeCommands.join(",") || "none"}`,
+    `runtimeCommandSnapshot=${environment.runtimeCommandSnapshotComplete ? "complete" : "unknown"}`,
     `pathSeparator=${environment.pathSeparator}.`,
     `executionMode=${environment.executionMode ?? "sandboxed"}`,
     environment.executionMode === "container"
-      ? "Execution uses a real OCI backend with staged workspace merge; if it is unavailable the run is blocked."
-      : "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands.",
-    "Do not probe or retry unlisted host commands."
+      ? "Execution uses an attested OCI target and a shared target workspace; bare commands resolve against target PATH, never control or host PATH, and target capability failures do not fall back to the host."
+      : "Execution capabilities are closed-world: use shell only through a listed verified shell kind and use bare executable names only from verifiedRuntimeCommands. Do not probe or retry unlisted host commands."
   ].join("; ");
 }

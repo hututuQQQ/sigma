@@ -6,6 +6,12 @@ function verifiedRuntimeCommands(session: RuntimeSession): string[] {
   return environment?.executionCapabilitiesVerified ? environment.availableRuntimeCommands : [];
 }
 
+function runtimeCommandSnapshotComplete(session: RuntimeSession): boolean {
+  const environment = session.services.runtimeEnvironment;
+  return environment?.executionCapabilitiesVerified === true
+    && environment.runtimeCommandSnapshotComplete === true;
+}
+
 /** Refresh the non-durable profile whenever the workspace state changes.
  * Restore deliberately starts without a cache and therefore re-derives it. */
 export async function refreshValidationCapabilityProfile(
@@ -24,7 +30,8 @@ export async function refreshValidationCapabilityProfile(
       signal,
       {
         stateDigest,
-        availableCommands: verifiedRuntimeCommands(session)
+        availableCommands: verifiedRuntimeCommands(session),
+        availableCommandsComplete: runtimeCommandSnapshotComplete(session)
       }
     );
   } catch {
@@ -34,6 +41,7 @@ export async function refreshValidationCapabilityProfile(
       stateDigest,
       complete: false,
       availableCommands: verifiedRuntimeCommands(session),
+      availableCommandsComplete: false,
       projects: []
     };
   }

@@ -20,6 +20,7 @@ describe("Sigma config", () => {
       readScope: "workspace",
       networkMode: "none",
       processHandoff: "allow",
+      commandTimeoutSec: 600,
       outputSchema: 3,
       legacySingleModelRoute: false,
       budget: { maxInputTokens: 8_000_000, maxOutputTokens: 1_000_000, maxCostMicroUsd: 50_000_000 }
@@ -30,6 +31,12 @@ describe("Sigma config", () => {
     const options = { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") };
     expect(loadCliConfig({ provider: "glm" }, options).legacySingleModelRoute).toBe(true);
     expect(loadCliConfig({ model: "glm-5.2" }, options).legacySingleModelRoute).toBe(true);
+  });
+
+  it("loads the public command timeout cap from flags and environment", () => {
+    const options = { env: {}, cwd: process.cwd(), homeDir: path.join(process.cwd(), ".missing-home") };
+    expect(loadCliConfig({ "command-timeout-sec": "180" }, options).commandTimeoutSec).toBe(180);
+    expect(loadCliConfig({}, { ...options, env: { SIGMA_COMMAND_TIMEOUT_SEC: "240" } }).commandTimeoutSec).toBe(240);
   });
 
   it("passes an explicit model catalog into production composition config", () => {
@@ -73,7 +80,26 @@ describe("Sigma config", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-config-container-"));
     expect(loadCliConfig({ "execution-mode": "container" }, {
       env: {}, cwd: root, homeDir: path.join(root, "missing-home")
-    }).executionMode).toBe("container");
+    })).toMatchObject({
+      executionMode: "container",
+      containerEngine: "auto",
+      containerTarget: "managed"
+    });
+    expect(loadCliConfig({
+      "execution-mode": "container",
+      "container-engine": "podman",
+      "container-target": "owned",
+      "container-image": `registry.example/sigma@sha256:${"1".repeat(64)}`
+    }, {
+      env: {}, cwd: root, homeDir: path.join(root, "missing-home")
+    })).toMatchObject({
+      containerEngine: "podman",
+      containerTarget: "owned",
+      containerImage: `registry.example/sigma@sha256:${"1".repeat(64)}`
+    });
+    expect(() => loadCliConfig({ "container-engine": "runc" }, {
+      env: {}, cwd: root, homeDir: path.join(root, "missing-home")
+    })).toThrow(/auto, docker, podman/u);
     expect(() => loadCliConfig({ "execution-mode": "disposable-container" }, {
       env: {}, cwd: root, homeDir: path.join(root, "missing-home")
     })).toThrow(/sandboxed, container/u);

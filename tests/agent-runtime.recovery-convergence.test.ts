@@ -16,7 +16,11 @@ import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import { armRunDeadline } from "../packages/agent-runtime/src/run-deadline.js";
 import { convergedToolFailure } from "../packages/agent-runtime/src/capability-failure-convergence.js";
-import { resolveToolIdleWatchdogMs } from "../packages/agent-runtime/src/tool-execution-monitor.js";
+import { executionCapabilityRetryFailure } from "../packages/agent-runtime/src/model-tool-availability.js";
+import {
+  deadlineBoundedToolTimeoutMs,
+  resolveToolIdleWatchdogMs
+} from "../packages/agent-runtime/src/tool-execution-monitor.js";
 import { completionRepairPhase } from "../packages/agent-runtime/src/tool-turn-policy.js";
 import type { RuntimeOptions } from "../packages/agent-runtime/src/types.js";
 import { completeAgentEventPayload } from "./testkit/agent-event-fixtures.js";
@@ -79,6 +83,18 @@ describe("runtime recovery convergence", () => {
     expect(convergedToolFailure(
       session, { ...shell, id: "shell-2" }, "2026-01-01T00:00:00.000Z", failure, signal
     ).diagnostics).toContain("capability_retry_exhausted");
+    expect(executionCapabilityRetryFailure(
+      session,
+      { ...other, id: "other-2" },
+      descriptor(),
+      "2026-01-01T00:00:00.000Z"
+    )).toBeUndefined();
+    expect(executionCapabilityRetryFailure(
+      session,
+      { ...shell, id: "shell-3" },
+      descriptor(),
+      "2026-01-01T00:00:00.000Z"
+    )).toMatchObject({ diagnostics: ["capability_retry_exhausted"] });
   });
 
   it("allows natural completion only after assurance readiness actually advances", () => {
@@ -109,6 +125,9 @@ describe("runtime recovery convergence", () => {
         stateDigest: "a".repeat(64), coveredPaths,
         claim: {
           kind, commandDigest: kind.padEnd(64, "0"), status: "passed",
+          strength: kind === "unit" ? "behavioral" : "structural",
+          independence: kind === "unit" ? "cross_method" : "same_method",
+          assertionMode: kind === "unit" ? "explicit" : "exit_code_only",
           subject: { projectId: ".", configPaths: [], selectedTests: [], exactFiles: [] }
         }
       }
@@ -126,6 +145,34 @@ describe("runtime recovery convergence", () => {
     expect(resolveToolIdleWatchdogMs(runtime(false), descriptor(120_000))).toBeUndefined();
     expect(resolveToolIdleWatchdogMs(runtime(240_000), descriptor(120_000))).toBe(240_000);
     expect(() => resolveToolIdleWatchdogMs(runtime(0), descriptor(120_000))).toThrow("positive integer");
+  });
+
+  it("reserves one bounded terminal model turn before a non-terminal tool deadline", () => {
+    const session = runtimeSessionFixture();
+    session.durable.state.deadlineRemainingMs = 373_800;
+    session.durable.state.usage = [{
+      provider: "fixture",
+      modelId: "fixture",
+      runId: session.durable.runId,
+      role: "orchestrator",
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      outputTokens: 8_192,
+      reasoningTokens: 0,
+      latencyMs: 123_700
+    }];
+    const nonTerminal = {
+      exactEffects: ["validation" as const], readPaths: [], writePaths: [], network: "none" as const,
+      processMode: "pipe" as const, checkpointScope: [], idempotence: "read_only" as const
+    };
+    const terminal = {
+      ...nonTerminal,
+      exactEffects: ["outcome.propose" as const],
+      processMode: "none" as const
+    };
+
+    expect(deadlineBoundedToolTimeoutMs(session, descriptor(), nonTerminal)).toBe(243_800);
+    expect(deadlineBoundedToolTimeoutMs(session, descriptor(), terminal)).toBe(363_800);
   });
 
   it("assigns one stable code to the durable run deadline abort reason", async () => {

@@ -19,9 +19,31 @@ export const linuxPackageFakeModelSmokeScript = fileURLToPath(import.meta.url);
 function realSandboxValidationTurn() {
   return fakeToolTurn([fakeToolCall("validate-package-smoke", "validate", {
     executable: "node",
-    args: ["--check", "hello.js"],
-    access: "readonly"
+    args: ["--check", "hello.js"]
   })]);
+}
+
+function realSandboxAcceptanceTurn() {
+  return fakeToolTurn([fakeToolCall("accept-package-smoke", "validate", {
+    executable: "node",
+    args: [
+      "-e",
+      "const fs=require('node:fs');const expected='const helloFromPackage = true;\\n';"
+        + "if(fs.readFileSync('hello.js','utf8')!==expected){throw new Error('hello.js content mismatch');}"
+    ]
+  })]);
+}
+
+export function linuxPackageSmokeResponses() {
+  return [
+    fakeToolTurn([fakeToolCall("write-package-smoke", "write", {
+      path: "hello.js", content: "const helloFromPackage = true;\n"
+    })]),
+    realSandboxValidationTurn,
+    realSandboxAcceptanceTurn,
+    fakeFinalTurn("Portable package fake-model smoke completed."),
+    fakeReviewerTurn()
+  ];
 }
 
 export async function runLinuxPackageFakeModelSmoke() {
@@ -36,14 +58,7 @@ export async function runLinuxPackageFakeModelSmoke() {
   ]);
   if (initCode !== 0) throw new Error(`agent init failed with exit ${initCode}`);
 
-  const gateway = new SmokeFakeGateway([
-    fakeToolTurn([fakeToolCall("write-package-smoke", "write", {
-      path: "hello.js", content: "const helloFromPackage = true;\n"
-    })]),
-    realSandboxValidationTurn,
-    fakeFinalTurn("Portable package fake-model smoke completed."),
-    fakeReviewerTurn()
-  ]);
+  const gateway = new SmokeFakeGateway(linuxPackageSmokeResponses());
   const composition = await createConfiguredRuntime(smokeRuntimeConfig(workspace), {
     gatewayFactory: () => gateway,
     stateRootDir: stateRoot

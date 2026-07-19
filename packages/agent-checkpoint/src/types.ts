@@ -1,6 +1,6 @@
 export type CheckpointStatus = "open" | "sealed" | "restored";
 
-export type CheckpointEntryKind = "file" | "directory" | "symlink";
+export type CheckpointEntryKind = "file" | "directory" | "symlink" | "reproducible_root";
 
 export interface CheckpointCasIdentity {
   dev: string;
@@ -11,6 +11,12 @@ export interface CheckpointCasIdentity {
   ctimeNs: string;
 }
 
+export interface CheckpointRootIdentity {
+  dev: string;
+  ino: string;
+  birthtimeMs: string;
+}
+
 export interface CheckpointEntry {
   path: string;
   kind: CheckpointEntryKind;
@@ -18,6 +24,9 @@ export interface CheckpointEntry {
   size: number;
   digest?: string;
   casIdentity?: CheckpointCasIdentity;
+  /** Stable identity of a shallow reproducible-root marker. Descendant
+   * timestamps are intentionally excluded, but replacing the root is not. */
+  rootIdentity?: CheckpointRootIdentity;
   linkTarget?: string;
   /** Required for newly captured Windows links so restore never guesses from the live postimage. */
   linkType?: "file" | "directory";
@@ -70,7 +79,13 @@ export interface CheckpointRecord {
   restoredAt?: string;
   preManifestDigest: string;
   postManifestDigest?: string;
+  /** Merkle root for the exact delta. Persisted records externalize the path
+   * list through this digest and hydrate `delta` only at the trusted API. */
+  deltaDigest?: string;
   delta?: CheckpointDelta;
+  /** Roots absent in the preimage that a trusted execution capability marks
+   * reproducible. They are represented and rolled back as one directory each. */
+  reproducibleRootPaths?: string[];
 }
 
 function stringArray(value: unknown): value is string[] {
@@ -125,7 +140,9 @@ export function isCheckpointRecord(value: unknown): value is CheckpointRecord {
     optionalString(record.restoredAt),
     checkpointDigest(record.preManifestDigest),
     optionalCheckpointDigest(record.postManifestDigest),
-    optionalCheckpointDelta(record.delta)
+    optionalCheckpointDigest(record.deltaDigest),
+    optionalCheckpointDelta(record.delta),
+    record.reproducibleRootPaths === undefined || stringArray(record.reproducibleRootPaths)
   ].every(Boolean);
 }
 
@@ -135,6 +152,11 @@ export interface CreateCheckpointInput {
   workspacePath: string;
   scopePaths: string[];
   baseSeq: number;
+  /** Trusted, capability-derived dependency/cache roots. Only roots proven
+   * absent at create time and outside explicit deliverables are compacted. */
+  reproducibleRootPaths?: string[];
+  /** User-visible outputs which must always retain exact per-entry tracking. */
+  explicitDeliverablePaths?: string[];
 }
 
 export interface CheckpointManagerOptions {

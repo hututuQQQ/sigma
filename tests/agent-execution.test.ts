@@ -525,6 +525,33 @@ describe("agent-execution protocol validation", () => {
       executionRoots: true,
       shells: [{ kind: "bash", executable: "/bin/bash", verified: true }]
     });
+    const containerDoctor = parseDoctor({
+      ...doctor,
+      sandbox: { ...doctor.sandbox, backend: "oci" },
+      container: {
+        available: true,
+        backend: "oci",
+        engine: "docker",
+        target: "managed",
+        targetId: "target-1",
+        targetStartedAt: "2026-07-19T00:00:00Z",
+        imageId: "image-1",
+        imageDigest: `sha256:${"1".repeat(64)}`,
+        attestationDigest: `sha256:${"2".repeat(64)}`
+      }
+    });
+    expect(containerDoctor.container).toMatchObject({
+      backend: "oci", engine: "docker", target: "managed", targetId: "target-1"
+    });
+    expect(() => parseDoctor({
+      ...doctor, container: { available: true, backend: "native" }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor, container: { available: true, backend: "oci", engine: "runc" }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor, container: { available: true, backend: "oci", target: "ambient" }
+    })).toThrow(BrokerProtocolError);
     expect(parseDoctor({
       ...doctor,
       platform: "windows",
@@ -539,11 +566,28 @@ describe("agent-execution protocol validation", () => {
       ...doctor,
       capabilities: {
         ...doctor.capabilities,
-        shells: [{ kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }]
+        shells: [{ kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }],
+        runtimeCommands: ["python", "git"],
+        runtimeCommandSnapshotComplete: true,
+        executableSearchPaths: ["/usr/local/bin", "/usr/bin", "/usr/bin"]
       }
-    }).capabilities.shells).toEqual([
-      { kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }
-    ]);
+    }).capabilities).toMatchObject({
+      shells: [{ kind: "bash", executable: "/bin/bash", verified: true, supportsChildProcesses: true }],
+      runtimeCommands: ["python", "git"],
+      runtimeCommandSnapshotComplete: true,
+      executableSearchPaths: ["/usr/local/bin", "/usr/bin"]
+    });
+    expect(() => parseDoctor({
+      ...doctor, capabilities: { ...doctor.capabilities, runtimeCommands: ["git\nforged"] }
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseDoctor({
+      ...doctor, capabilities: { ...doctor.capabilities, runtimeCommandSnapshotComplete: "true" }
+    })).toThrow(BrokerProtocolError);
+    for (const executableSearchPaths of [["relative/bin"], ["/usr/bin\0forged"], {}]) {
+      expect(() => parseDoctor({
+        ...doctor, capabilities: { ...doctor.capabilities, executableSearchPaths }
+      })).toThrow(BrokerProtocolError);
+    }
     expect(parseDoctor({
       ...doctor,
       sandbox: { ...doctor.sandbox, hardening: { ...doctor.sandbox.hardening, landlockAbi: undefined } }

@@ -70,6 +70,7 @@
     "eval:conformance": "node scripts/eval/conformance.mjs",
     "product:readiness": "node scripts/product-readiness-report.mjs",
     "smoke:harbor": "node scripts/run-bash.mjs scripts/smoke-harbor.sh",
+    "verify:oci:matrix": "node scripts/ci/sigma-oci-canary-matrix.mjs --engine auto",
     "verify:containment": "cargo build --locked --manifest-path native/sigma-exec/Cargo.toml && node scripts/verify-containment.mjs",
     "perf:repo-100k": "pnpm build && node scripts/perf-repository-100k.mjs",
     "perf:replay-v5-100k": "pnpm build && node --expose-gc scripts/perf-v5-replay-100k.mjs",
@@ -84,6 +85,8 @@
     "bench:tb:config:portable": "node scripts/package-harbor-runtime.mjs",
     "bench:tb:report": "node scripts/bench-report.mjs",
     "bench:tb:report:all": "node scripts/bench-report.mjs --all",
+    "bench:tb:sample:plan": "node scripts/bench-sample-plan.mjs",
+    "bench:tb:sample:gate": "node scripts/bench-paired-gate.mjs",
     "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs"
   },
   "devDependencies": {

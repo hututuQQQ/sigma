@@ -35,13 +35,22 @@ CHECKPOINT_RECOVERY_POLICIES = {"restore", "keep", "ask"}
 MAX_EXTERNAL_RECOVERIES = 8
 RECOVERY_POLL_INTERVAL_SEC = 0.25
 TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
+SUCCESS_STATUSES = {"completed", "completed_with_limitations"}
 FAILURE_KINDS = {
     "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
     "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
 }
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
-SUPPORTED_NETWORK_MODES = {"none", "full"}
+SUPPORTED_NETWORK_MODES = {"none", "loopback", "full"}
+CONTROL_SERVICE = "sigma-control"
+CONTROL_PACKAGE_PATH = "/opt/sigma-package/agent-cli.tgz"
+CONTROL_RUNTIME_ROOT = "/opt/sigma-control/agent-cli"
+CONTROL_AGENT_PATH = f"{CONTROL_RUNTIME_ROOT}/bin/agent"
+CONTROL_ATTESTATION_PATH = "/run/sigma-oci/attestation.json"
+SANDBOX_AGENT_PATH = "/usr/local/bin/agent"
+SHARED_HELPER_ROOT = "/opt/sigma-helper"
+WORKSPACE_PATH = "/app"
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
@@ -237,6 +246,13 @@ def _as_int(value: Any, fallback: int) -> int:
         except ValueError:
             return fallback
     return fallback
+
+
+def _positive_int(value: Any, name: str) -> int:
+    parsed = _as_int(value, 0)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def _normalize_globs(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -492,6 +508,10 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_profile: str = "standard",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
+        managed_provenance: bool = False,
+        container_engine: str = "docker",
+        max_turns: int = 256,
+        command_timeout_sec: int = 600,
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -528,6 +548,16 @@ class SigmaCliHarborAgent(BaseAgent):
                 "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
+        if not isinstance(managed_provenance, bool):
+            raise ValueError("managed_provenance must be a boolean")
+        self.managed_provenance = managed_provenance
+        if container_engine not in {"docker", "podman"}:
+            raise ValueError("container_engine must be one of: docker, podman")
+        self.container_engine = container_engine
+        self.max_turns = _positive_int(max_turns, "max_turns")
+        self.command_timeout_sec = _positive_int(
+            command_timeout_sec, "command_timeout_sec"
+        )
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
@@ -554,6 +584,8 @@ class SigmaCliHarborAgent(BaseAgent):
             str(reviewer_waiver_reason).strip() if reviewer_waiver_reason else None
         )
         self._workspace: str | None = None
+        self.execution_backend: str | None = None
+        self.container_metadata: dict[str, Any] = {}
 
     @staticmethod
     def name() -> str:
@@ -563,17 +595,23 @@ class SigmaCliHarborAgent(BaseAgent):
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        if self.execution_mode == "container":
+            await self._setup_container_runtime(environment)
+            return
+
         self._workspace = await self._resolve_workspace(environment)
+        identity_check = await self._observe_managed_target_identity(environment)
+        initial_checks = [identity_check] if identity_check is not None else []
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
-            await self._verify_agent_ready(environment)
+            await self._verify_agent_ready(environment, initial_checks)
             return
 
         tarball = self.agent_cli_tarball or self._tarball_from_env()
         if tarball is not None:
             await self._install_tarball(environment, tarball)
-            await self._verify_agent_ready(environment)
+            await self._verify_agent_ready(environment, initial_checks)
             return
 
         message = (
@@ -583,6 +621,222 @@ class SigmaCliHarborAgent(BaseAgent):
         )
         self._write_setup_checks([], "agent_setup_failed")
         raise RuntimeError(message)
+
+    async def _observe_managed_target_identity(self, environment: BaseEnvironment) -> dict[str, Any] | None:
+        """Collect launcher-requested provenance without changing sandboxed execution."""
+        if not self.managed_provenance:
+            return None
+        service_exec = getattr(environment, "service_exec", None)
+        if not callable(service_exec):
+            self._write_setup_checks([], "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: managed provenance requires Harbor compose service_exec"
+            )
+        try:
+            result = await service_exec(
+                f"cat {CONTROL_ATTESTATION_PATH}", service=CONTROL_SERVICE, timeout_sec=30
+            )
+        except Exception as error:
+            check = {
+                "stage": "managed_target_identity",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": _bounded_text(str(error)),
+                "status": "failed",
+                "reason": "control service could not provide managed attestation",
+            }
+            self._write_setup_checks([check], "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: managed provenance control service is unavailable"
+            ) from error
+        check = self._setup_check_record("managed_target_identity", result)
+        if _return_code(result) != 0:
+            check.update({
+                "status": "failed",
+                "reason": "control service could not provide managed attestation",
+            })
+            self._write_setup_checks([check], "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("managed_target_identity", result))
+        try:
+            attestation = json.loads(_stdout_text(result))
+        except json.JSONDecodeError:
+            check.update({"status": "failed", "reason": "attestation is not valid JSON"})
+            self._write_setup_checks([check], "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message(
+                "managed_target_identity", result, reason=check["reason"]
+            ))
+        required = (
+            "selector", "targetId", "targetStartedAt", "imageId", "labelsDigest",
+            "helperDigest", "attestationDigest",
+        )
+        valid = isinstance(attestation, dict) and attestation.get("protocolVersion") == 1 \
+            and attestation.get("engine") == self.container_engine \
+            and all(isinstance(attestation.get(field), str) and attestation[field] for field in required)
+        if not valid:
+            check.update({"status": "failed", "reason": "attestation identity fields are invalid"})
+            self._write_setup_checks([check], "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message(
+                "managed_target_identity", result, reason=check["reason"]
+            ))
+        self.container_metadata = {
+            "available": True,
+            "backend": "oci",
+            "target": "managed",
+            **{key: value for key, value in attestation.items() if key != "workspace"},
+        }
+        return check
+
+    @property
+    def _agent_path(self) -> str:
+        return CONTROL_AGENT_PATH if self.execution_mode == "container" else SANDBOX_AGENT_PATH
+
+    async def _runtime_exec(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        **kwargs: Any,
+    ) -> Any:
+        if self.execution_mode != "container":
+            return await environment.exec(command, **kwargs)
+        service_exec = getattr(environment, "service_exec", None)
+        if not callable(service_exec):
+            raise RuntimeError(
+                "agent_setup_failed: container mode requires Harbor compose service_exec; "
+                "execution in main or on the host is not an allowed fallback"
+            )
+        return await service_exec(command, service=CONTROL_SERVICE, **kwargs)
+
+    async def _runtime_download_file(
+        self,
+        environment: BaseEnvironment,
+        remote_path: str,
+        target_path: pathlib.Path,
+    ) -> None:
+        if self.execution_mode != "container":
+            await environment.download_file(remote_path, target_path)
+            return
+        service_download = getattr(environment, "service_download_file", None)
+        if not callable(service_download):
+            raise RuntimeError(
+                "agent_setup_failed: container mode requires Harbor compose service_download_file; "
+                "artifact collection from main or the host is not an allowed fallback"
+            )
+        await service_download(remote_path, target_path, service=CONTROL_SERVICE)
+
+    async def _setup_container_runtime(self, environment: BaseEnvironment) -> None:
+        if not callable(getattr(environment, "service_exec", None)):
+            self._write_setup_checks([], "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: container mode requires Harbor compose service_exec; "
+                "execution in main or on the host is not an allowed fallback"
+            )
+        if not callable(getattr(environment, "service_download_file", None)):
+            self._write_setup_checks([], "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: container mode requires Harbor compose service_download_file; "
+                "artifact collection from main or the host is not an allowed fallback"
+            )
+
+        checks: list[dict[str, Any]] = []
+        package_check = await self._runtime_exec(
+            environment,
+            f"""
+set -eu
+umask 022
+test -r {CONTROL_PACKAGE_PATH}
+rm -rf {CONTROL_RUNTIME_ROOT}.next
+mkdir -p {CONTROL_RUNTIME_ROOT}.next
+tar --no-same-owner --no-same-permissions -xzf {CONTROL_PACKAGE_PATH} -C {CONTROL_RUNTIME_ROOT}.next --strip-components=1
+test -x {CONTROL_RUNTIME_ROOT}.next/bin/agent
+test -x {CONTROL_RUNTIME_ROOT}.next/bin/node
+test -x {CONTROL_RUNTIME_ROOT}.next/bin/sigma-exec
+test -x {CONTROL_RUNTIME_ROOT}.next/bin/bwrap
+test -d {CONTROL_RUNTIME_ROOT}.next/lib
+rm -rf {CONTROL_RUNTIME_ROOT}
+mv {CONTROL_RUNTIME_ROOT}.next {CONTROL_RUNTIME_ROOT}
+chmod 0755 {CONTROL_RUNTIME_ROOT}/bin/agent {CONTROL_RUNTIME_ROOT}/bin/node
+test -x {SHARED_HELPER_ROOT}/bin/sigma-exec
+test -x {SHARED_HELPER_ROOT}/bin/bwrap
+test ! -e {SHARED_HELPER_ROOT}/agent
+test ! -e {SHARED_HELPER_ROOT}/node
+test ! -e {SHARED_HELPER_ROOT}/node_modules
+test "$(stat -c '%u:%g:%a' {SHARED_HELPER_ROOT}/bin/sigma-exec)" = "0:0:555"
+test "$(stat -c '%u:%g:%a' {SHARED_HELPER_ROOT}/bin/bwrap)" = "0:0:555"
+# Keep the redirection inside a child shell. In dash, a redirection failure on
+# the special builtin ':' exits the current non-interactive shell even when it
+# appears as an if condition; the subshell turns that failure into an ordinary
+# false condition for the parent running with `set -e`.
+if ( : > {SHARED_HELPER_ROOT}/.sigma-control-write-probe ) 2>/dev/null; then
+  rm -f {SHARED_HELPER_ROOT}/.sigma-control-write-probe
+  echo "control unexpectedly has write access to the trusted helper" >&2
+  exit 1
+fi
+""".strip(),
+            timeout_sec=180,
+        )
+        checks.append(self._setup_check_record("control_package", package_check))
+        if _return_code(package_check) != 0:
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("control_package", package_check))
+
+        # This is the only container-mode setup executed directly in Harbor's
+        # main service. The broker has already published the read-only helper;
+        # main only links bwrap and returns the shared workspace identity.
+        main_check = await environment.exec(
+            f"""
+set -eu
+test "$(pwd -P)" = {WORKSPACE_PATH}
+test -d {WORKSPACE_PATH} && test -r {WORKSPACE_PATH} && test -x {WORKSPACE_PATH}
+test -x {SHARED_HELPER_ROOT}/bin/sigma-exec
+test -x {SHARED_HELPER_ROOT}/bin/bwrap
+test "$(stat -c '%u:%g:%a' {SHARED_HELPER_ROOT}/bin/sigma-exec)" = "0:0:555"
+test "$(stat -c '%u:%g:%a' {SHARED_HELPER_ROOT}/bin/bwrap)" = "0:0:555"
+mkdir -p /usr/local/bin
+ln -sfn {SHARED_HELPER_ROOT}/bin/bwrap /usr/local/bin/bwrap
+test "$(readlink /usr/local/bin/bwrap)" = {SHARED_HELPER_ROOT}/bin/bwrap
+stat -c '%d:%i' {WORKSPACE_PATH}
+""".strip(),
+            timeout_sec=60,
+        )
+        checks.append(self._setup_check_record("main_boundary", main_check))
+        if _return_code(main_check) != 0:
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("main_boundary", main_check))
+
+        control_workspace = await self._runtime_exec(
+            environment,
+            f"""
+set -eu
+test "$(pwd -P)" = {WORKSPACE_PATH}
+test -d {WORKSPACE_PATH} && test -r {WORKSPACE_PATH} && test -x {WORKSPACE_PATH}
+i=0
+while test ! -S /run/sigma-oci/broker.sock || test ! -f /run/sigma-oci/attestation.json; do
+  i=$((i + 1))
+  test "$i" -le 30
+  sleep 1
+done
+stat -c '%d:%i' {WORKSPACE_PATH}
+""".strip(),
+            timeout_sec=45,
+        )
+        checks.append(self._setup_check_record("control_workspace", control_workspace))
+        if _return_code(control_workspace) != 0:
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(self._setup_failure_message("control_workspace", control_workspace))
+        main_identity = _stdout_text(main_check).strip().splitlines()[-1:]
+        control_identity = _stdout_text(control_workspace).strip().splitlines()[-1:]
+        if not main_identity or main_identity != control_identity:
+            checks[-1]["workspace_identity_error"] = {
+                "main": main_identity[0] if main_identity else None,
+                "control": control_identity[0] if control_identity else None,
+            }
+            self._write_setup_checks(checks, "agent_setup_failed")
+            raise RuntimeError(
+                "agent_setup_failed: sigma-control and main do not share the same /app workspace mount"
+            )
+
+        self._workspace = WORKSPACE_PATH
+        await self._verify_agent_ready(environment, checks)
 
     async def run(
         self,
@@ -605,7 +859,7 @@ class SigmaCliHarborAgent(BaseAgent):
         trace_path: pathlib.Path | None = None
         protocol_failure: dict[str, Any] | None = None
         try:
-            await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
+            await self._runtime_exec(environment, "mkdir -p /tmp/agent", timeout_sec=30)
             await self._upload_instruction(environment, instruction)
             result = await self._run_agent_once(environment, env_vars, context, recorder)
             events, output_result = self._merge_recorded_output(result, recorder)
@@ -640,7 +894,7 @@ class SigmaCliHarborAgent(BaseAgent):
                 error_message = str(output_result.get("message") or output_result.get("finalMessage") or reported_failure)
                 failure_kind = reported_failure
             elif event_failure is not None and (
-                output_result.get("status") not in {None, "completed"} or _return_code(result) != 0
+                output_result.get("status") not in {None, *SUCCESS_STATUSES} or _return_code(result) != 0
             ):
                 error_message = str(output_result.get("message") or output_result.get("finalMessage") or event_failure)
                 failure_kind = event_failure
@@ -671,7 +925,7 @@ class SigmaCliHarborAgent(BaseAgent):
                         or recorded_terminal.get("message")
                         or "agent requires external input"
                     )
-                elif status != "completed":
+                elif status not in SUCCESS_STATUSES:
                     reported_failure = (
                         recorded_terminal.get("failureKind")
                         or recorded_terminal.get("failure_kind")
@@ -795,6 +1049,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
+        summary.update(self._runtime_metadata())
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
@@ -824,7 +1079,7 @@ class SigmaCliHarborAgent(BaseAgent):
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
         command = [
-            "/usr/local/bin/agent",
+            self._agent_path,
             "run",
             "--workspace",
             self._workspace,
@@ -838,6 +1093,10 @@ class SigmaCliHarborAgent(BaseAgent):
             self.agent_profile,
             "--run-deadline-sec",
             str(self.max_wall_time_sec),
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--network",
             self.network_mode,
             "--read-scope",
@@ -857,6 +1116,8 @@ class SigmaCliHarborAgent(BaseAgent):
         ]
         if self.reviewer_waiver_reason:
             command.append("--waive-reviewer")
+        if self.execution_mode == "container":
+            command.extend(["--container-engine", self.container_engine, "--container-target", "managed"])
         return command
 
     def _agent_command_with_process_record(self, command: list[str]) -> str:
@@ -922,7 +1183,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
 """.strip()
         try:
             result = await asyncio.wait_for(
-                environment.exec(command, timeout_sec=PROCESS_CLEANUP_TIMEOUT_SEC),
+                self._runtime_exec(
+                    environment,
+                    command,
+                    timeout_sec=PROCESS_CLEANUP_TIMEOUT_SEC,
+                ),
                 timeout=PROCESS_CLEANUP_TIMEOUT_SEC,
             )
         except asyncio.CancelledError:
@@ -996,8 +1261,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         callback_scope = getattr(environment, "scoped_output_callback", None)
         if recorder is not None and callable(callback_scope):
             with callback_scope(recorder.callback):
-                return await environment.exec(command_text, **kwargs)
-        return await environment.exec(command_text, **kwargs)
+                return await self._runtime_exec(environment, command_text, **kwargs)
+        return await self._runtime_exec(environment, command_text, **kwargs)
 
     def _parse_stream_output(self, result: Any | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -1082,13 +1347,26 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     ) -> dict[str, Any] | None:
         if _return_code(result) != 0:
             return None
+        recorded = self._recorded_terminal_result(events, output_result)
+        if recorded is not None and isinstance(recorded.get("protocolError"), str):
+            return {
+                "process_exit_code": 0,
+                "protocol_error": recorded["protocolError"],
+                "terminal_event_received": any(
+                    event.get("type") in TERMINAL_EVENT_TYPES for event in events
+                ),
+                "result_status_received": isinstance(output_result.get("status"), str),
+                "result_finish_reason": output_result.get("finishReason")
+                or output_result.get("finish_reason"),
+                "last_event_type": events[-1].get("type") if events else None,
+            }
         terminal_event = next(
             (event for event in reversed(events) if event.get("type") in TERMINAL_EVENT_TYPES),
             None,
         )
         result_status = output_result.get("status")
         has_result_status = isinstance(result_status, str) and result_status in {
-            "completed", "needs_input", "cancelled", "error", "failed"
+            *SUCCESS_STATUSES, "needs_input", "cancelled", "error", "failed"
         }
         if terminal_event is not None or has_result_status:
             return None
@@ -1133,6 +1411,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         }
 
     def _protocol_failure_message(self, diagnostics: dict[str, Any]) -> str:
+        protocol_error = diagnostics.get("protocol_error")
+        if isinstance(protocol_error, str) and protocol_error:
+            return f"agent protocol incomplete: {protocol_error}"
         return "agent protocol incomplete: " + ", ".join([
             f"exit_code={diagnostics.get('process_exit_code')}",
             f"terminal_event_received={diagnostics.get('terminal_event_received')}",
@@ -1156,15 +1437,81 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return value
         return None
 
+    def _limitation_payload_error(self, limitations: Any) -> str | None:
+        if not isinstance(limitations, list) or not limitations:
+            return "completed_with_limitations requires a non-empty limitations list"
+        required = {
+            "kind", "claim", "attemptedCommandSummary", "capabilityEvidenceId", "reason"
+        }
+        claims = {"probe", "syntax", "typecheck", "lint", "unit", "integration", "acceptance"}
+        for index, limitation in enumerate(limitations):
+            if not isinstance(limitation, dict) or set(limitation) != required:
+                return f"limitation[{index}] does not match CompletionLimitationV1"
+            if limitation.get("kind") != "validation_capability_unavailable":
+                return f"limitation[{index}] has an unsupported kind"
+            if limitation.get("claim") not in claims:
+                return f"limitation[{index}] has an invalid validation claim"
+            for field in ("attemptedCommandSummary", "capabilityEvidenceId", "reason"):
+                value = limitation.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    return f"limitation[{index}].{field} must be a non-empty string"
+        return None
+
+    def _completion_output_error(self, result: dict[str, Any]) -> str | None:
+        status = result.get("status")
+        if status not in SUCCESS_STATUSES:
+            return None
+        if result.get("finishReason") != status:
+            return f"successful result status '{status}' must use the same finishReason"
+        if status == "completed_with_limitations":
+            return self._limitation_payload_error(result.get("limitations"))
+        if "limitations" in result:
+            return "ordinary completed result must not carry completion limitations"
+        return None
+
+    def _protocol_terminal_result(self, message: str, session_id: str) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "finishReason": "agent_protocol_invalid",
+            "failureKind": "agent_failure",
+            "sessionId": session_id,
+            "finalMessage": message,
+            "protocolError": message,
+        }
+
     def _recorded_terminal_result(
         self,
         events: list[dict[str, Any]],
         output_result: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if output_result.get("status") in {"completed", "needs_input", "cancelled", "error", "failed"}:
-            return dict(output_result)
         session_id = self._session_id(events, output_result) or ""
         terminal = self._terminal_result(events, session_id)
+        if terminal is not None and terminal.get("protocolError"):
+            return terminal
+        status = output_result.get("status")
+        if status in {*SUCCESS_STATUSES, "needs_input", "cancelled", "error", "failed"}:
+            output_error = self._completion_output_error(output_result)
+            if output_error is not None:
+                return self._protocol_terminal_result(output_error, session_id)
+            if status in SUCCESS_STATUSES:
+                if terminal is None:
+                    return self._protocol_terminal_result(
+                        f"{status} requires its matching run.completed event",
+                        session_id,
+                    )
+                if terminal.get("status") != status:
+                    return self._protocol_terminal_result(
+                        "terminal event and output result disagree about completion status",
+                        session_id,
+                    )
+                if status == "completed_with_limitations" and (
+                    terminal.get("limitations") != output_result.get("limitations")
+                ):
+                    return self._protocol_terminal_result(
+                        "terminal event and output result disagree about completion limitations",
+                        session_id,
+                    )
+            return dict(output_result)
         if terminal is not None:
             return terminal
         if self._pending_checkpoint(events) is not None:
@@ -1212,14 +1559,29 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             if event_type not in TERMINAL_EVENT_TYPES:
                 continue
             payload = _event_payload(event)
+            if event_type == "run.completed":
+                kind = payload.get("kind")
+                if kind not in SUCCESS_STATUSES:
+                    return self._protocol_terminal_result(
+                        "run.completed must declare kind completed or completed_with_limitations",
+                        session_id,
+                    )
+                limitation_error = self._limitation_payload_error(payload.get("limitations")) \
+                    if kind == "completed_with_limitations" else None
+                if limitation_error is not None:
+                    return self._protocol_terminal_result(limitation_error, session_id)
+                if kind == "completed" and "limitations" in payload:
+                    return self._protocol_terminal_result(
+                        "ordinary run.completed must not carry completion limitations",
+                        session_id,
+                    )
             status = {
-                "run.completed": "completed",
+                "run.completed": "completed_with_limitations"
+                if payload.get("kind") == "completed_with_limitations" else "completed",
                 "run.cancelled": "cancelled",
                 "run.failed": "failed",
             }[event_type]
-            finish_reason = payload.get("finishReason")
-            if not isinstance(finish_reason, str) or not finish_reason:
-                finish_reason = status
+            finish_reason = status
             final_message = payload.get("message")
             if not isinstance(final_message, str):
                 final_message = payload.get("finalMessage")
@@ -1250,7 +1612,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
         command: list[str] = [
-            "/usr/local/bin/agent",
+            self._agent_path,
             "session",
             subcommand,
             session_id,
@@ -1264,6 +1626,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             self.agent_profile,
             "--permission-mode",
             "auto",
+            "--max-model-turns",
+            str(self.max_turns),
+            "--command-timeout-sec",
+            str(self.command_timeout_sec),
             "--execution-mode",
             self.execution_mode,
             "--network",
@@ -1273,6 +1639,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "--process-handoff",
             "allow",
         ]
+        if self.execution_mode == "container":
+            command.extend(["--container-engine", self.container_engine, "--container-target", "managed"])
         return command
 
     async def _read_session_events(
@@ -1282,7 +1650,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         env_vars: dict[str, str],
     ) -> tuple[list[dict[str, Any]], str | None]:
         command = self._session_command("show", session_id) + ["--json"]
-        result = await environment.exec(
+        result = await self._runtime_exec(
+            environment,
             " ".join(shlex.quote(part) for part in command),
             env=env_vars or None,
             timeout_sec=30,
@@ -1322,7 +1691,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     checkpoint_id,
                     f"--{self.checkpoint_recovery}",
                 ]
-                recovery = await environment.exec(
+                recovery = await self._runtime_exec(
+                    environment,
                     " ".join(shlex.quote(part) for part in command),
                     env=env_vars or None,
                     timeout_sec=30,
@@ -1331,7 +1701,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     detail = _output_text(recovery).strip() or "session recover failed"
                     return merged, None, f"external checkpoint recovery failed: {detail}"
                 resume_command = self._session_command("resume", session_id)
-                resumed = await environment.exec(
+                resumed = await self._runtime_exec(
+                    environment,
                     " ".join(shlex.quote(part) for part in resume_command),
                     env=env_vars or None,
                     timeout_sec=30,
@@ -1357,7 +1728,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
     def _result_with_payload(self, base_result: Any, payload: dict[str, Any]) -> dict[str, Any]:
         status = payload.get("status")
         return {
-            "return_code": 0 if status == "completed" else 1,
+            "return_code": 0 if status in SUCCESS_STATUSES else 1,
             "stdout": f"{_stdout_text(base_result)}\n{json.dumps(payload, ensure_ascii=False)}\n",
             "stderr": _stderr_text(base_result),
         }
@@ -1397,10 +1768,19 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 "code": model_failure_payload.get("code"),
                 "diagnostics": model_diagnostics if isinstance(model_diagnostics, dict) else {},
             }
+        limitations = output_result.get("limitations")
+        if not isinstance(limitations, list):
+            terminal = next((event for event in reversed(events)
+                             if event.get("type") == "run.completed"), None)
+            terminal_limitations = _event_payload(terminal).get("limitations") \
+                if terminal is not None else None
+            limitations = terminal_limitations if isinstance(terminal_limitations, list) else []
         return {
             "schema_version": 1,
             "status": output_result.get("status"),
             "finish_reason": output_result.get("finishReason"),
+            "limitations": limitations,
+            "limitation_count": len(limitations),
             "session_id": output_result.get("sessionId") or self._session_id(events, output_result),
             "commands_executed": sum(event.get("type") in {"tool.completed", "tool.failed"} for event in events),
             "tool_calls": sum(event.get("type") == "tool.requested" for event in events),
@@ -1426,6 +1806,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            **self._runtime_metadata(),
             "agent_profile": self.agent_profile,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
@@ -1464,6 +1845,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
+            **self._runtime_metadata(),
             "last_event": last_event,
             "model_turns": live_state.get("model_turns", sum(event.get("type") == "model.started" for event in events)),
             "tool_calls": live_state.get(
@@ -1517,6 +1899,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
+            **self._runtime_metadata(),
         })
         summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1580,6 +1963,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                         "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
                         "terminal_origin": summary.get("terminal_origin"),
                         "execution_mode": summary.get("execution_mode"),
+                        "execution_backend": summary.get("execution_backend"),
+                        "container_engine": summary.get("container_engine"),
+                        "container_target": summary.get("container_target"),
+                        "target_image_id": summary.get("target_image_id"),
+                        "task_image_digest": summary.get("task_image_digest"),
                         "agent_profile": summary.get("agent_profile"),
                     } if summary is not None else {}),
                 }
@@ -1640,24 +2028,43 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             timeout_sec=180,
         )
 
-    async def _verify_agent_ready(self, environment: BaseEnvironment) -> None:
+    async def _verify_agent_ready(
+        self,
+        environment: BaseEnvironment,
+        initial_checks: list[dict[str, Any]] | None = None,
+    ) -> None:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        checks: list[dict[str, Any]] = []
-        help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
+        checks: list[dict[str, Any]] = list(initial_checks or [])
+        help_check = await self._runtime_exec(
+            environment,
+            f"{self._agent_path} --help",
+            timeout_sec=30,
+        )
         checks.append(self._setup_check_record("help", help_check))
         self._write_setup_checks(checks, "running")
         if _return_code(help_check) != 0:
             self._write_setup_checks(checks, "agent_setup_failed")
             raise RuntimeError(self._setup_failure_message("help", help_check))
 
-        doctor_check = await environment.exec(
-            " ".join([
-                "/usr/local/bin/agent doctor --workspace",
-                shlex.quote(self._workspace),
-                "--json --strict",
-                *( ["--check-api"] if self.check_api else [] ),
-            ]),
+        doctor_parts = [
+            self._agent_path,
+            "doctor",
+            "--workspace",
+            self._workspace,
+            "--json",
+            "--strict",
+            *(["--check-api"] if self.check_api else []),
+        ]
+        if self.execution_mode == "container":
+            doctor_parts.extend([
+                "--execution-mode", "container",
+                "--container-engine", self.container_engine,
+                "--container-target", "managed",
+            ])
+        doctor_check = await self._runtime_exec(
+            environment,
+            shlex.join(doctor_parts),
             env=self._agent_env() or None,
             timeout_sec=60,
         )
@@ -1685,6 +2092,24 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             )
         self.effective_network_mode = self.network_mode
         self.process_handoff_available = capabilities["processHandoff"]
+        sandbox = doctor_json.get("sandbox")
+        sandbox_backend = sandbox.get("backend") if isinstance(sandbox, dict) else None
+        if self.execution_mode == "container":
+            container = doctor_json["container"]
+            self.container_metadata = {
+                key: container.get(key)
+                for key in (
+                    "backend", "engine", "target", "targetId", "targetStartedAt",
+                    "imageId", "imageDigest", "helperDigest", "attestationDigest",
+                )
+                if container.get(key) is not None
+            }
+            self.execution_backend = f"oci:{container['engine']}"
+        else:
+            self.execution_backend = (
+                f"sandbox:{sandbox_backend}" if isinstance(sandbox_backend, str) and sandbox_backend
+                else "sandbox:unknown"
+            )
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -1731,6 +2156,22 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             return "capabilities.networkModes are missing or invalid"
         if not isinstance(capabilities.get("processHandoff"), bool):
             return "capabilities.processHandoff is missing or invalid"
+        if self.execution_mode == "container":
+            container = doctor_json.get("container")
+            if not isinstance(container, dict):
+                return "container report is missing"
+            if container.get("available") is not True:
+                return "container.available was not confirmed"
+            if container.get("backend") != "oci":
+                return "container.backend is not oci"
+            if container.get("engine") not in {"docker", "podman"}:
+                return "container.engine is missing or invalid"
+            if container.get("target") != "managed":
+                return "container.target is not managed"
+            for field in ("targetId", "targetStartedAt", "imageId", "helperDigest", "attestationDigest"):
+                value = container.get(field)
+                if not isinstance(value, str) or not value:
+                    return f"container.{field} is missing or invalid"
         return None
 
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
@@ -1741,7 +2182,16 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            "managed_provenance": self.managed_provenance,
+            "execution_backend": self.execution_backend,
+            "container": dict(self.container_metadata),
+            "container_engine": self.container_metadata.get("engine"),
+            "container_target": self.container_metadata.get("target"),
+            "target_image_id": self.container_metadata.get("imageId"),
+            "task_image_digest": self.container_metadata.get("imageDigest"),
             "agent_profile": self.agent_profile,
+            "max_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
             "process_handoff_available": self.process_handoff_available,
@@ -1771,6 +2221,20 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         return "\n".join(details)
 
     async def _upload_instruction(self, environment: BaseEnvironment, instruction: str) -> None:
+        if self.execution_mode == "container":
+            encoded = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
+            result = await self._runtime_exec(
+                environment,
+                " ".join([
+                    "set -eu; umask 077; mkdir -p /tmp/agent; printf %s",
+                    shlex.quote(encoded),
+                    "| base64 -d > /tmp/agent/instruction.md; chmod 0600 /tmp/agent/instruction.md",
+                ]),
+                timeout_sec=30,
+            )
+            if _return_code(result) != 0:
+                raise RuntimeError(self._setup_failure_message("instruction_upload", result))
+            return
         with tempfile.TemporaryDirectory() as tmp_dir:
             instruction_path = pathlib.Path(tmp_dir) / "instruction.md"
             instruction_path.write_text(instruction, encoding="utf-8")
@@ -1784,26 +2248,56 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         env_vars.update({key: os.environ[key] for key in ENV_KEYS if os.environ.get(key)})
         return env_vars
 
+    def _runtime_metadata(self) -> dict[str, Any]:
+        container = self.container_metadata
+        return {
+            "execution_backend": self.execution_backend,
+            "container_engine": container.get("engine"),
+            "container_target": container.get("target"),
+            "container_target_id": container.get("targetId"),
+            "container_target_started_at": container.get("targetStartedAt"),
+            "target_image_id": container.get("imageId"),
+            "target_image_digest": container.get("imageDigest"),
+            "task_image_digest": container.get("imageDigest"),
+            "max_turns": self.max_turns,
+            "command_timeout_sec": self.command_timeout_sec,
+            "container_helper_digest": container.get("helperDigest"),
+            "container_attestation_digest": container.get("attestationDigest"),
+            "container_metadata": dict(container),
+        }
+
     async def _download_if_present(
         self,
         environment: BaseEnvironment,
         remote_path: str,
         filename: str,
     ) -> pathlib.Path | None:
-        exists = await environment.exec(f"test -f {shlex.quote(remote_path)}", timeout_sec=30)
+        exists = await self._runtime_exec(
+            environment,
+            f"test -f {shlex.quote(remote_path)}",
+            timeout_sec=30,
+        )
         if _return_code(exists) != 0:
             return None
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         target_path = self.logs_dir / filename
-        await environment.download_file(remote_path, target_path)
+        await self._runtime_download_file(environment, remote_path, target_path)
         return target_path
 
     async def _download_attempt_artifacts(self, environment: BaseEnvironment) -> list[str]:
         warnings: list[str] = []
-        exists = await environment.exec("test -d /tmp/agent/attempts", timeout_sec=30)
+        exists = await self._runtime_exec(
+            environment,
+            "test -d /tmp/agent/attempts",
+            timeout_sec=30,
+        )
         if _return_code(exists) != 0:
             return warnings
-        listing = await environment.exec("find /tmp/agent/attempts -type f 2>/dev/null", timeout_sec=30)
+        listing = await self._runtime_exec(
+            environment,
+            "find /tmp/agent/attempts -type f 2>/dev/null",
+            timeout_sec=30,
+        )
         if _return_code(listing) != 0:
             return warnings
         for raw_path in _stdout_text(listing).splitlines():
@@ -1814,7 +2308,7 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             target_path = self.logs_dir / pathlib.Path(*relative.parts)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                await environment.download_file(remote_path, target_path)
+                await self._runtime_download_file(environment, remote_path, target_path)
             except Exception as exc:
                 warnings.append(f"{relative.as_posix()}: {exc}")
         return warnings
@@ -1903,11 +2397,30 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
             "terminal_origin": summary.get("terminal_origin"),
             "execution_mode": summary.get("execution_mode", self.execution_mode),
+            "execution_backend": summary.get("execution_backend", self.execution_backend),
+            "container_engine": summary.get("container_engine", self.container_metadata.get("engine")),
+            "container_target": summary.get("container_target", self.container_metadata.get("target")),
+            "container_target_id": summary.get("container_target_id", self.container_metadata.get("targetId")),
+            "container_target_started_at": summary.get(
+                "container_target_started_at", self.container_metadata.get("targetStartedAt")
+            ),
+            "target_image_id": summary.get("target_image_id", self.container_metadata.get("imageId")),
+            "target_image_digest": summary.get("target_image_digest", self.container_metadata.get("imageDigest")),
+            "task_image_digest": summary.get("task_image_digest", self.container_metadata.get("imageDigest")),
+            "container_helper_digest": summary.get(
+                "container_helper_digest", self.container_metadata.get("helperDigest")
+            ),
+            "container_attestation_digest": summary.get(
+                "container_attestation_digest", self.container_metadata.get("attestationDigest")
+            ),
+            "container_metadata": summary.get("container_metadata", dict(self.container_metadata)),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
             "read_scope_effective": summary.get("read_scope_effective", self.effective_read_scope),
             "process_handoff_available": summary.get("process_handoff_available", self.process_handoff_available),
+            "completion_limitations": summary.get("limitations", []),
+            "completion_limitation_count": _json_number(summary, "limitation_count"),
         }
         for key, value in values.items():
             self._set_context_value(context, key, value)
@@ -1970,6 +2483,28 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "suspension_to_exit_ms": getattr(context, "suspension_to_exit_ms", None),
             "terminal_origin": getattr(context, "terminal_origin", None),
             "execution_mode": getattr(context, "execution_mode", self.execution_mode),
+            "execution_backend": getattr(context, "execution_backend", self.execution_backend),
+            "container_engine": getattr(context, "container_engine", self.container_metadata.get("engine")),
+            "container_target": getattr(context, "container_target", self.container_metadata.get("target")),
+            "container_target_id": getattr(
+                context, "container_target_id", self.container_metadata.get("targetId")
+            ),
+            "container_target_started_at": getattr(
+                context, "container_target_started_at", self.container_metadata.get("targetStartedAt")
+            ),
+            "target_image_id": getattr(context, "target_image_id", self.container_metadata.get("imageId")),
+            "target_image_digest": getattr(
+                context, "target_image_digest", self.container_metadata.get("imageDigest")
+            ),
+            "task_image_digest": getattr(
+                context, "task_image_digest", self.container_metadata.get("imageDigest")
+            ),
+            "container_helper_digest": getattr(
+                context, "container_helper_digest", self.container_metadata.get("helperDigest")
+            ),
+            "container_attestation_digest": getattr(
+                context, "container_attestation_digest", self.container_metadata.get("attestationDigest")
+            ),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),

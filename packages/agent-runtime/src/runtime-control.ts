@@ -2,6 +2,7 @@ import {
   isCompletionEligibleEvidence,
   type BudgetAmounts,
   type BudgetLimits,
+  type CheckpointCreatePolicyV1,
   type CheckpointRef,
   type PlanGraph,
   type ReviewRequestResult,
@@ -48,7 +49,7 @@ export class RuntimeControlService {
       updatePlan: async (input) => await this.updatePlan(session, input),
       readBudget: async () => structuredClone(session.durable.state.budget),
       listCheckpoints: async () => (await this.options.checkpoints.list(session.identity.sessionId)).map(checkpointRef),
-      createCheckpoint: async (scopePaths) => await this.createCheckpoint(session, scopePaths),
+      createCheckpoint: async (scopePaths, policy) => await this.createCheckpoint(session, scopePaths, policy),
       restoreRunCheckpoint: async (checkpointId) => await this.restoreRunCheckpoint(session, checkpointId),
       requestReview: async () => this.requestReview(session),
       loadSkill: async (qualifiedName) => await this.skillControl.loadSkill(session, qualifiedName),
@@ -181,8 +182,12 @@ export class RuntimeControlService {
     await this.childBudgets.release(session, childId);
   }
 
-  async createCheckpoint(session: RuntimeSession, scopePaths: string[]): Promise<CheckpointRef> {
-    return await this.checkpoints.create(session, scopePaths);
+  async createCheckpoint(
+    session: RuntimeSession,
+    scopePaths: string[],
+    policy?: CheckpointCreatePolicyV1
+  ): Promise<CheckpointRef> {
+    return await this.checkpoints.create(session, scopePaths, policy);
   }
 
   async undoLatestCheckpoint(session: RuntimeSession): Promise<CheckpointRef> {

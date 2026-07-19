@@ -89,6 +89,44 @@ afterEach(async () => {
 });
 
 describe("AgentSupervisor writer isolation", () => {
+  it("propagates child completion limitations without classifying the child as failed", async () => {
+    const root = await fixture("limited-child");
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    const supervisor = new AgentSupervisor(async (context) => ({
+      childId: context.childId,
+      outcome: {
+        kind: "completed_with_limitations",
+        message: "child artifact produced",
+        evidence: [],
+        limitations: [{
+          kind: "validation_capability_unavailable",
+          claim: "unit",
+          attemptedCommandSummary: "pnpm test",
+          capabilityEvidenceId: "validation-proof",
+          reason: "The test runner is unavailable."
+        }]
+      },
+      report: null
+    }), 1, isolationManager(path.join(root, "worktrees")));
+
+    const child = supervisor.spawn({
+      parentId: "parent",
+      instruction: "inspect",
+      workspacePath: workspace,
+      intent: "analyze"
+    });
+    await expect(supervisor.join(child.id)).resolves.toMatchObject({
+      status: "completed",
+      result: {
+        outcome: {
+          kind: "completed_with_limitations",
+          limitations: [{ capabilityEvidenceId: "validation-proof" }]
+        }
+      }
+    });
+  });
+
   it("runs clean Git writers concurrently in independent worktrees and removes unchanged worktrees", async () => {
     const root = await fixture("clean-worktrees");
     const repository = await gitRepository(root);

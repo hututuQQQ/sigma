@@ -114,13 +114,15 @@ describe("connection-bound runtime capability reporting", () => {
     expect(prompt).toContain("verifiedRuntimeCommands=none");
   });
 
-  it("describes container execution as a real staged OCI backend", () => {
+  it("describes container execution as an attested OCI target with a shared workspace", () => {
     const environment = { ...runtimeEnvironment("linux"), executionMode: "container" as const };
     const prompt = runtimePrompt(environment);
 
     expect(prompt).toContain("executionMode=container");
-    expect(prompt).toContain("real OCI backend with staged workspace merge");
-    expect(prompt).toContain("if it is unavailable the run is blocked");
+    expect(prompt).toContain("attested OCI target");
+    expect(prompt).toContain("shared target workspace");
+    expect(prompt).toContain("do not fall back to the host");
+    expect(prompt).not.toContain("staged workspace merge");
     expect(prompt).not.toContain("disposable-container");
   });
 
@@ -148,7 +150,38 @@ describe("connection-bound runtime capability reporting", () => {
 
     expect(connect).toHaveBeenCalledOnce();
     expect(connected.capabilities.runtimeCommands).toEqual(["runtime-alias"]);
+    expect(connected.capabilities.runtimeCommandSnapshotComplete).toBe(true);
     expect(JSON.stringify(connected)).not.toContain(process.execPath);
+  });
+
+  it("distinguishes a complete target command snapshot from an unknown one", () => {
+    const known = report();
+    known.capabilities.runtimeCommands = ["node"];
+    known.capabilities.runtimeCommandSnapshotComplete = true;
+    expect(brokerRuntimeEnvironment(known)).toMatchObject({
+      availableRuntimeCommands: ["node"],
+      runtimeCommandSnapshotComplete: true
+    });
+
+    const unknown = report();
+    unknown.capabilities.runtimeCommands = ["node"];
+    expect(brokerRuntimeEnvironment(unknown)).toMatchObject({
+      availableRuntimeCommands: ["node"],
+      runtimeCommandSnapshotComplete: false
+    });
+
+    const ociWithoutObservedPath = report();
+    ociWithoutObservedPath.container = { available: true, backend: "oci" };
+    ociWithoutObservedPath.capabilities.runtimeCommands = [];
+    ociWithoutObservedPath.capabilities.runtimeCommandSnapshotComplete = true;
+    expect(brokerRuntimeEnvironment(ociWithoutObservedPath).runtimeCommandSnapshotComplete).toBe(false);
+
+    const ociWithObservedEmptyPath = report();
+    ociWithObservedEmptyPath.container = { available: true, backend: "oci" };
+    ociWithObservedEmptyPath.capabilities.runtimeCommands = [];
+    ociWithObservedEmptyPath.capabilities.runtimeCommandSnapshotComplete = true;
+    ociWithObservedEmptyPath.capabilities.executableSearchPaths = [];
+    expect(brokerRuntimeEnvironment(ociWithObservedEmptyPath).runtimeCommandSnapshotComplete).toBe(true);
   });
 
   it("resolves script-backed package-manager aliases through the trusted runtime", async () => {

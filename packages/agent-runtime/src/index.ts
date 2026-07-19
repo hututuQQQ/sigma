@@ -20,3 +20,13 @@ export {
   repositoryTransactionTool,
   type RepositoryCheckpointLimits
 } from "./repository-transaction-tool.js";
+export {
+  boundedProjectionV1,
+  MODEL_PROJECTION_MAX_BYTES,
+  MODEL_PROJECTION_MAX_ENTRIES,
+  projectionMetadata,
+  type BoundedProjectionOptions,
+  type BoundedProjectionV1
+} from "./bounded-projection.js";
+export { validationRequirementForInstruction } from "./assurance-engine.js";
+export * from "./model-tool-availability.js";

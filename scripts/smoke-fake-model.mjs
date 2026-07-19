@@ -20,8 +20,7 @@ export function fakeValidationTurn(id, checks) {
 export function fakeProcessValidationTurn(id, relativePath, expected) {
   return () => fakeToolTurn([fakeToolCall(id, "validate", {
       executable: "./pnpm",
-      args: ["run", "verify-smoke", relativePath, expected],
-      access: "readonly"
+      args: ["run", "verify-smoke", relativePath, expected]
     })]);
 }
 

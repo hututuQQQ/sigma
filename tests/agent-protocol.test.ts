@@ -211,10 +211,24 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
       data: {
         ...failed.data,
         exitCode: 0,
-        termination: { ...failed.data.termination!, exitCode: 0 }
+        termination: { ...failed.data.termination!, exitCode: 0 },
+        claim: {
+          kind: "unit",
+          commandDigest: "b".repeat(64),
+          strength: "behavioral",
+          independence: "cross_method",
+          assertionMode: "explicit",
+          subject: {
+            projectId: ".",
+            configPaths: [],
+            selectedTests: [],
+            exactFiles: ["src/index.ts"]
+          },
+          status: "passed"
+        }
       }
     };
-    expect(evidenceSupportsClaim(passed)).toBe(true);
+    expect(evidenceSupportsClaim(passed, "acceptance_met")).toBe(true);
     expect(evidenceSupportsClaim(passed, "validation_executed")).toBe(true);
 
     const withoutTermination: ValidationEvidence = {

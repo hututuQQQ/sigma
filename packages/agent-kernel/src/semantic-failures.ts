@@ -117,8 +117,17 @@ function nextCluster(
   current: SemanticFailureCluster | undefined,
   classification: InfrastructureFailureClassificationV1,
   progress: SemanticProgressWatermark,
-  revision: number
+  revision: number,
+  modelTurnId?: number
 ): SemanticFailureCluster {
+  if (current && modelTurnId !== undefined && current.lastModelTurnId === modelTurnId
+    && progressMatches(current.progress, progress)) {
+    return current.family === classification.family ? {
+      ...current,
+      lastRevision: revision,
+      diagnosticCodes: [...new Set([...current.diagnosticCodes, ...classification.codes])]
+    } : current;
+  }
   if (!current || current.family !== classification.family || !progressMatches(current.progress, progress)) {
     return {
       family: classification.family,
@@ -126,6 +135,7 @@ function nextCluster(
       firstRevision: revision,
       lastRevision: revision,
       diagnosticCodes: classification.codes,
+      ...(modelTurnId === undefined ? {} : { lastModelTurnId: modelTurnId }),
       progress: { ...progress }
     };
   }
@@ -133,6 +143,7 @@ function nextCluster(
     ...current,
     attempts: current.attempts + 1,
     lastRevision: revision,
+    ...(modelTurnId === undefined ? {} : { lastModelTurnId: modelTurnId }),
     diagnosticCodes: [...new Set([...current.diagnosticCodes, ...classification.codes])]
   };
 }
@@ -156,7 +167,8 @@ function withWorkspaceProgress(
 export function recordSemanticToolResult(
   state: KernelState,
   receipt: ToolReceipt,
-  toolName: string
+  toolName: string,
+  modelTurnId?: number
 ): SemanticFailureUpdate {
   const workspaceChanges = deltaSize(receipt.workspaceDelta);
   const executionCluster = isExecutionInfrastructureCluster(state.semanticFailureCluster);
@@ -184,7 +196,8 @@ export function recordSemanticToolResult(
     progressed.semanticFailureCluster,
     classification,
     progressed.semanticProgress,
-    progressed.revision
+    progressed.revision,
+    modelTurnId
   );
   return {
     state: { ...progressed, semanticFailureCluster: cluster },

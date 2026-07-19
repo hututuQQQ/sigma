@@ -18,6 +18,7 @@ import {
 import { processMutationContract, writePlanError } from "./process-mutation-contract.js";
 import type { PlannedToolExecutionContext } from "./registry.js";
 import { executionCommandSemantics } from "./execution-command-semantics.js";
+import { ociWorkspaceExecutableRoots } from "./execution-oci-paths.js";
 
 function network(input: Record<string, JsonValue>, options: ExecutionToolOptions): "none" | "loopback" | "full" {
   const available = availableNetworkModes(options);
@@ -221,6 +222,11 @@ async function plannedCall(
     && !isInside(workspaceRoot, path.resolve(item))
     && (!skillResource || !isInside(skillResource.readRoot, path.resolve(item))));
   const invocation = executionInvocation(input);
+  const workspaceExecutableRoots = await ociWorkspaceExecutableRoots(
+    invocation,
+    workspaceRoot,
+    options
+  );
   const shellCommand = typeof input.command === "string" ? input.command : undefined;
   const profile = capabilityProfile(invocation.executable);
   return {
@@ -245,11 +251,11 @@ async function plannedCall(
       traversalRoots: [invocation.cwd],
       workspaceReadRoots: ["."],
       dependencyRoots: profile.dependencies,
-      runtimeRoots: [],
+      runtimeRoots: workspaceExecutableRoots,
       writeRoots: mutation.writeRoots,
       tempRoots: [],
       network: networkMode,
-      backend: "native"
+      backend: options.executionBackend ?? "native"
     }
   };
 }
@@ -335,6 +341,9 @@ export function executionPolicy(
       ...(skillRoot ? [skillRoot] : [])
     ])],
     writeRoots: context.runMode === "change" ? writeRoots : [],
+    ...(options.executionBackend === "oci" && plan.executionCapability?.runtimeRoots.length
+      ? { executionRoots: [...plan.executionCapability.runtimeRoots] }
+      : {}),
     // The broker derives metadata guards from the minimal declared roots.
     // Adding workspace-root metadata here would make a narrow cwd/read scope
     // fail native root validation before the command can start.
@@ -349,6 +358,22 @@ export async function resolvedWriteRoots(
   plan: ToolCallPlan
 ): Promise<string[]> {
   if (context.runMode !== "change") return [];
+  if (!plan.exactEffects.includes("filesystem.write")) return [];
+  const capabilityRoots = plan.executionCapability?.writeRoots;
+  if (!plan.exactEffects.includes("process.spawn")
+    || plan.processMode === "none"
+    || plan.executionIntent?.access !== "write"
+    || !capabilityRoots
+    || capabilityRoots.length !== plan.checkpointScope.length
+    || capabilityRoots.some((item, index) => item !== plan.checkpointScope[index])) {
+    throw writePlanError(
+      "Process checkpoint scope no longer matches its runtime-derived write capability.",
+      "write_plan_stale"
+    );
+  }
+  // expectedChanges/writePaths describe expected evidence. The sandbox lease
+  // must cover the complete trusted checkpoint scope so any generator output
+  // is both contained and recoverable.
   const roots = await Promise.all(plan.checkpointScope.map(async (item) =>
     await resolveWorkspacePath(context.workspacePath, item)
   ));

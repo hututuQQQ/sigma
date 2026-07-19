@@ -196,6 +196,52 @@ describe("protocol enum and invariant contracts", () => {
     expectEventValues("session.created", ["mode"], ["analyze", "change"]);
     expectEventValues("run.started", ["mode"], ["analyze", "change"]);
     expectEventValues("run.failed", ["kind"], ["recoverable_failure", "fatal"]);
+    const limitedCompletion = {
+      kind: "completed_with_limitations",
+      message: "done with a constraint",
+      evidence: [],
+      limitations: [{
+        kind: "validation_capability_unavailable",
+        claim: "unit",
+        attemptedCommandSummary: "pnpm test",
+        capabilityEvidenceId: "validation-proof",
+        reason: "The test runner is unavailable."
+      }],
+      coordinator: {
+        modelStopped: true,
+        assuranceSatisfied: false,
+        reviewSatisfied: true,
+        limitationsAccepted: true,
+        runCompleted: true
+      },
+      outcomeRevision: 1
+    };
+    expect(isAgentEventEnvelope(eventWithPayload("run.completed", limitedCompletion))).toBe(true);
+    expect(isAgentEventEnvelope(eventWithPayload("run.completed", {
+      ...limitedCompletion,
+      coordinator: { ...limitedCompletion.coordinator, reviewSatisfied: false }
+    }))).toBe(true);
+    expect(isAgentEventEnvelope(eventWithPayload("run.completed", {
+      ...limitedCompletion,
+      coordinator: { ...limitedCompletion.coordinator, assuranceSatisfied: true }
+    }))).toBe(false);
+    const completed = {
+      kind: "completed",
+      message: "done",
+      evidence: [],
+      coordinator: {
+        modelStopped: true,
+        assuranceSatisfied: true,
+        reviewSatisfied: false,
+        runCompleted: true
+      },
+      outcomeRevision: 1
+    };
+    expect(isAgentEventEnvelope(eventWithPayload("run.completed", completed))).toBe(true);
+    expect(isAgentEventEnvelope(eventWithPayload("run.completed", {
+      ...completed,
+      coordinator: { ...completed.coordinator, reviewSatisfied: "false" }
+    }))).toBe(false);
     expectEventValues("user.follow_up", ["status"], ["queued", "delivered"]);
     expectEventValues("model.completed", ["finishReason"], [
       "stop", "length", "tool_calls", "content_filter", "protocol_error",
@@ -281,6 +327,16 @@ describe("protocol enum and invariant contracts", () => {
       }),
       eventWithPayload("tool.completed", {
         ...agentEventPayloadFixtures["tool.completed"], artifactRefs: [{}],
+      }),
+      eventWithPayload("tool.completed", {
+        ...agentEventPayloadFixtures["tool.completed"],
+        runtimeAdvisories: [{
+          schemaVersion: 1,
+          code: "no_progress",
+          repeatCount: 2,
+          unchangedDimensions: ["workspace"],
+          repair: { kind: "change_action_or_converge", suggestions: ["validate_or_finish"] },
+        }],
       }),
     ];
     for (const value of invalid) expect(isAgentEventEnvelope(value)).toBe(false);

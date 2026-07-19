@@ -4,6 +4,7 @@ import { stdin as processStdin, stdout as processStdout, stderr as processStderr
 import type { AgentEventEnvelope, ModelGateway, RunMode, RunOutcome, RuntimeClient } from "agent-protocol";
 import {
   createConfiguredRuntime,
+  validationRequirementForInstruction,
   type ConfiguredRuntime,
   type RuntimeFactoryDeps
 } from "agent-runtime";
@@ -37,22 +38,23 @@ async function instructionFromArgs(
   return positionals.join(" ").trim();
 }
 
-function status(outcome: RunOutcome): "completed" | "needs_input" | "cancelled" | "error" {
+function status(outcome: RunOutcome): "completed" | "completed_with_limitations" | "needs_input" | "cancelled" | "error" {
   if (outcome.kind === "completed") return "completed";
+  if (outcome.kind === "completed_with_limitations") return "completed_with_limitations";
   if (outcome.kind === "needs_input") return "needs_input";
   if (outcome.kind === "cancelled") return "cancelled";
   return "error";
 }
 
-function exitCode(outcome: RunOutcome): number {
-  if (outcome.kind === "completed") return 0;
+export function runOutcomeExitCode(outcome: RunOutcome): number {
+  if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") return 0;
   if (outcome.kind === "needs_input") return 2;
   if (outcome.kind === "cancelled") return 130;
   return 1;
 }
 
 function outcomeMessage(outcome: RunOutcome): string {
-  if (outcome.kind === "completed") return outcome.message;
+  if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") return outcome.message;
   if (outcome.kind === "cancelled") return outcome.reason;
   return outcome.message;
 }
@@ -130,7 +132,7 @@ async function streamSession(
 }
 
 function expectedTerminalEvent(outcome: RunOutcome): "run.completed" | "run.cancelled" | "run.failed" | "run.suspended" {
-  if (outcome.kind === "completed") return "run.completed";
+  if (outcome.kind === "completed" || outcome.kind === "completed_with_limitations") return "run.completed";
   if (outcome.kind === "cancelled") return "run.cancelled";
   if (outcome.kind === "needs_input") return "run.suspended";
   return "run.failed";
@@ -142,18 +144,23 @@ function writeResult(
   config: CliConfig,
   stdout: NodeJS.WritableStream
 ): void {
-  const result = {
-    status: status(outcome),
-    finishReason: outcome.kind,
-    sessionId,
-    finalMessage: outcomeMessage(outcome)
-  };
+  const result = runOutcomeResult(outcome, sessionId);
   if (config.outputFormat === "stream-json") {
     for (const line of outputJsonLines(
       outputResult(result, config.outputSchema), `result:${sessionId}`, config.streamJsonMaxLineBytes
     )) stdout.write(`${line}\n`);
   } else if (config.outputFormat === "json") stdout.write(`${JSON.stringify(outputResult(result, config.outputSchema))}\n`);
   else stdout.write(`\n${result.finalMessage}\n`);
+}
+
+export function runOutcomeResult(outcome: RunOutcome, sessionId: string) {
+  return {
+    status: status(outcome),
+    finishReason: outcome.kind,
+    sessionId,
+    finalMessage: outcomeMessage(outcome),
+    ...(outcome.kind === "completed_with_limitations" ? { limitations: outcome.limitations } : {})
+  };
 }
 
 async function executeRun(
@@ -176,7 +183,13 @@ async function executeRun(
   const streamAbort = new AbortController();
   const stream = streamSession(runtime, session.sessionId, config, stdin, stdout, stderr, streamAbort.signal);
   try {
-    await runtime.command({ type: "submit", sessionId: session.sessionId, text: instruction, mode });
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: instruction,
+      mode,
+      validationRequirement: validationRequirementForInstruction(instruction, config.agentProfile)
+    });
     const [outcome, terminalEvent] = await Promise.all([
       runtime.waitForOutcome(session.sessionId),
       stream
@@ -188,7 +201,7 @@ async function executeRun(
       ), { code: "cli_terminal_result_mismatch" });
     }
     writeResult(outcome, session.sessionId, config, stdout);
-    return exitCode(outcome);
+    return runOutcomeExitCode(outcome);
   } finally {
     streamAbort.abort();
     await stream.catch(() => undefined);

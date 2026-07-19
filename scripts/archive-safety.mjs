@@ -118,6 +118,28 @@ export function validateArchiveEntryNames(entries, root, label = "archive") {
   });
 }
 
+/** Discover one portable top-level directory from an immutable archive buffer.
+ * The returned root has already been used to validate every member name; callers
+ * must still inspect member types before extracting anything. */
+export function discoverArchiveRoot(bytes, label = "archive", spawn = spawnSync) {
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > MAX_ARCHIVE_BYTES) {
+    throw archiveError(label, `archive size must be between 1 and ${MAX_ARCHIVE_BYTES} bytes`);
+  }
+  return withArchiveSnapshot(bytes, (archive) => {
+    const rawEntries = runTarListing(["-tf", archive], label, spawn);
+    const roots = new Set(rawEntries.map((rawEntry) => {
+      const entry = rawEntry.endsWith("/") ? rawEntry.slice(0, -1) : rawEntry;
+      return entry.split("/")[0];
+    }));
+    if (roots.size !== 1) {
+      throw archiveError(label, "members must share exactly one top-level directory");
+    }
+    const [root] = roots;
+    validateArchiveEntryNames(rawEntries, root, label);
+    return root;
+  });
+}
+
 /**
  * Inspect names and member types from the same immutable byte buffer that will
  * later be extracted. `allowedTypes` uses tar's leading type characters.

@@ -14,7 +14,7 @@ import {
   prepareExecutionCallPlan,
   resolvedWriteRoots
 } from "./execution-tool-planning.js";
-import type { ExecutionToolOptions } from "./execution-tool-types.js";
+import { resolveCommandTimeoutSec, type ExecutionToolOptions } from "./execution-tool-types.js";
 import {
   assertAvailableExecutable,
   assertAvailableShell,
@@ -152,8 +152,9 @@ async function executeForegroundCommand(
       executionText(input, "executable"),
       [...(skillResource ? [skillResource.absolutePath] : []), ...executionStrings(input, "args")]
     );
+  const commandTimeoutMs = resolveCommandTimeoutSec(options.commandTimeoutSec) * 1_000;
   const timeoutMs = typeof input.timeoutMs === "number"
-    ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 600_000;
+    ? Math.max(1, Math.min(commandTimeoutMs, input.timeoutMs)) : commandTimeoutMs;
   const readLock = await pinProcessReadRoots(context, approvedPlan);
   let mutationLock: Awaited<ReturnType<typeof lockWindowsMutationRoots>> = undefined;
   let failed = false;

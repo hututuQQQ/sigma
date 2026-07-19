@@ -247,7 +247,15 @@ describe("V3 shared budget ledger", () => {
       createArtifact: async () => "artifact"
     });
     const port = control.forSession(target);
-    const proposed = (goal: string) => ({ ...target.durable.state.plan, revision: 2, goal });
+    await expect(port.updatePlan({
+      expectedRevision: 1,
+      plan: { ...target.durable.state.plan, revision: 2, goal: "rewritten by model" }
+    })).rejects.toThrow("goal is user-owned");
+    const proposed = (title: string) => ({
+      ...target.durable.state.plan,
+      revision: 2,
+      nodes: target.durable.state.plan.nodes.map((node) => ({ ...node, title }))
+    });
     const results = await Promise.allSettled([
       port.updatePlan({ expectedRevision: 1, plan: proposed("left") }),
       port.updatePlan({ expectedRevision: 1, plan: proposed("right") })

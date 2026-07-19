@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import {
   defaultSigmaExecPath,
   LazyExecutionBroker,
+  managedContainerAttestationDigest,
   resolveSigmaExecBinary,
   runtimeNodeBinding,
   runtimeTrustedToolchains,
@@ -264,7 +265,9 @@ function configured(workspace: string): RuntimeCompositionConfig {
     provider: "deepseek",
     model: "deepseek-v4-pro",
     permissionMode: "deny",
-    runDeadlineSec: 30,
+    // Capability projection assertions require a normal planning window; a
+    // short deadline now intentionally exposes terminal-only tools.
+    runDeadlineSec: 120,
     modelDeadlineSec: 10,
     streamIdleSec: 5,
     maxParallelTools: 1,
@@ -285,6 +288,163 @@ afterEach(async () => {
 });
 
 describe("configured runtime execution capabilities", () => {
+  it("keeps container mode fail-closed when no trusted launcher is installed", async () => {
+    const root = await workspace();
+    const runtimeConfig = configured(root);
+    runtimeConfig.executionMode = "container";
+
+    await expect(createConfiguredRuntime(runtimeConfig, {
+      executionBroker: fixtureBroker(doctorReport([]))
+    }, { connectMcp: false })).rejects.toMatchObject({ code: "container_unavailable" });
+  });
+
+  it("composes container mode through a trusted launcher and attested OCI report", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-oci-state-"));
+    fixtures.push(stateRoot);
+    const runtimeConfig = configured(root);
+    runtimeConfig.executionMode = "container";
+    runtimeConfig.containerEngine = "docker";
+    runtimeConfig.containerTarget = "managed";
+    runtimeConfig.commandTimeoutSec = 180;
+    const digest = `sha256:${"1".repeat(64)}`;
+    const proofPayload = {
+      protocolVersion: 1 as const,
+      engine: "docker" as const,
+      selector: "project/main",
+      targetId: "main-1",
+      targetStartedAt: "2026-07-19T00:00:00Z",
+      imageId: "image-1",
+      imageDigest: digest,
+      labelsDigest: `sha256:${"3".repeat(64)}`,
+      helperDigest: `sha256:${"4".repeat(64)}`
+    };
+    const proofDigest = managedContainerAttestationDigest(proofPayload);
+    const report: BrokerDoctorReport = {
+      ...doctorReport([]),
+      sandbox: {
+        available: true, backend: "oci", selfTestPassed: true, setupRequired: false
+      },
+      container: {
+        available: true,
+        backend: "oci",
+        engine: "docker",
+        target: "managed",
+        targetId: "main-1",
+        targetStartedAt: "2026-07-19T00:00:00Z",
+        imageId: "image-1",
+        imageDigest: digest,
+        helperDigest: proofPayload.helperDigest,
+        attestationDigest: proofDigest
+      },
+      capabilities: {
+        ...doctorReport([]).capabilities,
+        runtimeCommands: ["image-specific-command"],
+        runtimeCommandSnapshotComplete: true,
+        executableSearchPaths: ["/usr/local/bin", "/usr/bin", "/bin"]
+      }
+    };
+    const close = vi.fn(async () => undefined);
+    const createBroker = vi.fn(() => fixtureBroker(report, close));
+    const gateway = new CapturingGateway();
+    const configuredRuntime = await createConfiguredRuntime(runtimeConfig, {
+      stateRootDir: stateRoot,
+      gatewayFactory: () => gateway,
+      containerLauncher: {
+        protocolVersion: 1,
+        managedAttestation: {
+          ...proofPayload,
+          attestationDigest: proofDigest
+        },
+        createBroker
+      }
+    }, { connectMcp: false });
+    try {
+      expect(createBroker).toHaveBeenCalledWith(expect.objectContaining({
+        workspace: root,
+        config: { engine: "docker", target: "managed", network: "none" },
+        managedAttestation: expect.objectContaining({ selector: "project/main" })
+      }));
+      await expect(configuredRuntime.execution.doctor()).resolves.toMatchObject({
+        container: { targetId: "main-1", imageDigest: digest }
+      });
+      const session = await configuredRuntime.runtime.createSession({
+        workspacePath: root,
+        mode: "analyze"
+      });
+      await configuredRuntime.runtime.command({
+        type: "submit",
+        sessionId: session.sessionId,
+        text: "Report the execution boundary."
+      });
+      await configuredRuntime.runtime.waitForOutcome(session.sessionId);
+      const modelRequest = gateway.requests[0] as ModelRequest;
+      const execSchema = JSON.stringify(modelRequest.tools?.find((tool) => tool.name === "exec")?.inputSchema);
+      expect(execSchema).toContain("attested OCI target PATH");
+      expect(execSchema).toContain('"maximum":180000');
+      expect(execSchema).not.toContain("Unlisted bare commands are unavailable");
+      expect(execSchema).not.toContain("image-specific-command");
+      const runtimePrompt = modelRequest.messages.map((message) => message.content).join("\n");
+      expect(runtimePrompt).toContain("bare commands resolve against target PATH");
+      expect(runtimePrompt).toContain("do not fall back to the host");
+      expect(runtimePrompt).toContain("image-specific-command");
+      expect(runtimePrompt).toContain("runtimeCommandSnapshot=complete");
+    } finally {
+      await configuredRuntime.close();
+    }
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("passes the immutable image and network envelope to a trusted owned launcher", async () => {
+    const root = await workspace();
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-owned-oci-state-"));
+    fixtures.push(stateRoot);
+    const runtimeConfig = configured(root);
+    const digest = `sha256:${"4".repeat(64)}`;
+    runtimeConfig.executionMode = "container";
+    runtimeConfig.containerEngine = "podman";
+    runtimeConfig.containerTarget = "owned";
+    runtimeConfig.containerImage = `registry.example/owned@${digest}`;
+    runtimeConfig.networkMode = "loopback";
+    const ownedReport: BrokerDoctorReport = {
+      ...doctorReport([]),
+      sandbox: { available: true, backend: "oci", selfTestPassed: true, setupRequired: false },
+      capabilities: { ...doctorReport([]).capabilities, networkModes: ["none", "loopback"] },
+      container: {
+        available: true,
+        backend: "oci",
+        engine: "podman",
+        target: "owned",
+        targetId: "owned-1",
+        targetStartedAt: "2026-07-19T01:00:00Z",
+        imageId: `sha256:${"5".repeat(64)}`,
+        imageDigest: digest
+      }
+    };
+    const createBroker = vi.fn(() => fixtureBroker(ownedReport));
+    const runtime = await createConfiguredRuntime(runtimeConfig, {
+      stateRootDir: stateRoot,
+      gatewayFactory: () => new CapturingGateway(),
+      containerLauncher: { protocolVersion: 1, createBroker }
+    }, { connectMcp: false });
+    try {
+      expect(createBroker).toHaveBeenCalledWith({
+        workspace: root,
+        config: {
+          engine: "podman",
+          target: "owned",
+          network: "loopback",
+          image: `registry.example/owned@${digest}`
+        }
+      });
+      await expect(runtime.execution.doctor()).resolves.toMatchObject({
+        container: { target: "owned", imageDigest: digest }
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("rejects a configured network mode the broker did not advertise", () => {
     expect(() => verifiedNetworkPolicy(doctorReport([], [], {
       foreground: true, background: true, stdin: true, pty: true,
@@ -529,11 +689,9 @@ describe("configured runtime execution capabilities", () => {
         } else {
           expect(spawn?.inputSchema).not.toMatchObject({ properties: { pty: expect.anything() } });
         }
-        if (processCapabilities.stdin) {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeDefined();
-        } else {
-          expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
-        }
+        expect(request.tools?.find((tool) => tool.name === "process_poll")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_write")).toBeUndefined();
+        expect(request.tools?.find((tool) => tool.name === "process_terminate")).toBeUndefined();
       }
       const codeIntelAvailable = backgroundAvailable
         && processCapabilities.stdin
@@ -563,7 +721,7 @@ describe("configured runtime execution capabilities", () => {
         .map((message) => message.content)
         .join("\n");
       expect(runtimePrompt).toContain(
-        `platform=linux; arch=fixture-arch; executionCapabilities=broker-verified; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; verifiedRuntimeCommands=${expectedRuntimeCommands.join(",") || "none"}; pathSeparator=/`
+        `platform=linux; arch=fixture-arch; executionCapabilities=broker-verified; defaultShell=${expectedDefault}; verifiedShells=${expectedShells.join(",") || "none"}; verifiedRuntimeCommands=${expectedRuntimeCommands.join(",") || "none"}; runtimeCommandSnapshot=unknown; pathSeparator=/`
       );
       expect(runtimePrompt).toContain("Execution capabilities are closed-world");
       expect(runtimePrompt).toContain("Do not probe or retry unlisted host commands");

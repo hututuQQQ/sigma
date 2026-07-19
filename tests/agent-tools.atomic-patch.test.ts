@@ -10,6 +10,7 @@ import {
   AtomicPatchError,
   AtomicPatchRecoveryError,
   AtomicPatchRollbackError,
+  replaceWorkspaceTextFile,
   type AtomicPatchOptions
 } from "../packages/agent-tools/src/atomic-patch.js";
 import {
@@ -52,6 +53,10 @@ async function expectNoWorkspaceTransactionState(workspacePath: string): Promise
   await expect(lstat(path.join(workspacePath, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
 }
 
+async function rejectRenameAcrossMounts(): Promise<never> {
+  throw Object.assign(new Error("simulated bind-mount rename boundary"), { code: "EXDEV" });
+}
+
 afterEach(async () => {
   await Promise.all([...temporaryRoots].flatMap((root) => [root, patchStateRoot(root)])
     .map(async (root) => await rm(root, { recursive: true, force: true })));
@@ -88,6 +93,50 @@ describe("applyUnifiedPatch", () => {
     );
     await expect(readFile(path.join(root, "one.txt"), "utf8")).resolves.toBe("alpha\r\ngamma\r\n");
     await expectNoWorkspaceTransactionState(root);
+  });
+
+  it("publishes atomic writes and patches when rename crosses a bind-mount boundary", async () => {
+    const root = await workspace();
+    const stateRootDir = patchStateRoot(root);
+    const transactions = await patchTransactionRoot(root);
+    await replaceWorkspaceTextFile(root, "written.txt", {
+      stateRootDir,
+      renamePath: rejectRenameAcrossMounts,
+      transform: () => "written across mounts\n"
+    });
+    await applyUnifiedPatch(root, [
+      "--- a/written.txt", "+++ b/written.txt", "@@ -1 +1 @@",
+      "-written across mounts", "+patched across mounts"
+    ].join("\n"), { renamePath: rejectRenameAcrossMounts });
+
+    await expect(readFile(path.join(root, "written.txt"), "utf8"))
+      .resolves.toBe("patched across mounts\n");
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("restores earlier changes through the EXDEV fallback after a later operation fails", async () => {
+    const root = await workspace();
+    const transactions = await patchTransactionRoot(root);
+    await writeFile(path.join(root, "first.txt"), "first before\n", "utf8");
+    await writeFile(path.join(root, "second.txt"), "second before\n", "utf8");
+    const patch = [
+      "diff --git a/first.txt b/first.txt",
+      "--- a/first.txt", "+++ b/first.txt", "@@ -1 +1 @@", "-first before", "+first after",
+      "diff --git a/second.txt b/second.txt",
+      "--- a/second.txt", "+++ b/second.txt", "@@ -1 +1 @@", "-second before", "+second after"
+    ].join("\n");
+
+    await expect(applyUnifiedPatch(root, patch, {
+      renamePath: rejectRenameAcrossMounts,
+      beforeMutation: async (operation) => {
+        if (operation.direction === "commit" && operation.phase === "backup_source"
+          && operation.changeIndex === 1) throw new Error("stop after first cross-mount change");
+      }
+    })).rejects.toThrow("stop after first cross-mount change");
+
+    await expect(readFile(path.join(root, "first.txt"), "utf8")).resolves.toBe("first before\n");
+    await expect(readFile(path.join(root, "second.txt"), "utf8")).resolves.toBe("second before\n");
+    await expect(lstat(transactions)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects staged content replacement and restores the original", async () => {

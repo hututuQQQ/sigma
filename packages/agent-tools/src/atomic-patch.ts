@@ -18,6 +18,7 @@ import {
 } from "./atomic-patch-preparation.js";
 import { commitPreparedPatch, type AtomicPatchCleanupWarning } from "./atomic-patch-transaction.js";
 import type { AtomicPatchMutation, PreparedPatchChange } from "./atomic-patch-types.js";
+import type { AtomicPatchRename } from "./atomic-patch-move.js";
 import { readStableWorkspaceTextFile } from "./stable-workspace-read.js";
 
 export { AtomicPatchError, parseUnifiedPatch } from "./atomic-patch-parser.js";
@@ -32,6 +33,8 @@ export interface AtomicPatchOptions {
   beforeCommit?: () => Promise<void>;
   /** Test-only fault-injection point; callers cannot supply this through the model tool schema. */
   beforeMutation?: (operation: AtomicPatchMutation) => Promise<void>;
+  /** Test/integration injection point; callers cannot supply this through the model tool schema. */
+  renamePath?: AtomicPatchRename;
 }
 
 export interface AtomicTextReplaceOptions {
@@ -40,6 +43,8 @@ export interface AtomicTextReplaceOptions {
   stateRootDir?: string;
   signal?: AbortSignal;
   transform(content: string, exists: boolean): string;
+  /** Test/integration injection point; callers cannot supply this through the model tool schema. */
+  renamePath?: AtomicPatchRename;
 }
 
 export interface AtomicPatchResult {
@@ -195,6 +200,7 @@ async function commitChanges(
       workspace, transaction, changes,
       beforeCommit: options.beforeCommit,
       beforeMutation: options.beforeMutation,
+      renamePath: options.renamePath,
       validators: {
         assertAllUnchanged: async () => await assertPreparedChangesUnchanged(workspace, changes),
         assertSourceUnchanged: async (change) => await assertSourceUnchanged(workspace, change),
@@ -263,7 +269,10 @@ export async function replaceWorkspaceTextFile(
     content,
     kind: "file",
     mode: original.mode
-  }], options.stateRootDir ? { stateRootDir: options.stateRootDir } : {});
+  }], {
+    ...(options.stateRootDir ? { stateRootDir: options.stateRootDir } : {}),
+    ...(options.renamePath ? { renamePath: options.renamePath } : {})
+  });
 }
 
 export async function applyUnifiedPatch(

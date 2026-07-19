@@ -288,7 +288,9 @@ function gitPreservationFailures(check, context) {
 function terminalStatus(subjectResult, metrics) {
   if (subjectResult.cancellation) return "cancelled";
   const outcome = subjectResult.result?.finishReason ?? subjectResult.result?.status ?? metrics?.terminal?.type;
-  if (outcome === "completed" || outcome === "run.completed") return "completed";
+  if (outcome === "completed" || outcome === "completed_with_limitations" || outcome === "run.completed") {
+    return "completed";
+  }
   if (outcome === "needs_input" || outcome === "run.suspended") return "needs_input";
   if (outcome === "cancelled" || outcome === "run.cancelled") return "cancelled";
   return "error";

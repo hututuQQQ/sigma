@@ -9,6 +9,7 @@ import {
   packageAgentCli,
   patchWindowsAppContainerNode,
   pinnedNodeVersion,
+  repositoryBuildIdentity,
   nodeRuntimeArchiveName,
   windowsAppContainerNodeCompatibility,
   windowsNodeGlobalPipeMarker
@@ -265,6 +266,18 @@ async function writeV3PackageFixture(
 }
 
 describe("package-agent-cli", () => {
+  it("records a validated source revision and dirty state in build provenance", () => {
+    expect(repositoryBuildIdentity("ignored", {
+      SIGMA_SOURCE_REVISION: "a".repeat(40),
+      SIGMA_SOURCE_DIRTY: "true"
+    }, () => { throw new Error("git must not run for a complete override"); })).toEqual({
+      revision: "a".repeat(40), dirty: true
+    });
+    expect(() => repositoryBuildIdentity("ignored", {
+      SIGMA_SOURCE_REVISION: "not-a-commit", SIGMA_SOURCE_DIRTY: "false"
+    })).toThrow(/40-character Git commit/u);
+  });
+
   it("rejects non-Tier-1 architectures", async () => {
     await expect(packageAgentCli({ rootDir: process.cwd(), targetArch: "arm64" })).rejects.toThrow("AGENT_TARGET_ARCH");
   });

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ExecutionBroker, ExecutionResult } from "../packages/agent-execution/src/index.js";
@@ -169,6 +169,79 @@ describe("execution tool capability closure", () => {
     }
   });
 
+  it("delegates executable discovery to an attested OCI target and plans target workspace executables", async () => {
+    const root = await workspace();
+    const executable = path.join(root, "workspace-tool");
+    await writeFile(executable, "fixture", "utf8");
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      executionBackend: "oci",
+      executionPlatform: process.platform,
+      foreground: true,
+      background: false,
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: []
+    });
+
+    expect(JSON.stringify(tools.descriptor("exec")?.inputSchema)).toContain(
+      "attested OCI target PATH"
+    );
+    await expect(tools.prepare(
+      request("exec", { executable: "target-command" }),
+      preparation(root)
+    )).resolves.toMatchObject({
+      executionCapability: { backend: "oci", runtimeRoots: [] }
+    });
+
+    const call = request("exec", { executable: `.${path.sep}workspace-tool` });
+    const plan = await tools.prepare(call, preparation(root));
+    expect(plan).toMatchObject({
+      executionCapability: { backend: "oci", runtimeRoots: [executable] }
+    });
+    await expect(tools.execute(call, { ...execution(root), callPlan: plan }))
+      .resolves.toMatchObject({ ok: true });
+    expect(fixture.execute).toHaveBeenCalledWith(expect.objectContaining({
+      policy: expect.objectContaining({ executionRoots: [executable] })
+    }), expect.anything());
+  });
+
+  it("keeps OCI executable schemas stable across target command inventories", () => {
+    const first = registerBuiltinTools(new EffectToolRegistry(), {
+      executionBackend: "oci",
+      runtimeCommands: []
+    }).descriptor("exec")?.inputSchema;
+    const second = registerBuiltinTools(new EffectToolRegistry(), {
+      executionBackend: "oci",
+      runtimeCommands: ["image-specific-command", "another-command"]
+    }).descriptor("exec")?.inputSchema;
+
+    expect(second).toEqual(first);
+    expect(JSON.stringify(first)).not.toContain("image-specific-command");
+  });
+
+  it("fails closed for relative workspace executables across incompatible path semantics", async () => {
+    const root = await workspace();
+    const targetPlatform = process.platform === "win32" ? "linux" : "win32";
+    const targetRelative = targetPlatform === "win32" ? ".\\workspace-tool" : "./workspace-tool";
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      executionBackend: "oci",
+      executionPlatform: targetPlatform,
+      networkMode: "none",
+      networkModes: ["none"]
+    });
+
+    await expect(tools.prepare(
+      request("exec", { executable: targetRelative }),
+      preparation(root)
+    )).rejects.toMatchObject({
+      code: "execution_platform_mismatch",
+      controlPlatform: process.platform,
+      targetPlatform
+    });
+  });
+
   it("does not project process tools when policy and broker network modes do not intersect", () => {
     const tools = registerBuiltinTools(new EffectToolRegistry(), {
       foreground: true,
@@ -250,5 +323,49 @@ describe("execution tool capability closure", () => {
       request("shell", { shell: "bash", command: "printf ok", timeoutMs: "fast" }),
       preparation(root)
     )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+  });
+
+  it("projects and enforces one foreground command timeout cap", async () => {
+    const root = await workspace();
+    const fixture = brokerFixture();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), {
+      broker: fixture.broker,
+      commandTimeoutSec: 180,
+      foreground: true,
+      background: false,
+      networkMode: "none",
+      networkModes: ["none"],
+      runtimeCommands: ["runtime"],
+      shells: ["bash"]
+    });
+
+    for (const name of ["exec", "shell", "validate"]) {
+      expect(tools.descriptor(name)?.inputSchema).toMatchObject({
+        properties: { timeoutMs: { maximum: 180_000 } }
+      });
+      expect(tools.descriptor(name)?.timeoutMs).toBe(330_000);
+    }
+
+    const explicit = request("exec", { executable: "runtime", timeoutMs: 90_000 });
+    const explicitPlan = await tools.prepare(explicit, preparation(root));
+    await tools.execute(explicit, { ...execution(root), callPlan: explicitPlan });
+    const omitted = request("validate", { executable: "runtime" });
+    const omittedPlan = await tools.prepare(omitted, preparation(root));
+    await tools.execute(omitted, { ...execution(root), callPlan: omittedPlan });
+    await expect(tools.prepare(
+      request("shell", { shell: "bash", command: "printf ok", timeoutMs: 180_001 }),
+      preparation(root)
+    )).rejects.toMatchObject({ code: "tool_arguments_invalid" });
+
+    expect(fixture.execute).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      timeoutMs: 90_000,
+      idleTimeoutMs: 90_000
+    }), expect.anything());
+    expect(fixture.execute).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      timeoutMs: 180_000,
+      idleTimeoutMs: 120_000
+    }), expect.anything());
+    expect(() => registerBuiltinTools(new EffectToolRegistry(), { commandTimeoutSec: 0 }))
+      .toThrow(/positive integer/u);
   });
 });

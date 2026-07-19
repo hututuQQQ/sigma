@@ -28,10 +28,10 @@ describe("agent-config single-source schema", () => {
     const values = resolveConfig({
       flags: { provider: "glm" },
       env: { SIGMA_MODEL: "env-model", SIGMA_RUN_DEADLINE_SEC: "42" },
-      workspace: { model: { provider: "deepseek", name: "workspace-model" }, tools: { max_parallel: 7 } },
+      workspace: { model: { provider: "deepseek", name: "workspace-model" }, tools: { max_parallel: 7, command_timeout_sec: 300 } },
       home: { model: { provider: "deepseek", name: "home-model" }, permissions: { mode: "deny" } }
     });
-    expect(values).toMatchObject({ provider: "glm", model: "env-model", runDeadlineSec: 42, maxParallelTools: 4, permissionMode: "deny" });
+    expect(values).toMatchObject({ provider: "glm", model: "env-model", runDeadlineSec: 42, commandTimeoutSec: 300, maxParallelTools: 4, permissionMode: "deny" });
     expect(() => resolveConfig({ workspace: { model: { unknown: true } } })).toThrow("Unknown workspace configuration key");
     expect(() => resolveConfig({ home: { surprise: {} } })).toThrow("Unknown home configuration key");
     expect(() => resolveConfig({ flags: { surprise: true } })).toThrow("Unknown option");
@@ -47,13 +47,14 @@ describe("agent-config single-source schema", () => {
       workspace: {
         permissions: { mode: "auto" },
         security: { read_scope: "host", network: "full", process_handoff: "allow" },
-        budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 },
+        budget: { max_input_tokens: 2_000, max_tool_calls: 10 }, checkpoint: { max_files: 200 }, tools: { command_timeout_sec: 120 },
         agents: { max_parallel: 2 }
       }
     });
     expect(values).toMatchObject({
       permissionMode: "deny", readScope: "workspace", networkMode: "none", processHandoff: "deny",
-      maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2
+      maxInputTokens: 1_000, maxToolCalls: 10, checkpointMaxFiles: 100, maxParallelAgents: 2,
+      commandTimeoutSec: 120
     });
 
     const narrowed = resolveConfig({
@@ -95,6 +96,9 @@ describe("agent-config single-source schema", () => {
     expect(() => field("workspace").parse(1)).toThrow("string");
     expect(() => field("workspace").parse(" ")).toThrow("non-empty");
     expect(() => field("runDeadlineSec").parse("nan")).toThrow("number");
+    expect(field("commandTimeoutSec").parse("180")).toBe(180);
+    expect(() => field("commandTimeoutSec").parse(0)).toThrow("number");
+    expect(() => field("commandTimeoutSec").parse(1.5)).toThrow("positive integer");
     expect(field("streamActiveSec").parse(0)).toBe(0);
     expect(() => field("streamActiveSec").parse(-1)).toThrow("number");
     expect(field("streamJsonMaxLineBytes").parse(49_152)).toBe(49_152);
@@ -193,6 +197,7 @@ describe("agent-config single-source schema", () => {
     const help = configHelp();
     expect(help.some((line) => line.includes("--provider"))).toBe(true);
     expect(help.some((line) => line.includes("--trust-workspace-mcp"))).toBe(true);
+    expect(help.some((line) => line.includes("--command-timeout-sec"))).toBe(true);
     expect(help.some((line) => line.includes("--prompt"))).toBe(false);
     const registry = new CommandRegistry();
     expect(registry.resolve("inspect")).toMatchObject({ handler: "run", mode: "analyze" });

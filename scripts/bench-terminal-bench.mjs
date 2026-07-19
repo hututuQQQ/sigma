@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { cleanupHarborDockerResources } from "./harbor-docker-cleanup.mjs";
 import {
   benchRootDir,
+  agentCliArchiveSourceIdentity,
   buildCommandScript,
   buildHarborArgs,
   buildHarborJobConfig,
@@ -18,6 +20,7 @@ import {
   ensurePlaceholderTask,
   generateBenchReport,
   groupHarborTimeoutProbe,
+  harborTopologyForOptions,
   harborPythonCommand,
   harborEnvForRun,
   loadDotEnv,
@@ -25,6 +28,7 @@ import {
   packageAgentCli,
   packageHarborRuntime,
   parseHarborTimeoutProbe,
+  repositorySourceIdentity,
   resolveHarborCommand,
   resolveRunOptions,
   rootDir,
@@ -40,6 +44,96 @@ function statusFromExitCode(exitCode) {
 
 function evaluationLane(agentProfile) {
   return agentProfile === "strict" ? "strict_conformance" : "solving";
+}
+
+export async function allocateBenchmarkRunDirectory(
+  parentDirectory,
+  stem,
+  runLabel = null,
+  entropy = () => randomBytes(8).toString("hex")
+) {
+  await mkdir(parentDirectory, { recursive: true });
+  const label = runLabel ? `-${safePathPart(runLabel)}` : "";
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const nonce = safePathPart(entropy(), "entropy-unavailable");
+    const runId = `${stem}${label}-${nonce}`;
+    const runDir = path.join(parentDirectory, runId);
+    try {
+      await mkdir(runDir, { recursive: false, mode: 0o700 });
+      return { runId, runDir };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error("Could not allocate an exclusive benchmark run directory after 32 attempts.");
+}
+
+async function appendFileStream(targetPath, sourcePath, fallbackText = "") {
+  if (!existsSync(sourcePath)) {
+    if (fallbackText) await appendFile(targetPath, fallbackText, "utf8");
+    return;
+  }
+  await pipeline(
+    createReadStream(sourcePath),
+    createWriteStream(targetPath, { flags: "a", mode: 0o600 })
+  );
+}
+
+export async function assembleGroupedLogs(runDir, launchGroups, harborResults) {
+  const stdout = path.join(runDir, "harbor.stdout.log");
+  const stderr = path.join(runDir, "harbor.stderr.log");
+  const raw = path.join(runDir, "result.raw.log");
+  await Promise.all([writeFile(stdout, "", "utf8"), writeFile(stderr, "", "utf8")]);
+  const summaries = [];
+  for (let index = 0; index < launchGroups.length; index += 1) {
+    const suffix = `-group-${String(index + 1).padStart(3, "0")}`;
+    const result = harborResults[index] ?? {};
+    await appendFile(stdout, `[group ${index + 1}]\n`, "utf8");
+    await appendFileStream(
+      stdout,
+      path.join(runDir, `harbor${suffix}.stdout.log`),
+      result.stdout ?? ""
+    );
+    await appendFile(stdout, "\n", "utf8");
+    await appendFile(stderr, `[group ${index + 1}]\n`, "utf8");
+    await appendFileStream(
+      stderr,
+      path.join(runDir, `harbor${suffix}.stderr.log`),
+      result.stderr ?? ""
+    );
+    await appendFile(stderr, "\n", "utf8");
+    summaries.push([
+      `group: ${index + 1}`,
+      `exit_code: ${result.exitCode ?? 1}`,
+      `stdout_log: harbor${suffix}.stdout.log`,
+      `stderr_log: harbor${suffix}.stderr.log`
+    ].join("\n"));
+  }
+  await writeFile(raw, `${summaries.join("\n\n")}\n`, "utf8");
+}
+
+async function cleanupWithDeadline(cleanup, runId, engine, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => cleanup === cleanupHarborDockerResources
+        ? cleanup(runId, engine, undefined, timeoutMs)
+        : cleanup(runId, engine)),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Container cleanup exceeded its ${timeoutMs}ms deadline.`)),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function boundedReturnedLog(value, limit = 64 * 1024) {
+  const text = typeof value === "string" ? value : "";
+  return text.length <= limit ? text : text.slice(-limit);
 }
 
 async function sha256File(filePath) {
@@ -88,8 +182,12 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
 
   const baseRunId = makeRunId(new Date(), options.provider, options.model);
-  const runId = options.runLabel ? `${baseRunId}-${safePathPart(options.runLabel)}` : baseRunId;
-  const runDir = path.join(benchRootDir, runId);
+  const { runId, runDir } = await allocateBenchmarkRunDirectory(
+    benchRootDir,
+    baseRunId,
+    options.runLabel,
+    deps.runIdEntropy
+  );
   const jobsDir = path.join(runDir, "harbor-jobs");
   const env = harborEnvForRun(runDir);
   const startedAt = new Date().toISOString();
@@ -99,8 +197,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   const dockerCleanup = deps.cleanupHarborDockerResources ?? cleanupHarborDockerResources;
   const harborCommandInfo = deps.resolveHarborCommand?.(env) ?? resolveHarborCommand(env);
   const harborCommand = harborCommandInfo.command;
-  await mkdir(runDir, { recursive: true });
-
+  const harnessSourceIdentity = deps.repositorySourceIdentity?.() ?? repositorySourceIdentity(rootDir);
   let harborVersion = null;
   let harborArgs = ["run", "--help"];
   let config = {
@@ -112,17 +209,37 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     agent_profile: options.agentProfile,
     evaluation_lane: evaluationLane(options.agentProfile),
     execution_mode: options.executionMode,
+    managed_provenance: options.managedProvenance,
+    harbor_topology: harborTopologyForOptions(options),
+    container_engine_requested: options.containerEngine,
+    network_mode: options.networkMode,
     provider: options.provider,
     model: options.model ?? null,
+    model_parameters: {
+      temperature: "provider_default",
+      top_p: "provider_default"
+    },
+    max_turns: options.maxTurns,
+    command_timeout_sec: options.commandTimeoutSec,
     dataset: terminalBenchDataset,
+    terminal_bench_revision: options.terminalBenchRevision,
     k: options.mode === "k" ? options.k : null,
     n_concurrent_trials: options.nConcurrentTrials,
     task_id: options.mode === "task" ? options.taskId : null,
+    task_count: options.mode === "batch" ? options.tasks.length : null,
     tasks_file: options.tasksFile,
     tasks_file_sha256: options.tasksFileSha256,
     package_reused: options.reusePackage,
     expected_agent_cli_sha256: options.expectedArchiveSha256,
     agent_cli_sha256: null,
+    source_revision: null,
+    source_dirty: null,
+    source_identity_source: null,
+    preregistration_sha256: options.preregistrationSha256,
+    validation_manifest: options.validationManifest,
+    validation_manifest_sha256: options.validationManifestSha256,
+    harness_source_revision: harnessSourceIdentity.revision,
+    harness_source_dirty: harnessSourceIdentity.dirty,
     agent_cli_tarball: env.AGENT_CLI_TARBALL,
     harbor_jobs_dir: jobsDir,
     harbor_command: harborCommand,
@@ -171,7 +288,46 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
 
   const agentCliSha256 = await sha256File(env.AGENT_CLI_TARBALL);
-  config = { ...config, agent_cli_sha256: agentCliSha256 };
+  let embeddedSourceIdentity;
+  try {
+    embeddedSourceIdentity = (deps.agentCliArchiveSourceIdentity ?? agentCliArchiveSourceIdentity)(
+      env.AGENT_CLI_TARBALL
+    );
+  } catch (error) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `Agent CLI source provenance inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+      1
+    );
+  }
+  if (embeddedSourceIdentity && options.expectedSourceRevision
+    && embeddedSourceIdentity.revision !== options.expectedSourceRevision) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `Agent CLI source revision ${embeddedSourceIdentity.revision} does not match frozen ${options.expectedSourceRevision}.`,
+      1
+    );
+  }
+  const packageSourceIdentity = embeddedSourceIdentity ?? (options.expectedSourceRevision
+    ? { revision: options.expectedSourceRevision, dirty: null }
+    : null);
+  if (!packageSourceIdentity) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      "Agent CLI archive lacks source provenance; legacy reuse requires --expected-source-revision.",
+      1
+    );
+  }
+  config = {
+    ...config,
+    agent_cli_sha256: agentCliSha256,
+    source_revision: packageSourceIdentity.revision,
+    source_dirty: packageSourceIdentity.dirty,
+    source_identity_source: embeddedSourceIdentity ? "package_metadata" : "launcher_pinned_legacy"
+  };
   await writeJson(path.join(runDir, "config.json"), config);
   if (options.expectedArchiveSha256 && agentCliSha256 !== options.expectedArchiveSha256) {
     return await failBeforeHarbor(
@@ -345,7 +501,22 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       .join("\n"), "utf8");
   }
 
-  const cleanupBefore = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
+  let cleanupBefore;
+  try {
+    cleanupBefore = await cleanupWithDeadline(
+      dockerCleanup,
+      env.SIGMA_HARBOR_RUN_ID,
+      options.containerEngine,
+      options.agentTimeoutGraceSec * 1_000
+    );
+  } catch (error) {
+    cleanupBefore = {
+      schemaVersion: 1,
+      runId: env.SIGMA_HARBOR_RUN_ID,
+      clean: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
   await writeJson(path.join(runDir, "docker-cleanup-before.json"), cleanupBefore);
   if (!cleanupBefore.clean) {
     return await failBeforeHarbor(
@@ -356,29 +527,75 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
+  const abortController = new AbortController();
+  const interrupt = (signal) => abortController.abort(new Error(`Benchmark interrupted by ${signal}.`));
+  const onSigint = () => interrupt("SIGINT");
+  const onSigterm = () => interrupt("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
   const harborResults = [];
-  for (const group of launchGroups) {
-    process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, group.args)}\n`);
-    const suffix = launchGroups.length === 1 ? "" : `-group-${String(group.index + 1).padStart(3, "0")}`;
-    harborResults.push(await runner(harborCommand, group.args, {
-      cwd: rootDir,
-      env,
-      stdoutPath: path.join(runDir, `harbor${suffix}.stdout.log`),
-      stderrPath: path.join(runDir, `harbor${suffix}.stderr.log`),
-      rawPath: path.join(runDir, suffix ? `result${suffix}.raw.log` : "result.raw.log")
-    }));
+  let runnerError = null;
+  let cleanupAfter;
+  try {
+    for (const group of launchGroups) {
+      process.stdout.write(`Running Harbor benchmark: ${commandText(harborCommand, group.args)}\n`);
+      const suffix = launchGroups.length === 1 ? "" : `-group-${String(group.index + 1).padStart(3, "0")}`;
+      const groupResult = await runner(harborCommand, group.args, {
+        cwd: rootDir,
+        env,
+        stdoutPath: path.join(runDir, `harbor${suffix}.stdout.log`),
+        stderrPath: path.join(runDir, `harbor${suffix}.stderr.log`),
+        rawPath: path.join(runDir, suffix ? `result${suffix}.raw.log` : "result.raw.log"),
+        signal: abortController.signal
+      });
+      harborResults.push({
+        exitCode: groupResult.exitCode,
+        stdout: boundedReturnedLog(groupResult.stdout),
+        stderr: boundedReturnedLog(groupResult.stderr)
+      });
+      if (abortController.signal.aborted) break;
+    }
+    if (abortController.signal.aborted) {
+      runnerError = abortController.signal.reason?.message ?? "Benchmark interrupted.";
+    }
+  } catch (error) {
+    runnerError = error instanceof Error ? error.message : String(error);
+  } finally {
+    try {
+      cleanupAfter = await cleanupWithDeadline(
+        dockerCleanup,
+        env.SIGMA_HARBOR_RUN_ID,
+        options.containerEngine,
+        options.agentTimeoutGraceSec * 1_000
+      );
+    } catch (error) {
+      cleanupAfter = {
+        schemaVersion: 1,
+        runId: env.SIGMA_HARBOR_RUN_ID,
+        clean: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+    try {
+      await writeJson(path.join(runDir, "docker-cleanup-after.json"), cleanupAfter);
+    } finally {
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+    }
   }
   if (launchGroups.length > 1) {
-    await writeFile(path.join(runDir, "harbor.stdout.log"), harborResults
-      .map((result, index) => `[group ${index + 1}]\n${result.stdout ?? ""}`).join("\n"), "utf8");
-    await writeFile(path.join(runDir, "harbor.stderr.log"), harborResults
-      .map((result, index) => `[group ${index + 1}]\n${result.stderr ?? ""}`).join("\n"), "utf8");
-    await writeFile(path.join(runDir, "result.raw.log"), harborResults
-      .map((result, index) => `group: ${index + 1}\nexit_code: ${result.exitCode}\n`).join("\n"), "utf8");
+    await assembleGroupedLogs(runDir, launchGroups, harborResults);
   }
-  const harborExitCode = harborResults.find((result) => result.exitCode !== 0)?.exitCode ?? 0;
-  const cleanupAfter = await dockerCleanup(env.SIGMA_HARBOR_RUN_ID);
-  await writeJson(path.join(runDir, "docker-cleanup-after.json"), cleanupAfter);
+  for (const [name, content] of [
+    ["harbor.stdout.log", ""],
+    ["harbor.stderr.log", runnerError ? `${runnerError}\n` : ""],
+    ["result.raw.log", runnerError ? `runner_error: ${runnerError}\n` : ""]
+  ]) {
+    if (!existsSync(path.join(runDir, name))) await writeFile(path.join(runDir, name), content, "utf8");
+  }
+  const harborExitCode = runnerError
+    ? 1
+    : harborResults.find((result) => result.exitCode !== 0)?.exitCode ?? 0;
 
   const finishedAt = new Date().toISOString();
   const effectiveExitCode = cleanupAfter.clean ? harborExitCode : 1;
@@ -386,11 +603,14 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     ...config,
     finished_at: finishedAt,
     exit_code: effectiveExitCode,
+    harbor_exit_code: harborExitCode,
     status: statusFromExitCode(effectiveExitCode),
     docker_cleanup: cleanupAfter,
-    notes: cleanupAfter.clean
-      ? config.notes
-      : [...config.notes, "Run-scoped Docker resources remained after Harbor exited."]
+    notes: [
+      ...config.notes,
+      ...(runnerError ? [`Harbor runner failed before completing: ${runnerError}`] : []),
+      ...(cleanupAfter.clean ? [] : ["Run-scoped container resources remained after Harbor exited."])
+    ]
   };
   await writeJson(path.join(runDir, "config.json"), config);
   await ensurePlaceholderTask(runDir, {

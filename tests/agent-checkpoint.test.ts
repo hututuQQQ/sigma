@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import fc from "fast-check";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CheckpointConflictError,
@@ -20,6 +21,14 @@ import {
   captureCheckpointManifest,
   preflightCheckpointByteReservation
 } from "../packages/agent-checkpoint/src/safe-capture.js";
+import { CheckpointCasStore } from "../packages/agent-checkpoint/src/cas-store.js";
+import {
+  checkpointManifestStorageLimits,
+  putCheckpointDeltaMerkle,
+  putCheckpointManifestMerkle,
+  readCheckpointDeltaMerkle,
+  readCheckpointManifestMerkle
+} from "../packages/agent-checkpoint/src/manifest-store.js";
 import {
   acquireCheckpointMutationLease
 } from "../packages/agent-checkpoint/src/restore-transaction.js";
@@ -72,6 +81,13 @@ async function checkpointTransactionRoot(root: string, workspacePath: string): P
     stateRootDir: path.join(root, "state"),
     namespace: "checkpoint-restore"
   });
+}
+
+async function storedCheckpointManifest(root: string, digest: string) {
+  return await readCheckpointManifestMerkle(
+    new CheckpointCasStore(path.join(root, "state")),
+    digest
+  );
 }
 
 async function checkpointFileImage(target: string): Promise<{
@@ -181,10 +197,7 @@ describe("CheckpointManager", () => {
     await writeFile(path.join(workspace, "existing.txt"), "after existing", "utf8");
     await writeFile(path.join(workspace, "deleted.txt"), "after deleted", "utf8");
     await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const manifest = JSON.parse(await readFile(
-      path.join(root, "state", "checkpoints", "cas", checkpoint.preManifestDigest),
-      "utf8"
-    )) as { entries: Array<{ path: string; digest?: string }> };
+    const manifest = await storedCheckpointManifest(root, checkpoint.preManifestDigest);
     const desired = manifest.entries.find((entry) => entry.path === "deleted.txt")!;
     await writeFile(path.join(root, "state", "checkpoints", "cas", desired.digest!), "corrupt", "utf8");
 
@@ -550,6 +563,62 @@ describe("CheckpointManager", () => {
     await expect(lstat(path.join(workspace, ".agent"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("recovers a root-level reproducible dependency backup after a crash", async () => {
+    const { root, workspace, manager } = await fixture();
+    const dependencyRoot = path.join(workspace, "dependencies");
+    await mkdir(path.join(dependencyRoot, "nested"), { recursive: true });
+    await writeFile(path.join(dependencyRoot, "nested", "package.js"), "preserved during rollback\n", "utf8");
+    const dependencyInfo = await lstat(dependencyRoot);
+    const mode = dependencyInfo.mode;
+    const rootIdentity = {
+      dev: String(dependencyInfo.dev),
+      ino: String(dependencyInfo.ino),
+      birthtimeMs: String(dependencyInfo.birthtimeMs)
+    };
+    const currentImage = {
+      kind: "reproducible_root" as const,
+      mode,
+      size: 0,
+      digest: createHash("sha256").update(JSON.stringify([
+        "reproducible_root", mode, rootIdentity.dev, rootIdentity.ino, rootIdentity.birthtimeMs
+      ])).digest("hex")
+    };
+    const transactions = await checkpointTransactionRoot(root, workspace);
+    const transaction = path.join(transactions, "restore-reproducible-root-crash");
+    await mkdir(path.join(transaction, "backup"), { recursive: true });
+    await mkdir(path.join(transaction, "stage"), { recursive: true });
+    await rename(dependencyRoot, path.join(transaction, "backup", "0"));
+    await writeFile(path.join(transaction, "journal.json"), JSON.stringify({
+      schemaVersion: 3,
+      phase: "applying",
+      finalization: validRecoveryFinalization(workspace),
+      directoryModes: [],
+      operations: [{
+        path: "dependencies",
+        index: 0,
+        hadCurrent: true,
+        hasDesired: false,
+        backupIntent: true,
+        backupMoved: true,
+        installIntent: false,
+        installed: false,
+        currentImage
+      }]
+    }));
+
+    await manager.create({
+      sessionId: "session-reproducible-crash-recovery",
+      runId: "run-reproducible-crash-recovery",
+      workspacePath: workspace,
+      scopePaths: ["existing.txt"],
+      baseSeq: 0
+    });
+
+    await expect(readFile(path.join(dependencyRoot, "nested", "package.js"), "utf8"))
+      .resolves.toBe("preserved during rollback\n");
+    await expect(lstat(transaction)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.each([
     ["after installed removal", true, false, true, true],
     ["after backup restoration", false, true, true, true],
@@ -790,9 +859,7 @@ describe("CheckpointManager", () => {
       workspacePath: workspace, scopePaths: ["tree-preimage-link"], baseSeq: 1
     });
     if (process.platform === "win32") {
-      const manifest = JSON.parse(await readFile(
-        path.join(root, "state", "checkpoints", "cas", checkpoint.preManifestDigest), "utf8"
-      )) as { entries: Array<{ path: string; linkType?: string }> };
+      const manifest = await storedCheckpointManifest(root, checkpoint.preManifestDigest);
       expect(manifest.entries.find((entry) => entry.path === "tree-preimage-link")?.linkType).toBe("directory");
     }
     await rm(tree);
@@ -969,6 +1036,207 @@ describe("CheckpointManager", () => {
     await expect(readdir(path.join(limitedRoot, "checkpoints", "cas"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("stores large manifests as bounded Merkle leaves instead of one giant path list", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-merkle-");
+    const state = path.join(root, "state");
+    const cas = new CheckpointCasStore(state);
+    const entries = Array.from({ length: 20_000 }, (_unused, index) => ({
+      path: `generated/path-${index.toString().padStart(5, "0")}`,
+      kind: "directory" as const,
+      mode: 0o40755,
+      size: 0
+    }));
+    const manifest = { entries, fileCount: entries.length, totalBytes: 0 };
+    const rootDigest = await putCheckpointManifestMerkle(cas, manifest);
+    const descriptorBytes = await readFile(path.join(state, "checkpoints", "cas", rootDigest));
+    const descriptor = JSON.parse(descriptorBytes.toString("utf8")) as {
+      kind: string;
+      chunks: Array<{ digest: string; sizeBytes: number }>;
+    };
+
+    expect(descriptor.kind).toBe("checkpoint_manifest_merkle_v1");
+    expect(descriptor.chunks.length).toBeGreaterThan(1);
+    expect(descriptorBytes.byteLength).toBeLessThan(Buffer.byteLength(JSON.stringify(manifest), "utf8") / 8);
+    expect(Math.max(...descriptor.chunks.map((chunk) => chunk.sizeBytes)))
+      .toBeLessThanOrEqual(checkpointManifestStorageLimits.chunkMaxBytes);
+    await expect(readCheckpointManifestMerkle(cas, rootDigest)).resolves.toEqual(manifest);
+
+    await writeFile(
+      path.join(state, "checkpoints", "cas", descriptor.chunks[1]!.digest),
+      "forged Merkle leaf\n",
+      "utf8"
+    );
+    await expect(readCheckpointManifestMerkle(cas, rootDigest))
+      .rejects.toBeInstanceOf(CheckpointConflictError);
+  });
+
+  it("externalizes large exact deltas through a chunked Merkle root", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-delta-merkle-");
+    const state = path.join(root, "state");
+    const cas = new CheckpointCasStore(state);
+    const delta = {
+      added: Array.from({ length: 12_000 }, (_unused, index) =>
+        `dependencies/item-${index.toString().padStart(5, "0")}`),
+      modified: ["manifest.json"],
+      deleted: ["old.lock"]
+    };
+    const deltaDigest = await putCheckpointDeltaMerkle(cas, delta);
+    const descriptorBytes = await readFile(path.join(state, "checkpoints", "cas", deltaDigest));
+    const descriptor = JSON.parse(descriptorBytes.toString("utf8")) as {
+      kind: string;
+      itemCount: number;
+      chunks: unknown[];
+    };
+    expect(descriptor).toMatchObject({
+      kind: "checkpoint_delta_merkle_v1",
+      itemCount: 12_002
+    });
+    expect(descriptor.chunks.length).toBeGreaterThan(1);
+    expect(descriptorBytes.byteLength).toBeLessThan(Buffer.byteLength(JSON.stringify(delta), "utf8") / 8);
+    await expect(readCheckpointDeltaMerkle(cas, deltaDigest)).resolves.toEqual(delta);
+  });
+
+  it("reads legacy flat manifest roots during checkpoint migration", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-legacy-manifest-");
+    const cas = new CheckpointCasStore(path.join(root, "state"));
+    const legacy = {
+      entries: [{ path: "legacy", kind: "directory" as const, mode: 0o40755, size: 0 }],
+      fileCount: 1,
+      totalBytes: 0
+    };
+    const legacyDigest = await cas.putBytes(Buffer.from(JSON.stringify(legacy), "utf8"));
+    await expect(readCheckpointManifestMerkle(cas, legacyDigest)).resolves.toEqual(legacy);
+  });
+
+  it("property: canonical Merkle roots do not depend on caller entry order", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-merkle-property-");
+    const cas = new CheckpointCasStore(path.join(root, "state"));
+    await fc.assert(fc.asyncProperty(
+      fc.uniqueArray(fc.integer({ min: 0, max: 2_000 }), { maxLength: 96 }),
+      async (identifiers) => {
+        const entries = identifiers.map((identifier) => ({
+          path: `root/item-${identifier.toString().padStart(4, "0")}`,
+          kind: "directory" as const,
+          mode: 0o40755,
+          size: 0
+        }));
+        const forward = { entries, fileCount: entries.length, totalBytes: 0 };
+        const reverse = { entries: [...entries].reverse(), fileCount: entries.length, totalBytes: 0 };
+        const left = await putCheckpointManifestMerkle(cas, forward);
+        const right = await putCheckpointManifestMerkle(cas, reverse);
+        expect(left).toBe(right);
+      }
+    ), { numRuns: 24 });
+  });
+
+  it("rolls back a newly created reproducible dependency tree as one root record", async () => {
+    const { root, workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-reproducible-root",
+      runId: "run-reproducible-root",
+      workspacePath: workspace,
+      scopePaths: ["."],
+      baseSeq: 1,
+      reproducibleRootPaths: ["node_modules"],
+      explicitDeliverablePaths: ["dist/result.js"]
+    });
+    await mkdir(path.join(workspace, "node_modules", "pkg"), { recursive: true });
+    for (let index = 0; index < 32; index += 1) {
+      await writeFile(path.join(workspace, "node_modules", "pkg", `${index}.js`), `module ${index}\n`, "utf8");
+    }
+    await mkdir(path.join(workspace, "dist"));
+    await writeFile(path.join(workspace, "dist", "result.js"), "delivered\n", "utf8");
+
+    const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+    const post = await storedCheckpointManifest(root, sealed.postManifestDigest!);
+    expect(sealed.reproducibleRootPaths).toEqual(["node_modules"]);
+    expect(post.entries.filter((entry) => entry.path === "node_modules"
+      || entry.path.startsWith("node_modules/"))).toEqual([
+      expect.objectContaining({ path: "node_modules", kind: "reproducible_root" })
+    ]);
+    expect(sealed.delta?.added).toContain("node_modules");
+    await expect(manager.reviewDiff(checkpoint.sessionId, checkpoint.checkpointId))
+      .resolves.toContain("[reproducible dependency root; contents omitted]");
+
+    const recordPath = path.join(
+      root,
+      "state",
+      "checkpoints",
+      "sessions",
+      checkpoint.sessionId,
+      `${checkpoint.checkpointId}.json`
+    );
+    const persisted = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, unknown>;
+    expect(persisted.delta).toBeUndefined();
+    expect(persisted.deltaDigest).toMatch(/^[a-f0-9]{64}$/u);
+
+    await manager.undoLatest(checkpoint.sessionId);
+    await expect(lstat(path.join(workspace, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(path.join(workspace, "dist"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(workspace, "existing.txt"), "utf8")).resolves.toBe("before");
+  });
+
+  it("refuses to remove a replacement at an attested reproducible root", async () => {
+    const { workspace, manager } = await fixture();
+    const checkpoint = await manager.create({
+      sessionId: "session-replaced-reproducible-root",
+      runId: "run-replaced-reproducible-root",
+      workspacePath: workspace,
+      scopePaths: ["."],
+      baseSeq: 1,
+      reproducibleRootPaths: ["cache"]
+    });
+    const cache = path.join(workspace, "cache");
+    await mkdir(cache);
+    await writeFile(path.join(cache, "generated.bin"), "rebuildable\n", "utf8");
+    await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
+
+    await rm(cache, { recursive: true });
+    await mkdir(cache);
+    await writeFile(path.join(cache, "user.txt"), "replacement\n", "utf8");
+    await expect(manager.undoLatest(checkpoint.sessionId)).rejects.toBeInstanceOf(CheckpointConflictError);
+    await expect(readFile(path.join(cache, "user.txt"), "utf8")).resolves.toBe("replacement\n");
+  });
+
+  it("keeps pre-existing and explicitly delivered dependency roots exact", async () => {
+    const first = await fixture();
+    await mkdir(path.join(first.workspace, "vendor"));
+    await writeFile(path.join(first.workspace, "vendor", "existing.txt"), "before\n", "utf8");
+    const preExisting = await first.manager.create({
+      sessionId: "session-preexisting-root",
+      runId: "run-preexisting-root",
+      workspacePath: first.workspace,
+      scopePaths: ["vendor"],
+      baseSeq: 1,
+      reproducibleRootPaths: ["vendor"]
+    });
+    await writeFile(path.join(first.workspace, "vendor", "existing.txt"), "after\n", "utf8");
+    const sealedExisting = await first.manager.seal(preExisting.sessionId, preExisting.checkpointId);
+    const existingPost = await storedCheckpointManifest(first.root, sealedExisting.postManifestDigest!);
+    expect(sealedExisting.reproducibleRootPaths).toBeUndefined();
+    expect(existingPost.entries.find((entry) => entry.path === "vendor/existing.txt")?.kind).toBe("file");
+    await first.manager.undoLatest(preExisting.sessionId);
+    await expect(readFile(path.join(first.workspace, "vendor", "existing.txt"), "utf8")).resolves.toBe("before\n");
+
+    const second = await fixture();
+    const delivered = await second.manager.create({
+      sessionId: "session-delivered-root",
+      runId: "run-delivered-root",
+      workspacePath: second.workspace,
+      scopePaths: ["."],
+      baseSeq: 1,
+      reproducibleRootPaths: ["generated"],
+      explicitDeliverablePaths: ["generated/result.json"]
+    });
+    await mkdir(path.join(second.workspace, "generated"));
+    await writeFile(path.join(second.workspace, "generated", "result.json"), "{}\n", "utf8");
+    const sealedDelivered = await second.manager.seal(delivered.sessionId, delivered.checkpointId);
+    const deliveredPost = await storedCheckpointManifest(second.root, sealedDelivered.postManifestDigest!);
+    expect(sealedDelivered.reproducibleRootPaths).toBeUndefined();
+    expect(deliveredPost.entries.find((entry) => entry.path === "generated/result.json")?.kind).toBe("file");
+    expect(deliveredPost.entries.some((entry) => entry.kind === "reproducible_root")).toBe(false);
+  });
+
   it("keeps bounded review material UTF-8 safe without partial text", async () => {
     const { workspace, manager } = await fixture();
     await writeFile(path.join(workspace, "existing.txt"), "你好🙂".repeat(1024), "utf8");
@@ -1015,10 +1283,7 @@ describe("CheckpointManager", () => {
     });
     await writeFile(path.join(workspace, "existing.txt"), "after!", "utf8");
     const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const post = JSON.parse(await readFile(
-      path.join(root, "state", "checkpoints", "cas", sealed.postManifestDigest!),
-      "utf8"
-    )) as { entries: Array<{ path: string; digest?: string }> };
+    const post = await storedCheckpointManifest(root, sealed.postManifestDigest!);
     const digest = post.entries.find((entry) => entry.path === "existing.txt")!.digest!;
     await writeFile(path.join(root, "state", "checkpoints", "cas", digest), "forged!", "utf8");
 
@@ -1041,10 +1306,7 @@ describe("CheckpointManager", () => {
     });
     await writeFile(target, Buffer.from([0, 3, 4]));
     const sealed = await manager.seal(checkpoint.sessionId, checkpoint.checkpointId);
-    const post = JSON.parse(await readFile(
-      path.join(root, "state", "checkpoints", "cas", sealed.postManifestDigest!),
-      "utf8"
-    )) as { entries: Array<{ path: string; digest?: string }> };
+    const post = await storedCheckpointManifest(root, sealed.postManifestDigest!);
     const digest = post.entries.find((entry) => entry.path === "payload.bin")!.digest!;
     await writeFile(path.join(root, "state", "checkpoints", "cas", digest), Buffer.from([0, 9, 9]));
 

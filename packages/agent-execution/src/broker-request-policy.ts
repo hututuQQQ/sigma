@@ -50,7 +50,10 @@ function defaultProtectedPaths(policy: ExecutionPolicy): string[] {
   ));
   return [...new Set([
     ...explicit,
-    ...roots.flatMap((root) => [path.join(root, ".git"), path.join(root, ".agent")])
+    ...roots.flatMap((root) => [
+      path.join(root, ".git"),
+      path.join(root, ".agent")
+    ])
   ])];
 }
 
@@ -58,7 +61,8 @@ function executionRoots(
   command: CommandSpec,
   policy: ExecutionPolicy,
   toolchains: NormalizedTrustedToolchain[],
-  verifiedExecutables: string[]
+  verifiedExecutables: string[],
+  backend: "native" | "oci"
 ): string[] {
   const explicit = policy.executionRoots ?? [];
   assertAbsoluteRoots(explicit, "executionRoots");
@@ -67,7 +71,7 @@ function executionRoots(
     ...explicit.map(comparablePath),
     ...toolchains.flatMap((toolchain) => toolchain.executionRoots)
   ]);
-  if (path.isAbsolute(command.executable)
+  if (backend === "native" && path.isAbsolute(command.executable)
     && !explicit.some((root) => pathWithin(command.executable, root))
     && !toolchains.some((toolchain) => samePath(toolchain.executable, command.executable))
     && !verifiedExecutables.some((candidate) => samePath(candidate, command.executable))) {
@@ -78,7 +82,50 @@ function executionRoots(
   return roots;
 }
 
-function wireCommand(command: CommandSpec, toolchains: NormalizedTrustedToolchain[]): Record<string, unknown> {
+export interface VerifiedTargetExecutableEnvironment {
+  platform: string;
+  searchPaths: readonly string[];
+}
+
+function targetPathSeparator(platform: string): string {
+  return platform === "windows" || platform === "win32" ? ";" : ":";
+}
+
+function hasTargetPathSeparator(executable: string, platform: string): boolean {
+  return platform === "windows" || platform === "win32"
+    ? /[\\/]/u.test(executable)
+    : executable.includes("/");
+}
+
+function bindTargetExecutableEnvironment(
+  environment: Record<string, string>,
+  executable: string,
+  options: SigmaExecBrokerClientOptions,
+  target: VerifiedTargetExecutableEnvironment | undefined
+): Record<string, string> {
+  if ((options.executionBackend ?? "native") !== "oci") return environment;
+  const result = { ...environment };
+  for (const key of Object.keys(result)) {
+    if (key.toLowerCase() === "path") delete result[key];
+  }
+  if (!target || target.searchPaths.length === 0) {
+    if (!hasTargetPathSeparator(executable, target?.platform ?? process.platform)) {
+      throw new BrokerExecutableUnavailableError(
+        "The attested OCI target did not report an executable search path for a bare command."
+      );
+    }
+    return result;
+  }
+  result.PATH = target.searchPaths.join(targetPathSeparator(target.platform));
+  return result;
+}
+
+function wireCommand(
+  command: CommandSpec,
+  toolchains: NormalizedTrustedToolchain[],
+  options: SigmaExecBrokerClientOptions,
+  target: VerifiedTargetExecutableEnvironment | undefined
+): Record<string, unknown> {
   if (!command.executable || typeof command.executable !== "string") throw new BrokerPolicyError("Command executable is required.");
   if (!path.isAbsolute(command.cwd)) throw new BrokerPolicyError("Command cwd must be absolute.");
   if (command.args?.some((argument) => typeof argument !== "string" || argument.includes("\0"))) {
@@ -91,7 +138,12 @@ function wireCommand(command: CommandSpec, toolchains: NormalizedTrustedToolchai
     executable: command.executable,
     args: command.args ?? [],
     cwd: path.resolve(command.cwd),
-    env: applyTrustedToolchains(createMinimalEnvironment(command.environment), toolchains),
+    env: bindTargetExecutableEnvironment(
+      applyTrustedToolchains(createMinimalEnvironment(command.environment), toolchains),
+      command.executable,
+      options,
+      target
+    ),
     ...(command.stdin === undefined ? {} : { stdin: command.stdin })
   };
 }
@@ -107,7 +159,8 @@ function wirePolicy(
   assertAbsoluteRoots(policy.readRoots, "readRoots");
   assertAbsoluteRoots(policy.writeRoots, "writeRoots");
   assertAbsoluteRoots(policy.protectedPaths ?? [], "protectedPaths");
-  const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables);
+  const backend = options.executionBackend ?? "native";
+  const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables, backend);
   const runtimeRoots = toolchains
     .filter((toolchain) => samePath(toolchain.executable, command.executable))
     .flatMap((toolchain) => toolchain.runtimeRoots);
@@ -141,7 +194,8 @@ function wirePolicy(
     writeRoots: resolvedWriteRoots,
     executionRoots: resolvedExecutionRoots,
     ...(executableSha256 ? { executableSha256 } : {}),
-    protectedPaths: defaultProtectedPaths(policy).map((item) => path.resolve(item))
+    protectedPaths: defaultProtectedPaths(policy)
+      .map((item) => path.resolve(item))
   };
 }
 
@@ -149,7 +203,8 @@ export function requestParams(
   request: ExecutionRequest | ProcessSpawnRequest,
   options: SigmaExecBrokerClientOptions,
   toolchains: NormalizedTrustedToolchain[],
-  verifiedExecutables: string[]
+  verifiedExecutables: string[],
+  target?: VerifiedTargetExecutableEnvironment
 ): Record<string, unknown> {
   const invocation = resolveTrustedInvocation(
     request.command.executable, request.command.args ?? [], toolchains, request.command.cwd
@@ -169,7 +224,7 @@ export function requestParams(
     }
   }
   return {
-    command: wireCommand(resolvedCommand, toolchains),
+    command: wireCommand(resolvedCommand, toolchains, options, target),
     policy: wirePolicy(
       resolvedCommand, request.policy, options, toolchains, verifiedExecutables, executableSha256
     ),

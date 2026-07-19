@@ -23,6 +23,19 @@ function capabilityFailureKey(code: string, call: ModelToolCall): string {
   return `${code}:${call.name}:${canonical(call.arguments)}`;
 }
 
+/** Preflight retries are scoped to the same semantic invocation. A failure of
+ * one executable or argument set must never disable every process tool in the
+ * session. The diagnostic code remains part of the stored key because the
+ * runtime may learn about more than one unavailable capability independently. */
+export function capabilityRetryExhausted(
+  session: RuntimeSession,
+  call: ModelToolCall
+): boolean {
+  const suffix = `:${call.name}:${canonical(call.arguments)}`;
+  return [...session.interaction.capabilityFailures.entries()]
+    .some(([key, count]) => count >= 2 && key.endsWith(suffix));
+}
+
 export function convergedToolFailure(
   session: RuntimeSession,
   call: ModelToolCall,

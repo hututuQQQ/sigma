@@ -61,6 +61,11 @@ export async function stageRestoreEntry(
   symlinkType?: "file" | "junction"
 ): Promise<void> {
   await mkdir(path.dirname(target), { recursive: true });
+  if (entry.kind === "reproducible_root") {
+    throw new CheckpointConflictError(
+      `A reproducible-root marker cannot be installed as a checkpoint preimage: ${entry.path}`
+    );
+  }
   if (entry.kind === "directory") await mkdir(target, { recursive: true });
   else if (entry.kind === "symlink") await symlink(entry.linkTarget!, target, symlinkType);
   else await stageCasFile(readCas, target, entry);

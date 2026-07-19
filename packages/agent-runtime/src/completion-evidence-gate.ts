@@ -8,10 +8,19 @@ import {
   type ToolReceipt
 } from "agent-protocol";
 import { parseCompletionProposal } from "agent-tools";
-import { currentFrontierReview, frontierValidationReadiness } from "./mutation-evidence.js";
+import {
+  currentFrontierReview,
+  frontierValidationReadiness
+} from "./mutation-evidence.js";
 import { failed } from "./tool-receipt.js";
 import type { RuntimeSession } from "./types.js";
-import { assuranceRequirement } from "./assurance-engine.js";
+import {
+  assuranceRequirement,
+  validationClaimSatisfies
+} from "./assurance-engine.js";
+import { completionLimitations, reviewMode, reviewSatisfied } from "./completion-limitations.js";
+
+export { completionLimitations } from "./completion-limitations.js";
 
 function findingText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -23,33 +32,40 @@ export function currentRunEvidence(session: RuntimeSession): EvidenceRecord[] {
     isCompletionReferenceableEvidence(item, session.identity.sessionId, session.durable.runId));
 }
 
-function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
-  return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
-}
-
 export interface CompletionCoordinatorStateV1 {
   modelStopped: boolean;
   assuranceSatisfied: boolean;
+  actualValidationFailed: boolean;
   reviewSatisfied: boolean;
   runCompleted: boolean;
+}
+
+function hasCurrentRelevantActualValidationFailure(
+  session: RuntimeSession,
+  validation = frontierValidationReadiness(session)
+): boolean {
+  const requiredClaims = assuranceRequirement(session).requiredClaims;
+  return validation.validations.some((item) => item.status === "failed"
+    && item.data.claim?.status !== "unavailable"
+    && requiredClaims.some((required) =>
+      validationClaimSatisfies(item.data.claim?.kind, required)));
 }
 
 /** Defense-in-depth projection used at the durable outcome boundary. A model
  * stop is only an intent; it cannot imply assurance, review, or completion. */
 export function completionCoordinatorState(session: RuntimeSession): CompletionCoordinatorStateV1 {
-  const requirement = assuranceRequirement(session);
+  const validation = frontierValidationReadiness(session);
+  const actualValidationFailed = hasCurrentRelevantActualValidationFailure(session, validation);
   const assuranceSatisfied = session.durable.state.mutationFrontier.changedPaths.length === 0
-    || frontierValidationReadiness(session).ready;
-  const reviewRequired = reviewMode(session) === "required" || requirement.review === "required";
-  const review = currentFrontierReview(session);
-  const reviewSatisfied = !reviewRequired
-    || (review?.status === "passed" && review.data.verdict === "approved");
+    || (validation.ready && !actualValidationFailed);
+  const reviewReady = reviewSatisfied(session);
   const modelStopped = true;
   return {
     modelStopped,
     assuranceSatisfied,
-    reviewSatisfied,
-    runCompleted: modelStopped && assuranceSatisfied && reviewSatisfied
+    actualValidationFailed,
+    reviewSatisfied: reviewReady,
+    runCompleted: modelStopped && assuranceSatisfied && reviewReady
   };
 }
 
@@ -161,9 +177,23 @@ function validationOrReviewFailure(
 ): ToolReceipt | null {
   const frontier = session.durable.state.mutationFrontier;
   const validation = frontierValidationReadiness(session);
+  if (hasCurrentRelevantActualValidationFailure(session, validation)) {
+    return failed(call, startedAt,
+      "Current-state semantic validation has an actual failed required claim; repair it and validate the same frontier again, or report a durable blocker.",
+      "validation_failed", {
+        status: "rejected",
+        code: "validation_failed",
+        frontierRevision: frontier.revision,
+        stateDigest: frontier.currentStateDigest,
+        nextActions: [{ tool: "validate", after: "repair" }, { tool: "report_blocked", when: "repair is exhausted" }]
+      });
+  }
   if (!validation.ready) {
+    if (completionLimitations(session)) return null;
     const observedClaims = [...new Set(validation.validations
-      .filter((item) => item.status === "passed")
+      .filter((item) => isCompletionEligibleEvidence(
+        item, session.identity.sessionId, session.durable.runId
+      ))
       .map((item) => item.data.claim?.kind ?? "untyped"))].sort();
     const observed = observedClaims.length > 0 ? observedClaims.join(", ") : "none";
     return failed(call, startedAt,

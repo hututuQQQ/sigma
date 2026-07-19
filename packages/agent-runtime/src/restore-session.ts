@@ -31,6 +31,11 @@ import {
   type ApprovalBinding,
   type RecoveredApprovalMetadata
 } from "./approval-binding.js";
+import type { QueuedFollowUp } from "./types.js";
+import {
+  trackRecoveredFollowUp,
+  type RecoveredFollowUps
+} from "./restore-follow-ups.js";
 
 export interface RestoredSessionData {
   workspacePath: string;
@@ -39,7 +44,7 @@ export interface RestoredSessionData {
   state: KernelState;
   modelTurn: number;
   lastSeq: number;
-  followUps: Array<{ id: string; text: string }>;
+  followUps: QueuedFollowUp[];
   writeScope: string[];
   strictWriteScope: boolean;
   modelRole: ModelExecutionRole;
@@ -112,7 +117,7 @@ interface RestoreAccumulator {
   state: KernelState | undefined;
   modelTurn: number;
   lastSeq: number;
-  followUps: Map<string, string>;
+  followUps: RecoveredFollowUps;
   contextItems: Map<string, ContextItem>;
   executionPlans: Map<string, ToolCallPlan>;
   pendingApprovals: Map<string, RecoveredApprovalMetadata>;
@@ -214,14 +219,6 @@ function trackContext(accumulator: RestoreAccumulator, event: AgentEventEnvelope
   }
 }
 
-function trackFollowUp(accumulator: RestoreAccumulator, event: AgentEventEnvelope): void {
-  if (event.type !== "user.follow_up" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
-  const payload = event.payload as Record<string, JsonValue>;
-  if (typeof payload.queueId !== "string" || typeof payload.text !== "string") return;
-  if (payload.status === "queued") accumulator.followUps.set(payload.queueId, payload.text);
-  if (payload.status === "delivered") accumulator.followUps.delete(payload.queueId);
-}
-
 function validSnapshotShape(state: KernelState, sessionId: string): boolean {
   return isKernelState(state) && state.sessionId === sessionId;
 }
@@ -255,6 +252,14 @@ function restoredCompletionRepairState(stored: Partial<KernelState>): Pick<
   };
 }
 
+function restoredLengthState(stored: Partial<KernelState>): Pick<KernelState, "continuationAttempts"
+  | "lengthFinishDebt" | "lengthProgressFingerprint"> {
+  const continuationAttempts = Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts! : 0;
+  const lengthFinishDebt = Number.isInteger(stored.lengthFinishDebt) ? stored.lengthFinishDebt : continuationAttempts;
+  const lengthProgressFingerprint = typeof stored.lengthProgressFingerprint === "string" ? stored.lengthProgressFingerprint : undefined;
+  return { continuationAttempts, lengthFinishDebt, lengthProgressFingerprint };
+}
+
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
   const stored = snapshot.state as unknown as Partial<KernelState>;
@@ -269,7 +274,7 @@ function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>
     activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
     ...restoredSemanticState(stored),
     ...completionRepair,
-    continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
+    ...restoredLengthState(stored),
     repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
     receiptCountAtLastUserInput: Number.isInteger(stored.receiptCountAtLastUserInput)
       ? stored.receiptCountAtLastUserInput : 0
@@ -307,7 +312,7 @@ function replayEvent(
   runDeadlineMs: number
 ): void {
   accumulator.lastSeq = event.seq;
-  trackFollowUp(accumulator, event);
+  trackRecoveredFollowUp(accumulator.followUps, event);
   trackContext(accumulator, event);
   trackApprovalAuthority(accumulator, event);
   initializeFromCreated(accumulator, event, event.sessionId, runDeadlineMs);
@@ -388,7 +393,7 @@ export async function restoreStoredSession(store: RunStore, sessionId: string, r
     state: accumulator.state,
     modelTurn: accumulator.modelTurn,
     lastSeq: accumulator.lastSeq,
-    followUps: [...accumulator.followUps].map(([id, text]) => ({ id, text })),
+    followUps: [...accumulator.followUps.values()],
     contextItems: [...accumulator.contextItems.values()],
     pendingApprovals
   };

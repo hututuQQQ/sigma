@@ -21,8 +21,10 @@ import {
   isKernelState,
   isStaleEffect,
   isTerminal,
+  lengthConvergenceRequired,
   netChangedPaths,
   rehydrate,
+  stickyLengthDebt,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import { canonicalReportedBlockerCode } from "../packages/agent-kernel/src/terminal-reducer-helpers.js";
@@ -118,6 +120,16 @@ describe("runtime-owned blocker taxonomy", () => {
     const validation = initial();
     validation.evidence.push(frontierEvidence(validation, "validation"));
     expect(canonicalReportedBlockerCode(validation)).toBe("validation_failed");
+
+    const unavailable = initial();
+    const unavailableEvidence = frontierEvidence(unavailable, "validation");
+    if (unavailableEvidence.kind !== "validation") throw new Error("expected validation evidence");
+    unavailableEvidence.data.claim = {
+      ...unavailableEvidence.data.claim!,
+      status: "unavailable"
+    };
+    unavailable.evidence.push(unavailableEvidence);
+    expect(canonicalReportedBlockerCode(unavailable)).toBe("capability_unavailable");
 
     const review = initial();
     review.evidence.push(frontierEvidence(review, "review"));
@@ -219,6 +231,143 @@ function completedReceipt(
     completedAt: timestamp
   };
 }
+
+function terminalReview(
+  state: KernelState,
+  evidenceId: string,
+  options: {
+    status: "passed" | "failed";
+    verdict: "approved" | "changes_requested";
+    findings: JsonValue[];
+    failureKind?: "infrastructure" | "interrupted";
+  }
+): EvidenceRecord {
+  return {
+    evidenceId,
+    sessionId: state.sessionId,
+    runId: state.runId,
+    kind: "review",
+    status: options.status,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    producer: { authority: "runtime", id: "reviewer" },
+    summary: options.status === "passed" ? "Independent review approved." : "Independent review requested changes.",
+    data: {
+      reviewerId: "reviewer",
+      verdict: options.verdict,
+      findings: options.findings,
+      frontierRevision: state.mutationFrontier.revision,
+      stateDigest: state.mutationFrontier.currentStateDigest,
+      reviewBasisDigest: "0".repeat(64),
+      reviewBasisVersion: 2,
+      validationEvidenceIds: [],
+      reviewRelevantEvidenceIds: [],
+      ...(options.failureKind ? { failureKind: options.failureKind } : {})
+    }
+  };
+}
+
+function finalizeReceipt(summary: string): Record<string, JsonValue> {
+  return {
+    ok: true,
+    output: JSON.stringify({ summary }),
+    observedEffects: ["outcome.propose"],
+    actualEffects: ["outcome.propose"],
+    artifacts: [],
+    diagnostics: [],
+    evidence: [],
+    startedAt: "start",
+    completedAt: "end"
+  };
+}
+
+describe("review-gated terminal receipts", () => {
+  it("offers one correction opportunity before an actionable reviewer error can terminate", () => {
+    let state = withPendingTool("first-finalize", "runtime_finalize", { summary: "done" });
+    const rejected = terminalReview(state, "review-actionable", {
+      status: "failed",
+      verdict: "changes_requested",
+      findings: [{ actionable: true, severity: "error", summary: "Repair the incomplete behavior." }]
+    });
+    state = apply(state, "review.completed", rejected);
+    state = toolEvent(state, "tool.completed", "first-finalize", finalizeReceipt("done"));
+
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "review_changes_requested",
+        reviewEvidenceId: rejected.evidenceId
+      },
+      proposedOutcome: undefined
+    });
+    expect(state.messages.at(-1)?.content).toContain("one bounded correction opportunity");
+    expect(isCompletionRepairState(state.completionRepair)).toBe(true);
+
+    state = proposeToolBatch(state, 2, [{
+      id: "second-finalize",
+      name: "runtime_finalize",
+      arguments: { summary: "unchanged" }
+    }]);
+    state = toolEvent(state, "tool.completed", "second-finalize", finalizeReceipt("unchanged"));
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: {
+        kind: "recoverable_failure",
+        code: "review_changes_requested",
+        message: expect.stringContaining("Repair the incomplete behavior")
+      }
+    });
+  });
+
+  it("lets an approved follow-up verdict complete after the correction opportunity", () => {
+    let state = withPendingTool("first-finalize", "runtime_finalize", { summary: "done" });
+    state = apply(state, "review.completed", terminalReview(state, "review-actionable", {
+      status: "failed",
+      verdict: "changes_requested",
+      findings: [{ actionable: true, severity: "error", summary: "Repair it." }]
+    }));
+    state = toolEvent(state, "tool.completed", "first-finalize", finalizeReceipt("done"));
+    state = apply(state, "review.completed", terminalReview(state, "review-approved", {
+      status: "passed",
+      verdict: "approved",
+      findings: [{ actionable: false, severity: "warning", summary: "Document the limitation." }]
+    }));
+    state = proposeToolBatch(state, 2, [{
+      id: "second-finalize",
+      name: "runtime_finalize",
+      arguments: { summary: "repaired" }
+    }]);
+    state = toolEvent(state, "tool.completed", "second-finalize", finalizeReceipt("repaired"));
+
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: {
+        kind: "completed",
+        message: expect.stringContaining("Document the limitation")
+      }
+    });
+  });
+
+  it("preserves advisory capability-failure findings without treating them as actionable errors", () => {
+    let state = withPendingTool("finalize", "runtime_finalize", { summary: "done" });
+    state = apply(state, "review.completed", terminalReview(state, "review-unavailable", {
+      status: "failed",
+      verdict: "changes_requested",
+      findings: ["Independent reviewer was unavailable."],
+      failureKind: "infrastructure"
+    }));
+    state = toolEvent(state, "tool.completed", "finalize", finalizeReceipt("done"));
+
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      proposedOutcome: {
+        kind: "completed",
+        message: expect.stringContaining("Independent reviewer was unavailable")
+      }
+    });
+    expect(state.completionRepair).toBeUndefined();
+  });
+});
 
 describe("agent-kernel exhaustive protocol behavior", () => {
   it("rejects a mixed terminal batch atomically and bounds a repeated conflict", () => {
@@ -474,6 +623,30 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       ));
     }
     expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "developer",
+      content: expect.stringContaining("[no_progress]")
+    });
+    expect(state.receipts.at(-1)).toMatchObject({
+      ok: true,
+      outcome: { status: "succeeded" },
+      runtimeAdvisories: [{
+        schemaVersion: 1,
+        code: "no_progress",
+        repeatCount: 2,
+        unchangedDimensions: ["workspace", "validation_frontier", "process_state", "evidence"],
+        repair: {
+          kind: "change_action_or_converge",
+          suggestions: ["change_tool_or_arguments", "repair_blocker", "validate_or_finish"]
+        }
+      }]
+    });
+    const advisory = state.receipts.at(-1)?.runtimeAdvisories?.[0];
+    if (advisory?.code === "no_progress") {
+      expect(advisory.repair.kind).toBe("change_action_or_converge");
+    } else {
+      throw new Error("Expected a branchable no_progress runtime advisory.");
+    }
     state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
     expect(state.pendingTools).toEqual([]);
     expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
@@ -497,24 +670,164 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
   });
 
-  it("resets the completed-outcome streak when another batch intervenes", () => {
+  it("accrues action debt across semantically similar parameter variants", () => {
     let state = apply(initial(), "user.message", { text: "inspect related paths" });
-    for (const index of [1, 2]) {
-      const callId = `first-path-${index}`;
-      state = proposeToolBatch(state, index, [{ id: callId, name: "read", arguments: { path: "a.txt" } }]);
-      state = toolEvent(state, "tool.completed", callId, completedReceipt("A", `2026-01-01T00:00:0${index}.000Z`));
+    for (const [index, path] of ["a.txt", "b.txt"].entries()) {
+      const callId = `variant-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
     }
-    state = proposeToolBatch(state, 3, [{ id: "other-path", name: "read", arguments: { path: "b.txt" } }]);
-    state = toolEvent(state, "tool.completed", "other-path", completedReceipt("B", "2026-01-01T00:00:03.000Z"));
-    expect(state.repeatedToolBatchCount).toBe(1);
-    state = proposeToolBatch(state, 4, [{ id: "first-path-again", name: "read", arguments: { path: "a.txt" } }]);
+    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.receipts.at(-1)?.runtimeAdvisories?.[0]?.code).toBe("no_progress");
+
+    state = proposeToolBatch(state, 3, [{ id: "third-variant", name: "read", arguments: { path: "c.txt" } }]);
     expect(state.phase).toBe("tool_pending");
     expect(state.proposedOutcome).toBeUndefined();
+    state = toolEvent(state, "tool.completed", "third-variant", completedReceipt(
+      "C", "2026-01-01T00:00:03.000Z"
+    ));
+    expect(state.repeatedToolBatchCount).toBe(3);
+  });
+
+  it("resets action debt for new semantic evidence but ignores duplicate evidence IDs", () => {
+    let state = apply(initial(), "user.message", { text: "inspect related paths with diagnostics" });
+    state = proposeToolBatch(state, 1, [{ id: "diagnostic-1", name: "read", arguments: { path: "a.txt" } }]);
+    state = toolEvent(state, "tool.completed", "diagnostic-1", completedReceipt(
+      "A", "2026-01-01T00:00:01.000Z"
+    ));
+    state = apply(state, "evidence.recorded", diagnosticEvidence("new-diagnostic"));
+    state = proposeToolBatch(state, 2, [{ id: "diagnostic-2", name: "read", arguments: { path: "b.txt" } }]);
+    state = toolEvent(state, "tool.completed", "diagnostic-2", completedReceipt(
+      "B", "2026-01-01T00:00:02.000Z"
+    ));
+
+    expect(state.repeatedToolBatchCount).toBe(1);
+
+    state = apply(state, "evidence.recorded", diagnosticEvidence("duplicate-diagnostic"));
+    expect(state.repeatedToolBatchCount).toBe(1);
+    state = proposeToolBatch(state, 3, [{ id: "diagnostic-3", name: "read", arguments: { path: "c.txt" } }]);
+    state = toolEvent(state, "tool.completed", "diagnostic-3", completedReceipt(
+      "C", "2026-01-01T00:00:03.000Z"
+    ));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.receipts.at(-1)?.runtimeAdvisories?.[0]?.code).toBe("no_progress");
+  });
+
+  it("clears semantic action debt after validation-frontier progress", () => {
+    let state = apply(initial(), "user.message", { text: "inspect, validate, and inspect again" });
+    for (const [index, path] of ["a.txt", "b.txt"].entries()) {
+      const callId = `before-validation-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    state = apply(state, "evidence.recorded", frontierEvidence(state, "validation", "passed"));
+    expect(state.repeatedToolBatchCount).toBe(0);
+    state = proposeToolBatch(state, 3, [{ id: "after-validation", name: "read", arguments: { path: "c.txt" } }]);
+    state = toolEvent(state, "tool.completed", "after-validation", completedReceipt(
+      "C", "2026-01-01T00:00:03.000Z"
+    ));
+    expect(state.repeatedToolBatchCount).toBe(1);
+  });
+
+  it("rebases semantic action debt after plan obligations materially change", () => {
+    let state = apply(initial(), "user.message", { text: "inspect while following a changing plan" });
+    for (const [index, path] of ["a.txt", "b.txt"].entries()) {
+      const callId = `before-plan-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    state = apply(state, "plan.updated", {
+      previousRevision: 0,
+      plan: {
+        revision: 1,
+        goal: "produce a validated result",
+        activeNodeId: "validate",
+        nodes: [{
+          id: "validate",
+          title: "validate the result",
+          dependencies: [],
+          status: "in_progress",
+          owner: { kind: "root" },
+          acceptanceCriteria: ["validation passes"],
+          evidence: []
+        }]
+      }
+    });
+    state = proposeToolBatch(state, 3, [{ id: "after-plan", name: "read", arguments: { path: "c.txt" } }]);
+    state = toolEvent(state, "tool.completed", "after-plan", completedReceipt(
+      "C", "2026-01-01T00:00:03.000Z"
+    ));
+    expect(state.repeatedToolBatchCount).toBe(1);
+  });
+
+  it("clears semantic action debt when process state changes", () => {
+    let state = apply(initial(), "user.message", { text: "inspect before supervising a process" });
+    for (const [index, path] of ["a.txt", "b.txt"].entries()) {
+      const callId = `before-process-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    state = apply(state, "process.spawned", {
+      processId: "background-work", executionId: "execution", mode: "background"
+    });
+    expect(state.activeProcessIds).toEqual(["background-work"]);
+    expect(state.repeatedToolBatchCount).toBe(0);
+  });
+
+  it("treats volatile receipt output as no progress when trusted state is unchanged", () => {
+    let state = apply(initial(), "user.message", { text: "observe a volatile result" });
+    state = proposeToolBatch(state, 1, [{ id: "volatile-1", name: "shell", arguments: { command: "date" } }]);
+    state = toolEvent(state, "tool.completed", "volatile-1", completedReceipt("first", "2026-01-01T00:00:01.000Z"));
+    state = proposeToolBatch(state, 2, [{ id: "volatile-2", name: "shell", arguments: { command: "date" } }]);
+    state = toolEvent(state, "tool.completed", "volatile-2", completedReceipt("second", "2026-01-01T00:00:02.000Z"));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    state = proposeToolBatch(state, 3, [{ id: "volatile-3", name: "shell", arguments: { command: "date" } }]);
+    expect(state.pendingTools).toEqual([]);
+    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+  });
+
+  it("rebuilds a forged persisted evidence-progress cache before using it", () => {
+    const forged = "f".repeat(64);
+    let state: KernelState = {
+      ...initial(),
+      evidence: [diagnosticEvidence("persisted-evidence")],
+      progressEvidenceDigest: forged,
+      progressEvidenceFingerprints: [forged],
+      progressEvidenceRecordCount: 1
+    };
+    state = apply(state, "user.message", { text: "inspect with restored evidence" });
+    state = proposeToolBatch(state, 1, [{ id: "restored-1", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "restored-1", completedReceipt(
+      "stable", "2026-01-01T00:00:01.000Z"
+    ));
+
+    expect(state.progressEvidenceRecordCount).toBe(1);
+    expect(state.progressEvidenceDigest).not.toBe(forged);
+    expect(state.progressEvidenceFingerprints).not.toEqual([forged]);
+
+    state = proposeToolBatch(state, 2, [{ id: "restored-2", name: "read", arguments: { path: "seed.txt" } }]);
+    state = toolEvent(state, "tool.completed", "restored-2", completedReceipt(
+      "stable", "2026-01-01T00:00:02.000Z"
+    ));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    expect(state.receipts.at(-1)?.runtimeAdvisories?.[0]?.code).toBe("no_progress");
   });
 
   it.each([
-    ["receipt output", completedReceipt("first", "2026-01-01T00:00:01.000Z"),
-      completedReceipt("second", "2026-01-01T00:00:02.000Z")],
     ["workspace delta", completedReceipt("stable", "2026-01-01T00:00:01.000Z", {
       added: ["first.txt"], modified: [], deleted: []
     }), completedReceipt("stable", "2026-01-01T00:00:02.000Z", {
@@ -663,6 +976,40 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(exhaustedLength.proposedOutcome).toMatchObject({
       kind: "recoverable_failure", code: "model_output_limit"
     });
+    const toolPending = settleModel(startModel(length, 2), "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "inspect-after-length", name: "read", arguments: { path: "README.md" } }]
+      },
+      toolCalls: [{ id: "inspect-after-length", name: "read", arguments: { path: "README.md" } }],
+      finishReason: "tool_calls"
+    });
+    const noProgressTool = toolEvent(
+      toolPending,
+      "tool.completed",
+      "inspect-after-length",
+      completedReceipt("same observation", "2026-01-01T00:00:00.000Z")
+    );
+    expect(noProgressTool.continuationAttempts).toBe(0);
+    expect(stickyLengthDebt(noProgressTool)).toBe(1);
+    expect(lengthConvergenceRequired(noProgressTool)).toBe(true);
+    const separatedLength = settleModel(startModel(noProgressTool, 3), "model.completed", {
+      message: { role: "assistant", content: "partial again" },
+      toolCalls: [],
+      finishReason: "length"
+    });
+    expect(stickyLengthDebt(separatedLength)).toBe(2);
+    const trustedProgress = {
+      ...separatedLength,
+      mutationFrontier: {
+        ...separatedLength.mutationFrontier,
+        revision: separatedLength.mutationFrontier.revision + 1,
+        currentStateDigest: "b".repeat(64)
+      }
+    };
+    expect(stickyLengthDebt(trustedProgress)).toBe(0);
+    expect(lengthConvergenceRequired(trustedProgress)).toBe(false);
     const filtered = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "" }, toolCalls: [], finishReason: "content_filter" });
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
@@ -900,6 +1247,26 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toMatchObject({
       phase: "terminal",
       outcome: { kind: "completed", message: "evidence-backed result", evidence: [] }
+    });
+    expect(apply(completion, "run.completed", {
+      kind: "completed_with_limitations",
+      message: "committed with limitation",
+      outcomeRevision: committedRevision,
+      evidence: [],
+      limitations: [{
+        kind: "validation_capability_unavailable",
+        claim: "unit",
+        attemptedCommandSummary: "pnpm test",
+        capabilityEvidenceId: "validation-proof",
+        reason: "The test runner is unavailable."
+      }]
+    })).toMatchObject({
+      phase: "terminal",
+      outcome: {
+        kind: "completed_with_limitations",
+        message: "evidence-backed result",
+        limitations: [{ capabilityEvidenceId: "validation-proof" }]
+      }
     });
     expect(apply(completion, "run.completed", {
       message: "stale", outcomeRevision: committedRevision - 1
@@ -1453,6 +1820,22 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     state = apply(state, "process.lost", { processId: "process-2", reason: "broker ended" });
     expect(state.activeProcessIds).toEqual([]);
+  });
+
+  it("does not settle a reused current process ID while replaying an old-run event", () => {
+    const active: KernelState = { ...initial(), activeProcessIds: ["reused-process"] };
+    const oldRunExit: AgentEventEnvelope = {
+      ...envelope(active, "process.exited", { processId: "reused-process", exitCode: 0 }),
+      runId: "old-run"
+    };
+
+    const restored = rehydrate(active, [oldRunExit]);
+    expect(restored.activeProcessIds).toEqual(["reused-process"]);
+
+    const currentRunExit = envelope(restored, "process.exited", {
+      processId: "reused-process", exitCode: 0
+    });
+    expect(rehydrate(restored, [currentRunExit]).activeProcessIds).toEqual([]);
   });
 
   it("advances the frontier and invalidates old validation when a checkpoint is restored", () => {

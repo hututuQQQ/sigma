@@ -1,6 +1,7 @@
 import type {
   AgentEventEnvelope,
   BudgetLimits,
+  CompletionLimitationV1,
   ContextItem,
   JsonValue,
   ModelExecutionRole,
@@ -10,7 +11,9 @@ import type {
   RunStore,
   ToolEffect,
   ToolCallApproval,
-  ToolExecutor
+  ToolExecutor,
+  ValidationEvidence,
+  ValidationRequirementV1
 } from "agent-protocol";
 import type { KernelState } from "agent-kernel";
 import type { RepositoryValidationCapabilityProfile } from "agent-context";
@@ -77,6 +80,16 @@ export interface RuntimeOptions {
 export interface ChildJoinSummary {
   evidence: JsonValue[];
   failures: string[];
+  limitations?: CompletionLimitationV1[];
+  /** Resolvable source records for every propagated limitation. The parent
+   * imports each record under a parent-owned evidence ID before completion. */
+  limitationEvidence?: ChildLimitationEvidenceSource[];
+}
+
+export interface ChildLimitationEvidenceSource {
+  childId: string;
+  limitation: CompletionLimitationV1;
+  evidence: ValidationEvidence;
 }
 
 export interface ApprovalWaiter {
@@ -101,6 +114,7 @@ export interface CallApprovalGrant extends ToolCallApproval, ApprovalBinding {
 export interface QueuedFollowUp {
   id: string;
   text: string;
+  validationRequirement?: ValidationRequirementV1;
 }
 
 export interface OutcomeWaiter {

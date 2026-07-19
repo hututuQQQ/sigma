@@ -37,7 +37,8 @@ function safePath(value: string): boolean {
 function restoreImage(value: unknown): value is RestoreImageIdentity {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const image = value as Partial<RestoreImageIdentity>;
-  return (image.kind === "file" || image.kind === "directory" || image.kind === "symlink")
+  return (image.kind === "file" || image.kind === "directory" || image.kind === "symlink"
+    || image.kind === "reproducible_root")
     && Number.isSafeInteger(image.mode) && (image.mode as number) >= 0
     && Number.isSafeInteger(image.size) && (image.size as number) >= 0
     && typeof image.digest === "string" && /^[a-f0-9]{64}$/u.test(image.digest);

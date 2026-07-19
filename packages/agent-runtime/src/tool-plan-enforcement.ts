@@ -79,6 +79,52 @@ function syntaxSubjectArguments(executable: string, args: readonly string[]): st
   return [];
 }
 
+function inlineProgram(executable: string, args: readonly string[]): string | undefined {
+  const name = path.basename(executable).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/u, "");
+  const flags = ["node", "bun", "deno"].includes(name)
+    ? ["-e", "--eval", "-p", "--print"]
+    : ["python", "python3", "py"].includes(name) ? ["-c"] : [];
+  const index = args.findIndex((item) => flags.includes(item));
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+function hasExplicitFailureContract(program: string | undefined): boolean {
+  return Boolean(program && /(?:\bassert\b|\braise\b|\bthrow\b|\bsys\.exit\s*\(|\bprocess\.exit\s*\(|\bexit\s*\(\s*[1-9])/u.test(program));
+}
+
+function validationAssurance(
+  call: ModelToolCall,
+  semantics: ReturnType<typeof executionCommandSemantics>,
+  kind: ValidationClaimKindV1
+): Pick<ValidationClaimV1, "strength" | "independence" | "assertionMode"> {
+  if (kind === "probe") {
+    return { strength: "structural", independence: "same_method", assertionMode: "exit_code_only" };
+  }
+  if (["syntax", "typecheck", "lint"].includes(kind)) {
+    return { strength: "structural", independence: "cross_method", assertionMode: "explicit" };
+  }
+  if (["unit", "integration"].includes(kind)) {
+    return { strength: "behavioral", independence: "cross_method", assertionMode: "explicit" };
+  }
+  const program = inlineProgram(semantics.executable, semantics.args);
+  if (program !== undefined) {
+    return {
+      strength: "self_consistency",
+      independence: "same_method",
+      assertionMode: hasExplicitFailureContract(program) ? "explicit" : "exit_code_only"
+    };
+  }
+  if (!semantics.executable && call.name !== "validate") {
+    return { strength: "behavioral", independence: "cross_method", assertionMode: "explicit" };
+  }
+  if (semantics.purpose === "custom") {
+    return { strength: "self_consistency", independence: "same_method", assertionMode: "explicit" };
+  }
+  return semantics.purpose === "build"
+    ? { strength: "structural", independence: "cross_method", assertionMode: "explicit" }
+    : { strength: "behavioral", independence: "cross_method", assertionMode: "explicit" };
+}
+
 function validationClaim(
   workspaceRoot: string,
   call: ModelToolCall
@@ -121,6 +167,7 @@ function validationClaim(
     commandDigest: createHash("sha256").update(JSON.stringify({
       executable: semantics.executable, args: semantics.args, command: command.display, cwd: project.portable
     })).digest("hex"),
+    ...validationAssurance(call, semantics, kind),
     subject: {
       projectId: project.portable,
       configPaths,
@@ -207,6 +254,25 @@ async function implicitAddedParentDirectory(
   );
 }
 
+/** Process expectedChanges are an intent/evidence projection, not the
+ * sandbox ACL. Only a complete V5 process plan whose runtime-resolved write
+ * capability exactly matches its checkpoint scope may use that broader scope
+ * for post-receipt containment. Every incomplete, inconsistent, or
+ * non-process plan remains restricted to its explicit write paths. */
+function trustedProcessWriteScope(plan: ToolCallPlan): string[] | undefined {
+  const capabilityRoots = plan.executionCapability?.writeRoots;
+  if (!plan.exactEffects.includes("process.spawn")
+    || !plan.exactEffects.includes("filesystem.write")
+    || plan.processMode === "none"
+    || plan.executionIntent?.access !== "write"
+    || !capabilityRoots
+    || capabilityRoots.length !== plan.checkpointScope.length
+    || capabilityRoots.some((item, index) => item !== plan.checkpointScope[index])) {
+    return undefined;
+  }
+  return plan.checkpointScope;
+}
+
 export async function assertReceiptWithinPlan(
   session: RuntimeSession,
   receipt: ToolReceipt,
@@ -218,8 +284,10 @@ export async function assertReceiptWithinPlan(
     ...receipt.workspaceDelta.modified.map((item) => ({ path: item, kind: "modified" as const })),
     ...receipt.workspaceDelta.deleted.map((item) => ({ path: item, kind: "deleted" as const }))
   ] : [];
-  const plannedWritePaths = plan.writePaths.length > 0
-    ? plan.writePaths : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : [];
+  const trustedProcessScope = trustedProcessWriteScope(plan);
+  const plannedWritePaths = trustedProcessScope
+    ?? (plan.writePaths.length > 0
+      ? plan.writePaths : plan.exactEffects.includes("filesystem.write") ? plan.checkpointScope : []);
   const allowedResults = await Promise.all(plannedWritePaths.map(async (item) =>
     await canonicalWrittenObjectPath(session.identity.workspacePath, item)));
   const invalidAllowed = plannedWritePaths.filter((_item, index) => !allowedResults[index]);

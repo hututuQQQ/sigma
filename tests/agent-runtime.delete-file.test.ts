@@ -82,10 +82,12 @@ describe("delete_file runtime transaction", () => {
     }));
     expect(events.some((event) => event.type === "checkpoint.created")).toBe(true);
     expect(events.some((event) => event.type === "checkpoint.sealed")).toBe(true);
-    expect(events.some((event) => event.type === "evidence.recorded"
+    const deltaEvidence = events.find((event) => event.type === "evidence.recorded"
       && (event.payload as { kind?: string; data?: { delta?: { deleted?: string[] } } }).kind === "workspace_delta"
-      && (event.payload as { data?: { delta?: { deleted?: string[] } } }).data?.delta?.deleted?.includes("obsolete.txt")))
-      .toBe(true);
+      && (event.payload as { data?: { delta?: { deleted?: string[] } } }).data?.delta?.deleted?.includes("obsolete.txt"));
+    expect(deltaEvidence).toBeDefined();
+    expect((deltaEvidence?.payload as { data?: { deltaDigest?: string } }).data?.deltaDigest)
+      .toMatch(/^[a-f0-9]{64}$/u);
     expect(events.some((event) => event.type === "evidence.recorded"
       && (event.payload as { kind?: string; data?: { validator?: string } }).kind === "validation"
       && (event.payload as { data?: { validator?: string } }).data?.validator === "checkpoint_postimage_integrity"))

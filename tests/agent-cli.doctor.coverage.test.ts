@@ -158,6 +158,23 @@ describe("doctor command branch coverage", () => {
     }
   });
 
+  it("connects a new socket-style broker before requesting readiness", async () => {
+    const root = await workspace();
+    const runtimeBroker = healthyBroker();
+    const connect = vi.spyOn(runtimeBroker, "connect");
+    const doctor = vi.spyOn(runtimeBroker, "doctor").mockRejectedValue(
+      new Error("ordinary doctor requires an established connection")
+    );
+
+    await expect(runDoctorCommand(["--workspace", root, "--json"], {
+      stdout: new Capture(),
+      executionBroker: runtimeBroker,
+      languageServers: []
+    })).resolves.toBe(0);
+    expect(connect).toHaveBeenCalledOnce();
+    expect(doctor).not.toHaveBeenCalled();
+  });
+
   it("prints skipped and empty API results as text and enforces strict warnings", async () => {
     const root = await workspace();
     vi.stubEnv("GLM_API_KEY", "");
@@ -230,6 +247,28 @@ describe("doctor command branch coverage", () => {
     const stderr = new Capture();
     await expect(runDoctorCommand(["--not-a-doctor-option"], { stderr })).resolves.toBe(1);
     expect(stderr.text()).toContain("Unknown option");
+  });
+
+  it("reports a missing OCI launcher without consulting a native execution broker", async () => {
+    const root = await workspace();
+    const native = healthyBroker();
+    const nativeDoctor = vi.spyOn(native, "doctor");
+    const stdout = new Capture();
+    await expect(runDoctorCommand([
+      "--workspace", root,
+      "--execution-mode", "container",
+      "--container-target", "managed",
+      "--json"
+    ], { stdout, executionBroker: native, languageServers: [] })).resolves.toBe(1);
+
+    const report = JSON.parse(stdout.text()) as {
+      container: { available: boolean; backend: string; reason: string };
+      checks: Array<{ name: string; status: string; message: string }>;
+    };
+    expect(nativeDoctor).not.toHaveBeenCalled();
+    expect(report.container).toMatchObject({ available: false, backend: "oci" });
+    expect(report.container.reason).toContain("host execution is never used as a fallback");
+    expect(report.checks.find((check) => check.name === "container")?.status).toBe("error");
   });
 
   it("always closes an owned broker, including when report output fails", async () => {
