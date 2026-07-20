@@ -84,10 +84,6 @@ function validateLinkType(entry: CheckpointEntry): void {
 }
 
 export function validateManifest(manifest: CheckpointManifest): void {
-  if (entriesStrictlyOrdered(manifest.entries)) {
-    validateOrderedManifest(manifest);
-    return;
-  }
   const byPath = new Map<string, CheckpointEntry>();
   let totalBytes = 0;
   for (const entry of manifest.entries) {
@@ -103,26 +99,6 @@ export function validateManifest(manifest: CheckpointManifest): void {
         throw new CheckpointConflictError(`Checkpoint path has a non-directory ancestor: ${entry.path}`);
       }
     }
-  }
-  if (manifest.fileCount !== manifest.entries.length || manifest.totalBytes !== totalBytes) {
-    throw new CheckpointConflictError("Checkpoint manifest totals are inconsistent.");
-  }
-}
-
-function validateOrderedManifest(manifest: CheckpointManifest): void {
-  const ancestors: CheckpointEntry[] = [];
-  let totalBytes = 0;
-  for (const entry of manifest.entries) {
-    validateCheckpointEntry(entry);
-    while (ancestors.length > 0 && !entry.path.startsWith(`${ancestors.at(-1)!.path}/`)) {
-      ancestors.pop();
-    }
-    const ancestor = ancestors.at(-1);
-    if (ancestor && ancestor.kind !== "directory") {
-      throw new CheckpointConflictError(`Checkpoint path has a non-directory ancestor: ${entry.path}`);
-    }
-    if (entry.path !== ".") ancestors.push(entry);
-    if (entry.kind === "file") totalBytes += entry.size;
   }
   if (manifest.fileCount !== manifest.entries.length || manifest.totalBytes !== totalBytes) {
     throw new CheckpointConflictError("Checkpoint manifest totals are inconsistent.");

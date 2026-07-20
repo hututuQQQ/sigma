@@ -25,6 +25,7 @@ import {
   netChangedPaths,
   rehydrate,
   stickyLengthDebt,
+  trustedProgressFingerprint,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import { canonicalReportedBlockerCode } from "../packages/agent-kernel/src/terminal-reducer-helpers.js";
@@ -744,6 +745,22 @@ describe("agent-kernel exhaustive protocol behavior", () => {
   });
 
   it("rejects calls outside the runtime-bound terminal turn policy before pending execution", () => {
+    let unbound = startModel(apply(initial(), "user.message", { text: "use only offered tools" }));
+    unbound = apply(unbound, "model.completed", {
+      ...unbound.activeModelTurn!,
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "unbound-read", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      toolCalls: [{ id: "unbound-read", name: "read", arguments: { path: "seed.txt" } }],
+      finishReason: "tool_calls"
+    });
+    expect(unbound.messages.at(-1)).toMatchObject({
+      role: "developer",
+      content: expect.stringContaining("offered: none")
+    });
+
     let state = startModel(apply(initial(), "user.message", { text: "finish now" }));
     state = apply(state, "diagnostic", {
       kind: "model.tool_policy",
@@ -1286,6 +1303,22 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     };
     expect(stickyLengthDebt(trustedProgress)).toBe(0);
     expect(lengthConvergenceRequired(trustedProgress)).toBe(false);
+    const evidenceProgress = {
+      ...initial(),
+      progressEvidenceDigest: "a".repeat(64)
+    };
+    expect(trustedProgressFingerprint(evidenceProgress)).toContain("a".repeat(64));
+    expect(trustedProgressFingerprint({
+      ...evidenceProgress,
+      progressEvidenceDigest: undefined
+    })).toContain('"evidence":null');
+    const legacyDebt = {
+      ...initial(),
+      continuationAttempts: 1,
+      lengthFinishDebt: undefined,
+      lengthProgressFingerprint: trustedProgressFingerprint(initial())
+    };
+    expect(stickyLengthDebt(legacyDebt)).toBe(1);
     const filtered = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "" }, toolCalls: [], finishReason: "content_filter" });
     expect(filtered.proposedOutcome).toMatchObject({ kind: "fatal", code: "content_filter" });
     const conversational = settleModel(inFlight(), "model.completed", { message: { role: "assistant", content: "answer" }, toolCalls: [], finishReason: "stop" });
@@ -1294,6 +1327,19 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       completionRepairAttempts: 1,
       completionRepair: { kind: "no_change_confirmation", answer: "answer" },
       proposedOutcome: undefined
+    });
+    const invalidProtected = settleModel(startModel(conversational, 2), "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "protected-read", name: "read", arguments: { path: "README.md" } }]
+      },
+      toolCalls: [{ id: "protected-read", name: "read", arguments: { path: "README.md" } }],
+      finishReason: "tool_calls"
+    });
+    expect(invalidProtected.proposedOutcome).toMatchObject({
+      kind: "recoverable_failure",
+      code: "terminal_protocol_invalid"
     });
     const receipt = {
       callId: "progress", ok: true, output: "inspected", observedEffects: ["filesystem.read" as const],
@@ -1856,6 +1902,50 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     })).toThrow("active model turn must agree");
     expect(() => assertKernelInvariants({ ...initial(), phase: "needs_input", outcome: { kind: "needs_input", requestId: "x", message: "x" } })).not.toThrow();
     expect(() => assertKernelInvariants({ ...initial(), phase: "terminal", outcome: { kind: "completed", message: "x", evidence: [] } })).not.toThrow();
+    const pendingConfirmation = {
+      request: { callId: "confirm", name: "confirm_no_change", arguments: { summary: "No changes." } },
+      modelTurn: { turnId: 1, effectRevision: 1 },
+      approval: "pending" as const,
+      started: false
+    };
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "no_change_confirmation", answer: "No changes." },
+      toolCallIds: ["confirm"],
+      pendingTools: [pendingConfirmation]
+    })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "needs_input",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "no_change_confirmation", answer: "No changes." },
+      toolCallIds: ["confirm"],
+      pendingTools: [pendingConfirmation]
+    })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      phase: "outcome_pending",
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "protected_completion", answer: "Need input." },
+      evidence: [diagnosticEvidence("protected-outcome-input")],
+      toolCallIds: ["ask"],
+      pendingTools: [{
+        ...pendingConfirmation,
+        request: { callId: "ask", name: "request_user_input", arguments: { message: "Choose." } }
+      }],
+      outcome: { kind: "needs_input", requestId: "ask", message: "Choose." }
+    })).not.toThrow();
+    expect(() => assertKernelInvariants({
+      ...initial(),
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "no_change_confirmation", answer: "No changes." },
+      toolCallIds: ["bad-confirm"],
+      pendingTools: [{
+        ...pendingConfirmation,
+        request: { callId: "bad-confirm", name: "read", arguments: { path: "file.txt" } }
+      }]
+    })).toThrow("typed terminal-intent");
     expect(isKernelState({
       ...initial(),
       completionRepairAttempts: 1,
@@ -1982,6 +2072,21 @@ describe("agent-kernel exhaustive protocol behavior", () => {
         request: { callId: "invalid-revision", name: "read", arguments: null },
         modelTurn: { turnId: 1, effectRevision: Number.NaN }, approval: "allowed", started: false
       }] }, "valid originating model turn"],
+      [{
+        ...base,
+        phase: "model_in_flight",
+        activeModelTurn: { turnId: Number.NaN, effectRevision: 1 }
+      }, "Active model turn policy"],
+      [{
+        ...base,
+        completionRepairAttempts: 1,
+        completionRepair: { kind: "protected_recovery", answer: "recover" }
+      }, "Protected completion recovery"],
+      [{
+        ...base,
+        completionRepairAttempts: 0,
+        completionRepair: { kind: "protected_completion", answer: "complete" }
+      }, "Explicit protocol-repair state"],
       [{ ...base, activeModelSemanticDelta: true }, "durable model semantic delta"]
     ];
     for (const [state, message] of invalidStates) {
@@ -2288,6 +2393,28 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       repeatedToolBatchCount: 1
     })).toBe(true);
     expect(isKernelState({ ...base, activeModelSemanticDelta: true })).toBe(true);
+    expect(isKernelState({ ...base, frozenProfile: null })).toBe(false);
+    expect(isKernelState({
+      ...base,
+      frozenProfile: {
+        artifactId: "profile-artifact",
+        digest: "profile-digest",
+        source: "home",
+        qualifiedName: "home:profile"
+      },
+      frozenCustomization: {
+        artifactId: "a".repeat(64),
+        digest: "b".repeat(64)
+      },
+      frozenSkills: [{
+        artifactId: "skill-artifact",
+        digest: "skill-digest",
+        source: "workspace",
+        qualifiedName: "workspace:skill",
+        executionManifestArtifactId: "c".repeat(64),
+        executionManifestDigest: "d".repeat(64)
+      }]
+    })).toBe(true);
     expect(isKernelState({ ...base, semanticProgress: { ...base.semanticProgress, revision: 1 } })).toBe(false);
     expect(isKernelState({
       ...base,

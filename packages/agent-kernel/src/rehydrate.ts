@@ -152,14 +152,15 @@ function assertSinglePendingTool(
   message: string
 ): void {
   if (state.pendingTools.length === 0) return;
-  const terminalName = state.pendingTools[0]?.request.name ?? "";
+  const terminalName = state.pendingTools[0]!.request.name;
   if (state.pendingTools.length === 1 && allowedNames.includes(terminalName)) return;
   throw new Error(message);
 }
 
-function assertProtectedRepairState(state: KernelState): void {
-  const repair = state.completionRepair;
-  if (!repair) return;
+function assertProtectedRepairState(
+  state: KernelState,
+  repair: NonNullable<KernelState["completionRepair"]>
+): void {
   const protectedAnswer = repair.kind === "no_change_confirmation"
     || repair.kind === "protected_completion"
     || repair.kind === "protected_recovery";
@@ -178,7 +179,7 @@ function assertProtectedRepairState(state: KernelState): void {
 
 function assertCompletionRepairState(state: KernelState): void {
   assertRepairAttemptState(state);
-  if (state.completionRepair) assertProtectedRepairState(state);
+  if (state.completionRepair) assertProtectedRepairState(state, state.completionRepair);
 }
 
 function assertPhaseState(state: KernelState): void {

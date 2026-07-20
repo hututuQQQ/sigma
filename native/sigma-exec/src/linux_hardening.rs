@@ -806,8 +806,17 @@ mod tests {
             .map(|item| item.to_string_lossy())
             .collect::<Vec<_>>();
         assert_eq!(values[3], "--as-pid-1");
+        assert!(
+            values
+                .windows(2)
+                .any(|pair| pair == ["--cap-add", "CAP_NET_ADMIN"])
+        );
+        let tmpfs = values
+            .iter()
+            .position(|value| value == "--tmpfs")
+            .expect("self-test must create a private temporary directory");
         assert_eq!(
-            &values[7..15],
+            &values[tmpfs..tmpfs + 8],
             [
                 "--tmpfs",
                 "/tmp",

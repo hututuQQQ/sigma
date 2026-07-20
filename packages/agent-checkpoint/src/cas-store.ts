@@ -122,18 +122,17 @@ export class CheckpointCasStore {
       reused = true;
     }
     await rm(temporary, { force: true });
-    const verified = reused ? await this.verify(digest, size) : await this.inspect(digest);
+    const verified = reused ? await this.verify(digest, { expectedSize: size }) : await this.inspect(digest);
     return { digest, size, identity: verified.identity };
   }
 
   async readVerifiedAll(digest: string, maxBytes = Number.POSITIVE_INFINITY): Promise<Buffer> {
     validateReadLimit(maxBytes);
-    const inspected = await this.inspect(digest);
-    if (inspected.size > maxBytes) {
-      throw new CheckpointConflictError(`Checkpoint CAS object exceeds its bounded read limit: ${digest}`);
-    }
     const chunks: Buffer[] = [];
-    const verified = await this.verify(digest, inspected.size, (chunk) => chunks.push(chunk));
+    const verified = await this.verify(digest, {
+      maxBytes,
+      collect: (chunk) => chunks.push(chunk)
+    });
     return Buffer.concat(chunks, verified.size);
   }
 
@@ -209,17 +208,20 @@ export class CheckpointCasStore {
     }
   }
 
-  private async verify(
-    digest: string,
-    expectedSize?: number,
-    collect?: (chunk: Buffer) => void
-  ): Promise<{ identity: CheckpointCasIdentity; size: number }> {
+  private async verify(digest: string, options: {
+    expectedSize?: number;
+    maxBytes?: number;
+    collect?: (chunk: Buffer) => void;
+  } = {}): Promise<{ identity: CheckpointCasIdentity; size: number }> {
     const handle = await this.openRead(digest);
     const hash = createHash("sha256");
     let before: { identity: CheckpointCasIdentity; size: number } | undefined;
     let position = 0;
     try {
       before = await statIdentity(handle, digest);
+      if (before.size > (options.maxBytes ?? Number.POSITIVE_INFINITY)) {
+        throw new CheckpointConflictError(`Checkpoint CAS object exceeds its bounded read limit: ${digest}`);
+      }
       while (position < before.size) {
         const length = Math.min(CAS_CHUNK_BYTES, before.size - position);
         const buffer = Buffer.allocUnsafe(length);
@@ -227,7 +229,7 @@ export class CheckpointCasStore {
         if (bytesRead <= 0) break;
         const chunk = bytesRead === buffer.byteLength ? buffer : buffer.subarray(0, bytesRead);
         hash.update(chunk);
-        collect?.(chunk);
+        options.collect?.(chunk);
         position += bytesRead;
       }
       const after = await statIdentity(handle, digest);
@@ -238,7 +240,7 @@ export class CheckpointCasStore {
       await handle.close();
     }
     if (!before || position !== before.size || hash.digest("hex") !== digest
-      || (expectedSize !== undefined && position !== expectedSize)) {
+      || (options.expectedSize !== undefined && position !== options.expectedSize)) {
       throw new CheckpointConflictError(`Checkpoint CAS content is corrupt: ${digest}`);
     }
     return before;

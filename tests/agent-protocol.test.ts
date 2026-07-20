@@ -163,6 +163,18 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
     })).toBe(false);
     expect(isCompletionEligibleEvidence({ ...diagnostic, status: "failed" }, "session", "run")).toBe(false);
     expect(isCompletionEligibleEvidence(diagnostic, "session", "other-run")).toBe(false);
+    const inputAccess: EvidenceRecord = {
+      evidenceId: "input-access",
+      sessionId: "session",
+      runId: "run",
+      kind: "input_access",
+      status: "passed",
+      createdAt: fixtureOccurredAt,
+      producer: { authority: "runtime" },
+      summary: "read input",
+      data: { path: "src/input.ts", scope: "workspace", sha256: "a".repeat(64), byteLength: 1 }
+    };
+    expect(isCompletionEligibleEvidence(inputAccess, "session", "run")).toBe(false);
   });
 
   it("types failed validation as executed evidence without treating it as passed", () => {
@@ -230,6 +242,19 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
     };
     expect(evidenceSupportsClaim(passed, "acceptance_met")).toBe(true);
     expect(evidenceSupportsClaim(passed, "validation_executed")).toBe(true);
+    expect(isCompletionEligibleEvidence(passed, "session", "run")).toBe(true);
+
+    for (const field of ["strength", "independence"] as const) {
+      const unclassified: ValidationEvidence = {
+        ...passed,
+        evidenceId: `missing-${field}`,
+        data: {
+          ...passed.data,
+          claim: { ...passed.data.claim!, [field]: undefined }
+        }
+      };
+      expect(evidenceSupportsClaim(unclassified, "validation_passed")).toBe(false);
+    }
 
     const withoutTermination: ValidationEvidence = {
       ...passed,

@@ -22,6 +22,7 @@ import {
   preflightCheckpointByteReservation
 } from "../packages/agent-checkpoint/src/safe-capture.js";
 import { CheckpointCasStore } from "../packages/agent-checkpoint/src/cas-store.js";
+import { OrderedCheckpointManifestValidator } from "../packages/agent-checkpoint/src/manifest-stream-validation.js";
 import {
   checkpointManifestStorageLimits,
   putCheckpointDeltaMerkle,
@@ -33,6 +34,7 @@ import {
   acquireCheckpointMutationLease
 } from "../packages/agent-checkpoint/src/restore-transaction.js";
 import { recoverCheckpointTransactions } from "../packages/agent-checkpoint/src/restore-recovery.js";
+import { validateManifest } from "../packages/agent-checkpoint/src/restore-manifest-validation.js";
 import {
   cleanupWorkspaceTransactionRoot,
   workspaceTransactionRoot
@@ -1067,6 +1069,41 @@ describe("CheckpointManager", () => {
       "utf8"
     );
     await expect(readCheckpointManifestMerkle(cas, rootDigest))
+      .rejects.toBeInstanceOf(CheckpointConflictError);
+  });
+
+  it("rejects a non-directory ancestor separated by a lexical sibling", () => {
+    const entries = [
+      { path: "a", kind: "file" as const, mode: 0o100644, size: 0, digest: "0".repeat(64) },
+      { path: "a-foo", kind: "directory" as const, mode: 0o40755, size: 0 },
+      { path: "a/child", kind: "file" as const, mode: 0o100644, size: 0, digest: "0".repeat(64) }
+    ];
+    const manifest = { entries, fileCount: entries.length, totalBytes: 0 };
+
+    expect(() => validateManifest(manifest)).toThrow(CheckpointConflictError);
+    const validator = new OrderedCheckpointManifestValidator();
+    expect(() => entries.forEach((entry) => validator.add(entry)))
+      .toThrow(CheckpointConflictError);
+  });
+
+  it("checks bounded CAS size and content through one pinned read handle", async () => {
+    const root = await checkpointTemporaryRoot("sigma-checkpoint-cas-read-");
+    const cas = new CheckpointCasStore(path.join(root, "state"));
+    const content = Buffer.from("pinned bounded content", "utf8");
+    const digest = await cas.putBytes(content);
+    const internals = cas as unknown as {
+      openRead: (value: string) => Promise<Awaited<ReturnType<typeof import("node:fs/promises").open>>>;
+    };
+    const originalOpen = internals.openRead.bind(cas);
+    let openCount = 0;
+    internals.openRead = async (value) => {
+      openCount += 1;
+      return await originalOpen(value);
+    };
+
+    await expect(cas.readVerifiedAll(digest, content.byteLength)).resolves.toEqual(content);
+    expect(openCount).toBe(1);
+    await expect(cas.readVerifiedAll(digest, content.byteLength - 1))
       .rejects.toBeInstanceOf(CheckpointConflictError);
   });
 
