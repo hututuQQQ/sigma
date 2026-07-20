@@ -9,5 +9,6 @@ trace.jsonl
 summary.json
 *.tsbuildinfo
 native/sigma-exec/target/
+.pnpm-store/
 __pycache__/
 jobs/

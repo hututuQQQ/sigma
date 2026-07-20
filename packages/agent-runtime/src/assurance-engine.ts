@@ -17,37 +17,23 @@ const TEST_PATH = /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[j
 export function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
   const claims: ValidationClaimKindV1[] = [];
   const lower = goal.toLowerCase();
-  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?lint\b|\b(?:eslint|flake8|golangci-lint|pylint|ruff|stylelint)\b/u.test(lower)) {
+  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?lint\b|\b(?:eslint|flake8|golangci-lint|pylint|ruff|stylelint)\b|\blint(?:er)?\b/u.test(lower)) {
     claims.push("lint");
   }
-  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:typecheck|check-types)\b|\b(?:basedpyright|mypy|pyright|tsc)\b/u.test(lower)) {
+  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:typecheck|check-types)\b|\b(?:basedpyright|mypy|pyright|tsc)\b|\btype[- ]?check\b|类型检查/u.test(lower)) {
     claims.push("typecheck");
   }
-  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test\b|\b(?:vitest|jest|pytest|phpunit|rspec|ctest|tox|nox)\b|\bcargo\s+(?:test|nextest(?:\s+run)?)\b|\bgo\s+test\b|\bdotnet\s+(?:test|vstest)\b|\b(?:mvn|mvnw|gradle|gradlew)\s+test\b|\b(?:make|gmake|ninja)\s+(?:test|check)\b|\bmeson\s+test\b|\bswift\s+test\b|\bmix\s+test\b|\bcomposer\s+test\b|\bbundle\s+exec\s+rspec\b/u.test(lower)) {
+  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test\b|\b(?:vitest|jest|pytest|phpunit|rspec|ctest|tox|nox)\b|\bcargo\s+(?:test|nextest(?:\s+run)?)\b|\bgo\s+test\b|\bdotnet\s+(?:test|vstest)\b|\b(?:mvn|mvnw|gradle|gradlew)\s+test\b|\b(?:make|gmake|ninja)\s+(?:test|check)\b|\bmeson\s+test\b|\bswift\s+test\b|\bmix\s+test\b|\bcomposer\s+test\b|\bbundle\s+exec\s+rspec\b|\b(?:run|execute|perform|rerun|re-run)\s+(?:the\s+|all\s+)?(?:tests?|test\s+suite)\b|\btest\s+(?:it|this|that|the\s+(?:changes?|code|project|result|implementation|output))\b|\btests?\s+(?:must|should|needs?\s+to)\s+(?:pass|succeed|be\s+clean)\b|\b(?:make\s+sure|ensure|confirm|prove|check\s+that)\b[^.?!\n]{0,80}\btests?\s+pass\b|(?:运行|执行|跑|重跑)(?:一下|一遍|全部|所有)?(?:测试|测试套件)|测试(?:一下|一遍|它|这个|这些|修改|改动|代码|实现|功能|输出)|(?:确保|确认)[^。！？\n]{0,40}测试通过/u.test(lower)) {
     claims.push("unit");
   }
-  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build\b|\bcargo\s+(?:build|check)\b|\bgo\s+build\b|\bdotnet\s+build\b|\b(?:mvn|mvnw)\s+(?:package|verify)\b|\b(?:gradle|gradlew)\s+(?:build|check)\b|\b(?:make|gmake)\s+build\b|\bcmake\s+--build\b|\bmeson\s+compile\b|\bswift\s+build\b/u.test(lower)) {
+  if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build\b|\bcargo\s+(?:build|check)\b|\bgo\s+build\b|\bdotnet\s+build\b|\b(?:mvn|mvnw)\s+(?:package|verify)\b|\b(?:gradle|gradlew)\s+(?:build|check)\b|\b(?:make|gmake)\s+build\b|\bcmake\s+--build\b|\bmeson\s+compile\b|\bswift\s+build\b|\b(?:run|execute|perform|rerun|re-run)\s+(?:the\s+)?build\b|\bbuild\s+(?:must|should|needs?\s+to)\s+(?:pass|succeed)\b|\b(?:make\s+sure|ensure|confirm|prove|check\s+that)\b[^.?!\n]{0,80}\bbuild\s+succeeds?\b|(?:运行|执行|跑|重跑)(?:一下|一遍|全部|所有)?(?:构建|编译)|(?:确保|确认)[^。！？\n]{0,40}(?:构建成功|编译成功)/u.test(lower)) {
     claims.push("acceptance");
   }
   if (/\bnode(?:\.exe)?\s+--check\b/u.test(lower)) claims.push("syntax");
+  if (claims.length === 0 && (/\b(?:validate|verify)\b|\b(?:run|execute|perform|rerun|re-run)\s+(?:the\s+)?(?:validation|verification)\b|(?:验证|校验)(?:一下|一遍|它|这个|这些|结果|修改|改动|代码|实现|功能|输出)?/u.test(lower))) {
+    claims.push("acceptance");
+  }
   return [...new Set(claims)];
-}
-
-function hasExplicitValidationIntent(instruction: string): boolean {
-  const english = [
-    /\b(?:validate|verify|lint)\b|\btype[- ]?check\b/iu,
-    /\b(?:run|execute|perform|rerun|re-run)\s+(?:the\s+|all\s+)?(?:tests?|test\s+suite|validation|verification|lint(?:er)?|type[- ]?check|build)\b/iu,
-    /\btest\s+(?:it|this|that|the\s+(?:changes?|code|project|result|implementation|output))\b/iu,
-    /\b(?:tests?|build|lint|type[- ]?check)\s+(?:must|should|needs?\s+to)\s+(?:pass|succeed|be\s+clean)\b/iu,
-    /\b(?:make\s+sure|ensure|confirm|prove|check\s+that)\b[^.?!\n]{0,80}\b(?:tests?\s+pass|build\s+succeeds?|lint\s+(?:passes|is\s+clean)|type[- ]?check\s+passes)\b/iu
-  ];
-  if (english.some((pattern) => pattern.test(instruction))) return true;
-  return [
-    /(?:验证|校验)(?:一下|一遍|它|这个|这些|结果|修改|改动|代码|实现|功能|输出)?/u,
-    /(?:运行|执行|跑|重跑)(?:一下|一遍|全部|所有)?(?:测试|测试套件|验证|校验|lint|类型检查|构建|编译)/iu,
-    /测试(?:一下|一遍|它|这个|这些|修改|改动|代码|实现|功能|输出)/u,
-    /(?:确保|确认)[^。！？\n]{0,40}(?:测试通过|构建成功|编译成功|类型检查通过|lint\s*通过)/iu
-  ].some((pattern) => pattern.test(instruction));
 }
 
 /** Classify validation authority at a trusted user-facing control plane. The
@@ -60,7 +46,6 @@ export function validationRequirementForInstruction(
 ): ValidationRequirementV1 {
   return profileId === "standard"
     && explicitAcceptanceClaims(instruction).length === 0
-    && !hasExplicitValidationIntent(instruction)
     ? "default"
     : "required";
 }

@@ -298,6 +298,23 @@ describe("V5 assurance-coordinated mutation completion", () => {
     expect(explicitAcceptanceClaims("cargo nextest run")).toContain("unit");
   });
 
+  it.each([
+    ["Update README.md and run the tests.", "unit"],
+    ["修改 README 并运行测试。", "unit"],
+    ["Lint the project.", "lint"],
+    ["执行类型检查。", "typecheck"],
+    ["Run the build.", "acceptance"],
+    ["跑一下构建。", "acceptance"],
+    ["Verify the output.", "acceptance"],
+    ["验证这些改动。", "acceptance"]
+  ] as const)("preserves the requested validation claim for %s", (instruction, claim) => {
+    expect(explicitAcceptanceClaims(instruction)).toContain(claim);
+    const active = session([]);
+    active.durable.state.plan.goal = instruction;
+    active.durable.state.mutationFrontier.changedPaths = ["README.md"];
+    expect(assuranceRequirement(active).requiredClaims).toContain(claim);
+  });
+
   it("does not let a generic acceptance claim replace explicit semantic claims", () => {
     expect(validationClaimSatisfies("acceptance", "acceptance")).toBe(true);
     expect(validationClaimSatisfies("acceptance", "typecheck")).toBe(false);
