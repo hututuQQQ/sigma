@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import type {
   ExecutionBroker,
   ExecutionResult,
@@ -14,6 +15,7 @@ import type {
   ToolReceipt,
   ToolRequest
 } from "agent-protocol";
+import { dependencyDiagnostics } from "./execution-diagnostics.js";
 
 interface ImportedOutputArtifacts {
   brokerIds: string[];
@@ -89,23 +91,86 @@ function commandSucceeded(result: ExecutionResult): boolean {
     && result.failure === undefined;
 }
 
-/** Stable, language-level diagnostics only. Package names and command text are
- * deliberately excluded so convergence remains product- and task-invariant. */
-function dependencyDiagnostics(result: ExecutionResult): string[] {
-  if (commandSucceeded(result)) return [];
-  const output = `${result.stdout}\n${result.stderr}`;
-  const missing = [
-    /ModuleNotFoundError:\s*No module named/iu,
-    /(?:Error:\s*)?Cannot find (?:package|module)\b/iu,
-    /ERR_MODULE_NOT_FOUND/iu,
-    /cannot load such file --/iu,
-    /ClassNotFoundException\b/iu,
-    /NoClassDefFoundError\b/iu
-  ].some((pattern) => pattern.test(output));
-  // This is the invoked application reporting a missing package, not the
-  // execution broker failing to start. Keep it model-visible without feeding
-  // the infrastructure fail-fast taxonomy.
-  return missing ? ["command_dependency_missing"] : [];
+function workspaceRelative(root: string, candidate: string): string | undefined {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+    ? relative || "." : undefined;
+}
+
+const QUOTE_PAIRS = new Map([
+  ["'", "'"], ["\"", "\""], ["`", "`"], ["‘", "’"], ["“", "”"]
+]);
+
+function normalizedErofsTarget(value: string, explicitOperation = false): string | undefined {
+  const candidate = value.trim();
+  const closingQuote = QUOTE_PAIRS.get(candidate[0] ?? "");
+  const unquoted = closingQuote && candidate.endsWith(closingQuote)
+    ? candidate.slice(1, -closingQuote.length).trim()
+    : candidate;
+  if (!unquoted || unquoted.includes("\0") || /[\r\n]/u.test(unquoted)) return undefined;
+  if (closingQuote) return unquoted;
+  if (/\s|['"`‘’“”]/u.test(unquoted)) return undefined;
+  // A coreutils operation names its operand unambiguously. For generic
+  // `program: value: EROFS` diagnostics, require path syntax so words such as
+  // "error" or "EROFS" cannot be mistaken for a recoverable target.
+  return explicitOperation || /[./\\]/u.test(unquoted) ? unquoted : undefined;
+}
+
+function erofsTarget(stderr: string): string | undefined {
+  const node = stderr.match(/\bEROFS:\s*read-only file system,\s*[^'"`\r\n]*(['"`])([^'"`\r\n]+)\1/iu);
+  if (node?.[2]) return normalizedErofsTarget(`'${node[2]}'`);
+  const python = stderr.match(/\[Errno\s+30\]\s*Read-only file system:\s*(['"`])([^'"`\r\n]+)\1/iu);
+  if (python?.[2]) return normalizedErofsTarget(`'${python[2]}'`);
+
+  const diagnostic = stderr.match(/(?:^|\r?\n)[^:\r\n]+:\s+(.+):\s+Read-only file system\s*(?=$|\r?\n)/iu);
+  if (!diagnostic?.[1]) return undefined;
+  const operation = diagnostic[1].match(
+    /^cannot\s+(?:touch|create(?:\s+(?:regular\s+file|directory))?|open|write(?:\s+to)?)\s+(.+)$/iu
+  );
+  return normalizedErofsTarget(operation?.[1] ?? diagnostic[1], Boolean(operation));
+}
+
+function permissionDeniedTarget(stderr: string): string | undefined {
+  const node = stderr.match(/\b(?:EACCES|EPERM):\s*permission denied,\s*[^'"`\r\n]*(['"`])([^'"`\r\n]+)\1/iu);
+  if (node?.[2]) return normalizedErofsTarget(`'${node[2]}'`);
+  const python = stderr.match(/\[Errno\s+13\]\s*Permission denied:\s*(['"`])([^'"`\r\n]+)\1/iu);
+  return python?.[2] ? normalizedErofsTarget(`'${python[2]}'`) : undefined;
+}
+
+function scopedWorkspaceWriteFailureTarget(
+  request: ToolRequest,
+  result: ExecutionResult,
+  context: ToolExecutionContext,
+  includePermissionDenied: boolean
+): string | undefined {
+  if (result.exitCode === 0) return undefined;
+  const target = erofsTarget(result.stderr)
+    ?? (includePermissionDenied ? permissionDeniedTarget(result.stderr) : undefined);
+  if (!target) return undefined;
+  const args = request.arguments && typeof request.arguments === "object" && !Array.isArray(request.arguments)
+    ? request.arguments as Record<string, unknown> : {};
+  const requestedCwd = typeof args.cwd === "string" ? args.cwd : context.workspacePath;
+  const cwd = path.isAbsolute(requestedCwd)
+    ? path.resolve(requestedCwd) : path.resolve(context.workspacePath, requestedCwd);
+  if (workspaceRelative(context.workspacePath, cwd) === undefined) return undefined;
+  const resolved = path.isAbsolute(target) ? path.resolve(target) : path.resolve(cwd, target);
+  return workspaceRelative(context.workspacePath, resolved);
+}
+
+/** Emit recovery guidance only when the failed process named a target that
+ * resolves inside the active workspace. An arbitrary EROFS string or a write
+ * to a system/external root is not evidence that a workspace mutation lease
+ * can recover the command. Validation already has a disposable writable copy
+ * and therefore never receives this advisory. */
+function recoverableWriteContractTarget(
+  request: ToolRequest,
+  result: ExecutionResult,
+  validation: boolean,
+  actualEffects: ToolCallPlan["exactEffects"],
+  context: ToolExecutionContext
+): string | undefined {
+  if (validation || actualEffects.includes("filesystem.write") || result.exitCode === 0) return undefined;
+  return scopedWorkspaceWriteFailureTarget(request, result, context, false);
 }
 
 async function importOutputArtifacts(
@@ -158,7 +223,8 @@ function commandEvidence(
   validation: boolean,
   completedAt: string,
   context: ToolExecutionContext,
-  imported: ImportedOutputArtifacts
+  imported: ImportedOutputArtifacts,
+  validationCapabilityFailure = false
 ): EvidenceRecord {
   const base = {
     evidenceId: randomUUID(), sessionId: context.sessionId, runId: context.runId,
@@ -177,7 +243,10 @@ function commandEvidence(
         timedOut: result.timedOut,
         idleTimedOut: result.idleTimedOut,
         cancelled: result.cancelled,
-        ...(result.failure ? { failureCode: result.failure.code } : {})
+        ...(result.failure ? { failureCode: result.failure.code } : {}),
+        ...(validationCapabilityFailure ? {
+          failureCode: "validation_disposable_workspace_unavailable"
+        } : {})
       },
       artifactIds: imported.ids,
       // The runtime replaces this preparation-time placeholder with the
@@ -206,7 +275,8 @@ export async function commandReceipt(
   validation: boolean,
   actualEffects: ToolCallPlan["exactEffects"],
   context: ToolExecutionContext,
-  broker: ExecutionBroker
+  broker: ExecutionBroker,
+  readOnlyValidationFallback = false
 ): Promise<ToolReceipt> {
   const completedAt = new Date().toISOString();
   const ok = commandSucceeded(result);
@@ -216,15 +286,46 @@ export async function commandReceipt(
   await preserveProjectedStream("stdout", result.stdout, stdout, context, imported);
   await preserveProjectedStream("stderr", result.stderr, stderr, context, imported);
   await acknowledge(imported, broker);
-  const evidence = commandEvidence(request, command, result, validation, completedAt, context, imported);
+  const validationCapabilityTarget = validation && readOnlyValidationFallback
+    ? scopedWorkspaceWriteFailureTarget(request, result, context, true)
+    : undefined;
+  const evidence = commandEvidence(
+    request, command, result, validation, completedAt, context, imported,
+    validationCapabilityTarget !== undefined
+  );
+  const writeContractTarget = recoverableWriteContractTarget(
+    request, result, validation, actualEffects, context
+  );
+  const writeContractAdvisory = writeContractTarget
+    ? "[write_contract_required] The command attempted a workspace write without an approved mutation contract. Retry only with accurate expectedChanges so the runtime can grant a bounded, recoverable write lease."
+    : undefined;
+  const validationCapabilityAdvisory = validationCapabilityTarget
+    ? "[validation_disposable_workspace_unavailable] This validation requires workspace writes, but the current target supports only explicit read-only validation at the real workspace path; no workspace data was granted writable access."
+    : undefined;
   return {
     callId: request.callId, ok,
-    output: [stdout.value, stderr.value].filter(Boolean).join("\n"),
+    output: [validationCapabilityAdvisory, writeContractAdvisory, stdout.value, stderr.value]
+      .filter(Boolean).join("\n"),
     observedEffects: [...actualEffects], actualEffects: [...actualEffects],
+    ...(validationCapabilityTarget ? { result: {
+      status: "failed",
+      code: "validation_disposable_workspace_unavailable",
+      recoverable: false,
+      scope: "workspace",
+      target: validationCapabilityTarget
+    } } : writeContractTarget ? { result: {
+      status: "failed",
+      code: "write_contract_required",
+      recoverable: true,
+      scope: "workspace",
+      target: writeContractTarget
+    } } : {}),
     artifacts: imported.ids, artifactRefs: imported.refs,
     diagnostics: [
       `exit_code=${String(result.exitCode)}`,
       ...(result.failure ? [result.failure.code] : []),
+      ...(validationCapabilityTarget ? ["validation_disposable_workspace_unavailable"] : []),
+      ...(writeContractTarget ? ["write_contract_required"] : []),
       ...dependencyDiagnostics(result),
       ...(result.outputTruncated ? ["output_truncated"] : []), ...imported.diagnostics,
       ...(result.timedOut || result.idleTimedOut ? ["process_timed_out"] : [])

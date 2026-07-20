@@ -151,6 +151,14 @@ class CountingReviewer implements AccountableReviewerPort {
     };
   }
 
+  async prepareCompletionReserve(
+    input: ReviewerInput,
+    remainingBudgetMicroUsd: number,
+    _maxOutputTokens: number
+  ): Promise<PreparedReviewerCall["budget"]> {
+    return (await this.prepareReview(input, remainingBudgetMicroUsd)).budget;
+  }
+
   async reviewPrepared(
     input: ReviewerInput,
     requestId: string,
@@ -308,6 +316,12 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     { id: "mutation-call", name: "mutate_once", arguments: { path: "target.ts" } },
     { id: "read-proof", name: "list", arguments: { path: ".", limit: 20 } }
   ];
+  await append("diagnostic", {
+    kind: "model.tool_policy",
+    ...turn,
+    allowedToolNames: ["mutate_once", "list"],
+    terminalOnly: false
+  });
   await append("model.completed", {
     ...turn,
     message: { role: "assistant", content: "", toolCalls },
@@ -534,12 +548,28 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
     startedAt: now,
     deadlineAt: new Date(Date.now() + 60_000).toISOString()
   });
-  reviewState.mutationFrontier = sealedFrontier;
+  // checkpoint.sealed establishes the state identity; the subsequent durable
+  // workspace_delta projects the net changed path onto that same frontier.
+  // Mirror both reducer steps when preregistering the review basis.
+  reviewState.mutationFrontier = { ...sealedFrontier, changedPaths: ["target.ts"] };
+  reviewState.validationRequirement = "required";
+  reviewState.plan = {
+    revision: 1,
+    goal: "Exercise durable recovery.",
+    activeNodeId: "root",
+    nodes: [{
+      id: "root",
+      title: "Perform one mutation",
+      dependencies: [],
+      status: "in_progress",
+      owner: { kind: "root" },
+      acceptanceCriteria: ["Mutation occurs at most once"],
+      evidence: []
+    }]
+  };
   reviewState.evidence = [validationEvidence];
-  const reviewBasisDigestValue = reviewBasisDigest(
-    runtimeSessionFixture({ state: reviewState, workspacePath: workspace }),
-    [validationEvidence]
-  );
+  const reviewSession = runtimeSessionFixture({ state: reviewState, workspacePath: workspace });
+  const reviewBasisDigestValue = reviewBasisDigest(reviewSession, [validationEvidence]);
   const reviewRequestId = `review:${createHash("sha256").update(JSON.stringify({
     sessionId,
     runId,
@@ -630,7 +660,7 @@ async function seedRecovery(boundary: Boundary): Promise<SeededRecovery> {
       frontierRevision: sealedFrontier.revision,
       stateDigest: sealedFrontier.currentStateDigest,
       reviewBasisDigest: reviewBasisDigestValue,
-      reviewBasisVersion: 2,
+      reviewBasisVersion: 3,
       validationEvidenceIds: [`command-validation:${checkpoint.checkpointId}`],
       reviewRelevantEvidenceIds: [],
       checkpointId: checkpoint.checkpointId
@@ -718,8 +748,13 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
 function mutationReservationIds(stored: AgentEventEnvelope[]): Set<string> {
   const result = new Set<string>();
   for (const item of stored.filter((event) => event.type === "budget.reserved")) {
-    const payload = item.payload as { ledger?: { reservations?: Array<{ reservationId?: string; ownerId?: string }> } };
-    for (const reservation of payload.ledger?.reservations ?? []) {
+    const payload = item.payload as {
+      ledger?: { reservations?: Array<{ reservationId?: string; ownerId?: string }> };
+      mutation?: { kind?: string; reservation?: { reservationId?: string; ownerId?: string } };
+    };
+    const compact = payload.mutation?.kind === "reserve" && payload.mutation.reservation
+      ? [payload.mutation.reservation] : [];
+    for (const reservation of [...(payload.ledger?.reservations ?? []), ...compact]) {
       if (reservation.ownerId === "tool:mutation-call" && reservation.reservationId) {
         result.add(reservation.reservationId);
       }
@@ -867,7 +902,8 @@ describe("durable transaction fault-injection recovery", () => {
       const outcome = await runtime.waitForOutcome(fixture.sessionId);
       const stored = await events(fixture.store, fixture.sessionId);
       expect(executions.count).toBe(0);
-      expect(reviewer.calls).toBe(boundary === "validation_evidence" ? 1 : 0);
+      expect(reviewer.calls).toBe(boundary === "validation_evidence"
+        || boundary === "review_started" || boundary === "review_completed" ? 1 : 0);
       const convergedCompletion = boundary === "validation_evidence"
         || boundary === "review_started" || boundary === "review_completed";
       expect(outcome.kind).toBe(convergedCompletion ? "completed" : "needs_input");
@@ -898,21 +934,25 @@ describe("durable transaction fault-injection recovery", () => {
         convergedCompletion ? 1 : 0
       );
       if (boundary === "review_started" || boundary === "review_completed") {
+        const expectedReviewerRecords = boundary === "review_completed" ? 2 : 1;
         const reviewerReservationIds = new Set(stored.flatMap((item) => {
           if (item.type !== "budget.reserved") return [];
           const payload = item.payload as {
             ledger?: { reservations?: Array<{ reservationId?: string; ownerId?: string }> };
+            mutation?: { kind?: string; reservation?: { reservationId?: string; ownerId?: string } };
           };
-          return (payload.ledger?.reservations ?? []).flatMap((reservation) =>
+          const compact = payload.mutation?.kind === "reserve" && payload.mutation.reservation
+            ? [payload.mutation.reservation] : [];
+          return [...(payload.ledger?.reservations ?? []), ...compact].flatMap((reservation) =>
             reservation.ownerId?.startsWith("reviewer:") && reservation.reservationId
               ? [reservation.reservationId] : []);
         }));
         expect(stored.filter((item) => item.type === "budget.committed"
           && reviewerReservationIds.has((item.payload as { reservationId?: string }).reservationId ?? "")))
-          .toHaveLength(1);
+          .toHaveLength(expectedReviewerRecords);
         expect(stored.filter((item) => item.type === "usage.recorded"
-          && (item.payload as { role?: string }).role === "reviewer")).toHaveLength(1);
-        expect(stored.filter((item) => item.type === "review.completed")).toHaveLength(1);
+          && (item.payload as { role?: string }).role === "reviewer")).toHaveLength(expectedReviewerRecords);
+        expect(stored.filter((item) => item.type === "review.completed")).toHaveLength(expectedReviewerRecords);
       }
     });
   }

@@ -4,6 +4,7 @@ import {
   EVENT_SCHEMA_VERSION,
   type AgentEventEnvelope,
   type AgentEventType,
+  type BudgetAmounts,
   type BudgetLimits,
   type ContextAuthority,
   type JsonValue,
@@ -19,10 +20,25 @@ import {
   type WorkspaceDeltaEvidence
 } from "../packages/agent-protocol/src/index.js";
 import type { ModelRouteConstraints } from "../packages/agent-model/src/index.js";
-import { BudgetController, BudgetExceededError } from "../packages/agent-runtime/src/budget-controller.js";
+import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
+import { reviewValidationRequiredPaths } from "../packages/agent-runtime/src/assurance-engine.js";
+import { COMPLETION_CANDIDATE_MAX_SERIALIZED_UTF8_BYTES } from "../packages/agent-runtime/src/completion-review-candidate.js";
 import { ReviewCoordinator } from "../packages/agent-runtime/src/review-coordinator.js";
-import { currentFrontierReview } from "../packages/agent-runtime/src/mutation-evidence.js";
-import { ModelReviewer, type ReviewerPort } from "../packages/agent-runtime/src/reviewer.js";
+import { candidateReviewerBudgetReserve } from "../packages/agent-runtime/src/reviewer-budget-reserve.js";
+import {
+  fitPreparedBudget,
+  maximumAttemptOutputTokens
+} from "../packages/agent-runtime/src/model-budget-convergence.js";
+import {
+  currentFrontierReview,
+  currentWorkspaceReview
+} from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  completionCandidateDigest,
+  isAccountableReviewer,
+  ModelReviewer,
+  type ReviewerPort
+} from "../packages/agent-runtime/src/reviewer.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -31,6 +47,7 @@ const now = "2026-07-11T00:00:00.000Z";
 class ReviewerGateway implements ModelGateway {
   readonly provider = "deepseek";
   readonly model = "deepseek-v4-pro";
+  readonly maxTokensPerUtf8Byte: number = 1;
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 16_000,
     maxOutputTokens: 100,
@@ -77,6 +94,69 @@ class ReviewerGateway implements ModelGateway {
 
   async countTokens(): Promise<number> {
     return 100;
+  }
+}
+
+class CrossTokenizerReviewerGateway extends ReviewerGateway {
+  override readonly maxTokensPerUtf8Byte: number = 2;
+  override readonly capabilities: ModelCapabilities = {
+    ...super.capabilities,
+    contextWindowTokens: 100_000,
+    maxOutputTokens: 2_048,
+    tokenizer: "reviewer-byte-tokenizer"
+  };
+
+  override async countTokens(messages: ModelMessage[]): Promise<number> {
+    return 4_000 + 2 * Buffer.byteLength(messages.map((message) => message.content).join("\n"), "utf8");
+  }
+
+  async budgetPlan(
+    messages: ModelMessage[],
+    _tools: ModelToolDefinition[],
+    maxOutputTokens: number,
+    remainingBudgetMicroUsd: number,
+    minimumInputTokens = 0
+  ): Promise<{
+      estimatedInputTokens: number;
+      reservedInputTokens: number;
+      reservedOutputTokens: number;
+      reservedCostMicroUsd: number;
+      reservedModelTurns: number;
+      attemptReservations: Array<{ inputTokens: number; outputTokens: number; costMicroUsd: number }>;
+      constraints: ModelRouteConstraints;
+    }> {
+    const estimatedInputTokens = Math.max(await this.countTokens(messages), minimumInputTokens);
+    return {
+      estimatedInputTokens,
+      reservedInputTokens: estimatedInputTokens,
+      reservedOutputTokens: maxOutputTokens,
+      reservedCostMicroUsd: 1,
+      reservedModelTurns: 1,
+      attemptReservations: [{ inputTokens: estimatedInputTokens, outputTokens: maxOutputTokens, costMicroUsd: 1 }],
+      constraints: { estimatedInputTokens, maxOutputTokens, remainingBudgetMicroUsd }
+    };
+  }
+
+  routingIdentity(): { role: "reviewer"; routeId: string } {
+    return { role: "reviewer", routeId: "cross-tokenizer-review" };
+  }
+}
+
+class BoundarySensitiveReviewerGateway extends ReviewerGateway {
+  override readonly maxTokensPerUtf8Byte: number = 1;
+  override readonly capabilities: ModelCapabilities = {
+    ...super.capabilities,
+    contextWindowTokens: 100_000,
+    maxOutputTokens: 2_048
+  };
+
+  override async countTokens(messages: ModelMessage[]): Promise<number> {
+    const payload = JSON.parse(messages.at(-1)?.content ?? "{}") as {
+      completionCandidate?: { message?: string; summary?: string; warnings?: string[] };
+    };
+    const candidate = payload.completionCandidate;
+    if (candidate?.message === "" && candidate.summary === "" && candidate.warnings?.length === 0) return 1;
+    return messages.reduce((total, message) => total + Buffer.byteLength(message.content, "utf8"), 0);
   }
 }
 
@@ -292,17 +372,20 @@ function harness(target: RuntimeSession, crashBeforeUsage = false): {
 }
 
 describe("independent reviewer budget accounting", () => {
-  it("rejects exhausted reviewer budget before invoking the model", async () => {
+  it("persists reviewer reserve failure instead of throwing through completion", async () => {
     const target = runtimeSession(limits({ inputTokens: 119 }));
     const gateway = new ReviewerGateway();
     const { budgets, emit, events } = harness(target);
     const coordinator = new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets);
 
-    await expect(coordinator.maybeReview(target, new AbortController().signal))
-      .rejects.toBeInstanceOf(BudgetExceededError);
+    await expect(coordinator.maybeReview(target, new AbortController().signal)).resolves.toBeUndefined();
     expect(gateway.calls).toBe(0);
     expect(events).toContain("budget.exhausted");
     expect(events).not.toContain("review.started");
+    expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({
+      status: "failed",
+      data: { verdict: "changes_requested", failureKind: "infrastructure" }
+    });
   });
 
   it("commits actual reviewer usage to the session ledger", async () => {
@@ -326,6 +409,127 @@ describe("independent reviewer budget accounting", () => {
       role: "reviewer", providerId: "deepseek", modelId: "deepseek-v4-pro"
     });
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+  });
+
+  it("deducts the reviewer quote in every model-budget dimension before solver admission", async () => {
+    const target = runtimeSession();
+    const gateway = new ReviewerGateway();
+    const reviewer = new ModelReviewer(gateway);
+    const reserve = await candidateReviewerBudgetReserve(target, reviewer, 10_000);
+    const solver = {
+      estimatedInputTokens: 100,
+      reserved: { inputTokens: 100, outputTokens: 50, costMicroUsd: 20, modelTurns: 1 },
+      reservedAttempts: 1,
+      attemptReservations: [{ inputTokens: 100, outputTokens: 50, costMicroUsd: 20 }]
+    };
+    const enough: BudgetAmounts = {
+      inputTokens: 100 + reserve.inputTokens,
+      outputTokens: 50 + reserve.outputTokens,
+      costMicroUsd: 20 + reserve.costMicroUsd,
+      modelTurns: 1 + reserve.modelTurns,
+      toolCalls: 10,
+      children: 0
+    };
+    for (const dimension of ["inputTokens", "outputTokens", "costMicroUsd", "modelTurns"] as const) {
+      expect(fitPreparedBudget(solver, {
+        ...enough,
+        [dimension]: enough[dimension] - 1
+      }, 1, reserve), dimension).toBeNull();
+    }
+    expect(fitPreparedBudget(solver, enough, 1, reserve)).not.toBeNull();
+
+    target.durable.state.budget.limits = { ...enough, maxDepth: 0 };
+    const { budgets, emit } = harness(target);
+    const solverReservation = await budgets.reserve(target, "solver:completion", solver.reserved);
+    await budgets.commitMeasured(target, solverReservation, solver.reserved);
+    const candidate = { message: "done", summary: "done", warnings: [] };
+    await new ReviewCoordinator(reviewer, emit, budgets)
+      .maybeReview(target, new AbortController().signal, false, candidate);
+
+    expect(gateway.calls).toBe(1);
+    expect(currentFrontierReview(target, completionCandidateDigest(candidate))?.status).toBe("passed");
+  });
+
+  it("honors an attested two-token-per-byte bound through the budget-aware reviewer gateway", async () => {
+    const target = runtimeSession(limits({
+      inputTokens: 100_000, outputTokens: 100_000, costMicroUsd: 100_000, modelTurns: 10
+    }));
+    const gateway = new CrossTokenizerReviewerGateway();
+    const reviewer = new ModelReviewer(gateway);
+    const quote = await candidateReviewerBudgetReserve(target, reviewer, 100_000);
+    const candidate = {
+      message: `Delivered ${"界".repeat(500)}`,
+      summary: `Updated ${"界".repeat(500)}`,
+      warnings: []
+    };
+    const { budgets, emit } = harness(target);
+
+    await new ReviewCoordinator(reviewer, emit, budgets)
+      .maybeReview(target, new AbortController().signal, false, candidate);
+
+    const actualReviewerInput = await gateway.countTokens(gateway.requests[0]!.messages);
+    expect(quote.inputTokens).toBeGreaterThanOrEqual(actualReviewerInput);
+    expect(currentFrontierReview(target, completionCandidateDigest(candidate))?.status).toBe("passed");
+  });
+
+  it("covers whole-message re-tokenization when inserting a bounded completion candidate", async () => {
+    const target = runtimeSession(limits({
+      inputTokens: 100_000, outputTokens: 100_000, costMicroUsd: 100_000, modelTurns: 10
+    }));
+    const gateway = new BoundarySensitiveReviewerGateway();
+    const reviewer = new ModelReviewer(gateway);
+    const quote = await candidateReviewerBudgetReserve(target, reviewer, 100_000);
+    const candidate = { message: "x".repeat(7_000), summary: "done", warnings: [] };
+    const { budgets, emit } = harness(target);
+
+    await new ReviewCoordinator(reviewer, emit, budgets)
+      .maybeReview(target, new AbortController().signal, false, candidate);
+
+    const actualReviewerInput = await gateway.countTokens(gateway.requests[0]!.messages);
+    expect(actualReviewerInput).toBeGreaterThan(COMPLETION_CANDIDATE_MAX_SERIALIZED_UTF8_BYTES + 1);
+    expect(quote.inputTokens).toBeGreaterThanOrEqual(actualReviewerInput);
+    expect(currentFrontierReview(target, completionCandidateDigest(candidate))?.status).toBe("passed");
+  });
+
+  it("fails closed when a model reviewer has no trusted tokenizer expansion bound", async () => {
+    const target = runtimeSession();
+    const gateway = new ReviewerGateway();
+    Object.defineProperty(gateway, "maxTokensPerUtf8Byte", { value: undefined });
+
+    await expect(candidateReviewerBudgetReserve(target, new ModelReviewer(gateway), 100_000))
+      .rejects.toMatchObject({ code: "review_budget_quote_unavailable" });
+  });
+
+  it("quotes the largest fallback candidate and keeps normal-stage completion review bounded", async () => {
+    expect(maximumAttemptOutputTokens({
+      estimatedInputTokens: 1,
+      reserved: { inputTokens: 3, outputTokens: 350, costMicroUsd: 3, modelTurns: 3 },
+      reservedAttempts: 3,
+      attemptReservations: [
+        { inputTokens: 1, outputTokens: 50, costMicroUsd: 1 },
+        { inputTokens: 1, outputTokens: 200, costMicroUsd: 1 },
+        { inputTokens: 1, outputTokens: 100, costMicroUsd: 1 }
+      ]
+    })).toBe(200);
+
+    const target = runtimeSession(limits({
+      inputTokens: 100_000,
+      outputTokens: 100_000,
+      costMicroUsd: 100_000,
+      modelTurns: 10
+    }));
+    target.durable.state.deadlineRemainingMs = 600_000;
+    const gateway = new ReviewerGateway();
+    gateway.capabilities.maxOutputTokens = 4_096;
+    const { budgets, emit } = harness(target);
+    await new ReviewCoordinator(new ModelReviewer(gateway), emit, budgets).maybeReview(
+      target,
+      new AbortController().signal,
+      false,
+      { message: "done", summary: "done", warnings: [] }
+    );
+
+    expect(gateway.requests[0]?.maxOutputTokens).toBe(2_048);
   });
 
   it("settles provider-reported reviewer usage above its reservation", async () => {
@@ -423,12 +627,31 @@ describe("independent reviewer budget accounting", () => {
       })
     };
     const { budgets, emit } = harness(target);
+    await expect(candidateReviewerBudgetReserve(target, fake, 1_000)).resolves.toMatchObject({
+      inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0
+    });
 
     await new ReviewCoordinator(fake, emit, budgets).maybeReview(target, new AbortController().signal);
 
     expect(target.durable.state.usage).toHaveLength(0);
     expect(target.durable.state.budget.consumed.modelTurns).toBe(0);
     expect(target.durable.state.evidence.find((item) => item.kind === "review")).toMatchObject({ status: "passed" });
+  });
+
+  it("keeps legacy accountable reviewers budgeted but fails closed when completion quoting is unavailable", async () => {
+    const target = runtimeSession();
+    const gateway = new ReviewerGateway();
+    const reviewer = new ModelReviewer(gateway);
+    Object.defineProperty(reviewer, "prepareCompletionReserve", { value: undefined });
+    expect(isAccountableReviewer(reviewer)).toBe(true);
+    await expect(candidateReviewerBudgetReserve(target, reviewer, 1_000)).rejects.toMatchObject({
+      code: "review_budget_quote_unavailable"
+    });
+
+    const { budgets, emit } = harness(target);
+    await new ReviewCoordinator(reviewer, emit, budgets).maybeReview(target, new AbortController().signal);
+    expect(target.durable.state.usage).toHaveLength(1);
+    expect(target.durable.state.budget.consumed.modelTurns).toBe(1);
   });
 
   it("fails closed when any reviewer port approves while returning findings", async () => {
@@ -541,7 +764,130 @@ describe("independent reviewer budget accounting", () => {
     expect(calls).toBe(3);
   });
 
-  it("refreshes a rejected review when ordered validation evidence changes", async () => {
+  it("caps automatic retries for one completion candidate at the same review limit", async () => {
+    const target = runtimeSession();
+    const candidate = { message: "done", summary: "done", warnings: [] };
+    let calls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "candidate-retry-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        calls += 1;
+        return {
+          evidenceId: `candidate-failure-${calls}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "failed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "candidate-retry-reviewer" },
+          summary: "reviewer unavailable",
+          data: {
+            reviewerId: "candidate-retry-reviewer",
+            verdict: "changes_requested",
+            findings: ["reviewer unavailable"],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+            failureKind: "infrastructure"
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+    const coordinator = new ReviewCoordinator(reviewer, emit);
+
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+
+    expect(calls).toBe(3);
+  });
+
+  it("uses the stop-stage reserve only for a candidate-bound review", async () => {
+    const target = runtimeSession();
+    target.durable.state.deadlineRemainingMs = 1;
+    const candidate = { message: "done", summary: "done", warnings: [] };
+    let calls = 0;
+    const reviewer: ReviewerPort = {
+      reviewerId: "finishing-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        calls += 1;
+        return {
+          evidenceId: "finishing-review",
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "passed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "finishing-reviewer" },
+          summary: "approved",
+          data: {
+            reviewerId: "finishing-reviewer",
+            verdict: "approved",
+            findings: [],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+    const coordinator = new ReviewCoordinator(reviewer, emit);
+
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+    expect(calls).toBe(0);
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+
+    expect(calls).toBe(1);
+    expect(currentFrontierReview(target, completionCandidateDigest(candidate))?.status).toBe("passed");
+  });
+
+  it("keeps request_review workspace mode isolated from candidate-bound review", async () => {
+    const target = runtimeSession();
+    const candidate = { message: "done", summary: "done", warnings: [] };
+    const candidateDigest = completionCandidateDigest(candidate);
+    const modes: string[] = [];
+    const reviewer: ReviewerPort = {
+      reviewerId: "mode-isolation-reviewer",
+      review: async (input): Promise<ReviewEvidence> => {
+        modes.push(input.reviewMode ?? "workspace");
+        return {
+          evidenceId: `review-${modes.length}`,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          kind: "review",
+          status: "passed",
+          createdAt: now,
+          producer: { authority: "runtime", id: "mode-isolation-reviewer" },
+          summary: "approved",
+          data: {
+            reviewerId: "mode-isolation-reviewer",
+            verdict: "approved",
+            findings: [],
+            frontierRevision: input.frontierRevision,
+            stateDigest: input.stateDigest,
+            validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+          }
+        };
+      }
+    };
+    const { emit } = harness(target);
+    const coordinator = new ReviewCoordinator(reviewer, emit);
+
+    await coordinator.maybeReview(target, new AbortController().signal, false, candidate);
+    expect(currentFrontierReview(target, candidateDigest)?.status).toBe("passed");
+    expect(currentWorkspaceReview(target)).toBeUndefined();
+
+    await coordinator.maybeReview(target, new AbortController().signal, true);
+
+    expect(modes).toEqual(["completion", "workspace"]);
+    expect(currentWorkspaceReview(target)?.status).toBe("passed");
+    expect(currentFrontierReview(target, candidateDigest)?.status).toBe("passed");
+  });
+
+  it("ignores duplicate validation records and refreshes when semantic validation changes", async () => {
     const target = runtimeSession();
     let calls = 0;
     const reviewer: ReviewerPort = {
@@ -577,7 +923,7 @@ describe("independent reviewer budget accounting", () => {
     const duplicate = { ...validation(), evidenceId: "duplicate-validation" };
     target.durable.state.evidence.push(duplicate);
     await coordinator.maybeReview(target, new AbortController().signal);
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
 
     const stronger = {
       ...validation(),
@@ -587,7 +933,7 @@ describe("independent reviewer budget accounting", () => {
     target.durable.state.evidence.push(stronger);
     await coordinator.maybeReview(target, new AbortController().signal);
 
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
     expect(target.durable.state.evidence.at(-1)).toMatchObject({
       kind: "review",
       status: "passed",
@@ -639,7 +985,7 @@ describe("independent reviewer budget accounting", () => {
       .toBeLessThanOrEqual(4 * 1_024);
   });
 
-  it("fails closed when the durable review basis changes while review is in flight", async () => {
+  it("fails closed when completion-relevant validation changes while review is in flight", async () => {
     const target = runtimeSession();
     let requestedBasis: string | undefined;
     const reviewer: ReviewerPort = {
@@ -647,15 +993,9 @@ describe("independent reviewer budget accounting", () => {
       review: async (input): Promise<ReviewEvidence> => {
         requestedBasis = input.reviewBasisDigest;
         target.durable.state.evidence.push({
-          evidenceId: "evidence-arriving-during-review",
-          sessionId: input.sessionId,
-          runId: input.runId,
-          kind: "diagnostic",
-          status: "informational",
-          createdAt: "2026-07-11T00:00:01.000Z",
-          producer: { authority: "tool", id: "concurrent-inspection" },
-          summary: "A new semantic observation arrived while review was running.",
-          data: { source: "concurrent-inspection", diagnostic: { changed: true } }
+          ...validation(),
+          evidenceId: "validation-arriving-during-review",
+          data: { ...validation().data, command: "pnpm test -- --integration" }
         });
         return {
           evidenceId: "approval-for-stale-basis",
@@ -688,7 +1028,7 @@ describe("independent reviewer budget accounting", () => {
       data: {
         verdict: "changes_requested",
         failureKind: "interrupted",
-        reviewBasisVersion: 2,
+        reviewBasisVersion: 3,
         frontierRevision: 1,
         stateDigest: "a".repeat(64),
         reviewBasisDigest: requestedBasis
@@ -796,6 +1136,155 @@ describe("independent reviewer budget accounting", () => {
     expect(gateway.calls).toBe(1);
     const reviewerInput = JSON.parse(gateway.requests[0]!.messages[1]!.content) as { goal: string };
     expect(reviewerInput.goal).toBe(goal);
+  });
+
+  it("reviews separately checkpointed source and documentation without demanding validation for ordinary text", async () => {
+    const source = {
+      ...delta(),
+      data: { ...delta().data, reviewDiffPaths: ["src/code.ts"] }
+    };
+    const documentation: WorkspaceDeltaEvidence = {
+      ...delta(),
+      evidenceId: "docs-delta",
+      producer: { authority: "runtime", id: "docs-checkpoint" },
+      data: {
+        checkpointId: "docs-checkpoint",
+        delta: { added: [], modified: ["README.md"], deleted: [] },
+        reviewDiff: "--- a/README.md\n+++ b/README.md\n[metadata before=file:33188 after=file:33188]\n-old\n+new",
+        reviewDiffPaths: ["README.md"]
+      }
+    };
+    const candidate = {
+      message: "Implemented the requested change and updated README.md.",
+      summary: "Implemented the requested change.",
+      warnings: []
+    };
+    const gateway = new ReviewerGateway();
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Change the implementation and document it.",
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      workspaceDeltas: [source, documentation],
+      validations: [validation(["src/code.ts"])],
+      validationRequiredPaths: ["src/code.ts"],
+      reviewMode: "completion",
+      completionCandidate: candidate,
+      completionCandidateDigest: completionCandidateDigest(candidate)
+    }, new AbortController().signal);
+
+    expect(result).toMatchObject({
+      status: "passed",
+      data: {
+        verdict: "approved",
+        reviewBasisVersion: 3,
+        completionCandidateDigest: completionCandidateDigest(candidate)
+      }
+    });
+    const reviewerInput = JSON.parse(gateway.requests[0]!.messages[1]!.content) as {
+      reviewMode: string;
+      validationRequiredPaths: string[];
+      completionCandidate: { message: string };
+    };
+    expect(reviewerInput).toMatchObject({
+      reviewMode: "completion",
+      validationRequiredPaths: ["src/code.ts"],
+      completionCandidate: { message: candidate.message }
+    });
+  });
+
+  it("retains passed validation for an opaque artifact with a reviewable-text extension", async () => {
+    const target = runtimeSession();
+    const readmeDelta: WorkspaceDeltaEvidence = {
+      ...delta(),
+      data: {
+        checkpointId: "checkpoint",
+        delta: { added: [], modified: ["README.md"], deleted: [] },
+        reviewDiff: "",
+        reviewDiffPaths: [],
+        opaqueArtifacts: [{
+          path: "README.md",
+          before: { digest: beforeDigest, sizeBytes: 4 },
+          after: { digest: afterDigest, sizeBytes: 8 }
+        }]
+      }
+    };
+    const acceptance = validation(["README.md"]);
+    acceptance.data.claim = {
+      ...acceptance.data.claim!,
+      kind: "acceptance",
+      strength: "behavioral"
+    };
+    target.durable.state.evidence = [readmeDelta, acceptance];
+    target.durable.state.mutationFrontier = {
+      ...target.durable.state.mutationFrontier,
+      changedPaths: ["README.md"]
+    };
+    const gateway = new ReviewerGateway();
+    const { emit } = harness(target);
+
+    await new ReviewCoordinator(new ModelReviewer(gateway), emit)
+      .maybeReview(target, new AbortController().signal);
+
+    expect(gateway.calls).toBe(1);
+    const reviewerInput = JSON.parse(gateway.requests[0]!.messages[1]!.content) as {
+      validationRequiredPaths: string[];
+      validations: Array<{ data: { coveredPaths: string[] } }>;
+    };
+    expect(reviewerInput.validationRequiredPaths).toEqual(["README.md"]);
+    expect(reviewerInput.validations).toHaveLength(1);
+    expect(reviewerInput.validations[0]?.data.coveredPaths).toContain("README.md");
+  });
+
+  it.each([
+    ["opaque to text", true, false],
+    ["text to opaque", false, true]
+  ] as const)("uses the latest path representation for %s", async (_label, opaqueFirst, expectedOpaque) => {
+    const target = runtimeSession();
+    const representation = (evidenceId: string, opaque: boolean): WorkspaceDeltaEvidence => ({
+      ...delta(),
+      evidenceId,
+      data: {
+        checkpointId: evidenceId,
+        delta: { added: [], modified: ["README.md"], deleted: [] },
+        reviewDiff: opaque ? "" : "--- a/README.md\n+++ b/README.md\n-old\n+new",
+        reviewDiffPaths: opaque ? [] : ["README.md"],
+        ...(opaque ? { opaqueArtifacts: [{
+          path: "README.md",
+          before: { digest: beforeDigest, sizeBytes: 4 },
+          after: { digest: afterDigest, sizeBytes: 8 }
+        }] } : {})
+      }
+    });
+    target.durable.state.mutationFrontier = {
+      ...target.durable.state.mutationFrontier,
+      changedPaths: ["README.md"]
+    };
+    target.durable.state.mutationEvidence = [];
+    const workspaceDeltas = [
+      representation("first", opaqueFirst),
+      representation("last", !opaqueFirst)
+    ];
+    target.durable.state.evidence = workspaceDeltas;
+
+    const validationRequiredPaths = reviewValidationRequiredPaths(target);
+    expect(validationRequiredPaths.includes("README.md")).toBe(expectedOpaque);
+    const gateway = new ReviewerGateway();
+    const result = await new ModelReviewer(gateway).review({
+      sessionId: "session",
+      runId: "run",
+      goal: "Update README.md",
+      frontierRevision: 1,
+      stateDigest: "a".repeat(64),
+      reviewBasisDigest: "b".repeat(64),
+      workspaceDeltas,
+      validations: [],
+      validationRequiredPaths
+    }, new AbortController().signal);
+    expect(result.status).toBe(expectedOpaque ? "failed" : "passed");
+    expect(gateway.calls).toBe(expectedOpaque ? 0 : 1);
   });
 
   it.each([

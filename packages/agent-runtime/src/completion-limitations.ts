@@ -12,6 +12,7 @@ import {
 import {
   assurancePathsForClaim,
   assuranceRequirement,
+  reviewValidationRequiredPaths,
   validationRequirementForInstruction,
   validationClaimSatisfies
 } from "./assurance-engine.js";
@@ -23,6 +24,7 @@ import {
   type FrontierValidationReadiness
 } from "./mutation-evidence.js";
 import type { RuntimeSession } from "./types.js";
+import { assurancePathClass } from "./assurance-path-classification.js";
 
 export function reviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
@@ -60,8 +62,16 @@ function profileProvesUnavailable(
 ): boolean {
   if (paths.length === 0 || claim === "probe" || claim === "lint") return false;
   return paths.every((changedPath) => {
-    if (!repositoryValidationCapabilityCoversPath(changedPath)) return false;
+    const pathClass = assurancePathClass(changedPath);
     const project = projectCapabilitiesForPath(profile, changedPath);
+    if (pathClass === "reviewable_text") {
+      return claim === "acceptance"
+        && project !== undefined
+        && !project.unit
+        && project.staticClaims.length === 0
+        && project.commandFamilies.length === 0;
+    }
+    if (!repositoryValidationCapabilityCoversPath(changedPath)) return false;
     if (!project) return false;
     if (claim === "unit" || claim === "integration") return !project.unit;
     if (claim === "acceptance") {
@@ -177,6 +187,12 @@ function usesTrustedDefaultValidation(session: RuntimeSession): boolean {
     ) === "default";
 }
 
+function limitationPathScopeSupported(session: RuntimeSession): boolean {
+  return session.durable.state.mutationFrontier.changedPaths.every((path) =>
+    assurancePathClass(path) === "reviewable_text")
+    && reviewValidationRequiredPaths(session).length === 0;
+}
+
 /** Returns a typed, evidence-backed downgrade only for a trusted control-plane
  * `default` validation classification under the built-in standard profile.
  * Missing or `required` classifications fail closed; unavailable validation
@@ -185,8 +201,12 @@ export function completionLimitations(session: RuntimeSession): CompletionLimita
   if (!usesTrustedDefaultValidation(session)) return null;
   const frontier = session.durable.state.mutationFrontier;
   const requirement = assuranceRequirement(session);
-  if (frontier.changedPaths.length === 0 || requirement.risk === "high") return null;
-  if (!reviewSatisfied(session) || !completeWorkspaceDelta(session)) return null;
+  if (frontier.changedPaths.length === 0
+    || requirement.risk !== "low"
+    || !limitationPathScopeSupported(session)) return null;
+  const review = currentFrontierReview(session);
+  if (review?.status !== "passed" || review.data.verdict !== "approved"
+    || !completeWorkspaceDelta(session)) return null;
   const profile = currentCapabilityProfile(session);
   if (!profile) return null;
   const readiness = frontierValidationReadiness(session);

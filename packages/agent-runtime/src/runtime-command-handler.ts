@@ -87,7 +87,10 @@ async function persistApprovalResolution(
       callId: approval.external?.callId ?? requestId,
       decision,
       ...(deadlineAt ? { deadlineAt } : {}),
-      ...(pendingTool ? pendingTool.modelTurn : {
+      ...(pendingTool ? {
+        turnId: pendingTool.modelTurn.turnId,
+        effectRevision: pendingTool.modelTurn.effectRevision
+      } : {
         childId: approval.external?.childId,
         delegated: true
       })

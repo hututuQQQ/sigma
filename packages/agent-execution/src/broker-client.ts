@@ -1,36 +1,32 @@
 import { BrokerTransport } from "./broker-transport.js";
 import { verifiedShellExecutables, verifiedTargetExecutableEnvironment } from "./broker-doctor-projection.js";
-import { requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport,
-  requestVerifiedSandboxReport } from "./broker-sandbox-operations.js";
+import { requestRepositoryMetadataLease } from "./broker-client-repository-lease.js";
+import { BrokerScratchLeaseClient } from "./broker-client-scratch-lease.js";
+import { startBrokerClient } from "./broker-client-startup.js";
+import { requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxReport, requestVerifiedSandboxReport } from "./broker-sandbox-operations.js";
 import {
-  assertRequestSandbox, assertRequiredSandbox, cancellationError,
+  assertRequestSandbox, cancellationError,
   BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
   containReusedProcessId, createProcessRedaction, decodedExecutionResult,
-  DEFAULT_DOCTOR_TIMEOUT_MS, DEFAULT_SANDBOX_SETUP_TIMEOUT_MS, DEFAULT_STARTUP_TIMEOUT_MS,
+  DEFAULT_DOCTOR_TIMEOUT_MS, DEFAULT_SANDBOX_SETUP_TIMEOUT_MS,
   outputDecodingError, parsePostDispatchValue, rejectUndecodableExecution,
   requestExecutionValue, reserveProcessId, runPostResponseOperation, SerializedProcessOperations,
   type ClientState, type Cursor, type ProcessRedaction
 } from "./broker-client-support.js";
 import { settleCancelledSpawn } from "./broker-client-cancellation.js";
 import { decodedProcessPollResult } from "./broker-process-result.js";
-import {
-  attachBrokerLifecycleFailure, BrokerCancelledError, BrokerConnectionError,
-  BrokerPolicyError, BrokerProcessLostError, BrokerTimeoutError
-} from "./errors.js";
+import { attachBrokerLifecycleFailure, BrokerCancelledError, BrokerConnectionError,
+  BrokerPolicyError, BrokerProcessLostError, BrokerTimeoutError } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
-import {
-  positiveInteger,
-  redactionSecrets,
-  requestParams
-} from "./broker-request-policy.js";
+import { positiveInteger, requestParams } from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
-import { assertTrustedToolchainsAvailable, normalizeTrustedToolchains,
-  type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
+import { normalizeTrustedToolchains, type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
 import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
-  ProcessPollResult, ProcessSpawnRequest, SigmaExecBrokerClientOptions } from "./types.js";
-import { parseDoctor, parseHello, parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
+  ProcessPollResult, ProcessSpawnRequest, RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1, ScratchLeaseRequestV1, ScratchLeaseV1, SigmaExecBrokerClientOptions } from "./types.js";
+import { parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
 export class SigmaExecBrokerClient implements ExecutionBroker {
   private readonly transport: BrokerTransport;
   private readonly redactor: SecretRedactor;
@@ -49,6 +45,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   private connectOperation?: Promise<BrokerDoctorReport>;
   private closeRequested = false;
   private doctorValue?: BrokerDoctorReport;
+  private readonly scratchLeases: BrokerScratchLeaseClient;
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
     const transports = [options.helperPath, options.socketPath, options.trustedStream].filter(Boolean);
     if (transports.length !== 1) {
@@ -61,6 +58,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.redactor = new SecretRedactor(options.secrets);
     this.transport = new BrokerTransport(options, (error) =>
       containTransportFailure(error, () => this.markProcessesLost(), async () => await this.lifecycle.close()));
+    this.scratchLeases = new BrokerScratchLeaseClient(this.transport);
     this.outputArtifacts = new BrokerOutputArtifactImporter(this.redactor, async (artifactIds) =>
       await this.transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 }),
       undefined,
@@ -79,6 +77,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
         this.cursors.clear();
         this.activeProcesses.clear();
         this.processRedaction.clear();
+        this.scratchLeases.clear();
         this.state = closed ? "closed" : "failed";
       }
     );
@@ -95,26 +94,17 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   Promise<BrokerDoctorReport> {
     this.state = "connecting";
     try {
-      assertTrustedToolchainsAvailable(this.trustedToolchains, this.options.sandboxMode);
-      this.transport.start();
-      const hello = parseHello(await this.transport.request("hello", {
-        clientVersion: "3.0.0",
-        redactionSecrets: redactionSecrets(this.options.secrets)
-      }, { signal, timeoutMs: 5_000 }));
-      this.instanceId = hello.instanceId;
-      await this.outputArtifacts.configureRoot(hello.artifactRoot);
-      const report = parseDoctor(await this.transport.request(initialReport, {}, {
-        signal,
-        timeoutMs: this.options.startupTimeoutMs ?? this.options.requestTimeoutMs
-          ?? (initialReport === "sandbox.setup" ? DEFAULT_SANDBOX_SETUP_TIMEOUT_MS : DEFAULT_STARTUP_TIMEOUT_MS)
-      }));
-      assertRequiredSandbox(report, this.options.sandboxMode);
+      const startup = await startBrokerClient(
+        this.transport, this.options, this.trustedToolchains, initialReport,
+        async (artifactRoot) => await this.outputArtifacts.configureRoot(artifactRoot), signal
+      );
+      this.instanceId = startup.instanceId;
       if (this.closeRequested) {
         throw new BrokerConnectionError("Broker client was closed during startup.", { retrySafe: true });
       }
-      this.doctorValue = report;
+      this.doctorValue = startup.report;
       this.state = "ready";
-      return report;
+      return startup.report;
     } catch (error) {
       // An explicit close owns shutdown and waits for this startup operation to
       // settle before deleting its artifact root. Avoid racing that cleanup.
@@ -182,6 +172,16 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   async revokeSandboxLease(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult> {
     this.assertReady();
     return await requestSandboxLeaseRevoke(this.transport, workspacePath, this.options.requestTimeoutMs, signal);
+  }
+  async acquireRepositoryMetadataLease(request: RepositoryMetadataLeaseRequestV1, options: BrokerRequestOptions = {}): Promise<RepositoryMetadataLeaseV1> {
+    this.assertReady();
+    return await requestRepositoryMetadataLease(this.transport, request, options);
+  }
+  async acquireScratchLease(request: ScratchLeaseRequestV1, options: BrokerRequestOptions = {}): Promise<ScratchLeaseV1> {
+    this.assertReady(); return await this.scratchLeases.acquire(request, options);
+  }
+  async releaseScratchLease(sessionId: string, options: BrokerRequestOptions = {}): Promise<void> {
+    this.assertReady(); await this.scratchLeases.release(sessionId, { ...options, timeoutMs: options.timeoutMs ?? 5_000 });
   }
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {
     this.assertReady();

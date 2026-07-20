@@ -73,7 +73,12 @@ function injectedModelSpec(provider: "deepseek" | "glm", model: string, gateway:
     wireProtocol: "openai_chat",
     upstreamModel: model,
     capabilities: gateway.capabilities,
-    tokenizer: { id: "injected/test-tokenizer", accuracy: "approximate" },
+    tokenizer: {
+      id: "injected/test-tokenizer",
+      accuracy: "approximate",
+      ...(gateway.maxTokensPerUtf8Byte === undefined
+        ? {} : { maxTokensPerUtf8Byte: gateway.maxTokensPerUtf8Byte })
+    },
     pricing: {
       inputMicroUsdPerMillion: 0,
       outputMicroUsdPerMillion: 0,

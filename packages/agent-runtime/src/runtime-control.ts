@@ -21,15 +21,27 @@ import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
 import {
-  currentFrontierReview,
+  currentWorkspaceReview,
   frontierValidationReadiness,
-  latestFrontierReview,
+  latestWorkspaceReview,
   reviewBasisDigest
 } from "./mutation-evidence.js";
 
 export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
 export type { OpenCheckpointRecoveryResult, RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
+
+function reviewRequestStatus(
+  approved: boolean,
+  hasPendingSubject: boolean,
+  hasEligibleSubject: boolean,
+  failed: boolean
+): ReviewRequestResult["status"] {
+  if (approved) return "approved";
+  if (!hasPendingSubject) return "not_required";
+  if (!hasEligibleSubject) return "validation_required";
+  return failed ? "changes_required" : "review_requested";
+}
 
 export class RuntimeControlService {
   private readonly planQueues = new Map<string, Promise<void>>();
@@ -66,19 +78,25 @@ export class RuntimeControlService {
     const readiness = reviewReadiness(session);
     const validation = frontierValidationReadiness(session);
     const frontier = session.durable.state.mutationFrontier;
-    const currentReview = currentFrontierReview(session);
-    const latestReview = latestFrontierReview(session);
+    const currentReview = currentWorkspaceReview(session);
+    const latestReview = latestWorkspaceReview(session);
+    const approved = currentReview?.status === "passed" && currentReview.data.verdict === "approved";
+    const hasRepositoryDeltas = readiness.repositoryDeltas.length > 0;
     return {
-      status: readiness.pending.length === 0
-        ? "not_required"
-        : readiness.eligible.length === 0 ? "validation_required"
-          : readiness.blockedReview ? "changes_required" : "review_requested",
+      status: reviewRequestStatus(
+        approved,
+        readiness.pending.length > 0 || hasRepositoryDeltas,
+        readiness.eligible.length > 0 || hasRepositoryDeltas,
+        currentReview?.status === "failed"
+      ),
       reviewState: currentReview ? "current" : latestReview ? "stale" : "none",
-      reviewBasisDigest: reviewBasisDigest(session),
+      reviewBasisDigest: currentReview?.data.reviewBasisDigest ?? reviewBasisDigest(session),
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       changedPaths: [...frontier.changedPaths],
-      missingValidationPaths: validation.missingPaths,
+      missingValidationPaths: readiness.validationRequiredPaths.filter(
+        (path) => !validation.coveredPaths.includes(path)
+      ),
       ...(readiness.blockedReview ? {
         findings: [...readiness.blockedReview.data.findings]
       } : {}),

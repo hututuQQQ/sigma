@@ -60,7 +60,8 @@ function deepseekGateway(options: CreateGatewayOptions, model: string, spec?: Mo
       ...options.wireProfile
     },
     capabilities: spec?.capabilities ?? { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true },
-    pricing: spec?.pricing
+    pricing: spec?.pricing,
+    maxTokensPerUtf8Byte: spec?.tokenizer.maxTokensPerUtf8Byte
   });
 }
 
@@ -74,7 +75,8 @@ function glmGateway(options: CreateGatewayOptions, model: string, spec?: ModelSp
     apiKeyName: "GLM_API_KEY, ZAI_API_KEY, or BIGMODEL_API_KEY",
     wireProfile: { developerRole: "system", ...options.wireProfile },
     capabilities: spec?.capabilities ?? { contextWindowTokens: 128_000, maxOutputTokens: 8_192, reasoning: true },
-    pricing: spec?.pricing
+    pricing: spec?.pricing,
+    maxTokensPerUtf8Byte: spec?.tokenizer.maxTokensPerUtf8Byte
   });
 }
 

@@ -7,6 +7,7 @@ import {
   parseAgentEventPayload
 } from "../packages/agent-protocol/src/index.js";
 import {
+  authorityForEvent,
   checkpointFixture,
   evidenceFixture,
   validAgentEventFixture
@@ -18,6 +19,15 @@ const wrongString = fc.oneof(
 const wrongNullableNumber = fc.oneof(
   fc.string(), fc.boolean(), fc.array(fc.integer()), fc.dictionary(fc.string(), fc.integer())
 );
+
+function scopedEvent(type: (typeof AGENT_EVENT_TYPES)[number], seq: number, eventId: string): Record<string, unknown> {
+  return {
+    ...validAgentEventFixture(type),
+    seq: type === "session.created" ? 1 : seq,
+    authority: authorityForEvent(type),
+    eventId
+  };
+}
 
 function invalidOptional(type: string, field: string, value: unknown): Record<string, unknown> {
   if (type === "process.exited") {
@@ -48,13 +58,30 @@ describe("V5 protocol properties", () => {
       fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER }),
       fc.uuid(),
       (type, seq, eventId) => {
-        const encoded = JSON.stringify({ ...validAgentEventFixture(type), seq, eventId });
+        const encoded = JSON.stringify(scopedEvent(type, seq, eventId));
         const decoded: unknown = JSON.parse(encoded);
         expect(isAgentEventEnvelope(decoded)).toBe(true);
         assertAgentEventEnvelope(decoded);
         expect(() => parseAgentEventPayload(decoded.type, decoded.payload)).not.toThrow();
       }
     ), { numRuns: 300 });
+  });
+
+  it("rejects session.created outside the first runtime-authored event", () => {
+    fc.assert(fc.property(
+      fc.integer({ min: 2, max: Number.MAX_SAFE_INTEGER }),
+      (seq) => {
+        expect(isAgentEventEnvelope({ ...validAgentEventFixture("session.created"), seq })).toBe(false);
+      }
+    ), { numRuns: 100 });
+    fc.assert(fc.property(
+      fc.constantFrom("system", "developer", "user", "project", "tool"),
+      (authority) => {
+        expect(isAgentEventEnvelope({
+          ...validAgentEventFixture("session.created"), authority
+        })).toBe(false);
+      }
+    ), { numRuns: 100 });
   });
 
   it("rejects arbitrary non-string values in every known optional string gap", () => {

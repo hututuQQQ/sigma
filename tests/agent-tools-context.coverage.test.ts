@@ -280,7 +280,10 @@ describe("context, platform, and repository tool capabilities", () => {
       tools: [], contextWindowTokens: 160, outputReserveTokens: 20, promptCache: false
     });
     expect(compacted.omittedHistoryTurns).toBeGreaterThan(0);
-    expect(compacted.summary).toMatchObject({ authority: "tool", provenance: "lossy conversation compaction" });
+    expect(compacted.summary).toMatchObject({
+      authority: "tool",
+      provenance: "lossy conversation compaction archive"
+    });
     expect(() => planContext({
       system: [{ id: "required", authority: "system", provenance: "required", content: "required", tokenCount: 90, priority: 1 }],
       dynamic: [], history: [{ role: "user", content: "request" }], tools: [],
@@ -326,6 +329,14 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(tools.modelDescriptors().map((item) => item.name)).not.toContain("runtime_finalize");
     expect(tools.descriptor("exec")).toMatchObject({ timeoutMs: 750_000 });
     expect(tools.descriptor("exec")?.idleTimeoutMs).toBeUndefined();
+    await expect(tools.prepare(
+      request("list-plan", "list", { path: "src/.", glob: "**/*.txt" }),
+      context(workspace)
+    )).resolves.toMatchObject({ readPaths: ["src"] });
+    await expect(tools.prepare(
+      request("statistics-plan", "repository_stats", {}),
+      context(workspace)
+    )).resolves.toMatchObject({ readPaths: ["."] });
     const supervisor: SupervisorPort = {
       spawnDurable: async () => ({ id: "child" }), followUp: () => undefined,
       join: async () => null, list: () => [], integrate: async () => null
@@ -340,6 +351,21 @@ describe("context, platform, and repository tool capabilities", () => {
     expect(listed.output).toContain("src/one.txt");
     expect(listed.output).not.toMatch(/drop|ignored|hidden|credentials/u);
     expect(listed.diagnostics).toContain("listing_complete=true");
+    expect(listed.evidence).toEqual([expect.objectContaining({
+      kind: "input_access",
+      status: "passed",
+      data: expect.objectContaining({
+        path: "src",
+        scope: "workspace",
+        selection: expect.objectContaining({ kind: "structured_result" })
+      })
+    })]);
+    const equivalentListing = await tools.execute(
+      request("list-equivalent", "list", { path: "src/.", glob: "**/*.txt", limit: 20 }),
+      context(workspace)
+    );
+    expect(equivalentListing.output).toBe(listed.output);
+    expect(equivalentListing.evidence?.[0]?.data).toEqual(listed.evidence?.[0]?.data);
     const rootListed = await tools.execute(
       request("list-root", "list", { path: ".", glob: "**/*.txt" }), context(workspace)
     );
@@ -352,6 +378,18 @@ describe("context, platform, and repository tool capabilities", () => {
       totals: { files: 1, physicalLines: 3, nonBlankLines: 2 },
       languages: [{ language: "TypeScript", extensions: [".ts"], files: 1 }]
     });
+    expect(statistics.evidence).toEqual([expect.objectContaining({
+      kind: "input_access",
+      data: expect.objectContaining({
+        path: ".",
+        selection: expect.objectContaining({ kind: "structured_result" })
+      })
+    })]);
+    const repeatedStatistics = await tools.execute(
+      request("repository-stats-repeat", "repository_stats", {}), context(workspace)
+    );
+    expect(repeatedStatistics.output).toBe(statistics.output);
+    expect(repeatedStatistics.evidence?.[0]?.data).toEqual(statistics.evidence?.[0]?.data);
     expect(tools.descriptor("repository_stats")?.possibleEffects).toEqual(["filesystem.read"]);
     expect(tools.descriptor("list")?.timeoutMs).toBe(45_000);
     expect(tools.descriptor("grep")?.timeoutMs).toBe(45_000);
@@ -368,12 +406,31 @@ describe("context, platform, and repository tool capabilities", () => {
     ]));
     const found = await tools.execute(request("grep", "grep", { query: "alpha", path: "src", limit: 20 }), context(workspace));
     expect(found.output).toContain("one.txt");
+    expect(found.evidence).toEqual([expect.objectContaining({
+      kind: "input_access",
+      data: expect.objectContaining({
+        path: "src",
+        selection: expect.objectContaining({ kind: "structured_result" })
+      })
+    })]);
+    const equivalentSearch = await tools.execute(
+      request("grep-equivalent", "grep", { query: "alpha", path: "src/.", limit: 200 }),
+      context(workspace)
+    );
+    expect(equivalentSearch.output).toBe(found.output);
+    expect(equivalentSearch.evidence?.[0]?.data).toEqual(found.evidence?.[0]?.data);
     const textOnly = await tools.execute(request("grep-glob", "grep", {
       query: "alpha", path: "src", glob: "*.txt", limit: 20
     }), context(workspace));
     expect(textOnly.output).toContain("one.txt");
     expect(textOnly.output).not.toContain("two.md");
     expect(tools.descriptor("grep")?.possibleEffects).toEqual(["filesystem.read"]);
+    const invalidProviderTools = registerBuiltinTools(new EffectToolRegistry(), {
+      repositoryStatistics: async () => ({ output: "{}", accessPath: "../outside" })
+    });
+    await expect(invalidProviderTools.execute(
+      request("invalid-provider-path", "repository_stats", {}), context(workspace)
+    )).rejects.toMatchObject({ code: "repository_access_path_invalid" });
     const deadlinePartial = await repositoryTextSearchJsonLines(
       workspace,
       new AbortController().signal,

@@ -2,14 +2,29 @@ import { describe, expect, it } from "vitest";
 import {
   createBudgetLedger,
   type AgentEventEnvelope,
-  type BudgetLimits
+  type AgentEventType,
+  type BudgetLimits,
+  type JsonValue,
+  type ToolDescriptor
 } from "../packages/agent-protocol/src/index.js";
+import { evolve } from "../packages/agent-kernel/src/index.js";
 import { BudgetController } from "../packages/agent-runtime/src/budget-controller.js";
 import {
+  candidateReviewerRequestReserve,
   convergenceAdmissionFailure,
-  deadlineForecast
+  deadlineForecast,
+  monotonicBudgetStage
 } from "../packages/agent-runtime/src/convergence-policy.js";
-import { budgetStageForCapacity } from "../packages/agent-runtime/src/model-tool-capabilities.js";
+import { reviewBasisDigest } from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  budgetStageForCapacity,
+  resourceBudgetStageForCapacity
+} from "../packages/agent-runtime/src/model-tool-capabilities.js";
+import { descriptorsForBudgetStage } from "../packages/agent-runtime/src/model-budget-convergence.js";
+import {
+  maximumBudgetStage,
+  stableBudgetPreparation
+} from "../packages/agent-runtime/src/model-budget-stability.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -28,6 +43,81 @@ function limits(overrides: Partial<BudgetLimits> = {}): BudgetLimits {
 
 function event(): AgentEventEnvelope {
   return {} as AgentEventEnvelope;
+}
+
+function kernelEvent(
+  state: RuntimeSession["durable"]["state"],
+  type: AgentEventType,
+  payload: JsonValue,
+  authority: AgentEventEnvelope["authority"] = "runtime"
+): AgentEventEnvelope {
+  return {
+    schemaVersion: 3,
+    seq: state.lastSeq + 1,
+    eventId: `event-${state.lastSeq + 1}`,
+    sessionId: state.sessionId,
+    runId: state.runId,
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    type,
+    authority,
+    payload
+  };
+}
+
+function reduce(
+  state: RuntimeSession["durable"]["state"],
+  type: AgentEventType,
+  payload: JsonValue,
+  authority?: AgentEventEnvelope["authority"]
+): RuntimeSession["durable"]["state"] {
+  return evolve(state, kernelEvent(state, type, payload, authority));
+}
+
+function stateWithActionDebt(count: 2 | 3): RuntimeSession["durable"]["state"] {
+  let state = runtimeSessionFixture().durable.state;
+  state = reduce(state, "user.message", { text: "inspect the durable input" });
+  for (let turnId = 1; turnId <= count; turnId += 1) {
+    const effectRevision = state.revision;
+    state = reduce(state, "model.started", { provider: "test", model: "test", turnId, effectRevision });
+    state = reduce(state, "diagnostic", {
+      kind: "model.tool_policy",
+      turnId,
+      effectRevision,
+      allowedToolNames: ["read"],
+      terminalOnly: false
+    });
+    const callId = `read-${turnId}`;
+    const call = { id: callId, name: "read", arguments: { path: "stable.txt" } };
+    state = reduce(state, "model.completed", {
+      model: "test",
+      turnId,
+      effectRevision,
+      text: "",
+      finishReason: "tool_calls",
+      message: { role: "assistant", content: "", toolCalls: [call] },
+      toolCalls: [call],
+      usage: {}
+    });
+    const pending = state.pendingTools.find((item) => item.request.callId === callId);
+    if (!pending) continue;
+    state = reduce(state, "tool.started", { callId, name: "read", ...pending.modelTurn });
+    state = reduce(state, "tool.completed", {
+      callId,
+      name: "read",
+      ...pending.modelTurn,
+      ok: true,
+      output: "stable",
+      outcome: { status: "succeeded", output: "stable", diagnosticCodes: [] },
+      observedEffects: ["filesystem.read"],
+      actualEffects: ["filesystem.read"],
+      artifacts: [],
+      diagnostics: [],
+      evidence: [],
+      startedAt: "2026-01-01T00:00:00.000Z",
+      completedAt: "2026-01-01T00:00:00.001Z"
+    }, "tool");
+  }
+  return state;
 }
 
 function controller(target: RuntimeSession): BudgetController {
@@ -198,7 +288,7 @@ describe("unified convergence admission policy", () => {
     expect(budgetStageForCapacity(measuredForecast, 3)).toBe("terminal");
   });
 
-  it("reserves reviewer P90 when a successful finalize will trigger advisory review", () => {
+  it("reserves a future candidate review despite a current workspace review", () => {
     const target = runtimeSessionFixture();
     target.durable.state.deadlineRemainingMs = 600_000;
     target.durable.state.mutationFrontier = {
@@ -209,6 +299,21 @@ describe("unified convergence admission policy", () => {
       sourceCheckpointIds: []
     };
     target.durable.state.evidence.push({
+      evidenceId: "readme-delta",
+      sessionId: target.identity.sessionId,
+      runId: target.durable.runId,
+      kind: "workspace_delta",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime", id: "checkpoint" },
+      summary: "README changed",
+      data: {
+        checkpointId: "checkpoint",
+        delta: { added: [], modified: ["README.md"], deleted: [] },
+        reviewDiff: "--- a/README.md\n+++ b/README.md\n-old\n+new",
+        reviewDiffPaths: ["README.md"]
+      }
+    }, {
       evidenceId: "acceptance-proof",
       sessionId: target.identity.sessionId,
       runId: target.durable.runId,
@@ -244,6 +349,27 @@ describe("unified convergence admission policy", () => {
       cacheWriteTokens: 0, costMicroUsd: 0, latencyMs: 40_000, attempt: 1,
       occurredAt: "2026-01-01T00:00:00.000Z"
     });
+    const workspaceBasis = reviewBasisDigest(target);
+    target.durable.state.evidence.push({
+      evidenceId: "workspace-approval",
+      sessionId: target.identity.sessionId,
+      runId: target.durable.runId,
+      kind: "review",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "workspace approved",
+      data: {
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        frontierRevision: 1,
+        stateDigest: "a".repeat(64),
+        reviewBasisDigest: workspaceBasis,
+        reviewBasisVersion: 3,
+        validationEvidenceIds: ["acceptance-proof"]
+      }
+    });
 
     expect(deadlineForecast(target)).toMatchObject({
       nextModelEstimateMs: 15_000,
@@ -252,6 +378,191 @@ describe("unified convergence admission policy", () => {
       terminalActionReserveMs: 75_250,
       terminalStageReserveMs: 150_500
     });
+
+    target.durable.state.budget = createBudgetLedger(limits({
+      inputTokens: 10_000,
+      outputTokens: 10_000,
+      modelTurns: 1
+    }));
+    expect(convergenceAdmissionFailure(target, {
+      kind: "model",
+      stage: "terminal",
+      futureBudgetReserve: { modelTurns: 1 }
+    }))
+      .toMatchObject({ kind: "recoverable_failure", code: "budget_exhausted" });
+  });
+
+  it("reserves pure-text review time and removes it after an advisory waiver", () => {
+    const documentationTarget = (waived: boolean): RuntimeSession => {
+      const target = runtimeSessionFixture();
+      target.durable.state.deadlineRemainingMs = 60_000;
+      target.durable.state.mutationFrontier = {
+        revision: 1,
+        baselineManifestDigest: "0".repeat(64),
+        currentStateDigest: "a".repeat(64),
+        changedPaths: ["README.md"],
+        sourceCheckpointIds: ["checkpoint"]
+      };
+      target.durable.state.evidence.push({
+        evidenceId: "documentation-delta",
+        sessionId: target.identity.sessionId,
+        runId: target.durable.runId,
+        kind: "workspace_delta",
+        status: "passed",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        producer: { authority: "runtime", id: "checkpoint" },
+        summary: "README changed",
+        data: {
+          checkpointId: "checkpoint",
+          delta: { added: [], modified: ["README.md"], deleted: [] },
+          reviewDiff: "--- a/README.md\n+++ b/README.md\n-old\n+new",
+          reviewDiffPaths: ["README.md"]
+        }
+      });
+      if (waived) target.durable.state.evidence.push({
+        evidenceId: "review-waiver",
+        sessionId: target.identity.sessionId,
+        runId: target.durable.runId,
+        kind: "user_waiver",
+        status: "informational",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "user" },
+        summary: "review waived",
+        data: { scope: "review", reason: "user chose advisory waiver", checkpointId: "checkpoint" }
+      });
+      return target;
+    };
+
+    const reviewable = documentationTarget(false);
+    expect(candidateReviewerRequestReserve(reviewable)).toBe(1);
+    expect(deadlineForecast(reviewable)).toMatchObject({
+      stage: "converge",
+      reviewerEstimateMs: 15_000,
+      terminalActionReserveMs: 40_250
+    });
+
+    const waived = documentationTarget(true);
+    expect(candidateReviewerRequestReserve(waived)).toBe(0);
+    expect(deadlineForecast(waived)).toMatchObject({
+      stage: "normal",
+      reviewerEstimateMs: 0,
+      terminalActionReserveMs: 25_250
+    });
+    waived.durable.state.budget = createBudgetLedger(limits({
+      inputTokens: 10_000,
+      outputTokens: 10_000,
+      modelTurns: 1
+    }));
+    expect(convergenceAdmissionFailure(waived, { kind: "model", stage: "normal" })).toBeNull();
+  });
+
+  it("re-quotes contracted stages before latching resource convergence", async () => {
+    const target = runtimeSessionFixture();
+    target.durable.state.deadlineRemainingMs = 600_000;
+    const plan = {
+      messages: [], included: [], omitted: [],
+      budget: { contextWindowTokens: 1_000, outputReserveTokens: 100, usableInputTokens: 900 },
+      omittedHistoryTurns: 0, latestHistoryBlockTokens: 0,
+      cacheMode: "proactive_window" as const, historyTokenLimit: 0, dynamicSuffixTokens: 0
+    };
+    const prepared = (stage: "normal" | "converge" | "terminal") => ({
+      plan,
+      turn: {
+        messages: [], tools: [],
+        outputReserveTokens: stage === "normal" ? 100 : stage === "converge" ? 20 : 5,
+        budget: {
+          estimatedInputTokens: stage === "normal" ? 100 : stage === "converge" ? 50 : 10,
+          reserved: {
+            inputTokens: stage === "normal" ? 100 : stage === "converge" ? 50 : 10,
+            outputTokens: stage === "normal" ? 100 : stage === "converge" ? 20 : 5,
+            costMicroUsd: stage === "normal" ? 50 : stage === "converge" ? 20 : 5,
+            modelTurns: 1
+          },
+          reservedAttempts: 1,
+          attemptReservations: [{
+            inputTokens: stage === "normal" ? 100 : stage === "converge" ? 50 : 10,
+            outputTokens: stage === "normal" ? 100 : stage === "converge" ? 20 : 5,
+            costMicroUsd: stage === "normal" ? 50 : stage === "converge" ? 20 : 5
+          }]
+        }
+      }
+    });
+    const initial = prepared("normal");
+    const result = await stableBudgetPreparation(
+      initial,
+      deadlineForecast(target),
+      "normal",
+      false,
+      async (stage) => prepared(stage),
+      async (candidate) => ({
+        inputTokens: candidate.turn.outputReserveTokens * 2,
+        outputTokens: candidate.turn.outputReserveTokens * 2,
+        costMicroUsd: candidate.turn.outputReserveTokens,
+        modelTurns: 1,
+        toolCalls: 0,
+        children: 0
+      }),
+      {
+        inputTokens: 250, outputTokens: 250, costMicroUsd: 120,
+        modelTurns: 3, toolCalls: 0, children: 0
+      }
+    );
+
+    expect(result).toMatchObject({ stage: "converge", resourceStage: "converge" });
+    expect(result.prepared.turn.outputReserveTokens).toBe(20);
+
+    target.durable.state.repeatedToolBatchCount = 2;
+    const debtForecast = deadlineForecast(target);
+    const debtMinimum = monotonicBudgetStage(debtForecast, "normal");
+    const noReviewerReserve = async () => ({
+      inputTokens: 0, outputTokens: 0, costMicroUsd: 0,
+      modelTurns: 0, toolCalls: 0, children: 0
+    });
+    const ampleBudget = {
+      inputTokens: 1_000, outputTokens: 1_000, costMicroUsd: 1_000,
+      modelTurns: 3, toolCalls: 0, children: 0
+    };
+    const debtResult = await stableBudgetPreparation(
+      prepared(debtMinimum), debtForecast, debtMinimum, false,
+      async (stage) => prepared(stage), noReviewerReserve, ampleBudget
+    );
+    const debtResourceStage = monotonicBudgetStage(debtForecast, debtResult.resourceStage);
+    expect(debtResult).toMatchObject({ stage: "converge", resourceStage: "normal" });
+    expect(maximumBudgetStage(debtResourceStage, debtResult.stage)).toBe("converge");
+
+    // A trusted-progress reducer clears action debt. Since only the resource
+    // stage was latched, the next preparation returns to a normal contract.
+    target.durable.state.repeatedToolBatchCount = 0;
+    const recoveredForecast = deadlineForecast(target);
+    const recoveredMinimum = monotonicBudgetStage(recoveredForecast, "normal");
+    const recovered = await stableBudgetPreparation(
+      prepared(recoveredMinimum), recoveredForecast, recoveredMinimum, false,
+      async (stage) => prepared(stage), noReviewerReserve, ampleBudget
+    );
+    expect(recovered).toMatchObject({ stage: "normal", resourceStage: "normal" });
+    expect(recovered.prepared.turn.outputReserveTokens).toBe(100);
+
+    target.durable.state.convergenceStageHighWater = {
+      runId: target.durable.runId,
+      deadline: "normal",
+      budget: "terminal"
+    };
+    const restored = runtimeSessionFixture({ state: structuredClone(target.durable.state) });
+    const restoredForecast = deadlineForecast(restored);
+    const restoredMinimum = monotonicBudgetStage(restoredForecast, "normal");
+    const restoredResult = await stableBudgetPreparation(
+      prepared(restoredMinimum),
+      restoredForecast,
+      restoredMinimum,
+      false,
+      async (stage) => prepared(stage),
+      noReviewerReserve,
+      ampleBudget
+    );
+
+    expect(restoredMinimum).toBe("terminal");
+    expect(restoredResult).toMatchObject({ stage: "terminal", resourceStage: "terminal" });
+    expect(restoredResult.prepared.turn.outputReserveTokens).toBe(5);
   });
 
   it("keeps converge and terminal-only stages monotonic for the live run", () => {
@@ -278,6 +589,32 @@ describe("unified convergence admission policy", () => {
     expect(apparentlyRecovered.stage).toBe("converge");
     expect(budgetStageForCapacity(apparentlyRecovered, 3)).toBe("terminal");
 
+    target.durable.state = evolve(target.durable.state, {
+      schemaVersion: 3,
+      seq: target.durable.state.lastSeq + 1,
+      eventId: "deadline-high-water",
+      sessionId: target.identity.sessionId,
+      runId: target.durable.runId,
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      type: "diagnostic",
+      authority: "runtime",
+      payload: {
+        kind: "deadline.stage",
+        stage: "converge",
+        budgetStage: "terminal",
+        resourceBudgetStage: "terminal",
+        budgetStageSource: "resource",
+        remainingMs: 50_500,
+        nextModelEstimateMs: 15_000,
+        nextConvergenceModelEstimateMs: 15_000,
+        outputReserveTokens: 4_096
+      }
+    });
+    const restored = runtimeSessionFixture({ state: structuredClone(target.durable.state) });
+    restored.durable.state.deadlineRemainingMs = 600_000;
+    expect(deadlineForecast(restored).stage).toBe("converge");
+    expect(budgetStageForCapacity(deadlineForecast(restored), 3)).toBe("terminal");
+
     target.durable.runId = "next-run";
     target.durable.state.runId = "next-run";
     const nextRun = deadlineForecast(target);
@@ -285,7 +622,7 @@ describe("unified convergence admission policy", () => {
     expect(budgetStageForCapacity(nextRun, 3)).toBe("normal");
   });
 
-  it("uses semantic action debt to enter a 4K tool-first convergence stage", () => {
+  it("treats semantic action debt as a transient focused-action then terminal stage", () => {
     const target = runtimeSessionFixture();
     target.durable.state.deadlineRemainingMs = 600_000;
     target.durable.state.repeatedToolBatchCount = 2;
@@ -295,8 +632,95 @@ describe("unified convergence admission policy", () => {
     expect(budgetStageForCapacity(forecast, 3)).toBe("converge");
 
     target.durable.state.repeatedToolBatchCount = 0;
-    expect(budgetStageForCapacity(deadlineForecast(target), 3)).toBe("converge");
+    expect(budgetStageForCapacity(deadlineForecast(target), 3)).toBe("normal");
+
+    target.durable.state.repeatedToolBatchCount = 3;
+    const terminalStage = budgetStageForCapacity(deadlineForecast(target), 3);
+    expect(terminalStage).toBe("terminal");
+    const descriptor = (name: string, effect: ToolDescriptor["possibleEffects"][number]): ToolDescriptor => ({
+      name,
+      description: name,
+      inputSchema: {},
+      possibleEffects: [effect],
+      executionMode: "sequential",
+      resourceKeys: [],
+      approval: "auto",
+      idempotent: true,
+      timeoutMs: 1_000
+    });
+    const mixedTerminal: ToolDescriptor = {
+      ...descriptor("mixed_terminal_writer", "outcome.propose"),
+      possibleEffects: ["outcome.propose", "filesystem.write"]
+    };
+    const broadMaximumTerminal: ToolDescriptor = {
+      ...descriptor("broad_maximum_terminal_writer", "outcome.propose"),
+      maximumEffects: ["outcome.propose", "filesystem.write"]
+    };
+    const runtimeFinalize = descriptor("runtime_finalize", "outcome.propose");
+    const ordinaryDescriptors = [
+      descriptor("read", "filesystem.read"),
+      mixedTerminal,
+      broadMaximumTerminal,
+      descriptor("report_blocked", "outcome.report_blocked"),
+      descriptor("request_user_input", "outcome.request_input")
+    ];
+    expect(descriptorsForBudgetStage(
+      ordinaryDescriptors,
+      terminalStage,
+      [runtimeFinalize]
+    ).map((item) => item.name)).toEqual([
+      "runtime_finalize", "report_blocked", "request_user_input"
+    ]);
+    expect(descriptorsForBudgetStage(
+      ordinaryDescriptors,
+      "normal",
+      [runtimeFinalize]
+    ).map((item) => item.name)).not.toContain("runtime_finalize");
   });
+
+  it.each([2, 3] as const)(
+    "does not persist action-debt stage %s across restore after trusted progress",
+    (debt) => {
+      const target = runtimeSessionFixture({ state: stateWithActionDebt(debt) });
+      target.durable.state.deadlineRemainingMs = 600_000;
+      const before = deadlineForecast(target);
+      const resourceBudgetStage = resourceBudgetStageForCapacity(before, 3);
+      const budgetStage = budgetStageForCapacity(before, 3);
+      expect(before.actionDebt).toBe(debt);
+      expect(resourceBudgetStage).toBe("normal");
+      expect(budgetStage).toBe(debt === 2 ? "converge" : "terminal");
+
+      target.durable.state = reduce(target.durable.state, "diagnostic", {
+        kind: "deadline.stage",
+        stage: before.stage,
+        budgetStage,
+        resourceBudgetStage,
+        budgetStageSource: "action_debt",
+        remainingMs: before.remainingMs,
+        nextModelEstimateMs: before.nextModelEstimateMs,
+        nextConvergenceModelEstimateMs: before.nextConvergenceModelEstimateMs,
+        outputReserveTokens: 4_096
+      });
+      expect(target.durable.state.convergenceStageHighWater?.budget).toBe("normal");
+
+      const restored = runtimeSessionFixture({ state: structuredClone(target.durable.state) });
+      restored.durable.state.deadlineRemainingMs = 600_000;
+      restored.durable.state = reduce(restored.durable.state, "evidence.recorded", {
+        evidenceId: `new-input-${debt}`,
+        sessionId: restored.identity.sessionId,
+        runId: restored.durable.runId,
+        kind: "input_access",
+        status: "passed",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        producer: { authority: "runtime" },
+        summary: "new durable input",
+        data: { path: `new-${debt}.txt`, scope: "workspace", sha256: "a".repeat(64), byteLength: 1 }
+      });
+      const recovered = deadlineForecast(restored);
+      expect(recovered).toMatchObject({ stage: "normal", actionDebt: 0 });
+      expect(budgetStageForCapacity(recovered, 3)).toBe("normal");
+    }
+  );
 
   it("settles measured token, model-turn, and tool-call usage exactly before the next admission", async () => {
     const target = runtimeSessionFixture();

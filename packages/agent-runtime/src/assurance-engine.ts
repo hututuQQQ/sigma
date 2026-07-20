@@ -10,9 +10,41 @@ import {
   type RepositoryValidationCapabilityProfile
 } from "agent-context";
 import type { RuntimeSession } from "./types.js";
+import { assurancePathClass } from "./assurance-path-classification.js";
 
 const HIGH_RISK_PATH = /(?:^|\/)(?:native|security|sandbox|permissions?|auth|completion|budget|release|deployment|agent-execution|agent-runtime)(?:\/|$)|(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/iu;
 const TEST_PATH = /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/iu;
+
+function normalizedWorkspacePath(value: string): string {
+  return value.replaceAll("\\", "/");
+}
+
+/** Opaqueness is an observed property of checkpoint material, not a filename
+ * convention. A binary or content-omitted README must retain the same
+ * executable-validation obligation as an artifact with a binary extension. */
+export function frontierOpaqueArtifactPaths(session: RuntimeSession): string[] {
+  const frontierPaths = session.durable.state.mutationFrontier.changedPaths;
+  const changed = new Set(frontierPaths.map(normalizedWorkspacePath));
+  const latestRepresentation = new Map<string, "opaque" | "reviewable">();
+  const records = [...session.durable.state.mutationEvidence];
+  const seen = new Set(records.map((item) => item.evidenceId));
+  for (const item of session.durable.state.evidence) {
+    if (!seen.has(item.evidenceId)) records.push(item);
+  }
+  for (const item of records) {
+    if (item.kind !== "workspace_delta" || item.status !== "passed"
+      || item.sessionId !== session.identity.sessionId) continue;
+    const deltaPaths = [...new Set([
+      ...item.data.delta.added, ...item.data.delta.modified, ...item.data.delta.deleted
+    ].map(normalizedWorkspacePath))];
+    const opaquePaths = new Set((item.data.opaqueArtifacts ?? [])
+      .map((artifact) => normalizedWorkspacePath(artifact.path)));
+    for (const path of deltaPaths) {
+      if (changed.has(path)) latestRepresentation.set(path, opaquePaths.has(path) ? "opaque" : "reviewable");
+    }
+  }
+  return frontierPaths.filter((path) => latestRepresentation.get(normalizedWorkspacePath(path)) === "opaque");
+}
 
 export function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
   const claims: ValidationClaimKindV1[] = [];
@@ -147,4 +179,21 @@ export function assurancePathsForClaim(
   }
   if (claim === "lint") return paths.filter((item) => isRepositorySourcePath(item) || /\.(?:json|ya?ml|toml)$/iu.test(item));
   return [...paths];
+}
+
+/** Paths whose semantics must be covered by executable validation before an
+ * independent review can approve the current frontier. Ordinary reviewable
+ * text is inspected directly by the reviewer under the trusted default
+ * profile; explicit validation instructions and high-risk changes stay strict. */
+export function reviewValidationRequiredPaths(session: RuntimeSession): string[] {
+  const requirement = assuranceRequirement(session);
+  const explicit = session.durable.state.validationRequirement === "required";
+  const required = new Set(requirement.requiredClaims.flatMap((claim) =>
+    assurancePathsForClaim(session.durable.state.mutationFrontier.changedPaths, claim, session)));
+  const opaquePaths = frontierOpaqueArtifactPaths(session);
+  for (const path of opaquePaths) required.add(path);
+  const opaque = new Set(opaquePaths.map(normalizedWorkspacePath));
+  return [...required].filter((path) => opaque.has(normalizedWorkspacePath(path)) || explicit
+    || requirement.risk === "high"
+    || assurancePathClass(path) !== "reviewable_text");
 }

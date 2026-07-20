@@ -10,7 +10,9 @@ import type {
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
-  ModelToolDefinition
+  ModelToolDefinition,
+  ToolDescriptor,
+  ToolExecutor
 } from "../packages/agent-protocol/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { providerVisibleHistory } from "../packages/agent-runtime/src/model-budget-convergence.js";
@@ -49,6 +51,7 @@ describe("provider-visible runtime history", () => {
 class UnderestimatedGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "measured-usage";
+  readonly maxTokensPerUtf8Byte = 1;
   streamCalls = 0;
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 16_000,
@@ -94,6 +97,7 @@ class UnderestimatedGateway implements ModelGateway {
 class InspectableGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "inspectable";
+  readonly maxTokensPerUtf8Byte = 1;
   readonly requests: ModelRequest[] = [];
   readonly capabilities: ModelCapabilities;
 
@@ -128,6 +132,7 @@ class InspectableGateway implements ModelGateway {
 class DeadlineCrossingGateway implements ModelGateway {
   readonly provider = "fake";
   readonly model = "deadline-crossing";
+  readonly maxTokensPerUtf8Byte = 1;
   readonly requests: ModelRequest[] = [];
   private firstStartedResolve!: () => void;
   private secondStartedResolve!: () => void;
@@ -257,12 +262,298 @@ describe("provider-measured model budget settlement", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
-    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096, toolChoice: "required" });
+    expect(gateway.requests[0]).toMatchObject({ maxOutputTokens: 4_096 });
+    expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
+      "report_blocked", "request_user_input", "runtime_finalize"
     ]);
-    expect(gateway.requests[0].messages.some((message) => message.content.includes("Budget stage is terminal")))
+    expect(gateway.requests[0].messages.some((message) => message.content.includes("terminal-only")))
       .toBe(true);
+  });
+
+  it("accepts an explicit runtime_finalize only on the bound terminal-only turn", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-finalize-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-finalize-state-"));
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "terminal-finalize",
+          name: "runtime_finalize",
+          arguments: { summary: "The bounded terminal result is complete." }
+        }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 100,
+      outputTokens: 10
+    }], { maxOutputTokens: 64_000 });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 40_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "The bounded terminal result is complete."
+    });
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.tools.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
+    const events = await storedEvents(store, session.sessionId);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool.completed",
+      payload: expect.objectContaining({ callId: "terminal-finalize", ok: true })
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "plan.updated",
+      payload: expect.objectContaining({
+        plan: expect.objectContaining({ nodes: [expect.objectContaining({ id: "root", status: "completed" })] })
+      })
+    }));
+  });
+
+  it("routes a natural stop on a terminal-only turn through the same completion coordinator", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-natural-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-natural-state-"));
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const gateway = new InspectableGateway([{
+      message: { role: "assistant", content: "The natural terminal result is complete." },
+      finishReason: "stop",
+      inputTokens: 100,
+      outputTokens: 10
+    }], { maxOutputTokens: 64_000 });
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      permissionMode: "auto",
+      runDeadlineMs: 40_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish promptly" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: "The natural terminal result is complete."
+    });
+    expect(gateway.requests[0]!.toolChoice).toBeUndefined();
+    const events = await storedEvents(store, session.sessionId);
+    const completion = events.find((event) => event.type === "tool.completed"
+      && String((event.payload as { callId?: unknown }).callId).startsWith("runtime_completion_intent_"));
+    expect(completion).toBeDefined();
+  });
+
+  it.each(["read", "mixed_terminal_writer", "broad_maximum_terminal_writer"])(
+    "rejects unoffered %s calls at the bound terminal turn before tool execution",
+    async (unauthorizedName) => {
+      const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-policy-workspace-"));
+      const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-policy-state-"));
+      const store = new SegmentedJsonlStore({ rootDir: state });
+      let mixedExecutions = 0;
+      const tools = registerBuiltinTools(new EffectToolRegistry());
+      tools.register({
+        descriptor: {
+          name: "mixed_terminal_writer",
+          description: "A deliberately mixed-effect test tool.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          possibleEffects: ["outcome.propose", "filesystem.write"],
+          executionMode: "sequential",
+          resourceKeys: [],
+          approval: "auto",
+          idempotent: false,
+          timeoutMs: 1_000
+        },
+        async execute(request) {
+          mixedExecutions += 1;
+          return {
+            callId: request.callId,
+            ok: true,
+            output: "should not execute",
+            observedEffects: ["outcome.propose", "filesystem.write"],
+            artifacts: [],
+            diagnostics: [],
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString()
+          };
+        }
+      });
+      tools.register({
+        descriptor: {
+          name: "broad_maximum_terminal_writer",
+          description: "A terminal-looking test tool with a broader dynamic effect envelope.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          possibleEffects: ["outcome.propose"],
+          maximumEffects: ["outcome.propose", "filesystem.write"],
+          availableModes: ["change"],
+          executionMode: "sequential",
+          resourceKeys: [],
+          approval: "auto",
+          idempotent: false,
+          timeoutMs: 1_000,
+          prepare: async () => ({
+            exactEffects: ["filesystem.write"],
+            readPaths: [],
+            writePaths: ["unexpected.txt"],
+            network: "none",
+            processMode: "none",
+            checkpointScope: ["unexpected.txt"],
+            idempotence: "non_replayable"
+          })
+        },
+        async execute(request) {
+          mixedExecutions += 1;
+          return {
+            callId: request.callId,
+            ok: true,
+            output: "should not execute",
+            observedEffects: ["filesystem.write"],
+            artifacts: [],
+            diagnostics: [],
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString()
+          };
+        }
+      });
+      const unauthorized: ModelResponse = {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: `unauthorized-${unauthorizedName}`,
+            name: unauthorizedName,
+            arguments: unauthorizedName === "read" ? { path: "seed.txt" } : {}
+          }]
+        },
+        finishReason: "tool_calls",
+        inputTokens: 100,
+        outputTokens: 10
+      };
+      const gateway = new InspectableGateway([unauthorized, requestInputResponse()]);
+      const runtime = createRuntime({
+        gateway,
+        store,
+        storeRootDir: state,
+        tools,
+        permissionMode: "auto",
+        runDeadlineMs: 40_000
+      });
+      const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+      await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish safely" });
+
+      await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[0]!.tools.some((tool) => tool.name === unauthorizedName)).toBe(false);
+      expect(gateway.requests[1]!.messages.some((message) =>
+        message.content.includes("[tool_policy_violation]"))).toBe(true);
+      const events = await storedEvents(store, session.sessionId);
+      const unauthorizedCallId = `unauthorized-${unauthorizedName}`;
+      expect(events.some((event) => event.type === "tool.started"
+        && (event.payload as { callId?: unknown }).callId === unauthorizedCallId)).toBe(false);
+      expect(events.some((event) => event.type === "tool.requested"
+        && (event.payload as { callId?: unknown }).callId === unauthorizedCallId)).toBe(false);
+      expect(mixedExecutions).toBe(0);
+    }
+  );
+
+  it("rejects a non-terminal exact plan before every tool lifecycle event and executor call", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-exact-plan-workspace-"));
+    const state = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-exact-plan-state-"));
+    const store = new SegmentedJsonlStore({ rootDir: state });
+    const base = registerBuiltinTools(new EffectToolRegistry());
+    let executions = 0;
+    const descriptor: ToolDescriptor = {
+      name: "spoofed_terminal_writer",
+      description: "A terminal descriptor backed by an inconsistent test executor plan.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      possibleEffects: ["outcome.propose"],
+      maximumEffects: ["outcome.propose"],
+      availableModes: ["change"],
+      executionMode: "sequential",
+      resourceKeys: [],
+      approval: "auto",
+      idempotent: false,
+      timeoutMs: 1_000
+    };
+    const allDescriptors = (): ToolDescriptor[] => [...base.descriptors(), descriptor]
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const tools: ToolExecutor = {
+      descriptors: allDescriptors,
+      modelDescriptors: allDescriptors,
+      async prepare(request, context) {
+        if (request.name !== descriptor.name) return await base.prepare(request, context);
+        return {
+          exactEffects: ["filesystem.write"],
+          readPaths: [],
+          writePaths: ["unexpected.txt"],
+          network: "none",
+          processMode: "none",
+          checkpointScope: ["unexpected.txt"],
+          idempotence: "non_replayable"
+        };
+      },
+      async execute(request, context) {
+        if (request.name !== descriptor.name) return await base.execute(request, context);
+        executions += 1;
+        return {
+          callId: request.callId,
+          ok: true,
+          output: "should not execute",
+          observedEffects: ["filesystem.write"],
+          artifacts: [],
+          diagnostics: [],
+          startedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString()
+        };
+      }
+    };
+    const callId = "spoofed-terminal-call";
+    const gateway = new InspectableGateway([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: callId, name: descriptor.name, arguments: {} }]
+      },
+      finishReason: "tool_calls",
+      inputTokens: 100,
+      outputTokens: 10
+    }, requestInputResponse()]);
+    const runtime = createRuntime({
+      gateway,
+      store,
+      storeRootDir: state,
+      tools,
+      permissionMode: "auto",
+      runDeadlineMs: 40_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "finish safely" });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
+    expect(gateway.requests[0]!.tools.some((tool) => tool.name === descriptor.name)).toBe(true);
+    expect(executions).toBe(0);
+    const recorded = await storedEvents(store, session.sessionId);
+    for (const type of ["tool.requested", "execution.planned", "tool.started"] as const) {
+      expect(recorded.some((event) => event.type === type
+        && ((event.payload as { callId?: unknown }).callId === callId
+          || (event.payload as { executionId?: unknown }).executionId === callId))).toBe(false);
+    }
+    expect(recorded).toContainEqual(expect.objectContaining({
+      type: "tool.failed",
+      payload: expect.objectContaining({
+        callId,
+        diagnostics: ["tool_not_authorized_for_turn"]
+      })
+    }));
   });
 
   it("durably hands a late non-terminal call to a final terminal-only turn", async () => {
@@ -299,7 +590,7 @@ describe("provider-measured model budget settlement", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[0]!.tools.some((tool) => tool.name === "read")).toBe(true);
       expect(gateway.requests[1]!.tools.map((tool) => tool.name).sort()).toEqual([
-        "report_blocked", "request_user_input"
+        "report_blocked", "request_user_input", "runtime_finalize"
       ]);
       const events = await storedEvents(store, session.sessionId);
       expect(events).toContainEqual(expect.objectContaining({
@@ -342,7 +633,11 @@ describe("provider-measured model budget settlement", () => {
     }));
     const committed = events.filter((event) => event.type === "budget.committed").at(-1);
     expect(committed?.payload).toEqual(expect.objectContaining({
-      ledger: expect.objectContaining({ consumed: expect.objectContaining({ inputTokens: 130 }) })
+      mutation: expect.objectContaining({
+        kind: "settle",
+        status: "committed",
+        totals: expect.objectContaining({ consumed: expect.objectContaining({ inputTokens: 130 }) })
+      })
     }));
   });
 
@@ -366,9 +661,9 @@ describe("provider-measured model budget settlement", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "needs_input" });
     expect(gateway.requests).toHaveLength(1);
-    expect(gateway.requests[0].toolChoice).toBe("required");
+    expect(gateway.requests[0].toolChoice).toBeUndefined();
     expect(gateway.requests[0].tools.map((tool) => tool.name).sort()).toEqual([
-      "report_blocked", "request_user_input"
+      "report_blocked", "request_user_input", "runtime_finalize"
     ]);
   });
 
@@ -436,28 +731,34 @@ describe("provider-measured model budget settlement", () => {
       });
       const events = await storedEvents(store, session.sessionId);
       const committed = events.filter((event) => event.type === "budget.committed");
-      const ledger = (committed[0]?.payload as {
-        ledger: {
-          reservations: {
-            status: string;
-            requested: { inputTokens: number; outputTokens: number };
-            consumed: { inputTokens: number; outputTokens: number };
-          }[];
-          reserved: { inputTokens: number; outputTokens: number };
+      const mutation = (committed[0]?.payload as {
+        mutation: {
+          reservationId: string;
+          status: string;
           consumed: { inputTokens: number; outputTokens: number };
+          totals: {
+            reserved: { inputTokens: number; outputTokens: number };
+            consumed: { inputTokens: number; outputTokens: number };
+          };
         };
-      }).ledger;
-      const modelReservation = ledger.reservations.find((reservation) => reservation.status === "committed");
+      }).mutation;
+      const reserved = events.find((event) => event.type === "budget.reserved"
+        && (event.payload as { reservationId?: unknown }).reservationId === mutation.reservationId);
+      const modelReservation = (reserved?.payload as {
+        mutation?: { reservation?: { requested?: { inputTokens: number; outputTokens: number } } };
+      }).mutation?.reservation;
       expect(injected).toBe(true);
       expect(gateway.streamCalls).toBe(1);
       expect(committed).toHaveLength(1);
-      expect(ledger.reservations.filter((reservation) => reservation.status === "reserved")).toHaveLength(0);
-      expect(ledger.reserved).toMatchObject({ inputTokens: 0, outputTokens: 0 });
-      expect(ledger.consumed).toMatchObject({ inputTokens: 130, outputTokens: 5 });
-      expect(modelReservation).toMatchObject({
-        requested: { inputTokens: 120, outputTokens: 150 },
-        consumed: { inputTokens: 130, outputTokens: 5 }
+      expect(mutation).toMatchObject({
+        status: "committed",
+        consumed: { inputTokens: 130, outputTokens: 5 },
+        totals: {
+          reserved: { inputTokens: 0, outputTokens: 0 },
+          consumed: { inputTokens: 130, outputTokens: 5 }
+        }
       });
+      expect(modelReservation).toMatchObject({ requested: { inputTokens: 120, outputTokens: 150 } });
     }
   );
 });

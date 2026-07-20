@@ -128,9 +128,19 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
   z.object({
+    kind: z.literal("model.tool_policy"),
+    ...turnSchema,
+    allowedToolNames: z.array(nonEmptyStringSchema).max(512),
+    terminalOnly: z.boolean()
+  }).strict(),
+  z.object({
     kind: z.literal("deadline.stage"),
     stage: z.enum(["normal", "converge", "stop"]),
+    /** Effective stage remains useful for telemetry. Only the separately
+     * attributed resource stage may enter the durable high-water mark. */
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
+    resourceBudgetStage: z.enum(["normal", "converge", "terminal"]).optional(),
+    budgetStageSource: z.enum(["resource", "action_debt"]).optional(),
     remainingMs: z.number(),
     nextModelEstimateMs: z.number().int().nonnegative(),
     nextConvergenceModelEstimateMs: z.number().int().nonnegative().optional(),
@@ -177,7 +187,8 @@ export const coreEventPayloadSchemas = {
     writeScope: z.array(z.string()),
     strictWriteScope: z.boolean(),
     modelRole: sharedSchemas.modelExecutionRoleSchema,
-    parentSessionId: nonEmptyStringSchema.optional()
+    parentSessionId: nonEmptyStringSchema.optional(),
+    budgetLimits: sharedSchemas.budgetLimitsSchema.optional()
   }).strict(),
   "run.started": z.object({
     mode: runModeSchema,

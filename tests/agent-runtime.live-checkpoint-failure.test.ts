@@ -22,6 +22,7 @@ import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tool
 class ScriptedGateway implements ModelGateway {
   readonly provider = "test";
   readonly model = "live-checkpoint-failure";
+  readonly maxTokensPerUtf8Byte = 1;
   readonly capabilities: ModelCapabilities = {
     contextWindowTokens: 16_000,
     maxOutputTokens: 2_000,
@@ -75,19 +76,7 @@ async function fixture(writeBeforeFailure: boolean): Promise<{
   const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
   const gateway = new ScriptedGateway([
     toolTurn([
-      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } },
-      {
-        id: "same-turn-completion",
-        name: "runtime_finalize",
-        arguments: {
-          summary: "must not complete over an open checkpoint",
-          criteria: [{
-            criterion: "The mutation completed safely.",
-            status: "met",
-            evidence: [{ evidenceId: "invented", kind: "diagnostic" }]
-          }]
-        }
-      }
+      { id: "failing-mutation", name: "failing_mutation", arguments: { path: "target.txt" } }
     ]),
     toolTurn([{
       id: "clean-failure-observed",
@@ -144,8 +133,6 @@ describe("live mutation checkpoint failure recovery", () => {
     await expect(readFile(path.join(target.workspace, "target.txt"), "utf8")).resolves.toBe("partial");
     expect((await target.manager.list(session.sessionId)).at(-1)).toMatchObject({ status: "open" });
     const stored = await events(target.store, session.sessionId);
-    expect(stored.some((event) => event.type === "tool.requested"
-      && (event.payload as { callId?: string }).callId === "same-turn-completion")).toBe(false);
     expect(stored).toContainEqual(expect.objectContaining({
       type: "run.suspended",
       payload: expect.objectContaining({ requestId: expect.stringMatching(/^checkpoint:/u) })

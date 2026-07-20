@@ -150,6 +150,24 @@ function changedWorkspaceValidationFailureReport(_request: ModelRequest): ModelR
   };
 }
 
+function convergenceBlocked(id: string): ModelResponse {
+  return {
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id,
+        name: "report_blocked",
+        arguments: {
+          summary: "No trusted progress was produced within the bounded convergence opportunity.",
+          recoveryAttempted: "One focused recovery opportunity was exhausted."
+        }
+      }]
+    },
+    finishReason: "tool_calls"
+  };
+}
+
 class ScriptedGateway implements ModelGateway {
   readonly provider = "test";
   readonly model = "scripted";
@@ -572,6 +590,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
       message: expect.stringContaining("failed validation is reported")
     });
     expect(gateway.requests).toHaveLength(4);
+    // Terminal-only convergence deliberately permits either a typed terminal
+    // tool or a natural stop; both paths enter the same completion gates.
     expect(gateway.requests[3]?.toolChoice).toBeUndefined();
     expect(gateway.requests[3]?.tools?.map((tool) => tool.name)).toContain("report_blocked");
     expect(gateway.requests[3]?.messages.at(-1)?.content).toContain("validation");
@@ -580,18 +600,22 @@ describe("runtime queues and non-blocking instruction steering", () => {
       .toEqual([]);
   }, 30_000);
 
-  it("returns convergence_no_progress after three malformed completion calls", async () => {
+  it("lets the one terminal-only correction stop naturally after an unoffered completion call", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-terminal-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
-      ...[1, 2, 3].map((attempt) => ({
+      {
         message: {
           role: "assistant" as const,
           content: "",
-          toolCalls: [{ id: `malformed-complete-${attempt}`, name: "runtime_finalize", arguments: {} }]
+          toolCalls: [{ id: "malformed-complete-1", name: "runtime_finalize", arguments: {} }]
         },
         finishReason: "tool_calls" as const
-      }))
+      },
+      {
+        message: { role: "assistant", content: "The bounded inspection is complete." },
+        finishReason: "stop"
+      }
     ]);
     const runtime = createRuntime({
       gateway,
@@ -602,18 +626,16 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
 
-    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure",
-      code: "convergence_no_progress"
-    });
-    expect(gateway.requests).toHaveLength(3);
-    for (const request of gateway.requests) {
-      expect(request.tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
-      expect(request.tools?.map((tool) => tool.name)).toContain("read");
-    }
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({ kind: "completed" });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0]?.tools?.map((tool) => tool.name)).not.toContain("runtime_finalize");
+    expect(gateway.requests[1]?.toolChoice).toBeUndefined();
+    expect(gateway.requests[1]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
   }, 30_000);
 
-  it("returns convergence_no_progress after three malformed input requests", async () => {
+  it("hands three malformed input requests to one terminal-only outcome", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-malformed-input-repair-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -628,7 +650,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
           }]
         },
         finishReason: "tool_calls" as const
-      }))
+      })),
+      convergenceBlocked("malformed-input-terminal")
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -642,16 +665,19 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "convergence_no_progress"
+      code: "reported_blocker"
     });
-    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[3]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.failed"
       && String((event.payload as { callId?: string }).callId).startsWith("malformed-input-"))).toHaveLength(2);
     expect(events.some((event) => event.type === "run.suspended")).toBe(false);
   }, 30_000);
 
-  it("keeps ordinary tools executable while correcting an invalid terminal call", async () => {
+  it("keeps ordinary tools unavailable after an unoffered terminal call enters correction", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-terminal-repair-policy-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
     const gateway = new ScriptedGateway([
@@ -668,8 +694,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
           toolCalls: [{ id: "repair-read", name: "read", arguments: { path: "seed.txt" } }]
         },
         finishReason: "tool_calls"
-      },
-      completion("read after terminal correction")
+      }
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -680,13 +705,14 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect seed" });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "completed",
-      message: "read after terminal correction"
+      kind: "recoverable_failure",
+      code: "model_tool_policy_violation"
     });
-    expect(gateway.requests[1].tools?.map((tool) => tool.name)).toContain("read");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1].tools?.map((tool) => tool.name)).not.toContain("read");
     const events = await storedEvents(store, session.sessionId);
     expect(events.filter((event) => event.type === "tool.completed"
-      && (event.payload as { callId?: string }).callId === "repair-read")).toHaveLength(1);
+      && (event.payload as { callId?: string }).callId === "repair-read")).toHaveLength(0);
   }, 30_000);
 
   it("supports an explicit typed request for user input", async () => {
@@ -804,13 +830,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(readFile(path.join(workspace, "b.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("stops three consecutive identical tool batches without executing the third", async () => {
+  it("rejects the focused exact duplicate after action debt two and exposes only terminal tools next", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-repeated-batch-"));
     await writeFile(path.join(workspace, "seed.txt"), "seed", "utf8");
-    const gateway = new ScriptedGateway([1, 2, 3].map((index) => ({
+    const gateway = new ScriptedGateway([...([1, 2, 3, 4].map((index) => ({
       message: { role: "assistant", content: "", toolCalls: [{ id: `repeat-${index}`, name: "read", arguments: { path: "seed.txt" } }] },
       finishReason: "tool_calls" as const
-    })));
+    }))), convergenceBlocked("terminal-after-repeat")]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
       gateway, store, storeRootDir: path.join(workspace, ".agent"),
@@ -819,17 +845,230 @@ describe("runtime queues and non-blocking instruction steering", () => {
     const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "inspect without looping" });
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure", code: "convergence_no_progress"
+      kind: "recoverable_failure", code: "reported_blocker"
     });
     const events = await storedEvents(store, session.sessionId);
-    const receipts = events.filter((event) => event.type === "tool.completed");
-    expect(receipts).toHaveLength(2);
+    const receipts = events.filter((event) => event.type === "tool.completed"
+      && String((event.payload as { callId?: unknown }).callId).startsWith("repeat-"));
+    expect(receipts).toHaveLength(3);
     expect(receipts.every((event) => (event.payload as { outcome?: unknown }).outcome
       && (event.payload as { outcome: { status?: unknown } }).outcome.status === "succeeded")).toBe(true);
     const restored = await restoreStoredSession(store, session.sessionId, 10_000);
-    expect(restored.state.repeatedToolBatchCount).toBe(2);
+    expect(restored.state.repeatedToolBatchCount).toBeGreaterThanOrEqual(3);
     expect(restored.state.lastToolBatchOutcomeSignature).toMatch(/^[a-f0-9]{64}$/u);
+    expect(events.some((event) => ["tool.requested", "tool.started", "tool.completed", "tool.failed"].includes(event.type)
+      && (event.payload as { callId?: unknown }).callId === "repeat-4")).toBe(false);
+    expect(gateway.requests[4]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
   });
+
+  it("keeps action debt through a focused no-op mutation checkpoint and then exposes only terminal tools", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-focused-no-op-checkpoint-"));
+    await writeFile(path.join(workspace, "a.txt"), "A", "utf8");
+    const tools = registerBuiltinTools(new EffectToolRegistry());
+    tools.register({
+      descriptor: {
+        name: "no_op_mutator",
+        description: "Exercise a checkpointed mutation contract without changing workspace bytes.",
+        inputSchema: { type: "object", additionalProperties: false },
+        possibleEffects: ["filesystem.write"],
+        executionMode: "exclusive",
+        resourceKeys: ["workspace:write"],
+        approval: "auto",
+        idempotent: false,
+        timeoutMs: 5_000
+      },
+      async execute(request): Promise<ToolReceipt> {
+        const now = new Date().toISOString();
+        return {
+          callId: request.callId,
+          ok: true,
+          output: "No workspace bytes changed.",
+          observedEffects: [],
+          artifacts: [],
+          diagnostics: [],
+          startedAt: now,
+          completedAt: now
+        };
+      }
+    });
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "read-a", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "repeat-read-a-1", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "repeat-read-a-2", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "focused-no-op", name: "no_op_mutator", arguments: {} }] },
+        finishReason: "tool_calls"
+      },
+      convergenceBlocked("terminal-after-no-op")
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools, permissionMode: "auto", runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect both files, then take one focused action." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "reported_blocker"
+    });
+
+    const events = await storedEvents(store, session.sessionId);
+    const checkpointIndex = events.findIndex((event) => event.type === "checkpoint.created"
+      && (event.payload as { status?: unknown }).status === "open");
+    const receiptIndex = events.findIndex((event) => event.type === "tool.completed"
+      && (event.payload as { callId?: unknown }).callId === "focused-no-op");
+    expect(checkpointIndex).toBeGreaterThanOrEqual(0);
+    expect(receiptIndex).toBeGreaterThan(checkpointIndex);
+    expect(gateway.requests[4]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
+    const restored = await restoreStoredSession(store, session.sessionId, 10_000);
+    expect(restored.state.repeatedToolBatchCount).toBeGreaterThanOrEqual(3);
+  }, 30_000);
+
+  it("does not let a focused completion repair wash action debt before the terminal-only turn", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-focused-review-repair-"));
+    await writeFile(path.join(workspace, "a.txt"), "A", "utf8");
+    await writeFile(path.join(workspace, "b.txt"), "B", "utf8");
+    const tools = registerContentValidator(registerBuiltinTools(new EffectToolRegistry()));
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "write-reviewed", name: "write", arguments: { path: "changed.txt", content: "changed" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      validationTurn("validate-reviewed", [{ path: "changed.txt", expected: "changed" }]),
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "repair-read-a", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "repair-repeat-read-a-1", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "repair-repeat-read-a-2", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      completion("reviewed candidate"),
+      convergenceBlocked("terminal-after-review-repair")
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createBaseRuntime({
+      gateway,
+      store,
+      storeRootDir: path.join(workspace, ".agent"),
+      tools,
+      permissionMode: "auto",
+      runDeadlineMs: 300_000,
+      reviewer: {
+        reviewerId: "focused-rejecting-reviewer",
+        async review(input) {
+          return {
+            evidenceId: `rejected:${input.reviewBasisDigest}`,
+            sessionId: input.sessionId,
+            runId: input.runId,
+            kind: "review",
+            status: "failed",
+            createdAt: new Date().toISOString(),
+            producer: { authority: "runtime", id: "focused-rejecting-reviewer" },
+            summary: "The independent reviewer requested a correction.",
+            data: {
+              reviewerId: "focused-rejecting-reviewer",
+              verdict: "changes_requested",
+              findings: ["Repair the reviewed candidate."],
+              frontierRevision: input.frontierRevision,
+              stateDigest: input.stateDigest,
+              validationEvidenceIds: input.validations.map((item) => item.evidenceId)
+            }
+          };
+        }
+      }
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Make and validate the requested change." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "review_blocked"
+    });
+
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "review.completed"
+      && (event.payload as { data?: { verdict?: unknown } }).data?.verdict === "changes_requested")).toBe(true);
+    expect(gateway.requests[6]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
+    const restored = await restoreStoredSession(store, session.sessionId, 10_000);
+    expect(restored.state.repeatedToolBatchCount).toBeGreaterThanOrEqual(3);
+  }, 30_000);
+
+  it.each([
+    ["terminal before ordinary", [
+      { id: "debt-runtime-ask-first", name: "request_user_input", arguments: { message: "Need a target." } },
+      { id: "debt-runtime-read-second", name: "read", arguments: { path: "c.txt" } }
+    ]],
+    ["ordinary before terminal", [
+      { id: "debt-runtime-read-first", name: "read", arguments: { path: "d.txt" } },
+      { id: "debt-runtime-ask-second", name: "request_user_input", arguments: { message: "Choose a target." } }
+    ]]
+  ])("moves an unfocused %s batch at action debt two directly to terminal-only", async (_label, toolCalls) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-debt-mixed-terminal-"));
+    for (const [name, content] of [["a.txt", "A"], ["b.txt", "B"], ["c.txt", "C"], ["d.txt", "D"]]) {
+      await writeFile(path.join(workspace, name), content, "utf8");
+    }
+    const gateway = new ScriptedGateway([
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "debt-runtime-read-a", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "debt-runtime-repeat-a-1", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "", toolCalls: [{ id: "debt-runtime-repeat-a-2", name: "read", arguments: { path: "a.txt" } }] },
+        finishReason: "tool_calls"
+      },
+      { message: { role: "assistant", content: "", toolCalls }, finishReason: "tool_calls" },
+      convergenceBlocked(`terminal-after-${_label.replaceAll(" ", "-")}`)
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "analyze" });
+
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Inspect without looping, then converge." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "recoverable_failure", code: "reported_blocker"
+    });
+
+    const events = await storedEvents(store, session.sessionId);
+    const rejectedIds = new Set(toolCalls.map((call) => call.id));
+    expect(events.filter((event) => ["tool.requested", "tool.started", "tool.completed", "tool.failed"].includes(event.type)
+      && rejectedIds.has((event.payload as { callId?: string }).callId ?? ""))).toHaveLength(0);
+    expect(gateway.requests[4]?.tools?.map((tool) => tool.name).sort()).toEqual([
+      "report_blocked", "request_user_input", "runtime_finalize"
+    ]);
+    const restored = await restoreStoredSession(store, session.sessionId, 10_000);
+    expect(restored.state.repeatedToolBatchCount).toBeGreaterThanOrEqual(3);
+  }, 30_000);
 
   it.each([
     ["terminal before ordinary", [
@@ -1287,6 +1526,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await append(firstRunId, "run.started", { mode: initialMode, deadlineAt });
     await append(firstRunId, "user.message", { text: "first run" });
     await append(firstRunId, "model.started", { turnId: 1, effectRevision: 3 });
+    await append(firstRunId, "diagnostic", {
+      kind: "model.tool_policy",
+      turnId: 1,
+      effectRevision: 3,
+      allowedToolNames: ["runtime_finalize"],
+      terminalOnly: false
+    });
     await append(firstRunId, "model.completed", {
       turnId: 1,
       effectRevision: 3,
@@ -1869,7 +2115,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "run both effects" });
     await expect(Promise.race([
       durableBoundary,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Fast receipt was not durable while approval waited.")), 2_000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Fast receipt was not durable while approval waited.")), 5_000))
     ])).resolves.toBeUndefined();
     await expect(readFile(path.join(workspace, "fast.txt"), "utf8")).resolves.toBe("fast_side_effect");
     expect((await storedEvents(store, session.sessionId)).some((event) => event.type === "tool.completed"

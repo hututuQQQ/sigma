@@ -16,6 +16,9 @@ import type {
   ProcessHandoffResult,
   ProcessPollResult,
   ProcessSpawnRequest,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  ScratchLeaseRequestV1, ScratchLeaseV1,
   TrustedManagedContainerAttestationV1
 } from "./types.js";
 
@@ -174,7 +177,6 @@ export class AttestedContainerExecutionBroker implements ExecutionBroker {
   }
 
   get lostProcessHandles(): readonly ProcessHandle[] { return this.broker.lostProcessHandles; }
-
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     return this.accept(await this.broker.connect(signal));
   }
@@ -213,6 +215,36 @@ export class AttestedContainerExecutionBroker implements ExecutionBroker {
       throw new ContainerUnavailableError("OCI broker does not expose sandbox lease revocation.");
     }
     return await this.broker.revokeSandboxLease(workspacePath, signal);
+  }
+
+  async acquireRepositoryMetadataLease(
+    request: RepositoryMetadataLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLeaseV1> {
+    await this.verify(options?.signal);
+    if (!this.broker.acquireRepositoryMetadataLease) {
+      throw new ContainerUnavailableError("OCI broker does not expose repository metadata leases.");
+    }
+    return await this.broker.acquireRepositoryMetadataLease(request, options);
+  }
+
+  async acquireScratchLease(
+    request: ScratchLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ScratchLeaseV1> {
+    await this.verify(options?.signal);
+    if (!this.broker.acquireScratchLease) {
+      throw new ContainerUnavailableError("OCI broker does not expose RuntimeSession scratch leases.");
+    }
+    return await this.broker.acquireScratchLease(request, options);
+  }
+
+  async releaseScratchLease(sessionId: string, options?: BrokerRequestOptions): Promise<void> {
+    await this.verify(options?.signal);
+    if (!this.broker.releaseScratchLease) {
+      throw new ContainerUnavailableError("OCI broker does not expose RuntimeSession scratch lease release.");
+    }
+    await this.broker.releaseScratchLease(sessionId, options);
   }
 
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {

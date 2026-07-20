@@ -80,6 +80,11 @@ export interface ModelGateway {
   readonly provider: string;
   readonly model: string;
   readonly capabilities: ModelCapabilities;
+  /** Host-attested upper bound on content-token contribution per UTF-8 byte.
+   * Message framing is accounted separately. This is adapter/configuration
+   * metadata, never a value accepted from a model or provider response.
+   * Unknown bounds stay absent. */
+  readonly maxTokensPerUtf8Byte?: number;
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
   countTokens(messages: ModelMessage[], tools?: ModelToolDefinition[]): Promise<number>;

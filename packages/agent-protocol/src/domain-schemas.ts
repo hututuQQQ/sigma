@@ -1,21 +1,12 @@
 import { z } from "zod";
-import type { JsonValue } from "./json.js";
-
-export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
-  z.null(),
-  z.boolean(),
-  z.number(),
-  z.string(),
-  z.array(jsonValueSchema),
-  z.record(z.string(), jsonValueSchema)
-]));
-
-export const nonEmptyStringSchema = z.string().min(1);
-export const dateTimeSchema = z.string().refine(
-  (value) => Number.isFinite(Date.parse(value)),
-  "Expected an ISO-compatible date-time string"
-);
-export const nonNegativeIntegerSchema = z.number().int().nonnegative();
+import {
+  dateTimeSchema,
+  jsonValueSchema,
+  nonEmptyStringSchema,
+  nonNegativeIntegerSchema
+} from "./domain-schema-primitives.js";
+export * from "./domain-schema-primitives.js";
+export * from "./budget-schemas.js";
 
 export const evidenceKindSchema = z.enum([
   "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
@@ -108,7 +99,13 @@ export const repositoryDeltaEvidenceSchema = z.object({
     indexBeforeDigest: digestSchema,
     indexAfterDigest: digestSchema,
     reachableObjectsBefore: nonNegativeIntegerSchema,
-    reachableObjectsAfter: nonNegativeIntegerSchema
+    reachableObjectsAfter: nonNegativeIntegerSchema,
+    // Optional while historical repository evidence is still replayable. New
+    // structured Git transactions always emit these conflict postconditions.
+    conflictsBeforeDigest: digestSchema.optional(),
+    conflictsAfterDigest: digestSchema.optional(),
+    conflictCountBefore: nonNegativeIntegerSchema.optional(),
+    conflictCountAfter: nonNegativeIntegerSchema.optional()
   }).strict()
 }).strict();
 
@@ -174,6 +171,39 @@ export const diagnosticEvidenceSchema = z.object({
   }).strict()
 }).strict();
 
+const inputAccessSelectionSchema = z.object({
+  kind: z.enum(["line_range", "structured_result"]),
+  start: nonNegativeIntegerSchema.optional(),
+  endExclusive: nonNegativeIntegerSchema.optional(),
+  sha256: digestSchema,
+  byteLength: nonNegativeIntegerSchema
+}).strict().superRefine((selection, context) => {
+  if (selection.kind === "line_range") {
+    if (selection.start === undefined) {
+      context.addIssue({
+        code: "custom", path: ["start"], message: "Line-range input access requires a start offset"
+      });
+    }
+    if (selection.endExclusive === undefined) {
+      context.addIssue({
+        code: "custom", path: ["endExclusive"], message: "Line-range input access requires an exclusive end offset"
+      });
+    }
+    if (selection.start !== undefined && selection.endExclusive !== undefined
+      && selection.endExclusive < selection.start) {
+      context.addIssue({
+        code: "custom", path: ["endExclusive"], message: "Line-range input access cannot end before it starts"
+      });
+    }
+    return;
+  }
+  if (selection.start !== undefined || selection.endExclusive !== undefined) {
+    context.addIssue({
+      code: "custom", path: ["start"], message: "Structured input access cannot declare line offsets"
+    });
+  }
+});
+
 export const inputAccessEvidenceSchema = z.object({
   ...evidenceBaseShape,
   kind: z.literal("input_access"),
@@ -182,6 +212,7 @@ export const inputAccessEvidenceSchema = z.object({
     scope: z.enum(["workspace", "external"]),
     sha256: digestSchema.optional(),
     byteLength: nonNegativeIntegerSchema.optional(),
+    selection: inputAccessSelectionSchema.optional(),
     failureCode: nonEmptyStringSchema.optional()
   }).strict()
 }).strict();
@@ -196,8 +227,10 @@ export const reviewEvidenceSchema = z.object({
     frontierRevision: nonNegativeIntegerSchema,
     stateDigest: digestSchema,
     reviewBasisDigest: digestSchema.optional(),
-    reviewBasisVersion: z.literal(2).optional(),
+    reviewBasisVersion: z.union([z.literal(2), z.literal(3)]).optional(),
+    completionCandidateDigest: digestSchema.optional(),
     validationEvidenceIds: z.array(z.string()).optional(),
+    repositoryDeltaEvidenceIds: z.array(z.string()).optional(),
     reviewRelevantEvidenceIds: z.array(z.string()).optional(),
     failureKind: z.enum(["infrastructure", "interrupted"]).optional(),
     failureCode: z.literal("review_scope_too_large").optional(),
@@ -351,36 +384,6 @@ export const planGraphSchema = z.object({
     context.addIssue({ code: "custom", path: ["nodes"], message: "Plan dependencies must be acyclic" });
   }
 });
-
-export const budgetAmountsSchema = z.object({
-  inputTokens: nonNegativeIntegerSchema,
-  outputTokens: nonNegativeIntegerSchema,
-  costMicroUsd: nonNegativeIntegerSchema,
-  modelTurns: nonNegativeIntegerSchema,
-  toolCalls: nonNegativeIntegerSchema,
-  children: nonNegativeIntegerSchema
-}).strict();
-
-export const budgetLimitsSchema = budgetAmountsSchema.extend({
-  maxDepth: nonNegativeIntegerSchema
-}).strict();
-
-export const budgetReservationSchema = z.object({
-  reservationId: nonEmptyStringSchema,
-  ownerId: nonEmptyStringSchema,
-  status: z.enum(["reserved", "committed", "released"]),
-  requested: budgetAmountsSchema,
-  consumed: budgetAmountsSchema,
-  createdAt: dateTimeSchema,
-  settledAt: dateTimeSchema.optional()
-}).strict();
-
-export const budgetLedgerStateSchema = z.object({
-  limits: budgetLimitsSchema,
-  consumed: budgetAmountsSchema,
-  reserved: budgetAmountsSchema,
-  reservations: z.array(budgetReservationSchema)
-}).strict();
 
 export const checkpointRefSchema = z.object({
   checkpointId: nonEmptyStringSchema,

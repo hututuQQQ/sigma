@@ -9,7 +9,12 @@ import {
   type AgentEventEnvelope
 } from "agent-protocol";
 import { evolve } from "./reducer.js";
-import { isSemanticFailureCluster, isSemanticProgressWatermark, type KernelState } from "./state.js";
+import {
+  isActiveModelTurn,
+  isSemanticFailureCluster,
+  isSemanticProgressWatermark,
+  type KernelState
+} from "./state.js";
 
 export function rehydrate(initial: KernelState, events: Iterable<AgentEventEnvelope>): KernelState {
   let state = initial;
@@ -99,8 +104,7 @@ function assertToolLedger(state: KernelState): void {
   const callIds = state.pendingTools.map((item) => item.request.callId);
   if (new Set(callIds).size !== callIds.length) throw new Error("Duplicate pending tool call IDs.");
   if (new Set(state.toolCallIds).size !== state.toolCallIds.length) throw new Error("Duplicate run tool call IDs.");
-  if (state.pendingTools.some((item) => !Number.isInteger(item.modelTurn.turnId)
-    || !Number.isInteger(item.modelTurn.effectRevision))) {
+  if (state.pendingTools.some((item) => !isActiveModelTurn(item.modelTurn))) {
     throw new Error("Pending tools require a valid originating model turn.");
   }
   if (callIds.some((callId) => !state.toolCallIds.includes(callId))) {
@@ -180,6 +184,9 @@ function assertCompletionRepairState(state: KernelState): void {
 function assertPhaseState(state: KernelState): void {
   if ((state.phase === "model_in_flight") !== Boolean(state.activeModelTurn)) {
     throw new Error("Model-in-flight state and active model turn must agree.");
+  }
+  if (state.activeModelTurn && !isActiveModelTurn(state.activeModelTurn)) {
+    throw new Error("Active model turn policy is invalid.");
   }
   if (state.activeModelSemanticDelta && state.phase !== "model_in_flight") {
     throw new Error("A durable model semantic delta requires an active model turn.");

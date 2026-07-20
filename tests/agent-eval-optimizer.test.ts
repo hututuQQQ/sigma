@@ -416,6 +416,7 @@ describe("optimizer one-way boundary", () => {
     const rawState = path.join(root, "workspace-state");
     const sharedState = path.join(root, "repository-state");
     const conformancePath = path.join(root, "generic-conformance.json");
+    const now = () => new Date("2026-07-14T01:00:00.000Z");
     const genericEvents = [
       durableEvent(1, "session.created", { workspacePath: "opaque", mode: "analyze" }),
       attestationEvent(2),
@@ -443,7 +444,7 @@ describe("optimizer one-way boundary", () => {
       includeRealSessions: false,
       sessionIds: [],
       conformanceEventPaths: [conformancePath]
-    }, { repositoryStateRoot: path.join(root, "untrusted-repository-state") });
+    }, { repositoryStateRoot: path.join(root, "untrusted-repository-state"), now });
     expect(untrusted.observations).toEqual(expect.arrayContaining([
       expect.objectContaining({ provenance: expect.objectContaining({
         status: "unavailable", reason: "external_evidence_untrusted"
@@ -460,6 +461,7 @@ describe("optimizer one-way boundary", () => {
       conformanceEventPaths: [conformancePath]
     }, {
       repositoryStateRoot: sharedState,
+      now,
       verifyGenericConformanceStream: async () => true
     });
     expect(collected.observationDirectory).toBe(path.join(sharedState, "optimizer", "observations"));

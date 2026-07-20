@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { EvidenceRecord, JsonValue, ModelToolCall, ToolReceipt } from "agent-protocol";
+import type { EvidenceRecord, JsonValue, ModelToolCall } from "agent-protocol";
 import { toolBatchSignature } from "./model-convergence.js";
 import type { KernelState } from "./state.js";
 
@@ -8,10 +8,6 @@ type ToolBatchProgress = Pick<
   "lastToolBatchSignature" | "lastToolBatchOutcomeSignature" | "repeatedToolBatchCount"
   | "progressEvidenceDigest" | "progressEvidenceFingerprints" | "progressEvidenceRecordCount"
 >;
-
-const TERMINAL_PROTOCOL_TOOLS = new Set([
-  "runtime_finalize", "confirm_no_change", "report_blocked", "request_user_input"
-]);
 
 function uniqueSorted(values: readonly string[]): string[] {
   return [...new Set(values)].sort();
@@ -76,11 +72,10 @@ function stringSetSemantics(values: readonly string[]): JsonValue {
 
 type EvidenceOf<Kind extends EvidenceRecord["kind"]> = Extract<EvidenceRecord, { kind: Kind }>;
 
-function validationSemantics(evidence: EvidenceOf<"validation">): JsonValue {
+function validationSemantics(evidence: EvidenceOf<"validation">): Record<string, JsonValue> {
   return {
     status: evidence.status,
     validator: evidence.data.validator,
-    ...(evidence.data.command === undefined ? {} : { command: evidence.data.command }),
     ...(evidence.data.exitCode === undefined ? {} : { exitCode: evidence.data.exitCode }),
     ...(evidence.data.termination ? { termination: evidence.data.termination } : {}),
     frontierRevision: evidence.data.frontierRevision,
@@ -90,95 +85,18 @@ function validationSemantics(evidence: EvidenceOf<"validation">): JsonValue {
   };
 }
 
-function commandResultSemantics(evidence: EvidenceOf<"command">): JsonValue {
-  return {
-    status: evidence.status,
-    exitCode: evidence.data.exitCode,
-    ...(evidence.data.signal === undefined ? {} : { signal: evidence.data.signal }),
-    artifactIds: stringSetSemantics(evidence.data.artifactIds ?? []),
-    ...(evidence.data.stdoutArtifactId === undefined
-      ? {} : { stdoutArtifactId: evidence.data.stdoutArtifactId }),
-    ...(evidence.data.stderrArtifactId === undefined
-      ? {} : { stderrArtifactId: evidence.data.stderrArtifactId })
-  };
-}
-
-const VOLATILE_EVIDENCE_KEYS = new Set([
-  "callId", "requestId", "eventId", "evidenceId", "usageId", "reservationId",
-  "createdAt", "startedAt", "completedAt", "occurredAt", "timestamp",
-  "turnId", "effectRevision"
-]);
-
-function semanticEvidenceValue(value: JsonValue): JsonValue {
-  if (Array.isArray(value)) return value.map(semanticEvidenceValue);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !VOLATILE_EVIDENCE_KEYS.has(key))
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, item]) => [key, semanticEvidenceValue(item)]));
-}
-
-function semanticArgumentShape(value: JsonValue): JsonValue {
-  if (value === null) return "null";
-  if (Array.isArray(value)) {
-    return {
-      type: "array",
-      items: uniqueSorted(value.map((item) => canonicalJson(semanticArgumentShape(item))))
-    };
-  }
-  if (typeof value !== "object") return typeof value;
-  return {
-    type: "object",
-    fields: Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => [key, semanticArgumentShape(item)]))
-  };
-}
-
-function semanticToolBatchSignature(calls: readonly ModelToolCall[]): string {
-  const actions = calls.map((call) => canonicalJson({
-    name: call.name,
-    arguments: semanticArgumentShape(call.arguments)
-  })).sort();
-  return jsonDigest(actions);
-}
-
-function planObligationSemantics(state: KernelState): JsonValue {
+function satisfiedPlanObligationSemantics(state: KernelState): JsonValue {
   return state.plan.nodes
-    .filter((node) => node.status !== "completed" && node.status !== "cancelled")
+    .filter((node) => node.status === "completed")
     .map((node) => ({
       id: node.id,
-      status: node.status,
       owner: node.owner,
-      dependencies: uniqueSorted(node.dependencies),
-      acceptanceCriteria: uniqueSorted(node.acceptanceCriteria),
-      evidence: node.evidence.map((item) => canonicalJson(item)).sort()
+      evidence: node.evidence.map((item) => canonicalJson({
+        kind: item.kind,
+        ...(item.claim ? { claim: item.claim } : {})
+      })).sort()
     }))
     .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
-}
-
-function receiptWorkspaceDeltaSemantics(receipts: readonly ToolReceipt[]): JsonValue {
-  return {
-    added: stringSetSemantics(receipts.flatMap((receipt) => receipt.workspaceDelta?.added ?? [])),
-    modified: stringSetSemantics(receipts.flatMap((receipt) => receipt.workspaceDelta?.modified ?? [])),
-    deleted: stringSetSemantics(receipts.flatMap((receipt) => receipt.workspaceDelta?.deleted ?? []))
-  };
-}
-
-function terminalReceiptSemantics(receipt: ToolReceipt): JsonValue {
-  const outcome = receipt.outcome ?? {
-    status: receipt.ok ? "succeeded" as const : "failed" as const,
-    output: receipt.output,
-    diagnosticCodes: receipt.diagnostics
-  };
-  return {
-    ok: receipt.ok,
-    ...(receipt.result === undefined ? {} : { resultDigest: jsonDigest(receipt.result) }),
-    outcome: {
-      status: outcome.status,
-      diagnosticCodes: uniqueSorted(outcome.diagnosticCodes)
-    },
-    diagnostics: uniqueSorted(receipt.diagnostics)
-  };
 }
 
 interface EvidenceProgressState {
@@ -193,23 +111,80 @@ interface EvidenceProgressState {
  * O(1), without trusting a restored or forged digest. */
 const verifiedEvidenceProgress = new WeakMap<readonly EvidenceRecord[], EvidenceProgressState>();
 
-function evidenceFingerprint(evidence: EvidenceRecord): string | null {
-  if (evidence.kind === "workspace_delta" || evidence.kind === "repository_delta") return null;
-  if (evidence.kind === "validation") return jsonDigest(validationSemantics(evidence));
-  if (evidence.kind === "command") return jsonDigest(commandResultSemantics(evidence));
-  // IDs, timestamps, and producer call IDs are deliberately excluded. A new
-  // semantic result changes progress; replaying the same diagnostic or review
-  // under a fresh evidence ID does not wash action debt.
+function validationFingerprint(evidence: EvidenceOf<"validation">): string | null {
+  return evidence.status === "passed"
+    && (!evidence.data.claim || evidence.data.claim.status === "passed") ? jsonDigest({
+    kind: evidence.kind,
+    ...validationSemantics(evidence)
+  }) : null;
+}
+
+function inputAccessFingerprints(evidence: EvidenceOf<"input_access">): string[] {
+  if (evidence.status !== "passed") return [];
+  const input = {
+    kind: evidence.kind,
+    scope: evidence.data.scope,
+    path: evidence.data.path
+  };
+  // Progress is a new canonical path or a new actual returned-content binding
+  // for that path. The full-file digest and range metadata are retained for
+  // audit but deliberately do not participate: only the selection digest is
+  // bound by the runtime sanitizer to the exact receipt output, so changing a
+  // reported whole-file hash, selection kind, offset, or limit cannot wash
+  // action debt without discovering new returned bytes.
+  return [
+    jsonDigest({ ...input, dimension: "path" }),
+    ...(evidence.data.selection ? [jsonDigest({
+      ...input,
+      dimension: "selection",
+      sha256: evidence.data.selection.sha256
+    })] : [])
+  ];
+}
+
+function reviewFingerprint(evidence: EvidenceOf<"review">): string | null {
+  return evidence.status === "passed"
+    && evidence.data.verdict === "approved" ? jsonDigest({
+    kind: evidence.kind,
+    status: evidence.status,
+    verdict: evidence.data.verdict,
+    frontierRevision: evidence.data.frontierRevision,
+    stateDigest: evidence.data.stateDigest,
+    ...(evidence.data.reviewBasisDigest ? { reviewBasisDigest: evidence.data.reviewBasisDigest } : {})
+  }) : null;
+}
+
+function waiverFingerprint(evidence: EvidenceOf<"user_waiver">): string {
   return jsonDigest({
     kind: evidence.kind,
     status: evidence.status,
-    summary: evidence.summary,
-    data: semanticEvidenceValue(evidence.data as JsonValue)
-  } as JsonValue);
+    scope: evidence.data.scope,
+    ...(evidence.data.checkpointId ? { checkpointId: evidence.data.checkpointId } : {})
+  });
+}
+
+function evidenceFingerprints(evidence: EvidenceRecord): string[] {
+  // Workspace and repository progress are represented by the authoritative
+  // mutation frontier below. Raw command output and diagnostics are explicitly
+  // not progress: changing a command string, artifact ID, log text, or probe
+  // wording must not wash action debt.
+  switch (evidence.kind) {
+    case "validation": {
+      const fingerprint = validationFingerprint(evidence);
+      return fingerprint ? [fingerprint] : [];
+    }
+    case "input_access": return inputAccessFingerprints(evidence);
+    case "review": {
+      const fingerprint = reviewFingerprint(evidence);
+      return fingerprint ? [fingerprint] : [];
+    }
+    case "user_waiver": return [waiverFingerprint(evidence)];
+    default: return [];
+  }
 }
 
 function rebuildEvidenceProgress(evidence: readonly EvidenceRecord[]): EvidenceProgressState {
-  const fingerprints = [...new Set(evidence.flatMap((item) => evidenceFingerprint(item) ?? []))].sort();
+  const fingerprints = [...new Set(evidence.flatMap(evidenceFingerprints))].sort();
   return {
     progressEvidenceDigest: fingerprints.reduce(xorDigest, "0".repeat(64)),
     progressEvidenceFingerprints: fingerprints,
@@ -234,33 +209,16 @@ function progressStateSemantics(state: KernelState, evidenceDigest: string): Jso
         ? { repositoryStateDigest: state.mutationFrontier.repositoryStateDigest } : {}),
       changedPaths: stringSetSemantics(state.mutationFrontier.changedPaths)
     },
-    validationFrontierDigest: evidenceDigest,
+    semanticEvidenceDigest: evidenceDigest,
     validationRequirement: state.validationRequirement ?? "required",
-    planObligations: planObligationSemantics(state),
+    satisfiedPlanObligations: satisfiedPlanObligationSemantics(state),
     activeProcesses: uniqueSorted(state.activeProcessIds)
   };
 }
 
-function completedOutcomeSignature(
-  state: KernelState,
-  calls: ModelToolCall[],
-  receipts: Map<string, ToolReceipt>,
-  evidenceDigest: string
-): string | null {
-  const completedReceipts = calls.flatMap((call): ToolReceipt[] => {
-    const receipt = receipts.get(call.id);
-    return receipt ? [receipt] : [];
-  });
-  if (completedReceipts.length !== calls.length) return null;
-  const terminalProtocol = calls.some((call) => TERMINAL_PROTOCOL_TOOLS.has(call.name));
-  const terminalBatch = terminalProtocol ? calls.map((call) => canonicalJson({
-    call: { name: call.name, arguments: call.arguments },
-    receipt: terminalReceiptSemantics(receipts.get(call.id)!)
-  })).sort() : undefined;
+function currentProgressSignature(state: KernelState, evidenceDigest: string): string {
   return createHash("sha256").update(canonicalJson({
-    progress: progressStateSemantics(state, evidenceDigest),
-    ...(terminalBatch ? { terminalBatch } : { action: semanticToolBatchSignature(calls) }),
-    workspaceDelta: receiptWorkspaceDeltaSemantics(completedReceipts)
+    progress: progressStateSemantics(state, evidenceDigest)
   })).digest("hex");
 }
 
@@ -273,10 +231,32 @@ function resetProgress(evidenceProgress: EvidenceProgressState): ToolBatchProgre
   };
 }
 
+function preserveProgress(
+  state: KernelState,
+  evidenceProgress: EvidenceProgressState
+): ToolBatchProgress {
+  return {
+    ...evidenceProgress,
+    lastToolBatchSignature: state.lastToolBatchSignature,
+    lastToolBatchOutcomeSignature: state.lastToolBatchOutcomeSignature,
+    repeatedToolBatchCount: state.repeatedToolBatchCount
+  };
+}
+
 export function repeatsCompletedToolBatch(state: KernelState, calls: ModelToolCall[]): boolean {
-  return state.repeatedToolBatchCount >= 2
+  return semanticActionDebt(state) >= 2
     && typeof state.lastToolBatchOutcomeSignature === "string"
     && toolBatchSignature(calls) === state.lastToolBatchSignature;
+}
+
+/** Effective action debt is derived from the current trusted state instead of
+ * blindly trusting the serialized counter. This makes plan/frontier progress
+ * visible immediately even when its durable event is not a tool sidecar. */
+export function semanticActionDebt(state: KernelState): number {
+  if (!state.lastToolBatchOutcomeSignature) return Math.max(0, state.repeatedToolBatchCount);
+  const evidenceProgress = evidenceProgressState(state);
+  return currentProgressSignature(state, evidenceProgress.progressEvidenceDigest)
+    === state.lastToolBatchOutcomeSignature ? Math.max(0, state.repeatedToolBatchCount) : 0;
 }
 
 export function completedToolBatchProgress(state: KernelState, completedCallId: string): ToolBatchProgress {
@@ -285,11 +265,14 @@ export function completedToolBatchProgress(state: KernelState, completedCallId: 
     && message.toolCalls?.some((call) => call.id === completedCallId))?.toolCalls;
   if (!calls?.length) return resetProgress(evidenceProgress);
   const receipts = new Map(state.receipts.map((receipt) => [receipt.callId, receipt]));
-  const outcomeSignature = completedOutcomeSignature(state, calls, receipts, evidenceProgress.progressEvidenceDigest);
-  if (!outcomeSignature) return resetProgress(evidenceProgress);
+  if (!calls.every((call) => receipts.has(call.id))) return resetProgress(evidenceProgress);
+  const outcomeSignature = currentProgressSignature(state, evidenceProgress.progressEvidenceDigest);
   const callSignature = toolBatchSignature(calls);
-  const repeatedToolBatchCount = outcomeSignature === state.lastToolBatchOutcomeSignature
-    ? state.repeatedToolBatchCount + 1 : 1;
+  const repeatedToolBatchCount = state.lastToolBatchOutcomeSignature === undefined
+    ? 1
+    : outcomeSignature === state.lastToolBatchOutcomeSignature
+      ? state.repeatedToolBatchCount + 1
+      : 1;
   return {
     ...evidenceProgress,
     lastToolBatchSignature: callSignature,
@@ -310,31 +293,29 @@ export function refreshCompletedToolBatchProgress(
   rebaseCurrentBatch = false
 ): ToolBatchProgress {
   const evidenceProgress = evidenceProgressState(state);
-  if (!state.lastToolBatchSignature || !state.lastToolBatchOutcomeSignature) return {
-    ...evidenceProgress,
-    lastToolBatchSignature: state.lastToolBatchSignature,
-    lastToolBatchOutcomeSignature: state.lastToolBatchOutcomeSignature,
-    repeatedToolBatchCount: state.repeatedToolBatchCount
-  };
+  if (!state.lastToolBatchSignature || !state.lastToolBatchOutcomeSignature) {
+    return preserveProgress(state, evidenceProgress);
+  }
   const calls = [...state.messages].reverse().find((message) => message.role === "assistant"
     && message.toolCalls?.length)?.toolCalls;
+  // The stored fingerprint belongs to the last fully completed batch. A newer
+  // model call, checkpoint.created, or another in-flight protocol event cannot
+  // replace that baseline before the focused action has a durable receipt.
   if (!calls?.length || toolBatchSignature(calls) !== state.lastToolBatchSignature) {
-    return resetProgress(evidenceProgress);
+    return preserveProgress(state, evidenceProgress);
   }
   const receipts = new Map(state.receipts.map((receipt) => [receipt.callId, receipt]));
-  const outcomeSignature = completedOutcomeSignature(state, calls, receipts, evidenceProgress.progressEvidenceDigest);
-  if (!outcomeSignature) return resetProgress(evidenceProgress);
+  if (!calls.every((call) => receipts.has(call.id))) return preserveProgress(state, evidenceProgress);
+  const outcomeSignature = currentProgressSignature(state, evidenceProgress.progressEvidenceDigest);
   if (outcomeSignature !== state.lastToolBatchOutcomeSignature && rebaseCurrentBatch) {
     // Evidence emitted immediately after the receipt belongs to the batch we
-    // just completed. Rebase that batch onto the new trusted frontier instead
-    // of forgetting it altogether. The productive batch remains the baseline
-    // (count 1), so the next semantically identical batch can be recognized as
-    // the second no-progress attempt.
+    // just completed. It is trusted progress, so action debt is cleared while
+    // the new state becomes the comparison baseline for subsequent actions.
     return {
       ...evidenceProgress,
       lastToolBatchSignature: state.lastToolBatchSignature,
       lastToolBatchOutcomeSignature: outcomeSignature,
-      repeatedToolBatchCount: 1
+      repeatedToolBatchCount: 0
     };
   }
   if (outcomeSignature !== state.lastToolBatchOutcomeSignature) return resetProgress(evidenceProgress);

@@ -349,6 +349,14 @@ async function selectedSessionIds(stateRoot, options) {
   return available.slice(0, options.latest).map((item) => item.sessionId);
 }
 
+function collectionTime(dependencies) {
+  const value = typeof dependencies.now === "function" ? dependencies.now() : new Date();
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+    throw new Error("Optimizer collection clock must return a valid Date.");
+  }
+  return value.toISOString();
+}
+
 function inside(parent, child) {
   const relative = path.relative(parent, child);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -451,7 +459,7 @@ export async function collectOptimizerObservations(options, dependencies = {}) {
   const all = await readStoredObservations(output);
   const registry = path.join(repositoryStateRoot, "optimizer", "experiments");
   const experiments = await readRegisteredOptimizationExperiments(registry);
-  const cards = createOptimizerClusterCards(all, experiments);
+  const cards = createOptimizerClusterCards(all, experiments, { asOf: collectionTime(dependencies) });
   const cardDirectory = path.join(repositoryStateRoot, "optimizer", "clusters");
   await mkdir(cardDirectory, { recursive: true });
   for (const card of cards) await writeClusterCard(cardDirectory, card);

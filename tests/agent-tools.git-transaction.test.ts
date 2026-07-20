@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
+import { workspaceTransactionRoot, type ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import type { JsonValue, ToolExecutionContext, ToolReceipt } from "../packages/agent-protocol/src/index.js";
 import {
   recoverInterruptedRepositoryTransactions,
@@ -37,10 +38,38 @@ async function repository(): Promise<string> {
   return root;
 }
 
-function registry(limits: { maxFiles?: number; maxBytes?: number } = {}): EffectToolRegistry {
+function registry(
+  limits: { maxFiles?: number; maxBytes?: number } = {},
+  processExecution: ProcessExecutionPort = execution
+): EffectToolRegistry {
   const tools = new EffectToolRegistry();
-  tools.register(repositoryTransactionTool(execution, limits));
+  tools.register(repositoryTransactionTool(processExecution, limits));
   return tools;
+}
+
+function failingStateExecution(subcommand: string): ProcessExecutionPort {
+  return {
+    execute: async (request, options) => {
+      if (request.command.args?.includes(subcommand)
+        && request.command.args.some((argument) => argument.startsWith("--git-dir="))) {
+        return {
+          state: "exited",
+          exitCode: 128,
+          signal: null,
+          durationMs: 1,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false,
+          stdout: "",
+          stderr: `injected ${subcommand} state read failure`,
+          stdoutDroppedBytes: 0,
+          stderrDroppedBytes: 0,
+          outputTruncated: false
+        };
+      }
+      return await execution.execute(request, options);
+    }
+  };
 }
 
 async function transact(
@@ -96,7 +125,16 @@ describe("controlled Git transactions", () => {
     expect(receipt).toMatchObject({
       ok: true,
       observedEffects: ["repository.write"],
-      evidence: [expect.objectContaining({ kind: "repository_delta", status: "passed" })]
+      evidence: [expect.objectContaining({
+        kind: "repository_delta",
+        status: "passed",
+        data: expect.objectContaining({
+          conflictsBeforeDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          conflictsAfterDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          conflictCountBefore: 0,
+          conflictCountAfter: 0
+        })
+      })]
     });
     expect(git(root, ["log", "-1", "--pretty=%s"])).toBe("update seed");
     expect(git(root, ["status", "--porcelain", "--untracked-files=no"])).toBe("");
@@ -139,18 +177,37 @@ describe("controlled Git transactions", () => {
     expect(git(root, ["show-ref", "--verify", "refs/sigma/marker"])).toContain(seed);
   }, 180_000);
 
-  it("rolls back metadata when a later operation fails", async () => {
+  it("rolls back metadata and worktree when a later operation fails", async () => {
     const root = await repository();
     const tools = registry();
+    await writeFile(path.join(root, "seed.txt"), "dirty before transaction\n", "utf8");
 
     await expect(transact(tools, root, [
+      { op: "restore", paths: ["seed.txt"], worktree: true },
       { op: "branch", action: "create", name: "must-rollback" },
       { op: "branch", action: "delete", name: "missing-branch" }
     ])).rejects.toMatchObject({ code: "repository_operation_failed" });
 
     expect(() => git(root, ["show-ref", "--verify", "refs/heads/must-rollback"]))
       .toThrow();
+    expect(await readFile(path.join(root, "seed.txt"), "utf8")).toBe("dirty before transaction\n");
+    expect(git(root, ["status", "--porcelain", "--untracked-files=no"])).toBe("M seed.txt");
   }, 60_000);
+
+  it.each(["config", "rev-parse", "show-ref", "rev-list", "ls-files"])(
+    "fails closed when the %s repository inspection fails",
+    async (subcommand) => {
+      const root = await repository();
+      const tools = registry({}, failingStateExecution(subcommand));
+
+      await expect(transact(tools, root, [
+        { op: "branch", action: "create", name: "must-not-run" }
+      ])).rejects.toMatchObject({ code: "repository_state_unavailable" });
+      expect(() => git(root, ["show-ref", "--verify", "refs/heads/must-not-run"]))
+        .toThrow();
+    },
+    60_000
+  );
 
   it("rejects an oversized metadata checkpoint before applying an operation", async () => {
     const root = await repository();
@@ -180,6 +237,37 @@ describe("controlled Git transactions", () => {
 
     await expect(readFile(path.join(root, ".git", "interrupted-marker"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
+  }, 60_000);
+
+  it("restores HEAD, index, and worktree from an open atomic checkpoint after interruption", async () => {
+    const root = await repository();
+    await writeFile(path.join(root, "seed.txt"), "second commit\n", "utf8");
+    git(root, ["add", "seed.txt"]);
+    git(root, ["commit", "-qm", "second"]);
+    const expectedHead = git(root, ["rev-parse", "HEAD"]);
+    const stateRoot = await workspaceTransactionRoot({
+      workspacePath: root,
+      stateRootDir: path.join(root, ".agent", "repository-checkpoints"),
+      namespace: "repository-checkpoint-state"
+    });
+    const manager = new CheckpointManager({
+      rootDir: stateRoot,
+      excludedNames: [".agent"]
+    });
+    await manager.create({
+      sessionId: "interrupted-worktree-session", runId: "run", workspacePath: root,
+      scopePaths: ["."], baseSeq: 0
+    });
+
+    git(root, ["reset", "--hard", "HEAD^"]);
+    expect((await readFile(path.join(root, "seed.txt"), "utf8")).replaceAll("\r\n", "\n")).toBe("seed\n");
+
+    await recoverInterruptedRepositoryTransactions(root, "interrupted-worktree-session");
+
+    expect(git(root, ["rev-parse", "HEAD"])).toBe(expectedHead);
+    expect((await readFile(path.join(root, "seed.txt"), "utf8")).replaceAll("\r\n", "\n"))
+      .toBe("second commit\n");
+    expect(git(root, ["status", "--porcelain", "--untracked-files=no"])).toBe("");
   }, 60_000);
 
   it("supports approved external gitdirs while rejecting broad arguments, escapes, and local helpers", async () => {

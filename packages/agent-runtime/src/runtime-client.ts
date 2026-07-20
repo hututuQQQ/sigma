@@ -19,7 +19,7 @@ import { RuntimeHookCoordinator } from "./runtime-hooks.js";
 import { ModelAgentProfileHookRunner } from "./agent-profile-hook-runner.js";
 import { createRuntimeHooks } from "./create-runtime-hooks.js";
 import { runRuntimeSession } from "./runtime-run.js";
-import { terminateRunProcesses } from "./process-cleanup.js";
+import { settleRunProcessesAndScratch } from "./process-cleanup.js";
 import { requestDelegatedApproval as awaitDelegatedApproval } from "./delegated-approval.js";
 import { RuntimeCommandHandler } from "./runtime-command-handler.js";
 import { RuntimeEventLog } from "./runtime-event-log.js";
@@ -190,6 +190,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       });
     } catch (error) {
       this.sessions.delete(session.identity.sessionId);
+      await this.options.execution?.releaseScratchLease?.(session.identity.sessionId).catch(() => undefined);
       await this.commandBus.release(session.identity.sessionId);
       throw error;
     }
@@ -275,7 +276,10 @@ export class InProcessRuntimeClient implements RuntimeClient {
     const session = this.sessions.get(sessionId);
     if (!session || !await releaseRuntimeSession(session,
       async () => await this.effects.waitForQuiescence(sessionId),
-      async () => await this.commandBus.release(sessionId))) return;
+      async () => {
+        await this.options.execution?.releaseScratchLease?.(sessionId);
+        await this.commandBus.release(sessionId);
+      })) return;
     this.sessions.delete(sessionId);
     this.events.forget(sessionId);
   }
@@ -327,10 +331,8 @@ export class InProcessRuntimeClient implements RuntimeClient {
       events: this.events,
       commandBus: this.commandBus,
       cancelChildren: this.options.cancelChildren,
-      beforeOutcome: async (target, finalOutcome) => await terminateRunProcesses(
-        target,
-        finalOutcome,
-        this.options.execution,
+      beforeOutcome: async (target, finalOutcome) => await settleRunProcessesAndScratch(
+        target, finalOutcome, this.options.execution,
         async (current, type, authority, value) => await this.emit(current, type, authority, value)
       )
     }, session, outcome, outcomeRevision, suspensionContext);

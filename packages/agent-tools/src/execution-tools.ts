@@ -172,9 +172,15 @@ async function executeForegroundCommand(
     );
     const writeRoots = await resolvedWriteRoots(context, approvedPlan);
     await readLock.verify();
+    const scratchLease = await options.broker.acquireScratchLease?.({
+      protocolVersion: 1,
+      sessionId: context.sessionId
+    }, { signal: context.signal });
     const result = await options.broker.execute({
       command: { ...invocation, cwd, environment: executionEnvironment(input) },
-      policy: executionPolicy(context, approvedPlan, options, writeRoots, skillResource),
+      policy: executionPolicy(
+        context, approvedPlan, options, writeRoots, skillResource, validation, scratchLease
+      ),
       timeoutMs,
       idleTimeoutMs: Math.min(timeoutMs, 120_000)
     }, { signal: context.signal });
@@ -193,7 +199,8 @@ async function executeForegroundCommand(
       validation,
       approvedPlan.exactEffects,
       context,
-      options.broker
+      options.broker,
+      validation && (options.executionPlatform ?? process.platform) === "win32"
     );
   } catch (error) {
     failed = true;
@@ -255,6 +262,10 @@ async function executeBackgroundProcess(
       context.workspacePath, typeof input.cwd === "string" ? input.cwd : "."
     );
     await readLock.verify();
+    const scratchLease = await options.broker.acquireScratchLease?.({
+      protocolVersion: 1,
+      sessionId: context.sessionId
+    }, { signal: context.signal });
     const processHandle = await options.broker.spawn({
       command: {
         executable: executionText(input, "executable"),
@@ -262,7 +273,7 @@ async function executeBackgroundProcess(
         cwd,
         environment: executionEnvironment(input)
       },
-      policy: executionPolicy(context, approvedPlan, options, [], skillResource),
+      policy: executionPolicy(context, approvedPlan, options, [], skillResource, false, scratchLease),
       lifecycle,
       ...(input.pty === true ? { pty: true } : {})
     }, { signal: context.signal });

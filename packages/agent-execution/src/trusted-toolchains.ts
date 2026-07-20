@@ -1,4 +1,4 @@
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   BrokerPolicyError,
@@ -129,6 +129,18 @@ function normalizedAbsolutePaths(values: string[], label: string): string[] {
   return uniquePaths(values.map(comparablePath));
 }
 
+/** Preserve the declared mount while also attesting its canonical target.
+ * This is generic symlink handling: package data may live outside an
+ * executable prefix, but only roots explicitly declared by trusted product
+ * composition are expanded. */
+function normalizedRuntimeRoots(values: string[], label: string): string[] {
+  const declared = normalizedAbsolutePaths(values, label);
+  return uniquePaths(declared.flatMap((root) => {
+    try { return [root, comparablePath(realpathSync.native(root))]; }
+    catch { return [root]; }
+  }));
+}
+
 function normalizeToolchainRoots(
   entry: TrustedToolchainManifestEntry,
   executable: string,
@@ -189,7 +201,7 @@ function normalizeTrustedToolchain(
     || ["node", "node.exe"].includes(executableName);
   const executable = comparablePath(entry.executable);
   const roots = normalizeToolchainRoots(entry, executable, nodeRuntime);
-  const runtimeRoots = normalizedAbsolutePaths(
+  const runtimeRoots = normalizedRuntimeRoots(
     entry.runtimeRoots ?? [],
     `trustedToolchains.${entry.id}.runtimeRoots`
   );

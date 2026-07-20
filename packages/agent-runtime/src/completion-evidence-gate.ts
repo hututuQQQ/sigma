@@ -119,6 +119,20 @@ function runtimeOwnsCompletion(session: RuntimeSession, call: ModelToolCall): bo
   return pending?.origin === "runtime" || pending?.origin === undefined;
 }
 
+/** A provider may propose completion explicitly only when the runtime placed
+ * runtime_finalize in that exact terminal-only turn. The durable, runtime-
+ * authored policy is the authority; guessing the private tool name or call-id
+ * prefix on an ordinary turn remains insufficient. */
+function terminalModelTurnOwnsCompletion(session: RuntimeSession, call: ModelToolCall): boolean {
+  if (call.name !== "runtime_finalize") return false;
+  const pending = session.durable.state.pendingTools.find((item) =>
+    item.request.callId === call.id && item.request.name === call.name);
+  const policy = pending?.modelTurn.toolPolicy;
+  return pending?.origin === "model"
+    && policy?.terminalOnly === true
+    && policy.allowedToolNames.includes("runtime_finalize");
+}
+
 function completionAuthorityFailure(
   session: RuntimeSession,
   call: ModelToolCall,
@@ -126,7 +140,8 @@ function completionAuthorityFailure(
 ): ToolReceipt | null {
   const noChangeConfirmation = call.name === "confirm_no_change"
     && session.durable.state.completionRepair?.kind === "no_change_confirmation";
-  if (noChangeConfirmation || runtimeOwnsCompletion(session, call)) return null;
+  if (noChangeConfirmation || runtimeOwnsCompletion(session, call)
+    || terminalModelTurnOwnsCompletion(session, call)) return null;
   return failed(call, startedAt,
     "Completion is owned by the runtime coordinator and cannot be invoked as a model tool.",
     "internal_tool_denied", { status: "rejected", code: "internal_tool_denied" });

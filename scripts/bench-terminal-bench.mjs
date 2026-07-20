@@ -27,6 +27,9 @@ import {
   makeRunId,
   packageAgentCli,
   packageHarborRuntime,
+  pairedRunCohortScheduleSha256,
+  pairedRunTaskIdentitySha256,
+  pairedRunTaskKey,
   parseHarborTimeoutProbe,
   repositorySourceIdentity,
   resolveHarborCommand,
@@ -234,12 +237,16 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     agent_cli_sha256: null,
     source_revision: null,
     source_dirty: null,
+    source_diff_sha256: null,
     source_identity_source: null,
     preregistration_sha256: options.preregistrationSha256,
     validation_manifest: options.validationManifest,
     validation_manifest_sha256: options.validationManifestSha256,
     harness_source_revision: harnessSourceIdentity.revision,
     harness_source_dirty: harnessSourceIdentity.dirty,
+    harness_source_diff_sha256: harnessSourceIdentity.dirtyDiffSha256 ?? null,
+    attempts_per_arm: options.attemptsPerArm,
+    retries: options.retries,
     agent_cli_tarball: env.AGENT_CLI_TARBALL,
     harbor_jobs_dir: jobsDir,
     harbor_command: harborCommand,
@@ -310,6 +317,25 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       1
     );
   }
+  if (embeddedSourceIdentity && options.expectedSourceDirty !== null
+    && embeddedSourceIdentity.dirty !== options.expectedSourceDirty) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      `Agent CLI source dirty state ${String(embeddedSourceIdentity.dirty)} does not match frozen ${String(options.expectedSourceDirty)}.`,
+      1
+    );
+  }
+  if (options.expectedSourceDiffSha256
+    && (harnessSourceIdentity.revision !== (options.expectedSourceRevision ?? embeddedSourceIdentity?.revision)
+      || harnessSourceIdentity.dirtyDiffSha256 !== options.expectedSourceDiffSha256)) {
+    return await failBeforeHarbor(
+      runDir,
+      config,
+      "Current source delta does not match the frozen source-diff SHA-256.",
+      1
+    );
+  }
   const packageSourceIdentity = embeddedSourceIdentity ?? (options.expectedSourceRevision
     ? { revision: options.expectedSourceRevision, dirty: null }
     : null);
@@ -326,6 +352,9 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     agent_cli_sha256: agentCliSha256,
     source_revision: packageSourceIdentity.revision,
     source_dirty: packageSourceIdentity.dirty,
+    source_diff_sha256: options.expectedSourceDiffSha256
+      ?? (harnessSourceIdentity.revision === packageSourceIdentity.revision
+        ? harnessSourceIdentity.dirtyDiffSha256 : null),
     source_identity_source: embeddedSourceIdentity ? "package_metadata" : "launcher_pinned_legacy"
   };
   await writeJson(path.join(runDir, "config.json"), config);
@@ -454,6 +483,15 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     const configPath = path.join(runDir, `resolved-job${suffix}.config.json`);
     const jobConfig = buildHarborJobConfig(groupOptions, jobsDir, groupPlan, group.timeout_probe);
     await writeJson(configPath, jobConfig);
+    const resolvedTaskAttestationPath = path.join(
+      runDir, `resolved-task-attestation${suffix}.json`
+    );
+    await writeJson(resolvedTaskAttestationPath, {
+      schemaVersion: 1,
+      kind: "sigma.harbor-resolved-task-attestation",
+      job_config_sha256: await sha256File(configPath),
+      tasks: group.tasks
+    });
     const args = buildHarborArgs({
       ...groupOptions,
       taskSelectionFlag,
@@ -467,11 +505,57 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       index,
       args,
       configPath,
+      resolvedTaskAttestationPath,
       timeoutPlan: groupPlan,
       taskNames: group.tasks.map((task) => task?.task_name).filter(Boolean)
     });
   }
   harborArgs = launchGroups[0].args;
+  let pairedRunControls = null;
+  if (options.mode === "batch" && options.tasks.length === timeoutProbe?.tasks?.length) {
+    const controlledTasks = options.tasks.map((task, index) => {
+      const controlled = {
+        pairing_key: pairedRunTaskKey(task),
+        source: task.source,
+        path: task.path,
+        git_url: task.git_url,
+        git_commit_id: task.git_commit_id ?? options.terminalBenchRevision,
+        effective_solver_timeout_sec: Number(timeoutProbe.tasks[index]?.agent_timeout_sec),
+        network_mode_effective: options.networkMode
+      };
+      return { ...controlled, task_identity_sha256: pairedRunTaskIdentitySha256(controlled) };
+    });
+    const cohortSchedule = timeoutGroups.map((group, index) => ({
+      order: index,
+      effective_solver_timeout_sec: Number(group.agent_timeout_sec),
+      task_keys: group.task_indexes.map((taskIndex) => pairedRunTaskKey(options.tasks[taskIndex])).sort()
+    }));
+    const inputConfigSha256s = await Promise.all(launchGroups.map(async (group, index) => ({
+      order: index,
+      sha256: await sha256File(group.configPath)
+    })));
+    pairedRunControls = {
+      agent: "sigma",
+      source_revision: config.source_revision,
+      source_dirty: config.source_dirty,
+      source_diff_sha256: config.source_diff_sha256,
+      execution_subject_kind: "archive",
+      execution_subject_sha256: config.agent_cli_sha256,
+      archiveSha256: config.agent_cli_sha256,
+      model_identity: options.model?.includes("/")
+        ? options.model : `${options.provider}/${options.model}`,
+      terminal_bench_revision: options.terminalBenchRevision,
+      network_mode: options.networkMode,
+      n_concurrent_trials: options.nConcurrentTrials,
+      attempts_per_arm: options.attemptsPerArm,
+      retries: options.retries,
+      preregistration_sha256: options.preregistrationSha256,
+      tasks: controlledTasks,
+      cohort_schedule: cohortSchedule,
+      cohort_schedule_sha256: pairedRunCohortScheduleSha256(cohortSchedule),
+      input_config_sha256s: inputConfigSha256s
+    };
+  }
   config = {
     ...config,
     finished_at: null,
@@ -488,10 +572,13 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       timeout_plan: group.timeoutPlan,
       resolved_job_config_path: path.relative(runDir, group.configPath).replace(/\\/g, "/")
     })),
+    paired_run_controls: pairedRunControls,
     score_mode: options.benchmarkClass === "diagnostic" ? "diagnostic" : "standard_benchmark",
     resolved_job_config_path: path.relative(runDir, launchGroups[0].configPath).replace(/\\/g, "/"),
     resolved_job_config_paths: launchGroups.map((group) =>
       path.relative(runDir, group.configPath).replace(/\\/g, "/")),
+    resolved_task_attestation_paths: launchGroups.map((group) =>
+      path.relative(runDir, group.resolvedTaskAttestationPath).replace(/\\/g, "/")),
     commands: launchGroups.map((group) => [harborCommand, ...group.args])
   };
   await writeRunFiles(runDir, config, harborCommand, harborArgs, env);
@@ -528,7 +615,11 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
 
   const abortController = new AbortController();
-  const interrupt = (signal) => abortController.abort(new Error(`Benchmark interrupted by ${signal}.`));
+  let interruptionSignal = null;
+  const interrupt = (signal) => {
+    interruptionSignal ??= signal;
+    abortController.abort(new Error(`Benchmark interrupted by ${signal}.`));
+  };
   const onSigint = () => interrupt("SIGINT");
   const onSigterm = () => interrupt("SIGTERM");
   process.on("SIGINT", onSigint);
@@ -605,6 +696,11 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     exit_code: effectiveExitCode,
     harbor_exit_code: harborExitCode,
     status: statusFromExitCode(effectiveExitCode),
+    termination_source: interruptionSignal === "SIGINT"
+      ? "manual_stop"
+      : interruptionSignal ? "external_stop" : null,
+    interruption_signal: interruptionSignal,
+    manual_stop_count: interruptionSignal === "SIGINT" ? 1 : 0,
     docker_cleanup: cleanupAfter,
     notes: [
       ...config.notes,
@@ -616,6 +712,8 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   await ensurePlaceholderTask(runDir, {
     status: statusFromExitCode(harborExitCode),
     exit_code: harborExitCode,
+    termination_source: config.termination_source,
+    manual_stop_count: config.manual_stop_count,
     artifact_note: "Per-task Sigma traces are mirrored here when Harbor exposes task context to the adapter. If this is the only task entry, inspect harbor.stdout.log and harbor.stderr.log."
   });
 

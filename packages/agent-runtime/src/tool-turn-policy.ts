@@ -17,6 +17,10 @@ export type CompletionRepairPhase =
   | "protected_completion"
   | "protected_recovery";
 
+export function internalToolForRepair(name: string, phase: CompletionRepairPhase): boolean {
+  return phase === "no_change_confirmation" && name === "confirm_no_change";
+}
+
 function hasExitedFailedValidation(session: RuntimeSession): boolean {
   return session.durable.state.evidence.some((item) => item.sessionId === session.identity.sessionId
     && item.runId === session.durable.runId

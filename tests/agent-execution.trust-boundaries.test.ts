@@ -68,6 +68,30 @@ async function portableLayout(): Promise<{
 }
 
 describe("trusted toolchain boundaries", () => {
+  it("forwards only the opaque id of a local one-use repository metadata lease", async () => {
+    const workspace = await temporaryRoot("sigma-repository-metadata-wire-");
+    const value = request("git", workspace);
+    value.policy.readRoots = [workspace];
+    value.policy.writeRoots = [workspace];
+    value.policy.repositoryMetadataLease = {
+      protocolVersion: 1,
+      leaseId: "broker-issued-one-use",
+      repositoryRoot: workspace,
+      gitDir: path.join(workspace, ".git"),
+      commonDir: path.join(workspace, ".git"),
+      executable: "git",
+      executableSha256: "a".repeat(64),
+      network: "none",
+      uses: 1
+    };
+    const wired = requestParams(value, clientOptions("required"), [], []);
+    expect(wired.policy).toMatchObject({
+      repositoryMetadataLeaseId: "broker-issued-one-use",
+      network: "none"
+    });
+    expect(wired.policy).not.toHaveProperty("repositoryMetadataLease");
+  });
+
   it("defaults a generic toolchain to its exact executable without extending PATH", () => {
     const executable = path.resolve("tools", process.platform === "win32" ? "compiler.exe" : "compiler");
     const toolchains = normalizeTrustedToolchains([{
@@ -117,6 +141,31 @@ describe("trusted toolchain boundaries", () => {
       request(sibling, workspace), clientOptions("unsafe"), toolchains, []
     )).toThrow(BrokerExecutableUnavailableError);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "includes a declared runtime root's canonical symlink target without widening execution trust",
+    async () => {
+      const root = await temporaryRoot("sigma-toolchain-runtime-symlink-");
+      const workspace = path.join(root, "workspace");
+      const realRuntime = path.join(root, "real-runtime");
+      const linkedRuntime = path.join(root, "linked-runtime");
+      const executable = path.join(root, "bin", portableExecutableName());
+      await mkdir(workspace);
+      await mkdir(realRuntime);
+      await mkdir(path.dirname(executable));
+      await writeFile(executable, "runtime\n");
+      await symlink(realRuntime, linkedRuntime, "dir");
+      const toolchains = normalizeTrustedToolchains([{
+        id: "runtime-symlink", runtime: "node", executable, aliases: ["node"],
+        executionRoots: [executable], runtimeRoots: [linkedRuntime]
+      }]);
+      const wired = requestParams(request("node", workspace), clientOptions("unsafe"), toolchains, []);
+      expect((wired.policy as { readRoots: string[] }).readRoots).toEqual([
+        workspace, linkedRuntime, await realpath(realRuntime)
+      ]);
+      expect((wired.policy as { executionRoots: string[] }).executionRoots).toEqual([executable]);
+    }
+  );
 
   it.runIf(process.platform !== "win32")(
     "canonicalizes an absolute symlink only when its target is an exact verified executable",

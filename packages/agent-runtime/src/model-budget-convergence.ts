@@ -20,6 +20,13 @@ import {
 import { prepareModelBudget, type PreparedModelBudget } from "./model-accounting.js";
 import type { DeadlineForecast } from "./convergence-policy.js";
 import type { RuntimeSession } from "./types.js";
+import { terminalOnlyToolDescriptor } from "./terminal-tool-policy.js";
+
+export {
+  fitPreparedBudget,
+  maximumAttemptOutputTokens,
+  requestCapacity
+} from "./model-budget-capacity.js";
 
 export interface PreparedModelTurn {
   messages: ContextPlan["messages"];
@@ -72,6 +79,9 @@ export interface TurnPreparationInput {
   forecast: DeadlineForecast;
   turnId: number;
   descriptors: readonly ToolDescriptor[];
+  /** Runtime-owned tools that are projected only for a terminal-only turn.
+   * They remain absent from every ordinary model turn. */
+  terminalDescriptors?: readonly ToolDescriptor[];
   capabilities: ModelToolProjectionCapabilities;
   dynamic: readonly ContextItem[];
   hookContext: readonly ContextItem[];
@@ -105,7 +115,7 @@ function requiredActionContent(
     return "Budget stage is terminal. Use one available terminal tool now. Do not start or describe additional work.";
   }
   if (forecast.actionDebt >= 2) {
-    return "Repeated semantically similar tool actions have not changed the workspace, validation frontier, plan obligations, or process state. Use one focused tool action now to produce or validate the best available deliverable, then immediately choose the appropriate terminal outcome. Do not continue exploratory variants.";
+    return "Tool actions have completed twice without trusted workspace, newly accessed input, validation, review, plan, checkpoint, or process progress. Use exactly one focused tool action now. Parameter, command-text, artifact-ID, and diagnostic-output variation do not count as progress. If this action produces no trusted progress, the next turn is terminal-only.";
   }
   if (forecast.stage === "converge") {
     return "Deadline stage is converge. Choose one focused tool action now, then immediately use the appropriate terminal tool. Do not start exploratory work.";
@@ -122,18 +132,6 @@ function specialActionPolicy(
   firstLengthContinuation: boolean
 ): ActionPolicy | null {
   const { session, turnId, budgetStage, allowNaturalCompletion } = input;
-  if (budgetStage === "terminal" && !input.descriptors.some(terminalDescriptor)) return {
-    required: false,
-    outputReserveTokens,
-    context: [{
-      id: `runtime:natural-terminal:${session.durable.runId}:${turnId}`,
-      authority: "runtime",
-      provenance: "terminal fallback",
-      content: "No terminal tool is available in this runtime. Answer directly now; the runtime will apply the same assurance and completion gates to the natural stop. Do not start or describe additional work.",
-      tokenCount: 32,
-      priority: 10_000
-    }]
-  };
   if (session.durable.state.completionRepair?.kind === "no_change_confirmation") return {
     required: true,
     outputReserveTokens: Math.min(2_048, input.defaultOutputReserveTokens),
@@ -143,6 +141,18 @@ function specialActionPolicy(
       provenance: "terminal intent confirmation",
       content: "The protected original answer ended a change task with no net workspace mutation. Choose exactly one offered terminal intent: confirm_no_change if the request is already satisfied, request_user_input if a concrete user decision is required, or report_blocked for a durable blocker. Do not repeat the answer as ordinary text.",
       tokenCount: 55,
+      priority: 10_000
+    }]
+  };
+  if (budgetStage === "terminal") return {
+    required: false,
+    outputReserveTokens,
+    context: [{
+      id: `runtime:natural-terminal:${session.durable.runId}:${turnId}`,
+      authority: "runtime",
+      provenance: "terminal convergence",
+      content: "This turn is terminal-only. Ordinary work tools are unavailable. Finish now with runtime_finalize, report a durable blocker, request concrete user input, or answer directly so the runtime can finalize the best supported result. Do not start or describe additional work.",
+      tokenCount: 45,
       priority: 10_000
     }]
   };
@@ -197,7 +207,7 @@ function actionPolicy(input: TurnPreparationInput): ActionPolicy {
     authority: "runtime",
     provenance: repeatedLength ? "repeated length recovery" : actionDebt ? "action debt" : "deadline stage",
     content,
-    tokenCount: repeatedLength ? 37 : actionDebt ? 48 : 30,
+    tokenCount: repeatedLength ? 37 : actionDebt ? 76 : 30,
     priority: 10_000
   }] };
 }
@@ -234,11 +244,16 @@ export function availableModelBudget(session: RuntimeSession): BudgetAmounts {
   };
 }
 
-function terminalDescriptor(descriptor: ToolDescriptor): boolean {
-  return descriptor.possibleEffects.some((effect) => effect === "outcome.propose"
-    || effect === "outcome.report_blocked" || effect === "outcome.request_input");
+export function descriptorsForBudgetStage(
+  descriptors: readonly ToolDescriptor[],
+  budgetStage: BudgetStage,
+  terminalDescriptors: readonly ToolDescriptor[] = []
+): ToolDescriptor[] {
+  if (budgetStage !== "terminal") return [...descriptors];
+  return [...new Map([...terminalDescriptors, ...descriptors]
+    .filter(terminalOnlyToolDescriptor)
+    .map((descriptor) => [descriptor.name, descriptor])).values()];
 }
-
 function requiresToolChoice(
   tools: readonly ModelToolDefinition[],
   repairPending: boolean,
@@ -246,61 +261,6 @@ function requiresToolChoice(
   allowNaturalCompletion: boolean
 ): boolean {
   return tools.length > 0 && !allowNaturalCompletion && (repairPending || policyRequired);
-}
-
-function firstAttemptBudget(prepared: PreparedModelBudget): Partial<BudgetAmounts> {
-  const attempt = prepared.attemptReservations?.[0];
-  return attempt ? {
-    inputTokens: attempt.inputTokens,
-    outputTokens: attempt.outputTokens,
-    costMicroUsd: attempt.costMicroUsd ?? 0,
-    modelTurns: 1
-  } : prepared.reserved;
-}
-
-export function requestCapacity(available: BudgetAmounts, prepared: PreparedModelBudget): number {
-  const unit = firstAttemptBudget(prepared);
-  const dimensions = ["inputTokens", "outputTokens", "costMicroUsd", "modelTurns"] as const;
-  return Math.min(3, ...dimensions.map((dimension) => {
-    const required = unit[dimension] ?? 0;
-    return required <= 0 ? Number.POSITIVE_INFINITY : Math.floor(available[dimension] / required);
-  }));
-}
-
-export function fitPreparedBudget(
-  prepared: PreparedModelBudget,
-  available: BudgetAmounts,
-  maxAttempts: number
-): PreparedModelBudget | null {
-  const attempts = prepared.attemptReservations;
-  if (!attempts || attempts.length === 0) {
-    const fits = (["inputTokens", "outputTokens", "costMicroUsd", "modelTurns"] as const)
-      .every((dimension) => (prepared.reserved[dimension] ?? 0) <= available[dimension]);
-    return fits ? prepared : null;
-  }
-  const selected = [];
-  const totals = { inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0 };
-  for (const attempt of attempts.slice(0, maxAttempts)) {
-    const next = {
-      inputTokens: totals.inputTokens + attempt.inputTokens,
-      outputTokens: totals.outputTokens + attempt.outputTokens,
-      costMicroUsd: totals.costMicroUsd + (attempt.costMicroUsd ?? 0),
-      modelTurns: totals.modelTurns + 1
-    };
-    if (next.inputTokens > available.inputTokens || next.outputTokens > available.outputTokens
-      || next.costMicroUsd > available.costMicroUsd || next.modelTurns > available.modelTurns) break;
-    selected.push(attempt);
-    Object.assign(totals, next);
-  }
-  if (selected.length === 0) return null;
-  return {
-    ...prepared,
-    estimatedInputTokens: totals.inputTokens,
-    reserved: totals,
-    reservedAttempts: selected.length,
-    attemptReservations: selected,
-    routeConstraints: { ...prepared.routeConstraints, maxAttempts: selected.length }
-  };
 }
 
 export function budgetFailure(message: string): RunOutcome {
@@ -314,7 +274,11 @@ export async function prepareBudgetedModelTurn(
     session, descriptors, capabilities, dynamic, hookContext, ledger,
     available, repairPending, allowNaturalCompletion, budgetStage
   } = input;
-  const stageDescriptors = budgetStage === "terminal" ? descriptors.filter(terminalDescriptor) : descriptors;
+  const stageDescriptors = descriptorsForBudgetStage(
+    descriptors,
+    budgetStage,
+    input.terminalDescriptors
+  );
   const tools = modelTools(projectModelToolDescriptors(stageDescriptors, capabilities));
   // A runtime can legitimately expose no terminal model tool (for example an
   // analysis-only embedding). Natural stop is still safe because the runtime
@@ -360,7 +324,13 @@ export async function prepareBudgetedModelTurn(
     turn: {
       messages: plan.messages,
       tools,
-      ...(requiresToolChoice(tools, repairPending, policy.required, allowNaturalCompletion)
+      ...(requiresToolChoice(
+        tools,
+        repairPending,
+        policy.required,
+        allowNaturalCompletion || (budgetStage === "terminal"
+          && session.durable.state.completionRepair?.kind !== "no_change_confirmation")
+      )
         ? { toolChoice: "required" as const } : {}),
       budget,
       outputReserveTokens

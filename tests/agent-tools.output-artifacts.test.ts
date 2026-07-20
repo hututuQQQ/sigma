@@ -7,7 +7,8 @@ import type {
   ExecutionBroker,
   ExecutionResult,
   ProcessOutputArtifact,
-  ProcessPollResult
+  ProcessPollResult,
+  ExecutionRequest
 } from "../packages/agent-execution/src/index.js";
 import type { ToolExecutionContext, ToolRequest } from "../packages/agent-protocol/src/index.js";
 import { ContentAddressedArtifactStore } from "../packages/agent-store/src/index.js";
@@ -40,13 +41,14 @@ function outputArtifact(stream: "stdout" | "stderr", content: string): ProcessOu
 function broker(
   execution: ExecutionResult,
   poll: ProcessPollResult,
-  released: string[][] = []
+  released: string[][] = [],
+  requests: ExecutionRequest[] = []
 ): ExecutionBroker {
   return {
     lostProcessHandles: [],
     connect: async () => report,
     doctor: async () => report,
-    execute: async () => execution,
+    execute: async (requestValue) => { requests.push(requestValue); return execution; },
     spawn: async () => poll.handle,
     poll: async () => poll,
     write: async () => undefined,
@@ -120,8 +122,10 @@ describe("execution output artifact receipts", () => {
     const poll: ProcessPollResult = {
       ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
     };
+    const requests: ExecutionRequest[] = [];
     const tools = executionTools({
-      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none", shells: ["bash"]
+      broker: broker(execution, poll, [], requests), sandboxMode: "required", networkMode: "none",
+      shells: ["bash"], executionPlatform: "win32"
     });
     const validate = tools.find((tool) => tool.descriptor.name === "validate")!;
     const { context } = await fixtureContext(workspace);
@@ -136,6 +140,106 @@ describe("execution output artifact receipts", () => {
       status: "failed",
       data: expect.objectContaining({ command: "run-the-real-tests --strict", exitCode: 7 })
     })]);
+    expect(requests[0]?.policy).toMatchObject({
+      writeRoots: [], readOnlyValidationWorkspaceRoot: workspace
+    });
+  });
+
+  it.each([
+    ["generic", "tool: output.bin: Read-only file system"],
+    ["coreutils", "touch: cannot touch 'output.bin': Read-only file system"],
+    ["node", "Error: EROFS: read-only file system, open 'output.bin'"],
+    ["python", "OSError: [Errno 30] Read-only file system: 'output.bin'"]
+  ] as const)("returns a typed write-contract advisory for a scoped %s EROFS target", async (_format, stderr) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-write-contract-advisory-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr,
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0, outputTruncated: false
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "exec")!.execute(
+      request("readonly-erofs", "exec", { executable: process.execPath }), context
+    );
+    expect(receipt.diagnostics).toContain("write_contract_required");
+    expect(receipt.output).toContain("[write_contract_required]");
+    expect(receipt.result).toEqual({
+      status: "failed",
+      code: "write_contract_required",
+      recoverable: true,
+      scope: "workspace",
+      target: "output.bin"
+    });
+  });
+
+  it.each([
+    ["an external target", "tool: /usr/local/output.bin: Read-only file system", "exec"],
+    ["an ambiguous error", "EROFS: Read-only file system", "exec"],
+    ["an ambiguous generic value", "tool: Error: Read-only file system", "exec"],
+    ["a node error without a named operand", "Error: EROFS: read-only file system, open", "exec"],
+    ["disposable validation", "tool: output.bin: Read-only file system", "validate"]
+  ] as const)("does not suggest a workspace write contract for %s", async (_label, stderr, toolName) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-write-contract-scope-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr, stdoutDroppedBytes: 0, stderrDroppedBytes: 0,
+      outputTruncated: false
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const tools = executionTools({
+      broker: broker(execution, poll), sandboxMode: "required", networkMode: "none",
+      ...(toolName === "validate" ? { executionPlatform: "linux" as const } : {})
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === toolName)!.execute(
+      request(`readonly-erofs-${toolName}`, toolName, {
+        executable: toolName === "validate" ? "/node" : process.execPath
+      }), context
+    );
+
+    expect(receipt.diagnostics).not.toContain("write_contract_required");
+    expect(receipt.result).toBeUndefined();
+  });
+
+  it("reports a scoped workspace-write limitation for Windows read-only validation fallback", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-validation-readonly-limit-"));
+    const execution: ExecutionResult = {
+      state: "exited", exitCode: 1, signal: null, durationMs: 1,
+      timedOut: false, idleTimedOut: false, cancelled: false,
+      stdout: "", stderr: "Error: EACCES: permission denied, open 'output.bin'",
+      stdoutDroppedBytes: 0, stderrDroppedBytes: 0, outputTruncated: false
+    };
+    const poll: ProcessPollResult = {
+      ...execution, state: "exited", handle: { id: "process", brokerInstanceId: "broker" }
+    };
+    const requests: ExecutionRequest[] = [];
+    const tools = executionTools({
+      broker: broker(execution, poll, [], requests), sandboxMode: "required", networkMode: "none",
+      executionPlatform: "win32"
+    });
+    const { context } = await fixtureContext(workspace);
+    const receipt = await tools.find((tool) => tool.descriptor.name === "validate")!.execute(
+      request("readonly-validation-limit", "validate", { executable: process.execPath }), context
+    );
+
+    expect(requests[0]?.policy).toMatchObject({
+      writeRoots: [], readOnlyValidationWorkspaceRoot: workspace
+    });
+    expect(receipt.diagnostics).toContain("validation_disposable_workspace_unavailable");
+    expect(receipt.result).toEqual({
+      status: "failed", code: "validation_disposable_workspace_unavailable",
+      recoverable: false, scope: "workspace", target: "output.bin"
+    });
   });
 
   it("binds foreground overflow CAS objects to validation evidence", async () => {

@@ -132,6 +132,10 @@ async function appendRecoveredWriteApproval(
   append("run.started", { mode: "change" });
   append("user.message", { text: "write result" });
   append("model.started", { turnId: 1, effectRevision: 4 });
+  append("diagnostic", {
+    kind: "model.tool_policy", turnId: 1, effectRevision: 4,
+    allowedToolNames: [call.name], terminalOnly: false
+  });
   append("model.completed", {
     turnId: 1, effectRevision: 4,
     message: { role: "assistant", content: "", toolCalls: [call] },
@@ -530,28 +534,32 @@ describe("sensitive per-call approvals", () => {
       fixtureEvent(3, "run.started", { mode: "analyze" }),
       fixtureEvent(4, "user.message", { text: "resume" }),
       fixtureEvent(5, "model.started", { turnId: 1, effectRevision: 4 }),
-      fixtureEvent(6, "model.completed", {
+      fixtureEvent(6, "diagnostic", {
+        kind: "model.tool_policy", turnId: 1, effectRevision: 4,
+        allowedToolNames: [call.name], terminalOnly: false
+      }),
+      fixtureEvent(7, "model.completed", {
         turnId: 1, effectRevision: 4,
         message: { role: "assistant", content: "", toolCalls: [call] },
         finishReason: "tool_calls", toolCalls: [call]
       }),
-      fixtureEvent(7, "tool.requested", {
+      fixtureEvent(8, "tool.requested", {
         turnId: 1, effectRevision: 4, callId: call.id, name: call.name, arguments: call.arguments
       }),
-      fixtureEvent(8, "execution.planned", {
+      fixtureEvent(9, "execution.planned", {
         executionId: call.id, toolCallId: call.id, plan: {
           exactEffects: ["process.spawn.readonly", "network"], readPaths: ["."], writePaths: [],
           network: "full", processMode: "pipe", checkpointScope: [], idempotence: "non_replayable"
         }
       }),
-      fixtureEvent(9, "tool.approval_requested", {
+      fixtureEvent(10, "tool.approval_requested", {
         turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, toolName: call.name,
         effects: ["process.spawn.readonly", "network"]
       }),
-      fixtureEvent(10, "run.suspended", {
+      fixtureEvent(11, "run.suspended", {
         turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, message: "approval required"
       }),
-      { ...fixtureEvent(11, "tool.approval_resolved", {
+      { ...fixtureEvent(12, "tool.approval_resolved", {
         turnId: 1, effectRevision: 4, requestId: call.id, callId: call.id, decision: "allow"
       }), authority: "user" }
     ];
@@ -570,7 +578,7 @@ describe("sensitive per-call approvals", () => {
     await runtime.command({ type: "resume", sessionId: "sensitive-session" });
     const automaticRequest = (async () => {
       for await (const event of runtime.subscribe("sensitive-session")) {
-        if (event.type === "tool.approval_requested" && event.seq > 11) return event;
+        if (event.type === "tool.approval_requested" && event.seq > 12) return event;
       }
       throw new Error("missing automatic approval request");
     })();

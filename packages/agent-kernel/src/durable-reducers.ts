@@ -1,5 +1,4 @@
 import {
-  isBudgetLedgerState,
   isCheckpointRef,
   isCompletionEligibleEvidence,
   isCompletionReferenceableEvidence,
@@ -17,6 +16,7 @@ import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-front
 import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
 import { refreshCompletedToolBatchProgress } from "./tool-batch-progress.js";
+import { durableBudgetReducers } from "./durable-budget-reducers.js";
 
 export type KernelEventReducer = (
   state: KernelState,
@@ -102,15 +102,6 @@ const planUpdated: KernelEventReducer = (state, _event, payload) => {
     || payload.previousRevision !== state.plan.revision || payload.plan.revision !== state.plan.revision + 1) return state;
   return { ...state, plan: payload.plan };
 };
-
-const budgetUpdated: KernelEventReducer = (state, _event, payload) => isBudgetLedgerState(payload.ledger)
-  ? { ...state, budget: payload.ledger }
-  : state;
-
-const budgetLimitIncreased: KernelEventReducer = (state, event, payload) =>
-  event.authority === "user" && isBudgetLedgerState(payload.ledger)
-    ? { ...state, budget: payload.ledger }
-    : state;
 
 function pruneRestoredCheckpointEvidence(
   state: KernelState,
@@ -200,7 +191,16 @@ const checkpointRecoveryResolved: KernelEventReducer = (state, event) => {
   return { ...state, phase: nextPhase(state.pendingTools), outcome: undefined, proposedOutcome: undefined };
 };
 
-const reviewEvidence: KernelEventReducer = (state, event, payload) => evidenceRecorded(state, event, payload);
+const reviewEvidence: KernelEventReducer = (state, event, payload) => {
+  const progressed = evidenceRecorded(state, event, payload);
+  const evidence = event.payload;
+  if (event.type !== "review.completed" || !isEvidenceRecord(evidence) || evidence.kind !== "review"
+    || evidence.status !== "passed" || evidence.data.verdict !== "approved"
+    || evidence.data.frontierRevision !== state.mutationFrontier.revision
+    || evidence.data.stateDigest !== state.mutationFrontier.currentStateDigest
+    || state.completionRepair?.kind !== "review_changes_requested") return progressed;
+  return { ...progressed, completionRepairAttempts: 0, completionRepair: undefined };
+};
 
 const profileResolved: KernelEventReducer = (state, event, payload) => {
   if (event.authority !== "runtime" || event.sessionId !== state.sessionId
@@ -278,11 +278,7 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "evidence.recorded": evidenceRecorded,
   "usage.recorded": usageRecorded,
   "plan.updated": planUpdated,
-  "budget.reserved": budgetUpdated,
-  "budget.reservation_bound": budgetUpdated,
-  "budget.committed": budgetUpdated,
-  "budget.released": budgetUpdated,
-  "budget.limit_increased": budgetLimitIncreased,
+  ...durableBudgetReducers,
   "checkpoint.created": checkpointUpdated,
   "checkpoint.sealed": checkpointUpdated,
   "checkpoint.restored": checkpointUpdated,

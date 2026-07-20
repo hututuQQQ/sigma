@@ -5,7 +5,7 @@ import type {
   BudgetLimits,
   BudgetReservation
 } from "agent-protocol";
-import { emptyBudgetAmounts } from "agent-protocol";
+import { emptyBudgetAmounts, isBudgetLedgerState } from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import {
@@ -13,10 +13,15 @@ import {
   mutationReservationHasDelta,
   parseMutationBudgetOwner
 } from "./mutation-budget.js";
-
-const DIMENSIONS = [
-  "inputTokens", "outputTokens", "costMicroUsd", "modelTurns", "toolCalls", "children"
-] as const satisfies readonly (keyof BudgetAmounts)[];
+import {
+  BUDGET_DIMENSIONS,
+  addBudgetAmounts,
+  budgetAmounts,
+  budgetTotals,
+  increasedBudgetLimits,
+  settleBudgetReservation,
+  settledBudgetMutation
+} from "./budget-ledger-operations.js";
 
 export interface MeasuredBudgetOverrun {
   dimension: keyof BudgetAmounts;
@@ -47,63 +52,6 @@ export class BudgetExceededError extends Error {
   }
 }
 
-function amounts(input: Partial<BudgetAmounts>): BudgetAmounts {
-  const result = emptyBudgetAmounts();
-  for (const dimension of DIMENSIONS) {
-    const value = input[dimension] ?? 0;
-    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Budget amount '${dimension}' must be a non-negative integer.`);
-    result[dimension] = value;
-  }
-  return result;
-}
-
-function add(left: BudgetAmounts, right: BudgetAmounts): BudgetAmounts {
-  return Object.fromEntries(DIMENSIONS.map((key) => [key, left[key] + right[key]])) as unknown as BudgetAmounts;
-}
-
-function subtract(left: BudgetAmounts, right: BudgetAmounts): BudgetAmounts {
-  return Object.fromEntries(DIMENSIONS.map((key) => [key, left[key] - right[key]])) as unknown as BudgetAmounts;
-}
-
-const LIMIT_DIMENSIONS = [...DIMENSIONS, "maxDepth"] as const satisfies readonly (keyof BudgetLimits)[];
-
-function increasedLimits(current: BudgetLimits, input: Partial<BudgetLimits>): {
-  limits: BudgetLimits;
-  increase: BudgetLimits;
-} {
-  const entries = LIMIT_DIMENSIONS.map((dimension) => {
-    const increment = input[dimension] ?? 0;
-    if (!Number.isSafeInteger(increment) || increment < 0) {
-      throw new Error(`Budget increase '${dimension}' must be a non-negative integer.`);
-    }
-    const next = current[dimension] + increment;
-    if (!Number.isSafeInteger(next)) throw new Error(`Budget limit '${dimension}' exceeds the safe integer range.`);
-    return [dimension, { increment, next }] as const;
-  });
-  if (!entries.some(([, value]) => value.increment > 0)) throw new Error("At least one budget limit increase must be positive.");
-  return {
-    limits: Object.fromEntries(entries.map(([key, value]) => [key, value.next])) as unknown as BudgetLimits,
-    increase: Object.fromEntries(entries.map(([key, value]) => [key, value.increment])) as unknown as BudgetLimits
-  };
-}
-
-function settle(
-  ledger: BudgetLedgerState,
-  reservation: BudgetReservation,
-  status: "committed" | "released",
-  consumed: BudgetAmounts
-): BudgetLedgerState {
-  const now = new Date().toISOString();
-  return {
-    ...ledger,
-    reserved: subtract(ledger.reserved, reservation.requested),
-    consumed: status === "committed" ? add(ledger.consumed, consumed) : { ...ledger.consumed },
-    reservations: ledger.reservations.map((item) => item.reservationId === reservation.reservationId
-      ? { ...item, status, consumed, settledAt: now }
-      : item)
-  };
-}
-
 export class BudgetController {
   private readonly queues = new Map<string, Promise<void>>();
 
@@ -132,14 +80,17 @@ export class BudgetController {
       const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") throw new Error(`Unknown active budget reservation '${reservationId}'.`);
-      const actual = amounts(actualInput);
-      for (const dimension of DIMENSIONS) {
+      const actual = budgetAmounts(actualInput);
+      for (const dimension of BUDGET_DIMENSIONS) {
         if (actual[dimension] > reservation.requested[dimension]) {
           throw new BudgetExceededError(dimension, actual[dimension], reservation.requested[dimension]);
         }
       }
-      const next = settle(ledger, reservation, "committed", actual);
-      await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+      const next = settleBudgetReservation(ledger, reservation, "committed", actual);
+      await this.emitAndApply(session, ledger, next, async () => await this.emit(
+        session, "budget.committed", "runtime",
+        { reservationId, mutation: settledBudgetMutation(next, reservationId, "committed", actual) }
+      ));
     });
   }
 
@@ -154,15 +105,15 @@ export class BudgetController {
       if (!reservation || reservation.status === "released") {
         throw new Error(`Unknown unsettled budget reservation '${reservationId}'.`);
       }
-      const actual = amounts(actualInput);
-      if (reservation.status === "committed" && DIMENSIONS.some((dimension) =>
+      const actual = budgetAmounts(actualInput);
+      if (reservation.status === "committed" && BUDGET_DIMENSIONS.some((dimension) =>
         reservation.consumed[dimension] !== actual[dimension])) {
         throw new Error(`Committed budget reservation '${reservationId}' does not match the measured usage.`);
       }
       const next = reservation.status === "reserved"
-        ? settle(ledger, reservation, "committed", actual)
+        ? settleBudgetReservation(ledger, reservation, "committed", actual)
         : ledger;
-      const overruns = DIMENSIONS.flatMap((dimension): MeasuredBudgetOverrun[] => {
+      const overruns = BUDGET_DIMENSIONS.flatMap((dimension): MeasuredBudgetOverrun[] => {
         const overReservation = Math.max(0, actual[dimension] - reservation.requested[dimension]);
         const overLimit = Math.max(0, next.consumed[dimension] + next.reserved[dimension] - next.limits[dimension]);
         return overReservation === 0 && overLimit === 0 ? [] : [{
@@ -177,7 +128,10 @@ export class BudgetController {
       });
       const overLimitDimensions = overruns.filter((item) => item.overLimit > 0);
       if (reservation.status === "reserved") {
-        await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+        await this.emitAndApply(session, ledger, next, async () => await this.emit(
+          session, "budget.committed", "runtime",
+          { reservationId, mutation: settledBudgetMutation(next, reservationId, "committed", actual) }
+        ));
         if (overLimitDimensions.length > 0) {
           await this.emit(session, "budget.overrun", "runtime", {
             reservationId,
@@ -205,14 +159,17 @@ export class BudgetController {
       const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") return false;
-      const actual = amounts(actualInput);
-      for (const dimension of DIMENSIONS) {
+      const actual = budgetAmounts(actualInput);
+      for (const dimension of BUDGET_DIMENSIONS) {
         if (actual[dimension] > reservation.requested[dimension]) {
           throw new BudgetExceededError(dimension, actual[dimension], reservation.requested[dimension]);
         }
       }
-      const next = settle(ledger, reservation, "committed", actual);
-      await this.emit(session, "budget.committed", "runtime", { reservationId, ledger: next });
+      const next = settleBudgetReservation(ledger, reservation, "committed", actual);
+      await this.emitAndApply(session, ledger, next, async () => await this.emit(
+        session, "budget.committed", "runtime",
+        { reservationId, mutation: settledBudgetMutation(next, reservationId, "committed", actual) }
+      ));
       return true;
     });
   }
@@ -235,7 +192,13 @@ export class BudgetController {
         reservations: ledger.reservations.map((item) => item.reservationId === reservationId
           ? { ...item, ownerId } : item)
       };
-      await this.emit(session, "budget.reservation_bound", "runtime", { reservationId, ownerId, ledger: next });
+      await this.emitAndApply(session, ledger, next, async () => await this.emit(
+        session, "budget.reservation_bound", "runtime", {
+          reservationId,
+          ownerId,
+          mutation: { schemaVersion: 1, kind: "bind", reservationId, ownerId }
+        }
+      ));
     });
   }
 
@@ -244,8 +207,13 @@ export class BudgetController {
       const ledger = session.durable.state.budget;
       const reservation = ledger.reservations.find((item) => item.reservationId === reservationId);
       if (!reservation || reservation.status !== "reserved") return;
-      const next = settle(ledger, reservation, "released", emptyBudgetAmounts());
-      await this.emit(session, "budget.released", "runtime", { reservationId, ledger: next });
+      const next = settleBudgetReservation(ledger, reservation, "released", emptyBudgetAmounts());
+      await this.emitAndApply(session, ledger, next, async () => await this.emit(
+        session, "budget.released", "runtime", {
+          reservationId,
+          mutation: settledBudgetMutation(next, reservationId, "released", emptyBudgetAmounts())
+        }
+      ));
     });
   }
 
@@ -299,9 +267,13 @@ export class BudgetController {
   async increaseLimits(session: RuntimeSession, requested: Partial<BudgetLimits>): Promise<BudgetLimits> {
     return await this.serial(session.identity.sessionId, async () => {
       const previousLimits = { ...session.durable.state.budget.limits };
-      const { limits, increase } = increasedLimits(previousLimits, requested);
+      const { limits, increase } = increasedBudgetLimits(previousLimits, requested);
       const ledger: BudgetLedgerState = { ...session.durable.state.budget, limits };
-      await this.emit(session, "budget.limit_increased", "user", { previousLimits, increase, ledger });
+      const before = session.durable.state.budget;
+      await this.emitAndApply(session, before, ledger, async () => await this.emit(
+        session, "budget.limit_increased", "user",
+        { mutation: { schemaVersion: 1, kind: "limit", increase, limits } }
+      ));
       return { ...limits };
     });
   }
@@ -312,10 +284,10 @@ export class BudgetController {
     requestedInput: Partial<BudgetAmounts>,
     requiredDepth: number
   ): Promise<string> {
-    const requested = amounts(requestedInput);
+    const requested = budgetAmounts(requestedInput);
     const ledger = session.durable.state.budget;
     await this.assertDepthLocked(session, requiredDepth);
-    for (const dimension of DIMENSIONS) {
+    for (const dimension of BUDGET_DIMENSIONS) {
       const used = ledger.consumed[dimension] + ledger.reserved[dimension];
       const available = Math.max(0, ledger.limits[dimension] - used);
       if (requested[dimension] > available) {
@@ -336,11 +308,36 @@ export class BudgetController {
     };
     const next: BudgetLedgerState = {
       ...ledger,
-      reserved: add(ledger.reserved, requested),
+      reserved: addBudgetAmounts(ledger.reserved, requested),
       reservations: [...ledger.reservations, reservation]
     };
-    await this.emit(session, "budget.reserved", "runtime", { reservationId, ledger: next });
+    await this.emitAndApply(session, ledger, next, async () => await this.emit(
+      session, "budget.reserved", "runtime", {
+        reservationId,
+        mutation: {
+          schemaVersion: 1,
+          kind: "reserve",
+          reservation,
+          totals: budgetTotals(next)
+        }
+      }
+    ));
     return reservationId;
+  }
+
+  private async emitAndApply(
+    session: RuntimeSession,
+    previous: BudgetLedgerState,
+    next: BudgetLedgerState,
+    emit: () => Promise<unknown>
+  ): Promise<void> {
+    await emit();
+    // RuntimeEventLog reduces the durable event synchronously. Lightweight
+    // embedders may provide a persistence-only emitter, so keep the controller
+    // usable without writing a second event or a full ledger payload.
+    if (session.durable.state.budget === previous || !isBudgetLedgerState(session.durable.state.budget)) {
+      session.durable.state.budget = next;
+    }
   }
 
   private async assertDepthLocked(session: RuntimeSession, requiredDepth: number): Promise<void> {

@@ -6,7 +6,11 @@ import type {
   ProcessLaunchFailureV1,
   ProcessHandle,
   ProcessHandoffResult,
-  ProcessPollResult
+  ProcessPollResult,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  ScratchLeaseRequestV1,
+  ScratchLeaseV1
 } from "agent-execution";
 import { BrokerCancelledError } from "agent-execution";
 import type { ShellKind } from "./environment.js";
@@ -17,6 +21,15 @@ export interface ProcessExecutionPort {
   terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
+  acquireRepositoryMetadataLease?(
+    request: RepositoryMetadataLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLeaseV1>;
+  acquireScratchLease?(
+    request: ScratchLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ScratchLeaseV1>;
+  releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
 }
 
 export interface ProcessRequest {
@@ -35,6 +48,9 @@ export interface ProcessRequest {
   protectedPaths?: string[];
   network?: "none" | "full";
   networkApproved?: boolean;
+  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
+  /** Trusted runtime binding; never derived from a command or model field. */
+  scratchSessionId?: string;
 }
 
 export interface ProcessResult {
@@ -72,7 +88,7 @@ function limitedLines(value: string, maximum: number | undefined): { value: stri
   return { value, limited: false };
 }
 
-function executionRequest(request: ProcessRequest): ExecutionRequest {
+function executionRequest(request: ProcessRequest, scratchLease?: ScratchLeaseV1): ExecutionRequest {
   const cwd = path.resolve(request.cwd);
   const readRoots = (request.readRoots ?? [cwd]).map((root) => path.resolve(root));
   const writeRoots = (request.writeRoots ?? []).map((root) => path.resolve(root));
@@ -90,12 +106,24 @@ function executionRequest(request: ProcessRequest): ExecutionRequest {
       networkApproved: network === "full" && request.networkApproved === true,
       readRoots,
       writeRoots,
-      protectedPaths: request.protectedPaths ?? [path.join(cwd, ".git"), path.join(cwd, ".agent")]
+      protectedPaths: request.protectedPaths ?? [path.join(cwd, ".git"), path.join(cwd, ".agent")],
+      ...(request.repositoryMetadataLease ? {
+        repositoryMetadataLease: request.repositoryMetadataLease
+      } : {}),
+      ...(scratchLease ? { scratchLease } : {})
     },
     timeoutMs: request.timeoutMs,
     idleTimeoutMs: request.idleTimeoutMs,
     maxOutputBytes: request.maxOutputBytes
   };
+}
+
+async function processScratchLease(request: ProcessRequest): Promise<ScratchLeaseV1 | undefined> {
+  if (!request.scratchSessionId || !request.execution.acquireScratchLease) return undefined;
+  return await request.execution.acquireScratchLease({
+    protocolVersion: 1,
+    sessionId: request.scratchSessionId
+  }, { signal: request.signal });
 }
 
 export async function runProcess(request: ProcessRequest): Promise<ProcessResult> {
@@ -104,7 +132,8 @@ export async function runProcess(request: ProcessRequest): Promise<ProcessResult
   const startedAt = performance.now();
   let result: ExecutionResult;
   try {
-    result = await request.execution.execute(executionRequest(request), { signal: request.signal });
+    const scratchLease = await processScratchLease(request);
+    result = await request.execution.execute(executionRequest(request, scratchLease), { signal: request.signal });
   } catch (error) {
     const cancelled = error instanceof BrokerCancelledError
       || (error !== null && typeof error === "object"

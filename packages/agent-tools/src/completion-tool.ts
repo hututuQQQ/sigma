@@ -108,7 +108,7 @@ function terminalReceipt(
 function completionTool(): RegisteredEffectTool {
   const descriptor: ToolDescriptor = {
     name: "runtime_finalize",
-    description: "Internal completion-coordinator action derived from a natural model stop.",
+    description: "Finish with the best supported final answer. This action is available only on a runtime-restricted terminal convergence turn; the runtime still applies assurance, review, and plan-completion gates.",
     inputSchema: {
       type: "object",
       properties: {

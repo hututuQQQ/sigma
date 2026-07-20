@@ -14,6 +14,8 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections import deque
+from collections.abc import Iterator
 from typing import Any
 
 from harbor.agents.base import BaseAgent
@@ -39,6 +41,7 @@ SUCCESS_STATUSES = {"completed", "completed_with_limitations"}
 FAILURE_KINDS = {
     "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
     "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
+    "external_cancel",
 }
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
@@ -54,6 +57,10 @@ WORKSPACE_PATH = "/app"
 MAX_CONTEXT_TEXT_CHARS = 8_192
 MAX_PARTIAL_ARTIFACT_CHARS = 1_048_576
 MAX_TRACE_ARTIFACT_BYTES = 4 * 1_048_576
+MAX_RECORDER_EVENT_BYTES = 512 * 1_024
+MAX_RECORDER_EVENT_COUNT = 512
+MAX_SEEN_EVENT_IDENTITIES = 2_048
+MAX_STREAM_CHUNK_STATES = 4
 MAX_STREAM_LINE_CHARS = 65_536
 MAX_STREAM_RECORD_BYTES = 16 * 1_048_576
 PROCESS_CLEANUP_TIMEOUT_SEC = 8
@@ -189,29 +196,146 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
         handle.write(value)
 
 
-def _append_bounded_jsonl(path: pathlib.Path, record: dict[str, Any], maximum: int) -> None:
-    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-    existing_size = path.stat().st_size if path.is_file() else 0
-    if existing_size + len(line) <= maximum:
-        with path.open("ab") as handle:
+class _BoundedJsonlSpool:
+    """Persist a bounded JSONL head plus a rolling tail while the run is live.
+
+    Ordinary records are appended directly. Once the tail reaches its high
+    water mark, the oldest tail records are discarded down to a low water mark
+    and the bounded head/marker/tail view is atomically materialized. This
+    keeps recent convergence evidence visible even if the process is killed
+    before finalization, without rewriting the growing artifact per event.
+    """
+
+    def __init__(self, path: pathlib.Path, maximum: int) -> None:
+        if maximum <= 0:
+            raise ValueError("maximum must be positive")
+        self.path = path
+        self.maximum = maximum
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"")
+        self._marker_reserve = min(maximum, 512, max(96, maximum // 8))
+        usable = max(0, maximum - self._marker_reserve)
+        self._head_limit = usable // 2
+        self._tail_limit = usable - self._head_limit
+        self._tail_low_water = self._tail_limit // 2
+        self._head = bytearray()
+        self._head_size = 0
+        self._head_closed = False
+        self._tail: deque[bytes] = deque()
+        self._tail_size = 0
+        self._omitted_records = 0
+        self._omitted_bytes = 0
+        self._omitted_digest = hashlib.sha256()
+        self._finalized = False
+
+    @property
+    def retained_bytes(self) -> int:
+        return self._head_size + self._tail_size
+
+    @property
+    def omitted_records(self) -> int:
+        return self._omitted_records
+
+    def append(self, record: dict[str, Any]) -> None:
+        if self._finalized:
+            raise RuntimeError("cannot append to a finalized JSONL spool")
+        line = self._encoded_record(record)
+        if not self._head_closed and self._head_size + len(line) <= self._head_limit:
+            with self.path.open("ab") as handle:
+                handle.write(line)
+            self._head.extend(line)
+            self._head_size += len(line)
+            return
+        self._head_closed = True
+        if len(line) > self._tail_limit:
+            self._omit(line)
+            self._materialize()
+            return
+        if self._tail_size + len(line) > self._tail_limit:
+            while self._tail and self._tail_size + len(line) > self._tail_low_water:
+                removed = self._tail.popleft()
+                self._tail_size -= len(removed)
+                self._omit(removed)
+            self._tail.append(line)
+            self._tail_size += len(line)
+            self._materialize()
+            return
+        self._tail.append(line)
+        self._tail_size += len(line)
+        with self.path.open("ab") as handle:
             handle.write(line)
-        return
-    existing = path.read_bytes() if path.is_file() else b""
-    content = existing + line
-    digest = hashlib.sha256(content).hexdigest()
-    marker = (json.dumps({
-        "type": "trace_truncated",
-        "omitted_bytes_sha256": digest,
-    }, ensure_ascii=False) + "\n").encode("utf-8")
-    if len(marker) >= maximum:
-        bounded = marker[:maximum]
-    else:
-        tail = content[-(maximum - len(marker)):].decode("utf-8", errors="ignore").encode("utf-8")
-        bounded = marker + tail
-        if len(bounded) > maximum:
-            bounded = bounded[:maximum]
-    with path.open("wb") as handle:
-        handle.write(bounded)
+
+    def finalize(self) -> pathlib.Path:
+        if self._finalized:
+            return self.path
+        self._materialize()
+        self._finalized = True
+        return self.path
+
+    def _materialize(self) -> None:
+        marker = self._omission_marker()
+        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as target:
+                target.write(self._head)
+                if marker:
+                    target.write(marker)
+                for line in self._tail:
+                    target.write(line)
+            if temporary.stat().st_size > self.maximum:
+                raise RuntimeError("bounded JSONL spool exceeded its artifact limit")
+            temporary.replace(self.path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _encoded_record(self, record: dict[str, Any]) -> bytes:
+        line = (
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if len(line) <= self.maximum:
+            return line
+        digest = hashlib.sha256(line).hexdigest()
+        replacement = {
+            "type": "trace_record_omitted",
+            "original_type": record.get("type"),
+            "original_bytes": len(line),
+            "original_sha256": digest,
+        }
+        return (
+            json.dumps(replacement, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+
+    def _omit(self, line: bytes) -> None:
+        self._omitted_records += 1
+        self._omitted_bytes += len(line)
+        self._omitted_digest.update(line)
+
+    def _omission_marker(self) -> bytes:
+        if self._omitted_records == 0:
+            return b""
+        candidates = (
+            {
+                "type": "trace_truncated",
+                "omitted_records": self._omitted_records,
+                "omitted_bytes": self._omitted_bytes,
+                "omitted_bytes_sha256": self._omitted_digest.hexdigest(),
+            },
+            {
+                "type": "trace_truncated",
+                "omitted_records": self._omitted_records,
+                "omitted_bytes": self._omitted_bytes,
+            },
+            {"type": "trace_truncated", "omitted_records": self._omitted_records},
+            {"type": "trace_truncated"},
+        )
+        for candidate in candidates:
+            marker = (
+                json.dumps(candidate, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            if len(marker) <= self._marker_reserve:
+                return marker
+        return b""
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -279,12 +403,13 @@ def _event_identity(event: dict[str, Any]) -> tuple[str, ...]:
     event_type = event.get("type")
     if isinstance(seq, int) and isinstance(session_id, str) and isinstance(event_type, str):
         return ("seq", session_id, str(seq), event_type)
-    return ("raw", json.dumps(event, sort_keys=True, ensure_ascii=False))
+    raw = json.dumps(event, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return ("raw-sha256", hashlib.sha256(raw).hexdigest())
 
 
 def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, Any]:
     raw = json.dumps(event, ensure_ascii=False, sort_keys=True)
-    if len(raw) <= maximum:
+    if len(raw.encode("utf-8")) <= maximum:
         return event
     return {
         "type": event.get("type"),
@@ -293,6 +418,108 @@ def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, An
         "seq": event.get("seq"),
         "payload_summary": _text_artifact_summary(raw),
         "truncated": True,
+    }
+
+
+def _selected_scalars(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        key: payload[key]
+        for key in keys
+        if key in payload and (
+            payload[key] is None
+            or isinstance(payload[key], (str, int, float, bool))
+        )
+    }
+
+
+def _trace_record(
+    event: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one trace record without duplicating the raw Sigma payload."""
+    event_type = str(event.get("type") or "event")
+    payload = _event_payload(event)
+    trace_type = event_type
+    metadata: dict[str, Any] = {"event_type": event_type}
+    if event_type == "usage.recorded":
+        trace_type = "usage"
+        metadata.update(_selected_scalars(payload, (
+            "inputTokens", "outputTokens", "reasoningTokens", "cacheReadTokens",
+            "cacheWriteTokens", "costMicroUsd", "latencyMs", "attempt",
+            "cacheTokens", "costUsd",
+        )))
+        metadata.setdefault(
+            "cacheTokens",
+            _as_int(payload.get("cacheReadTokens"), 0)
+            + _as_int(payload.get("cacheWriteTokens"), 0),
+        )
+        metadata.setdefault(
+            "costUsd", _as_int(payload.get("costMicroUsd"), 0) / 1_000_000
+        )
+    elif event_type == "tool.started":
+        trace_type = "tool_start"
+        metadata.update(_selected_scalars(payload, (
+            "callId", "toolCallId", "toolName", "name", "executionId", "status",
+        )))
+        tool_name = payload.get("toolName") or payload.get("name")
+        if isinstance(tool_name, (str, int, float, bool)) or tool_name is None:
+            metadata["toolName"] = tool_name
+    elif event_type in {"tool.completed", "tool.failed"}:
+        trace_type = "tool_end"
+        metadata.update(_selected_scalars(payload, (
+            "callId", "toolCallId", "toolName", "name", "executionId", "status",
+            "durationMs", "exitCode", "code",
+        )))
+        tool_name = payload.get("toolName") or payload.get("name")
+        if isinstance(tool_name, (str, int, float, bool)) or tool_name is None:
+            metadata["toolName"] = tool_name
+    elif event_type == "model.started":
+        trace_type = "model_start"
+        metadata.update(_selected_scalars(payload, (
+            "requestId", "turnId", "role", "routeId", "modelId", "attempt",
+        )))
+    elif event_type in {"model.completed", "model.failed"}:
+        trace_type = "model_end"
+        metadata.update(_selected_scalars(payload, (
+            "requestId", "turnId", "role", "routeId", "modelId", "attempt",
+            "finishReason", "status", "code", "latencyMs",
+        )))
+    elif event_type == "diagnostic":
+        metadata.update(_selected_scalars(payload, (
+            "kind", "stage", "budgetStage", "remainingMs", "nextModelEstimateMs",
+            "nextConvergenceModelEstimateMs", "outputReserveTokens", "code", "message",
+        )))
+    elif event_type in TERMINAL_EVENT_TYPES:
+        trace_type = "run_end"
+        metadata.update(_selected_scalars(payload, (
+            "status", "finishReason", "failureKind", "message", "finalMessage",
+            "terminationSource", "terminalOrigin",
+        )))
+        if summary is not None:
+            metadata.update(_selected_scalars(summary, (
+                "status", "finish_reason", "commands_executed", "input_tokens",
+                "output_tokens", "reasoning_tokens", "cache_tokens", "cache_read_tokens",
+                "length_finish_count", "converge_turns", "deadline_converge_turns",
+                "budget_converge_turns", "terminal_budget_turns", "manual_stop_count",
+                "cost_usd", "duration_ms", "suspension_to_exit_ms", "terminal_origin",
+                "termination_source", "execution_mode", "execution_backend", "container_engine",
+                "container_target", "target_image_id", "task_image_digest", "agent_profile",
+                "harbor_deadline_sec", "sigma_deadline_sec", "limitation_count",
+            )))
+    elif event_type in {"error", "run_timeout"}:
+        metadata.update(_selected_scalars(payload, (
+            "status", "code", "message", "failure_kind", "termination_source",
+        )))
+    metadata = {
+        key: value for key, value in metadata.items()
+        if value is None or isinstance(value, (str, int, float, bool))
+    }
+    return {
+        "type": trace_type,
+        "seq": event.get("seq"),
+        "occurredAt": event.get("occurredAt"),
+        "metadata": metadata,
+        "sigma_event": _bounded_event(event),
     }
 
 
@@ -323,11 +550,20 @@ def _decode_stream_line(
         or index >= total
     ):
         return []
-    state = chunks.setdefault(record_id, {"total": total, "parts": {}})
+    if record_id not in chunks and len(chunks) >= MAX_STREAM_CHUNK_STATES:
+        chunks.pop(next(iter(chunks)))
+    state = chunks.setdefault(record_id, {"total": total, "parts": {}, "encoded_bytes": 0})
     if state["total"] != total:
         chunks.pop(record_id, None)
         return []
+    previous = state["parts"].get(index)
+    previous_size = len(previous) if isinstance(previous, str) else 0
+    encoded_bytes = _as_int(state.get("encoded_bytes"), 0) - previous_size + len(data)
+    if encoded_bytes > MAX_STREAM_RECORD_BYTES * 2:
+        chunks.pop(record_id, None)
+        raise ValueError("chunked stream record exceeds the adapter size limit")
     state["parts"][index] = data
+    state["encoded_bytes"] = encoded_bytes
     if len(state["parts"]) != total:
         return []
     encoded = "".join(state["parts"][part] for part in range(total))
@@ -339,6 +575,31 @@ def _decode_stream_line(
         raise ValueError("chunked stream record exceeds the adapter size limit")
     restored = json.loads(decoded.decode("utf-8"))
     return [restored] if isinstance(restored, dict) else []
+
+
+def _bounded_protocol_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Retain protocol fields while dropping large diagnostic payloads."""
+    bounded = _bounded_event(event, 128 * 1_024)
+    if not bounded.get("truncated"):
+        return bounded
+    payload = _event_payload(event)
+    essential = _selected_scalars(payload, (
+        "kind", "status", "finishReason", "failureKind", "failure_kind", "code",
+        "message", "finalMessage", "terminationSource", "terminalOrigin", "checkpointId",
+    ))
+    for key in ("message", "finalMessage"):
+        value = essential.get(key)
+        if isinstance(value, str):
+            essential[key] = _bounded_text(value, 4_096)
+    limitations = payload.get("limitations")
+    if isinstance(limitations, list):
+        encoded = json.dumps(limitations, ensure_ascii=False).encode("utf-8")
+        if len(encoded) <= 16_384:
+            essential["limitations"] = limitations
+    return {
+        key: value for key, value in event.items()
+        if key in {"type", "eventId", "sessionId", "runId", "seq", "occurredAt"}
+    } | {"payload": essential, "truncated": True}
 
 
 class _OutputRecorder:
@@ -354,22 +615,42 @@ class _OutputRecorder:
         self._pending_stdout = ""
         self._stream_chunks: dict[str, dict[str, Any]] = {}
         self._seen: set[tuple[str, ...]] = set()
+        self._seen_order: deque[tuple[str, ...]] = deque()
+        self._highest_seq: dict[str, int] = {}
         self.events: list[dict[str, Any]] = []
+        self._event_sizes: deque[int] = deque()
+        self._event_bytes = 0
+        self.total_events = 0
         self.output_result: dict[str, Any] = {}
         self.last_event: dict[str, Any] | None = None
+        self.session_id: str | None = None
         self.model_turns = 0
         self.tool_calls = 0
+        self.commands_executed = 0
         self.usage: dict[str, Any] = {}
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.reasoning_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        self.cost_micro_usd = 0
         self.retry_count = 0
         self.last_retry: dict[str, Any] | None = None
+        self.model_failure: dict[str, Any] | None = None
         self.length_finish_count = 0
         self.converge_turns = 0
+        self.deadline_converge_turns = 0
+        self.budget_converge_turns = 0
+        self.terminal_budget_turns = 0
         self._started_monotonic = time.monotonic()
         self._suspended_monotonic: float | None = None
         self._process_exit_monotonic: float | None = None
         logs_dir.mkdir(parents=True, exist_ok=True)
-        for path in (self.stdout_path, self.stderr_path, self.trace_path):
+        for path in (self.stdout_path, self.stderr_path):
             path.write_text("", encoding="utf-8")
+        self._trace_spool = _BoundedJsonlSpool(
+            self.trace_path, MAX_TRACE_ARTIFACT_BYTES
+        )
         self._write_state()
 
     async def callback(self, text: str, stream: str) -> None:
@@ -395,6 +676,51 @@ class _OutputRecorder:
         for value in _decode_stream_line(line, self._stream_chunks):
             self._consume_value(value)
 
+    def finish_stream(self) -> None:
+        if self._pending_stdout:
+            pending = self._pending_stdout
+            self._pending_stdout = ""
+            self._consume_line(pending)
+
+    def consume_event(self, event: dict[str, Any]) -> None:
+        self._consume_value({"kind": "event", "event": event})
+
+    def finalize_trace(self) -> pathlib.Path:
+        return self._trace_spool.finalize()
+
+    def _remember_identity(
+        self, event: dict[str, Any], identity: tuple[str, ...]
+    ) -> bool:
+        session_id = event.get("sessionId")
+        seq = event.get("seq")
+        if isinstance(session_id, str) and isinstance(seq, int):
+            highest = self._highest_seq.get(session_id)
+            if highest is not None and seq <= highest:
+                return False
+            self._highest_seq[session_id] = seq
+            while len(self._highest_seq) > 64:
+                self._highest_seq.pop(next(iter(self._highest_seq)))
+        if identity in self._seen:
+            return False
+        self._seen.add(identity)
+        self._seen_order.append(identity)
+        while len(self._seen_order) > MAX_SEEN_EVENT_IDENTITIES:
+            self._seen.discard(self._seen_order.popleft())
+        return True
+
+    def _remember_event(self, event: dict[str, Any]) -> None:
+        bounded = _bounded_protocol_event(event)
+        size = len(json.dumps(bounded, ensure_ascii=False).encode("utf-8"))
+        self.events.append(bounded)
+        self._event_sizes.append(size)
+        self._event_bytes += size
+        while (
+            len(self.events) > MAX_RECORDER_EVENT_COUNT
+            or self._event_bytes > MAX_RECORDER_EVENT_BYTES
+        ) and self.events:
+            self.events.pop(0)
+            self._event_bytes -= self._event_sizes.popleft()
+
     def _consume_value(self, value: dict[str, Any]) -> None:
         if value.get("kind") == "event" and isinstance(value.get("event"), dict):
             event = value["event"]
@@ -404,24 +730,34 @@ class _OutputRecorder:
             event = None
         if isinstance(event, dict) and isinstance(event.get("type"), str):
             identity = _event_identity(event)
-            if identity in self._seen:
+            if not self._remember_identity(event, identity):
                 return
-            self._seen.add(identity)
-            self.events.append(event)
-            self.last_event = event
+            self.total_events += 1
+            self._remember_event(event)
+            self.last_event = _bounded_protocol_event(event)
+            session_id = event.get("sessionId")
+            if isinstance(session_id, str) and session_id:
+                self.session_id = session_id
             event_type = str(event.get("type"))
             if event_type == "model.started":
                 self.model_turns += 1
             if event_type == "tool.requested":
                 self.tool_calls += 1
+            if event_type in {"tool.completed", "tool.failed"}:
+                self.commands_executed += 1
             if event_type == "run.suspended" and self._suspended_monotonic is None:
                 self._suspended_monotonic = time.monotonic()
             payload = _event_payload(event)
             if event_type == "model.completed" and payload.get("finishReason") == "length":
                 self.length_finish_count += 1
-            if (event_type == "diagnostic" and payload.get("kind") == "deadline.stage"
-                    and payload.get("stage") == "converge"):
-                self.converge_turns += 1
+            if event_type == "diagnostic" and payload.get("kind") == "deadline.stage":
+                deadline_converge = payload.get("stage") == "converge"
+                budget_converge = payload.get("budgetStage") == "converge"
+                terminal_budget = payload.get("budgetStage") == "terminal"
+                self.deadline_converge_turns += int(deadline_converge)
+                self.budget_converge_turns += int(budget_converge)
+                self.terminal_budget_turns += int(terminal_budget)
+                self.converge_turns += int(deadline_converge or budget_converge)
             if event_type == "usage.recorded":
                 self.usage = {
                     **self.usage,
@@ -432,16 +768,22 @@ class _OutputRecorder:
                         + _as_int(payload.get("cacheWriteTokens"), 0),
                     ),
                 }
+                self.input_tokens += _as_int(payload.get("inputTokens"), 0)
+                self.output_tokens += _as_int(payload.get("outputTokens"), 0)
+                self.reasoning_tokens += _as_int(payload.get("reasoningTokens"), 0)
+                self.cache_read_tokens += _as_int(payload.get("cacheReadTokens"), 0)
+                self.cache_write_tokens += _as_int(payload.get("cacheWriteTokens"), 0)
+                self.cost_micro_usd += _as_int(payload.get("costMicroUsd"), 0)
+            if event_type == "model.failed":
+                diagnostics = payload.get("diagnostics")
+                self.model_failure = {
+                    "code": payload.get("code"),
+                    "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
+                }
             if "retry" in event_type.lower() or "retry" in str(payload.get("status", "")).lower():
                 self.retry_count += 1
                 self.last_retry = _bounded_event(event)
-            _append_bounded_jsonl(self.trace_path, {
-                "type": "event",
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": {"event_type": event_type},
-                "sigma_event": _bounded_event(event),
-            }, MAX_TRACE_ARTIFACT_BYTES)
+            self._trace_spool.append(_trace_record(event))
             self._write_state()
             return
         if value.get("kind") == "result" or value.get("type") == "result":
@@ -464,13 +806,29 @@ class _OutputRecorder:
     def snapshot(self) -> dict[str, Any]:
         return {
             "last_event": _bounded_event(self.last_event) if self.last_event else None,
+            "session_id": self.session_id,
+            "events_retained": len(self.events),
+            "events_retained_bytes": self._event_bytes,
+            "events_observed": self.total_events,
             "model_turns": self.model_turns,
             "tool_calls": self.tool_calls,
+            "commands_executed": self.commands_executed,
             "usage": dict(self.usage),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_tokens": self.cache_read_tokens + self.cache_write_tokens,
+            "cost_micro_usd": self.cost_micro_usd,
             "retry_count": self.retry_count,
             "last_retry": self.last_retry,
+            "model_failure": self.model_failure,
             "length_finish_count": self.length_finish_count,
             "converge_turns": self.converge_turns,
+            "deadline_converge_turns": self.deadline_converge_turns,
+            "budget_converge_turns": self.budget_converge_turns,
+            "terminal_budget_turns": self.terminal_budget_turns,
             **self.timing_snapshot(),
         }
 
@@ -573,7 +931,7 @@ class SigmaCliHarborAgent(BaseAgent):
         if self.outer_trial_deadline_sec is not None:
             requested_wall_time = min(
                 requested_wall_time,
-                max(1, self.outer_trial_deadline_sec - self.agent_timeout_grace_sec),
+                self.outer_trial_deadline_sec,
             )
         self.max_wall_time_sec = requested_wall_time
         self.check_api = bool(check_api)
@@ -852,6 +1210,7 @@ stat -c '%d:%i' {WORKSPACE_PATH}
         failure_kind: str | None = None
         timed_out = False
         cancelled_error: asyncio.CancelledError | None = None
+        cancellation_source: str | None = None
         artifact_warnings: list[str] = []
         events: list[dict[str, Any]] = []
         output_result: dict[str, Any] = {}
@@ -869,6 +1228,9 @@ stat -c '%d:%i' {WORKSPACE_PATH}
                     environment, session_id, events, env_vars
                 )
                 events = recovery[0]
+                for recovered_event in events:
+                    recorder.consume_event(recovered_event)
+                events = list(recorder.events)
                 if recovery[1] is not None:
                     output_result = recovery[1]
                     result = self._result_with_payload(result, output_result)
@@ -942,9 +1304,12 @@ stat -c '%d:%i' {WORKSPACE_PATH}
                     )
             else:
                 cancelled_error = exc
-                timed_out = True
-                failure_kind = "timeout"
-                error_message = "agent execution cancelled by the Harbor outer trial deadline"
+                cancellation_source = "external_cancel"
+                failure_kind = "external_cancel"
+                error_message = (
+                    "agent execution was cancelled by an external controller; "
+                    "no adapter deadline origin was established"
+                )
                 summary_path, trace_path = self._persist_timeout_artifacts(
                     result,
                     events,
@@ -953,6 +1318,11 @@ stat -c '%d:%i' {WORKSPACE_PATH}
                     error_message,
                     recorder=recorder,
                     process_cleanup=self._process_cleanup,
+                    status="cancelled",
+                    failure_kind="external_cancel",
+                    timed_out=False,
+                    termination_source="external_cancel",
+                    artifact_name="interruption.json",
                 )
         except Exception as exc:
             partial = getattr(exc, "result", None)
@@ -985,14 +1355,11 @@ stat -c '%d:%i' {WORKSPACE_PATH}
             if cancelled_error is None and not timed_out:
                 for remote_path, filename in (
                     ("/tmp/agent/summary.json", "summary.json"),
-                    ("/tmp/agent/trace.jsonl", "trace.jsonl"),
                 ):
                     try:
                         downloaded = await self._download_if_present(environment, remote_path, filename)
                         if filename == "summary.json":
                             summary_path = downloaded
-                        else:
-                            trace_path = downloaded
                     except Exception as exc:
                         artifact_warnings.append(f"{filename}: {exc}")
                 try:
@@ -1000,14 +1367,15 @@ stat -c '%d:%i' {WORKSPACE_PATH}
                 except Exception as exc:
                     artifact_warnings.append(f"attempts: {exc}")
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
-                trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
-                if trace_path == recorder.trace_path:
-                    trace_path = None
+            trace_path = recorder.finalize_trace()
 
-        derived_summary = self._summary_from_events(events, output_result)
+        derived_summary = self._summary_from_events(
+            events, output_result, recorder.snapshot()
+        )
         derived_summary.update(recorder.timing_snapshot())
         derived_summary["terminal_origin"] = (
             "adapter_timeout" if timed_out
+            else cancellation_source if cancellation_source is not None
             else "runtime_result" if output_result.get("status") is not None
             else "runtime_event" if any(
                 event.get("type") in {*TERMINAL_EVENT_TYPES, "run.suspended"} for event in events
@@ -1015,15 +1383,14 @@ stat -c '%d:%i' {WORKSPACE_PATH}
             else None
         )
         derived_summary["termination_source"] = derived_summary["terminal_origin"]
-        if events and (summary_path is None or trace_path is None):
-            derived_summary_path, derived_trace_path = self._write_accounting_artifacts(
+        if events and summary_path is None:
+            derived_summary_path, _ = self._write_accounting_artifacts(
                 events,
                 derived_summary,
                 write_summary=summary_path is None,
-                write_trace=trace_path is None,
+                write_trace=False,
             )
             summary_path = summary_path or derived_summary_path
-            trace_path = trace_path or derived_trace_path
         summary = {**derived_summary, **self._read_result(result)}
         downloaded_summary = self._read_summary(summary_path)
         if downloaded_summary:
@@ -1056,7 +1423,7 @@ stat -c '%d:%i' {WORKSPACE_PATH}
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
         self._populate_context(context, result, summary, error_message)
-        if timed_out or protocol_failure is not None:
+        if timed_out or cancelled_error is not None or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
@@ -1240,7 +1607,12 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         result: Any | None,
         recorder: _OutputRecorder,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        parsed_events, parsed_result = self._parse_stream_output(result)
+        recorder.finish_stream()
+        parsed_events, parsed_result = self._parse_stream_output(
+            result,
+            event_consumer=recorder.consume_event,
+            collect_events=False,
+        )
         events = self._merge_events(recorder.events, parsed_events)
         output_result = {**recorder.output_result, **parsed_result}
         return events, output_result
@@ -1264,16 +1636,41 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 return await self._runtime_exec(environment, command_text, **kwargs)
         return await self._runtime_exec(environment, command_text, **kwargs)
 
-    def _parse_stream_output(self, result: Any | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _parse_stream_output(
+        self,
+        result: Any | None,
+        event_consumer: Any | None = None,
+        collect_events: bool = True,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        event_sizes: deque[int] = deque()
+        event_bytes = 0
         output_result: dict[str, Any] = {}
         chunks: dict[str, dict[str, Any]] = {}
+
+        def collect(event: dict[str, Any]) -> None:
+            nonlocal event_bytes
+            bounded = _bounded_protocol_event(event)
+            size = len(json.dumps(bounded, ensure_ascii=False).encode("utf-8"))
+            events.append(bounded)
+            event_sizes.append(size)
+            event_bytes += size
+            while (
+                len(events) > MAX_RECORDER_EVENT_COUNT
+                or event_bytes > MAX_RECORDER_EVENT_BYTES
+            ) and events:
+                events.pop(0)
+                event_bytes -= event_sizes.popleft()
+
         for line in _stdout_text(result).splitlines() if result is not None else []:
             for value in _decode_stream_line(line, chunks):
                 if value.get("kind") == "event" and isinstance(value.get("event"), dict):
                     event = value["event"]
                     if isinstance(event.get("type"), str):
-                        events.append(event)
+                        if callable(event_consumer):
+                            event_consumer(event)
+                        elif collect_events:
+                            collect(event)
                     continue
                 if value.get("kind") == "result" or value.get("type") == "result":
                     candidate = value.get("result")
@@ -1294,7 +1691,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     output_result = dict(value)
                     continue
                 if isinstance(value.get("type"), str) and value.get("payload") is not None:
-                    events.append(value)
+                    if callable(event_consumer):
+                        event_consumer(value)
+                    elif collect_events:
+                        collect(value)
         return events, output_result
 
     def _failure_kind_from_events(
@@ -1737,6 +2137,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         self,
         events: list[dict[str, Any]],
         output_result: dict[str, Any],
+        accounting: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         usage = [_event_payload(event) for event in events if event.get("type") == "usage.recorded"]
         input_tokens = sum(_as_int(item.get("inputTokens"), 0) for item in usage)
@@ -1749,12 +2150,30 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             event.get("type") == "model.completed" and _event_payload(event).get("finishReason") == "length"
             for event in events
         )
-        converge_turns = sum(
-            event.get("type") == "diagnostic"
-            and _event_payload(event).get("kind") == "deadline.stage"
-            and _event_payload(event).get("stage") == "converge"
+        deadline_stage_events = [
+            _event_payload(event)
             for event in events
+            if event.get("type") == "diagnostic"
+            and _event_payload(event).get("kind") == "deadline.stage"
+        ]
+        deadline_converge_turns = sum(
+            payload.get("stage") == "converge" for payload in deadline_stage_events
         )
+        budget_converge_turns = sum(
+            payload.get("budgetStage") == "converge" for payload in deadline_stage_events
+        )
+        terminal_budget_turns = sum(
+            payload.get("budgetStage") == "terminal" for payload in deadline_stage_events
+        )
+        converge_turns = sum(
+            payload.get("stage") == "converge" or payload.get("budgetStage") == "converge"
+            for payload in deadline_stage_events
+        )
+        terminal_source = (
+            output_result.get("terminationSource")
+            or output_result.get("termination_source")
+        )
+        manual_stop_count = int(terminal_source == "manual_stop")
         cost_micro_usd = sum(_as_int(item.get("costMicroUsd"), 0) for item in usage)
         model_failure_event = next(
             (event for event in reversed(events) if event.get("type") == "model.failed"),
@@ -1768,6 +2187,30 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                 "code": model_failure_payload.get("code"),
                 "diagnostics": model_diagnostics if isinstance(model_diagnostics, dict) else {},
             }
+        if accounting is not None:
+            input_tokens = _as_int(accounting.get("input_tokens"), input_tokens)
+            output_tokens = _as_int(accounting.get("output_tokens"), output_tokens)
+            reasoning_tokens = _as_int(accounting.get("reasoning_tokens"), reasoning_tokens)
+            cache_read_tokens = _as_int(accounting.get("cache_read_tokens"), cache_read_tokens)
+            cache_write_tokens = _as_int(accounting.get("cache_write_tokens"), cache_write_tokens)
+            cache_tokens = cache_read_tokens + cache_write_tokens
+            length_finish_count = _as_int(
+                accounting.get("length_finish_count"), length_finish_count
+            )
+            deadline_converge_turns = _as_int(
+                accounting.get("deadline_converge_turns"), deadline_converge_turns
+            )
+            budget_converge_turns = _as_int(
+                accounting.get("budget_converge_turns"), budget_converge_turns
+            )
+            terminal_budget_turns = _as_int(
+                accounting.get("terminal_budget_turns"), terminal_budget_turns
+            )
+            converge_turns = _as_int(accounting.get("converge_turns"), converge_turns)
+            cost_micro_usd = _as_int(accounting.get("cost_micro_usd"), cost_micro_usd)
+            recorded_model_failure = accounting.get("model_failure")
+            if isinstance(recorded_model_failure, dict):
+                model_failure = recorded_model_failure
         limitations = output_result.get("limitations")
         if not isinstance(limitations, list):
             terminal = next((event for event in reversed(events)
@@ -1781,10 +2224,26 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "finish_reason": output_result.get("finishReason"),
             "limitations": limitations,
             "limitation_count": len(limitations),
-            "session_id": output_result.get("sessionId") or self._session_id(events, output_result),
-            "commands_executed": sum(event.get("type") in {"tool.completed", "tool.failed"} for event in events),
-            "tool_calls": sum(event.get("type") == "tool.requested" for event in events),
-            "model_turns": sum(event.get("type") == "model.started" for event in events),
+            "session_id": (
+                output_result.get("sessionId")
+                or (accounting or {}).get("session_id")
+                or self._session_id(events, output_result)
+            ),
+            "commands_executed": (
+                _as_int(accounting.get("commands_executed"), 0)
+                if accounting is not None
+                else sum(event.get("type") in {"tool.completed", "tool.failed"} for event in events)
+            ),
+            "tool_calls": (
+                _as_int(accounting.get("tool_calls"), 0)
+                if accounting is not None
+                else sum(event.get("type") == "tool.requested" for event in events)
+            ),
+            "model_turns": (
+                _as_int(accounting.get("model_turns"), 0)
+                if accounting is not None
+                else sum(event.get("type") == "model.started" for event in events)
+            ),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "reasoning_tokens": reasoning_tokens,
@@ -1795,12 +2254,24 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "reasoning_output_ratio": reasoning_tokens / output_tokens if output_tokens > 0 else None,
             "length_finish_count": length_finish_count,
             "converge_turns": converge_turns,
+            "deadline_converge_turns": deadline_converge_turns,
+            "budget_converge_turns": budget_converge_turns,
+            "terminal_budget_turns": terminal_budget_turns,
+            "manual_stop_count": manual_stop_count,
             "cost_usd": cost_micro_usd / 1_000_000,
-            "last_event": _bounded_event(events[-1]) if events else None,
-            "retry_count": sum(
-                "retry" in str(event.get("type", "")).lower()
-                or "retry" in str(_event_payload(event).get("status", "")).lower()
-                for event in events
+            "last_event": (
+                accounting.get("last_event")
+                if accounting is not None
+                else _bounded_event(events[-1]) if events else None
+            ),
+            "retry_count": (
+                _as_int(accounting.get("retry_count"), 0)
+                if accounting is not None
+                else sum(
+                    "retry" in str(event.get("type", "")).lower()
+                    or "retry" in str(_event_payload(event).get("status", "")).lower()
+                    for event in events
+                )
             ),
             "model_failure": model_failure,
             "network_mode_requested": self.network_mode,
@@ -1823,6 +2294,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         error_message: str | None,
         recorder: _OutputRecorder | None = None,
         process_cleanup: dict[str, Any] | None = None,
+        status: str = "timeout",
+        failure_kind: str = "timeout",
+        timed_out: bool = True,
+        termination_source: str = "adapter_timeout",
+        artifact_name: str = "timeout.json",
     ) -> tuple[pathlib.Path, pathlib.Path]:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         stdout = _bounded_utf8_text(_stdout_text(result), MAX_PARTIAL_ARTIFACT_CHARS)
@@ -1837,10 +2313,12 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         live_state = recorder.snapshot() if recorder is not None else {}
         last_event = live_state.get("last_event") or (events[-1] if events else self._last_trace_event(trace_path))
         state = {
-            "status": "timeout",
-            "timed_out": True,
-            "failure_kind": "timeout",
-            "message": error_message or "agent execution timed out",
+            "status": status,
+            "timed_out": timed_out,
+            "failure_kind": failure_kind,
+            "message": error_message or (
+                "agent execution timed out" if timed_out else "agent execution was cancelled"
+            ),
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "read_scope_effective": self.effective_read_scope,
@@ -1857,10 +2335,14 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "last_retry": live_state.get("last_retry"),
             "length_finish_count": live_state.get("length_finish_count", 0),
             "converge_turns": live_state.get("converge_turns", 0),
+            "deadline_converge_turns": live_state.get("deadline_converge_turns", 0),
+            "budget_converge_turns": live_state.get("budget_converge_turns", 0),
+            "terminal_budget_turns": live_state.get("terminal_budget_turns", 0),
+            "manual_stop_count": 0,
             "duration_ms": live_state.get("duration_ms", 0),
             "suspension_to_exit_ms": live_state.get("suspension_to_exit_ms"),
-            "terminal_origin": "adapter_timeout",
-            "termination_source": "adapter_timeout",
+            "terminal_origin": termination_source,
+            "termination_source": termination_source,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
             "stdout": _text_artifact_summary(stdout),
@@ -1868,7 +2350,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "process_cleanup": process_cleanup,
             "recorded_at": time.time(),
         }
-        (self.logs_dir / "timeout.json").write_text(
+        (self.logs_dir / artifact_name).write_text(
             json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
 
@@ -1876,10 +2358,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         summary = self._read_summary(summary_target)
         summary.update({
             "schema_version": max(1, _as_int(summary.get("schema_version"), 1)),
-            "status": "timeout",
-            "failure_kind": "timeout",
-            "last_error": error_message or "agent execution timed out",
-            "timeout": state,
+            "status": status,
+            "failure_kind": failure_kind,
+            "last_error": state["message"],
+            ("timeout" if timed_out else "interruption"): state,
             "last_event": last_event,
             "model_turns": state["model_turns"],
             "tool_calls": state["tool_calls"],
@@ -1888,6 +2370,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "last_retry": state["last_retry"],
             "length_finish_count": state["length_finish_count"],
             "converge_turns": state["converge_turns"],
+            "deadline_converge_turns": state["deadline_converge_turns"],
+            "budget_converge_turns": state["budget_converge_turns"],
+            "terminal_budget_turns": state["terminal_budget_turns"],
+            "manual_stop_count": state["manual_stop_count"],
             "duration_ms": state["duration_ms"],
             "suspension_to_exit_ms": state["suspension_to_exit_ms"],
             "terminal_origin": state["terminal_origin"],
@@ -1904,85 +2390,36 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         summary_target.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         trace_target = trace_path or (self.logs_dir / "trace.jsonl")
-        existing = trace_target.read_text(encoding="utf-8") if trace_target.is_file() else ""
-        if '"type": "run_timeout"' not in existing:
-            _append_bounded_jsonl(trace_target, {
-                "type": "run_timeout",
-                "occurredAt": time.time(),
-                "metadata": {"timeout": state},
-                "sigma_event": last_event,
-            }, MAX_TRACE_ARTIFACT_BYTES)
+        timeout_event = {
+            "type": "run_timeout" if timed_out else "run_cancelled",
+            "occurredAt": time.time(),
+            "payload": {
+                "status": status,
+                "message": state["message"],
+                "failure_kind": failure_kind,
+                "termination_source": termination_source,
+            },
+        }
+        if recorder is not None:
+            recorder.consume_event(timeout_event)
+            trace_target = recorder.finalize_trace()
+        else:
+            trace_spool = _BoundedJsonlSpool(
+                trace_target, MAX_TRACE_ARTIFACT_BYTES
+            )
+            for event in events:
+                trace_spool.append(_trace_record(event))
+            trace_spool.append(_trace_record(timeout_event))
+            trace_spool.finalize()
         return summary_target, trace_target
 
     def _trace_records(
         self,
         events: list[dict[str, Any]],
         summary: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
+    ) -> Iterator[dict[str, Any]]:
         for event in events:
-            event_type = event.get("type")
-            payload = _event_payload(event)
-            if event_type == "usage.recorded":
-                trace_type = "usage"
-                metadata = {"usage": {
-                    **payload,
-                    "cacheTokens": payload.get("cacheTokens", _as_int(payload.get("cacheReadTokens"), 0)
-                        + _as_int(payload.get("cacheWriteTokens"), 0)),
-                    "costUsd": payload.get("costUsd", _as_int(payload.get("costMicroUsd"), 0) / 1_000_000),
-                }}
-            elif event_type == "tool.started":
-                trace_type = "tool_start"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type in {"tool.completed", "tool.failed"}:
-                trace_type = "tool_end"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type == "model.started":
-                trace_type = "model_start"
-                metadata = payload
-            elif event_type in {"model.completed", "model.failed"}:
-                trace_type = "model_end"
-                metadata = payload
-            elif event_type in TERMINAL_EVENT_TYPES:
-                trace_type = "run_end"
-                result = {
-                    **payload,
-                    **({
-                        "status": summary.get("status"),
-                        "finishReason": summary.get("finish_reason"),
-                        "commands_executed": summary.get("commands_executed", 0),
-                        "input_tokens": summary.get("input_tokens", 0),
-                        "output_tokens": summary.get("output_tokens", 0),
-                        "reasoning_tokens": summary.get("reasoning_tokens", 0),
-                        "cache_tokens": summary.get("cache_tokens", 0),
-                        "cache_read_tokens": summary.get("cache_read_tokens", 0),
-                        "length_finish_count": summary.get("length_finish_count", 0),
-                        "converge_turns": summary.get("converge_turns", 0),
-                        "cost_usd": summary.get("cost_usd"),
-                        "duration_ms": summary.get("duration_ms", 0),
-                        "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
-                        "terminal_origin": summary.get("terminal_origin"),
-                        "execution_mode": summary.get("execution_mode"),
-                        "execution_backend": summary.get("execution_backend"),
-                        "container_engine": summary.get("container_engine"),
-                        "container_target": summary.get("container_target"),
-                        "target_image_id": summary.get("target_image_id"),
-                        "task_image_digest": summary.get("task_image_digest"),
-                        "agent_profile": summary.get("agent_profile"),
-                    } if summary is not None else {}),
-                }
-                metadata = {"result": result}
-            else:
-                trace_type = str(event_type or "event")
-                metadata = {"payload": payload}
-            records.append({
-                "type": trace_type,
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": metadata,
-                "sigma_event": event,
-            })
-        return records
+            yield _trace_record(event, summary)
 
     def _write_accounting_artifacts(
         self,
@@ -1997,10 +2434,12 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         if summary_path is not None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if trace_path is not None:
-            trace_path.write_text(
-                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in self._trace_records(events, summary)),
-                encoding="utf-8",
+            trace_spool = _BoundedJsonlSpool(
+                trace_path, MAX_TRACE_ARTIFACT_BYTES
             )
+            for record in self._trace_records(events, summary):
+                trace_spool.append(record)
+            trace_spool.finalize()
         return summary_path, trace_path
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -2392,6 +2831,10 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_cache_read_tokens": _json_number(summary, "cache_read_tokens"),
             "length_finish_count": _json_number(summary, "length_finish_count"),
             "converge_turns": _json_number(summary, "converge_turns"),
+            "deadline_converge_turns": _json_number(summary, "deadline_converge_turns"),
+            "budget_converge_turns": _json_number(summary, "budget_converge_turns"),
+            "terminal_budget_turns": _json_number(summary, "terminal_budget_turns"),
+            "manual_stop_count": _json_number(summary, "manual_stop_count"),
             "cost_usd": summary.get("cost_usd"),
             "duration_ms": _json_number(summary, "duration_ms"),
             "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
@@ -2521,6 +2964,10 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "n_cache_read_tokens": getattr(context, "n_cache_read_tokens", 0),
             "length_finish_count": getattr(context, "length_finish_count", 0),
             "converge_turns": getattr(context, "converge_turns", 0),
+            "deadline_converge_turns": getattr(context, "deadline_converge_turns", 0),
+            "budget_converge_turns": getattr(context, "budget_converge_turns", 0),
+            "terminal_budget_turns": getattr(context, "terminal_budget_turns", 0),
+            "manual_stop_count": getattr(context, "manual_stop_count", 0),
             "cost_usd": getattr(context, "cost_usd", None),
             "changed_app_files": [],
             "workspace_snapshots": [],

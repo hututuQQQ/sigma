@@ -1,4 +1,14 @@
-import type { JsonValue, ToolDescriptor, ToolReceipt, ToolRequest } from "agent-protocol";
+import { createHash } from "node:crypto";
+import path from "node:path";
+import type {
+  InputAccessEvidence,
+  JsonValue,
+  ToolCallPlan,
+  ToolDescriptor,
+  ToolExecutionContext,
+  ToolReceipt,
+  ToolRequest
+} from "agent-protocol";
 import {
   runProcess,
   repositoryTopology,
@@ -14,6 +24,8 @@ export type RepositoryStatisticsProvider = (
 export interface RepositoryProviderResult {
   output: string;
   diagnostics?: string[];
+  /** Trusted, normalized repository scope actually observed by the provider. */
+  accessPath: string;
 }
 
 export interface RepositoryListRequest {
@@ -76,9 +88,72 @@ function result(
   output: string,
   ok = true,
   diagnostics: string[] = [],
-  artifacts: string[] = []
+  artifacts: string[] = [],
+  evidence: InputAccessEvidence[] = []
 ): ToolReceipt {
-  return { callId: request.callId, ok, output, observedEffects: ["filesystem.read"], artifacts, diagnostics, startedAt, completedAt: new Date().toISOString() };
+  return {
+    callId: request.callId,
+    ok,
+    output,
+    observedEffects: ["filesystem.read"],
+    artifacts,
+    diagnostics,
+    evidence,
+    startedAt,
+    completedAt: new Date().toISOString()
+  };
+}
+
+function normalizedAccessPath(value: string): string {
+  const portable = value.replaceAll("\\", "/");
+  const normalized = path.posix.normalize(portable);
+  if (path.posix.isAbsolute(portable) || path.win32.isAbsolute(value)
+    || normalized === ".." || normalized.startsWith("../")) {
+    throw Object.assign(new Error(`Repository provider returned an invalid access path: ${value}`), {
+      code: "repository_access_path_invalid"
+    });
+  }
+  return normalized === "" ? "." : normalized;
+}
+
+function repositoryReadPlan(accessPath: string): ToolCallPlan {
+  return {
+    exactEffects: ["filesystem.read"],
+    readPaths: [normalizedAccessPath(accessPath)],
+    writePaths: [],
+    network: "none",
+    processMode: "none",
+    checkpointScope: [],
+    idempotence: "read_only"
+  };
+}
+
+function structuredReadEvidence(
+  request: ToolRequest,
+  context: Pick<ToolExecutionContext, "sessionId" | "runId">,
+  accessPath: string,
+  output: string,
+  summary: string
+): InputAccessEvidence {
+  const sha256 = createHash("sha256").update(output, "utf8").digest("hex");
+  const byteLength = Buffer.byteLength(output, "utf8");
+  return {
+    evidenceId: `input-access:${request.callId}`,
+    sessionId: context.sessionId,
+    runId: context.runId,
+    kind: "input_access",
+    status: "passed",
+    createdAt: new Date().toISOString(),
+    producer: { authority: "tool", id: request.callId },
+    summary,
+    data: {
+      path: normalizedAccessPath(accessPath),
+      scope: "workspace",
+      sha256,
+      byteLength,
+      selection: { kind: "structured_result", sha256, byteLength }
+    }
+  };
 }
 
 const listGlobCharacterLimit = 512;
@@ -95,7 +170,10 @@ function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
         limit: { type: "integer", minimum: 1, maximum: maximumListEntries }
       },
       contextPathArguments: ["path"],
-      possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
+      possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000,
+      prepare(argumentsValue) {
+        return repositoryReadPlan(text(object(argumentsValue), "path", "."));
+      }
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
@@ -127,7 +205,21 @@ function listTool(listProvider: RepositoryListProvider): RegisteredEffectTool {
         }
         throw error;
       }
-      return result(request, startedAt, listing.output, true, listing.diagnostics ?? []);
+      return result(
+        request,
+        startedAt,
+        listing.output,
+        true,
+        listing.diagnostics ?? [],
+        [],
+        [structuredReadEvidence(
+          request,
+          context,
+          listing.accessPath,
+          listing.output,
+          `Listed repository input '${listing.accessPath}'.`
+        )]
+      );
     }
   };
 }
@@ -138,12 +230,27 @@ function repositoryStatsTool(statisticsProvider: RepositoryStatisticsProvider): 
       name: "repository_stats",
       description: "Count accepted source files and physical/non-blank text lines from one repository snapshot by language and bounded top-level directory groups without starting a process; returns scope, read limits, and completeness, and exposes no partial aggregates when its deadline is reached.",
       properties: {}, possibleEffects: ["filesystem.read"], executionMode: "parallel",
-      resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000
+      resourceKeys: [], approval: "auto", idempotent: true, timeoutMs: 45_000,
+      prepare() { return repositoryReadPlan("."); }
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
       const statistics = await statisticsProvider(context.workspacePath, context.signal);
-      return result(request, startedAt, statistics.output, true, statistics.diagnostics ?? []);
+      return result(
+        request,
+        startedAt,
+        statistics.output,
+        true,
+        statistics.diagnostics ?? [],
+        [],
+        [structuredReadEvidence(
+          request,
+          context,
+          statistics.accessPath,
+          statistics.output,
+          "Read repository statistics snapshot."
+        )]
+      );
     }
   };
 }
@@ -159,7 +266,10 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
         limit: { type: "integer", minimum: 1, maximum: maximumSearchMatches }
       },
       required: ["query"], possibleEffects: ["filesystem.read"], executionMode: "parallel", resourceKeys: [],
-      contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 45_000
+      contextPathArguments: ["path"], approval: "auto", idempotent: true, timeoutMs: 45_000,
+      prepare(argumentsValue) {
+        return repositoryReadPlan(text(object(argumentsValue), "path", "."));
+      }
     }),
     async execute(request, context) {
       const startedAt = new Date().toISOString();
@@ -174,7 +284,21 @@ function grepTool(searchProvider: RepositoryTextSearchProvider): RegisteredEffec
         context.signal,
         { query, path: searchPath, glob, regex, limit }
       );
-      return result(request, startedAt, search.output, true, search.diagnostics ?? []);
+      return result(
+        request,
+        startedAt,
+        search.output,
+        true,
+        search.diagnostics ?? [],
+        [],
+        [structuredReadEvidence(
+          request,
+          context,
+          search.accessPath,
+          search.output,
+          `Searched repository input '${search.accessPath}'.`
+        )]
+      );
     }
   };
 }

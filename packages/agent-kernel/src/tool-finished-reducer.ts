@@ -68,7 +68,7 @@ export const toolFinished: KernelEventReducer = (state, event) => {
           ...advisedState,
           messages: [...advisedState.messages, {
             role: "developer" as const,
-            content: "[no_progress] Semantically similar tool actions have now completed twice without trusted workspace, validation, process, plan, or evidence progress. Do not repeat the same action again unless relevant state changes; choose a materially different action, repair the blocker, or finish with the appropriate terminal outcome."
+            content: "[no_progress] Tool actions have now completed twice without trusted workspace, newly accessed input, validation, review, process, plan, or checkpoint progress. Exactly one focused action remains before terminal-only convergence. Parameter, command-text, artifact-ID, or diagnostic-output variation is not progress; produce a trusted state change, repair the blocker, validate, or finish."
           }]
         };
       })()

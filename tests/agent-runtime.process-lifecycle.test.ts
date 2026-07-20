@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type {
   AgentEventType,
@@ -8,7 +11,12 @@ import type {
 } from "../packages/agent-protocol/src/index.js";
 import { createKernelState } from "../packages/agent-kernel/src/index.js";
 import { completionFailure } from "../packages/agent-runtime/src/effect-helpers.js";
-import { terminateRunProcesses } from "../packages/agent-runtime/src/process-cleanup.js";
+import {
+  settleRunProcessesAndScratch,
+  terminateRunProcesses
+} from "../packages/agent-runtime/src/process-cleanup.js";
+import { RuntimeCommandHandler } from "../packages/agent-runtime/src/runtime-command-handler.js";
+import { releaseRuntimeSession } from "../packages/agent-runtime/src/release-session.js";
 import { finishRuntimeSession } from "../packages/agent-runtime/src/runtime-session-finish.js";
 import type { ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import {
@@ -60,6 +68,32 @@ function recorder(): {
     emit: async (_session, type, _authority, payload) => {
       events.push({ type, payload });
       return {} as Awaited<ReturnType<Parameters<typeof recordProcessReceipt>[4]>>;
+    }
+  };
+}
+
+async function scratchFixture(): Promise<{
+  execution: ProcessExecutionPort;
+  marker: string;
+  releases: string[];
+  root: string;
+}> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sigma-runtime-scratch-lifecycle-"));
+  const scratch = path.join(root, "scratch");
+  const marker = path.join(scratch, "persistent.txt");
+  await mkdir(scratch);
+  await writeFile(marker, "retained across runs", "utf8");
+  const releases: string[] = [];
+  return {
+    root,
+    marker,
+    releases,
+    execution: {
+      execute: async () => { throw new Error("not used"); },
+      releaseScratchLease: async (releasedSessionId) => {
+        releases.push(releasedSessionId);
+        await rm(scratch, { recursive: true, force: true });
+      }
     }
   };
 }
@@ -264,6 +298,83 @@ describe("durable process lifecycle events", () => {
         }
       }
     ]);
+  });
+
+  it("retains RuntimeSession scratch across completion and a follow-up run", async () => {
+    const target = runtimeSessionFixture({ sessionId: "scratch-follow-up" });
+    const scratch = await scratchFixture();
+    try {
+      await settleRunProcessesAndScratch(target, {
+        kind: "completed", message: "first run complete", evidence: []
+      }, scratch.execution, recorder().emit);
+      target.durable.state.phase = "terminal";
+      target.recovery.lastOutcome = {
+        kind: "completed", message: "first run complete", evidence: []
+      };
+      const start = vi.fn();
+      const handler = new RuntimeCommandHandler({
+        runDeadlineMs: 60_000,
+        commandBus: { claim: async () => undefined } as never,
+        cancelChildren: undefined,
+        emit: recorder().emit,
+        finish: async () => true,
+        start
+      });
+
+      await handler.followUp(target, {
+        type: "follow_up", sessionId: target.identity.sessionId, text: "continue"
+      });
+
+      await expect(readFile(scratch.marker, "utf8")).resolves.toBe("retained across runs");
+      expect(scratch.releases).toEqual([]);
+      expect(start).toHaveBeenCalledOnce();
+    } finally {
+      await rm(scratch.root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases RuntimeSession scratch when the user explicitly cancels", async () => {
+    const target = runtimeSessionFixture({ sessionId: "scratch-cancel" });
+    const scratch = await scratchFixture();
+    try {
+      const handler = new RuntimeCommandHandler({
+        runDeadlineMs: 60_000,
+        commandBus: { claim: async () => undefined } as never,
+        cancelChildren: undefined,
+        emit: recorder().emit,
+        finish: async (session, outcome) => {
+          await settleRunProcessesAndScratch(session, outcome, scratch.execution, recorder().emit);
+          return true;
+        },
+        start: () => undefined
+      });
+
+      await handler.cancel(target, {
+        type: "cancel", sessionId: target.identity.sessionId, reason: "stop"
+      });
+
+      await expect(readFile(scratch.marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(scratch.releases).toEqual([target.identity.sessionId]);
+    } finally {
+      await rm(scratch.root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases RuntimeSession scratch when the session is destroyed", async () => {
+    const target = runtimeSessionFixture({ sessionId: "scratch-release" });
+    const scratch = await scratchFixture();
+    try {
+      await releaseRuntimeSession(
+        target,
+        async () => undefined,
+        async () => await scratch.execution.releaseScratchLease?.(target.identity.sessionId)
+      );
+
+      await expect(readFile(scratch.marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(scratch.releases).toEqual([target.identity.sessionId]);
+    } finally {
+      await rm(scratch.root, { recursive: true, force: true });
+    }
   });
 
   it("does not terminate processes for a stale outcome revision", async () => {

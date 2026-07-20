@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
@@ -16,10 +16,10 @@ use std::process::{Command, Stdio};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND, FILETIME, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_ALL,
+    GENERIC_EXECUTE, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GRANT_ACCESS, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
@@ -32,13 +32,14 @@ use windows_sys::Win32::Security::Isolation::{
     DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
-    AddAccessAllowedAceEx, AddAce, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+    AclSizeInformation, AddAccessAllowedAceEx, AddAce, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
     DACL_SECURITY_INFORMATION, DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, INHERITED_ACE, InitializeAcl,
-    InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-    SE_DACL_PROTECTED, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
-    SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAnyPackageSid,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, INHERIT_ONLY_ACE, INHERITED_ACE,
+    InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_CAPABILITIES,
+    SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAnyPackageSid,
     WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
@@ -97,6 +98,7 @@ const MAX_RECOVERY_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECOVERY_ENTRIES: usize = 100_000;
 const MAX_RECOVERY_SCAN_DEPTH: usize = 256;
 const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE_VALUE: u8 = 1;
 const SANDBOX_REPARSE_TARGET_UNRESOLVABLE: &str = "sandbox_reparse_target_unresolvable";
 static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -247,7 +249,15 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
     // tree preflight. The launcher repeats this check before any ACL mutation
     // and again immediately before CreateProcess, preserving defense in depth.
     resolve_executable(params)?;
-    validate_writable_acl_roots(params)?;
+    if params.policy.disposable_workspace_authorized_root.is_some() {
+        validate_disposable_workspace_roots(params)?;
+    } else if !params.policy.repository_metadata_roots.is_empty() {
+        // BrokerState already consumed and topology-checked the one-use
+        // repository capability. The mixed ACL planner keeps non-metadata
+        // protected paths (notably .agent) read-only in the writable tree.
+    } else {
+        validate_writable_acl_roots(params)?;
+    }
     let failure_nonce = secure_nonce("launch failure marker")?;
     let payload = serde_json::to_vec(&LauncherBootstrap {
         params: params.clone(),
@@ -288,6 +298,7 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
         bootstrap_stdin: bootstrap,
         protected_path_guards: Vec::new(),
         launch_failure_nonce: Some(failure_nonce),
+        disposable_workspace: None,
     })
 }
 
@@ -300,7 +311,7 @@ fn validate_writable_acl_roots(params: &ProcessParams) -> Result<(), RpcError> {
             .into_iter()
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
-    let protected = canonical_protected(&protected, &write)?;
+    let protected = repository_filtered_protected(params, canonical_protected(&protected, &write)?);
     for root in &write {
         inspect_acl_target_path(root, Some(root))?;
         if protected.iter().any(|item| windows_path_within(root, item)) {
@@ -312,6 +323,40 @@ fn validate_writable_acl_roots(params: &ProcessParams) -> Result<(), RpcError> {
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_disposable_workspace_roots(params: &ProcessParams) -> Result<(), RpcError> {
+    let authorized = params
+        .policy
+        .disposable_workspace_authorized_root
+        .as_ref()
+        .ok_or_else(|| RpcError::new("policy_denied", "disposable workspace is not authorized"))?;
+    let authorized = canonicalize_policy_root(authorized)?;
+    let read = canonical_unique(&params.policy.read_roots)?;
+    let write = canonical_unique(&params.policy.write_roots)?;
+    let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
+    let cwd = canonicalize_policy_root(&params.command.cwd)?;
+    if !windows_path_within(&authorized, &cwd)
+        || !read.iter().any(|root| root == &authorized)
+        || !write.iter().any(|root| root == &authorized)
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "disposable workspace capability is not bound to cwd and exact read/write roots",
+        ));
+    }
+    if write.iter().any(|root| {
+        root != &authorized
+            && !scratch
+                .iter()
+                .any(|scratch_root| windows_path_within(scratch_root, root))
+    }) {
+        return Err(RpcError::new(
+            "policy_denied",
+            "disposable workspace cannot carry an external durable write root",
+        ));
     }
     Ok(())
 }
@@ -410,10 +455,34 @@ fn run_launcher_with_params(params: ProcessParams) -> Result<i32, RpcError> {
     // writer from inside the sandbox.
     let granted = {
         let _acl_transaction = RecoveryMutex::acquire(&recovery)?;
-        grant_root_lease_access(&params, profile.sid, &user_profile, &mut journal)
+        if params.policy.disposable_workspace_authorized_root.is_some()
+            || !params.policy.repository_metadata_roots.is_empty()
+        {
+            grant_policy_access(&params, profile.sid, &user_profile, &mut journal)
+        } else {
+            grant_root_lease_access(&params, profile.sid, &user_profile, &mut journal)
+        }
     };
     let result = match granted {
-        Ok(()) => launch_appcontainer(&params, profile.sid),
+        Ok(preauthorized) => {
+            let recheck = preauthorized.into_iter().try_for_each(|path| {
+                if existing_lpac_read_execute(&path)? {
+                    Ok(())
+                } else {
+                    Err(RpcError::new(
+                        "sandbox_reparse_target_changed",
+                        format!(
+                            "preauthorized LPAC read/execute access changed before launch: '{}'",
+                            path.display()
+                        ),
+                    ))
+                }
+            });
+            match recheck {
+                Ok(()) => launch_appcontainer(&params, profile.sid),
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     };
     // Cleanup is deliberately delegated to the broker's outer PlatformGuard.
@@ -904,7 +973,7 @@ fn grant_root_lease_access(
     sid: PSID,
     user_profile: &Path,
     journal: &mut RecoveryJournal,
-) -> Result<(), RpcError> {
+) -> Result<Vec<PathBuf>, RpcError> {
     let mut readable = params.policy.read_roots.clone();
     readable.extend(params.policy.execution_roots.iter().cloned());
     let declared_read = canonical_unique(&readable)?;
@@ -916,9 +985,14 @@ fn grant_root_lease_access(
             .into_iter()
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
-    let protected = canonical_protected(&protected, &write)?;
+    let protected = repository_filtered_protected(params, canonical_protected(&protected, &write)?);
     let mut plan = Vec::new();
+    let mut preauthorized = Vec::new();
     for path in policy_ancestor_paths(params, user_profile)? {
+        if existing_lpac_read_execute(&path)? {
+            preauthorized.push(path);
+            continue;
+        }
         plan.push(PlannedAcl {
             path,
             permissions: FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -929,6 +1003,10 @@ fn grant_root_lease_access(
         });
     }
     for root in read {
+        if existing_lpac_read_execute(&root)? {
+            preauthorized.push(root.clone());
+            continue;
+        }
         let Some((directory, reparse_target)) =
             inspect_read_acl_target_path(&root, &declared_read)?
         else {
@@ -968,16 +1046,16 @@ fn grant_root_lease_access(
     }
     journal.snapshot.product = ROOT_LEASE_RECOVERY_PRODUCT.into();
     journal.prepare(&plan, sid)?;
-    journal.apply(&plan, sid)
+    journal.apply(&plan, sid)?;
+    Ok(preauthorized)
 }
 
-#[allow(dead_code)]
 fn grant_policy_access(
     params: &ProcessParams,
     sid: PSID,
     user_profile: &Path,
     journal: &mut RecoveryJournal,
-) -> Result<(), RpcError> {
+) -> Result<Vec<PathBuf>, RpcError> {
     let workspace_read = canonical_unique(&params.policy.read_roots)?;
     let mut read_and_execute = params.policy.read_roots.clone();
     read_and_execute.extend(params.policy.execution_roots.iter().cloned());
@@ -986,7 +1064,12 @@ fn grant_policy_access(
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
     let mut plan = Vec::new();
     let mut planned_objects = 0;
+    let mut preauthorized = Vec::new();
     for path in policy_ancestor_paths(params, user_profile)? {
+        if existing_lpac_read_execute(&path)? {
+            preauthorized.push(path);
+            continue;
+        }
         plan.push(PlannedAcl {
             path,
             permissions: FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -997,14 +1080,25 @@ fn grant_policy_access(
         });
     }
     for path in &read {
-        plan_read_tree(
-            path,
-            &declared_read,
-            &write,
-            &mut plan,
-            &mut planned_objects,
-            0,
-        )?;
+        if write.iter().any(|root| windows_path_within(root, path)) {
+            continue;
+        }
+        if existing_lpac_read_execute(path)? {
+            preauthorized.push((*path).clone());
+            continue;
+        }
+        let Some((directory, reparse_target)) = inspect_read_acl_target_path(path, &declared_read)?
+        else {
+            continue;
+        };
+        plan.push(PlannedAcl {
+            path: path.clone(),
+            permissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            inherit: directory && reparse_target.is_none(),
+            propagate_inheritance: directory && reparse_target.is_none(),
+            read_reparse_target: reparse_target,
+            writable_root: None,
+        });
     }
     let mut protected = params.policy.protected_paths.clone();
     protected.extend(
@@ -1012,8 +1106,25 @@ fn grant_policy_access(
             .into_iter()
             .flat_map(|root| [root.join(".git"), root.join(".agent")]),
     );
-    let protected = canonical_protected(&protected, &write)?;
+    let protected = repository_filtered_protected(params, canonical_protected(&protected, &write)?);
     for path in &write {
+        if params
+            .policy
+            .session_scratch_roots
+            .iter()
+            .any(|root| windows_path_within(root, path))
+        {
+            let directory = inspect_acl_target_path(path, Some(path))?;
+            plan.push(PlannedAcl {
+                path: path.clone(),
+                permissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+                inherit: directory,
+                propagate_inheritance: directory,
+                read_reparse_target: None,
+                writable_root: directory.then_some(path.clone()),
+            });
+            continue;
+        }
         plan_write_tree(
             path,
             path,
@@ -1025,7 +1136,8 @@ fn grant_policy_access(
         )?;
     }
     journal.prepare(&plan, sid)?;
-    journal.apply(&plan, sid)
+    journal.apply(&plan, sid)?;
+    Ok(preauthorized)
 }
 
 fn policy_ancestor_paths(
@@ -1173,11 +1285,13 @@ fn plan_write_tree(
         }
         return Ok(());
     }
-    let has_protected_descendant = protected.iter().any(|item| windows_path_within(path, item));
     plan.push(PlannedAcl {
         path: path.to_owned(),
         permissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        inherit: !has_protected_descendant && is_directory,
+        // NtSetSecurityObject installs the inheritable ACE without tree
+        // propagation. Existing protected descendants receive their own
+        // explicit read-only ACE; future ordinary build outputs inherit RW.
+        inherit: is_directory,
         // Existing descendants are each journaled and receive their own
         // explicit ACE. NtSetSecurityObject avoids creating unjournaled
         // inherited ACEs while preserving inheritance for future children.
@@ -1228,6 +1342,7 @@ fn plan_read_tree_within_write_root(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn plan_read_tree(
     path: &Path,
     read_roots: &[PathBuf],
@@ -1372,6 +1487,24 @@ fn canonical_protected(
     Ok(result)
 }
 
+fn repository_filtered_protected(params: &ProcessParams, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            !params
+                .policy
+                .repository_metadata_roots
+                .iter()
+                .any(|root| windows_path_within(root, path))
+                && !params
+                    .policy
+                    .session_scratch_roots
+                    .iter()
+                    .any(|root| windows_path_within(root, path))
+        })
+        .collect()
+}
+
 fn canonical_unique(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -1459,9 +1592,166 @@ fn open_acl_target(path: &Path) -> Result<OwnedHandle, RpcError> {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(last_error("CreateFileW(ACL target)"));
+        let error = last_error("CreateFileW(ACL target)");
+        return Err(RpcError::new(
+            error.code,
+            format!("{} for '{}'", error.message, path.display()),
+        ));
     }
     Ok(OwnedHandle(handle))
+}
+
+#[repr(C)]
+struct RestrictedApplicationPackagesSid {
+    revision: u8,
+    sub_authority_count: u8,
+    identifier_authority: [u8; 6],
+    sub_authorities: [u32; 2],
+}
+
+fn file_access_mask(mask: u32) -> u32 {
+    let mut mapped = mask;
+    if mask & GENERIC_ALL != 0 {
+        mapped |= u32::MAX;
+    }
+    if mask & GENERIC_READ != 0 {
+        mapped |= FILE_GENERIC_READ;
+    }
+    if mask & GENERIC_EXECUTE != 0 {
+        mapped |= FILE_GENERIC_EXECUTE;
+    }
+    mapped
+}
+
+/// Prove that an immutable system/runtime object already grants the LPAC
+/// restricting SID read+execute. This is the only case where a read root may
+/// bypass DACL mutation. Any deny ACE is treated conservatively as blocking.
+pub(crate) fn existing_lpac_read_execute(path: &Path) -> Result<bool, RpcError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(RpcError::from)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(false);
+    }
+    let path_wide = wide_null(path.as_os_str());
+    let mutable = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if mutable != INVALID_HANDLE_VALUE {
+        unsafe { CloseHandle(mutable) };
+        return Ok(false);
+    }
+    let mutable_error = unsafe { GetLastError() };
+    if mutable_error != ERROR_ACCESS_DENIED {
+        return Err(win32_code_error(
+            "CreateFileW(existing LPAC immutability proof)",
+            mutable_error,
+        ));
+    }
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_ACCESS_DENIED {
+            return Ok(false);
+        }
+        return Err(win32_code_error(
+            "CreateFileW(existing LPAC read proof)",
+            error,
+        ));
+    }
+    let handle = OwnedHandle(handle);
+    let mut acl = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(win32_code_error(
+            "GetSecurityInfo(existing LPAC read proof)",
+            status,
+        ));
+    }
+    let result = (|| {
+        if acl.is_null() {
+            return Ok(true);
+        }
+        let mut information = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                acl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error("GetAclInformation(existing LPAC read proof)"));
+        }
+        let restricted = RestrictedApplicationPackagesSid {
+            revision: 1,
+            sub_authority_count: 2,
+            identifier_authority: [0, 0, 0, 0, 0, 15],
+            sub_authorities: [2, 2],
+        };
+        let restricted_sid = (&restricted as *const RestrictedApplicationPackagesSid)
+            .cast_mut()
+            .cast::<c_void>();
+        let desired = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        let mut allowed = 0_u32;
+        for index in 0..information.AceCount {
+            let mut raw_ace = null_mut();
+            if unsafe { GetAce(acl, index, &mut raw_ace) } == 0 {
+                return Err(last_error("GetAce(existing LPAC read proof)"));
+            }
+            let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            if header.AceType == ACCESS_DENIED_ACE_TYPE_VALUE {
+                let denied = unsafe { &*raw_ace.cast::<ACCESS_DENIED_ACE>() };
+                if file_access_mask(denied.Mask) & desired != 0 {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE_VALUE {
+                continue;
+            }
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            if unsafe { EqualSid(sid, restricted_sid) } != 0 {
+                allowed |= file_access_mask(ace.Mask);
+            }
+        }
+        Ok(allowed & desired == desired)
+    })();
+    unsafe { LocalFree(descriptor) };
+    result
 }
 
 fn open_recovery_root_for_scan(path: &Path) -> Result<OwnedHandle, RpcError> {
@@ -4390,34 +4680,7 @@ fn pin_executable(
         ));
     }
     if let Some(expected) = expected_sha256 {
-        let mut file = std::fs::File::open(&executable).map_err(|error| {
-            RpcError::new(
-                "executable_unavailable",
-                format!(
-                    "cannot read pinned executable '{}': {error}",
-                    executable.display()
-                ),
-            )
-        })?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).map_err(|error| {
-                RpcError::new(
-                    "executable_unavailable",
-                    format!(
-                        "cannot hash pinned executable '{}': {error}",
-                        executable.display()
-                    ),
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-        }
-        let actual_digest = format!("{:x}", digest.finalize());
-        if actual_digest != expected {
+        if sha256_executable_handle(handle.0, &executable)? != expected {
             return Err(RpcError::new(
                 "executable_unavailable",
                 format!(
@@ -4428,6 +4691,49 @@ fn pin_executable(
         }
     }
     Ok(handle)
+}
+
+fn sha256_executable_handle(handle: HANDLE, path: &Path) -> Result<String, RpcError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let mut count = 0_u32;
+        if unsafe {
+            ReadFile(
+                handle,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut count,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot hash pinned executable '{}': {}",
+                    path.display(),
+                    last_error("ReadFile(pinned executable)").message
+                ),
+            ));
+        }
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count as usize]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn pinned_executable_sha256(path: &Path) -> Result<String, RpcError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        RpcError::new(
+            "executable_unavailable",
+            format!("cannot resolve executable '{}': {error}", path.display()),
+        )
+    })?;
+    let handle = pin_executable(&canonical, None)?;
+    sha256_executable_handle(handle.0, &canonical)
 }
 
 fn authorize_executable(params: &ProcessParams, executable: &Path) -> Result<(), RpcError> {
@@ -4714,6 +5020,14 @@ fn self_test() -> Result<(), RpcError> {
             execution_roots: Vec::new(),
             executable_sha256: None,
             protected_paths: vec![root.join(".git"), root.join(".agent")],
+            disposable_workspace_root: None,
+            read_only_validation_workspace_root: None,
+            repository_metadata_lease_id: None,
+            scratch_lease_id: None,
+            scratch_session_id: None,
+            repository_metadata_roots: Vec::new(),
+            session_scratch_roots: Vec::new(),
+            disposable_workspace_authorized_root: None,
             #[cfg(test)]
             unsafe_host_exec_approved: false,
         },
@@ -5098,6 +5412,29 @@ mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Security::WinWorldSid;
+
+    #[test]
+    fn immutable_system_runtime_requires_existing_lpac_read_execute_access() {
+        let command = verified_cmd_executable().expect("resolve the verified system command");
+        assert!(
+            existing_lpac_read_execute(&command).expect("inspect system command ACL"),
+            "the verified AppContainer command must already grant LPAC read/execute"
+        );
+
+        let unique = ephemeral_profile_name()
+            .expect("create LPAC ACL fixture name")
+            .replace('.', "-");
+        let root = std::env::temp_dir().join(format!("sigma-lpac-existing-acl-{unique}"));
+        let mutable = root.join("git.exe");
+        std::fs::create_dir(&root).expect("create mutable runtime fixture");
+        std::fs::write(&mutable, b"untrusted").expect("create mutable executable fixture");
+        assert!(
+            !existing_lpac_read_execute(&mutable).expect("inspect mutable fixture ACL"),
+            "a caller-mutable executable must never bypass the DACL lease"
+        );
+        std::fs::remove_file(&mutable).expect("remove mutable executable fixture");
+        std::fs::remove_dir(&root).expect("remove mutable runtime fixture");
+    }
 
     fn world_sid() -> Vec<u8> {
         let mut sid = vec![0_u8; 68];
@@ -6462,6 +6799,14 @@ mod tests {
                 execution_roots,
                 executable_sha256: None,
                 protected_paths: Vec::new(),
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                repository_metadata_lease_id: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                repository_metadata_roots: Vec::new(),
+                session_scratch_roots: Vec::new(),
+                disposable_workspace_authorized_root: None,
                 unsafe_host_exec_approved: false,
             },
             max_output_bytes: 1_024,
@@ -6525,6 +6870,14 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::new(),
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                repository_metadata_lease_id: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                repository_metadata_roots: Vec::new(),
+                session_scratch_roots: Vec::new(),
+                disposable_workspace_authorized_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },

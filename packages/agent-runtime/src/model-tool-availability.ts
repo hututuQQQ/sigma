@@ -1,14 +1,16 @@
 import type {
   JsonValue,
   ModelToolCall,
+  ToolCallPlan,
   ToolDescriptor,
   ToolReceipt
 } from "agent-protocol";
-import type { PendingTool } from "agent-kernel";
+import type { ActiveModelTurn, PendingTool } from "agent-kernel";
 import { assertDescriptorArguments } from "agent-tools";
 import { failed } from "./tool-receipt.js";
 import { capabilityRetryExhausted } from "./capability-failure-convergence.js";
 import type { RuntimeSession } from "./types.js";
+import { terminalOnlyToolDescriptor, terminalOnlyToolEffects } from "./terminal-tool-policy.js";
 
 const PROCESS_CONTROL_TOOLS = new Set([
   "process_poll", "process_write", "process_terminate", "process_handoff"
@@ -33,6 +35,64 @@ function objectArguments(value: JsonValue): Record<string, JsonValue> | undefine
 function pendingForCall(session: RuntimeSession, call: ModelToolCall): PendingTool | undefined {
   return session.durable.state.pendingTools.find((pending) =>
     pending.request.callId === call.id && pending.request.name === call.name);
+}
+
+/** Re-check the runtime-authored model-turn capability at the transaction
+ * boundary. This is intentionally redundant with the kernel reducer: restored
+ * or malformed pending work must not become executable merely because it
+ * bypassed the normal model.completed transition. */
+export function modelTurnToolPolicyFailure(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  descriptor: ToolDescriptor,
+  modelTurn: ActiveModelTurn,
+  startedAt: string
+): ToolReceipt | undefined {
+  const pending = pendingForCall(session, call);
+  if (pending?.origin !== "model") return undefined;
+  const boundTurn = pending.modelTurn;
+  const policy = boundTurn.toolPolicy;
+  const sameTurn = boundTurn.turnId === modelTurn.turnId
+    && boundTurn.effectRevision === modelTurn.effectRevision;
+  const authorized = sameTurn && policy?.allowedToolNames.includes(call.name) === true
+    && (!policy.terminalOnly || terminalOnlyToolDescriptor(descriptor));
+  if (authorized) return undefined;
+  return failed(
+    call,
+    startedAt,
+    `Tool '${call.name}' was not authorized by the runtime-bound policy for its originating model turn and was not started.`,
+    "tool_not_authorized_for_turn",
+    { status: "rejected", code: "tool_not_authorized_for_turn" }
+  );
+}
+
+/** Dynamic planning can narrow an effect envelope, but it must never widen a
+ * terminal-only model turn. Re-check the exact plan before emitting any tool
+ * lifecycle event or entering approval/execution. */
+export function modelTurnToolPlanPolicyFailure(
+  session: RuntimeSession,
+  call: ModelToolCall,
+  plan: ToolCallPlan,
+  modelTurn: ActiveModelTurn,
+  startedAt: string
+): ToolReceipt | undefined {
+  const pending = pendingForCall(session, call);
+  if (pending?.origin !== "model") return undefined;
+  const boundTurn = pending.modelTurn;
+  const policy = boundTurn.toolPolicy;
+  if (policy?.terminalOnly !== true) return undefined;
+  const sameTurn = boundTurn.turnId === modelTurn.turnId
+    && boundTurn.effectRevision === modelTurn.effectRevision;
+  const authorized = sameTurn && policy.allowedToolNames.includes(call.name)
+    && terminalOnlyToolEffects(plan.exactEffects);
+  if (authorized) return undefined;
+  return failed(
+    call,
+    startedAt,
+    `Tool '${call.name}' planned non-terminal effects for a terminal-only model turn and was not started.`,
+    "tool_not_authorized_for_turn",
+    { status: "rejected", code: "tool_not_authorized_for_turn" }
+  );
 }
 
 /** State-dependent tools are absent until the durable resource that they

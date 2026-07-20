@@ -25,7 +25,7 @@ import {
   type ValidationRequirementV1
 } from "agent-protocol";
 import { emptyMutationFrontier } from "./mutation-frontier.js";
-
+import { validConvergenceStageHighWater, validFrozenState } from "./state-validation.js";
 export type KernelPhase =
   | "idle"
   | "ready_model"
@@ -39,6 +39,15 @@ export type KernelPhase =
 export interface ActiveModelTurn {
   turnId: number;
   effectRevision: number;
+  /** Runtime-authored snapshot of the tools actually projected into this
+   * provider request. Missing on legacy/interrupted turns and therefore never
+   * authorizes a model-authored tool call. */
+  toolPolicy?: ModelTurnToolPolicyV1;
+}
+
+export interface ModelTurnToolPolicyV1 {
+  allowedToolNames: string[];
+  terminalOnly: boolean;
 }
 
 export interface PendingTool {
@@ -93,6 +102,14 @@ export type CompletionRepairState =
       modelTurn: ActiveModelTurn;
     };
 
+export interface ConvergenceStageHighWaterV1 {
+  runId: string;
+  deadline: "normal" | "converge" | "stop";
+  /** Capacity/deadline-derived budget pressure only. Transient action debt is
+   * intentionally excluded so trusted progress can recover after restore. */
+  budget: "normal" | "converge" | "terminal";
+}
+
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
   sessionId: string;
@@ -108,6 +125,9 @@ export interface KernelState {
   validationRequirement?: ValidationRequirementV1;
   /** Active runtime milliseconds preserved while waiting for explicit user approval. */
   deadlineRemainingMs?: number;
+  /** Durable resource high-water mark recorded by deadline.stage diagnostics.
+   * It is optional for replay compatibility and resets only at a run boundary. */
+  convergenceStageHighWater?: ConvergenceStageHighWaterV1;
   activeModelTurn?: ActiveModelTurn;
   /** True once any content or reasoning from the active provider attempt is durable. */
   activeModelSemanticDelta?: boolean;
@@ -177,6 +197,11 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     lastSeq: 0,
     startedAt: options.startedAt,
     deadlineAt: options.deadlineAt,
+    convergenceStageHighWater: {
+      runId: options.runId,
+      deadline: "normal",
+      budget: "normal"
+    },
     messages: [],
     pendingTools: [],
     toolCallIds: [],
@@ -213,6 +238,26 @@ function validDeadlineState(state: Record<string, unknown>): boolean {
 
 function nonNegativeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+export function isModelTurnToolPolicy(value: unknown): value is ModelTurnToolPolicyV1 {
+  const policy = record(value);
+  if (!policy || typeof policy.terminalOnly !== "boolean"
+    || !Array.isArray(policy.allowedToolNames) || policy.allowedToolNames.length > 512
+    || !policy.allowedToolNames.every((item) => typeof item === "string" && item.length > 0)) return false;
+  return new Set(policy.allowedToolNames).size === policy.allowedToolNames.length;
+}
+
+export function isActiveModelTurn(value: unknown): value is ActiveModelTurn {
+  const turn = record(value);
+  return Boolean(turn
+    && nonNegativeInteger(turn.turnId)
+    && nonNegativeInteger(turn.effectRevision)
+    && (turn.toolPolicy === undefined || isModelTurnToolPolicy(turn.toolPolicy)));
+}
+
+function validActiveModelState(state: Record<string, unknown>): boolean {
+  return state.activeModelTurn === undefined || isActiveModelTurn(state.activeModelTurn);
 }
 
 function validEvidenceProgressState(state: Record<string, unknown>): boolean {
@@ -318,9 +363,11 @@ export function isKernelState(value: unknown): value is KernelState {
     Number.isSafeInteger(state.lastSeq) && Number(state.lastSeq) >= 0,
     typeof state.startedAt === "string",
     validDeadlineState(state),
+    validConvergenceStageHighWater(state),
     state.validationRequirement === undefined
       || state.validationRequirement === "default"
       || state.validationRequirement === "required",
+    validActiveModelState(state),
     state.activeModelSemanticDelta === undefined || typeof state.activeModelSemanticDelta === "boolean",
     Array.isArray(state.messages),
     Array.isArray(state.pendingTools),
@@ -342,42 +389,6 @@ export function isKernelState(value: unknown): value is KernelState {
     [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
       state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
   ].every(Boolean);
-}
-
-function validFrozenState(state: Record<string, unknown>): boolean {
-  return [
-    state.frozenProfile === undefined || isFrozenArtifactRef(state.frozenProfile),
-    state.frozenCustomization === undefined || isFrozenCustomizationRef(state.frozenCustomization),
-    Array.isArray(state.frozenSkills) && state.frozenSkills.every(isFrozenArtifactRef)
-  ].every(Boolean);
-}
-
-function isFrozenArtifactRef(value: unknown): value is FrozenArtifactRef {
-  const item = record(value);
-  if (!item) return false;
-  const manifestAbsent = item?.executionManifestArtifactId === undefined
-    && item?.executionManifestDigest === undefined;
-  const manifestPresent = [
-    typeof item.executionManifestArtifactId === "string",
-    typeof item.executionManifestArtifactId === "string"
-      && /^[a-f0-9]{64}$/u.test(item.executionManifestArtifactId),
-    typeof item.executionManifestDigest === "string",
-    typeof item.executionManifestDigest === "string"
-      && /^[a-f0-9]{64}$/u.test(item.executionManifestDigest)
-  ].every(Boolean);
-  return [
-    typeof item.artifactId === "string" && item.artifactId.length > 0,
-    typeof item.digest === "string" && item.digest.length > 0,
-    ["home", "workspace", "builtin"].includes(String(item.source)),
-    typeof item.qualifiedName === "string" && item.qualifiedName.length > 0,
-    manifestAbsent || manifestPresent
-  ].every(Boolean);
-}
-
-function isFrozenCustomizationRef(value: unknown): value is FrozenCustomizationRef {
-  const item = record(value);
-  return Boolean(item && typeof item.artifactId === "string" && /^[a-f0-9]{64}$/u.test(item.artifactId)
-    && typeof item.digest === "string" && /^[a-f0-9]{64}$/u.test(item.digest));
 }
 
 export function assertKernelState(value: unknown): asserts value is KernelState {

@@ -62,12 +62,14 @@ export interface OpenAIModelGatewayOptions {
   fetchImpl?: typeof fetch;
   wireProfile?: Partial<OpenAIWireProfile>;
   pricing?: ModelPricing;
+  maxTokensPerUtf8Byte?: number;
 }
 
 export class OpenAIModelGateway implements ModelGateway {
   readonly provider: string;
   readonly model: string;
   readonly capabilities: ModelCapabilities;
+  readonly maxTokensPerUtf8Byte?: number;
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly apiKeyName: string;
@@ -90,6 +92,11 @@ export class OpenAIModelGateway implements ModelGateway {
     this.apiKey = options.apiKey?.trim();
     this.apiKeyName = options.apiKeyName;
     this.capabilities = { ...defaultOpenAICapabilities, ...options.capabilities };
+    if (options.maxTokensPerUtf8Byte !== undefined
+      && (!Number.isSafeInteger(options.maxTokensPerUtf8Byte) || options.maxTokensPerUtf8Byte < 1)) {
+      throw new Error("Tokenizer UTF-8 expansion bound must be a positive safe integer.");
+    }
+    this.maxTokensPerUtf8Byte = options.maxTokensPerUtf8Byte;
     this.maxRetries = Math.max(0, Math.trunc(options.maxRetries ?? 2));
     this.requestTimeoutMs = Math.max(1, Math.trunc(options.requestTimeoutMs ?? 120_000));
     this.idleTimeoutMs = Math.max(1, Math.trunc(options.idleTimeoutMs ?? 45_000));

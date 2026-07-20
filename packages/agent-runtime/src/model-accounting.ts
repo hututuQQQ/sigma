@@ -43,7 +43,8 @@ function modelUsageScope(session: ModelUsageSession): { sessionId: string; runId
 
 interface BudgetAwareGateway extends ModelGateway {
   budgetPlan(
-    messages: ModelMessage[], tools: ModelToolDefinition[], maxOutputTokens: number, remainingBudgetMicroUsd: number
+    messages: ModelMessage[], tools: ModelToolDefinition[], maxOutputTokens: number,
+    remainingBudgetMicroUsd: number, minimumInputTokens?: number
   ): Promise<{
     estimatedInputTokens: number;
     reservedInputTokens: number;
@@ -79,12 +80,19 @@ export async function prepareModelBudget(
   messages: ModelMessage[],
   tools: ModelToolDefinition[],
   outputReserveTokens: number,
-  remainingBudgetMicroUsd?: number
+  remainingBudgetMicroUsd?: number,
+  minimumInputTokens = 0
 ): Promise<PreparedModelBudget> {
   const spec = matchingSpec(gateway);
   const outputTokens = Math.min(outputReserveTokens, gateway.capabilities.maxOutputTokens);
   if (budgetAware(gateway) && remainingBudgetMicroUsd !== undefined) {
-    const plan = await gateway.budgetPlan(messages, tools, outputTokens, remainingBudgetMicroUsd);
+    const plan = await gateway.budgetPlan(
+      messages, tools, outputTokens, remainingBudgetMicroUsd, minimumInputTokens
+    );
+    if (plan.estimatedInputTokens < minimumInputTokens
+      || plan.reservedInputTokens < minimumInputTokens) {
+      throw new Error("Model gateway budget plan did not honor the required input-token reserve floor.");
+    }
     return {
       estimatedInputTokens: Math.max(1, plan.reservedInputTokens),
       reserved: {
@@ -101,7 +109,7 @@ export async function prepareModelBudget(
   }
   const counted = await gateway.countTokens(messages, tools);
   const margin = spec?.tokenizer.accuracy === "exact" ? 1 : APPROXIMATE_TOKEN_RESERVATION_MARGIN;
-  const estimatedInputTokens = Math.max(1, Math.ceil(counted * margin));
+  const estimatedInputTokens = Math.max(1, minimumInputTokens, Math.ceil(counted * margin));
   const reservedOutputTokens = Math.ceil(outputTokens * margin);
   return {
     estimatedInputTokens,

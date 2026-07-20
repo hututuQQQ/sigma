@@ -32,6 +32,8 @@ import {
   parseHandleId,
   parseHello,
   parseProcessHandoff,
+  parseRepositoryMetadataLease,
+  parseScratchLease,
   parseProcessValue,
   parseSpawnedProcess
 } from "../packages/agent-execution/src/values.js";
@@ -488,6 +490,33 @@ describe("agent-execution protocol validation", () => {
     expect(() => parseHello({ protocolVersion: 1, instanceId: "" })).toThrow(BrokerProtocolError);
     expect(() => parseHello({ protocolVersion: 1, instanceId: 1 })).toThrow(BrokerProtocolError);
     expect(() => parseHello({ protocolVersion: 1, instanceId: "instance", artifactRoot: 1 })).toThrow(BrokerProtocolError);
+    expect(parseScratchLease({
+      protocolVersion: 1, leaseId: "scratch-1", sessionId: "runtime-session",
+      lifetime: "runtime_session", isolation: "private", persistentAcrossCalls: true,
+      home: "/root", temp: "/tmp"
+    })).toMatchObject({
+      leaseId: "scratch-1", sessionId: "runtime-session", persistentAcrossCalls: true
+    });
+    expect(() => parseScratchLease({
+      protocolVersion: 1, leaseId: "bad", sessionId: "runtime-session", lifetime: "broker_session"
+    })).toThrow(BrokerProtocolError);
+    expect(parseRepositoryMetadataLease({
+      protocolVersion: 1, leaseId: "git-1", repositoryRoot: "/workspace",
+      gitDir: "/workspace/.git", commonDir: "/workspace/.git",
+      executable: "/usr/bin/git", executableSha256: "a".repeat(64), network: "none", uses: 1
+    })).toMatchObject({
+      leaseId: "git-1", executableSha256: "a".repeat(64), network: "none", uses: 1
+    });
+    expect(() => parseRepositoryMetadataLease({
+      protocolVersion: 1, leaseId: "git-1", repositoryRoot: "/workspace",
+      gitDir: "/workspace/.git", commonDir: "/workspace/.git",
+      executable: "/usr/bin/git", executableSha256: "not-a-digest", network: "none", uses: 1
+    })).toThrow(BrokerProtocolError);
+    expect(() => parseRepositoryMetadataLease({
+      protocolVersion: 1, leaseId: "git-1", repositoryRoot: "/workspace",
+      gitDir: "/workspace/.git", commonDir: "/workspace/.git",
+      executable: "/usr/bin/git", executableSha256: "a".repeat(64), network: "full", uses: 1
+    })).toThrow(BrokerProtocolError);
     expect(parseHandleId({ handleId: "process" })).toBe("process");
     expect(() => parseHandleId({ handleId: "" })).toThrow(BrokerProtocolError);
     const doctor = {

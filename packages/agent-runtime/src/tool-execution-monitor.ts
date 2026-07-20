@@ -19,6 +19,7 @@ import type { RuntimeControlService } from "./runtime-control.js";
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { ACTION_SETTLEMENT_GRACE_MS, deadlineForecast } from "./convergence-policy.js";
+import { terminalOnlyToolEffects } from "./terminal-tool-policy.js";
 
 export interface ToolExecutionMonitorOptions {
   runtime: RuntimeOptions;
@@ -48,8 +49,7 @@ function processTimeout(message: string, code: "process_deadline" | "process_idl
 }
 
 function terminalOnlyPlan(plan: ToolCallPlan): boolean {
-  return plan.exactEffects.every((effect) => effect === "outcome.propose"
-    || effect === "outcome.report_blocked" || effect === "outcome.request_input");
+  return terminalOnlyToolEffects(plan.exactEffects);
 }
 
 export function deadlineBoundedToolTimeoutMs(

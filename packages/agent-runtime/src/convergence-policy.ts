@@ -1,7 +1,9 @@
 import type { BudgetAmounts, RunOutcome } from "agent-protocol";
+import { semanticActionDebt } from "agent-kernel";
 import type { RuntimeSession } from "./types.js";
-import { completionLimitations, reviewMode, reviewSatisfied } from "./completion-limitations.js";
-import { currentFrontierReview, frontierValidationReadiness } from "./mutation-evidence.js";
+import { completionLimitations, reviewSatisfied } from "./completion-limitations.js";
+import { frontierValidationReadiness } from "./mutation-evidence.js";
+import { candidateReviewEligible } from "./review-eligibility.js";
 
 export const ACTION_SETTLEMENT_GRACE_MS = 10_000;
 const MODEL_MINIMUM_MS = 15_000;
@@ -15,7 +17,11 @@ const PROCESS_CLEANUP_MS = 10_000;
 const TERMINAL_ATTEMPT_WINDOWS = 2;
 
 export type ConvergenceAction =
-  | { kind: "model"; stage?: "normal" | "converge" | "terminal" }
+  | {
+    kind: "model";
+    stage?: "normal" | "converge" | "terminal";
+    futureBudgetReserve?: Partial<BudgetAmounts>;
+  }
   | { kind: "tool"; count: number; terminalOnly?: boolean };
 
 export interface ConvergenceAdmissionDecision {
@@ -122,10 +128,11 @@ const BUDGET_STAGE_RANK: Record<ConvergenceBudgetStage, number> = { normal: 0, c
 function stageLatch(session: RuntimeSession): ConvergenceStageLatch {
   const existing = sessionStageLatches.get(session);
   if (existing?.runId === session.durable.runId) return existing;
+  const durable = session.durable.state.convergenceStageHighWater;
   const created: ConvergenceStageLatch = {
     runId: session.durable.runId,
-    deadline: "normal",
-    budget: "normal"
+    deadline: durable?.runId === session.durable.runId ? durable.deadline : "normal",
+    budget: durable?.runId === session.durable.runId ? durable.budget : "normal"
   };
   sessionStageLatches.set(session, created);
   return created;
@@ -136,9 +143,11 @@ function monotonicDeadlineStage(latch: ConvergenceStageLatch, requested: Deadlin
   return latch.deadline;
 }
 
-/** The forecast carries a runtime-local stage latch. It is deliberately not
- * serialized: a new run receives a fresh latch, while every turn in the same
- * live run can only move toward convergence and terminal settlement. */
+/** The forecast carries a runtime-local capacity/deadline latch. It is
+ * deliberately not serialized: a new run receives a fresh latch, while hard
+ * resource pressure in the same live run can only move toward settlement.
+ * Action debt is intentionally not passed here because trusted semantic
+ * progress must be able to return it to normal. */
 export function monotonicBudgetStage(
   forecast: DeadlineForecast,
   requested: ConvergenceBudgetStage
@@ -185,11 +194,16 @@ function observedConvergenceCycleMs(session: RuntimeSession): number {
   return modelMs + toolMs;
 }
 
-function reviewerWillRunAtFinalize(session: RuntimeSession, changed: boolean): boolean {
-  return changed
-    && reviewMode(session) !== "off"
-    && frontierValidationReadiness(session).ready
-    && currentFrontierReview(session) === undefined;
+function reviewerWillRunAtFinalize(session: RuntimeSession): boolean {
+  return candidateReviewEligible(session);
+}
+
+/** A workspace review or a review bound to an older completion message cannot
+ * cover the completion candidate that the next model request has not produced
+ * yet. Keep one model-request window available for that future candidate-bound
+ * review whenever finalization can reach the reviewer. */
+export function candidateReviewerRequestReserve(session: RuntimeSession): 0 | 1 {
+  return reviewerWillRunAtFinalize(session) ? 1 : 0;
 }
 
 export function convergenceObligations(session: RuntimeSession): string[] {
@@ -213,10 +227,7 @@ export function deadlineForecast(session: RuntimeSession, now = Date.now()): Dea
   const nextModelEstimateMs = modelEstimateMs(session);
   const nextConvergenceModelEstimateMs = convergenceModelEstimateMs(session, nextModelEstimateMs);
   const nextToolEstimateMs = toolEstimateMs(session, false);
-  const reviewPending = reviewerWillRunAtFinalize(
-    session,
-    session.durable.state.mutationFrontier.changedPaths.length > 0
-  );
+  const reviewPending = reviewerWillRunAtFinalize(session);
   const reviewerReserveMs = reviewPending
     ? reviewerEstimateMs(session, nextConvergenceModelEstimateMs)
     : 0;
@@ -264,7 +275,7 @@ export function deadlineForecast(session: RuntimeSession, now = Date.now()): Dea
     terminalProjectionThresholdMs,
     settlementReserveMs,
     obligations,
-    actionDebt: Math.max(0, session.durable.state.repeatedToolBatchCount)
+    actionDebt: semanticActionDebt(session.durable.state)
   };
   forecastStageLatches.set(forecast, latch);
   return forecast;
@@ -289,6 +300,13 @@ function hardBudgetFailure(session: RuntimeSession, action: ConvergenceAction): 
     return action.count > available
       ? budgetFailure(`The next tool batch requires ${action.count} calls but only ${available} tool-call budget remains.`)
       : null;
+  }
+  const reviewerTurns = action.futureBudgetReserve?.modelTurns ?? 0;
+  const availableTurns = availableBudget(session, "modelTurns");
+  if (availableTurns <= reviewerTurns) {
+    return budgetFailure(reviewerTurns > 0
+      ? "The remaining model-turn budget is reserved for the candidate-bound reviewer; another solver turn cannot be admitted."
+      : "No modelTurns budget remains for another model turn.");
   }
   const dimensions: Array<keyof BudgetAmounts> = ["inputTokens", "outputTokens", "modelTurns"];
   const exhausted = dimensions.find((dimension) => availableBudget(session, dimension) < 1);

@@ -4,6 +4,7 @@ import {
   type ValidationEvidence,
   type WorkspaceDeltaEvidence
 } from "agent-protocol";
+import { completionCandidateEnvelopeFailure } from "./completion-review-candidate.js";
 import type { ReviewerInput } from "./reviewer.js";
 
 function binaryReviewEvidenceFailure(
@@ -114,10 +115,17 @@ function expectedReviewHeader(path: string, kind: ChangeKind): string {
 }
 
 function hasPassedValidation(
-  delta: WorkspaceDeltaEvidence,
+  paths: readonly string[],
   validations: readonly ValidationEvidence[]
 ): boolean {
-  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
+  return paths.every((path) => validations.some((item) => passedValidationSupportsClaim(item)
+    && item.data.coveredPaths.includes(path)));
+}
+
+function hasAnyPassedValidation(
+  paths: readonly string[],
+  validations: readonly ValidationEvidence[]
+): boolean {
   return validations.some((item) => passedValidationSupportsClaim(item)
     && paths.some((path) => item.data.coveredPaths.includes(path)));
 }
@@ -216,7 +224,8 @@ function reviewDiffEvidenceFailure(
 
 function completeReviewEvidenceFailure(
   delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[]
+  validations: readonly ValidationEvidence[],
+  requiredValidationPaths: ReadonlySet<string> | undefined
 ): string | undefined {
   const changes = changedPathKinds(delta);
   if (!changes) return `Delta ${delta.evidenceId} has invalid or duplicate workspace paths.`;
@@ -226,19 +235,40 @@ function completeReviewEvidenceFailure(
   if ("failure" in coverageResult) return coverageResult.failure;
   const diffFailure = reviewDiffEvidenceFailure(delta, changes, artifactResult.value, coverageResult.value);
   if (diffFailure) return diffFailure;
-  if (!hasPassedValidation(delta, validations)) {
+  if (!requiredValidationPaths) {
+    if (!hasAnyPassedValidation([...changes.keys()], validations)) {
+      return `Delta ${delta.evidenceId} has no passed validation evidence bound to its workspace delta.`;
+    }
+    return undefined;
+  }
+  const validationPaths = [...changes.keys()].filter((path) => requiredValidationPaths.has(path));
+  if (validationPaths.length > 0 && !hasPassedValidation(validationPaths, validations)) {
     return `Delta ${delta.evidenceId} has no passed validation evidence bound to its workspace delta.`;
   }
   return undefined;
 }
 
+function completionReviewCandidateFailure(input: ReviewerInput): string | undefined {
+  if (input.reviewMode === "completion" && input.completionCandidate) {
+    const candidateFailure = completionCandidateEnvelopeFailure(input.completionCandidate);
+    if (candidateFailure) return `${candidateFailure.code}: ${candidateFailure.message}`;
+  }
+  return undefined;
+}
+
 export function reviewInputFailure(input: ReviewerInput): string | undefined {
+  return completionReviewCandidateFailure(input) ?? workspaceReviewInputFailure(input);
+}
+
+function workspaceReviewInputFailure(input: ReviewerInput): string | undefined {
+  const requiredValidationPaths = input.validationRequiredPaths
+    ? new Set(input.validationRequiredPaths) : undefined;
   for (const delta of input.workspaceDeltas) {
     if (delta.data.reviewProblem) {
       return `${delta.data.reviewProblem.code}: ${delta.data.reviewProblem.message} ${delta.data.reviewProblem.action}`;
     }
     if (delta.data.reviewDiffPaths !== undefined) {
-      const completeFailure = completeReviewEvidenceFailure(delta, input.validations);
+      const completeFailure = completeReviewEvidenceFailure(delta, input.validations, requiredValidationPaths);
       if (completeFailure) return completeFailure;
       continue;
     }

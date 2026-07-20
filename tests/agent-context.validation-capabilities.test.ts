@@ -142,4 +142,53 @@ describe("safe repository validation capability profiles", () => {
       evidence: expect.arrayContaining(["build.gradle", "gradlew"])
     });
   });
+
+  it("discovers generic native and static-site build manifests", async () => {
+    const root = await workspace();
+    await Promise.all([
+      writeFile(path.join(root, "Makefile"), "all:\n\t@true\n", "utf8"),
+      writeFile(path.join(root, "CMakeLists.txt"), "project(example)\n", "utf8"),
+      writeFile(path.join(root, "Gemfile"), "gem 'jekyll'\n", "utf8"),
+      writeFile(path.join(root, "_config.yml"), "title: example\n", "utf8")
+    ]);
+
+    const profile = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "1".repeat(64),
+      availableCommands: ["make", "cmake", "bundle"],
+      availableCommandsComplete: true
+    });
+
+    expect(projectCapabilitiesForPath(profile, "README.md")).toMatchObject({
+      commandFamilies: expect.arrayContaining(["make build/check", "cmake build/check", "jekyll build"]),
+      evidence: expect.arrayContaining(["Makefile", "CMakeLists.txt", "Gemfile", "_config.yml"])
+    });
+  });
+
+  it("discovers package-manager build scripts only when a package manager is available", async () => {
+    const root = await workspace();
+    await Promise.all([
+      writeFile(path.join(root, "index.html"), "<!doctype html>\n", "utf8"),
+      writeFile(path.join(root, "package.json"), JSON.stringify({
+        scripts: { build: "vite build", verify: "astro check" }
+      }), "utf8")
+    ]);
+
+    const unavailable = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "2".repeat(64),
+      availableCommands: ["node"],
+      availableCommandsComplete: true
+    });
+    expect(projectCapabilitiesForPath(unavailable, "index.html")?.commandFamilies)
+      .not.toContain("package-manager build");
+
+    const available = await deriveRepositoryValidationCapabilities(root, new AbortController().signal, {
+      stateDigest: "3".repeat(64),
+      availableCommands: ["node", "npm"],
+      availableCommandsComplete: true
+    });
+    expect(projectCapabilitiesForPath(available, "index.html")).toMatchObject({
+      commandFamilies: expect.arrayContaining(["package-manager build", "package-manager verify"]),
+      evidence: expect.arrayContaining(["package.json#scripts.build", "package.json#scripts.verify"])
+    });
+  });
 });

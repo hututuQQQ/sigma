@@ -1,15 +1,18 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   agentCliArchiveSourceIdentity,
+  benchmarkRunInputAttestation,
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
   buildCommandScript,
   classifyFailure,
+  comparePairedRunControls,
   computeHarborTimeoutPlan,
   defaultAgentCliTarballForEnv,
   detectHarborRunCapabilities,
@@ -23,6 +26,8 @@ import {
   harborRuntimeDir,
   harborSandboxComposePath,
   parseHarborTimeoutProbe,
+  pairedRunCohortSchedule,
+  pairedRunCohortScheduleSha256,
   portableAgentImportPath,
   removedHarborAdapterErrorMessage,
   removedHarborPackageName,
@@ -30,9 +35,219 @@ import {
   resolveHarborCommand,
   resolveRunOptions,
   runProcess,
+  summarizeTraceEvents,
   suggestedOwnerForFailureCategory,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
+
+function pairedControls(overrides: Record<string, unknown> = {}) {
+  const revision = "9".repeat(40);
+  const tasks = [
+    {
+      pairing_key: "suite/a", source: "https://example.test/suite.git",
+      path: "tasks/a", git_commit_id: revision,
+      effective_solver_timeout_sec: 900, network_mode_effective: "full"
+    },
+    {
+      pairing_key: "suite/b", source: "https://example.test/suite.git",
+      path: "tasks/b", git_commit_id: revision,
+      effective_solver_timeout_sec: 1800, network_mode_effective: "full"
+    }
+  ];
+  const cohortSchedule = pairedRunCohortSchedule(tasks);
+  return {
+    model_identity: "provider/model",
+    terminal_bench_revision: revision,
+    network_mode: "full",
+    n_concurrent_trials: 5,
+    attempts_per_arm: 1,
+    retries: 0,
+    tasks,
+    cohort_schedule: cohortSchedule,
+    cohort_schedule_sha256: pairedRunCohortScheduleSha256(cohortSchedule),
+    ...overrides
+  };
+}
+
+describe("paired-run control comparison", () => {
+  it("normalizes agent-specific model records and compares only solver opportunity", () => {
+    const revision = "9".repeat(40);
+    const baseline = {
+      agents: [{ name: "one", model_name: "provider/model" }],
+      paired_run_controls: pairedControls({
+        model_identity: undefined,
+        tasks: [900, 1800].map((timeout, index) => ({
+          pairing_key: `suite/${index === 0 ? "a" : "b"}`,
+          path: `tasks/${index === 0 ? "a" : "b"}`,
+          source: "https://example.test/suite.git",
+          git_commit_id: revision, effective_solver_timeout_sec: timeout,
+          network_mode_effective: "full"
+        }))
+      })
+    };
+    const candidate = {
+      provider: "provider", model: "model", ...pairedControls({
+        model_identity: undefined,
+        tasks: [900, 1800].map((timeout, index) => ({
+          task_id: `suite/${index === 0 ? "a" : "b"}`,
+          path: `tasks/${index === 0 ? "a" : "b"}`,
+          source: "https://example.test/suite.git",
+          git_commit_id: revision, effective_solver_timeout_sec: timeout,
+          network_mode_effective: "full"
+        }))
+      })
+    };
+    expect(comparePairedRunControls(baseline, candidate, pairedControls())).toMatchObject({
+      comparable: true,
+      mismatchReasons: [],
+      controls: { taskCount: 2, model: "provider/model", networkMode: "full" }
+    });
+  });
+
+  it.each([
+    ["model", { model_identity: "provider/other" }],
+    ["task_revision", { terminal_bench_revision: "8".repeat(40), tasks: pairedControls().tasks
+      .map((task) => ({ ...task, git_commit_id: "8".repeat(40) })) }],
+    ["task_set", { tasks: pairedControls().tasks.slice(0, 1) }],
+    ["network", { network_mode: "none", tasks: pairedControls().tasks
+      .map((task) => ({ ...task, network_mode_effective: "none" })) }],
+    ["effective_solver_timeout", { tasks: pairedControls().tasks
+      .map((task, index) => index === 0 ? { ...task, effective_solver_timeout_sec: 901 } : task) }]
+  ])("marks %s drift as explicitly non-comparable", (reason, override) => {
+    const result = comparePairedRunControls(
+      pairedControls(), pairedControls(override), pairedControls()
+    );
+    expect(result.comparable).toBe(false);
+    expect(result.mismatchReasons).toContain(reason);
+  });
+
+  it("fails closed when one-attempt/no-retry attestations are absent", () => {
+    const candidate = pairedControls({ attempts_per_arm: undefined, retries: undefined });
+    const result = comparePairedRunControls(pairedControls(), candidate, pairedControls());
+    expect(result).toMatchObject({ comparable: false });
+    expect(result.mismatchReasons).toEqual(expect.arrayContaining(["attempts_per_arm", "retries"]));
+  });
+
+  it("fails closed for partial or conflicting per-task control claims", () => {
+    const partial = pairedControls({
+      terminal_bench_revision: undefined,
+      tasks: pairedControls().tasks.map((task, index) => index === 0
+        ? { ...task, git_commit_id: undefined } : task)
+    });
+    expect(comparePairedRunControls(pairedControls(), partial, pairedControls())).toMatchObject({
+      comparable: false,
+      mismatchReasons: expect.arrayContaining(["task_revision", "control_records_complete"])
+    });
+    const conflicting = pairedControls({
+      effective_solver_timeout_sec: 900
+    });
+    expect(comparePairedRunControls(pairedControls(), conflicting, pairedControls())).toMatchObject({
+      comparable: false,
+      mismatchReasons: expect.arrayContaining([
+        "effective_solver_timeout", "control_records_complete"
+      ])
+    });
+  });
+});
+
+describe("paired-run input attestation", () => {
+  it("binds ordered JobConfigs and job-level Harbor locks while ignoring trial lock copies", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-paired-attestation-"));
+    const controls = pairedControls();
+    const configPaths = [];
+    try {
+      const archivePath = path.join(runDir, "agent.tgz");
+      await writeFile(archivePath, "agent archive", "utf8");
+      const agentCliSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
+      for (const cohort of controls.cohort_schedule) {
+        const configPath = path.join(runDir, `config-${cohort.order}.json`);
+        const record = {
+          n_attempts: 1,
+          timeout_multiplier: 1,
+          n_concurrent_trials: 5,
+          retry: { max_retries: 0 },
+          agents: [{
+            name: "agent",
+            kwargs: {
+              provider: "provider", model: "model", network_mode: "full",
+              max_wall_time_sec: cohort.effective_solver_timeout_sec,
+              agent_cli_tarball: archivePath
+            }
+          }],
+          tasks: cohort.task_keys.map((key) => ({
+            path: `tasks/${key.split("/").at(-1)}`,
+            source: "https://example.test/suite.git",
+            git_commit_id: "9".repeat(40)
+          }))
+        };
+        const text = `${JSON.stringify(record, null, 2)}\n`;
+        await writeFile(configPath, text, "utf8");
+        configPaths.push(path.basename(configPath));
+        const jobDir = path.join(runDir, "harbor-jobs", `job-${cohort.order}`);
+        await mkdir(path.join(jobDir, "trial-copy"), { recursive: true });
+        const trials = cohort.task_keys.map((key) => ({
+          task: {
+            name: key,
+            path: `tasks/${key.split("/").at(-1)}`,
+            source: "https://example.test/suite.git",
+            git_commit_id: "9".repeat(40)
+          },
+          timeout_multiplier: 1,
+          agent: {
+            kwargs: {
+              provider: "provider", model: "model", network_mode: "full",
+              max_wall_time_sec: cohort.effective_solver_timeout_sec,
+              agent_cli_tarball: archivePath
+            }
+          }
+        }));
+        await writeFile(path.join(jobDir, "lock.json"), `${JSON.stringify({
+          created_at: `2026-01-01T00:00:0${cohort.order}.000Z`,
+          n_concurrent_trials: 5,
+          retry: { max_retries: 0 },
+          trials
+        }, null, 2)}\n`, "utf8");
+        await writeFile(path.join(jobDir, "trial-copy", "lock.json"), "{}\n", "utf8");
+      }
+      const inputConfigSha256s = await Promise.all(configPaths.map(async (file, order) => ({
+        order,
+        sha256: createHash("sha256").update(await readFile(path.join(runDir, file))).digest("hex")
+      })));
+      const result = await benchmarkRunInputAttestation(runDir, {
+        provider: "provider",
+        model: "model",
+        network_mode: "full",
+        agent_cli_tarball: archivePath,
+        agent_cli_sha256: agentCliSha256,
+        n_concurrent_trials: 5,
+        resolved_job_config_paths: configPaths,
+        paired_run_controls: { ...controls, input_config_sha256s: inputConfigSha256s }
+      });
+      expect(result).toMatchObject({ valid: true, issues: [], configSha256s: inputConfigSha256s });
+      expect(result.lockSha256s).toHaveLength(2);
+    } finally {
+      await rm(runDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("benchmark convergence accounting", () => {
+  it("separates deadline, action-budget, terminal-budget, and manual-stop metrics", () => {
+    const summary = summarizeTraceEvents([
+      { type: "diagnostic", metadata: { kind: "deadline.stage", stage: "normal", budgetStage: "converge" } },
+      { type: "diagnostic", metadata: { kind: "deadline.stage", stage: "converge", budgetStage: "converge" } },
+      { type: "diagnostic", metadata: { kind: "deadline.stage", stage: "stop", budgetStage: "terminal" } },
+      { type: "run_end", metadata: { result: { manual_stop_count: 1 } } }
+    ]);
+    expect(summary).toMatchObject({
+      converge_turns: 2,
+      deadline_converge_turns: 1,
+      budget_converge_turns: 2,
+      terminal_budget_turns: 1,
+      manual_stop_count: 1
+    });
+  });
+});
 
 async function writeHarborJobResult(jobDir: string, total: number, errored = 0, retries = 0) {
   await mkdir(jobDir, { recursive: true });
@@ -309,6 +524,17 @@ describe("Terminal-Bench command construction", () => {
       "--expected-archive-sha256", "a".repeat(64),
       "--expected-source-revision", "b".repeat(40)
     ])).toMatchObject({ expectedArchiveSha256: "a".repeat(64), expectedSourceRevision: "b".repeat(40) });
+    expect(resolveRunOptions([
+      "--mode", "task", "--task-id", "one",
+      "--expected-source-dirty", "true",
+      "--expected-source-diff-sha256", "c".repeat(64)
+    ])).toMatchObject({ expectedSourceDirty: true, expectedSourceDiffSha256: "c".repeat(64) });
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "one", "--attempts-per-arm", "2"
+    ])).toThrow(/one attempt|attempts-per-arm 1/iu);
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "one", "--retries", "1"
+    ])).toThrow(/retries 0/iu);
   });
 
   it("rejects comparisons across agent profiles and evaluation lanes", () => {
@@ -338,6 +564,7 @@ describe("Terminal-Bench command construction", () => {
     const identity = repositorySourceIdentity();
     expect(identity.revision).toMatch(/^[a-f0-9]{40}$/u);
     expect(typeof identity.dirty).toBe("boolean");
+    expect(identity.dirtyDiffSha256).toMatch(/^[a-f0-9]{64}$/u);
   });
 
   it("propagates the run-level network mode into Harbor agent configuration", () => {
@@ -378,13 +605,14 @@ describe("Terminal-Bench command construction", () => {
       benchmarkClass: "standard", executionMode: "sandboxed", agentProfile: "standard"
     });
     expect(standardPlan).toMatchObject({
-      agent_wall_time_sec: 780,
+      agent_wall_time_sec: 900,
       benchmark_class: "standard",
-      agent_timeout_multiplier: null,
+      policy: "solver_full_task_timeout_separate_cleanup_grace",
+      agent_timeout_multiplier: "1.14",
       verifier_timeout_multiplier: null,
       environment_build_timeout_multiplier: null
     });
-    expect(config).not.toHaveProperty("agent_timeout_multiplier");
+    expect(config.agent_timeout_multiplier).toBe(1.14);
     expect(config.agents[0].kwargs.execution_mode).toBe("sandboxed");
     expect(config.agents[0].kwargs.agent_profile).toBe("standard");
 
@@ -413,10 +641,10 @@ describe("Terminal-Bench command construction", () => {
     ]);
     expect(computeHarborTimeoutPlan(options, { max_agent_timeout_sec: 900 })).toMatchObject({
       recommended_agent_timeout_sec: 900,
-      agent_wall_time_sec: 780,
+      agent_wall_time_sec: 900,
       leniency_multiplier: 1,
       leniency_min_extra_sec: 0,
-      agent_timeout_multiplier: null,
+      agent_timeout_multiplier: "1.14",
       benchmark_class: "standard"
     });
   });
@@ -578,9 +806,9 @@ describe("Terminal-Bench command construction", () => {
     const plan = computeHarborTimeoutPlan({ benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, timeoutProbe);
 
     expect(plan).toMatchObject({
-      requested_agent_wall_time_sec: 1080,
-      agent_wall_time_sec: 1080,
-      child_deadline_sec: 1080,
+      requested_agent_wall_time_sec: 1200,
+      agent_wall_time_sec: 1200,
+      child_deadline_sec: 1200,
       outer_trial_deadline_sec: null,
       outer_trial_deadline_scope: "harbor_per_trial",
       deadline_cleanup_grace_sec: 120,
@@ -589,7 +817,7 @@ describe("Terminal-Bench command construction", () => {
     const kwargs = buildHarborJobConfig({
       mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
     }, "jobs", plan, timeoutProbe).agents[0].kwargs;
-    expect(kwargs).toMatchObject({ max_wall_time_sec: 1080 });
+    expect(kwargs).toMatchObject({ max_wall_time_sec: 1200 });
     expect(kwargs).not.toHaveProperty("outer_trial_deadline_sec");
   });
 
@@ -614,8 +842,8 @@ describe("Terminal-Bench command construction", () => {
         { benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, group.timeout_probe
       ).agent_wall_time_sec
     }))).toEqual([
-      { timeout: 900, tasks: ["terminal-bench/short-a", "terminal-bench/short-b"], plan: 780 },
-      { timeout: 3600, tasks: ["terminal-bench/long"], plan: 3480 }
+      { timeout: 900, tasks: ["terminal-bench/short-a", "terminal-bench/short-b"], plan: 900 },
+      { timeout: 3600, tasks: ["terminal-bench/long"], plan: 3600 }
     ]);
   });
 
@@ -630,12 +858,12 @@ describe("Terminal-Bench command construction", () => {
     );
 
     expect(plan).toMatchObject({
-      agent_wall_time_sec: 780,
+      agent_wall_time_sec: 900,
       outer_trial_deadline_sec: 900,
       outer_trial_deadline_scope: "uniform_task_timeout",
       deadline_cleanup_grace_sec: 120
     });
-    expect(plan.agent_wall_time_sec).toBe(plan.outer_trial_deadline_sec - plan.deadline_cleanup_grace_sec);
+    expect(plan.agent_wall_time_sec).toBe(plan.outer_trial_deadline_sec);
   });
 
   it("gives long MVP tasks lenient wall time by default", () => {

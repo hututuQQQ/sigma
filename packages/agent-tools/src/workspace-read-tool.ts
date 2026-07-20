@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -67,8 +68,13 @@ async function executeRead(
   const limit = typeof input.limit === "number" ? Math.max(1, Math.floor(input.limit)) : 500;
   const allLines = [...textLines(loaded.content)];
   const lines = allLines.slice(offset, offset + limit);
+  const output = lines.map((line) => `${line.number}: ${line.text}`).join("\n");
+  const canonicalPath = external
+    ? target
+    : path.relative(workspace, target).split(path.sep).join("/") || ".";
+  const actualStart = Math.min(offset, allLines.length);
   return receipt(request, startedAt, {
-    output: lines.map((line) => `${line.number}: ${line.text}`).join("\n"),
+    output,
     result: {
       status: "read",
       path: requested,
@@ -83,7 +89,7 @@ async function executeRead(
     },
     observedEffects: external
       ? ["filesystem.read", "filesystem.read.external"] : ["filesystem.read"],
-    evidence: external ? [{
+    evidence: [{
       evidenceId: `input-access:${request.callId}`,
       sessionId: context.sessionId,
       runId: context.runId,
@@ -91,14 +97,21 @@ async function executeRead(
       status: "passed",
       createdAt: new Date().toISOString(),
       producer: { authority: "tool", id: request.callId },
-      summary: `Read external input '${requested}'.`,
+      summary: `Read ${external ? "external" : "workspace"} input '${canonicalPath}'.`,
       data: {
-        path: target,
-        scope: "external",
+        path: canonicalPath,
+        scope: external ? "external" : "workspace",
         sha256: loaded.sha256,
-        byteLength: loaded.byteLength
+        byteLength: loaded.byteLength,
+        selection: {
+          kind: "line_range",
+          start: actualStart,
+          endExclusive: actualStart + lines.length,
+          sha256: createHash("sha256").update(output, "utf8").digest("hex"),
+          byteLength: Buffer.byteLength(output, "utf8")
+        }
       }
-    }] : []
+    }]
   });
 }
 

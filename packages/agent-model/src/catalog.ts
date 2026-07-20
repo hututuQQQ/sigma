@@ -69,6 +69,8 @@ export interface TokenizerMetadata {
   id: string;
   accuracy: "exact" | "approximate";
   assetDigest?: string;
+  /** Pinned conservative expansion bound for arbitrary UTF-8 input. */
+  maxTokensPerUtf8Byte?: number;
 }
 
 /** Prices are integer micro-USD per one million tokens. */
@@ -103,7 +105,10 @@ export interface ModelRoute {
 const approximateTokenizer: TokenizerMetadata = {
   id: "sigma/cjk-byte-v1",
   accuracy: "approximate",
-  assetDigest: "d80956868f0d3660b3963e24f16475e592c67cebfe71dc2836cd8403e461f760"
+  assetDigest: "d80956868f0d3660b3963e24f16475e592c67cebfe71dc2836cd8403e461f760",
+  // Byte fallback emits at most one token per input byte. This locally pinned
+  // bound is deliberately independent of provider-reported capabilities.
+  maxTokensPerUtf8Byte: 1
 };
 
 export const BUILTIN_MODEL_SPECS: readonly ModelSpec[] = [

@@ -48,7 +48,7 @@ function spec(id: string, overrides: Partial<ModelSpec> = {}): ModelSpec {
     wireProtocol: "openai_chat",
     upstreamModel: id,
     capabilities,
-    tokenizer: { id: "test", accuracy: "approximate" },
+    tokenizer: { id: "test", accuracy: "approximate", maxTokensPerUtf8Byte: 1 },
     pricing: {
       inputMicroUsdPerMillion: 1_000_000,
       outputMicroUsdPerMillion: 2_000_000,
@@ -135,12 +135,15 @@ describe("capability-aware model routing", () => {
       "deepseek/deepseek-v4-pro",
       "glm/glm-5.2"
     ]);
-    expect(BUILTIN_MODEL_SPECS.every((item) => item.pricing && item.tokenizer.accuracy === "approximate")).toBe(true);
+    expect(BUILTIN_MODEL_SPECS.every((item) => item.pricing
+      && item.tokenizer.accuracy === "approximate"
+      && item.tokenizer.maxTokensPerUtf8Byte === 1)).toBe(true);
     const gateway = createModelGatewayForSpec(spec("deepseek/custom", {
       capabilities: { ...capabilities, contextWindowTokens: 42_000 }
     }), { apiKey: "secret" });
     expect(gateway).toMatchObject({ provider: "deepseek", model: "deepseek/custom" });
     expect(gateway.capabilities.contextWindowTokens).toBe(42_000);
+    expect(gateway.maxTokensPerUtf8Byte).toBe(1);
   });
 
   it("composes production fallback candidates only when configured and keeps legacy flags single", () => {
@@ -316,6 +319,7 @@ describe("capability-aware model routing", () => {
     expect(plan.reservedOutputTokens).toBe(300);
     expect(plan.reservedCostMicroUsd).toBeGreaterThan(0);
     expect(routed.routingIdentity()).toEqual({ role: "child_analyze", routeId: "main" });
+    expect(routed.maxTokensPerUtf8Byte).toBe(1);
   });
 
   it("falls back only for configured infrastructure errors before semantic output", async () => {

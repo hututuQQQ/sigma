@@ -4,13 +4,19 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
+  BrokerRequestOptions,
   BrokerDoctorReport,
-  ExecutionBroker
+  ExecutionBroker,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  ScratchLeaseRequestV1,
+  ScratchLeaseV1
 } from "../packages/agent-execution/src/index.js";
 import {
   nodeRuntimeReadRoots,
   withTrustedRuntimeCapabilities
 } from "../packages/agent-execution/src/lazy-execution-broker-runtime.js";
+import { LazyExecutionBroker } from "../packages/agent-execution/src/lazy-execution-broker.js";
 import {
   assertTrustedToolchainsAvailable,
   normalizeTrustedToolchains,
@@ -237,6 +243,145 @@ describe("connection-bound runtime capability reporting", () => {
     await expect(wrapped.revokeSandboxLease?.("C:/workspace")).resolves.toMatchObject({ generation: 3 });
     expect(status).toHaveBeenCalledWith("C:/workspace", undefined);
     expect(revoke).toHaveBeenCalledWith("C:/workspace", undefined);
+  });
+
+  it("forwards session scratch and repository metadata leases through the capability wrapper", async () => {
+    const native = fixtureBroker(async () => report());
+    const scratchRequest: ScratchLeaseRequestV1 = { protocolVersion: 1, sessionId: "session-fixture" };
+    const scratchLease: ScratchLeaseV1 = {
+      ...scratchRequest,
+      leaseId: "scratch-fixture",
+      lifetime: "runtime_session",
+      isolation: "private",
+      persistentAcrossCalls: true,
+      home: "C:/scratch/home",
+      temp: "C:/scratch/temp"
+    };
+    const repositoryRequest: RepositoryMetadataLeaseRequestV1 = {
+      protocolVersion: 1,
+      repositoryRoot: "C:/workspace",
+      gitDir: "C:/workspace/.git",
+      commonDir: "C:/workspace/.git",
+      executable: "C:/runtime/git.exe",
+      network: "none"
+    };
+    const repositoryLease: RepositoryMetadataLeaseV1 = {
+      ...repositoryRequest,
+      leaseId: "repository-fixture",
+      executableSha256: "a".repeat(64),
+      uses: 1
+    };
+    const requestOptions: BrokerRequestOptions = { timeoutMs: 321 };
+    const acquireScratchLease = vi.fn(async () => scratchLease);
+    const releaseScratchLease = vi.fn(async () => undefined);
+    const acquireRepositoryMetadataLease = vi.fn(async () => repositoryLease);
+    native.acquireScratchLease = acquireScratchLease;
+    native.releaseScratchLease = releaseScratchLease;
+    native.acquireRepositoryMetadataLease = acquireRepositoryMetadataLease;
+    const wrapped = withTrustedRuntimeCapabilities(native, undefined);
+
+    await expect(wrapped.acquireScratchLease?.(scratchRequest, requestOptions)).resolves.toBe(scratchLease);
+    await expect(wrapped.acquireRepositoryMetadataLease?.(repositoryRequest, requestOptions))
+      .resolves.toBe(repositoryLease);
+    await expect(wrapped.releaseScratchLease?.("session-fixture", requestOptions)).resolves.toBeUndefined();
+    expect(acquireScratchLease).toHaveBeenCalledWith(scratchRequest, requestOptions);
+    expect(acquireRepositoryMetadataLease).toHaveBeenCalledWith(repositoryRequest, requestOptions);
+    expect(releaseScratchLease).toHaveBeenCalledWith("session-fixture", requestOptions);
+  });
+
+  it("does not manufacture lease capabilities that the wrapped broker lacks", () => {
+    const native = fixtureBroker(async () => report());
+    native.acquireScratchLease = vi.fn();
+    const wrapped = withTrustedRuntimeCapabilities(native, undefined);
+
+    expect(wrapped.acquireScratchLease).toBeUndefined();
+    expect(wrapped.releaseScratchLease).toBeUndefined();
+    expect(wrapped.acquireRepositoryMetadataLease).toBeUndefined();
+  });
+
+  it("keeps scratch cleanup callable through the lazy runtime capability stack", async () => {
+    const native = fixtureBroker(async () => report());
+    const releaseScratchLease = vi.fn(async () => undefined);
+    native.acquireScratchLease = vi.fn(async (request: ScratchLeaseRequestV1): Promise<ScratchLeaseV1> => ({
+      ...request,
+      leaseId: "scratch-fixture",
+      lifetime: "runtime_session",
+      isolation: "private",
+      persistentAcrossCalls: true,
+      home: "C:/scratch/home",
+      temp: "C:/scratch/temp"
+    }));
+    native.releaseScratchLease = releaseScratchLease;
+    const broker = new LazyExecutionBroker({
+      sandboxMode: "required",
+      clientFactory: () => withTrustedRuntimeCapabilities(native, undefined)
+    });
+
+    try {
+      await expect(broker.acquireScratchLease({ protocolVersion: 1, sessionId: "session-fixture" }))
+        .resolves.toMatchObject({ leaseId: "scratch-fixture" });
+      const releaseGate = Promise.withResolvers<void>();
+      releaseScratchLease.mockImplementation(async () => await releaseGate.promise);
+      const firstRelease = broker.releaseScratchLease("session-fixture");
+      const concurrentRelease = broker.releaseScratchLease("session-fixture");
+      await vi.waitFor(() => expect(releaseScratchLease).toHaveBeenCalledTimes(1));
+      releaseGate.resolve();
+      await expect(Promise.all([firstRelease, concurrentRelease])).resolves.toEqual([undefined, undefined]);
+      await expect(broker.releaseScratchLease("session-fixture")).resolves.toBeUndefined();
+      expect(releaseScratchLease).toHaveBeenCalledWith("session-fixture", undefined);
+      expect(releaseScratchLease).toHaveBeenCalledTimes(1);
+    } finally {
+      await broker.close();
+    }
+  });
+
+  it("does not require or start a scratch capability for a session that never acquired scratch", async () => {
+    const connect = vi.fn(async () => report());
+    const native = fixtureBroker(connect);
+    const broker = new LazyExecutionBroker({
+      sandboxMode: "required",
+      clientFactory: () => withTrustedRuntimeCapabilities(native, undefined)
+    });
+
+    try {
+      await expect(broker.releaseScratchLease("read-only-session")).resolves.toBeUndefined();
+      expect(connect).not.toHaveBeenCalled();
+      await broker.connect();
+      await expect(broker.releaseScratchLease("read-only-session")).resolves.toBeUndefined();
+      expect(connect).toHaveBeenCalledTimes(1);
+    } finally {
+      await broker.close();
+    }
+  });
+
+  it("fails closed for a held scratch lease and retains it for a release retry", async () => {
+    const native = fixtureBroker(async () => report());
+    native.acquireScratchLease = vi.fn(async (request: ScratchLeaseRequestV1): Promise<ScratchLeaseV1> => ({
+      ...request,
+      leaseId: "scratch-held",
+      lifetime: "runtime_session",
+      isolation: "private",
+      persistentAcrossCalls: true,
+      home: "C:/scratch/home",
+      temp: "C:/scratch/temp"
+    }));
+    const releaseScratchLease = vi.fn(async () => undefined);
+    native.releaseScratchLease = releaseScratchLease;
+    const broker = new LazyExecutionBroker({ sandboxMode: "required", clientFactory: () => native });
+
+    try {
+      await broker.acquireScratchLease({ protocolVersion: 1, sessionId: "held-session" });
+      delete native.releaseScratchLease;
+      await expect(broker.releaseScratchLease("held-session")).rejects.toMatchObject({
+        code: "scratch_lease_unavailable"
+      });
+      native.releaseScratchLease = releaseScratchLease;
+      await expect(broker.releaseScratchLease("held-session")).resolves.toBeUndefined();
+      await expect(broker.releaseScratchLease("held-session")).resolves.toBeUndefined();
+      expect(releaseScratchLease).toHaveBeenCalledTimes(1);
+    } finally {
+      await broker.close();
+    }
   });
 
   it("reports and forwards handoff only when the wrapped broker implements it", async () => {

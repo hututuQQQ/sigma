@@ -167,9 +167,7 @@ export function planContext(options: PlanContextOptions): ContextPlan {
     available - used,
     options.promptCache ? Number.POSITIVE_INFINITY : Math.max(0, historyTokenLimit - retainedHistoryTokens)
   ));
-  const { summary, summaryDelta } = historySummaries(
-    omittedBlocks, summaryTokenBudget, options.promptCache
-  );
+  const { summary, summaryDelta } = historySummaries(omittedBlocks, summaryTokenBudget);
   if (summary) included.push(summary);
   if (summaryDelta) included.push(summaryDelta);
   const retainedHistory = [...selection.selected.entries()]

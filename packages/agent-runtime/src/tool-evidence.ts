@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import type {
   CommandEvidence,
   DiagnosticEvidence,
@@ -113,22 +114,70 @@ function sanitizeDiagnostic(raw: DiagnosticEvidence, receipt: ToolReceipt, scope
   };
 }
 
+function canonicalInputAccessPath(
+  value: string,
+  inputScope: InputAccessEvidence["data"]["scope"]
+): string | undefined {
+  if (inputScope === "external") {
+    return path.isAbsolute(value) ? path.normalize(value).split(path.sep).join("/") : undefined;
+  }
+  const portable = value.replaceAll("\\", "/");
+  const normalized = path.posix.normalize(portable);
+  return path.posix.isAbsolute(portable) || path.win32.isAbsolute(value)
+    || normalized === ".." || normalized.startsWith("../") ? undefined : normalized;
+}
+
+function approvedInputAccessPath(
+  raw: InputAccessEvidence,
+  plan: ToolCallPlan
+): { canonicalPath: string | undefined; valid: boolean } {
+  const canonicalPath = canonicalInputAccessPath(raw.data.path, raw.data.scope);
+  const approvedPaths = new Set(plan.readPaths.flatMap((value) => {
+    const canonical = canonicalInputAccessPath(value, raw.data.scope);
+    return canonical === undefined ? [] : [canonical];
+  }));
+  return { canonicalPath, valid: canonicalPath !== undefined && approvedPaths.has(canonicalPath) };
+}
+
+function inputAccessSelectionMatchesReceipt(raw: InputAccessEvidence, receipt: ToolReceipt): boolean {
+  if (!raw.data.selection) return true;
+  const outputSha256 = createHash("sha256").update(receipt.output, "utf8").digest("hex");
+  return raw.data.selection.sha256 === outputSha256
+    && raw.data.selection.byteLength === Buffer.byteLength(receipt.output, "utf8");
+}
+
+function inputAccessFailureCode(
+  raw: InputAccessEvidence,
+  pathValid: boolean,
+  selectionValid: boolean
+): string | undefined {
+  if (!pathValid) return "input_access_path_invalid";
+  if (!selectionValid) return "input_access_content_mismatch";
+  return raw.data.failureCode;
+}
+
 function sanitizeInputAccess(
   raw: InputAccessEvidence,
   receipt: ToolReceipt,
-  scope: ReceiptEvidenceScope
+  scope: ReceiptEvidenceScope,
+  plan: ToolCallPlan
 ): InputAccessEvidence {
+  const { canonicalPath, valid: pathValid } = approvedInputAccessPath(raw, plan);
+  const selectionValid = inputAccessSelectionMatchesReceipt(raw, receipt);
+  const passed = receipt.ok && raw.status === "passed" && pathValid && selectionValid;
+  const failureCode = inputAccessFailureCode(raw, pathValid, selectionValid);
   return {
     ...evidenceBase(scope, receipt),
     kind: "input_access",
-    status: receipt.ok && raw.status === "passed" ? "passed" : "failed",
+    status: passed ? "passed" : "failed",
     summary: raw.summary,
     data: {
-      path: raw.data.path,
+      path: canonicalPath ?? raw.data.path,
       scope: raw.data.scope,
       ...(raw.data.sha256 ? { sha256: raw.data.sha256 } : {}),
       ...(raw.data.byteLength === undefined ? {} : { byteLength: raw.data.byteLength }),
-      ...(raw.data.failureCode ? { failureCode: raw.data.failureCode } : {})
+      ...(selectionValid && raw.data.selection ? { selection: { ...raw.data.selection } } : {}),
+      ...(failureCode ? { failureCode } : {})
     }
   };
 }
@@ -192,7 +241,7 @@ export function normalizeReceiptEvidence(
     }
     if (raw.kind === "diagnostic") return [sanitizeDiagnostic(raw, receipt, scope)];
     if (raw.kind === "input_access" && actualEffects.includes("filesystem.read")) {
-      return [sanitizeInputAccess(raw, receipt, scope)];
+      return [sanitizeInputAccess(raw, receipt, scope, plan)];
     }
     return [];
   });

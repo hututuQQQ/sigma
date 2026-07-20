@@ -1,9 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
-import os from "node:os";
+import { randomUUID } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { CheckpointManager, type CheckpointManagerOptions } from "agent-checkpoint";
-import { repositoryTopology, runProcess, type ProcessExecutionPort } from "agent-platform";
+import { repositoryTopology, workspaceTransactionRoot, type ProcessExecutionPort } from "agent-platform";
 import type { JsonValue, RepositoryDeltaEvidence, ToolCallPlan, ToolDescriptor, ToolReceipt } from "agent-protocol";
 import type { PlannedToolExecutionContext, RegisteredEffectTool } from "agent-tools";
 import {
@@ -15,9 +14,14 @@ import {
   mutatesWorktree,
   type GitOperation
 } from "./repository-transaction-schema.js";
+import {
+  GIT_NULL_DEVICE,
+  assertNoExternalDrivers,
+  repositoryState,
+  runGit
+} from "./repository-transaction-state.js";
 
 export type RepositoryCheckpointLimits = Pick<CheckpointManagerOptions, "maxFiles" | "maxBytes">;
-interface GitResult { exitCode: number; stdout: string; stderr: string }
 
 async function repositoryRoot(
   workspace: string,
@@ -59,16 +63,33 @@ function repositoryCheckpointManager(
   });
 }
 
-async function restoreOpenRepositoryCheckpoint(manager: CheckpointManager, sessionId: string): Promise<void> {
-  const open = [...await manager.list(sessionId)].reverse().find((item) => item.status === "open");
-  if (!open) return;
-  const inspection = await manager.inspectOpen(sessionId, open.checkpointId);
-  await manager.restoreOpen(sessionId, open.checkpointId, inspection.currentManifestDigest);
+async function atomicRepositoryCheckpointManager(
+  workspace: string,
+  limits: RepositoryCheckpointLimits = {}
+): Promise<CheckpointManager> {
+  const legacyRoot = path.join(workspace, ".agent", "repository-checkpoints");
+  const rootDir = await workspaceTransactionRoot({
+    workspacePath: workspace,
+    stateRootDir: legacyRoot,
+    namespace: "repository-checkpoint-state"
+  });
+  return new CheckpointManager({ rootDir, excludedNames: [".agent"], ...limits });
 }
 
-/** Restore the CAS-backed .git preimage left by a hard process interruption. */
+async function restoreOpenRepositoryCheckpoint(manager: CheckpointManager, sessionId: string): Promise<void> {
+  for (;;) {
+    const open = [...await manager.list(sessionId)].reverse().find((item) => item.status === "open");
+    if (!open) return;
+    const inspection = await manager.inspectOpen(sessionId, open.checkpointId);
+    await manager.restoreOpen(sessionId, open.checkpointId, inspection.currentManifestDigest);
+  }
+}
+
+/** Restore the atomic repository/worktree preimage left by a hard interruption. */
 export async function recoverInterruptedRepositoryTransactions(workspace: string, sessionId: string): Promise<void> {
   try {
+    await restoreOpenRepositoryCheckpoint(await atomicRepositoryCheckpointManager(workspace), sessionId);
+    // V1 repository transactions stored metadata-only checkpoints here.
     await restoreOpenRepositoryCheckpoint(repositoryCheckpointManager(workspace), sessionId);
   } catch (error) {
     throw Object.assign(new Error("Interrupted repository transaction could not be restored.", { cause: error }), {
@@ -77,102 +98,55 @@ export async function recoverInterruptedRepositoryTransactions(workspace: string
   }
 }
 
-function gitEnvironment(hooks: string): Record<string, string> {
-  return {
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: path.join(hooks, "global-config-disabled"),
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_ALLOW_PROTOCOL: "",
-    GIT_EDITOR: "true",
-    GIT_SEQUENCE_EDITOR: "true"
-  };
+function pathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!path.isAbsolute(relative)
+    && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-async function runGit(
-  execution: ProcessExecutionPort,
-  root: string,
-  metadataRoots: string[],
-  args: string[],
-  hooks: string,
-  signal: AbortSignal
-): Promise<GitResult> {
-  const result = await runProcess({
-    execution,
-    executable: "git",
-    args: ["-c", `core.hooksPath=${hooks}`, "-c", "core.fsmonitor=false", ...args],
-    cwd: root,
-    env: gitEnvironment(hooks),
-    timeoutMs: 600_000,
-    maxOutputBytes: 16 * 1024 * 1024,
-    signal,
-    readRoots: [...new Set([root, ...metadataRoots])],
-    writeRoots: [...new Set([root, ...metadataRoots])],
-    protectedPaths: [path.join(root, ".agent")],
-    network: "none"
-  });
-  return { exitCode: result.exitCode ?? 1, stdout: result.stdout, stderr: result.stderr };
-}
-
-function sha(value: string | Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-async function repositoryState(
-  execution: ProcessExecutionPort,
-  root: string,
-  gitDir: string,
-  metadataRoots: string[],
-  hooks: string,
-  signal: AbortSignal
-) {
-  const command = async (args: string[]): Promise<GitResult> =>
-    await runGit(execution, root, metadataRoots, args, hooks, signal);
-  const headResult = await command(["rev-parse", "--verify", "HEAD"]);
-  const refs = await command(["show-ref", "--head"]);
-  const objects = await command(["rev-list", "--objects", "--all"]);
-  const index = await readFile(path.join(gitDir, "index")).catch(() => Buffer.alloc(0));
-  const state = {
-    head: headResult.exitCode === 0 ? headResult.stdout.trim() : null,
-    refsDigest: sha(refs.stdout),
-    indexDigest: sha(index),
-    reachableObjects: objects.exitCode === 0 ? objects.stdout.split(/\r?\n/u).filter(Boolean).length : 0
-  };
-  return { ...state, stateDigest: sha(JSON.stringify(state)) };
-}
-
-async function assertNoExternalDrivers(
-  execution: ProcessExecutionPort,
-  root: string,
-  metadataRoots: string[],
-  hooks: string,
-  signal: AbortSignal
-): Promise<void> {
-  const config = await runGit(execution, root, metadataRoots, ["config", "--local", "--includes", "--get-regexp",
-    "^(include(if)?\\..*\\.path|merge\\..*\\.driver|diff\\..*\\.command|filter\\..*\\.(clean|smudge|process)|core\\.(fsmonitor|sshcommand)|commit\\.gpgsign|tag\\.gpgsign|gpg\\..*\\.program)$"], hooks, signal);
-  if (config.exitCode === 0 && config.stdout.trim()) {
-    throw Object.assign(new Error("Repository config contains an external driver or helper."), {
-      code: "repository_external_helper_denied"
+function atomicCheckpointScope(paths: string[]): { workspacePath: string; scopePaths: string[] } {
+  const minimal = [...new Set(paths.map((item) => path.resolve(item)))]
+    .filter((item, index, values) => !values.some((candidate, candidateIndex) =>
+      candidateIndex !== index && pathWithin(candidate, item)));
+  const first = minimal[0];
+  if (!first) {
+    throw Object.assign(new Error("Repository transaction has no checkpoint scope."), {
+      code: "repository_atomicity_unavailable"
     });
   }
+  let workspacePath = first;
+  while (!minimal.every((item) => pathWithin(workspacePath, item))) {
+    const parent = path.dirname(workspacePath);
+    if (parent === workspacePath) {
+      throw Object.assign(new Error("Repository transaction roots do not share a filesystem scope."), {
+        code: "repository_atomicity_unavailable"
+      });
+    }
+    workspacePath = parent;
+  }
+  return {
+    workspacePath,
+    scopePaths: minimal.map((item) => path.relative(workspacePath, item) || ".")
+  };
 }
 
-async function createMetadataCheckpoint(
+async function createRepositoryCheckpoint(
   manager: CheckpointManager,
   context: PlannedToolExecutionContext,
-  metadataRoot: string
+  captureRoots: string[]
 ): Promise<string> {
   try {
+    const scope = atomicCheckpointScope(captureRoots);
     const checkpoint = await manager.create({
       sessionId: context.sessionId,
       runId: context.runId,
-      workspacePath: metadataRoot,
-      scopePaths: ["."],
+      ...scope,
       baseSeq: 0
     });
     return checkpoint.checkpointId;
   } catch (error) {
     if ((error as { code?: unknown }).code === "checkpoint_limit_exceeded") {
-      throw Object.assign(new Error("Repository metadata exceeds checkpoint limits.", { cause: error }), {
+      throw Object.assign(new Error("Repository transaction preimage exceeds checkpoint limits.", { cause: error }), {
         code: "repository_checkpoint_too_large"
       });
     }
@@ -191,7 +165,9 @@ async function applyGitOperations(
   const outputs: string[] = [];
   for (const operationArgs of args) {
     context.signal.throwIfAborted();
-    const result = await runGit(execution, root, metadataRoots, operationArgs, hooks, context.signal);
+    const result = await runGit(
+      execution, root, metadataRoots, operationArgs, hooks, context.signal, context.sessionId
+    );
     outputs.push(result.stdout, result.stderr);
     if (result.exitCode !== 0) {
       throw Object.assign(new Error(`Git operation failed with exit code ${result.exitCode}: ${result.stderr.trim()}`), {
@@ -225,7 +201,11 @@ function repositoryReceipt(
       refsBeforeDigest: before.refsDigest, refsAfterDigest: after.refsDigest,
       indexBeforeDigest: before.indexDigest, indexAfterDigest: after.indexDigest,
       reachableObjectsBefore: before.reachableObjects,
-      reachableObjectsAfter: after.reachableObjects
+      reachableObjectsAfter: after.reachableObjects,
+      conflictsBeforeDigest: before.conflictsDigest,
+      conflictsAfterDigest: after.conflictsDigest,
+      conflictCountBefore: before.conflictCount,
+      conflictCountAfter: after.conflictCount
     }
   };
   const effects: ToolDescriptor["possibleEffects"] = ["repository.write",
@@ -269,18 +249,29 @@ async function executeTransaction(
     });
   }
   const metadataRoots = [...new Set([gitDir, commonDir])];
-  const checkpoints = repositoryCheckpointManager(context.workspacePath, limits);
+  const captureRoots = requestedOperations.some(mutatesWorktree)
+    ? [root, ...metadataRoots]
+    : metadataRoots;
+  const checkpoints = await atomicRepositoryCheckpointManager(context.workspacePath, limits);
   await restoreOpenRepositoryCheckpoint(checkpoints, context.sessionId);
-  const transactionRoot = await mkdtemp(path.join(os.tmpdir(), "sigma-git-transaction-"));
-  const hooks = path.join(transactionRoot, "empty-hooks");
-  await mkdir(hooks, { recursive: true });
+  await restoreOpenRepositoryCheckpoint(repositoryCheckpointManager(context.workspacePath, limits), context.sessionId);
+  // The platform null device is immutable from the sandbox and cannot contain
+  // hooks. Unlike a host temporary directory, it is present in every broker
+  // namespace without granting another read root.
+  const hooks = GIT_NULL_DEVICE;
   let checkpointId: string | undefined;
   try {
-    await assertNoExternalDrivers(execution, root, metadataRoots, hooks, context.signal);
-    const before = await repositoryState(execution, root, gitDir, metadataRoots, hooks, context.signal);
-    checkpointId = await createMetadataCheckpoint(checkpoints, context, commonDir);
+    await assertNoExternalDrivers(
+      execution, root, metadataRoots, hooks, context.signal, context.sessionId
+    );
+    const before = await repositoryState(
+      execution, root, gitDir, metadataRoots, hooks, context.signal, context.sessionId
+    );
+    checkpointId = await createRepositoryCheckpoint(checkpoints, context, captureRoots);
     const outputs = await applyGitOperations(execution, root, metadataRoots, args, hooks, context);
-    const after = await repositoryState(execution, root, gitDir, metadataRoots, hooks, context.signal);
+    const after = await repositoryState(
+      execution, root, gitDir, metadataRoots, hooks, context.signal, context.sessionId
+    );
     await checkpoints.seal(context.sessionId, checkpointId);
     checkpointId = undefined;
     return repositoryReceipt(
@@ -298,8 +289,6 @@ async function executeTransaction(
       }
     }
     throw error;
-  } finally {
-    await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 

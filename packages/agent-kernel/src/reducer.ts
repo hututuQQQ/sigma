@@ -4,29 +4,23 @@ import type {
   CompletionLimitationV1,
   JsonValue,
   ModelMessage,
-  ModelToolCall,
   RunOutcome
 } from "agent-protocol";
-import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
+import type { KernelState } from "./state.js";
 import {
   completionRepairFailureMessage,
-  conflictingTerminalBatch,
-  hasCompletionRepair,
-  incompleteModelCompletion,
-  protectedCompletionAnswer,
-  repairConflictingTerminalBatch
+  protectedCompletionAnswer
 } from "./model-convergence.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
-import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
+import { isCurrentModelTurn, modelTurn } from "./model-event-parsing.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
-import { repeatsCompletedToolBatch } from "./tool-batch-progress.js";
 import { toolFinished } from "./tool-finished-reducer.js";
+import { modelCompleted } from "./model-completed-reducer.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
   nextPhase,
   pendingForEvent,
-  protectedToolBatchFailure,
   proposedOutcomeState,
   terminalState
 } from "./terminal-reducer-helpers.js";
@@ -43,15 +37,6 @@ function supersededToolMessages(state: KernelState): ModelMessage[] {
     content: `Failed tool receipt ID: ${pending.request.callId}\nSuperseded by a newer user instruction; no successful receipt or side effect may be inferred.`
   }));
 }
-function pendingFromCalls(calls: ModelToolCall[], modelTurn: ActiveModelTurn): PendingTool[] {
-  return calls.map((call): PendingTool => ({
-    request: { callId: call.id, name: call.name, arguments: call.arguments },
-    modelTurn,
-    approval: "not_required",
-    started: false,
-    origin: "model"
-  }));
-}
 type EventReducer = KernelEventReducer;
 const runStarted: EventReducer = (state, _event, payload) => ({
   ...state,
@@ -60,6 +45,11 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   deadlineAt: typeof payload.deadlineAt === "string" ? payload.deadlineAt : state.deadlineAt,
   validationRequirement: payload.validationRequirement === "default" ? "default" : "required",
   deadlineRemainingMs: undefined,
+  convergenceStageHighWater: {
+    runId: state.runId,
+    deadline: "normal",
+    budget: "normal"
+  },
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   completionRepairAttempts: 0,
@@ -141,64 +131,6 @@ const modelSemanticDelta: EventReducer = (state, _event, payload) => {
   if (state.phase !== "model_in_flight" || !state.activeModelTurn
     || payload.turnId !== state.activeModelTurn.turnId) return state;
   return { ...state, activeModelSemanticDelta: true };
-};
-
-const modelCompleted: EventReducer = (state, _event, payload) => {
-  if (state.phase !== "model_in_flight" || !isCurrentModelTurn(state, payload)) return state;
-  const message = modelMessage(payload.message);
-  const messages = message ? [...state.messages, message] : state.messages;
-  const calls = modelToolCalls(payload.toolCalls);
-  const modelTurn = state.activeModelTurn!;
-  const completedState = { ...state, activeModelTurn: undefined, activeModelSemanticDelta: undefined };
-  if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
-  const protectedFailure = protectedToolBatchFailure(state, calls);
-  if (protectedFailure) {
-    return proposedOutcomeState({ ...completedState, messages }, {
-      kind: "recoverable_failure",
-      code: protectedFailure.code,
-      message: completionRepairFailureMessage(state, protectedFailure.message)
-    });
-  }
-  const identifiers = calls.map((call) => call.id);
-  const seen = new Set(state.toolCallIds);
-  const duplicate = identifiers.find((id, index) => identifiers.indexOf(id) !== index || seen.has(id));
-  if (duplicate) {
-    return proposedOutcomeState({ ...completedState, messages }, {
-      kind: "recoverable_failure",
-      code: "protocol_error",
-      message: completionRepairFailureMessage(
-        state,
-        `Model reused tool call id '${duplicate}' within the current run.`
-      )
-    });
-  }
-  if (conflictingTerminalBatch(calls, hasCompletionRepair(state))) {
-    return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
-  }
-  if (repeatsCompletedToolBatch(state, calls)) {
-    return proposedOutcomeState({
-      ...completedState,
-      messages,
-      toolCallIds: [...state.toolCallIds, ...identifiers]
-    }, {
-      kind: "recoverable_failure",
-      code: "convergence_no_progress",
-      message: completionRepairFailureMessage(
-        state,
-        "The same tool batch produced the same completed outcome twice and was proposed again without progress."
-      )
-    });
-  }
-  const pendingTools = pendingFromCalls(calls, modelTurn);
-  return {
-    ...completedState,
-    messages,
-    pendingTools,
-    toolCallIds: [...state.toolCallIds, ...identifiers],
-    completionRepairAttempts: state.completionRepairAttempts,
-    continuationAttempts: 0,
-    phase: "tool_pending"
-  };
 };
 
 const modelFailed: EventReducer = (state, _event, payload) => {
@@ -305,11 +237,73 @@ const runCompleted: EventReducer = (state, _event, payload) => {
   }, outcome);
 };
 
-const diagnostic: EventReducer = (state, _event, payload) => {
+const DEADLINE_STAGE_RANK = { normal: 0, converge: 1, stop: 2 } as const;
+const BUDGET_STAGE_RANK = { normal: 0, converge: 1, terminal: 2 } as const;
+
+function convergenceStageUpdate(
+  state: KernelState,
+  event: AgentEventEnvelope,
+  payload: Record<string, JsonValue>
+): KernelState | undefined {
+  if (payload.kind !== "deadline.stage" || event.authority !== "runtime" || event.runId !== state.runId) {
+    return undefined;
+  }
+  const deadline = payload.stage === "normal" || payload.stage === "converge" || payload.stage === "stop"
+    ? payload.stage : "normal";
+  const prior = state.convergenceStageHighWater?.runId === state.runId
+    ? state.convergenceStageHighWater
+    : { runId: state.runId, deadline: "normal" as const, budget: "normal" as const };
+  // Legacy events exposed only the effective budget stage, which could have
+  // been raised by transient action debt. It is deliberately not replayed as
+  // durable resource pressure because its provenance is ambiguous.
+  const resourceBudget = payload.resourceBudgetStage === "normal"
+    || payload.resourceBudgetStage === "converge"
+    || payload.resourceBudgetStage === "terminal" ? payload.resourceBudgetStage : prior.budget;
+  return {
+    ...state,
+    convergenceStageHighWater: {
+      runId: state.runId,
+      deadline: DEADLINE_STAGE_RANK[deadline] > DEADLINE_STAGE_RANK[prior.deadline]
+        ? deadline : prior.deadline,
+      budget: BUDGET_STAGE_RANK[resourceBudget] > BUDGET_STAGE_RANK[prior.budget]
+        ? resourceBudget : prior.budget
+    }
+  };
+}
+
+function modelToolPolicyUpdate(
+  state: KernelState,
+  event: AgentEventEnvelope,
+  payload: Record<string, JsonValue>
+): KernelState | undefined {
+  if (payload.kind !== "model.tool_policy" || event.authority !== "runtime"
+    || event.runId !== state.runId || state.phase !== "model_in_flight"
+    || !isCurrentModelTurn(state, payload) || !Array.isArray(payload.allowedToolNames)
+    || typeof payload.terminalOnly !== "boolean") return undefined;
+  const allowedToolNames = payload.allowedToolNames.filter(
+    (item): item is string => typeof item === "string" && item.length > 0
+  );
+  if (allowedToolNames.length !== payload.allowedToolNames.length
+    || allowedToolNames.length > 512
+    || new Set(allowedToolNames).size !== allowedToolNames.length) return undefined;
+  return {
+    ...state,
+    activeModelTurn: {
+      ...state.activeModelTurn!,
+      toolPolicy: { allowedToolNames, terminalOnly: payload.terminalOnly }
+    }
+  };
+}
+
+const diagnostic: EventReducer = (state, event, payload) => {
   // user.steer is the durable authority for superseding a turn. The later
   // steering.restart event is observational only: applying it could erase a
   // newer turn that completed while the cancelled provider was unwinding.
   if (payload.kind === "steering.restart") return state;
+  const toolPolicy = modelToolPolicyUpdate(state, event, payload);
+  if (toolPolicy) return toolPolicy;
+  const convergence = convergenceStageUpdate(state, event, payload);
+  if (convergence) return convergence;
   if (payload.kind === "recovery.retry_model") return {
     ...state,
     phase: "ready_model",

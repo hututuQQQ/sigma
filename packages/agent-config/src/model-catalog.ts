@@ -18,7 +18,12 @@ export interface ModelSpecConfigValue {
   providerId: ConfigModelProvider;
   upstreamModel: string;
   capabilities: ModelCapabilities;
-  tokenizer: { id: string; accuracy: ConfigTokenizerAccuracy; assetDigest?: string };
+  tokenizer: {
+    id: string;
+    accuracy: ConfigTokenizerAccuracy;
+    assetDigest?: string;
+    maxTokensPerUtf8Byte?: number;
+  };
   pricing?: ModelPricingConfigValue;
 }
 
@@ -36,7 +41,7 @@ const CAPABILITY_KEYS = new Set([
   "context_window_tokens", "max_output_tokens", "tools", "parallel_tools", "reasoning",
   "structured_output", "prompt_cache", "tokenizer"
 ]);
-const TOKENIZER_KEYS = new Set(["id", "accuracy", "asset_digest"]);
+const TOKENIZER_KEYS = new Set(["id", "accuracy", "asset_digest", "max_tokens_per_utf8_byte"]);
 const PRICING_KEYS = new Set([
   "input_micro_usd_per_million", "output_micro_usd_per_million", "cache_read_micro_usd_per_million",
   "cache_write_micro_usd_per_million", "effective_at", "source_url"
@@ -69,6 +74,12 @@ function modelSpec(raw: unknown, label: string): ModelSpecConfigValue {
       accuracy: choice(tokenizer.accuracy, ["exact", "approximate"], `${label}.tokenizer.accuracy`),
       ...(tokenizer.asset_digest === undefined ? {} : {
         assetDigest: text(tokenizer.asset_digest, `${label}.tokenizer.asset_digest`)
+      }),
+      ...(tokenizer.max_tokens_per_utf8_byte === undefined ? {} : {
+        maxTokensPerUtf8Byte: integer(
+          tokenizer.max_tokens_per_utf8_byte,
+          `${label}.tokenizer.max_tokens_per_utf8_byte`
+        )
       })
     },
     ...(pricing ? { pricing } : {})

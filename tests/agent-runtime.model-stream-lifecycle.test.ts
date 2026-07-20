@@ -162,18 +162,18 @@ describe("runtime model stream lifecycle", () => {
       }
     });
     const committed = events.find((event) => event.type === "budget.committed") as
-      | (AgentEventEnvelope & { payload: { ledger: {
-        reserved: Record<string, number>;
-        reservations: Array<{ status: string }>;
+      | (AgentEventEnvelope & { payload: { mutation: {
+        status: string;
+        totals: { reserved: Record<string, number> };
       } } })
       | undefined;
-    expect(committed?.payload.ledger.reserved).toMatchObject({
+    expect(committed?.payload.mutation.totals.reserved).toMatchObject({
       inputTokens: 0,
       outputTokens: 0,
       costMicroUsd: 0,
       modelTurns: 0
     });
-    expect(committed?.payload.ledger.reservations.every((item) => item.status !== "reserved")).toBe(true);
+    expect(committed?.payload.mutation.status).toBe("committed");
     expect(events.at(-1)?.type).toBe("run.failed");
   });
 });

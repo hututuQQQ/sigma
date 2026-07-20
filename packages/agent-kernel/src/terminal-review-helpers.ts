@@ -9,7 +9,7 @@ function currentFrontierReview(state: KernelState): ReviewEvidence | undefined {
   return state.evidence.filter((item): item is ReviewEvidence => item.kind === "review"
     && item.data.frontierRevision === frontier.revision
     && item.data.stateDigest === frontier.currentStateDigest
-    && item.data.reviewBasisVersion === 2).at(-1);
+    && (item.data.reviewBasisVersion === 2 || item.data.reviewBasisVersion === 3)).at(-1);
 }
 
 export function boundedReviewFindings(review: ReviewEvidence): string {

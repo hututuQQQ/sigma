@@ -46,6 +46,8 @@ function evidenceVariants(): EvidenceRecord[] {
       refsBeforeDigest: "a".repeat(64), refsAfterDigest: "b".repeat(64),
       indexBeforeDigest: "a".repeat(64), indexAfterDigest: "b".repeat(64),
       reachableObjectsBefore: 0, reachableObjectsAfter: 1,
+      conflictsBeforeDigest: "a".repeat(64), conflictsAfterDigest: "b".repeat(64),
+      conflictCountBefore: 0, conflictCountAfter: 0,
     } },
     { ...base, kind: "command", data: { command: "pnpm test", exitCode: 0 } },
     { ...base, kind: "validation", data: {

@@ -17,12 +17,7 @@ import {
   createApprovalBinding,
   sameApprovalBinding
 } from "./approval-binding.js";
-
-const internalTerminalEffects: ReadonlySet<ToolEffect> = new Set([
-  "outcome.propose",
-  "outcome.report_blocked",
-  "outcome.request_input"
-]);
+import { terminalOnlyToolDescriptor, terminalOnlyToolEffects } from "./terminal-tool-policy.js";
 
 function approvalCommand(call: ModelToolCall): string {
   const value = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments)
@@ -82,12 +77,6 @@ function requiresFreshRecoveredApproval(plan: ToolCallPlan): boolean {
     ["filesystem.write", "repository.write", "destructive", "checkpoint.restore", "open_world"].includes(effect));
 }
 
-function containsOnlyInternalTerminalEffects(
-  effects: readonly ToolEffect[]
-): boolean {
-  return effects.length > 0 && effects.every((effect) => internalTerminalEffects.has(effect));
-}
-
 function mandatoryApprovalDecision(
   descriptor: ToolDescriptor,
   effects: ToolDescriptor["possibleEffects"],
@@ -95,10 +84,8 @@ function mandatoryApprovalDecision(
 ): "allow" | "deny" | undefined {
   if (descriptor.approval === "deny") return "deny";
   if (permissionMode !== "deny") return undefined;
-  const maximumEffects = descriptor.maximumEffects ?? descriptor.possibleEffects;
-  return containsOnlyInternalTerminalEffects(descriptor.possibleEffects)
-    && containsOnlyInternalTerminalEffects(maximumEffects)
-    && containsOnlyInternalTerminalEffects(effects)
+  return terminalOnlyToolDescriptor(descriptor)
+    && terminalOnlyToolEffects(effects)
     ? "allow"
     : "deny";
 }

@@ -8,11 +8,16 @@ import { resolvePortableNodeExecutable, resolveSigmaExecBinary } from "./paths.j
 import { trustedToolchainCommandAliases } from "./trusted-toolchains.js";
 import type {
   BrokerDoctorReport,
+  BrokerRequestOptions,
   ExecutionBroker,
   ExecutionRequest,
   ProcessHandle,
   ProcessPollResult,
   ProcessSpawnRequest,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  ScratchLeaseRequestV1,
+  ScratchLeaseV1,
   TrustedToolchainManifestEntry
 } from "./types.js";
 import {
@@ -119,6 +124,21 @@ export function withTrustedRuntimeCapabilities(
     ...(broker.revokeSandboxLease ? {
       revokeSandboxLease: async (workspacePath: string, signal?: AbortSignal) =>
         await broker.revokeSandboxLease!(workspacePath, signal)
+    } : {}),
+    ...(broker.acquireRepositoryMetadataLease ? {
+      acquireRepositoryMetadataLease: async (
+        request: RepositoryMetadataLeaseRequestV1,
+        options?: BrokerRequestOptions
+      ): Promise<RepositoryMetadataLeaseV1> =>
+        await broker.acquireRepositoryMetadataLease!(request, options)
+    } : {}),
+    ...(broker.acquireScratchLease && broker.releaseScratchLease ? {
+      acquireScratchLease: async (
+        request: ScratchLeaseRequestV1,
+        options?: BrokerRequestOptions
+      ): Promise<ScratchLeaseV1> => await broker.acquireScratchLease!(request, options),
+      releaseScratchLease: async (sessionId: string, options?: BrokerRequestOptions): Promise<void> =>
+        await broker.releaseScratchLease!(sessionId, options)
     } : {}),
     execute: async (request: ExecutionRequest, options) => await broker.execute(request, options),
     spawn: async (request: ProcessSpawnRequest, options) => await broker.spawn(request, options),

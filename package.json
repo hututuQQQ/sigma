@@ -87,6 +87,7 @@
     "bench:tb:report:all": "node scripts/bench-report.mjs --all",
     "bench:tb:sample:plan": "node scripts/bench-sample-plan.mjs",
     "bench:tb:sample:gate": "node scripts/bench-paired-gate.mjs",
+    "bench:tb:paired": "node scripts/bench-cross-agent-paired.mjs",
     "bench:tb:formal": "node scripts/bench-terminal-bench-formal.mjs"
   },
   "devDependencies": {

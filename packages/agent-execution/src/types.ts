@@ -34,6 +34,18 @@ export interface ExecutionPolicy {
   /** Read/execute-only roots for explicitly trusted absolute executables. */
   executionRoots?: string[];
   protectedPaths?: string[];
+  /** Trusted validation adapter request: mount a broker-owned writable copy at
+   * this exact in-sandbox path and discard it when the process exits. */
+  disposableWorkspaceRoot?: string;
+  /** Explicit fallback for targets without same-path COW. The broker executes
+   * at the real path with read-only workspace access and writable scratch. */
+  readOnlyValidationWorkspaceRoot?: string;
+  /** One-use broker-issued capability. Its topology fields are observational;
+   * the native broker authorizes only the stored lease id. */
+  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
+  /** Runtime-only broker capability. Tool/model arguments cannot construct or
+   * select its host paths or lease id. */
+  scratchLease?: ScratchLeaseV1;
 }
 
 export interface ExecutionRequest {
@@ -252,6 +264,23 @@ export interface BrokerSandboxRevokeResult {
   generation: number;
 }
 
+export interface RepositoryMetadataLeaseRequestV1 {
+  protocolVersion: 1;
+  repositoryRoot: string;
+  gitDir: string;
+  commonDir: string;
+  executable: string;
+  network: "none";
+}
+
+export interface RepositoryMetadataLeaseV1 extends RepositoryMetadataLeaseRequestV1 {
+  leaseId: string;
+  /** SHA-256 of the exact executable object pinned when the broker issued the lease. */
+  executableSha256: string;
+  /** Capabilities are deliberately single-use and are burned before launch. */
+  uses: 1;
+}
+
 /**
  * A package-verified runtime/toolchain that may execute inside the sandbox.
  * The broker treats every entry as trusted configuration, never as model- or
@@ -306,6 +335,17 @@ export interface ExecutionBroker {
   repairSandbox?(signal?: AbortSignal): Promise<BrokerDoctorReport>;
   sandboxLeaseStatus?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus>;
   revokeSandboxLease?(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult>;
+  acquireRepositoryMetadataLease?(
+    request: RepositoryMetadataLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLeaseV1>;
+  acquireScratchLease?(
+    request: ScratchLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ScratchLeaseV1>;
+  /** Idempotently ends a RuntimeSession lease after all of its processes have
+   * reached a terminal state. */
+  releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
   execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult>;
   spawn(request: ProcessSpawnRequest, options?: BrokerRequestOptions): Promise<ProcessHandle>;
   poll(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
@@ -347,3 +387,5 @@ export interface SigmaExecBrokerClientOptions {
   trustedToolchains?: TrustedToolchainManifestEntry[];
 }
 import type { Duplex } from "node:stream";
+import type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+export type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";

@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::linux_mount_source::{PinnedMountSource, ResolvedMountSource, inherit_mount_sources};
 use crate::protocol::RpcError;
+use crate::scratch::{DisposableWorkspace, ScratchLease};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -73,6 +74,29 @@ pub struct ExecutionPolicy {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub disposable_workspace_root: Option<PathBuf>,
+    /** Explicit validation fallback for backends without same-path COW. The
+     * workspace remains a normal read root and receives no write grant. */
+    #[serde(default)]
+    pub read_only_validation_workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    pub repository_metadata_lease_id: Option<String>,
+    /** Broker-issued RuntimeSession scratch capability. Both fields are
+     * consumed before the launcher sees the request. */
+    #[serde(default)]
+    pub scratch_lease_id: Option<String>,
+    #[serde(default)]
+    pub scratch_session_id: Option<String>,
+    /** Set only after BrokerState consumes an issued one-use lease. */
+    #[serde(default)]
+    pub repository_metadata_roots: Vec<PathBuf>,
+    /** Broker-internal roots that are private scratch, never repository data. */
+    #[serde(default)]
+    pub session_scratch_roots: Vec<PathBuf>,
+    /** Broker-internal authorization for a remapped disposable workspace. */
+    #[serde(default)]
+    pub disposable_workspace_authorized_root: Option<PathBuf>,
     #[cfg(test)]
     #[serde(default)]
     pub unsafe_host_exec_approved: bool,
@@ -473,6 +497,14 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     execution_roots: Vec::new(),
                     executable_sha256: None,
                     protected_paths: Vec::new(),
+                    disposable_workspace_root: None,
+                    read_only_validation_workspace_root: None,
+                    repository_metadata_lease_id: None,
+                    scratch_lease_id: None,
+                    scratch_session_id: None,
+                    repository_metadata_roots: Vec::new(),
+                    session_scratch_roots: Vec::new(),
+                    disposable_workspace_authorized_root: None,
                     #[cfg(test)]
                     unsafe_host_exec_approved: false,
                 },
@@ -484,7 +516,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                 pty_columns: 80,
                 pty_rows: 24,
             };
-            let result = build_sandboxed_command(&params)
+            let result = build_sandboxed_command(&params, None, None)
                 .and_then(|mut prepared| prepared.command.output().map_err(RpcError::from))
                 .ok();
             let _ = std::fs::remove_dir_all(&root);
@@ -500,6 +532,8 @@ pub struct PreparedCommand {
     pub protected_path_guards: Vec<ProtectedPathGuard>,
     /** Broker-held nonce shared only with the trusted internal sandbox launcher. */
     pub launch_failure_nonce: Option<String>,
+    /** Owns and removes a writable validation mirror after the process exits. */
+    pub disposable_workspace: Option<DisposableWorkspace>,
     /** Keeps O_PATH mount sources alive until bwrap has inherited them. */
     #[cfg(target_os = "linux")]
     _mount_source_descriptors: Vec<std::fs::File>,
@@ -541,19 +575,41 @@ impl Drop for ProtectedPathGuard {
 pub fn build_command(
     params: &ProcessParams,
     allow_unsafe: bool,
+    scratch: Option<&ScratchLease>,
 ) -> Result<PreparedCommand, RpcError> {
     validate(params, allow_unsafe)?;
+    #[cfg(not(target_os = "linux"))]
+    if params.policy.disposable_workspace_root.is_some() {
+        return Err(RpcError::new(
+            "validation_disposable_workspace_unavailable",
+            "this sandbox backend cannot provide a same-path disposable validation workspace",
+        ));
+    }
+    let disposable_workspace = match (&params.policy.disposable_workspace_root, scratch) {
+        (Some(root), Some(lease)) => Some(lease.disposable_workspace(root)?),
+        (Some(_), None) => {
+            return Err(RpcError::new(
+                "validation_disposable_workspace_unavailable",
+                "validation workspace isolation requires broker session scratch",
+            ));
+        }
+        (None, _) => None,
+    };
+    let effective_params = params;
     let guards = match params.policy.sandbox {
-        SandboxMode::Required => create_missing_protected_guards(params)?,
+        SandboxMode::Required => create_missing_protected_guards(effective_params)?,
         #[cfg(test)]
         SandboxMode::Unsafe => Vec::new(),
     };
     let mut prepared = match params.policy.sandbox {
-        SandboxMode::Required => build_sandboxed_command(params),
+        SandboxMode::Required => {
+            build_sandboxed_command(effective_params, scratch, disposable_workspace.as_ref())
+        }
         #[cfg(test)]
-        SandboxMode::Unsafe => build_host_command(params),
+        SandboxMode::Unsafe => build_host_command(effective_params),
     }?;
     prepared.protected_path_guards = guards;
+    prepared.disposable_workspace = disposable_workspace;
     Ok(prepared)
 }
 
@@ -715,6 +771,56 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
     let read_roots = canonical_roots(&params.policy.read_roots)?;
     let write_roots = canonical_roots(&params.policy.write_roots)?;
     let execution_roots = canonical_roots(&params.policy.execution_roots)?;
+    if params.policy.disposable_workspace_root.is_some()
+        && params.policy.read_only_validation_workspace_root.is_some()
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "validation cannot request both same-path COW and read-only fallback",
+        ));
+    }
+    if let Some(disposable) = params
+        .policy
+        .disposable_workspace_root
+        .as_ref()
+        .or(params.policy.read_only_validation_workspace_root.as_ref())
+    {
+        let canonical = canonicalize_sandbox_root(disposable)?;
+        let scratch_roots = canonical_roots(&params.policy.session_scratch_roots)?;
+        if write_roots.iter().any(|root| {
+            !scratch_roots
+                .iter()
+                .any(|scratch| root.starts_with(scratch))
+        }) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "isolated validation cannot declare durable write roots",
+            ));
+        }
+        if params.policy.repository_metadata_lease_id.is_some()
+            || !params.policy.repository_metadata_roots.is_empty()
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "repository metadata leases cannot be combined with isolated validation",
+            ));
+        }
+        if !read_roots.iter().any(|root| canonical.starts_with(root)) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "validation workspace must be contained by a declared read root",
+            ));
+        }
+        if write_roots
+            .iter()
+            .any(|root| canonical.starts_with(root) || root.starts_with(&canonical))
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "validation workspace cannot overlap durable write roots",
+            ));
+        }
+    }
     for write_root in &write_roots {
         if !read_roots.iter().any(|root| write_root.starts_with(root)) {
             return Err(RpcError::new(
@@ -726,7 +832,9 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        if name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".agent") {
+        if (name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".agent"))
+            && !metadata_path_authorized(write_root, &params.policy.repository_metadata_roots)
+        {
             return Err(RpcError::new(
                 "policy_denied",
                 "metadata directories cannot be writable roots",
@@ -797,6 +905,9 @@ fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, Rpc
     let mut resolved = BTreeMap::<String, PathBuf>::new();
     for candidate in candidates {
         let canonical = canonicalize_allow_missing(&candidate)?;
+        if metadata_path_authorized(&canonical, &params.policy.repository_metadata_roots) {
+            continue;
+        }
         let key = if cfg!(windows) {
             canonical.to_string_lossy().to_lowercase()
         } else {
@@ -805,6 +916,10 @@ fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, Rpc
         resolved.entry(key).or_insert(canonical);
     }
     Ok(resolved.into_values().collect())
+}
+
+fn metadata_path_authorized(path: &Path, metadata_roots: &[PathBuf]) -> bool {
+    metadata_roots.iter().any(|root| path.starts_with(root))
 }
 
 fn guard_token() -> String {
@@ -911,7 +1026,11 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, RpcError> {
     let suffix = path
         .strip_prefix(ancestor)
         .map_err(|_| RpcError::new("policy_denied", "protected path normalization failed"))?;
-    Ok(canonical.join(suffix))
+    if suffix.as_os_str().is_empty() {
+        Ok(canonical)
+    } else {
+        Ok(canonical.join(suffix))
+    }
 }
 
 fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, RpcError> {
@@ -1019,13 +1138,18 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        disposable_workspace: None,
         #[cfg(target_os = "linux")]
         _mount_source_descriptors: Vec::new(),
     })
 }
 
 #[cfg(target_os = "linux")]
-fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    params: &ProcessParams,
+    scratch: Option<&ScratchLease>,
+    disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
     // Session processes retain bubblewrap's parent-death cleanup in addition
@@ -1080,6 +1204,9 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     let write_roots = pin_resolved_mount_sources(resolved_write_roots)?;
     let execution_roots = pin_resolved_mount_sources(resolved_execution_roots)?;
     let protected_roots = pin_resolved_mount_sources(resolved_protected_roots)?;
+    let disposable_source = disposable_workspace
+        .map(|workspace| PinnedMountSource::pin(workspace.source()))
+        .transpose()?;
     let cwd_source = resolved_cwd.pin()?;
     verify_pinned_root_hierarchy(
         &read_roots,
@@ -1101,10 +1228,27 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         let value = root.to_string_lossy();
         command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
     }
-    command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+    command.args(["--proc", "/proc", "--dev", "/dev"]);
+    let scratch_home = scratch
+        .map(|lease| PinnedMountSource::pin(lease.home_source()))
+        .transpose()?;
+    let scratch_temp = scratch
+        .map(|lease| PinnedMountSource::pin(lease.temp_source()))
+        .transpose()?;
+    if let (Some(lease), Some(home), Some(temp)) =
+        (scratch, scratch_home.as_ref(), scratch_temp.as_ref())
+    {
+        home.append_bind_at(&mut command, false, lease.home_destination());
+        temp.append_bind_at(&mut command, false, Path::new("/tmp"));
+    } else {
+        command.args(["--tmpfs", "/tmp"]);
+    }
     bind_pinned_roots(&mut command, &read_roots, true, &system_roots);
     bind_pinned_roots(&mut command, &write_roots, false, &[]);
     bind_pinned_roots(&mut command, &execution_roots, true, &system_roots);
+    if let (Some(workspace), Some(source)) = (disposable_workspace, disposable_source.as_ref()) {
+        source.append_bind_at(&mut command, false, workspace.destination());
+    }
     bind_pinned_roots(&mut command, &protected_roots, true, &[]);
     cwd_source.append_bind_at(
         &mut command,
@@ -1122,6 +1266,25 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     // with the glibc 2.28 baseline's bubblewrap 0.4 runtime.
     for (key, value) in &params.command.env {
         command.args(["--setenv", key, value]);
+    }
+    if let Some(lease) = scratch {
+        let home = lease.home_destination();
+        command.args(["--setenv", "HOME"]).arg(home);
+        command.args(["--setenv", "TMPDIR", "/tmp"]);
+        command.args(["--setenv", "TMP", "/tmp"]);
+        command.args(["--setenv", "TEMP", "/tmp"]);
+        command
+            .args(["--setenv", "XDG_CACHE_HOME"])
+            .arg(home.join(".cache"));
+        command
+            .args(["--setenv", "XDG_CONFIG_HOME"])
+            .arg(home.join(".config"));
+        command
+            .args(["--setenv", "XDG_DATA_HOME"])
+            .arg(home.join(".local/share"));
+        command
+            .args(["--setenv", "XDG_STATE_HOME"])
+            .arg(home.join(".local/state"));
     }
     let helper = std::env::current_exe().map_err(|error| {
         RpcError::new(
@@ -1167,6 +1330,12 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     {
         command.arg("--write").arg(root);
     }
+    if let Some(workspace) = disposable_workspace {
+        command.arg("--write").arg(workspace.destination());
+    }
+    if let Some(lease) = scratch {
+        command.arg("--write").arg(lease.home_destination());
+    }
     command.arg("--");
     if params.pty {
         command
@@ -1194,6 +1363,9 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
             cwd_source.raw_fd(),
             executable.source.raw_fd(),
         ])
+        .chain(scratch_home.iter().map(PinnedMountSource::raw_fd))
+        .chain(scratch_temp.iter().map(PinnedMountSource::raw_fd))
+        .chain(disposable_source.iter().map(PinnedMountSource::raw_fd))
         .collect::<Vec<_>>();
     inherit_mount_sources(&mut command, &mount_source_fds)?;
     let mount_source_descriptors = read_roots
@@ -1207,23 +1379,47 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
             cwd_source.into_descriptor(),
             executable.source.into_descriptor(),
         ])
+        .chain(
+            scratch_home
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            scratch_temp
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            disposable_source
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
         .collect();
     Ok(PreparedCommand {
         command,
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        disposable_workspace: None,
         _mount_source_descriptors: mount_source_descriptors,
     })
 }
 
 #[cfg(target_os = "windows")]
-fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    params: &ProcessParams,
+    _scratch: Option<&ScratchLease>,
+    _disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     crate::windows_sandbox::prepare_command(params)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn build_sandboxed_command(_params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    _params: &ProcessParams,
+    _scratch: Option<&ScratchLease>,
+    _disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     Err(RpcError::new(
         "sandbox_unavailable",
         "required sandbox backend is unavailable on this platform",
@@ -1468,6 +1664,17 @@ fn authorize_linux_executable(
         if !source.is_executable_file()? {
             continue;
         }
+        if let Some(expected) = params.policy.executable_sha256.as_deref()
+            && source.sha256()? != expected
+        {
+            return Err(RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "executable '{}' no longer matches its trusted digest",
+                    source.destination().display()
+                ),
+            ));
+        }
         if system_roots
             .iter()
             .any(|root| source.destination().starts_with(root))
@@ -1523,6 +1730,12 @@ fn resolve_protected(
             continue;
         }
         let source = ResolvedMountSource::resolve(&item)?;
+        if metadata_path_authorized(
+            source.destination(),
+            &params.policy.repository_metadata_roots,
+        ) {
+            continue;
+        }
         if !read_roots
             .iter()
             .any(|root| source.destination().starts_with(root.destination()))
@@ -1846,6 +2059,14 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                repository_metadata_lease_id: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                repository_metadata_roots: Vec::new(),
+                session_scratch_roots: Vec::new(),
+                disposable_workspace_authorized_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },
@@ -2013,6 +2234,109 @@ mod tests {
         assert_eq!(overlap.code, "policy_denied");
         assert!(overlap.message.contains("must not overlap"));
         std::fs::remove_dir_all(&root).expect("remove test workspace");
+    }
+
+    #[test]
+    fn disposable_validation_allows_only_broker_session_scratch_write_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-disposable-write-scope-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = root.join("workspace");
+        let scratch = root.join("scratch");
+        let external = root.join("external");
+        for directory in [&workspace, &scratch, &external] {
+            std::fs::create_dir_all(directory).expect("create validation scope");
+        }
+        let mut params = non_git_params(&workspace);
+        params.policy.disposable_workspace_root = Some(workspace.clone());
+        params.policy.read_roots = vec![workspace.clone(), scratch.clone()];
+        params.policy.write_roots = vec![scratch.clone()];
+        params.policy.session_scratch_roots = vec![scratch.clone()];
+        validate_roots(&params).expect("broker scratch is an internal validation write root");
+
+        params.policy.read_roots.push(external.clone());
+        params.policy.write_roots.push(external);
+        let error = validate_roots(&params).unwrap_err();
+        assert_eq!(error.code, "policy_denied");
+        assert!(error.message.contains("durable write roots"));
+        std::fs::remove_dir_all(root).expect("remove validation scope");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_disposable_workspace_fails_closed_without_same_path_cow() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-disposable-remap-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create validation workspace");
+        let input = root.join("input.txt");
+        std::fs::write(&input, b"input").expect("create validation input");
+        let scratch = ScratchLease::new("remap-test");
+        scratch.prepare().expect("prepare private scratch");
+        let mut params = non_git_params(&root);
+        params.policy.sandbox = SandboxMode::Unsafe;
+        params.policy.unsafe_host_exec_approved = true;
+        params.policy.write_roots.clear();
+        params.policy.disposable_workspace_root = Some(root.clone());
+        params.command.args = vec![input.to_string_lossy().into_owned()];
+
+        let error = match build_command(&params, true, Some(&scratch)) {
+            Ok(_) => panic!("Windows must not remap a same-path validation request"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "validation_disposable_workspace_unavailable");
+        assert!(error.message.contains("same-path"));
+        assert_eq!(std::fs::read(&input).unwrap(), b"input");
+        assert_eq!(
+            std::fs::read_dir(scratch.disposable_base())
+                .expect("disposable root")
+                .count(),
+            0
+        );
+        std::fs::remove_dir_all(root).expect("remove validation workspace");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_read_only_validation_is_explicit_and_cannot_gain_a_workspace_write_root() {
+        let root = std::env::temp_dir().join(format!(
+            "sigma-read-only-validation-{}-{}",
+            std::process::id(),
+            PROTECTED_GUARD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create validation workspace");
+        let input = root.join("input.txt");
+        std::fs::write(&input, b"input").expect("create validation input");
+        let mut params = non_git_params(&root);
+        params.policy.sandbox = SandboxMode::Unsafe;
+        params.policy.unsafe_host_exec_approved = true;
+        params.policy.write_roots.clear();
+        params.policy.read_only_validation_workspace_root = Some(root.clone());
+        params.command.executable = "cmd.exe".into();
+        params.command.args = vec![
+            "/d".into(),
+            "/s".into(),
+            "/c".into(),
+            "type input.txt".into(),
+        ];
+
+        let mut prepared = build_command(&params, true, None)
+            .expect("read-only validation is executable at the real path");
+        assert!(prepared.disposable_workspace.is_none());
+        let output = prepared.command.output().expect("run read-only validation");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"input");
+
+        params.policy.write_roots = vec![root.clone()];
+        let error = validate_roots(&params).unwrap_err();
+        assert_eq!(error.code, "policy_denied");
+        assert!(error.message.contains("durable write roots"));
+        assert_eq!(std::fs::read(&input).unwrap(), b"input");
+        std::fs::remove_dir_all(root).expect("remove validation workspace");
     }
 
     #[cfg(target_os = "linux")]

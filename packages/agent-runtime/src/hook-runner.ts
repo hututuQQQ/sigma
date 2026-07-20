@@ -1,7 +1,21 @@
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { isSecretEnvironmentKey, SecretRedactor, type ExecutionBroker } from "agent-execution";
+import { isSecretEnvironmentKey, SecretRedactor,
+  type ExecutionBroker, type ScratchLeaseV1 } from "agent-execution";
 import type { HookRunnerPort, HookRunnerRequest, HookRunnerResult } from "agent-extensions";
+
+async function runtimeScratchLease(
+  broker: ExecutionBroker,
+  sessionId: string | undefined,
+  signal: AbortSignal
+): Promise<ScratchLeaseV1 | undefined> {
+  if (!sessionId || !broker.acquireScratchLease) return undefined;
+  return await broker.acquireScratchLease({ protocolVersion: 1, sessionId }, { signal });
+}
+
+function scratchPolicy(scratchLease: ScratchLeaseV1 | undefined): { scratchLease?: ScratchLeaseV1 } {
+  return scratchLease ? { scratchLease } : {};
+}
 
 function containedPath(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -111,6 +125,7 @@ export class BrokerCommandHookRunner implements HookRunnerPort {
         throw new Error(`Hook cwd '${request.hook.cwd}' escapes the workspace.`);
       }
       const invocationRoot = frozenInvocationRoot(this.frozenAssetRoot, request.hook, cwd);
+      const scratchLease = await runtimeScratchLease(this.broker, request.sessionId, signal);
       const result = await this.broker.execute({
         command: {
           executable: request.hook.command,
@@ -127,7 +142,8 @@ export class BrokerCommandHookRunner implements HookRunnerPort {
             path.join(this.workspacePath, ".git"),
             path.join(this.workspacePath, ".agent"),
             ...(invocationRoot ? [invocationRoot] : [])
-          ]
+          ],
+          ...scratchPolicy(scratchLease)
         },
         timeoutMs: request.hook.timeoutMs,
         idleTimeoutMs: request.hook.timeoutMs,

@@ -38,7 +38,8 @@ export async function repositoryListJsonLines(
   ];
   return {
     output: listing.entries.map(formatRepositoryListEntry).join("\n"),
-    diagnostics
+    diagnostics,
+    accessPath: listing.scope.path
   };
 }
 
@@ -49,6 +50,7 @@ export async function repositoryStatisticsJson(
   const statistics = await collectRepositoryStatistics(workspace, signal);
   return {
     output: JSON.stringify(statistics),
+    accessPath: ".",
     diagnostics: statistics.complete ? [] : [
       "statistics_partial=true",
       ...(statistics.truncated ? ["statistics_truncated=true"] : []),
@@ -79,7 +81,8 @@ export async function repositoryTextSearchJsonLines(
   ];
   return {
     output: search.matches.map(formatRepositoryTextMatch).join("\n"),
-    diagnostics
+    diagnostics,
+    accessPath: search.scope.path
   };
 }
 

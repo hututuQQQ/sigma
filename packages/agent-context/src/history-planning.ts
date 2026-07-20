@@ -1,5 +1,9 @@
 import type { ContextItem, ModelMessage } from "agent-protocol";
-import { summarizeHistory, summarizeStableHistory } from "./summary.js";
+import {
+  STABLE_SUMMARY_EPOCH_BLOCKS,
+  summarizeHistory,
+  summarizeStableHistoryArchive
+} from "./summary.js";
 import { approximateTokens } from "./unicode.js";
 
 export interface HistoryBlock {
@@ -12,8 +16,7 @@ export const MAXIMUM_RAW_HISTORY_BLOCKS = 12;
 export const CACHED_RAW_HISTORY_TOKEN_LIMIT = 96_000;
 export const MAXIMUM_HISTORY_SUMMARY_TOKENS = 16_000;
 
-const CACHE_SUMMARY_EPOCH_BLOCKS = 8;
-const CACHE_SUMMARY_DELTA_TOKEN_RESERVE = 2_048;
+const SUMMARY_DELTA_TOKEN_RESERVE = 2_048;
 
 /**
  * Replaying every tool turn that still fits the provider window makes the
@@ -246,27 +249,37 @@ export function includeRecentHistory(
 
 export function historySummaries(
   omittedBlocks: readonly ModelMessage[][],
-  summaryTokenBudget: number,
-  promptCache: boolean
+  summaryTokenBudget: number
 ): { summary?: ContextItem; summaryDelta?: ContextItem } {
-  if (!promptCache) {
-    const summary = summarizeHistory(omittedBlocks, summaryTokenBudget);
+  // Stable epochs are a context invariant, not a provider-cache optimization.
+  // Every provider gets the same append-only archive plus a bounded recent
+  // delta; prompt-cache capability only controls the size/layout of the raw
+  // tail in the planner.
+  const completeEpochBlockCount = Math.floor(
+    omittedBlocks.length / STABLE_SUMMARY_EPOCH_BLOCKS
+  ) * STABLE_SUMMARY_EPOCH_BLOCKS;
+  if (completeEpochBlockCount === 0) {
+    const summary = summarizeHistory(
+      omittedBlocks,
+      Math.min(SUMMARY_DELTA_TOKEN_RESERVE, summaryTokenBudget)
+    );
     return summary ? { summary } : {};
   }
-  const completeEpochBlockCount = Math.floor(
-    omittedBlocks.length / CACHE_SUMMARY_EPOCH_BLOCKS
-  ) * CACHE_SUMMARY_EPOCH_BLOCKS;
-  const deltaTokenBudget = Math.min(CACHE_SUMMARY_DELTA_TOKEN_RESERVE, summaryTokenBudget);
-  const summary = summarizeStableHistory(
+  const deltaTokenBudget = Math.min(
+    SUMMARY_DELTA_TOKEN_RESERVE,
+    summaryTokenBudget < 32 ? 0 : Math.max(0, Math.floor(summaryTokenBudget / 4))
+  );
+  const archive = summarizeStableHistoryArchive(
     omittedBlocks.slice(0, completeEpochBlockCount),
-    Math.max(0, summaryTokenBudget - deltaTokenBudget)
+    Math.max(0, summaryTokenBudget - deltaTokenBudget),
+    STABLE_SUMMARY_EPOCH_BLOCKS
   );
   const summaryDelta = summarizeHistory(
-    omittedBlocks.slice(completeEpochBlockCount),
+    omittedBlocks.slice(archive.coveredBlocks),
     deltaTokenBudget
   );
   return {
-    ...(summary ? { summary } : {}),
+    ...(archive.summary ? { summary: archive.summary } : {}),
     ...(summaryDelta ? { summaryDelta } : {})
   };
 }

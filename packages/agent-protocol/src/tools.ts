@@ -171,7 +171,7 @@ export interface CheckpointCreatePolicyV1 {
 }
 
 export interface ReviewRequestResult {
-  status: "review_requested" | "validation_required" | "changes_required" | "not_required";
+  status: "approved" | "review_requested" | "validation_required" | "changes_required" | "not_required";
   reviewState: "none" | "current" | "stale";
   reviewBasisDigest: string;
   frontierRevision: number;

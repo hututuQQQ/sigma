@@ -172,8 +172,21 @@ function settleModel(
   type: "model.completed" | "model.failed",
   payload: Record<string, JsonValue>
 ): KernelState {
-  if (!state.activeModelTurn) throw new Error("Test model turn was not active.");
-  return apply(state, type, { ...payload, ...state.activeModelTurn });
+  let current = state;
+  if (type === "model.completed" && current.activeModelTurn?.toolPolicy === undefined) {
+    const calls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
+    const allowedToolNames = [...new Set(calls.flatMap((call) =>
+      call && typeof call === "object" && !Array.isArray(call) && typeof call.name === "string"
+        ? [call.name] : []))];
+    current = apply(current, "diagnostic", {
+      kind: "model.tool_policy",
+      ...current.activeModelTurn!,
+      allowedToolNames,
+      terminalOnly: false
+    });
+  }
+  if (!current.activeModelTurn) throw new Error("Test model turn was not active.");
+  return apply(current, type, { ...payload, ...current.activeModelTurn });
 }
 
 function withPendingTool(callId: string, name: string, argumentsValue: JsonValue = null): KernelState {
@@ -346,6 +359,40 @@ describe("review-gated terminal receipts", () => {
         message: expect.stringContaining("Document the limitation")
       }
     });
+  });
+
+  it("does not let a stale approval clear a current review repair", () => {
+    let state: KernelState = {
+      ...initial(),
+      mutationFrontier: {
+        ...emptyMutationFrontier(),
+        revision: 2,
+        currentStateDigest: "b".repeat(64),
+        changedPaths: ["src/current.ts"]
+      },
+      completionRepairAttempts: 1,
+      completionRepair: {
+        kind: "review_changes_requested",
+        reviewEvidenceId: "review-current",
+        findings: ["Repair the current frontier."]
+      }
+    };
+    const stale = terminalReview(state, "review-stale-approved", {
+      status: "passed",
+      verdict: "approved",
+      findings: []
+    });
+    if (stale.kind !== "review") throw new Error("expected review evidence");
+    stale.data.frontierRevision = 1;
+    stale.data.stateDigest = "a".repeat(64);
+
+    state = apply(state, "review.completed", stale);
+
+    expect(state.completionRepair).toMatchObject({
+      kind: "review_changes_requested",
+      reviewEvidenceId: "review-current"
+    });
+    expect(state.completionRepairAttempts).toBe(1);
   });
 
   it("preserves advisory capability-failure findings without treating them as actionable errors", () => {
@@ -612,7 +659,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
   });
 
-  it("blocks a third identical batch only after two identical completed outcomes", () => {
+  it("rejects an exact duplicate without execution and advances to terminal-only debt", () => {
     let state = apply(initial(), "user.message", { text: "inspect repeatedly" });
     for (const index of [1, 2]) {
       const callId = `same-${index}`;
@@ -649,8 +696,103 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }
     state = proposeToolBatch(state, 3, [{ id: "same-3", name: "read", arguments: { path: "seed.txt" } }]);
     expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.phase).toBe("ready_model");
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.repeatedToolBatchCount).toBe(3);
+    expect(state.messages.slice(-2)).toEqual([
+      expect.objectContaining({
+        role: "tool", toolCallId: "same-3", content: expect.stringContaining("Rejected before execution")
+      }),
+      expect.objectContaining({ role: "developer", content: expect.stringContaining("terminal-only") })
+    ]);
+  });
+
+  it.each([
+    ["terminal before ordinary", [
+      { id: "debt-ask-first", name: "request_user_input", arguments: { message: "Need a concrete target." } },
+      { id: "debt-read-second", name: "read", arguments: { path: "third.txt" } }
+    ]],
+    ["ordinary before terminal", [
+      { id: "debt-read-first", name: "read", arguments: { path: "fourth.txt" } },
+      { id: "debt-ask-second", name: "request_user_input", arguments: { message: "Choose the target." } }
+    ]]
+  ])("atomically rejects an unfocused %s batch at action debt two", (_label, mixedCalls) => {
+    let state = apply(initial(), "user.message", { text: "inspect without looping" });
+    for (const [index, path] of ["first.txt", "second.txt"].entries()) {
+      const callId = `debt-read-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        "stable", `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
+    }
     expect(state.repeatedToolBatchCount).toBe(2);
+
+    state = proposeToolBatch(state, 3, mixedCalls);
+
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      pendingTools: [],
+      repeatedToolBatchCount: 3
+    });
+    expect(state.completionRepair).toBeUndefined();
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.messages.slice(-3)).toEqual([
+      expect.objectContaining({ role: "tool", toolCallId: mixedCalls[0]!.id }),
+      expect.objectContaining({ role: "tool", toolCallId: mixedCalls[1]!.id }),
+      expect.objectContaining({ role: "developer", content: expect.stringContaining("terminal-only") })
+    ]);
+  });
+
+  it("rejects calls outside the runtime-bound terminal turn policy before pending execution", () => {
+    let state = startModel(apply(initial(), "user.message", { text: "finish now" }));
+    state = apply(state, "diagnostic", {
+      kind: "model.tool_policy",
+      ...state.activeModelTurn!,
+      allowedToolNames: ["runtime_finalize", "report_blocked", "request_user_input"],
+      terminalOnly: true
+    });
+    state = settleModel(state, "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "unauthorized-read", name: "read", arguments: { path: "seed.txt" } }]
+      },
+      toolCalls: [{ id: "unauthorized-read", name: "read", arguments: { path: "seed.txt" } }],
+      finishReason: "tool_calls"
+    });
+    expect(state).toMatchObject({
+      phase: "ready_model",
+      pendingTools: [],
+      completionRepairAttempts: 1,
+      completionRepair: { kind: "terminal_action" },
+      repeatedToolBatchCount: 3
+    });
+    expect(state.messages.slice(-2)).toEqual([
+      expect.objectContaining({ role: "tool", toolCallId: "unauthorized-read" }),
+      expect.objectContaining({ role: "developer", content: expect.stringContaining("[tool_policy_violation]") })
+    ]);
+
+    state = startModel(state, 2);
+    state = apply(state, "diagnostic", {
+      kind: "model.tool_policy",
+      ...state.activeModelTurn!,
+      allowedToolNames: ["report_blocked", "request_user_input"],
+      terminalOnly: true
+    });
+    state = settleModel(state, "model.completed", {
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "unauthorized-again", name: "read", arguments: { path: "other.txt" } }]
+      },
+      toolCalls: [{ id: "unauthorized-again", name: "read", arguments: { path: "other.txt" } }],
+      finishReason: "tool_calls"
+    });
+    expect(state).toMatchObject({
+      phase: "outcome_pending",
+      pendingTools: [],
+      proposedOutcome: { kind: "recoverable_failure", code: "model_tool_policy_violation" }
+    });
   });
 
   it("hashes large repeated outputs without weakening repeated-action convergence", () => {
@@ -667,7 +809,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = proposeToolBatch(state, 3, [{ id: "large-3", name: "read", arguments: { path: "large.txt" } }]);
 
     expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.phase).toBe("ready_model");
+    expect(state.repeatedToolBatchCount).toBe(3);
   });
 
   it("accrues action debt across semantically similar parameter variants", () => {
@@ -691,7 +834,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.repeatedToolBatchCount).toBe(3);
   });
 
-  it("resets action debt for new semantic evidence but ignores duplicate evidence IDs", () => {
+  it("does not treat diagnostic IDs or diagnostic variants as semantic progress", () => {
     let state = apply(initial(), "user.message", { text: "inspect related paths with diagnostics" });
     state = proposeToolBatch(state, 1, [{ id: "diagnostic-1", name: "read", arguments: { path: "a.txt" } }]);
     state = toolEvent(state, "tool.completed", "diagnostic-1", completedReceipt(
@@ -703,16 +846,15 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       "B", "2026-01-01T00:00:02.000Z"
     ));
 
-    expect(state.repeatedToolBatchCount).toBe(1);
+    expect(state.repeatedToolBatchCount).toBe(2);
 
     state = apply(state, "evidence.recorded", diagnosticEvidence("duplicate-diagnostic"));
-    expect(state.repeatedToolBatchCount).toBe(1);
+    expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, [{ id: "diagnostic-3", name: "read", arguments: { path: "c.txt" } }]);
     state = toolEvent(state, "tool.completed", "diagnostic-3", completedReceipt(
       "C", "2026-01-01T00:00:03.000Z"
     ));
-    expect(state.repeatedToolBatchCount).toBe(2);
-    expect(state.receipts.at(-1)?.runtimeAdvisories?.[0]?.code).toBe("no_progress");
+    expect(state.repeatedToolBatchCount).toBe(3);
   });
 
   it("clears semantic action debt after validation-frontier progress", () => {
@@ -735,7 +877,138 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.repeatedToolBatchCount).toBe(1);
   });
 
-  it("rebases semantic action debt after plan obligations materially change", () => {
+  it("clears action debt only for a passed input access with a new path or returned content", () => {
+    let state = apply(initial(), "user.message", { text: "inspect newly discovered input" });
+    const inputAccess = (
+      evidenceId: string,
+      status: "passed" | "failed",
+      inputPath: string,
+      sha256: string | undefined,
+      byteLength: number,
+      selection?: Extract<EvidenceRecord, { kind: "input_access" }>["data"]["selection"]
+    ): EvidenceRecord => ({
+      evidenceId,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      kind: "input_access",
+      status,
+      createdAt: "2026-01-01T00:00:03.000Z",
+      producer: { authority: "tool", id: "external-read" },
+      summary: evidenceId,
+      data: {
+        path: inputPath,
+        scope: "workspace",
+        ...(sha256 ? { sha256 } : {}),
+        byteLength,
+        ...(selection ? { selection } : {}),
+        ...(status === "failed" ? { failureCode: "input_not_found" } : {})
+      }
+    });
+    const record = (evidence: EvidenceRecord): void => {
+      state = evolve(state, {
+        ...envelope(state, "evidence.recorded", evidence),
+        authority: "tool"
+      });
+    };
+    const firstSelection = {
+      kind: "line_range" as const,
+      start: 0,
+      endExclusive: 1,
+      sha256: "1".repeat(64),
+      byteLength: 12
+    };
+    record(inputAccess(
+      "known-input", "passed", "inputs/known.txt", "a".repeat(64), 12, firstSelection
+    ));
+    for (const [index, path] of ["a.txt", "b.txt"].entries()) {
+      const callId = `before-input-${index + 1}`;
+      state = proposeToolBatch(state, index + 1, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 1}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    record(inputAccess("failed-new-path", "failed", "inputs/missing.txt", "b".repeat(64), 0));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    record(inputAccess("failed-another-path", "failed", "inputs/also-missing.txt", "c".repeat(64), 0));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    record(inputAccess(
+      "known-input-again", "passed", "inputs/known.txt", "a".repeat(64), 99,
+      { ...firstSelection, byteLength: 99 }
+    ));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    record(inputAccess(
+      "known-input-new-full-file-digest", "passed", "inputs/known.txt", "c".repeat(64), 13,
+      firstSelection
+    ));
+    expect(state.repeatedToolBatchCount).toBe(2);
+    record(inputAccess(
+      "known-input-new-returned-content", "passed", "inputs/known.txt", "c".repeat(64), 13,
+      { ...firstSelection, sha256: "2".repeat(64), byteLength: 13 }
+    ));
+
+    expect(state.repeatedToolBatchCount).toBe(0);
+
+    for (const [index, path] of ["c.txt", "d.txt"].entries()) {
+      const callId = `before-path-${index + 1}`;
+      state = proposeToolBatch(state, index + 3, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 4}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+    record(inputAccess("new-path-without-digest", "passed", "inputs/new.txt", undefined, 0));
+
+    expect(state.repeatedToolBatchCount).toBe(0);
+
+    const firstRange = {
+      kind: "line_range" as const,
+      start: 0,
+      endExclusive: 10,
+      sha256: "d".repeat(64),
+      byteLength: 10
+    };
+    record(inputAccess("known-range", "passed", "inputs/ranged.txt", "e".repeat(64), 100, firstRange));
+    for (const [index, path] of ["e.txt", "f.txt"].entries()) {
+      const callId = `before-range-${index + 1}`;
+      state = proposeToolBatch(state, index + 5, [{ id: callId, name: "read", arguments: { path } }]);
+      state = toolEvent(state, "tool.completed", callId, completedReceipt(
+        path, `2026-01-01T00:00:0${index + 6}.000Z`
+      ));
+    }
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    record(inputAccess("duplicate-range", "passed", "inputs/ranged.txt", "e".repeat(64), 999, {
+      ...firstRange,
+      byteLength: 999
+    }));
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    record(inputAccess("new-range", "passed", "inputs/ranged.txt", "e".repeat(64), 100, {
+      ...firstRange,
+      start: 10,
+      endExclusive: 20
+    }));
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    record(inputAccess("selection-kind-variant", "passed", "inputs/ranged.txt", "e".repeat(64), 100, {
+      kind: "structured_result",
+      sha256: firstRange.sha256,
+      byteLength: firstRange.byteLength
+    }));
+    expect(state.repeatedToolBatchCount).toBe(2);
+
+    record(inputAccess("new-range-content", "passed", "inputs/ranged.txt", "e".repeat(64), 100, {
+      ...firstRange,
+      start: 10,
+      endExclusive: 20,
+      sha256: "f".repeat(64)
+    }));
+    expect(state.repeatedToolBatchCount).toBe(0);
+  });
+
+  it("rebases semantic action debt after a plan obligation is satisfied", () => {
     let state = apply(initial(), "user.message", { text: "inspect while following a changing plan" });
     for (const [index, path] of ["a.txt", "b.txt"].entries()) {
       const callId = `before-plan-${index + 1}`;
@@ -751,15 +1024,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       plan: {
         revision: 1,
         goal: "produce a validated result",
-        activeNodeId: "validate",
         nodes: [{
           id: "validate",
           title: "validate the result",
           dependencies: [],
-          status: "in_progress",
+          status: "completed",
           owner: { kind: "root" },
           acceptanceCriteria: ["validation passes"],
-          evidence: []
+          evidence: [{ evidenceId: "plan-proof", kind: "diagnostic" }]
         }]
       }
     });
@@ -797,7 +1069,8 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, [{ id: "volatile-3", name: "shell", arguments: { command: "date" } }]);
     expect(state.pendingTools).toEqual([]);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.phase).toBe("ready_model");
+    expect(state.repeatedToolBatchCount).toBe(3);
   });
 
   it("rebuilds a forged persisted evidence-progress cache before using it", () => {
@@ -833,16 +1106,17 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     }), completedReceipt("stable", "2026-01-01T00:00:02.000Z", {
       added: [], modified: ["second.txt"], deleted: []
     })]
-  ])("allows a third identical call when the completed %s changes", (_label, first, second) => {
+  ])("does not treat untrusted receipt %s as semantic progress", (_label, first, second) => {
     let state = apply(initial(), "user.message", { text: "observe changing results" });
     state = proposeToolBatch(state, 1, [{ id: "changing-1", name: "read", arguments: { path: "seed.txt" } }]);
     state = toolEvent(state, "tool.completed", "changing-1", first);
     state = proposeToolBatch(state, 2, [{ id: "changing-2", name: "read", arguments: { path: "seed.txt" } }]);
     state = toolEvent(state, "tool.completed", "changing-2", second);
-    expect(state.repeatedToolBatchCount).toBe(1);
+    expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, [{ id: "changing-3", name: "read", arguments: { path: "seed.txt" } }]);
-    expect(state.phase).toBe("tool_pending");
-    expect(state.pendingTools).toHaveLength(1);
+    expect(state.phase).toBe("ready_model");
+    expect(state.pendingTools).toHaveLength(0);
+    expect(state.repeatedToolBatchCount).toBe(3);
     expect(state.proposedOutcome).toBeUndefined();
   });
 
@@ -863,7 +1137,9 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = toolEvent(state, "tool.completed", "batch-2-a", completedReceipt("A", "2026-01-01T00:00:04.000Z"));
     expect(state.repeatedToolBatchCount).toBe(2);
     state = proposeToolBatch(state, 3, calls(3, true));
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.phase).toBe("ready_model");
+    expect(state.repeatedToolBatchCount).toBe(3);
+    expect(state.proposedOutcome).toBeUndefined();
   });
 
   it("accepts legacy repetition snapshots without an outcome signature", () => {
@@ -1395,7 +1671,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 
-  it("resets prerequisite stagnation when the structured completion deficit changes", () => {
+  it("does not treat a changed completion-prerequisite deficit as semantic progress", () => {
     const failure = (claims: string[], paths: string[]): Record<string, JsonValue> => ({
       ok: false,
       output: `Completion requires validation: ${claims.join(",")}; ${paths.join(",")}.`,
@@ -1431,13 +1707,14 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     state = proposeCompletion(state, "complete-progress", 2);
     state = toolEvent(state, "tool.failed", "complete-progress", failure(["acceptance"], ["settings.json"]));
     expect(state.completionRepair).toMatchObject({ kind: "completion_prerequisite", retryCount: 0 });
+    expect(state.repeatedToolBatchCount).toBe(2);
 
     state = proposeCompletion(state, "complete-repeat-one", 3);
-    state = toolEvent(state, "tool.failed", "complete-repeat-one", failure(["acceptance"], ["settings.json"]));
-    expect(state.completionRepair).toMatchObject({ kind: "completion_prerequisite", retryCount: 1 });
-
-    state = proposeCompletion(state, "complete-repeat-two", 4);
-    expect(state.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "convergence_no_progress" });
+    expect(state.phase).toBe("ready_model");
+    expect(state.pendingTools).toEqual([]);
+    expect(state.repeatedToolBatchCount).toBe(3);
+    expect(state.proposedOutcome).toBeUndefined();
+    expect(state.messages.at(-1)?.content).toContain("terminal-only");
   });
 
   it("advances a user-resolved checkpoint recovery out of NeedsInput", () => {
@@ -1746,12 +2023,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(state, "usage.recorded", { ...usage, usageId: "other", sessionId: "other" }).usage).toHaveLength(1);
 
     expect(apply(state, "plan.updated", { previousRevision: "0", plan: null }).plan).toBe(state.plan);
-    expect(apply(state, "budget.released", { ledger: null }).budget).toBe(state.budget);
+    expect(() => apply(state, "budget.released", { ledger: null }))
+      .toThrow(/invalid budget\.released transition/iu);
     const increased = createBudgetLedger({ ...state.budget.limits, toolCalls: state.budget.limits.toolCalls + 1 });
-    expect(apply(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }).budget)
-      .toBe(state.budget);
+    expect(() => apply(state, "budget.limit_increased", {
+      previousLimits: state.budget.limits, ledger: increased, increase: { toolCalls: 1 }
+    })).toThrow(/authority must be 'user'/iu);
     state = evolve(state, {
-      ...envelope(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }), authority: "user"
+      ...envelope(state, "budget.limit_increased", {
+        previousLimits: state.budget.limits, ledger: increased, increase: { toolCalls: 1 }
+      }), authority: "user"
     });
     expect(state.budget.limits.toolCalls).toBe(increased.limits.toolCalls);
 

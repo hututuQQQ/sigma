@@ -62,7 +62,8 @@ export function recoveryDenialPayload(
     diagnostics: ["recovery_retry_denied"],
     startedAt: now,
     completedAt: now,
-    ...modelTurn
+    turnId: modelTurn.turnId,
+    effectRevision: modelTurn.effectRevision
   };
 }
 
@@ -86,6 +87,7 @@ export function recoveryResultLostPayload(
     diagnostics: ["recovery_result_lost_no_replay"],
     startedAt: now,
     completedAt: now,
-    ...modelTurn
+    turnId: modelTurn.turnId,
+    effectRevision: modelTurn.effectRevision
   };
 }

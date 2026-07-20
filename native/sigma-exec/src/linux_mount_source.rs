@@ -1,7 +1,9 @@
 use crate::protocol::RpcError;
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, Metadata};
 use std::io;
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -169,6 +171,36 @@ impl PinnedMountSource {
                 self.destination.display()
             ),
         ))
+    }
+
+    pub(crate) fn sha256(&self) -> Result<String, RpcError> {
+        let mut reader = File::open(self.fd_path()).map_err(|error| {
+            RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot read pinned executable '{}': {error}",
+                    self.destination.display()
+                ),
+            )
+        })?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).map_err(|error| {
+                RpcError::new(
+                    "executable_unavailable",
+                    format!(
+                        "cannot hash pinned executable '{}': {error}",
+                        self.destination.display()
+                    ),
+                )
+            })?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     pub(crate) fn occupies_destination(&self, destination: &Path) -> Result<bool, RpcError> {

@@ -495,7 +495,7 @@ describe("run command branch coverage", () => {
       ssePayloads: 1,
       sseTrailingBytes: 0
     });
-    expect(records.find((record) => record.type === "budget.committed")?.payload?.ledger?.reserved)
+    expect(records.find((record) => record.type === "budget.committed")?.payload?.mutation?.totals?.reserved)
       .toMatchObject({ inputTokens: 0, outputTokens: 0, costMicroUsd: 0, modelTurns: 0 });
     expect(records.some((record) => record.type === "run.failed")).toBe(true);
     expect(records.at(-1)).toMatchObject({ type: "result", status: "error" });

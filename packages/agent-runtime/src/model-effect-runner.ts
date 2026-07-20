@@ -6,7 +6,6 @@ import {
 } from "agent-protocol";
 import { lengthConvergenceRequired, type KernelEffect } from "agent-kernel";
 import { RepositoryContextProvider, type ContextPlan } from "agent-context";
-import { isToolAllowed } from "agent-tools";
 import { completionLimitations, steeringRestart } from "./effect-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import type { RuntimeSession } from "./types.js";
@@ -16,8 +15,7 @@ import {
   successfulModelUsage
 } from "./model-accounting.js";
 import { evidenceLedger } from "./model-evidence-ledger.js";
-import { profileAllowsTool } from "./profile-policy.js";
-import { completionRepairPhase, descriptorsAllowedForRepair } from "./tool-turn-policy.js";
+import { modelWorkingState } from "./model-working-state.js";
 import {
   modelFailureCode,
   modelFailureDiagnostics,
@@ -27,8 +25,11 @@ import {
 import {
   convergenceAdmissionFailure,
   deadlineForecast,
+  monotonicBudgetStage,
   type DeadlineForecast
 } from "./convergence-policy.js";
+import { candidateReviewerBudgetReserve, CompletionReserveQuoteUnavailableError,
+  reviewerForSession } from "./reviewer-budget-reserve.js";
 import { refreshValidationCapabilityProfile } from "./validation-capability-profile.js";
 import {
   availableModelBudget,
@@ -36,31 +37,28 @@ import {
   defaultModelOutputReserveTokens,
   fitPreparedBudget,
   prepareBudgetedModelTurn,
-  requestCapacity,
   type BudgetStage,
   type PreparedModelTurn
 } from "./model-budget-convergence.js";
-import { budgetStageForCapacity, projectedToolCapabilities } from "./model-tool-capabilities.js";
-import { descriptorsAvailableToModel } from "./model-tool-availability.js";
+import { maximumBudgetStage, stableBudgetPreparation } from "./model-budget-stability.js";
+import { projectedToolCapabilities } from "./model-tool-capabilities.js";
+import { turnDescriptorProjection } from "./model-turn-descriptors.js";
 import {
   emitModelContextComposition,
   emitResolvedModelRoute
 } from "./model-effect-telemetry.js";
-
 type RequestModelEffect = Extract<KernelEffect, { type: "request_model" }>;
-
 interface ModelReservationState {
   settled: boolean;
   response?: ModelResponse; consumed?: Partial<BudgetAmounts>;
 }
-
 interface PreparedAttempt {
   turn: PreparedModelTurn;
   plan: ContextPlan;
   forecast: DeadlineForecast;
   budgetStage: BudgetStage;
+  resourceBudgetStage: BudgetStage;
 }
-
 function takeUnloadedSummary(session: RuntimeSession, plan: ContextPlan): ContextItem | undefined {
   const summary = plan.summary;
   if (!summary || session.interaction.loadedContextIds.has(summary.id)) return undefined;
@@ -169,25 +167,17 @@ export class ModelEffectRunner {
     signal: AbortSignal,
     hookContext: readonly ContextItem[]
   ): Promise<PreparedAttempt | RunOutcome> {
-    const repairPhase = completionRepairPhase(session);
-    const modelDescriptors = this.options.runtime.tools.modelDescriptors?.()
-      ?? this.options.runtime.tools.descriptors();
-    const stageInternal = repairPhase === "no_change_confirmation"
-      ? this.options.runtime.tools.descriptors().filter((item) => item.name === "confirm_no_change")
-      : [];
-    const ordinaryDescriptors = descriptorsAvailableToModel(session, modelDescriptors).filter((item) =>
-      isToolAllowed(item, session.durable.mode) && profileAllowsTool(session, item));
-    const availableDescriptors = [...new Map([...ordinaryDescriptors, ...stageInternal]
-      .map((item) => [item.name, item])).values()];
+    const {
+      repairPhase, repairPending, modelDescriptors, descriptors, terminalDescriptors
+    } = turnDescriptorProjection(this.options, session);
     // Once a completion prerequisite has new durable evidence, the model must
     // be able to stop naturally so the runtime-owned completion intent can be
     // generated. Other repair phases remain forced tool sub-turns.
-    const repairPending = repairPhase !== "none";
     await refreshValidationCapabilityProfile(session, signal);
     const allowNaturalCompletion = repairPhase === "protected_completion"
       || completionLimitations(session) !== null;
     const ledger = evidenceLedger(session);
-    const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
+    const workingState = modelWorkingState(session);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);
@@ -196,21 +186,36 @@ export class ModelEffectRunner {
       session, modelDescriptors, this.options.runtime.skills?.descriptors
     );
     const preparation = {
-      session, forecast, turnId, descriptors, capabilities: projectedCapabilities, dynamic, hookContext,
+      session, forecast, turnId, descriptors, terminalDescriptors,
+      capabilities: projectedCapabilities,
+      dynamic: [...dynamic, workingState], hookContext,
       ledger, available, repairPending, allowNaturalCompletion,
       defaultOutputReserveTokens: this.options.runtime.outputReserveTokens
         ?? defaultModelOutputReserveTokens(session.services.gateway.capabilities)
     };
-    let prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage: "normal" });
-    const capacity = requestCapacity(available, prepared.turn.budget);
-    const stageCapacity = lengthConvergenceRequired(session.durable.state)
-      ? Math.min(capacity, 2) : capacity;
-    const budgetStage = budgetStageForCapacity(forecast, stageCapacity);
-    if (budgetStage !== "normal") prepared = await prepareBudgetedModelTurn({ ...preparation, budgetStage });
+    const minimumStage = monotonicBudgetStage(forecast, "normal");
+    const initial = await prepareBudgetedModelTurn({ ...preparation, budgetStage: minimumStage });
+    const reviewer = reviewerForSession(this.options, session);
+    let stable;
+    try {
+      stable = await stableBudgetPreparation(
+        initial, forecast, minimumStage, lengthConvergenceRequired(session.durable.state),
+        async (stage) => await prepareBudgetedModelTurn({ ...preparation, budgetStage: stage }),
+        async () => await candidateReviewerBudgetReserve(session, reviewer, available.costMicroUsd), available
+      );
+    } catch (error) {
+      if (error instanceof CompletionReserveQuoteUnavailableError) return { kind: "recoverable_failure", code: error.code, message: error.message };
+      throw error;
+    }
+    const prepared = stable.prepared;
+    const reviewerBudgetReserve = stable.reviewerReserve;
+    const resourceBudgetStage = monotonicBudgetStage(forecast, stable.resourceStage);
+    const budgetStage = maximumBudgetStage(resourceBudgetStage, stable.stage);
     const fittedBudget = fitPreparedBudget(
       prepared.turn.budget,
       available,
-      budgetStage === "normal" ? Number.MAX_SAFE_INTEGER : 1
+      budgetStage === "normal" ? Number.MAX_SAFE_INTEGER : 1,
+      reviewerBudgetReserve
     );
     if (!fittedBudget) {
       return budgetFailure(
@@ -219,14 +224,16 @@ export class ModelEffectRunner {
     }
     const admissionFailure = convergenceAdmissionFailure(session, {
       kind: "model",
-      stage: budgetStage
+      stage: budgetStage,
+      futureBudgetReserve: reviewerBudgetReserve
     });
     if (admissionFailure) return admissionFailure;
     return {
       turn: { ...prepared.turn, budget: fittedBudget },
       plan: prepared.plan,
       forecast,
-      budgetStage
+      budgetStage,
+      resourceBudgetStage
     };
   }
 
@@ -239,11 +246,20 @@ export class ModelEffectRunner {
   ): Promise<RunOutcome | null> {
     const prepared = await this.prepareTurn(session, turnId, signal, hookContext);
     if ("kind" in prepared) return prepared;
-    const { turn, plan, forecast, budgetStage } = prepared;
+    const { turn, plan, forecast, budgetStage, resourceBudgetStage } = prepared;
+    await this.options.emit(session, "diagnostic", "runtime", {
+      kind: "model.tool_policy",
+      turnId,
+      effectRevision,
+      allowedToolNames: [...new Set(turn.tools.map((tool) => tool.name))],
+      terminalOnly: budgetStage === "terminal"
+    });
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "deadline.stage",
       stage: forecast.stage,
       budgetStage,
+      resourceBudgetStage,
+      budgetStageSource: budgetStage === resourceBudgetStage ? "resource" : "action_debt",
       remainingMs: forecast.remainingMs,
       nextModelEstimateMs: forecast.nextModelEstimateMs,
       nextConvergenceModelEstimateMs: forecast.nextConvergenceModelEstimateMs,

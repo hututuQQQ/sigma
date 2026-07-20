@@ -82,6 +82,52 @@ function executionRoots(
   return roots;
 }
 
+function disposableWorkspaceRoot(policy: ExecutionPolicy): string | undefined {
+  const value = policy.disposableWorkspaceRoot;
+  if (value === undefined) return undefined;
+  if (!path.isAbsolute(value)) {
+    throw new BrokerPolicyError("disposableWorkspaceRoot must be absolute.");
+  }
+  return path.resolve(value);
+}
+
+function readOnlyValidationWorkspaceRoot(policy: ExecutionPolicy): string | undefined {
+  const value = policy.readOnlyValidationWorkspaceRoot;
+  if (value === undefined) return undefined;
+  if (!path.isAbsolute(value)) {
+    throw new BrokerPolicyError("readOnlyValidationWorkspaceRoot must be absolute.");
+  }
+  if (policy.disposableWorkspaceRoot !== undefined) {
+    throw new BrokerPolicyError("Validation cannot request COW and a read-only workspace together.");
+  }
+  return path.resolve(value);
+}
+
+function repositoryMetadataLeaseId(policy: ExecutionPolicy): string | undefined {
+  const lease = policy.repositoryMetadataLease;
+  if (lease === undefined) return undefined;
+  if (lease.protocolVersion !== 1 || lease.uses !== 1 || lease.network !== "none"
+    || policy.network !== "none" || !lease.leaseId
+    || !/^[a-f0-9]{64}$/u.test(lease.executableSha256)) {
+    throw new BrokerPolicyError("repositoryMetadataLease is invalid or not local-only.");
+  }
+  return lease.leaseId;
+}
+
+function scratchLeaseCapability(policy: ExecutionPolicy): {
+  scratchLeaseId: string;
+  scratchSessionId: string;
+} | undefined {
+  const lease = policy.scratchLease;
+  if (lease === undefined) return undefined;
+  if (lease.protocolVersion !== 1 || lease.lifetime !== "runtime_session"
+    || lease.isolation !== "private" || lease.persistentAcrossCalls !== true
+    || !lease.leaseId || !/^[A-Za-z0-9_.-]{1,128}$/u.test(lease.sessionId)) {
+    throw new BrokerPolicyError("scratchLease is not a valid RuntimeSession capability.");
+  }
+  return { scratchLeaseId: lease.leaseId, scratchSessionId: lease.sessionId };
+}
+
 export interface VerifiedTargetExecutableEnvironment {
   platform: string;
   searchPaths: readonly string[];
@@ -160,6 +206,10 @@ function wirePolicy(
   assertAbsoluteRoots(policy.writeRoots, "writeRoots");
   assertAbsoluteRoots(policy.protectedPaths ?? [], "protectedPaths");
   const backend = options.executionBackend ?? "native";
+  const disposableRoot = disposableWorkspaceRoot(policy);
+  const readOnlyValidationRoot = readOnlyValidationWorkspaceRoot(policy);
+  const repositoryLeaseId = repositoryMetadataLeaseId(policy);
+  const scratchLease = scratchLeaseCapability(policy);
   const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables, backend);
   const runtimeRoots = toolchains
     .filter((toolchain) => samePath(toolchain.executable, command.executable))
@@ -195,7 +245,13 @@ function wirePolicy(
     executionRoots: resolvedExecutionRoots,
     ...(executableSha256 ? { executableSha256 } : {}),
     protectedPaths: defaultProtectedPaths(policy)
-      .map((item) => path.resolve(item))
+      .map((item) => path.resolve(item)),
+    ...(disposableRoot === undefined ? {} : { disposableWorkspaceRoot: disposableRoot }),
+    ...(readOnlyValidationRoot === undefined ? {} : {
+      readOnlyValidationWorkspaceRoot: readOnlyValidationRoot
+    }),
+    ...(repositoryLeaseId === undefined ? {} : { repositoryMetadataLeaseId: repositoryLeaseId }),
+    ...(scratchLease ?? {})
   };
 }
 

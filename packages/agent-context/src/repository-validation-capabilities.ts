@@ -2,7 +2,7 @@ import path from "node:path";
 import { withHostRepositorySnapshot } from "./repository-host-snapshot.js";
 
 const MAX_MANIFEST_BYTES = 256_000;
-const PROJECT_MANIFEST = /(?:^|\/)(?:package\.json|pyproject\.toml|pytest\.ini|setup\.cfg|go\.mod|go\.work|cargo\.toml|pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|[^/]+\.(?:csproj|fsproj|vbproj|sln))$/iu;
+const PROJECT_MANIFEST = /(?:^|\/)(?:package\.json|pyproject\.toml|pytest\.ini|setup\.cfg|go\.mod|go\.work|cargo\.toml|pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|gemfile|rakefile|_config\.ya?ml|makefile|gnumakefile|cmakelists\.txt|meson\.build|[^/]+\.(?:csproj|fsproj|vbproj|sln))$/iu;
 const TEST_FILE = /(?:^|\/)(?:tests?|specs?|__tests__)(?:\/|$)|(?:^|\/)(?:test_[^/]+|[^/]+_test)\.py$|_test\.go$|\.(?:test|spec)\.[cm]?[jt]sx?$/iu;
 const TEST_CONFIG = /(?:^|\/)(?:vitest|jest|playwright|pytest|tox|nose|mocha)(?:\.config)?\.[^/]+$|(?:^|\/)conftest\.py$/iu;
 const SOURCE_EXTENSION = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|cs|fs|vb)$/iu;
@@ -89,6 +89,21 @@ function packageTypecheckScript(content: string | null): boolean {
   }
 }
 
+function packageBuildScripts(content: string | null): Array<{ name: string; script: string }> {
+  if (!content) return [];
+  try {
+    const parsed = JSON.parse(content) as { scripts?: Record<string, unknown> };
+    return Object.entries(parsed.scripts ?? {}).flatMap(([name, value]) => {
+      if (!/^(?:build|check|verify)$/iu.test(name) || typeof value !== "string") return [];
+      const script = value.trim();
+      if (!script || /(?:not implemented|todo)|(?:^|\s)exit\s+1(?:\s|$)/iu.test(script)) return [];
+      return [{ name: name.toLowerCase(), script }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 function hasRuntimeForPath(file: string, commands: ReadonlySet<string>): boolean {
   if (/\.[cm]?jsx?$/iu.test(file)) return commandAvailable(commands, "node", "bun", "deno");
   if (/\.tsx?$/iu.test(file)) return commandAvailable(commands, "tsc", "deno", "bun");
@@ -141,12 +156,18 @@ function addUnitCapability(
 function packageCapabilities(input: ProjectCapabilityInput, target: CapabilityAccumulator): boolean {
   const { root, manifests, commands } = input;
   const packagePath = root === "." ? "package.json" : `${root}/package.json`;
-  const packageScript = packageTestScript(manifests.get(packagePath) ?? null);
-  const packageTypecheck = packageTypecheckScript(manifests.get(packagePath) ?? null);
+  const packageContent = manifests.get(packagePath) ?? null;
+  const packageScript = packageTestScript(packageContent);
+  const packageTypecheck = packageTypecheckScript(packageContent);
   const testAvailable = Boolean(packageScript && packageScriptExecutable(packageScript, commands));
   if (testAvailable) {
     target.evidence.push(`${packagePath}#scripts.test`);
     addUnitCapability(target, true, "package-manager test");
+  }
+  for (const { name, script } of packageBuildScripts(packageContent)) {
+    if (!packageScriptExecutable(script, commands)) continue;
+    target.commandFamilies.add(`package-manager ${name}`);
+    target.evidence.push(`${packagePath}#scripts.${name}`);
   }
   return packageTypecheck;
 }
@@ -210,6 +231,37 @@ function manifestUnitCapabilities(
   addUnitCapability(target, hasTests && gradle, "gradle test");
 }
 
+function manifestBuildCapabilities(
+  input: ProjectCapabilityInput,
+  target: CapabilityAccumulator
+): void {
+  const { root, manifests, commands } = input;
+  const candidates = (names: readonly string[]): string | undefined => names
+    .map((name) => projectManifest(root, name))
+    .find((name) => manifests.has(name));
+  const makefile = candidates(["Makefile", "makefile", "GNUmakefile"]);
+  if (makefile && commandAvailable(commands, "make", "gmake")) {
+    target.commandFamilies.add("make build/check");
+    target.evidence.push(makefile);
+  }
+  const cmake = candidates(["CMakeLists.txt"]);
+  if (cmake && commands.has("cmake")) {
+    target.commandFamilies.add("cmake build/check");
+    target.evidence.push(cmake);
+  }
+  const meson = candidates(["meson.build"]);
+  if (meson && commands.has("meson")) {
+    target.commandFamilies.add("meson build/check");
+    target.evidence.push(meson);
+  }
+  const gemfile = candidates(["Gemfile"]);
+  const jekyll = candidates(["_config.yml", "_config.yaml"]);
+  if ((gemfile || jekyll) && commandAvailable(commands, "bundle", "jekyll")) {
+    target.commandFamilies.add(jekyll ? "jekyll build" : "bundle/ruby build");
+    target.evidence.push(...[gemfile, jekyll].filter((item): item is string => item !== undefined));
+  }
+}
+
 function staticCapabilities(
   source: readonly string[],
   commands: ReadonlySet<string>,
@@ -252,6 +304,7 @@ function projectCapabilities(input: ProjectCapabilityInput): ProjectValidationCa
   target.evidence.push(...tests.slice(0, 20), ...testConfigs.slice(0, 10));
   discoveredTestCapabilities(tests, commands, target);
   manifestUnitCapabilities(input, tests.length > 0, target);
+  manifestBuildCapabilities(input, target);
   const source = files.filter((file) => SOURCE_EXTENSION.test(file));
   return {
     projectId: root,

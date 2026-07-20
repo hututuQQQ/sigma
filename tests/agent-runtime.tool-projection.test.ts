@@ -7,7 +7,8 @@ import {
 import {
   descriptorsAvailableToModel,
   modelToolArgumentFailure,
-  modelToolCallContractFailure
+  modelToolCallContractFailure,
+  modelTurnToolPolicyFailure
 } from "../packages/agent-runtime/src/model-tool-availability.js";
 import type { ModelToolCall, ToolDescriptor } from "../packages/agent-protocol/src/index.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
@@ -143,6 +144,45 @@ describe("session model-tool capability projection", () => {
           nextArguments: { executable: ".\\tool.exe", expectedChanges: ["out.txt"] }
         }
       });
+  });
+
+  it("fails closed on missing or mixed-effect model-turn authorization", () => {
+    const session = runtimeSessionFixture();
+    const read = descriptors.find((item) => item.name === "read")!;
+    const readCall: ModelToolCall = { id: "unbound-read", name: "read", arguments: { path: "seed.txt" } };
+    const unboundTurn = { turnId: 10, effectRevision: session.durable.state.revision };
+    session.durable.state.pendingTools = [{
+      request: { callId: readCall.id, name: readCall.name, arguments: readCall.arguments },
+      modelTurn: unboundTurn,
+      approval: "not_required",
+      started: false,
+      origin: "model"
+    }];
+    expect(modelTurnToolPolicyFailure(
+      session, readCall, read, unboundTurn, "2026-01-01T00:00:00.000Z"
+    )).toMatchObject({ diagnostics: ["tool_not_authorized_for_turn"] });
+
+    const mixed: ToolDescriptor = {
+      ...read,
+      name: "mixed_terminal_writer",
+      possibleEffects: ["outcome.propose", "filesystem.write"]
+    };
+    const mixedCall: ModelToolCall = { id: "mixed-call", name: mixed.name, arguments: {} };
+    const terminalTurn = {
+      turnId: 11,
+      effectRevision: session.durable.state.revision,
+      toolPolicy: { allowedToolNames: [mixed.name], terminalOnly: true }
+    };
+    session.durable.state.pendingTools = [{
+      request: { callId: mixedCall.id, name: mixedCall.name, arguments: mixedCall.arguments },
+      modelTurn: terminalTurn,
+      approval: "not_required",
+      started: false,
+      origin: "model"
+    }];
+    expect(modelTurnToolPolicyFailure(
+      session, mixedCall, mixed, terminalTurn, "2026-01-01T00:00:00.000Z"
+    )).toMatchObject({ diagnostics: ["tool_not_authorized_for_turn"] });
   });
 
   it("returns an adoptable nextArguments object when invalid extras can be removed safely", () => {

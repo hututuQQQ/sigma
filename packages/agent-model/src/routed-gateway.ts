@@ -12,6 +12,7 @@ import {
   ModelRouter,
   mergeRequiredCapabilities,
   modelReservationEstimate,
+  type ModelResolution,
   type ModelReservationEstimate,
   type ModelRouteConstraints
 } from "./router.js";
@@ -57,11 +58,27 @@ function mergeConstraints(
   };
 }
 
+function routedTokenizerExpansionBound(
+  resolution: ModelResolution,
+  constraints: ModelRouteConstraints
+): number | undefined {
+  const attempts = Math.min(
+    resolution.route.maxAttempts,
+    constraints.maxAttempts ?? resolution.route.maxAttempts,
+    resolution.candidates.length
+  );
+  const bounds = resolution.candidates.slice(0, attempts)
+    .map((spec) => spec.tokenizer.maxTokensPerUtf8Byte);
+  if (bounds.length === 0 || bounds.some((value) => value === undefined)) return undefined;
+  return Math.max(...bounds as number[]);
+}
+
 /** Adapts the role-aware deterministic router to the runtime's gateway port. */
 export class RoutedModelGateway implements ModelGateway {
   readonly provider: string;
   readonly model: string;
   readonly capabilities: ModelCapabilities;
+  readonly maxTokensPerUtf8Byte: number | undefined;
   private readonly router: ModelRouter;
   private readonly role: ModelRole;
   private readonly routeId: string;
@@ -78,7 +95,11 @@ export class RoutedModelGateway implements ModelGateway {
     this.model = options.representative.model;
     this.capabilities = options.representative.capabilities;
     // Resolve eagerly so configuration/profile errors fail before a session starts.
-    this.router.resolve(this.routeId, this.constraints());
+    // The bound comes only from the frozen route specs; a provider response or
+    // representative gateway cannot expand its own accounting authority.
+    const initialConstraints = this.constraints();
+    const resolution = this.router.resolve(this.routeId, initialConstraints);
+    this.maxTokensPerUtf8Byte = routedTokenizerExpansionBound(resolution, initialConstraints);
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -119,10 +140,12 @@ export class RoutedModelGateway implements ModelGateway {
     messages: ModelMessage[],
     tools: ModelToolDefinition[],
     maxOutputTokens: number,
-    remainingBudgetMicroUsd: number
+    remainingBudgetMicroUsd: number,
+    minimumInputTokens = 0
   ): Promise<RoutedBudgetPlan> {
-    const estimatedInputTokens = conservativeTokenCount(
-      await this.representative.countTokens(messages, tools)
+    const estimatedInputTokens = Math.max(
+      conservativeTokenCount(await this.representative.countTokens(messages, tools)),
+      conservativeTokenCount(minimumInputTokens)
     );
     const constraints: ModelRouteConstraints = {
       ...this.constraints(),

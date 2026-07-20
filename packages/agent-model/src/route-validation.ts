@@ -85,6 +85,11 @@ function validateTokenizer(spec: ModelSpec): void {
   if (spec.tokenizer.assetDigest !== undefined && !/^[a-f0-9]{64}$/u.test(spec.tokenizer.assetDigest)) {
     throw new Error(`Model spec '${spec.id}' has an invalid tokenizer asset digest.`);
   }
+  if (spec.tokenizer.maxTokensPerUtf8Byte !== undefined
+    && (!Number.isSafeInteger(spec.tokenizer.maxTokensPerUtf8Byte)
+      || spec.tokenizer.maxTokensPerUtf8Byte < 1)) {
+    throw new Error(`Model spec '${spec.id}' has an invalid tokenizer UTF-8 expansion bound.`);
+  }
 }
 
 function validateCapabilities(spec: ModelSpec): void {

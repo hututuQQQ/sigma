@@ -10,6 +10,7 @@ import {
   type RunStore,
   type ValidationEvidence
 } from "agent-protocol";
+import { isBudgetLedgerSemanticallyValid, replayBudgetLedgerEvent } from "agent-kernel";
 import { finalizeChildCompletion, handleChildEvent } from "./child-event-handler.js";
 import type { RuntimeControlService } from "./runtime-control.js";
 import type {
@@ -202,7 +203,16 @@ interface ChildLedgerSnapshot {
   ledger?: BudgetLedgerState;
   terminal?: { status: "completed" | "failed" | "cancelled"; outcome: RunOutcome };
 }
-
+function snapshotBudget(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): {
+  ledger?: BudgetLedgerState; seq: number;
+} {
+  if (!snapshot) return { seq: 0 };
+  const snapshotState = record(snapshot.state);
+  if (snapshot.sessionId !== sessionId || !isBudgetLedgerState(snapshotState.budget)
+    || !isBudgetLedgerSemanticallyValid(snapshotState.budget)) throw new Error(
+    `Child '${sessionId}' has an unreadable budget snapshot.`);
+  return { ledger: snapshotState.budget, seq: snapshot.seq };
+}
 function eventOutcome(event: AgentEventEnvelope): ChildLedgerSnapshot["terminal"] {
   if (!["run.completed", "run.failed", "run.cancelled"].includes(event.type)) return undefined;
   const value = record(event.payload);
@@ -227,15 +237,23 @@ function eventOutcome(event: AgentEventEnvelope): ChildLedgerSnapshot["terminal"
 }
 
 async function childLedger(store: RunStore, sessionId: string): Promise<ChildLedgerSnapshot> {
-  const result: ChildLedgerSnapshot = { seen: false };
+  const snapshot = await store.latestSnapshot(sessionId);
+  const restored = snapshotBudget(snapshot, sessionId);
+  let ledger = restored.ledger;
+  const snapshotSeq = restored.seq;
+  const result: ChildLedgerSnapshot = { seen: snapshotSeq > 0 };
   for await (const event of store.events(sessionId)) {
     result.seen = true;
     if (event.type === "run.started") result.terminal = undefined;
     const terminal = eventOutcome(event);
     if (terminal) result.terminal = terminal;
-    if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) continue;
-    const ledger = (event.payload as Record<string, unknown>).ledger;
-    if (isBudgetLedgerState(ledger)) result.ledger = ledger;
+    if (event.seq > snapshotSeq) ledger = replayBudgetLedgerEvent(ledger, event);
+  }
+  if (ledger) {
+    if (!isBudgetLedgerSemanticallyValid(ledger)) {
+      throw new Error(`Child '${sessionId}' has an unreadable budget ledger.`);
+    }
+    result.ledger = ledger;
   }
   return result;
 }
@@ -346,7 +364,7 @@ export async function reconcileInterruptedChildren(
     }
     const usage = snapshot.ledger
       ? conservativeUsage(snapshot.ledger)
-      : child.childSessionId && reservation
+      : reservation
         ? Object.fromEntries(BUDGET_KEYS.map((key) => [
           key,
           key === "children" ? Math.max(0, reservation.requested.children - 1) : reservation.requested[key]

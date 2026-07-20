@@ -166,7 +166,10 @@ describe("agent-config single-source schema", () => {
         parallel_tools: false, reasoning: true, structured_output: true,
         prompt_cache: false, tokenizer: "approximate"
       },
-      tokenizer: { id: "custom-tokenizer", accuracy: "exact", asset_digest: "a".repeat(64) },
+      tokenizer: {
+        id: "custom-tokenizer", accuracy: "exact", asset_digest: "a".repeat(64),
+        max_tokens_per_utf8_byte: 2
+      },
       pricing: {
         input_micro_usd_per_million: 10, output_micro_usd_per_million: 20,
         cache_read_micro_usd_per_million: 1, effective_at: "2026-01-01"
@@ -180,7 +183,7 @@ describe("agent-config single-source schema", () => {
     const values = resolveConfig({ workspace: { model: { specs: [rawSpec], routes: [rawRoute] } } });
     expect(values.modelSpecs).toEqual([expect.objectContaining({
       id: "deepseek/custom", providerId: "deepseek",
-      tokenizer: expect.objectContaining({ accuracy: "exact" })
+      tokenizer: expect.objectContaining({ accuracy: "exact", maxTokensPerUtf8Byte: 2 })
     })]);
     expect(values.modelRoutes).toEqual([expect.objectContaining({
       id: "analysis", requireExactTokenizer: true,
@@ -189,6 +192,10 @@ describe("agent-config single-source schema", () => {
     const specParser = SIGMA_CONFIG_SCHEMA.find((item) => item.key === "modelSpecs")!.parse;
     const routeParser = SIGMA_CONFIG_SCHEMA.find((item) => item.key === "modelRoutes")!.parse;
     expect(() => specParser([{ ...rawSpec, surprise: true }])).toThrow("Unknown configuration key");
+    expect(() => specParser([{
+      ...rawSpec,
+      tokenizer: { ...rawSpec.tokenizer, max_tokens_per_utf8_byte: 0 }
+    }])).toThrow("positive integer");
     expect(() => routeParser([{ ...rawRoute, fallback_on: ["auth"] }])).toThrow("must be one of");
     expect(() => routeParser([{ ...rawRoute, candidates: ["same", "same"] }])).toThrow("duplicates");
   });

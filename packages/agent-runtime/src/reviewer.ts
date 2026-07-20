@@ -7,6 +7,7 @@ import type {
   ModelMessage,
   ModelRequest,
   ModelResponse,
+  RepositoryDeltaEvidence,
   ReviewEvidence,
   UsageRecord,
   ValidationEvidence,
@@ -20,10 +21,12 @@ import {
   type PreparedModelBudget
 } from "./model-accounting.js";
 import { reviewInputFailure } from "./review-evidence-preflight.js";
+import { reviewMessages } from "./reviewer-messages.js";
 import type { ReviewObservationProjectionV1 } from "./review-observations.js";
-
+import { COMPLETION_CANDIDATE_MAX_SERIALIZED_UTF8_BYTES,
+  type CompletionReviewCandidateV1 } from "./completion-review-candidate.js";
 export { reviewInputFailure } from "./review-evidence-preflight.js";
-
+export { completionCandidateDigest, type CompletionReviewCandidateV1 } from "./completion-review-candidate.js";
 export interface ReviewerInput {
   sessionId: string;
   runId: string;
@@ -32,11 +35,15 @@ export interface ReviewerInput {
   stateDigest: string;
   reviewBasisDigest: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
+  repositoryDeltas?: RepositoryDeltaEvidence[];
   validations: ValidationEvidence[];
+  validationRequiredPaths?: string[];
+  reviewMode?: "workspace" | "completion";
+  completionCandidate?: CompletionReviewCandidateV1;
+  completionCandidateDigest?: string;
   inputAccesses?: InputAccessEvidence[];
   observations?: ReviewObservationProjectionV1;
 }
-
 export interface ReviewerPort {
   readonly reviewerId?: string;
   review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence>;
@@ -73,7 +80,17 @@ export interface AccountableReviewerPort extends ReviewerPort {
     error: unknown
   ): UsageRecord;
   recoveredUsage(input: ReviewerInput, requestId: string, consumed: BudgetAmounts): UsageRecord;
+  /** Quote a conservative budget for any completion candidate produced within
+   * `candidateOutputTokenLimit`. The runtime deducts this quote before it
+   * admits the solver request that will produce that candidate. */
+  prepareCompletionReserve?(
+    input: ReviewerInput,
+    remainingBudgetMicroUsd: number,
+    maxOutputTokens: number
+  ): Promise<PreparedModelBudget>;
 }
+
+export const COMPLETION_REVIEW_OUTPUT_TOKENS = 2_048;
 
 export function isAccountableReviewer(reviewer: ReviewerPort): reviewer is AccountableReviewerPort {
   const candidate = reviewer as Partial<AccountableReviewerPort>;
@@ -81,6 +98,12 @@ export function isAccountableReviewer(reviewer: ReviewerPort): reviewer is Accou
     && typeof candidate.reviewPrepared === "function"
     && typeof candidate.failedUsage === "function"
     && typeof candidate.recoveredUsage === "function";
+}
+
+export function canQuoteCompletionReserve(
+  reviewer: AccountableReviewerPort
+): reviewer is AccountableReviewerPort & Required<Pick<AccountableReviewerPort, "prepareCompletionReserve">> {
+  return typeof reviewer.prepareCompletionReserve === "function";
 }
 
 function responseObject(content: string): Record<string, unknown> | null {
@@ -115,8 +138,11 @@ export function reviewInputFailureEvidence(
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
       reviewBasisDigest: input.reviewBasisDigest,
-      reviewBasisVersion: 2,
+      reviewBasisVersion: 3,
+      ...(input.completionCandidateDigest
+        ? { completionCandidateDigest: input.completionCandidateDigest } : {}),
       validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+      repositoryDeltaEvidenceIds: input.repositoryDeltas?.map((item) => item.evidenceId) ?? [],
       reviewRelevantEvidenceIds: input.observations?.items.map((item) => item.evidenceId) ?? [],
       ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
         ? { failureCode: "review_scope_too_large" as const } : {})
@@ -130,7 +156,9 @@ export class ModelReviewer implements ReviewerPort {
   async review(input: ReviewerInput, signal: AbortSignal): Promise<ReviewEvidence> {
     const inputProblem = reviewInputFailure(input);
     if (inputProblem) return reviewInputFailureEvidence(input, this.reviewerId, inputProblem);
-    const prepared = await this.prepareReview(input, Number.MAX_SAFE_INTEGER);
+    const outputLimit = input.reviewMode === "completion"
+      ? COMPLETION_REVIEW_OUTPUT_TOKENS : undefined;
+    const prepared = await this.prepareReview(input, Number.MAX_SAFE_INTEGER, outputLimit);
     return (await this.reviewPrepared(input, randomUUID(), prepared, signal)).evidence;
   }
 
@@ -149,6 +177,39 @@ export class ModelReviewer implements ReviewerPort {
       remainingBudgetMicroUsd
     );
     return { messages, maxOutputTokens, budget };
+  }
+
+  async prepareCompletionReserve(
+    input: ReviewerInput,
+    remainingBudgetMicroUsd: number,
+    outputLimit = COMPLETION_REVIEW_OUTPUT_TOKENS
+  ): Promise<PreparedModelBudget> {
+    const maxTokensPerUtf8Byte = this.gateway.maxTokensPerUtf8Byte;
+    if (!Number.isSafeInteger(maxTokensPerUtf8Byte) || (maxTokensPerUtf8Byte ?? 0) < 1) {
+      throw new Error("The reviewer gateway has no trusted tokenizer UTF-8 expansion bound.");
+    }
+    const messages = reviewMessages(input);
+    const counted = await this.gateway.countTokens(messages, []);
+    const baseContentUtf8Bytes = messages.reduce((total, message) =>
+      total + Buffer.byteLength(message.content, "utf8"), 0);
+    // Do not assume inserting the candidate preserves token boundaries in the
+    // surrounding JSON. The empty request count covers non-negative framing;
+    // independently bounding every byte of the full possible message content
+    // covers even a tokenizer that re-segments all surrounding text.
+    const boundedContentTokens = (baseContentUtf8Bytes
+      + COMPLETION_CANDIDATE_MAX_SERIALIZED_UTF8_BYTES) * (maxTokensPerUtf8Byte as number);
+    const minimumInputTokens = Math.max(1, Math.ceil(counted)) + boundedContentTokens;
+    if (!Number.isSafeInteger(boundedContentTokens) || !Number.isSafeInteger(minimumInputTokens)) {
+      throw new Error("The reviewer tokenizer UTF-8 expansion bound exceeds the safe accounting range.");
+    }
+    return await prepareModelBudget(
+      this.gateway,
+      messages,
+      [],
+      Math.min(outputLimit, this.gateway.capabilities.maxOutputTokens),
+      remainingBudgetMicroUsd,
+      minimumInputTokens
+    );
   }
 
   async reviewPrepared(
@@ -221,33 +282,6 @@ export class ModelReviewer implements ReviewerPort {
   }
 }
 
-function reviewMessages(input: ReviewerInput): ModelMessage[] {
-  return [{
-    role: "system",
-    content: "You are Sigma's independent read-only code reviewer. Review only the supplied goal, durable workspace delta, input-access evidence, validation evidence, and bounded post-validation observations. Evaluate every explicit goal dimension in one pass, including correctness, performance, format, and delivery behavior when the goal mentions them; do not stop after the first missing proof. A failed validation is a real correctness signal: never describe it as passed or treat review approval as validation_passed. A validation with assertionMode=exit_code_only is diagnostic and cannot establish readiness. Treat strength=self_consistency or independence=same_method as weaker evidence: compare it against the requested behavior, source material, diff, and later observations instead of accepting the command's own expectations as an oracle. Later command or diagnostic observations can contradict an earlier passing validation; report that contradiction as an actionable error unless the supplied evidence resolves it. Absence of input-access evidence is not itself a failure; only a recorded failed access to a required user-declared input is actionable. Never accept a run-created sample or fixture as a substitute for a user-declared external input whose access failed. Check that each validation command plausibly exercises every workspace delta linked to it; a file-specific syntax check cannot establish unrelated files or runtime behavior. Complete opaque or content-omitted artifacts are reviewable by workspace path, SHA-256, size, checkpoint-bound delta, and passed validation, but their hidden content must not be claimed as inspected. Return strict JSON: {\"verdict\":\"approved\"|\"changes_requested\",\"findings\":[{\"actionable\":boolean,\"severity\":\"error\"|\"warning\"|\"info\",\"summary\":string}]}. Set changes_requested only when at least one finding is both actionable=true and severity=error. Positive observations must be non-actionable info findings. Never claim to have edited files."
-  }, {
-    role: "user",
-    content: JSON.stringify({
-      goal: input.goal,
-      frontierRevision: input.frontierRevision,
-      stateDigest: input.stateDigest,
-      reviewBasisDigest: input.reviewBasisDigest,
-      observations: input.observations ?? null,
-      inputAccesses: input.inputAccesses ?? [],
-      workspaceDeltas: input.workspaceDeltas.map((item) => ({
-        evidenceId: item.evidenceId,
-        checkpointId: item.data.checkpointId,
-        delta: item.data.delta,
-        diff: item.data.reviewDiff ?? "[diff artifact unavailable]",
-        reviewDiffPaths: item.data.reviewDiffPaths ?? [],
-        opaqueArtifacts: item.data.opaqueArtifacts ?? [],
-        reviewProblem: item.data.reviewProblem
-      })),
-      validations: input.validations.map((item) => ({ status: item.status, summary: item.summary, data: item.data }))
-    })
-  }];
-}
-
 export function isActionableErrorFinding(finding: JsonValue): boolean {
   if (finding && typeof finding === "object" && !Array.isArray(finding)
     && Object.hasOwn(finding, "actionable") && Object.hasOwn(finding, "severity")) {
@@ -257,6 +291,23 @@ export function isActionableErrorFinding(finding: JsonValue): boolean {
   // Old review evidence allowed arbitrary JSON findings. Preserve the prior
   // conservative interpretation when reading those durable records.
   return true;
+}
+
+function reviewEvidenceReferences(input: ReviewerInput): Pick<ReviewEvidence["data"],
+  "completionCandidateDigest" | "validationEvidenceIds" | "repositoryDeltaEvidenceIds"
+  | "reviewRelevantEvidenceIds" | "failureCode"> {
+  const repositoryDeltaEvidenceIds = (input.repositoryDeltas ?? []).map((item) => item.evidenceId);
+  const reviewRelevantEvidenceIds = (input.observations?.items ?? []).map((item) => item.evidenceId);
+  const scopeTooLarge = input.workspaceDeltas.some((item) =>
+    item.data.reviewProblem?.code === "review_scope_too_large");
+  return {
+    ...(input.completionCandidateDigest
+      ? { completionCandidateDigest: input.completionCandidateDigest } : {}),
+    validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+    repositoryDeltaEvidenceIds,
+    reviewRelevantEvidenceIds,
+    ...(scopeTooLarge ? { failureCode: "review_scope_too_large" } : {})
+  };
 }
 
 function reviewEvidence(
@@ -289,11 +340,8 @@ function reviewEvidence(
         frontierRevision: input.frontierRevision,
         stateDigest: input.stateDigest,
         reviewBasisDigest: input.reviewBasisDigest,
-        reviewBasisVersion: 2,
-        validationEvidenceIds: input.validations.map((item) => item.evidenceId),
-        reviewRelevantEvidenceIds: input.observations?.items.map((item) => item.evidenceId) ?? [],
-        ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
-          ? { failureCode: "review_scope_too_large" as const } : {})
+        reviewBasisVersion: 3,
+        ...reviewEvidenceReferences(input)
       }
     };
 }

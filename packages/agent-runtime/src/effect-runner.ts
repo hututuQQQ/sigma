@@ -28,9 +28,10 @@ import { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import type { RunSuspensionContext } from "./runtime-session-finish.js";
-import {
-  durableToolReceipt, receiptToolName, runtimeSignal, shouldReviewReceipt, type DurableToolReceipt
-} from "./effect-receipt-helpers.js";
+import { durableToolReceipt, receiptToolName, runtimeSignal, type DurableToolReceipt } from "./effect-receipt-helpers.js";
+import { CompletionReceiptReviewer } from "./completion-receipt-reviewer.js";
+import { modelTurnToolPolicyFailure } from "./model-tool-availability.js";
+import { terminalOnlyToolDescriptor } from "./terminal-tool-policy.js";
 
 export interface EffectRunnerOptions {
   runtime: RuntimeOptions;
@@ -54,6 +55,7 @@ export interface EffectRunnerOptions {
 export class EffectRunner {
   private readonly models: ModelEffectRunner;
   private readonly reviews: ReviewCoordinator;
+  private readonly completionReviews: CompletionReceiptReviewer;
   private readonly execution: ToolExecutionMonitor;
   private readonly transactions: ToolTransactionRunner;
 
@@ -64,6 +66,7 @@ export class EffectRunner {
       options.emit,
       options.budgets
     );
+    this.completionReviews = new CompletionReceiptReviewer(options, () => this.reviews);
     this.execution = new ToolExecutionMonitor(options);
     this.transactions = new ToolTransactionRunner(options, this.execution);
   }
@@ -94,10 +97,10 @@ export class EffectRunner {
     effects: ExecuteToolEffect[]
   ): Promise<boolean> {
     const descriptors = this.options.runtime.tools.descriptors();
-    const terminalOnly = effects.every((effect) => descriptors
-      .find((item) => item.name === effect.request.name)
-          ?.possibleEffects.every((item) => item === "outcome.propose" || item === "outcome.report_blocked"
-            || item === "outcome.request_input") === true);
+    const terminalOnly = effects.every((effect) => {
+      const descriptor = descriptors.find((item) => item.name === effect.request.name);
+      return descriptor ? terminalOnlyToolDescriptor(descriptor) : false;
+    });
     const admission = convergenceAdmissionDecision(session, {
       kind: "tool", count: effects.length, terminalOnly
     });
@@ -228,9 +231,17 @@ export class EffectRunner {
     try {
       let loadedInstructions = false;
       const instructionFailures = new Set<string>();
-      for (const { call } of attempts) {
+      for (const { call, modelTurn } of attempts) {
         const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
         if (!descriptor) continue;
+        const turnPolicyFailure = modelTurnToolPolicyFailure(
+          session, call, descriptor, modelTurn, new Date().toISOString()
+        );
+        if (turnPolicyFailure) {
+          instructionFailures.add(call.id);
+          await this.emitReceipt(session, turnPolicyFailure, modelTurn);
+          continue;
+        }
         const instructionResult = await this.loadInstructions(session, call, descriptor);
         if (instructionResult.failure) {
           instructionFailures.add(call.id);
@@ -327,20 +338,6 @@ export class EffectRunner {
     return { loaded: true };
   }
 
-  private async maybeReviewBeforeReceipt(
-    session: RuntimeSession,
-    receipt: ToolReceipt,
-    name: string,
-    reviewMode: "off" | "advisory" | "required"
-  ): Promise<boolean> {
-    const required = receipt.ok && name === "runtime_finalize" && reviewMode !== "off";
-    if (!required) return false;
-    // A successful completion intent is a proposal, not a committed outcome.
-    // Make the independent verdict durable before reducing the terminal receipt.
-    await this.reviews.maybeReview(session, runtimeSignal(session));
-    return true;
-  }
-
   private async emitDurableReceipt(
     session: RuntimeSession,
     receipt: ToolReceipt,
@@ -370,25 +367,18 @@ export class EffectRunner {
     }, runtimeSignal(session));
   }
 
-  private async maybeReviewAfterReceipt(
-    session: RuntimeSession,
-    name: string,
-    reviewMode: "off" | "advisory" | "required",
-    reviewedBefore: boolean
-  ): Promise<void> {
-    if (reviewedBefore || !shouldReviewReceipt(name, reviewMode)) return;
-    await this.reviews.maybeReview(session, runtimeSignal(session), name === "request_review");
-  }
-
   private async emitReceipt(session: RuntimeSession, receipt: ToolReceipt, modelTurn: ActiveModelTurn): Promise<void> {
     const name = receiptToolName(session, receipt, modelTurn);
-    const durableReceipt = durableToolReceipt(receipt);
     const reviewMode = session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
     try {
-      const reviewedBefore = await this.maybeReviewBeforeReceipt(session, receipt, name, reviewMode);
-      await this.emitDurableReceipt(session, receipt, durableReceipt, name, modelTurn);
-      await this.dispatchPostTool(session, receipt, name);
-      await this.maybeReviewAfterReceipt(session, name, reviewMode, reviewedBefore);
+      const prepared = await this.completionReviews.beforeReceipt(
+        session, receipt, name, reviewMode, runtimeSignal(session)
+      );
+      const effectiveReceipt = prepared.receipt;
+      const effectiveDurableReceipt = durableToolReceipt(effectiveReceipt);
+      await this.emitDurableReceipt(session, effectiveReceipt, effectiveDurableReceipt, name, modelTurn);
+      await this.dispatchPostTool(session, effectiveReceipt, name);
+      await this.completionReviews.afterReceipt(session, name, reviewMode, prepared.reviewed);
     } finally {
       await this.transactions.settleBudgetsAfterReceipt(session);
     }

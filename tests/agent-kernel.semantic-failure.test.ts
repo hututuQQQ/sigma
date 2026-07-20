@@ -71,6 +71,12 @@ function queueTool(
   const turnId = next.toolCallIds.length + 1;
   next = apply(next, "model.started", { turnId, effectRevision: next.revision }, events);
   const turn = next.activeModelTurn!;
+  next = apply(next, "diagnostic", {
+    kind: "model.tool_policy",
+    ...turn,
+    allowedToolNames: [name],
+    terminalOnly: false
+  }, events);
   return apply(next, "model.completed", {
     ...turn,
     message: { role: "assistant", content: "" },
@@ -89,6 +95,12 @@ function queueTools(
   const turnId = next.toolCallIds.length + 1;
   next = apply(next, "model.started", { turnId, effectRevision: next.revision }, events);
   const turn = next.activeModelTurn!;
+  next = apply(next, "diagnostic", {
+    kind: "model.tool_policy",
+    ...turn,
+    allowedToolNames: [...new Set(calls.map((call) => call.name))],
+    terminalOnly: false
+  }, events);
   return apply(next, "model.completed", {
     ...turn,
     message: { role: "assistant", content: "" },

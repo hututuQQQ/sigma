@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   link,
   mkdir,
@@ -63,7 +64,40 @@ describe("stable explicit workspace reads", () => {
 
     expect(result.output).toBe("2: second\n3: third");
     expect(result.observedEffects).toEqual(["filesystem.read"]);
-    expect(result.evidence).toEqual([]);
+    expect(result.evidence).toEqual([expect.objectContaining({
+      kind: "input_access",
+      status: "passed",
+      data: expect.objectContaining({
+        path: "src/lines.txt",
+        scope: "workspace",
+        byteLength: Buffer.byteLength("first\nsecond\nthird\nfourth\n"),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        selection: {
+          kind: "line_range",
+          start: 1,
+          endExclusive: 3,
+          byteLength: Buffer.byteLength(result.output),
+          sha256: createHash("sha256").update(result.output, "utf8").digest("hex")
+        }
+      })
+    })]);
+
+    const equivalent = await tools.execute(
+      request("equivalent-page", { path: "src/./lines.txt", offset: 1, limit: 2 }),
+      context(workspace)
+    );
+    expect(equivalent.output).toBe(result.output);
+    expect(equivalent.evidence?.[0]?.data).toEqual(result.evidence?.[0]?.data);
+
+    const pastEnd = await tools.execute(
+      request("past-end", { path: "src/lines.txt", offset: 100, limit: 1 }),
+      context(workspace)
+    );
+    const fartherPastEnd = await tools.execute(
+      request("farther-past-end", { path: "src/lines.txt", offset: 10_000, limit: 500 }),
+      context(workspace)
+    );
+    expect(pastEnd.evidence?.[0]?.data).toEqual(fartherPastEnd.evidence?.[0]?.data);
   });
 
   it("reads an approved absolute host input with stable input-access evidence", async () => {
@@ -95,7 +129,11 @@ describe("stable explicit workspace reads", () => {
         path: inputPath,
         scope: "external",
         byteLength: Buffer.byteLength("external input\n"),
-        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u)
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        selection: expect.objectContaining({
+          kind: "line_range", start: 0, endExclusive: 1,
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u)
+        })
       })
     })]);
   });

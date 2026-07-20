@@ -82,9 +82,12 @@ export class RuntimeEventLog {
     } as AgentEventOf<TType>;
     // TypeScript cannot distribute a generic indexed access over the mapped
     // event union, but `emit` has already bound TType to its payload above.
+    // Preflight semantic reducers before the event becomes durable. A malformed
+    // accounting transition must not be appended and then leave seq/state split.
+    const nextState = evolve(session.durable.state, event);
     const append = await this.store.append(event as import("agent-protocol").AnyTypedAgentEvent, expectedSeq);
     session.durable.seq = event.seq;
-    session.durable.state = evolve(session.durable.state, event);
+    session.durable.state = nextState;
     for (const subscriber of session.interaction.subscribers) subscriber.push(event);
     if (append.rotated || event.seq % 250 === 0) await this.writeSnapshot(session);
     return event;

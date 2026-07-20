@@ -3,14 +3,17 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
-import { createKernelState } from "../packages/agent-kernel/src/index.js";
+import { createKernelState, rehydrate } from "../packages/agent-kernel/src/index.js";
 import {
   createBudgetLedger,
   emptyBudgetAmounts,
   EVENT_SCHEMA_VERSION,
+  SNAPSHOT_SCHEMA_VERSION,
+  STORE_LAYOUT_VERSION,
   type AgentEventEnvelope,
   type AgentEventType,
   type BudgetLedgerState,
+  type BudgetLimits,
   type ContextAuthority,
   type JsonValue,
   type ModelGateway,
@@ -29,6 +32,7 @@ import { BudgetController } from "../packages/agent-runtime/src/budget-controlle
 import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-control.js";
 import { RuntimeEventLog } from "../packages/agent-runtime/src/runtime-event-log.js";
 import type { RuntimeEventEmitter } from "../packages/agent-runtime/src/runtime-event-emitter.js";
+import { restoreStoredSession } from "../packages/agent-runtime/src/restore-session.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { validationCoversDelta } from "../packages/agent-runtime/src/validation-policy.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -100,7 +104,7 @@ async function append(
   payload: unknown,
   authority: Exclude<ContextAuthority, "external_verifier"> = "runtime"
 ): Promise<AgentEventEnvelope> {
-  return await store.append({
+  const event = {
     schemaVersion: EVENT_SCHEMA_VERSION,
     seq,
     eventId: randomUUID(),
@@ -110,7 +114,9 @@ async function append(
     type,
     authority,
     payload: json(payload)
-  }, seq - 1);
+  } as AgentEventEnvelope;
+  await store.append(event as never, seq - 1);
+  return event;
 }
 
 afterEach(async () => {
@@ -285,6 +291,204 @@ describe("durable child identity and crash recovery", () => {
     });
   });
 
+  it("restores custom root and child allocations after an early crash before the first snapshot", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-early-budget-recovery-"));
+    fixtures.push(root);
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    const rootLimits: BudgetLimits = {
+      inputTokens: 12_345,
+      outputTokens: 2_345,
+      costMicroUsd: 98_765,
+      modelTurns: 37,
+      toolCalls: 73,
+      children: 5,
+      maxDepth: 4
+    };
+    const childLimits: BudgetLimits = {
+      inputTokens: 1_234,
+      outputTokens: 345,
+      costMicroUsd: 8_765,
+      modelTurns: 7,
+      toolCalls: 13,
+      children: 2,
+      maxDepth: 2
+    };
+    const runtime = createRuntime({
+      gateway: new IdleGateway(), tools: new EffectToolRegistry(), store, storeRootDir: root,
+      budgetLimits: rootLimits
+    });
+    const parent = await runtime.createSession({ workspacePath: root, mode: "analyze" });
+    const child = await runtime.createChildSession(parent.sessionId, {
+      workspacePath: root, mode: "analyze"
+    }, childLimits);
+
+    const parentEvents = await sessionEvents(store, parent.sessionId);
+    const childEvents = await sessionEvents(store, child.sessionId);
+    expect(parentEvents.length).toBeLessThan(250);
+    expect(childEvents.length).toBeLessThan(250);
+    expect(await store.latestSnapshot(parent.sessionId)).toBeNull();
+    expect(await store.latestSnapshot(child.sessionId)).toBeNull();
+    expect(parentEvents[0]?.payload).toMatchObject({ budgetLimits: rootLimits });
+    expect(childEvents[0]?.payload).toMatchObject({ budgetLimits: childLimits });
+    expect(parentEvents[0]?.payload).not.toHaveProperty("ledger");
+    expect(childEvents[0]?.payload).not.toHaveProperty("ledger");
+
+    await runtime.releaseSession(child.sessionId);
+    await runtime.releaseSession(parent.sessionId);
+    const restoredParent = await restoreStoredSession(store, parent.sessionId, 60_000);
+    const restoredChild = await restoreStoredSession(store, child.sessionId, 60_000);
+    expect(restoredParent.state.budget.limits).toEqual(rootLimits);
+    expect(restoredChild.state.budget.limits).toEqual(childLimits);
+    expect(restoredChild.parentSessionId).toBe(parent.sessionId);
+  });
+
+  it("charges the complete parent reservation when a durable spawn has no durable started message", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-pre-start-crash-"));
+    fixtures.push(root);
+    const store = new SegmentedJsonlStore({ rootDir: root });
+    const sessionId = "pre-start-parent";
+    const runId = "pre-start-run";
+    const childId = "12121212-1212-4121-8121-121212121212";
+    await append(store, sessionId, runId, 1, "child.spawned", {
+      childId, payload: { detached: false, metadata: {} }
+    });
+    const state = createKernelState({
+      sessionId, runId, mode: "change", startedAt: new Date().toISOString(),
+      deadlineAt: new Date(Date.now() + 60_000).toISOString()
+    });
+    const requested = {
+      inputTokens: 101, outputTokens: 51, costMicroUsd: 501, modelTurns: 3, toolCalls: 7, children: 2
+    };
+    state.budget.reserved = { ...requested };
+    state.budget.reservations.push({
+      reservationId: "pre-start-reservation",
+      ownerId: `child:${childId}`,
+      status: "reserved",
+      requested,
+      consumed: emptyBudgetAmounts(),
+      createdAt: new Date().toISOString()
+    });
+    const session = runtimeSessionFixture(state, root, 1);
+    const eventLog = new RuntimeEventLog(store);
+    const emit: RuntimeEventEmitter = async (target, type, authority, payload) =>
+      await eventLog.emit(target, type, authority, payload);
+    const control = new RuntimeControlService({
+      checkpoints: new CheckpointManager({ rootDir: root }),
+      budgets: new BudgetController(emit),
+      emit,
+      createArtifact: async () => "artifact",
+      readArtifact: async () => "artifact"
+    });
+
+    await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
+    expect(session.durable.state.budget.consumed).toEqual(requested);
+    expect(session.durable.state.budget.reservations[0]).toMatchObject({ status: "committed", consumed: requested });
+  });
+
+  it.each(["snapshot", "compact", "legacy"] as const)(
+    "charges the complete parent reservation when the child %s ledger is semantically unreadable",
+    async (corruption) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `sigma-child-${corruption}-budget-`));
+      fixtures.push(root);
+      const store = new SegmentedJsonlStore({ rootDir: root });
+      const parentSessionId = `${corruption}-parent`;
+      const parentRunId = `${corruption}-parent-run`;
+      const childId = "34343434-3434-4343-8343-343434343434";
+      const childSessionId = `${corruption}-child`;
+      const childRunId = `${corruption}-child-run`;
+      await append(store, parentSessionId, parentRunId, 1, "child.spawned", {
+        childId, payload: { detached: false, metadata: {} }
+      });
+      await append(store, parentSessionId, parentRunId, 2, "child.message", {
+        childId, payload: { kind: "started", sessionId: childSessionId }
+      });
+      const childLedger = createBudgetLedger();
+      const created = await append(store, childSessionId, childRunId, 1, "session.created", {
+        workspacePath: root,
+        mode: "change",
+        title: "child",
+        writeScope: [],
+        strictWriteScope: false,
+        modelRole: "child_write",
+        parentSessionId,
+        budgetLimits: childLedger.limits
+      });
+      const childRequested = { ...emptyBudgetAmounts(), inputTokens: 11, toolCalls: 1 };
+      const childReservation = {
+        reservationId: "corrupt-child-reservation",
+        ownerId: "model:corrupt-child",
+        status: "reserved" as const,
+        requested: childRequested,
+        consumed: emptyBudgetAmounts(),
+        createdAt: new Date().toISOString()
+      };
+      if (corruption === "snapshot") {
+        const invalidSnapshotLedger = {
+          ...childLedger,
+          reservations: [childReservation]
+        };
+        await store.writeSnapshot({
+          schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+          storeLayoutVersion: STORE_LAYOUT_VERSION,
+          sessionId: childSessionId,
+          seq: 1,
+          createdAt: new Date().toISOString(),
+          state: json({ budget: invalidSnapshotLedger })
+        });
+      } else if (corruption === "compact") {
+        await append(store, childSessionId, childRunId, 2, "budget.reserved", {
+          reservationId: childReservation.reservationId,
+          mutation: {
+            schemaVersion: 1,
+            kind: "reserve",
+            reservation: childReservation,
+            totals: { consumed: emptyBudgetAmounts(), reserved: emptyBudgetAmounts() }
+          }
+        });
+      } else {
+        await append(store, childSessionId, childRunId, 2, "budget.released", {
+          reservationId: "missing",
+          ledger: childLedger
+        });
+      }
+
+      const state = createKernelState({
+        sessionId: parentSessionId,
+        runId: parentRunId,
+        mode: "change",
+        startedAt: created.occurredAt,
+        deadlineAt: new Date(Date.now() + 60_000).toISOString()
+      });
+      const requested = {
+        inputTokens: 103, outputTokens: 53, costMicroUsd: 503, modelTurns: 5, toolCalls: 9, children: 3
+      };
+      state.budget.reserved = { ...requested };
+      state.budget.reservations.push({
+        reservationId: `${corruption}-parent-reservation`,
+        ownerId: `child:${childId}`,
+        status: "reserved",
+        requested,
+        consumed: emptyBudgetAmounts(),
+        createdAt: new Date().toISOString()
+      });
+      const session = runtimeSessionFixture(state, root, 2);
+      const eventLog = new RuntimeEventLog(store);
+      const emit: RuntimeEventEmitter = async (target, type, authority, payload) =>
+        await eventLog.emit(target, type, authority, payload);
+      const control = new RuntimeControlService({
+        checkpoints: new CheckpointManager({ rootDir: root }),
+        budgets: new BudgetController(emit),
+        emit,
+        createArtifact: async () => "artifact",
+        readArtifact: async () => "artifact"
+      });
+
+      await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
+      expect(session.durable.state.budget.consumed).toEqual(requested);
+      expect(session.durable.state.budget.reservations[0]).toMatchObject({ status: "committed", consumed: requested });
+    }
+  );
+
   it("rejects child budget increases both live and after replay", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-child-root-budget-"));
     fixtures.push(root);
@@ -335,16 +539,84 @@ describe("durable child identity and crash recovery", () => {
       childId, payload: { kind: "started", sessionId: childSessionId }
     });
 
-    const childLedger = createBudgetLedger();
-    childLedger.consumed.inputTokens = 111;
-    childLedger.reserved.inputTokens = 17;
-    childLedger.consumed.toolCalls = 2;
-    childLedger.reserved.toolCalls = 1;
-    childLedger.reserved.children = 1;
-    await append(store, childSessionId, "child-run", 1, "budget.reserved", {
-      reservationId: "model", ledger: childLedger
+    const childRunId = "child-run";
+    const initialChildLedger = createBudgetLedger();
+    const modelRequested = { ...emptyBudgetAmounts(), inputTokens: 111, toolCalls: 2 };
+    const pendingRequested = { ...emptyBudgetAmounts(), inputTokens: 17, toolCalls: 1, children: 1 };
+    const modelReservation = {
+      reservationId: "child-model",
+      ownerId: "model:child-request",
+      status: "reserved" as const,
+      requested: modelRequested,
+      consumed: emptyBudgetAmounts(),
+      createdAt: new Date(1_000).toISOString()
+    };
+    const pendingReservation = {
+      reservationId: "child-tool",
+      ownerId: "tool:child-call",
+      status: "reserved" as const,
+      requested: pendingRequested,
+      consumed: emptyBudgetAmounts(),
+      createdAt: new Date(4_000).toISOString()
+    };
+    const created = await append(store, childSessionId, childRunId, 1, "session.created", {
+      workspacePath: root,
+      mode: "change",
+      title: "child",
+      writeScope: [],
+      strictWriteScope: false,
+      modelRole: "child_write",
+      parentSessionId,
+      budgetLimits: initialChildLedger.limits
     });
-    await append(store, childSessionId, "child-run", 2, "run.completed", {
+    const modelReserved = await append(store, childSessionId, childRunId, 2, "budget.reserved", {
+      reservationId: modelReservation.reservationId,
+      mutation: {
+        schemaVersion: 1,
+        kind: "reserve",
+        reservation: modelReservation,
+        totals: { consumed: emptyBudgetAmounts(), reserved: modelRequested }
+      }
+    });
+    const settledAt = new Date(3_000).toISOString();
+    const modelCommitted = await append(store, childSessionId, childRunId, 3, "budget.committed", {
+      reservationId: modelReservation.reservationId,
+      mutation: {
+        schemaVersion: 1,
+        kind: "settle",
+        reservationId: modelReservation.reservationId,
+        status: "committed",
+        consumed: modelRequested,
+        settledAt,
+        totals: { consumed: modelRequested, reserved: emptyBudgetAmounts() }
+      }
+    });
+    const childState = createKernelState({
+      sessionId: childSessionId,
+      runId: childRunId,
+      mode: "change",
+      startedAt: created.occurredAt,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString()
+    });
+    const snapshotState = rehydrate(childState, [created, modelReserved, modelCommitted]);
+    await store.writeSnapshot({
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      storeLayoutVersion: STORE_LAYOUT_VERSION,
+      sessionId: childSessionId,
+      seq: 3,
+      createdAt: new Date(3_500).toISOString(),
+      state: json({ ...snapshotState, lastSeq: 3 })
+    });
+    await append(store, childSessionId, childRunId, 4, "budget.reserved", {
+      reservationId: pendingReservation.reservationId,
+      mutation: {
+        schemaVersion: 1,
+        kind: "reserve",
+        reservation: pendingReservation,
+        totals: { consumed: modelRequested, reserved: pendingRequested }
+      }
+    });
+    await append(store, childSessionId, childRunId, 5, "run.completed", {
       kind: "completed", message: "child model run ended", evidence: []
     });
 
@@ -414,7 +686,9 @@ describe("durable child identity and crash recovery", () => {
 
     await expect(reconcileInterruptedChildren(store, session, control, emit)).resolves.toBe(1);
     expect(session.durable.state.budget.reserved).toMatchObject({ inputTokens: 0, toolCalls: 0, children: 0 });
-    expect(session.durable.state.budget.consumed).toMatchObject({ inputTokens: 128, toolCalls: 3, children: 2 });
+    expect(session.durable.state.budget.consumed).toEqual({
+      ...emptyBudgetAmounts(), inputTokens: 128, toolCalls: 3, children: 2
+    });
     expect(session.durable.state.budget.reservations[0]?.status).toBe("committed");
     expect(session.durable.state.plan.nodes[0]).toMatchObject({
       status: "blocked",

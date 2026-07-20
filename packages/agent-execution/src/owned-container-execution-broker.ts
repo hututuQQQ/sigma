@@ -45,7 +45,10 @@ import type {
   ProcessHandle,
   ProcessHandoffResult,
   ProcessPollResult,
-  ProcessSpawnRequest
+  ProcessSpawnRequest,
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1,
+  ScratchLeaseRequestV1, ScratchLeaseV1
 } from "./types.js";
 
 export const OWNED_OCI_HELPER_TARGET = "/opt/sigma-helper/sigma-exec";
@@ -84,7 +87,6 @@ export class OwnedContainerExecutionBroker implements ExecutionBroker {
   }
 
   get lostProcessHandles(): readonly ProcessHandle[] { return this.client?.lostProcessHandles ?? []; }
-
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     this.connection ??= this.connectOnce(this.combinedSignal(signal));
     return await this.connection;
@@ -125,6 +127,36 @@ export class OwnedContainerExecutionBroker implements ExecutionBroker {
     await this.reattest(signal);
     if (!client.revokeSandboxLease) throw new ContainerUnavailableError("Owned OCI sandbox lease revoke is unavailable.");
     return await this.guard(() => client.revokeSandboxLease!(workspacePath, signal));
+  }
+
+  async acquireRepositoryMetadataLease(
+    request: RepositoryMetadataLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<RepositoryMetadataLeaseV1> {
+    const client = await this.attestedClient(options?.signal);
+    if (!client.acquireRepositoryMetadataLease) {
+      throw new ContainerUnavailableError("Owned OCI repository metadata leases are unavailable.");
+    }
+    return await this.guard(() => client.acquireRepositoryMetadataLease!(request, options));
+  }
+
+  async acquireScratchLease(
+    request: ScratchLeaseRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ScratchLeaseV1> {
+    const client = await this.attestedClient(options?.signal);
+    if (!client.acquireScratchLease) {
+      throw new ContainerUnavailableError("Owned OCI RuntimeSession scratch leases are unavailable.");
+    }
+    return await this.guard(() => client.acquireScratchLease!(request, options));
+  }
+
+  async releaseScratchLease(sessionId: string, options?: BrokerRequestOptions): Promise<void> {
+    const client = await this.attestedClient(options?.signal);
+    if (!client.releaseScratchLease) {
+      throw new ContainerUnavailableError("Owned OCI RuntimeSession scratch lease release is unavailable.");
+    }
+    await this.guard(() => client.releaseScratchLease!(sessionId, options));
   }
 
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {

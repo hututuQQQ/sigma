@@ -106,12 +106,29 @@ function validEvidenceAuthority(event: AgentEventEnvelope, evidence: EvidenceRec
     && evidence.kind !== "review" && evidence.kind !== "user_waiver";
 }
 
-function scopeIssues(event: AgentEventEnvelope): ProtocolValidationIssue[] {
-  if (event.type === "checkpoint.recovery_resolved" && event.authority !== "user") {
-    return [{ path: ["authority"], code: "invalid_authority", message: "Checkpoint recovery requires user authority" }];
+function accountingScopeIssue(event: AgentEventEnvelope): ProtocolValidationIssue | undefined {
+  if (event.type === "session.created" && (event.authority !== "runtime" || event.seq !== 1)) {
+    return {
+      path: [event.authority !== "runtime" ? "authority" : "seq"],
+      code: event.authority !== "runtime" ? "invalid_authority" : "invalid_sequence",
+      message: "Session creation must be the first runtime-authored event"
+    };
   }
   if (event.type === "budget.limit_increased" && event.authority !== "user") {
-    return [{ path: ["authority"], code: "invalid_authority", message: "Budget increases require user authority" }];
+    return { path: ["authority"], code: "invalid_authority", message: "Budget increases require user authority" };
+  }
+  if (["budget.reserved", "budget.reservation_bound", "budget.committed", "budget.released"].includes(event.type)
+    && event.authority !== "runtime") {
+    return { path: ["authority"], code: "invalid_authority", message: "Budget accounting requires runtime authority" };
+  }
+  return undefined;
+}
+
+function scopeIssues(event: AgentEventEnvelope): ProtocolValidationIssue[] {
+  const accountingIssue = accountingScopeIssue(event);
+  if (accountingIssue) return [accountingIssue];
+  if (event.type === "checkpoint.recovery_resolved" && event.authority !== "user") {
+    return [{ path: ["authority"], code: "invalid_authority", message: "Checkpoint recovery requires user authority" }];
   }
   if (!["evidence.recorded", "review.completed", "review.waived"].includes(event.type)
     || !isEvidenceRecord(event.payload)) return [];

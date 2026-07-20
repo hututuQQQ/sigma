@@ -25,11 +25,17 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
   const runDir = path.dirname(configPath);
   const jobConfig = JSON.parse(await readFile(configPath, "utf8"));
   const managedProvenance = jobConfig.agents?.[0]?.kwargs?.managed_provenance === true;
-  const trialDir = path.join(runDir, "harbor-jobs", "job-1", `trial-${attempt}`);
-  const taskDir = path.join(runDir, "tasks", "selected-task");
+  const configuredTask = jobConfig.tasks?.[0] ?? { name: "terminal-bench/selected-task" };
+  const rawTask = String(configuredTask.name ?? configuredTask.path ?? "selected-task")
+    .replaceAll("\\", "/");
+  const taskLeaf = rawTask.split("/").at(-1);
+  const taskName = `terminal-bench/${taskLeaf}`;
+  const jobDir = path.join(runDir, "harbor-jobs", `job-${attempt}`);
+  const trialDir = path.join(jobDir, `trial-${attempt}`);
+  const taskDir = path.join(runDir, "tasks", taskLeaf);
   await mkdir(taskDir, { recursive: true });
   await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
-    task_id: "terminal-bench/selected-task",
+    task_id: taskName,
     source_logs_dir: path.join(trialDir, "agent"),
     execution_backend: "sandbox:bwrap",
     ...(managedProvenance ? {
@@ -54,7 +60,8 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
     path.join(trialDir, "result.json"),
     `${JSON.stringify({
       trial_name: `trial-${attempt}`,
-      task_name: "terminal-bench/selected-task",
+      task_name: taskName,
+      task_id: { path: `tasks/${taskLeaf}` },
       verifier_result: { rewards: { reward: passed ? 1 : 0 } }
     })}\n`,
     "utf8"
@@ -70,9 +77,19 @@ async function writeAttemptArtifacts(configPath: string, attempt: number, passed
     })}\n`,
     "utf8"
   );
-  await writeFile(path.join(path.dirname(trialDir), "result.json"), `${JSON.stringify({
+  await writeFile(path.join(jobDir, "result.json"), `${JSON.stringify({
     n_total_trials: 1,
     stats: { n_completed_trials: 1, n_errored_trials: 0, n_retries: 0 }
+  })}\n`, "utf8");
+  await writeFile(path.join(jobDir, "lock.json"), `${JSON.stringify({
+    created_at: `2026-01-01T00:00:0${attempt}.000Z`,
+    n_concurrent_trials: jobConfig.n_concurrent_trials,
+    retry: jobConfig.retry,
+    trials: [{
+      task: { name: taskName },
+      timeout_multiplier: jobConfig.timeout_multiplier,
+      agent: jobConfig.agents[0]
+    }]
   })}\n`, "utf8");
 }
 
@@ -284,8 +301,93 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(result.report.score_mode).toBe("standard_benchmark");
       expect(harborRuns).toBe(1);
       const firstConfig = JSON.parse(await readFile(path.join(result.runDir, "resolved-job.config.json"), "utf8"));
+      expect(firstConfig).toMatchObject({
+        n_attempts: 1,
+        timeout_multiplier: 1,
+        retry: { max_retries: 0 }
+      });
       expect(Object.keys(firstConfig.agents[0].kwargs).some((key) => key.includes("feedback"))).toBe(false);
       await expect(readFile(path.join(result.runDir, "resolved-job.retry-1.config.json"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(result.runDir, { recursive: true, force: true });
+      if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;
+      else process.env.AGENT_CLI_TARBALL = previousTarball;
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  it("projects paired controls from ordered configs and job locks", async () => {
+    const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-paired-"));
+    const tarball = path.join(fixtureDir, "agent-cli-linux-x64.tgz");
+    const tasksFile = path.join(fixtureDir, "tasks.json");
+    const previousTarball = process.env.AGENT_CLI_TARBALL;
+    const revision = "e".repeat(40);
+    const sourceRevision = "f".repeat(40);
+    const sourceDiffSha256 = "a".repeat(64);
+    process.env.AGENT_CLI_TARBALL = tarball;
+    await writeFile(tarball, "paired archive", "utf8");
+    await writeFile(tasksFile, `${JSON.stringify([0, 1].map((index) => ({
+      path: `tasks/case-${index}`,
+      git_url: "https://example.test/tasks.git",
+      git_commit_id: revision,
+      source: "external-plan"
+    })))}\n`, "utf8");
+    let harborRuns = 0;
+    const result = await runTerminalBenchCli([
+      "--mode", "batch", "--tasks-file", tasksFile,
+      "--provider", "provider", "--model", "model", "--network", "full",
+      "--concurrency", "5", "--terminal-bench-revision", revision,
+      "--preregistration-sha256", "b".repeat(64)
+    ], {
+      repositorySourceIdentity: () => ({
+        revision: sourceRevision, dirty: true, dirtyDiffSha256: sourceDiffSha256
+      }),
+      agentCliArchiveSourceIdentity: () => ({ revision: sourceRevision, dirty: true }),
+      resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
+      packageAgentCli: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      packageHarborRuntime: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      cleanupHarborDockerResources: cleanDockerResources,
+      runProcess: async (_command: string, args: string[], options: Record<string, string | undefined>) => {
+        const response = { exitCode: 0, stdout: "", stderr: "" };
+        if (args[0] === "--version") response.stdout = "harbor 0.17.1";
+        else if (args[0] === "run" && args[1] === "--help") {
+          response.stdout = "--config --yes --task-id";
+        } else if (args.some((arg) => arg.endsWith("probe-harbor-timeouts.py"))) {
+          response.stdout = JSON.stringify({
+            resolved_tasks: [0, 1].map((index) => ({ name: `terminal-bench/case-${index}` })),
+            tasks: [750, 900].map((timeout, index) => ({
+              task_name: `terminal-bench/case-${index}`,
+              agent_timeout_sec: timeout,
+              verifier_timeout_sec: 60,
+              environment_build_timeout_sec: 60
+            }))
+          });
+        } else if (args[0] === "run" && args.includes("--config")) {
+          harborRuns += 1;
+          await writeAttemptArtifacts(args[args.indexOf("--config") + 1], harborRuns, true);
+        }
+        await writeRunnerLogs(options, response);
+        return response;
+      }
+    });
+    try {
+      expect(result.report.run_input_attestation).toMatchObject({ valid: true, issues: [] });
+      expect(result.report.paired_run_controls).toMatchObject({
+        agent: "sigma",
+        source_revision: sourceRevision,
+        source_dirty: true,
+        source_diff_sha256: sourceDiffSha256,
+        n_concurrent_trials: 5,
+        attempts_per_arm: 1,
+        retries: 0,
+        cohort_schedule: [
+          { order: 0, effective_solver_timeout_sec: 750 },
+          { order: 1, effective_solver_timeout_sec: 900 }
+        ]
+      });
+      expect(result.report.tasks.map((task: any) => task.pairing_key).sort()).toEqual([
+        "external-plan/case-0", "external-plan/case-1"
+      ]);
     } finally {
       await rm(result.runDir, { recursive: true, force: true });
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;

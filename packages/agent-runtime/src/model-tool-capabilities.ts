@@ -28,11 +28,36 @@ export function projectedToolCapabilities(
   };
 }
 
-export function budgetStageForCapacity(forecast: DeadlineForecast, capacity: number): BudgetStage {
-  const requested: BudgetStage = capacity <= 1 || forecast.stage === "stop"
+export function resourceBudgetStageForCapacity(
+  forecast: DeadlineForecast,
+  capacity: number
+): BudgetStage {
+  return monotonicBudgetStage(forecast, requestedResourceBudgetStage(forecast, capacity));
+}
+
+/** Pure stage forecast used while model/reviewer budgets converge. Latching is
+ * deferred until the selected context stage and its own quote agree. */
+export function requestedResourceBudgetStage(
+  forecast: DeadlineForecast,
+  capacity: number
+): BudgetStage {
+  return capacity <= 1 || forecast.stage === "stop"
     || forecast.remainingMs <= forecast.terminalProjectionThresholdMs ? "terminal"
-    : capacity === 2 || forecast.stage === "converge" || forecast.actionDebt >= 2
+    : capacity === 2 || forecast.stage === "converge"
       ? "converge"
       : "normal";
-  return monotonicBudgetStage(forecast, requested);
+}
+
+export function budgetStageForCapacity(forecast: DeadlineForecast, capacity: number): BudgetStage {
+  const resourceStage = resourceBudgetStageForCapacity(forecast, capacity);
+  if (resourceStage === "terminal" || forecast.actionDebt >= 3) return "terminal";
+  if (resourceStage === "converge" || forecast.actionDebt >= 2) return "converge";
+  return "normal";
+}
+
+export function requestedBudgetStage(forecast: DeadlineForecast, capacity: number): BudgetStage {
+  const resourceStage = requestedResourceBudgetStage(forecast, capacity);
+  if (resourceStage === "terminal" || forecast.actionDebt >= 3) return "terminal";
+  if (resourceStage === "converge" || forecast.actionDebt >= 2) return "converge";
+  return "normal";
 }

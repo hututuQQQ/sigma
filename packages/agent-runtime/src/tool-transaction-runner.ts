@@ -16,18 +16,14 @@ import { mutatingPlan, planAllowsMutation, turnPayload, type ToolAttempt } from 
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profileAllowsTool } from "./profile-policy.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
-import {
-  assertCheckpointActionAllowed,
-  assertReceiptWithinPlan,
-  validationScope
-} from "./tool-plan-enforcement.js";
+import { assertCheckpointActionAllowed, assertReceiptWithinPlan, validationScope } from "./tool-plan-enforcement.js";
 import type { ToolExecutionMonitor } from "./tool-execution-monitor.js";
 import type { RuntimeSession } from "./types.js";
 import { WorkspaceMutationLease } from "./workspace-mutation-lease.js";
 import { recordLostProcess, recordProcessReceipt } from "./process-lifecycle.js";
 import { ToolApprovalCoordinator } from "./tool-approval-coordinator.js";
 import { settleEligibleToolBudgets } from "./mutation-budget.js";
-import { completionRepairPhase, descriptorAllowedForRepair, effectsAllowedForRepair } from "./tool-turn-policy.js";
+import { completionRepairPhase, descriptorAllowedForRepair, effectsAllowedForRepair, internalToolForRepair } from "./tool-turn-policy.js";
 import { failedExternalInputReceipt } from "./failed-input-evidence.js";
 import {
   createMutationCheckpoint,
@@ -42,7 +38,9 @@ import type { PreparedTool, TransactionState } from "./tool-transaction-types.js
 import {
   executionCapabilityRetryFailure,
   modelToolArgumentFailure,
-  modelToolCallContractFailure
+  modelToolCallContractFailure,
+  modelTurnToolPlanPolicyFailure,
+  modelTurnToolPolicyFailure
 } from "./model-tool-availability.js";
 import { prepareRuntimeToolPlan } from "./runtime-tool-plan.js";
 export class ToolTransactionRunner {
@@ -91,18 +89,19 @@ export class ToolTransactionRunner {
     const { call, modelTurn } = attempt;
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
     if (!descriptor) return failed(call, startedAt, `Unknown tool '${call.name}'.`, "unknown_tool");
+    const turnPolicyFailure = modelTurnToolPolicyFailure(
+      session, call, descriptor, modelTurn, startedAt
+    );
+    if (turnPolicyFailure) return turnPolicyFailure;
     const capabilityFailure = executionCapabilityRetryFailure(session, call, descriptor, startedAt);
     if (capabilityFailure) return capabilityFailure;
-    await this.options.emit(session, "tool.requested", "runtime", {
-      callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
-    });
     const contractFailure = modelToolCallContractFailure(session, call, descriptor, startedAt);
     if (contractFailure) return contractFailure;
     if (!isToolAllowed(descriptor, session.durable.mode)) {
       return failed(call, startedAt, `Tool '${call.name}' is not allowed in ${session.durable.mode} mode.`, "mode_denied");
     }
     const repairPhase = completionRepairPhase(session);
-    const phaseInternal = repairPhase === "no_change_confirmation" && call.name === "confirm_no_change";
+    const phaseInternal = internalToolForRepair(call.name, repairPhase);
     if (!phaseInternal && !profileAllowsTool(session, descriptor)) {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
@@ -129,6 +128,7 @@ export class ToolTransactionRunner {
       if (argumentFailure) return argumentFailure;
       throw error;
     }
+    const planPolicyFailure = modelTurnToolPlanPolicyFailure(session, call, plan, modelTurn, startedAt);
     if (!effectsAllowedForRepair(plan.exactEffects, repairPhase)) {
       return failed(
         call,
@@ -137,6 +137,10 @@ export class ToolTransactionRunner {
         "tool_unavailable_for_repair"
       );
     }
+    if (planPolicyFailure) return planPolicyFailure;
+    await this.options.emit(session, "tool.requested", "runtime", {
+      callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
+    });
     const selectedValidationScope = validationScope(session, call, plan);
     await this.options.emit(session, "execution.planned", "runtime", {
       executionId: call.id, toolCallId: call.id, plan
@@ -184,7 +188,7 @@ export class ToolTransactionRunner {
     call: ModelToolCall,
     descriptor: ToolDescriptor,
     startedAt: string,
-    signal: AbortSignal
+    _signal: AbortSignal
   ): Promise<ToolReceipt | undefined> {
     if (!descriptor.possibleEffects.includes("outcome.propose")) return undefined;
     const pending = session.durable.state.plan.nodes.filter((node) =>
@@ -210,14 +214,10 @@ export class ToolTransactionRunner {
       });
     }
     const completed = completionPlan(session);
-    if (completed) {
-      const previousRevision = session.durable.state.plan.revision;
-      await this.options.emit(session, "plan.updated", "runtime", { previousRevision, plan: completed });
-      await this.options.hooks.dispatch(session, "plan_changed", {
-        previousRevision, plan: completed, source: "completion"
-      }, signal);
-    }
-    return completionPlanError(session, call, startedAt) ?? undefined;
+    // Completion is only a proposal here. The effect runner closes the plan
+    // after candidate-bound review has completed, so rejected review leaves an
+    // editable in-progress root node.
+    return completed ? undefined : completionPlanError(session, call, startedAt) ?? undefined;
   }
 
   private async executePrepared(

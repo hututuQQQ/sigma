@@ -5,8 +5,12 @@ use crate::output_artifact::{
 };
 use crate::platform::PlatformGuard;
 use crate::protocol::RpcError;
+use crate::repository_lease::{AcquireRepositoryMetadataLeaseParams, RepositoryMetadataLeases};
 use crate::sandbox::{
     ProcessLifecycle, ProcessParams, ProtectedPathGuard, SandboxMode, build_command,
+};
+use crate::scratch::{
+    AcquireScratchLeaseParams, ReleaseScratchLeaseParams, ScratchLease, ScratchLeases,
 };
 use serde::Deserialize;
 use serde_json::{Value, json, to_value};
@@ -80,6 +84,8 @@ struct ManagedProcess {
     output_artifacts: Vec<OutputArtifactMetadata>,
     launch_failure_nonce: Option<String>,
     protected_path_guards: Vec<ProtectedPathGuard>,
+    _scratch_lease: Arc<ScratchLease>,
+    _disposable_workspace: Option<crate::scratch::DisposableWorkspace>,
     _guard: PlatformGuard,
 }
 
@@ -94,6 +100,8 @@ pub struct BrokerState {
     artifact_root: PathBuf,
     artifacts: Mutex<HashMap<String, PathBuf>>,
     redaction: Mutex<RedactionConfig>,
+    scratch: ScratchLeases,
+    repository_metadata_leases: RepositoryMetadataLeases,
 }
 
 impl BrokerState {
@@ -113,6 +121,8 @@ impl BrokerState {
             artifact_root,
             artifacts: Mutex::new(HashMap::new()),
             redaction: Mutex::new(RedactionConfig::default()),
+            scratch: ScratchLeases::default(),
+            repository_metadata_leases: RepositoryMetadataLeases::default(),
         }
     }
 
@@ -153,6 +163,29 @@ impl BrokerState {
     pub fn prepare_artifact_root(&self) -> Result<(), RpcError> {
         prepare_artifact_root(&self.artifact_root)
             .map_err(|error| RpcError::new("sandbox_unavailable", error.to_string()))
+    }
+
+    pub fn acquire_scratch_lease(
+        &self,
+        params: AcquireScratchLeaseParams,
+    ) -> Result<Value, RpcError> {
+        to_value(self.scratch.acquire(&self.instance_id, params)?)
+            .map_err(|error| RpcError::new("broker_protocol_error", error.to_string()))
+    }
+
+    pub fn release_scratch_lease(
+        &self,
+        params: ReleaseScratchLeaseParams,
+    ) -> Result<Value, RpcError> {
+        Ok(json!({ "released": self.scratch.release(params)? }))
+    }
+
+    pub fn acquire_repository_metadata_lease(
+        &self,
+        params: AcquireRepositoryMetadataLeaseParams,
+    ) -> Result<Value, RpcError> {
+        to_value(self.repository_metadata_leases.acquire(params)?)
+            .map_err(|error| RpcError::new("broker_protocol_error", error.to_string()))
     }
 
     pub fn configure_redaction(&self, secrets: Vec<RedactionSecret>) -> Result<(), RpcError> {
@@ -387,19 +420,62 @@ impl BrokerState {
             artifacts.clear();
         }
         cleanup_artifact_root(&self.artifact_root);
+        self.scratch.clear();
     }
 
     fn spawn_managed(
         &self,
-        params: ProcessParams,
+        mut params: ProcessParams,
         close_stdin: bool,
     ) -> Result<(String, Arc<Mutex<ManagedProcess>>), RpcError> {
+        // These fields cross the launcher bootstrap for convenience, but are
+        // broker-issued only. A process request can never populate them.
+        params.policy.session_scratch_roots.clear();
+        params.policy.disposable_workspace_authorized_root = None;
+        let scratch = self.scratch.resolve(
+            &self.instance_id,
+            params.policy.scratch_lease_id.take(),
+            params.policy.scratch_session_id.take(),
+        )?;
+        self.repository_metadata_leases.consume(&mut params)?;
+        #[cfg(windows)]
+        {
+            // Windows has no passwd database. Bind the same broker-session
+            // scratch semantics through the AppContainer ACL lease instead.
+            let home = scratch.home_source().to_owned();
+            let temp = scratch.temp_source().to_owned();
+            params
+                .policy
+                .read_roots
+                .extend([home.clone(), temp.clone()]);
+            params
+                .policy
+                .write_roots
+                .extend([home.clone(), temp.clone()]);
+            params.policy.session_scratch_roots = vec![home.clone(), temp.clone()];
+            for (key, value) in [
+                ("HOME", home.clone()),
+                ("USERPROFILE", home.clone()),
+                ("TMPDIR", temp.clone()),
+                ("TMP", temp.clone()),
+                ("TEMP", temp.clone()),
+                ("XDG_CACHE_HOME", home.join(".cache")),
+                ("XDG_CONFIG_HOME", home.join(".config")),
+                ("XDG_DATA_HOME", home.join(".local/share")),
+                ("XDG_STATE_HOME", home.join(".local/state")),
+            ] {
+                params
+                    .command
+                    .env
+                    .insert(key.into(), value.to_string_lossy().into_owned());
+            }
+        }
         let maximum = params.max_output_bytes;
         let lifecycle = params.lifecycle.clone();
         let deliverable = lifecycle == ProcessLifecycle::Deliverable;
         let initial_input = params.command.stdin.clone();
         let recover_sandbox = params.policy.sandbox == SandboxMode::Required;
-        let mut prepared = build_command(&params, self.allow_unsafe)?;
+        let mut prepared = build_command(&params, self.allow_unsafe, Some(scratch.as_ref()))?;
         let launch_failure_nonce = prepared.launch_failure_nonce.take();
         let handle = format!(
             "{}-{}",
@@ -487,6 +563,8 @@ impl BrokerState {
             output_artifacts: Vec::new(),
             launch_failure_nonce,
             protected_path_guards: prepared.protected_path_guards,
+            _scratch_lease: scratch,
+            _disposable_workspace: prepared.disposable_workspace,
             _guard: guard,
         }));
         self.processes
@@ -832,6 +910,14 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::<PathBuf>::new(),
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                repository_metadata_lease_id: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                repository_metadata_roots: Vec::new(),
+                session_scratch_roots: Vec::new(),
+                disposable_workspace_authorized_root: None,
                 #[cfg(test)]
                 unsafe_host_exec_approved: true,
             },

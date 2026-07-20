@@ -13,6 +13,7 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
+  semanticActionDebt,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import {
@@ -67,8 +68,21 @@ function settleModel(
   state: KernelState,
   payload: Record<string, JsonValue>
 ): KernelState {
-  if (!state.activeModelTurn) throw new Error("Property model turn is not active.");
-  return apply(state, "model.completed", { ...payload, ...state.activeModelTurn });
+  let current = state;
+  if (current.activeModelTurn?.toolPolicy === undefined) {
+    const calls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
+    const allowedToolNames = [...new Set(calls.flatMap((call) =>
+      call && typeof call === "object" && !Array.isArray(call) && typeof call.name === "string"
+        ? [call.name] : []))];
+    current = apply(current, "diagnostic", {
+      kind: "model.tool_policy",
+      ...current.activeModelTurn!,
+      allowedToolNames,
+      terminalOnly: false
+    });
+  }
+  if (!current.activeModelTurn) throw new Error("Property model turn is not active.");
+  return apply(current, "model.completed", { ...payload, ...current.activeModelTurn });
 }
 
 function evidence(): EvidenceRecord {
@@ -115,6 +129,89 @@ function descriptor(
 }
 
 describe("terminal convergence properties", () => {
+  it("preserves focused-action debt across checkpoint and completion-repair protocol events", () => {
+    fc.assert(fc.property(nonBlankText, (missingPath) => {
+      const completedRead = (input: KernelState, turnId: number, callId: string, path: string): KernelState => {
+        let state = settleModel(startModel(input, turnId), {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: callId, name: "read", arguments: { path } }]
+          },
+          toolCalls: [{ id: callId, name: "read", arguments: { path } }],
+          finishReason: "tool_calls"
+        });
+        const pending = state.pendingTools[0]!;
+        state = apply(state, "tool.completed", {
+          callId,
+          ...pending.modelTurn,
+          ok: true,
+          output: "unchanged",
+          observedEffects: ["filesystem.read"],
+          actualEffects: ["filesystem.read"],
+          artifacts: [],
+          diagnostics: [],
+          startedAt: NOW,
+          completedAt: NOW
+        });
+        return state;
+      };
+
+      let state = apply(initial(), "user.message", { text: "finish without looping" });
+      state = completedRead(state, 1, "read-one", "one.txt");
+      state = completedRead(state, 2, "read-two", "two.txt");
+      expect(semanticActionDebt(state)).toBe(2);
+
+      state = settleModel(startModel(state, 3), {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "focused-finalize", name: "runtime_finalize", arguments: { summary: "done" } }]
+        },
+        toolCalls: [{ id: "focused-finalize", name: "runtime_finalize", arguments: { summary: "done" } }],
+        finishReason: "tool_calls"
+      });
+      state = apply(state, "checkpoint.created", {
+        checkpointId: "focused-checkpoint",
+        sessionId: state.sessionId,
+        runId: state.runId,
+        status: "open",
+        createdAt: NOW,
+        preManifestDigest: "a".repeat(64)
+      });
+      expect(semanticActionDebt(state)).toBe(2);
+
+      const pending = state.pendingTools[0]!;
+      state = apply(state, "tool.failed", {
+        callId: "focused-finalize",
+        ...pending.modelTurn,
+        ok: false,
+        output: "Completion requires validation.",
+        result: {
+          status: "rejected",
+          code: "validation_evidence_required",
+          missingClaims: ["unit"],
+          missingPaths: [missingPath]
+        },
+        outcome: {
+          status: "failed",
+          output: "Completion requires validation.",
+          diagnosticCodes: ["validation_evidence_required"]
+        },
+        observedEffects: ["outcome.propose"],
+        actualEffects: ["outcome.propose"],
+        artifacts: [],
+        diagnostics: ["validation_evidence_required"],
+        startedAt: NOW,
+        completedAt: NOW
+      });
+
+      expect(state.completionRepair?.kind).toBe("completion_prerequisite");
+      expect(semanticActionDebt(state)).toBeGreaterThanOrEqual(3);
+      assertKernelInvariants(state);
+    }));
+  });
+
   it("keeps every normal tool available during terminal correction", () => {
     const effects = fc.uniqueArray(fc.constantFrom<ToolEffect>(
       "outcome.propose",

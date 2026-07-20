@@ -58,3 +58,20 @@ export async function terminateRunProcesses(
   }
   return emitted;
 }
+
+export async function settleRunProcessesAndScratch(
+  session: RuntimeSession,
+  outcome: RunOutcome,
+  execution: ProcessExecutionPort | undefined,
+  emit: RuntimeEventEmitter
+): Promise<number> {
+  const emitted = await terminateRunProcesses(session, outcome, execution, emit);
+  // Scratch belongs to the RuntimeSession, not an individual run. Completed,
+  // failed, and blocked runs may all be followed up in the same session.
+  // Cancellation is the one run outcome that explicitly retires the lease;
+  // ordinary session destruction releases it through releaseSession.
+  if (outcome.kind === "cancelled") {
+    await execution?.releaseScratchLease?.(session.identity.sessionId);
+  }
+  return emitted;
+}

@@ -1,6 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, readFileSync } from "node:fs";
+import {
+  createWriteStream, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync
+} from "node:fs";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { finished } from "node:stream/promises";
@@ -51,13 +53,42 @@ export function repositorySourceIdentity(directory = rootDir) {
   const revision = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: directory, encoding: "utf8", windowsHide: true
   });
-  const status = spawnSync("git", ["status", "--porcelain", "--untracked-files=normal"], {
+  const status = spawnSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
     cwd: directory, encoding: "utf8", windowsHide: true
   });
+  const trackedDiff = spawnSync("git", ["diff", "--binary", "HEAD", "--"], {
+    cwd: directory, encoding: "buffer", windowsHide: true,
+    maxBuffer: 128 * 1024 * 1024
+  });
+  const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd: directory, encoding: "buffer", windowsHide: true,
+    maxBuffer: 32 * 1024 * 1024
+  });
+  let dirtyDiffSha256 = null;
+  if (trackedDiff.status === 0 && untracked.status === 0) {
+    const records = untracked.stdout.toString("utf8").split("\0").filter(Boolean)
+      .sort().map((name) => {
+        const target = path.resolve(directory, name);
+        const relative = path.relative(path.resolve(directory), target);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+          throw new Error("Git reported an unsafe untracked path while measuring source identity.");
+        }
+        const metadata = lstatSync(target);
+        const bytes = metadata.isSymbolicLink()
+          ? Buffer.from(readlinkSync(target), "utf8") : readFileSync(target);
+        return [name.replaceAll("\\", "/"), metadata.isSymbolicLink() ? "link" : "file",
+          createHash("sha256").update(bytes).digest("hex")];
+      });
+    dirtyDiffSha256 = createHash("sha256").update(canonicalControl({
+      trackedDiffSha256: createHash("sha256").update(trackedDiff.stdout).digest("hex"),
+      untracked: records
+    })).digest("hex");
+  }
   return {
     revision: revision.status === 0 && /^[a-f0-9]{40}$/u.test(revision.stdout.trim())
       ? revision.stdout.trim() : null,
-    dirty: status.status === 0 ? status.stdout.trim().length > 0 : null
+    dirty: status.status === 0 ? status.stdout.trim().length > 0 : null,
+    dirtyDiffSha256
   };
 }
 
@@ -335,6 +366,13 @@ function normalizedGitRevision(value, name) {
   return text;
 }
 
+function normalizedBoolean(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error(`${name} must be true or false.`);
+}
+
 function validateTaskRecord(value, index) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`tasks-file[${index}] must be an object.`);
@@ -392,6 +430,15 @@ export function resolveRunOptions(argv, env = process.env) {
   const expectedSourceRevision = normalizedGitRevision(
     flags["expected-source-revision"], "--expected-source-revision"
   );
+  const expectedSourceDirty = normalizedBoolean(
+    flags["expected-source-dirty"], "--expected-source-dirty"
+  );
+  const expectedSourceDiffSha256 = normalizedSha256(
+    flags["expected-source-diff-sha256"], "--expected-source-diff-sha256"
+  );
+  if (expectedSourceDiffSha256 && expectedSourceDirty === null) {
+    throw new Error("--expected-source-diff-sha256 requires --expected-source-dirty.");
+  }
   const terminalBenchRevision = normalizedGitRevision(
     flags["terminal-bench-revision"], "--terminal-bench-revision"
   );
@@ -430,6 +477,11 @@ export function resolveRunOptions(argv, env = process.env) {
   }
 
   const runClass = benchmarkClass(flags["benchmark-class"] ?? env.SIGMA_BENCHMARK_CLASS);
+  const attemptsPerArm = asPositiveInt(flags["attempts-per-arm"], 1, "--attempts-per-arm");
+  const retries = asNonNegativeInt(flags.retries, 0, "--retries");
+  if (attemptsPerArm !== 1 || retries !== 0) {
+    throw new Error("Formal benchmark runs require --attempts-per-arm 1 and --retries 0.");
+  }
   const requestedLeniencyMultiplier = flags["timeout-leniency-multiplier"]
     ?? env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER;
   const requestedLeniencyExtra = flags["timeout-leniency-min-extra-sec"]
@@ -467,10 +519,14 @@ export function resolveRunOptions(argv, env = process.env) {
     reusePackage: flags["reuse-package"] === true,
     expectedArchiveSha256,
     expectedSourceRevision,
+    expectedSourceDirty,
+    expectedSourceDiffSha256,
     terminalBenchRevision,
     preregistrationSha256,
     validationManifest,
     validationManifestSha256: expectedValidationManifestSha256,
+    attemptsPerArm,
+    retries,
     maxTurns: asPositiveInt(env.AGENT_MAX_TURNS, 200, "AGENT_MAX_TURNS"),
     maxTurnsExplicit: env.AGENT_MAX_TURNS !== undefined && env.AGENT_MAX_TURNS !== null && env.AGENT_MAX_TURNS !== "",
     commandTimeoutSec: asPositiveInt(env.AGENT_COMMAND_TIMEOUT_SEC, 180, "AGENT_COMMAND_TIMEOUT_SEC"),
@@ -616,26 +672,26 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
   const cleanupGraceSec = graceSec;
-  const standardAgentWallTimeSec = Math.max(1, Math.floor(recommendedAgentTimeoutSec - cleanupGraceSec));
+  const standardAgentWallTimeSec = Math.max(1, Math.floor(recommendedAgentTimeoutSec));
   const agentWallTimeSec = runClass === "standard"
     ? standardAgentWallTimeSec
     : Math.ceil(requestedWallTimeSec ?? lenientAgentWallTimeSec);
   const harnessTimeoutSec = agentWallTimeSec + cleanupGraceSec;
-  const agentTimeoutMultiplier = runClass === "diagnostic" &&
-    harnessTimeoutSec > recommendedAgentTimeoutSec
-      ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
-      : null;
+  // Harbor owns the outer cancellation boundary. Give it a separate cleanup
+  // window while Sigma receives the complete solver budget below.
+  const agentTimeoutMultiplier = harnessTimeoutSec > recommendedAgentTimeoutSec
+    ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
+    : null;
   const timeoutTasks = Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [];
   const taskAgentTimeouts = timeoutTasks
     .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec));
   const knownTaskAgentTimeouts = taskAgentTimeouts.filter((value) => value !== null);
-  const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
   const allTaskTimeoutsAvailable = timeoutTasks.length > 0
     && knownTaskAgentTimeouts.length === timeoutTasks.length;
   const uniformTaskTimeout = allTaskTimeoutsAvailable
     && knownTaskAgentTimeouts.every((value) => value === knownTaskAgentTimeouts[0]);
   const outerTrialDeadlineSec = uniformTaskTimeout
-    ? knownTaskAgentTimeouts[0] * appliedAgentTimeoutMultiplier
+    ? agentWallTimeSec
     : null;
   const outerTrialDeadlineScope = uniformTaskTimeout
     ? "uniform_task_timeout"
@@ -644,7 +700,7 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
       : "unavailable";
   const safeChildDeadlineSec = outerTrialDeadlineSec === null
     ? agentWallTimeSec
-    : Math.max(1, Math.floor(outerTrialDeadlineSec - cleanupGraceSec));
+    : Math.max(1, Math.floor(outerTrialDeadlineSec));
   const effectiveAgentWallTimeSec = Math.min(agentWallTimeSec, safeChildDeadlineSec);
 
   return {
@@ -670,6 +726,7 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     verifier_timeout_multiplier: runClass === "diagnostic" ? agentTimeoutMultiplier : null,
     environment_build_timeout_multiplier: runClass === "diagnostic" ? agentTimeoutMultiplier : null,
     benchmark_class: runClass,
+    policy: "solver_full_task_timeout_separate_cleanup_grace",
     source: runClass === "standard" ? "standard_task_timeout"
       : requestedWallTimeSec ? "explicit_max_wall_time" : timeoutProbe ? "harbor_task_metadata" : "fallback"
   };
@@ -702,8 +759,7 @@ function selectedTaskRecords(timeoutProbe) {
 
 function harborTaskRecord(task) {
   if (!task || typeof task !== "object") return task;
-  const { source: _controlPlaneSource, ...record } = task;
-  return record;
+  return { ...task };
 }
 
 function benchmarkAgentKwargs(options, timeoutPlan = null) {
@@ -744,7 +800,10 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
 
   const config = {
     jobs_dir: jobsDir,
+    n_attempts: options.attemptsPerArm ?? 1,
+    timeout_multiplier: 1,
     n_concurrent_trials: options.nConcurrentTrials ?? defaultConcurrentTrials,
+    retry: { max_retries: options.retries ?? 0 },
     agents: [
       {
         name: agentName,
@@ -1582,7 +1641,7 @@ async function listNamedFiles(dir, fileName) {
   return files;
 }
 
-function summarizeTraceEvents(events) {
+export function summarizeTraceEvents(events) {
   const summary = {
     status: undefined,
     finish_reason: undefined,
@@ -1594,6 +1653,10 @@ function summarizeTraceEvents(events) {
     cache_read_tokens: 0,
     length_finish_count: 0,
     converge_turns: 0,
+    deadline_converge_turns: 0,
+    budget_converge_turns: 0,
+    terminal_budget_turns: 0,
+    manual_stop_count: 0,
     cost_usd: null,
     duration_ms: 0,
     suspension_to_exit_ms: null,
@@ -1626,7 +1689,14 @@ function summarizeTraceEvents(events) {
     }
     if (event?.type === "diagnostic") {
       const payload = metadata.payload ?? metadata;
-      if (payload.kind === "deadline.stage" && payload.stage === "converge") summary.converge_turns += 1;
+      if (payload.kind === "deadline.stage") {
+        const deadlineConverge = payload.stage === "converge";
+        const budgetConverge = payload.budgetStage === "converge";
+        summary.deadline_converge_turns += Number(deadlineConverge);
+        summary.budget_converge_turns += Number(budgetConverge);
+        summary.terminal_budget_turns += Number(payload.budgetStage === "terminal");
+        summary.converge_turns += Number(deadlineConverge || budgetConverge);
+      }
     }
     if (event?.type === "tool_end" && metadata.toolName === "bash") {
       summary.commands_executed += 1;
@@ -1650,6 +1720,16 @@ function summarizeTraceEvents(events) {
       );
       summary.length_finish_count = Number(result.length_finish_count ?? summary.length_finish_count);
       summary.converge_turns = Number(result.converge_turns ?? summary.converge_turns);
+      summary.deadline_converge_turns = Number(
+        result.deadline_converge_turns ?? summary.deadline_converge_turns
+      );
+      summary.budget_converge_turns = Number(
+        result.budget_converge_turns ?? summary.budget_converge_turns
+      );
+      summary.terminal_budget_turns = Number(
+        result.terminal_budget_turns ?? summary.terminal_budget_turns
+      );
+      summary.manual_stop_count = Number(result.manual_stop_count ?? summary.manual_stop_count);
       const resultCost = Number(result.usage?.costUsd ?? result.cost_usd ?? summary.cost_usd);
       summary.cost_usd = Number.isFinite(resultCost) ? resultCost : summary.cost_usd;
       summary.duration_ms = Number(result.durationMs ?? result.duration_ms ?? summary.duration_ms);
@@ -1840,8 +1920,15 @@ async function resolvedJobConfigForReport(runDir, config) {
       return existsSync(filePath) ? await readJsonSafe(filePath) : null;
     }));
     const available = records.filter(Boolean);
+    const uniform = (selector) => {
+      const values = [...new Set(available.map(selector).map((value) => JSON.stringify(value)))];
+      return values.length === 1 ? JSON.parse(values[0]) : null;
+    };
     return {
       n_concurrent_trials: config.n_concurrent_trials,
+      n_attempts: uniform((record) => record.n_attempts),
+      timeout_multiplier: uniform((record) => record.timeout_multiplier),
+      retry: uniform((record) => record.retry),
       tasks: available.flatMap((record) => Array.isArray(record.tasks) ? record.tasks : []),
       datasets: available.flatMap((record) => Array.isArray(record.datasets) ? record.datasets : [])
     };
@@ -1851,6 +1938,156 @@ async function resolvedJobConfigForReport(runDir, config) {
     : "resolved-job.config.json";
   const filePath = path.isAbsolute(configured) ? configured : path.join(runDir, configured);
   return existsSync(filePath) ? await readJsonSafe(filePath) : null;
+}
+
+export async function benchmarkRunInputAttestation(runDir, config) {
+  const configured = Array.isArray(config.resolved_job_config_paths)
+    ? config.resolved_job_config_paths
+    : typeof config.resolved_job_config_path === "string" ? [config.resolved_job_config_path] : [];
+  const declared = Array.isArray(config.paired_run_controls?.input_config_sha256s)
+    ? config.paired_run_controls.input_config_sha256s : [];
+  const issues = [];
+  const configSha256s = [];
+  const schedule = Array.isArray(config.paired_run_controls?.cohort_schedule)
+    ? config.paired_run_controls.cohort_schedule : [];
+  const expectedModel = config.model?.includes("/")
+    ? config.model : config.model ? `${config.provider}/${config.model}` : null;
+  let executionSubjectPath = null;
+  let executionSubjectSha256 = null;
+  if (config.paired_run_controls) {
+    try {
+      executionSubjectPath = realpathSync(path.resolve(config.agent_cli_tarball));
+      executionSubjectSha256 = createHash("sha256")
+        .update(readFileSync(executionSubjectPath)).digest("hex");
+      if (executionSubjectSha256 !== config.agent_cli_sha256) {
+        issues.push("execution_subject_digest_mismatch");
+      }
+    } catch {
+      issues.push("execution_subject_missing");
+    }
+  }
+  const agentSubjectMatches = (agent) => {
+    if (!executionSubjectPath) return false;
+    const configuredPath = agent?.kwargs?.agent_cli_tarball;
+    if (typeof configuredPath !== "string" || configuredPath.length === 0) return false;
+    try {
+      return realpathSync(path.resolve(configuredPath)) === executionSubjectPath;
+    } catch {
+      return false;
+    }
+  };
+  const expectedTaskLeaves = (cohort) => Array.isArray(cohort?.task_keys)
+    ? cohort.task_keys.map(normalizedTaskKey).sort() : [];
+  for (let index = 0; index < configured.length; index += 1) {
+    const target = path.isAbsolute(configured[index]) ? configured[index] : path.join(runDir, configured[index]);
+    if (!existsSync(target)) {
+      issues.push("input_config_missing");
+      continue;
+    }
+    try {
+      const bytes = await readFile(target);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      configSha256s.push({ order: index, sha256 });
+      const record = JSON.parse(bytes.toString("utf8"));
+      if (record.n_attempts !== 1) issues.push("input_attempts_not_one");
+      if (record.retry?.max_retries !== 0) issues.push("input_retries_not_zero");
+      if (record.timeout_multiplier !== 1) issues.push("input_timeout_multiplier_not_one");
+      if (record.n_concurrent_trials !== config.n_concurrent_trials) {
+        issues.push("input_concurrency_mismatch");
+      }
+      const agent = Array.isArray(record.agents) && record.agents.length === 1
+        ? record.agents[0] : null;
+      const model = agent?.kwargs?.model?.includes("/")
+        ? agent.kwargs.model
+        : agent?.kwargs?.model ? `${agent.kwargs.provider}/${agent.kwargs.model}` : null;
+      if (model !== expectedModel) issues.push("input_model_mismatch");
+      if (config.paired_run_controls && !agentSubjectMatches(agent)) {
+        issues.push("input_execution_subject_mismatch");
+      }
+      if (agent?.kwargs?.network_mode !== config.network_mode) {
+        issues.push("input_network_mismatch");
+      }
+      const cohort = schedule[index];
+      const actualLeaves = (Array.isArray(record.tasks) ? record.tasks : [])
+        .map(pairedRunTaskKey).map(normalizedTaskKey).sort();
+      if (!cohort || JSON.stringify(actualLeaves) !== JSON.stringify(expectedTaskLeaves(cohort))) {
+        issues.push("input_cohort_membership_mismatch");
+      }
+      if (Number(agent?.kwargs?.max_wall_time_sec)
+        !== Number(cohort?.effective_solver_timeout_sec)) {
+        issues.push("input_solver_timeout_mismatch");
+      }
+    } catch {
+      issues.push("input_config_invalid");
+    }
+  }
+  if (JSON.stringify(configSha256s) !== JSON.stringify(declared)) {
+    issues.push("input_config_digest_mismatch");
+  }
+  const lockFiles = (await listNamedFiles(path.join(runDir, "harbor-jobs"), "lock.json")).sort();
+  const lockSha256s = [];
+  const lockCohorts = [];
+  for (const filePath of lockFiles) {
+    try {
+      const bytes = await readFile(filePath);
+      const lock = JSON.parse(bytes.toString("utf8"));
+      // Harbor also writes a trial-level lock.json. Only the job-level lock
+      // contains the scheduler controls and the complete trial list.
+      if (!Array.isArray(lock.trials)) continue;
+      lockSha256s.push(createHash("sha256").update(bytes).digest("hex"));
+      if (lock.retry?.max_retries !== 0) issues.push("lock_retries_not_zero");
+      if (lock.n_concurrent_trials !== config.n_concurrent_trials) {
+        issues.push("lock_concurrency_mismatch");
+      }
+      if (lock.trials.length === 0
+        || lock.trials.some((trial) => trial.timeout_multiplier !== 1)) {
+        issues.push("lock_timeout_multiplier_not_one");
+      }
+      const lockLeaves = lock.trials.map((trial) => pairedRunTaskKey(trial?.task))
+        .map(normalizedTaskKey).sort();
+      const cohort = schedule.find((candidate) =>
+        JSON.stringify(expectedTaskLeaves(candidate)) === JSON.stringify(lockLeaves));
+      if (!cohort) {
+        issues.push("lock_cohort_membership_mismatch");
+      } else {
+        const createdAt = Date.parse(lock.created_at);
+        lockCohorts.push({ order: cohort.order, createdAt });
+        if (!Number.isFinite(createdAt)) issues.push("lock_cohort_order_mismatch");
+      }
+      if (cohort && lock.trials.some((trial) => {
+        const kwargs = trial?.agent?.kwargs;
+        const model = kwargs?.model?.includes("/")
+          ? kwargs.model : kwargs?.model ? `${kwargs.provider}/${kwargs.model}` : null;
+        return model !== expectedModel || kwargs?.network_mode !== config.network_mode
+          || Number(kwargs?.max_wall_time_sec) !== Number(cohort.effective_solver_timeout_sec);
+      })) {
+        issues.push("lock_agent_controls_mismatch");
+      }
+      if (config.paired_run_controls
+        && lock.trials.some((trial) => !agentSubjectMatches(trial?.agent))) {
+        issues.push("lock_execution_subject_mismatch");
+      }
+    } catch {
+      issues.push("lock_invalid");
+    }
+  }
+  if (configured.length > 0 && lockSha256s.length !== configured.length) {
+    issues.push("lock_count_mismatch");
+  }
+  const chronologicalCohorts = [...lockCohorts]
+    .sort((left, right) => left.createdAt - right.createdAt).map((item) => item.order);
+  if (JSON.stringify(chronologicalCohorts) !== JSON.stringify(schedule.map((item) => item.order))) {
+    issues.push("lock_cohort_order_mismatch");
+  }
+  return {
+    schemaVersion: 1,
+    executionSubjectKind: config.paired_run_controls ? "archive" : null,
+    executionSubjectSha256,
+    configSha256s,
+    lockSha256s: lockSha256s.sort(),
+    valid: issues.length === 0,
+    issues: [...new Set(issues)].sort()
+  };
 }
 
 function expectedTrialCount(config, resolvedJobConfig) {
@@ -1916,6 +2153,10 @@ function emptyTaskForTrial(trialResult, index) {
     reasoning_tokens: 0,
     length_finish_count: 0,
     converge_turns: 0,
+    deadline_converge_turns: 0,
+    budget_converge_turns: 0,
+    terminal_budget_turns: 0,
+    manual_stop_count: 0,
     cost_usd: null,
     duration_ms: 0,
     suspension_to_exit_ms: null,
@@ -2047,6 +2288,21 @@ function mergeHarborTrialResult(task, trialResult) {
       task.length_finish_count || traceSummary.length_finish_count || agentResult.length_finish_count || 0
     ),
     converge_turns: Number(task.converge_turns || traceSummary.converge_turns || agentResult.converge_turns || 0),
+    deadline_converge_turns: Number(
+      task.deadline_converge_turns || traceSummary.deadline_converge_turns
+      || agentResult.deadline_converge_turns || 0
+    ),
+    budget_converge_turns: Number(
+      task.budget_converge_turns || traceSummary.budget_converge_turns
+      || agentResult.budget_converge_turns || 0
+    ),
+    terminal_budget_turns: Number(
+      task.terminal_budget_turns || traceSummary.terminal_budget_turns
+      || agentResult.terminal_budget_turns || 0
+    ),
+    manual_stop_count: Number(
+      task.manual_stop_count || traceSummary.manual_stop_count || agentResult.manual_stop_count || 0
+    ),
     cost_usd: Number.isFinite(Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd))
       ? Number(agentResult.cost_usd ?? task.cost_usd ?? traceSummary.cost_usd)
       : null,
@@ -2056,6 +2312,10 @@ function mergeHarborTrialResult(task, trialResult) {
     terminal_origin: task.terminal_origin ?? traceSummary.terminal_origin ?? agentMetadata.terminal_origin ?? null,
     termination_source: task.termination_source ?? traceSummary.termination_source
       ?? agentMetadata.termination_source ?? null,
+    network_mode_requested: task.network_mode_requested
+      ?? agentMetadata.network_mode_requested ?? null,
+    network_mode_effective: task.network_mode_effective
+      ?? agentMetadata.network_mode_effective ?? null,
     execution_mode: task.execution_mode ?? traceSummary.execution_mode ?? agentMetadata.execution_mode ?? null,
     execution_backend: task.execution_backend ?? traceSummary.execution_backend
       ?? agentMetadata.execution_backend ?? agentMetadata.executionBackend ?? null,
@@ -2254,6 +2514,16 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     reasoning_tokens: Number(summary.reasoning_tokens ?? metadata.n_reasoning_tokens ?? 0),
     length_finish_count: Number(summary.length_finish_count ?? metadata.length_finish_count ?? 0),
     converge_turns: Number(summary.converge_turns ?? metadata.converge_turns ?? 0),
+    deadline_converge_turns: Number(
+      summary.deadline_converge_turns ?? metadata.deadline_converge_turns ?? 0
+    ),
+    budget_converge_turns: Number(
+      summary.budget_converge_turns ?? metadata.budget_converge_turns ?? 0
+    ),
+    terminal_budget_turns: Number(
+      summary.terminal_budget_turns ?? metadata.terminal_budget_turns ?? 0
+    ),
+    manual_stop_count: Number(summary.manual_stop_count ?? metadata.manual_stop_count ?? 0),
     cost_usd: Number.isFinite(Number(summary.cost_usd ?? metadata.cost_usd))
       ? Number(summary.cost_usd ?? metadata.cost_usd)
       : null,
@@ -2261,6 +2531,8 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     suspension_to_exit_ms: summary.suspension_to_exit_ms ?? metadata.suspension_to_exit_ms ?? null,
     terminal_origin: summary.terminal_origin ?? metadata.terminal_origin ?? null,
     termination_source: summary.termination_source ?? metadata.termination_source ?? null,
+    network_mode_requested: summary.network_mode_requested ?? metadata.network_mode_requested ?? null,
+    network_mode_effective: summary.network_mode_effective ?? metadata.network_mode_effective ?? null,
     execution_mode: summary.execution_mode ?? metadata.execution_mode ?? null,
     execution_backend: summary.execution_backend ?? metadata.execution_backend ?? null,
     container_engine: summary.container_engine ?? metadata.container_engine ?? null,
@@ -2324,6 +2596,10 @@ function syntheticRunTask(config, globalLogText) {
     reasoning_tokens: 0,
     length_finish_count: 0,
     converge_turns: 0,
+    deadline_converge_turns: 0,
+    budget_converge_turns: 0,
+    terminal_budget_turns: 0,
+    manual_stop_count: config.termination_source === "manual_stop" ? 1 : 0,
     cost_usd: null,
     duration_ms: 0,
     suspension_to_exit_ms: null,
@@ -2403,6 +2679,388 @@ function assertUniformReportIdentity(reports, key, label) {
       `Benchmark reports use different ${label} (${values.join(", ")}) and cannot be combined.`
     ), { code: `benchmark_${key}_mismatch` });
   }
+}
+
+function firstControlValue(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "") ?? null;
+}
+
+function canonicalControl(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalControl).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalControl(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function controlSha256(value) {
+  return createHash("sha256").update(canonicalControl(value)).digest("hex");
+}
+
+function pairedControlSource(record) {
+  const controls = record?.paired_run_controls;
+  return controls && typeof controls === "object" && !Array.isArray(controls) ? controls : record;
+}
+
+function pairedModelIdentity(record) {
+  const source = pairedControlSource(record);
+  const configuredAgent = Array.isArray(record?.agents) && record.agents.length === 1
+    ? record.agents[0] : null;
+  const explicit = firstControlValue(
+    source?.model_identity, source?.modelIdentity, source?.model_name, configuredAgent?.model_name
+  );
+  if (explicit) return String(explicit).trim();
+  const model = firstControlValue(source?.model, record?.model);
+  const provider = firstControlValue(source?.provider, record?.provider);
+  if (!model) return null;
+  const text = String(model).trim();
+  return provider && !text.includes("/") ? `${String(provider).trim()}/${text}` : text;
+}
+
+export function pairedRunTaskKey(task) {
+  const explicit = firstControlValue(task?.pairing_key, task?.pairingKey);
+  if (explicit) return String(explicit).trim().replaceAll("\\", "/");
+  const raw = firstControlValue(task?.task_id, task?.task_name, task?.name, task?.path);
+  if (!raw) return null;
+  let key = String(raw).trim().replaceAll("\\", "/").replace(/^\.\//u, "");
+  if (task?.path && key.startsWith("tasks/")) key = key.slice("tasks/".length);
+  const source = firstControlValue(task?.source);
+  return source && !key.includes("/") ? `${String(source).trim()}/${key}` : key;
+}
+
+function normalizedTaskPath(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return value.trim().replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/+$/u, "");
+}
+
+function normalizedTaskSource(task) {
+  const value = firstControlValue(
+    task?.source, task?.task_source, task?.taskSource
+  );
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return value.trim().replaceAll("\\", "/").replace(/\/+$/u, "");
+}
+
+/** Freeze the complete external pairing identity. The public pairing key is
+ * never used as a substitute for repository source, path, or revision. */
+export function pairedRunTaskIdentity(task) {
+  const pairingKey = pairedRunTaskKey(task);
+  const source = normalizedTaskSource(task);
+  const taskPath = normalizedTaskPath(firstControlValue(
+    task?.path, task?.task_path, task?.taskPath, task?.task_id?.path,
+    task?.config?.task?.path
+  ));
+  const revisionValue = firstControlValue(
+    task?.git_commit_id, task?.gitCommitId, task?.task_commit, task?.taskRevision,
+    task?.task_id?.git_commit_id, task?.config?.task?.git_commit_id
+  );
+  const revision = typeof revisionValue === "string" && revisionValue.trim().length > 0
+    ? revisionValue.trim().toLowerCase() : null;
+  if (!pairingKey || !source || !taskPath || !revision) return null;
+  const repository = normalizedTaskPath(firstControlValue(
+    task?.git_url, task?.gitUrl, task?.repository_url, task?.repositoryUrl,
+    task?.source_url, task?.sourceUrl
+  ));
+  return {
+    pairingKey, source, path: taskPath, revision,
+    ...(repository ? { repository } : {})
+  };
+}
+
+export function pairedRunTaskIdentitySha256(task) {
+  const explicit = firstControlValue(task?.task_identity_sha256, task?.taskIdentitySha256);
+  if (typeof explicit === "string" && /^[a-f0-9]{64}$/u.test(explicit)) return explicit;
+  const identity = pairedRunTaskIdentity(task);
+  return identity ? controlSha256(identity) : null;
+}
+
+function pairedTaskRecords(record) {
+  const source = pairedControlSource(record);
+  if (Array.isArray(source?.tasks)) return source.tasks;
+  return Array.isArray(record?.tasks) ? record.tasks : [];
+}
+
+/** Canonicalize an externally selected task set without exposing task content
+ * in the digest used by paired-run reports. */
+export function pairedRunTaskSetSnapshot(tasks) {
+  const records = Array.isArray(tasks) ? tasks : [];
+  const identities = records.map((task) => ({
+    key: pairedRunTaskKey(task),
+    digest: pairedRunTaskIdentitySha256(task)
+  })).sort((left, right) => String(left.key).localeCompare(String(right.key)));
+  const taskKeys = identities.map((item) => item.key).filter(Boolean);
+  const taskIdentitySha256s = identities.map((item) => item.digest).filter(Boolean);
+  const valid = taskKeys.length > 0 && taskKeys.length === records.length
+    && taskIdentitySha256s.length === records.length
+    && new Set(taskKeys).size === taskKeys.length
+    && new Set(taskIdentitySha256s).size === taskIdentitySha256s.length;
+  return {
+    valid,
+    taskCount: taskKeys.length,
+    taskSetSha256: valid ? controlSha256(identities) : null,
+    taskKeys,
+    taskIdentitySha256s
+  };
+}
+
+function finitePositive(value) {
+  if (typeof value === "boolean") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function safeIntegerControl(value) {
+  if (value === null || typeof value === "boolean") return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
+function pairedTaskTimeout(task, source) {
+  const explicit = firstControlValue(
+    task?.effective_solver_timeout_sec, task?.effectiveSolverTimeoutSec,
+    task?.solver_timeout_sec, task?.sigma_deadline_sec, task?.agent_timeout_sec
+  );
+  if (explicit !== null) return finitePositive(explicit);
+  const uniform = firstControlValue(
+    source?.effective_solver_timeout_sec, source?.effectiveSolverTimeoutSec,
+    source?.solver_timeout_sec
+  );
+  return finitePositive(uniform);
+}
+
+/** Produce a deterministic external-run cohort plan. Cohort order is explicit;
+ * callers may supply an ordered timeout list, while the default is ascending
+ * timeout. Task membership is derived only from generic task controls. */
+export function pairedRunCohortSchedule(tasks, orderedTimeouts = null) {
+  const records = Array.isArray(tasks) ? tasks : [];
+  const grouped = new Map();
+  for (const task of records) {
+    const key = pairedRunTaskKey(task);
+    const timeout = pairedTaskTimeout(task, {});
+    if (!key || timeout === null) throw new Error("Cohort tasks require a pairing key and effective solver timeout.");
+    const keys = grouped.get(timeout) ?? [];
+    keys.push(key);
+    grouped.set(timeout, keys);
+  }
+  const order = orderedTimeouts === null
+    ? [...grouped.keys()].sort((left, right) => left - right)
+    : [...orderedTimeouts];
+  if (order.length !== grouped.size || new Set(order).size !== order.length
+    || order.some((timeout) => !grouped.has(timeout))) {
+    throw new Error("Cohort timeout order must contain every observed timeout exactly once.");
+  }
+  return order.map((timeout, index) => ({
+    order: index,
+    effective_solver_timeout_sec: timeout,
+    task_keys: [...grouped.get(timeout)].sort()
+  }));
+}
+
+export function pairedRunCohortScheduleSha256(schedule) {
+  return controlSha256(schedule);
+}
+
+function pairedCohortScheduleSnapshot(source, taskKeys, issues) {
+  const schedule = firstControlValue(source?.cohort_schedule, source?.cohortSchedule);
+  const expectedDigest = firstControlValue(
+    source?.cohort_schedule_sha256, source?.cohortScheduleSha256
+  );
+  if (!Array.isArray(schedule) || schedule.length === 0) {
+    issues.push("cohort_schedule_missing_or_invalid");
+    return { schedule: null, digest: null };
+  }
+  const normalized = [];
+  const flattened = [];
+  for (let index = 0; index < schedule.length; index += 1) {
+    const cohort = schedule[index];
+    const order = safeIntegerControl(cohort?.order);
+    const timeout = finitePositive(firstControlValue(
+      cohort?.effective_solver_timeout_sec, cohort?.effectiveSolverTimeoutSec,
+      cohort?.solver_timeout_sec
+    ));
+    const rawKeys = firstControlValue(cohort?.task_keys, cohort?.taskKeys, cohort?.pairing_keys);
+    const keys = Array.isArray(rawKeys)
+      ? rawKeys.map((value) => String(value).trim().replaceAll("\\", "/")).filter(Boolean).sort()
+      : [];
+    if (order !== index || timeout === null || keys.length === 0 || new Set(keys).size !== keys.length) {
+      issues.push("cohort_schedule_missing_or_invalid");
+      return { schedule: null, digest: null };
+    }
+    normalized.push({ order, effective_solver_timeout_sec: timeout, task_keys: keys });
+    flattened.push(...keys);
+  }
+  if (new Set(flattened).size !== flattened.length
+    || JSON.stringify([...flattened].sort()) !== JSON.stringify([...taskKeys].sort())) {
+    issues.push("cohort_schedule_task_set_mismatch");
+  }
+  const digest = pairedRunCohortScheduleSha256(normalized);
+  if (expectedDigest !== digest) issues.push("cohort_schedule_digest_mismatch");
+  return { schedule: normalized, digest };
+}
+
+function uniformControlValue(values, issues, issue) {
+  if (values.length === 0 || values.some((value) => value === null)) {
+    issues.push(issue);
+    return null;
+  }
+  const present = [...new Set(values.filter((value) => value !== null))];
+  if (present.length !== 1) {
+    issues.push(issue);
+    return null;
+  }
+  return present[0];
+}
+
+/** Build a control-only snapshot for a paired run. This code deliberately
+ * ignores prompts, outputs, verifier details, and scores. Task identities are
+ * used only to prove that both externally selected sets are identical. */
+function pairedRunControlSnapshot(record) {
+  const source = pairedControlSource(record);
+  const tasks = pairedTaskRecords(record);
+  const issues = [];
+  const keyedTasks = tasks.map((task) => ({ task, key: pairedRunTaskKey(task) }));
+  const taskSet = pairedRunTaskSetSnapshot(tasks);
+  const taskKeys = taskSet.taskKeys;
+  if (!taskSet.valid) issues.push("task_set_invalid");
+  const topRevision = firstControlValue(
+    source?.task_revision, source?.taskRevision, source?.terminal_bench_revision,
+    source?.terminalBenchRevision, record?.terminal_bench_revision
+  );
+  const revisions = keyedTasks.map(({ task }) => firstControlValue(
+    task?.git_commit_id, task?.task_commit, task?.taskRevision, topRevision
+  )).map((value) => value === null ? null : String(value).trim().toLowerCase());
+  const revisionClaims = topRevision === null ? revisions
+    : [...revisions, String(topRevision).trim().toLowerCase()];
+  const taskRevision = uniformControlValue(
+    revisionClaims, issues, "task_revision_missing_or_mixed"
+  );
+  const topNetwork = firstControlValue(
+    source?.network_mode_effective, source?.networkModeEffective,
+    source?.network_mode, source?.networkMode, record?.network_mode
+  );
+  const networks = keyedTasks.map(({ task }) => firstControlValue(
+    task?.network_mode_effective, task?.networkModeEffective, task?.network_mode,
+    topNetwork
+  )).map((value) => value === null ? null : String(value));
+  const networkClaims = topNetwork === null ? networks : [...networks, String(topNetwork)];
+  const networkMode = uniformControlValue(
+    networkClaims, issues, "network_missing_or_mixed"
+  );
+  if (networkMode !== null && !["none", "loopback", "full"].includes(networkMode)) {
+    issues.push("network_invalid");
+  }
+  const timeoutEntries = keyedTasks.map(({ task, key }) => [key, pairedTaskTimeout(task, source)])
+    .sort(([left], [right]) => String(left).localeCompare(String(right)));
+  const uniformTimeout = finitePositive(firstControlValue(
+    source?.effective_solver_timeout_sec, source?.effectiveSolverTimeoutSec,
+    source?.solver_timeout_sec
+  ));
+  if (timeoutEntries.some(([key, timeout]) => !key || timeout === null)) {
+    issues.push("effective_solver_timeout_missing_or_invalid");
+  }
+  if (uniformTimeout !== null && timeoutEntries.some(([, timeout]) => timeout !== uniformTimeout)) {
+    issues.push("effective_solver_timeout_conflict");
+  }
+  const taskSetSha256 = taskSet.taskSetSha256;
+  const timeoutPlanSha256 = issues.some((issue) => issue.startsWith("effective_solver_timeout"))
+    ? null : controlSha256(timeoutEntries);
+  const retries = firstControlValue(
+    source?.retries, source?.retry_count, source?.retryCount,
+    record?.retries, record?.retry_count, record?.retryCount
+  );
+  const attempts = firstControlValue(
+    source?.attempts_per_arm, source?.attemptsPerArm, source?.n_attempts,
+    source?.attempts_per_task, record?.attempts_per_arm, record?.attemptsPerArm,
+    record?.n_attempts, record?.attempts_per_task
+  );
+  const concurrency = safeIntegerControl(firstControlValue(
+    source?.n_concurrent_trials, source?.concurrency,
+    record?.n_concurrent_trials, record?.concurrency
+  ));
+  if (concurrency === null || concurrency <= 0) issues.push("concurrency_missing_or_invalid");
+  const cohort = pairedCohortScheduleSnapshot(source, taskKeys, issues);
+  const model = pairedModelIdentity(record);
+  if (!model) issues.push("model_missing");
+  if (tasks.length === 0) issues.push("tasks_missing");
+  return {
+    model,
+    taskRevision,
+    taskCount: taskKeys.length,
+    taskSetSha256,
+    timeoutPlanSha256,
+    cohortScheduleSha256: cohort.digest,
+    networkMode,
+    concurrency,
+    attemptsPerArm: safeIntegerControl(attempts),
+    retries: safeIntegerControl(retries),
+    taskKeys,
+    issues: [...new Set(issues)].sort()
+  };
+}
+
+function pairedControlCheck(name, baseline, candidate, expected = undefined) {
+  const values = expected === undefined ? [baseline, candidate] : [baseline, candidate, expected];
+  const present = values.every((value) => value !== null && value !== undefined);
+  return {
+    name,
+    passed: present && values.every((value) => JSON.stringify(value) === JSON.stringify(values[0])),
+    baseline: baseline ?? null,
+    candidate: candidate ?? null,
+    ...(expected === undefined ? {} : { expected: expected ?? null })
+  };
+}
+
+/** Compare the controls that affect solver opportunity. Mismatches are data,
+ * not exceptions, so an audit artifact can always state comparable=false. */
+export function comparePairedRunControls(baseline, candidate, expected = null) {
+  const before = pairedRunControlSnapshot(baseline);
+  const after = pairedRunControlSnapshot(candidate);
+  const frozen = expected ? pairedRunControlSnapshot(expected) : null;
+  const expectedValue = (key) => frozen ? frozen[key] : undefined;
+  const checks = [
+    pairedControlCheck("model", before.model, after.model, expectedValue("model")),
+    pairedControlCheck("task_revision", before.taskRevision, after.taskRevision, expectedValue("taskRevision")),
+    pairedControlCheck("task_set", before.taskSetSha256, after.taskSetSha256, expectedValue("taskSetSha256")),
+    pairedControlCheck("network", before.networkMode, after.networkMode, expectedValue("networkMode")),
+    pairedControlCheck("concurrency", before.concurrency, after.concurrency, expectedValue("concurrency")),
+    pairedControlCheck(
+      "effective_solver_timeout", before.timeoutPlanSha256, after.timeoutPlanSha256,
+      expectedValue("timeoutPlanSha256")
+    ),
+    pairedControlCheck(
+      "cohort_schedule", before.cohortScheduleSha256, after.cohortScheduleSha256,
+      expectedValue("cohortScheduleSha256")
+    ),
+    pairedControlCheck("attempts_per_arm", before.attemptsPerArm, after.attemptsPerArm, 1),
+    pairedControlCheck("retries", before.retries, after.retries, 0),
+    {
+      name: "control_records_complete",
+      passed: before.issues.length === 0 && after.issues.length === 0
+        && (!frozen || frozen.issues.length === 0),
+      baseline: before.issues.length,
+      candidate: after.issues.length,
+      ...(frozen ? { expected: frozen.issues.length } : {})
+    }
+  ];
+  const passed = (name) => checks.find((check) => check.name === name)?.passed === true;
+  return {
+    schemaVersion: 1,
+    kind: "sigma.benchmark-paired-preflight",
+    comparable: checks.every((check) => check.passed),
+    mismatchReasons: checks.filter((check) => !check.passed).map((check) => check.name),
+    controls: {
+      taskCount: passed("task_set") ? before.taskCount : null,
+      taskSetSha256: passed("task_set") ? before.taskSetSha256 : null,
+      timeoutPlanSha256: passed("effective_solver_timeout") ? before.timeoutPlanSha256 : null,
+      cohortScheduleSha256: passed("cohort_schedule") ? before.cohortScheduleSha256 : null,
+      taskRevision: passed("task_revision") ? before.taskRevision : null,
+      model: passed("model") ? before.model : null,
+      networkMode: passed("network") ? before.networkMode : null,
+      concurrency: passed("concurrency") ? before.concurrency : null
+    },
+    checks
+  };
 }
 
 /** Aggregation consumers must never mix product bytes, execution backends, or
@@ -2512,6 +3170,10 @@ export function formatMarkdownReport(report) {
     `- Reasoning/output ratio: ${report.reasoning_output_ratio ?? "unknown"}`,
     `- Length finishes: ${report.length_finish_count ?? 0}`,
     `- Converge turns: ${report.converge_turns ?? 0}`,
+    `- Deadline converge turns: ${report.deadline_converge_turns ?? 0}`,
+    `- Budget/action-debt converge turns: ${report.budget_converge_turns ?? 0}`,
+    `- Terminal-budget turns: ${report.terminal_budget_turns ?? 0}`,
+    `- Manual stops: ${report.manual_stop_count ?? 0}`,
     `- Completed with limitations: ${report.completion_limitations?.tasks ?? 0} tasks / ${report.completion_limitations?.total ?? 0} limitations`,
     `- Cost USD: ${report.cost_usd ?? 0}`,
     `- Lane metrics: ${markdownEscape(JSON.stringify(report.lane_metrics ?? {}))}`,
@@ -2649,6 +3311,13 @@ export async function generateBenchReport(runDir) {
   const harborTrialResults = await readHarborTrialResults(runDir);
   const harborJobAccounting = await readHarborJobAccounting(runDir);
   const resolvedJobConfig = await resolvedJobConfigForReport(runDir, config);
+  const runInputAttestation = config.paired_run_controls
+    ? await benchmarkRunInputAttestation(runDir, config) : null;
+  if (runInputAttestation && !runInputAttestation.valid) {
+    incompleteReason.push(
+      `Paired-run input attestation failed: ${runInputAttestation.issues.join(", ") || "unknown"}.`
+    );
+  }
   const expected = expectedTrialCount(config, resolvedJobConfig);
   const accounting = trialAccounting(expected, harborTrialResults);
   if (expected > 0) {
@@ -2684,10 +3353,22 @@ export async function generateBenchReport(runDir) {
     tasks = merged.tasks;
     orphanArtifacts = merged.orphanArtifacts;
   }
+  const controlledPairingKeys = Array.isArray(config.paired_run_controls?.tasks)
+    ? config.paired_run_controls.tasks.map(pairedRunTaskKey).filter(Boolean) : [];
+  const pairingKeyByLeaf = new Map();
+  for (const key of controlledPairingKeys) {
+    const leaf = normalizedTaskKey(key);
+    const existing = pairingKeyByLeaf.get(leaf);
+    pairingKeyByLeaf.set(leaf, existing === undefined ? key : null);
+  }
   tasks = tasks.map((task) => {
     const verifierOutcome = task.verifier_outcome ?? (task.verifier_status ?? "not_run");
+    const observedPairingKey = pairedRunTaskKey(task);
+    const pairingKey = controlledPairingKeys.includes(observedPairingKey)
+      ? observedPairingKey : pairingKeyByLeaf.get(normalizedTaskKey(observedPairingKey)) ?? null;
     return withSuggestedOwner({
       ...task,
+      ...(pairingKey ? { pairing_key: pairingKey } : {}),
       agent_outcome: task.agent_outcome ?? (task.status === "passed" ? "completed" : "unknown"),
       verifier_outcome: verifierOutcome,
       validity: task.validity ?? "valid",
@@ -2801,6 +3482,21 @@ export async function generateBenchReport(runDir) {
     (total, task) => total + Number(task.length_finish_count ?? 0), 0
   );
   const convergeTurns = tasks.reduce((total, task) => total + Number(task.converge_turns ?? 0), 0);
+  const deadlineConvergeTurns = tasks.reduce(
+    (total, task) => total + Number(task.deadline_converge_turns ?? 0), 0
+  );
+  const budgetConvergeTurns = tasks.reduce(
+    (total, task) => total + Number(task.budget_converge_turns ?? 0), 0
+  );
+  const terminalBudgetTurns = tasks.reduce(
+    (total, task) => total + Number(task.terminal_budget_turns ?? 0), 0
+  );
+  const taskManualStops = tasks.reduce(
+    (total, task) => total + Number(task.manual_stop_count ?? 0), 0
+  );
+  const manualStopCount = Math.max(
+    taskManualStops, config.termination_source === "manual_stop" ? 1 : 0
+  );
   const costUsd = tasks.reduce((total, task) => {
     const value = Number(task.cost_usd);
     return total + (Number.isFinite(value) ? value : 0);
@@ -2810,6 +3506,14 @@ export async function generateBenchReport(runDir) {
     tasks: limitedTasks.length,
     total: limitedTasks.reduce((total, task) => total + Number(task.completion_limitation_count ?? 0), 0)
   };
+  const pairedRunControls = config.paired_run_controls ? {
+    ...config.paired_run_controls,
+    n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? null,
+    attempts_per_arm: resolvedJobConfig?.n_attempts ?? null,
+    retries: resolvedJobConfig?.retry?.max_retries ?? null,
+    input_config_sha256s: runInputAttestation?.configSha256s ?? [],
+    lock_sha256s: runInputAttestation?.lockSha256s ?? []
+  } : null;
   const report = {
     run_id: config.run_id ?? path.basename(runDir),
     started_at: config.started_at ?? null,
@@ -2821,9 +3525,11 @@ export async function generateBenchReport(runDir) {
     terminal_bench_revision: config.terminal_bench_revision ?? null,
     source_revision: config.source_revision ?? null,
     source_dirty: typeof config.source_dirty === "boolean" ? config.source_dirty : null,
+    source_diff_sha256: config.source_diff_sha256 ?? null,
     source_identity_source: config.source_identity_source ?? null,
     harness_source_revision: config.harness_source_revision ?? null,
     harness_source_dirty: typeof config.harness_source_dirty === "boolean" ? config.harness_source_dirty : null,
+    harness_source_diff_sha256: config.harness_source_diff_sha256 ?? null,
     agent_profile: taskProfiles.length === 1 ? taskProfiles[0] : config.agent_profile ?? null,
     evaluation_lane: config.evaluation_lane
       ?? ((taskProfiles.length === 1 ? taskProfiles[0] : config.agent_profile) === "strict"
@@ -2840,6 +3546,8 @@ export async function generateBenchReport(runDir) {
     agent_cli_sha256: config.agent_cli_sha256 ?? null,
     package_reused: config.package_reused ?? false,
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
+    attempts_per_arm: resolvedJobConfig?.n_attempts ?? config.attempts_per_arm ?? null,
+    retries: resolvedJobConfig?.retry?.max_retries ?? config.retries ?? null,
     network_mode: config.network_mode ?? null,
     max_turns: config.max_turns ?? null,
     command_timeout_sec: config.command_timeout_sec ?? null,
@@ -2859,6 +3567,11 @@ export async function generateBenchReport(runDir) {
     reasoning_output_ratio: reasoningOutputRatio,
     length_finish_count: lengthFinishCount,
     converge_turns: convergeTurns,
+    deadline_converge_turns: deadlineConvergeTurns,
+    budget_converge_turns: budgetConvergeTurns,
+    terminal_budget_turns: terminalBudgetTurns,
+    manual_stop_count: manualStopCount,
+    termination_source: config.termination_source ?? null,
     completion_limitations: completionLimitations,
     cost_usd: costUsd,
     incomplete_reason: incompleteReason.length > 0 ? incompleteReason : null,
@@ -2879,6 +3592,8 @@ export async function generateBenchReport(runDir) {
     container_engine_requested: config.container_engine_requested ?? null,
     docker_cleanup: config.docker_cleanup ?? null,
     preregistration_sha256: config.preregistration_sha256 ?? null,
+    paired_run_controls: pairedRunControls,
+    run_input_attestation: runInputAttestation,
     validation_manifest: config.validation_manifest ?? null,
     validation_manifest_sha256: config.validation_manifest_sha256 ?? null,
     score_mode: config.score_mode ?? (config.benchmark_class === "diagnostic" ? "diagnostic" : "standard_benchmark"),

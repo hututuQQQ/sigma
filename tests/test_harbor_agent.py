@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 def install_harbor_stubs() -> None:
@@ -1126,7 +1126,8 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 for line in (logs_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual([record["type"] for record in trace], ["model_end", "run_end"])
-            self.assertEqual(trace[0]["metadata"]["diagnostics"], diagnostics)
+            self.assertNotIn("diagnostics", trace[0]["metadata"])
+            self.assertEqual(trace[0]["sigma_event"]["payload"]["diagnostics"], diagnostics)
 
     async def test_terminal_model_and_tool_errors_keep_distinct_categories(self):
         module = import_portable_agent_module()
@@ -1324,7 +1325,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                     "costMicroUsd": 19,
                 })),
                 json.dumps(event(3, "model.completed", {"finishReason": "length"})),
-                json.dumps(event(4, "diagnostic", {"kind": "deadline.stage", "stage": "converge"})),
+                json.dumps(event(4, "diagnostic", {
+                    "kind": "deadline.stage", "stage": "converge", "budgetStage": "converge"
+                })),
                 json.dumps(event(5, "tool.requested", {"callId": "tool-1", "name": "execute"})),
                 json.dumps(event(6, "tool.completed", {"callId": "tool-1", "name": "execute"})),
                 json.dumps(event(7, "run.completed", {
@@ -1377,6 +1380,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary["reasoning_output_ratio"], 6 / 7)
             self.assertEqual(summary["length_finish_count"], 1)
             self.assertEqual(summary["converge_turns"], 1)
+            self.assertEqual(summary["deadline_converge_turns"], 1)
+            self.assertEqual(summary["budget_converge_turns"], 1)
+            self.assertEqual(summary["terminal_budget_turns"], 0)
             self.assertEqual(summary["model_turns"], 1)
             trace_types = [
                 json.loads(line)["type"]
@@ -1694,7 +1700,7 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("model_start", (logs_dir / "trace.jsonl").read_text(encoding="utf-8"))
             self.assertTrue((logs_dir / "stdout.partial.log").is_file())
 
-    async def test_cancelled_run_persists_timeout_artifacts_before_reraising(self):
+    async def test_cancelled_run_persists_external_interruption_artifacts_before_reraising(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             logs_dir = Path(tmp) / "logs"
@@ -1731,12 +1737,22 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await agent.run("run", env, context)
 
-            self.assertEqual(agent.max_wall_time_sec, 70)
-            self.assertEqual(context.failure_kind, "timeout")
-            for filename in ("timeout.json", "summary.json", "trace.jsonl", "stdout.partial.log", "stderr.partial.log"):
+            self.assertEqual(agent.max_wall_time_sec, 100)
+            self.assertEqual(context.failure_kind, "external_cancel")
+            for filename in ("interruption.json", "summary.json", "trace.jsonl", "stdout.partial.log", "stderr.partial.log"):
                 self.assertTrue((logs_dir / filename).is_file(), filename)
-            timeout_state = json.loads((logs_dir / "timeout.json").read_text(encoding="utf-8"))
-            self.assertEqual(timeout_state["process_cleanup"]["pid"], 42)
+            self.assertFalse((logs_dir / "timeout.json").exists())
+            interruption = json.loads((logs_dir / "interruption.json").read_text(encoding="utf-8"))
+            self.assertEqual(interruption["status"], "cancelled")
+            self.assertFalse(interruption["timed_out"])
+            self.assertEqual(interruption["failure_kind"], "external_cancel")
+            self.assertEqual(interruption["termination_source"], "external_cancel")
+            self.assertEqual(interruption["manual_stop_count"], 0)
+            self.assertEqual(interruption["process_cleanup"]["pid"], 42)
+            summary = json.loads((logs_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["termination_source"], "external_cancel")
+            self.assertEqual(summary["failure_kind"], "external_cancel")
+            self.assertNotEqual(summary["terminal_origin"], "adapter_timeout")
             self.assertIn("kill -TERM", "\n".join(commands))
             self.assertIn("kill -KILL", "\n".join(commands))
             self.assertNotIn("pkill", "\n".join(commands))
@@ -1844,12 +1860,161 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.jsonl"
-            for index in range(20):
-                module._append_bounded_jsonl(trace_path, {"type": "event", "seq": index, "payload": "z" * 40}, 256)
-            self.assertLessEqual(trace_path.stat().st_size, 256)
+            spool = module._BoundedJsonlSpool(trace_path, 1_024)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
+                for index in range(100):
+                    spool.append({"type": "event", "seq": index, "payload": "z" * 80})
+                self.assertLessEqual(trace_path.stat().st_size, 1_024)
+                live_lines = trace_path.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(any(
+                    json.loads(line).get("type") == "trace_truncated"
+                    for line in live_lines
+                ))
+                self.assertEqual(json.loads(live_lines[-1]).get("seq"), 99)
+                spool.finalize()
+            self.assertLessEqual(trace_path.stat().st_size, 1_024)
             trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
-            self.assertEqual(json.loads(trace_lines[-1]).get("seq"), 19)
+            self.assertEqual(json.loads(trace_lines[-1]).get("seq"), 99)
+
+    async def test_incremental_trace_survives_writer_loss_without_finalize(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.jsonl"
+            spool = module._BoundedJsonlSpool(trace_path, 2_048)
+            for index in range(200):
+                spool.append({"type": "event", "seq": index, "payload": "x" * 96})
+
+            live_bytes = trace_path.read_bytes()
+            self.assertLessEqual(len(live_bytes), 2_048)
+            live_lines = live_bytes.decode("utf-8").splitlines()
+            self.assertTrue(any(
+                json.loads(line).get("type") == "trace_truncated"
+                for line in live_lines
+            ))
+            self.assertEqual(json.loads(live_lines[-1]).get("seq"), 199)
+
+            # Simulate an abrupt owner exit: no finalize/close callback is
+            # required for the already materialized rolling tail to survive.
+            del spool
+            self.assertEqual(trace_path.read_bytes(), live_bytes)
+
+    async def test_incremental_trace_compacts_amortized_not_per_event(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.jsonl"
+            spool = module._BoundedJsonlSpool(trace_path, 64 * 1_024)
+            with patch.object(spool, "_materialize", wraps=spool._materialize) as materialize:
+                for index in range(2_000):
+                    spool.append({"type": "event", "seq": index, "payload": "y" * 96})
+                self.assertLess(materialize.call_count, 50)
+            self.assertLessEqual(trace_path.stat().st_size, 64 * 1_024)
+            self.assertEqual(
+                json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1]).get("seq"),
+                1_999,
+            )
+
+    async def test_stream_recorder_keeps_bounded_protocol_state(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            recorder = module._OutputRecorder(Path(tmp) / "logs")
+            for index in range(1_000):
+                recorder.consume_event({
+                    "eventId": f"event-{index}",
+                    "sessionId": "bounded-session",
+                    "seq": index,
+                    "type": "diagnostic",
+                    "payload": {"kind": "progress", "blob": "z" * 4_096},
+                })
+            snapshot = recorder.snapshot()
+            self.assertEqual(snapshot["events_observed"], 1_000)
+            self.assertLessEqual(
+                snapshot["events_retained_bytes"], module.MAX_RECORDER_EVENT_BYTES
+            )
+            self.assertLessEqual(
+                snapshot["events_retained"], module.MAX_RECORDER_EVENT_COUNT
+            )
+            self.assertLessEqual(len(recorder._seen), module.MAX_SEEN_EVENT_IDENTITIES)
+            recorder.finalize_trace()
+            self.assertLessEqual(
+                recorder.trace_path.stat().st_size, module.MAX_TRACE_ARTIFACT_BYTES
+            )
+
+    async def test_trace_metadata_is_scalar_only_and_raw_event_occurs_once(self):
+        module = import_portable_agent_module()
+        usage_event = {
+            "type": "usage.recorded",
+            "seq": 1,
+            "payload": {
+                "inputTokens": 3,
+                "outputTokens": 2,
+                "usage": {"nested": True},
+            },
+        }
+        terminal_event = {
+            "type": "run.completed",
+            "seq": 2,
+            "payload": {
+                "kind": "completed",
+                "result": {"nested": True},
+            },
+        }
+        for event in (usage_event, terminal_event):
+            record = module._trace_record(event, {"status": "completed"})
+            self.assertTrue(all(
+                value is None or isinstance(value, (str, int, float, bool))
+                for value in record["metadata"].values()
+            ))
+            self.assertNotIn("usage", record["metadata"])
+            self.assertNotIn("result", record["metadata"])
+            self.assertEqual(
+                json.dumps(record, ensure_ascii=False).count('"sigma_event"'), 1
+            )
+
+    async def test_final_trace_is_streamed_bounded_and_keeps_raw_event_only_once(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            agent = module.SigmaCliHarborAgent(logs_dir=logs_dir)
+            events = [{
+                "eventId": f"event-{index}",
+                "sessionId": "trace-session",
+                "seq": index + 1,
+                "type": "diagnostic",
+                "payload": {
+                    "kind": "deadline.stage",
+                    "stage": "normal",
+                    "budgetStage": "normal",
+                    "blob": "z" * 20_000,
+                },
+            } for index in range(300)]
+
+            _, trace_path = agent._write_accounting_artifacts(
+                events, {"status": "completed"}, write_summary=False
+            )
+
+            self.assertIsNotNone(trace_path)
+            self.assertLessEqual(trace_path.stat().st_size, module.MAX_TRACE_ARTIFACT_BYTES)
+            records = [
+                json.loads(line)
+                for line in trace_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(any(record.get("type") == "trace_truncated" for record in records))
+            event_records = [record for record in records if record.get("type") == "diagnostic"]
+            self.assertTrue(event_records)
+            self.assertTrue(all("payload" not in record["metadata"] for record in event_records))
+            self.assertTrue(all("sigma_event" in record for record in event_records))
+
+    async def test_summary_counts_manual_stop_separately(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            summary = agent._summary_from_events([], {
+                "status": "cancelled",
+                "termination_source": "manual_stop",
+            })
+            self.assertEqual(summary["manual_stop_count"], 1)
+            self.assertEqual(summary["converge_turns"], 0)
 
 
 if __name__ == "__main__":
