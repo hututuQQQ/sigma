@@ -10,6 +10,12 @@ import {
   nonEmptyStringSchema,
   nonNegativeIntegerSchema
 } from "./domain-schema-primitives.js";
+import {
+  repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema
+} from "./repository-evidence-schemas.js";
 export {
   checkpointDeltaSchema,
   dateTimeSchema,
@@ -64,25 +70,6 @@ export const mutationFrontierSchema = z.object({
   changedPaths: z.array(nonEmptyStringSchema),
   sourceCheckpointIds: z.array(nonEmptyStringSchema),
   repositoryStateDigest: digestSchema.optional()
-}).strict();
-
-export const repositoryDeltaEvidenceSchema = z.object({
-  ...evidenceBaseShape,
-  kind: z.literal("repository_delta"),
-  data: z.object({
-    operationCount: z.number().int().positive(),
-    operations: z.array(nonEmptyStringSchema),
-    beforeStateDigest: digestSchema,
-    afterStateDigest: digestSchema,
-    headBefore: z.string().nullable(),
-    headAfter: z.string().nullable(),
-    refsBeforeDigest: digestSchema,
-    refsAfterDigest: digestSchema,
-    indexBeforeDigest: digestSchema,
-    indexAfterDigest: digestSchema,
-    reachableObjectsBefore: nonNegativeIntegerSchema,
-    reachableObjectsAfter: nonNegativeIntegerSchema
-  }).strict()
 }).strict();
 
 export const commandEvidenceSchema = z.object({
@@ -246,7 +233,18 @@ export const evidenceRecordSchema = z.discriminatedUnion("kind", [
   childOutcomeEvidenceSchema,
   userWaiverEvidenceSchema,
   workspaceRestorationEvidenceV1Schema
+  , repositoryRecoverySelectionEvidenceV1Schema
+  , repositoryRecoveryDecisionEvidenceV1Schema
+  , repositoryAcceptanceEvidenceV1Schema
 ]);
+
+export {
+  repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema,
+  repositorySemanticAssertionsV3Schema
+} from "./repository-evidence-schemas.js";
 
 export const modelExecutionRoleSchema = z.enum([
   "orchestrator", "planner", "reviewer", "child_analyze", "child_write", "summarizer"

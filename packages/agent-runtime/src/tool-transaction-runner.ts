@@ -15,7 +15,7 @@ import {
 import { mutatingPlan, planAllowsMutation, turnPayload, type ToolAttempt } from "./effect-runner-helpers.js";
 import type { EffectRunnerOptions } from "./effect-runner.js";
 import { profileAllowsTool } from "./profile-policy.js";
-import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
+import { assertToolReceiptIdentity } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
   assertTaskControlCallAllowed,
@@ -42,6 +42,8 @@ import {
 import { convergedToolFailure } from "./capability-failure-convergence.js";
 import type { PreparedTool, TransactionState } from "./tool-transaction-types.js";
 import { recordRuntimeDependencyFailure } from "./runtime-dependency-observation.js";
+import { toolTaskControlContext } from "./repository-recovery-context.js";
+import { normalizeToolTransactionReceipt } from "./tool-receipt-normalization.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -113,6 +115,7 @@ export class ToolTransactionRunner {
       runId: session.durable.runId,
       workspacePath: session.identity.workspacePath,
       runMode: session.durable.mode,
+      ...toolTaskControlContext(session),
       runtimeControl: this.options.control.forSession(session)
     } as const;
     const plan = this.options.runtime.tools.prepare
@@ -338,16 +341,7 @@ export class ToolTransactionRunner {
       await assertReceiptWithinPlan(session, receipt, plan);
       if (checkpoint) await this.options.control.sealCheckpoint(session, checkpoint.checkpointId);
       await recordProcessReceipt(session, call, plan, receipt, this.options.emit);
-      const finalValidationScope = plan.exactEffects.includes("validation")
-        && plan.exactEffects.includes("filesystem.write")
-        ? validationScope(session, call, plan)
-        : prepared.validationScope;
-      const normalizedReceipt = normalizeReceiptEvidence(receipt, descriptor.name, plan, {
-        sessionId: session.identity.sessionId,
-        runId: session.durable.runId,
-        workspaceDeltas: [],
-        ...(finalValidationScope ? { validationScope: finalValidationScope } : {})
-      });
+      const normalizedReceipt = normalizeToolTransactionReceipt(session, prepared, receipt);
       await this.options.emit(session, "execution.completed", "runtime", {
         executionId: call.id,
         evidenceIds: (normalizedReceipt.evidence ?? []).map((item) => item.evidenceId)
@@ -396,4 +390,5 @@ export class ToolTransactionRunner {
       throw error;
     }
   }
+
 }

@@ -21,6 +21,7 @@ export const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 export const evidenceKindSchema = z.enum([
   "workspace_delta", "repository_delta", "command", "validation", "diagnostic",
   "input_access", "review", "checkpoint", "child_outcome", "user_waiver", "restoration"
+  , "repository_recovery_selection", "repository_recovery_decision", "repository_acceptance"
 ]);
 export const evidenceStatusSchema = z.enum(["passed", "failed", "warning", "informational"]);
 export const evidenceClaimSchema = z.enum([

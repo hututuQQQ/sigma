@@ -5,6 +5,13 @@ use crate::output_artifact::{
 };
 use crate::platform::PlatformGuard;
 use crate::protocol::RpcError;
+use crate::repository_lease::{AcquireRepositoryMetadataLeaseParams, RepositoryMetadataLeases};
+use crate::repository_transaction::{
+    AcquireRepositoryTransactionLeaseParams, BeginRepositoryTransactionParams,
+    BoundRepositoryTransactionParams, ContinueRepositoryTransactionParams,
+    RecoverRepositoryTransactionsParams, ReleaseRepositoryRunBaselineParams,
+    RepositoryTransactions, RestoreRepositoryRunBaselineParams,
+};
 use crate::sandbox::{
     ProcessLifecycle, ProcessParams, ProtectedPathGuard, SandboxMode, build_command,
 };
@@ -105,6 +112,8 @@ pub struct BrokerState {
     scratch: ScratchLeases,
     #[cfg(target_os = "linux")]
     managed: Option<Arc<ManagedServerContext>>,
+    repository_metadata_leases: RepositoryMetadataLeases,
+    repository_transactions: RepositoryTransactions,
 }
 
 impl BrokerState {
@@ -121,6 +130,7 @@ impl BrokerState {
             "sigma-exec-artifacts-{instance_id}-{}",
             ARTIFACT_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
+        let repository_transactions = RepositoryTransactions::new(&instance_id);
         Self {
             instance_id,
             allow_unsafe,
@@ -135,6 +145,8 @@ impl BrokerState {
             scratch: ScratchLeases::default(),
             #[cfg(target_os = "linux")]
             managed: None,
+            repository_metadata_leases: RepositoryMetadataLeases::default(),
+            repository_transactions,
         }
     }
 
@@ -187,6 +199,12 @@ impl BrokerState {
     }
 
     pub fn begin_request(&self, request_id: u64, method: &str) -> Result<(), RpcError> {
+        if matches!(
+            method,
+            "repositoryTransaction.begin" | "repositoryTransaction.continue"
+        ) {
+            return self.repository_transactions.begin_request(request_id);
+        }
         if method != "exec" {
             return Ok(());
         }
@@ -201,6 +219,7 @@ impl BrokerState {
     }
 
     pub fn finish_request(&self, request_id: u64) {
+        self.repository_transactions.finish_request(request_id);
         if let Ok(mut active) = self.exec_requests.lock() {
             active.remove(&request_id);
         }
@@ -234,6 +253,73 @@ impl BrokerState {
         params: ReleaseScratchLeaseParams,
     ) -> Result<Value, RpcError> {
         Ok(json!({ "released": self.scratch.release(params)? }))
+    }
+
+    pub fn acquire_repository_metadata_lease(
+        &self,
+        params: AcquireRepositoryMetadataLeaseParams,
+    ) -> Result<Value, RpcError> {
+        to_value(self.repository_metadata_leases.acquire(params)?)
+            .map_err(|error| RpcError::new("broker_protocol_error", error.to_string()))
+    }
+
+    pub fn acquire_repository_transaction_lease(
+        &self,
+        params: AcquireRepositoryTransactionLeaseParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.acquire(params)
+    }
+
+    pub fn begin_repository_transaction(
+        &self,
+        request_id: u64,
+        params: BeginRepositoryTransactionParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.begin(request_id, params)
+    }
+
+    pub fn continue_repository_transaction(
+        &self,
+        request_id: u64,
+        params: ContinueRepositoryTransactionParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions
+            .continue_transaction(request_id, params)
+    }
+
+    pub fn abort_repository_transaction(
+        &self,
+        params: BoundRepositoryTransactionParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.abort(params)
+    }
+
+    pub fn recover_repository_transactions(
+        &self,
+        params: RecoverRepositoryTransactionsParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.recover(params)
+    }
+
+    pub fn seal_repository_transaction(
+        &self,
+        params: BoundRepositoryTransactionParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.seal(params)
+    }
+
+    pub fn restore_repository_run_baseline(
+        &self,
+        params: RestoreRepositoryRunBaselineParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.restore_run_baseline(params)
+    }
+
+    pub fn release_repository_run_baseline(
+        &self,
+        params: ReleaseRepositoryRunBaselineParams,
+    ) -> Result<Value, RpcError> {
+        self.repository_transactions.release_run_baseline(params)
     }
 
     pub fn configure_redaction(&self, secrets: Vec<RedactionSecret>) -> Result<(), RpcError> {
@@ -418,6 +504,9 @@ impl BrokerState {
     }
 
     pub fn cancel(&self, params: CancelParams) -> Result<Value, RpcError> {
+        let repository_cancelled = self
+            .repository_transactions
+            .cancel_request(params.target_request_id);
         let handle = self
             .requests
             .lock()
@@ -445,13 +534,14 @@ impl BrokerState {
             }
             cancelled.insert(params.target_request_id);
         }
-        Ok(json!({ "cancelled": handle.is_some() }))
+        Ok(json!({ "cancelled": handle.is_some() || repository_cancelled }))
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown(&self) -> Result<(), RpcError> {
+        let repository_result = self.repository_transactions.shutdown();
         let processes = match self.processes.lock() {
             Ok(value) => value.values().cloned().collect::<Vec<_>>(),
-            Err(_) => return,
+            Err(_) => Vec::new(),
         };
         for process in processes {
             if let Ok(mut managed) = process.lock() {
@@ -469,6 +559,7 @@ impl BrokerState {
         }
         cleanup_artifact_root(&self.artifact_root);
         self.scratch.clear();
+        repository_result
     }
 
     fn spawn_managed(
@@ -478,7 +569,9 @@ impl BrokerState {
     ) -> Result<(String, Arc<Mutex<ManagedProcess>>), RpcError> {
         // These fields cross the launcher bootstrap for convenience, but are
         // broker-issued only. A process request can never populate them.
+        params.policy.repository_metadata_roots.clear();
         params.policy.session_scratch_roots.clear();
+        self.repository_metadata_leases.consume(&mut params)?;
         let scratch = self.scratch.resolve(
             &self.instance_id,
             params.policy.scratch_lease_id.take(),
@@ -961,6 +1054,8 @@ mod tests {
                 scratch_lease_id: None,
                 scratch_session_id: None,
                 session_scratch_roots: Vec::new(),
+                repository_metadata_lease_id: None,
+                repository_metadata_roots: Vec::new(),
                 #[cfg(test)]
                 unsafe_host_exec_approved: true,
             },
@@ -985,7 +1080,7 @@ mod tests {
                 .unwrap()
                 .contains("sigma-native-ok")
         );
-        state.shutdown();
+        state.shutdown().unwrap();
     }
 
     #[test]
@@ -1053,7 +1148,7 @@ mod tests {
             })
             .unwrap();
         assert!(!path.exists());
-        state.shutdown();
+        state.shutdown().unwrap();
     }
 
     #[test]
@@ -1082,7 +1177,7 @@ mod tests {
             0
         );
         state.finish_request(7);
-        state.shutdown();
+        state.shutdown().unwrap();
     }
 
     #[test]
@@ -1147,6 +1242,6 @@ mod tests {
                 .is_err()
         );
         assert!(state.processes.lock().unwrap().is_empty());
-        state.shutdown();
+        state.shutdown().unwrap();
     }
 }

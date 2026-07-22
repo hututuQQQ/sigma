@@ -48,6 +48,8 @@ export interface ToolDescriptor {
   idempotent: boolean;
   timeoutMs: number;
   idleTimeoutMs?: number;
+  /** Trusted built-in declaration permitting broker-owned mutation journals. */
+  brokerMutationAuthority?: "repository_transaction_v2";
   prepare?(argumentsValue: JsonValue, context: ToolPreparationContext): Promise<ToolCallPlan> | ToolCallPlan;
 }
 
@@ -56,6 +58,10 @@ export interface ToolPreparationContext {
   runId: string;
   workspacePath: string;
   runMode: RunMode;
+  goalEpoch?: number;
+  repositoryRecoveryCandidateIds?: readonly string[];
+  mutationFrontierRevision?: number;
+  mutationFrontierStateDigest?: string;
   /** Read-only session authority used while dynamically planning resources
    * whose paths are intentionally not model-addressable. */
   runtimeControl?: RuntimeControlPort;
@@ -76,6 +82,9 @@ export interface ToolCallPlan {
   /** Transaction-control actions are executed by the runtime without opening
    * a nested mutation checkpoint. The target is frozen during preparation. */
   checkpointAction?: { kind: "restore"; checkpointId: string };
+  /** Runtime-authored proof that an out-of-process broker owns the complete
+   * rollback journal. Only the structured repository transaction tool may set it. */
+  mutationAuthority?: "broker_repository_transaction_v2";
   idempotence: "read_only" | "replay_safe" | "non_replayable";
   /** V5 semantic process request and broker-resolved capability. Present for
    * process tools; filesystem grants are never model-authored. */
@@ -170,6 +179,14 @@ export interface ToolExecutionContext {
   runId: string;
   workspacePath: string;
   runMode: import("./outcomes.js").RunMode;
+  /** Current reducer-owned goal epoch. Tools may bind evidence to it but may
+   * never advance or reconstruct it. */
+  goalEpoch?: number;
+  /** Runtime-matched candidate ids from the latest user decision. Model tool
+   * arguments cannot populate this capability. */
+  repositoryRecoveryCandidateIds?: readonly string[];
+  mutationFrontierRevision?: number;
+  mutationFrontierStateDigest?: string;
   /** Immutable runtime-approved plan for this exact call. Mutating tools must
    * fail closed when it is unavailable. */
   callPlan?: ToolCallPlan;

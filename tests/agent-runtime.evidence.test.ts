@@ -8,6 +8,7 @@ import type {
   EvidenceRecord,
   JsonValue,
   ModelToolCall,
+  RepositoryDeltaEvidence,
   ReviewEvidence,
   ToolCallPlan,
   ToolDescriptor,
@@ -188,6 +189,61 @@ function proofEvidence(): EvidenceRecord {
     producer: { authority: "tool", id: "proof" },
     summary: "inspection completed",
     data: { source: "read", diagnostic: { ok: true } }
+  };
+}
+
+function repositoryDelta(target = "1".repeat(40)): RepositoryDeltaEvidence {
+  const digest = "a".repeat(64);
+  return {
+    evidenceId: "repository-delta",
+    sessionId: "session",
+    runId: "run",
+    kind: "repository_delta",
+    status: "passed",
+    createdAt: now,
+    producer: { authority: "tool", id: "git-call" },
+    summary: "repository recovered",
+    data: {
+      repositoryRoot: ".",
+      operationCount: 1,
+      operations: ["reset"],
+      beforeStateDigest: "b".repeat(64),
+      afterStateDigest: digest,
+      headBefore: "2".repeat(40),
+      headAfter: target,
+      refsBeforeDigest: "c".repeat(64),
+      refsAfterDigest: digest,
+      indexBeforeDigest: "d".repeat(64),
+      indexAfterDigest: digest,
+      reachableObjectsBefore: 1,
+      reachableObjectsAfter: 2,
+      transactionHandle: "transaction",
+      selectionEvidenceId: "selection",
+      candidateId: "e".repeat(64),
+      selectedObject: target,
+      semanticAssertions: {
+        schemaVersion: 3,
+        head: target,
+        symbolicRef: "refs/heads/main",
+        refsDigest: digest,
+        reachabilityDigest: digest,
+        reachableObjectCount: 2,
+        indexDigest: digest,
+        conflictsDigest: digest,
+        conflictCount: 0,
+        trackedDigest: digest,
+        trackedCount: 1,
+        untrackedDigest: digest,
+        untrackedCount: 0,
+        targetAssertions: {
+          schemaVersion: 3,
+          selectedHead: target,
+          selectedSymbolicRef: "refs/heads/main",
+          requiredReachableObjects: [target],
+          satisfied: true
+        }
+      }
+    }
   };
 }
 
@@ -961,6 +1017,53 @@ describe.skip("V3 run-scoped completion evidence", () => {
     expect(normalized.evidence?.[0]?.evidenceId).not.toBe("attacker-id");
     expect(() => assertToolReceiptIdentity(receipt("forged-call"), "requested-call"))
       .toThrow("does not match requested callId");
+  });
+
+  it("issues repository acceptance only for broker-proved recovery targets in the current goal epoch", () => {
+    const raw = repositoryDelta();
+    const plan: ToolCallPlan = {
+      exactEffects: ["repository.write"], readPaths: [], writePaths: [], network: "none",
+      processMode: "pipe", checkpointScope: [], idempotence: "non_idempotent"
+    };
+    const transactionReceipt = {
+      ...receipt("git-call"),
+      actualEffects: ["repository.write"] as const,
+      observedEffects: ["repository.write"] as const,
+      evidence: [raw]
+    };
+    const frontier = {
+      revision: 4,
+      baselineManifestDigest: "0".repeat(64),
+      currentStateDigest: "3".repeat(64),
+      changedPaths: [],
+      sourceCheckpointIds: []
+    };
+    const normalized = normalizeReceiptEvidence(transactionReceipt, "git_transaction", plan, {
+      sessionId: "session",
+      runId: "run",
+      workspaceDeltas: [],
+      repositoryScope: { goalEpoch: 7, frontier, mutationEvidence: [] }
+    });
+    const acceptance = normalized.evidence?.find((item) => item.kind === "repository_acceptance");
+    expect(acceptance).toMatchObject({
+      kind: "repository_acceptance",
+      producer: { authority: "runtime", id: "git-call" },
+      data: {
+        goalEpoch: 7,
+        frontierRevision: 5,
+        selectionEvidenceId: "selection",
+        candidateId: "e".repeat(64)
+      }
+    });
+
+    const mismatched = repositoryDelta();
+    mismatched.data.semanticAssertions!.targetAssertions!.selectedHead = "4".repeat(40);
+    const rejected = normalizeReceiptEvidence({ ...transactionReceipt, evidence: [mismatched] },
+      "git_transaction", plan, {
+        sessionId: "session", runId: "run", workspaceDeltas: [],
+        repositoryScope: { goalEpoch: 7, frontier, mutationEvidence: [] }
+      });
+    expect(rejected.evidence?.some((item) => item.kind === "repository_acceptance")).toBe(false);
   });
 
   it("clears evidence, waiver, receipts, and checkpoint head at a follow-up run boundary", () => {

@@ -13,8 +13,9 @@ import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./m
 import { recordSemanticToolResult } from "./semantic-failures.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { completedToolBatchProgress, startedToolBatchProgress } from "./tool-batch-progress.js";
-import { beginGoalEpoch, terminalResolutionObligation, userDecisionObligation } from "./task-control.js";
+import { beginGoalEpoch, terminalResolutionObligation } from "./task-control.js";
 import { runtimeDependencyDiagnostic } from "./runtime-dependency-reducer.js";
+import { repositoryRecoveryDecisionState } from "./repository-task-control.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
@@ -194,18 +195,6 @@ const toolStarted: EventReducer = (state, _event, payload) => {
   return { ...state, pendingTools, phase: "tool_in_flight" };
 };
 
-function recoveryDecisionState(state: KernelState, diagnostics: readonly string[]): KernelState {
-  if (!diagnostics.includes("recovery_result_lost_no_replay")) return state;
-  return {
-    ...state,
-    taskControl: userDecisionObligation(
-      state.taskControl,
-      state.revision,
-      "recovery_result_lost_no_replay"
-    )
-  };
-}
-
 const toolFinished: EventReducer = (state, event) => {
   const receipt = toolReceipt(event.payload);
   const pending = pendingForEvent(state, objectPayload(event.payload));
@@ -229,7 +218,7 @@ const toolFinished: EventReducer = (state, event) => {
     phase: nextPhase(pendingTools)
   };
   const semantic = recordSemanticToolResult(next, receipt, pending.request.name);
-  const decisionState = recoveryDecisionState(semantic.state, receipt.diagnostics);
+  const decisionState = repositoryRecoveryDecisionState(semantic.state, receipt.diagnostics);
   const progressed = pendingTools.length === 0
     ? { ...decisionState, ...completedToolBatchProgress(decisionState) }
     : decisionState;

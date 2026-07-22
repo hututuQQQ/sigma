@@ -6,10 +6,10 @@ import { requestSandboxLeaseRevoke, requestSandboxLeaseStatus, requestSandboxRep
 import {
   assertRequestSandbox, cancellationError,
   BrokerClientLifecycle, BrokerPostResponseOperations, containPostDispatchFailure, containTransportFailure,
-  containReusedProcessId, createProcessRedaction, decodedExecutionResult,
+  containReusedProcessId, createProcessRedaction,
   DEFAULT_DOCTOR_TIMEOUT_MS, DEFAULT_SANDBOX_SETUP_TIMEOUT_MS,
-  outputDecodingError, parsePostDispatchValue, rejectUndecodableExecution,
-  requestExecutionValue, reserveProcessId, runPostResponseOperation, SerializedProcessOperations,
+  outputDecodingError, parsePostDispatchValue,
+  reserveProcessId, runPostResponseOperation, SerializedProcessOperations,
   type ClientState, type Cursor, type ProcessRedaction
 } from "./broker-client-support.js";
 import { settleCancelledSpawn } from "./broker-client-cancellation.js";
@@ -17,17 +17,26 @@ import { decodedProcessPollResult } from "./broker-process-result.js";
 import { attachBrokerLifecycleFailure, BrokerCancelledError, BrokerConnectionError,
   BrokerPolicyError, BrokerProcessLostError, BrokerTimeoutError } from "./errors.js";
 import { BrokerOutputArtifactImporter } from "./output-artifact-import.js";
+import { executeBrokerForeground } from "./broker-client-foreground.js";
 import { positiveInteger, requestParams } from "./broker-request-policy.js";
 import { SecretRedactor } from "./redaction.js";
 import { normalizeTrustedToolchains, type NormalizedTrustedToolchain } from "./trusted-toolchains.js";
 import { requestManagedEnvironmentPreparation } from "./broker-client-managed-environment.js";
+import {
+  BrokerRepositoryEnvironmentClient,
+  invokeBrokerClientRepositoryOperation
+} from "./broker-client-repository-environment.js";
+import {
+  RepositoryExecutionBrokerBase,
+  type RepositoryOperationMethod
+} from "./repository-execution-broker-base.js";
 import type { BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult, ProcessHandle, ProcessHandoffResult,
   ManagedEnvironmentPrepareRequestV1, ManagedEnvironmentPrepareResultV1,
   ProcessPollResult, ProcessSpawnRequest, ScratchLeaseRequestV1, ScratchLeaseV1,
   SigmaExecBrokerClientOptions } from "./types.js";
 import { parseProcessHandoff, parseProcessValue, parseSpawnedProcess } from "./values.js";
-export class SigmaExecBrokerClient implements ExecutionBroker {
+export class SigmaExecBrokerClient extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private readonly transport: BrokerTransport;
   private readonly redactor: SecretRedactor;
   private readonly cursors = new Map<string, Cursor>();
@@ -46,7 +55,9 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   private closeRequested = false;
   private doctorValue?: BrokerDoctorReport;
   private readonly scratchLeases: BrokerScratchLeaseClient;
+  private readonly repositoryEnvironment: BrokerRepositoryEnvironmentClient;
   constructor(private readonly options: SigmaExecBrokerClientOptions) {
+    super();
     const transports = [options.helperPath, options.socketPath, options.trustedStream].filter(Boolean);
     if (transports.length !== 1) {
       throw new BrokerPolicyError(
@@ -59,6 +70,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
     this.transport = new BrokerTransport(options, (error) =>
       containTransportFailure(error, () => this.markProcessesLost(), async () => await this.lifecycle.close()));
     this.scratchLeases = new BrokerScratchLeaseClient(this.transport);
+    this.repositoryEnvironment = new BrokerRepositoryEnvironmentClient(this.transport);
     this.outputArtifacts = new BrokerOutputArtifactImporter(this.redactor, async (artifactIds) =>
       await this.transport.request("artifact.release", { artifactIds }, { timeoutMs: 5_000 }),
       undefined,
@@ -78,6 +90,7 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
         this.activeProcesses.clear();
         this.processRedaction.clear();
         this.scratchLeases.clear();
+        this.repositoryEnvironment.clear();
         this.state = closed ? "closed" : "failed";
       }
     );
@@ -179,43 +192,30 @@ export class SigmaExecBrokerClient implements ExecutionBroker {
   async releaseScratchLease(sessionId: string, options: BrokerRequestOptions = {}): Promise<void> {
     this.assertReady(); await this.scratchLeases.release(sessionId, { ...options, timeoutMs: options.timeoutMs ?? 5_000 });
   }
+  protected async repositoryOperation(
+    method: RepositoryOperationMethod,
+    request: unknown,
+    options: BrokerRequestOptions = {}
+  ): Promise<unknown> {
+    this.assertReady();
+    return await invokeBrokerClientRepositoryOperation(
+      this.transport, this.repositoryEnvironment, method, request, options
+    );
+  }
   async prepareManagedEnvironment(request: ManagedEnvironmentPrepareRequestV1, options: BrokerRequestOptions = {}):
   Promise<ManagedEnvironmentPrepareResultV1> {
     this.assertReady(); return await requestManagedEnvironmentPreparation(this.transport, this.doctorValue, request, options);
   }
   async execute(request: ExecutionRequest, options: BrokerRequestOptions = {}): Promise<ExecutionResult> {
     this.assertReady();
-    assertRequestSandbox(request.policy, this.doctorValue);
-    const timeoutMs = positiveInteger(request.timeoutMs, 120_000, "timeoutMs");
-    const params = {
-      ...requestParams(
-        request,
-        this.options,
-        this.trustedToolchains,
-        verifiedShellExecutables(this.doctorValue),
-        verifiedTargetExecutableEnvironment(this.options.executionBackend, this.doctorValue)
-      ), timeoutMs,
-      ...(request.idleTimeoutMs === undefined ? {} : {
-        idleTimeoutMs: positiveInteger(request.idleTimeoutMs, 30_000, "idleTimeoutMs")
-      })
-    };
-    return await runPostResponseOperation(this.postResponseOperations, async () => {
-      const value = await requestExecutionValue(
-        this.transport, params, options, timeoutMs, async () => await this.closeForActiveOperation()
-      );
-      const decodingError = outputDecodingError(value);
-      if (decodingError) {
-        await rejectUndecodableExecution(
-          this.transport, value, decodingError, async () => await this.closeForActiveOperation()
-        );
-      }
-      const outputArtifacts = await this.outputArtifacts.consume(value.outputArtifacts).catch(
-        async (error: unknown) => await containPostDispatchFailure(
-          error, async () => await this.closeForActiveOperation()
-        )
-      );
-      return decodedExecutionResult(value, this.redactor, outputArtifacts);
-    }, async () => await this.close());
+    return await executeBrokerForeground({
+      transport: this.transport, options: this.options,
+      trustedToolchains: this.trustedToolchains, doctorValue: this.doctorValue,
+      postResponseOperations: this.postResponseOperations,
+      outputArtifacts: this.outputArtifacts, redactor: this.redactor,
+      closeForActiveOperation: async () => await this.closeForActiveOperation(),
+      close: async () => await this.close()
+    }, request, options);
   }
   async spawn(request: ProcessSpawnRequest, options: BrokerRequestOptions = {}): Promise<ProcessHandle> {
     this.assertReady();

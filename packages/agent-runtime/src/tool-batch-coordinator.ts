@@ -348,7 +348,12 @@ export class ToolBatchCoordinator {
       ...durableToolReceipt(receipt), name, ...turnPayload(modelTurn)
     });
     for (const evidence of receipt.evidence ?? []) {
-      await this.options.emit(session, "evidence.recorded", "tool", evidence);
+      await this.options.emit(
+        session,
+        "evidence.recorded",
+        evidence.producer.authority === "runtime" ? "runtime" : "tool",
+        evidence
+      );
     }
     await this.options.emit(session, "diagnostic", "runtime", {
       kind: "tool.batch_settled",

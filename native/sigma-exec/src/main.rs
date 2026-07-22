@@ -9,6 +9,8 @@ mod output_artifact;
 mod platform;
 mod process;
 mod protocol;
+mod repository_lease;
+mod repository_transaction;
 mod sandbox;
 mod scratch;
 #[cfg(target_os = "linux")]
@@ -20,6 +22,13 @@ use output_artifact::RedactionSecret;
 use process::{BrokerState, CancelParams, HandleParams, ReleaseArtifactParams, WriteParams};
 use protocol::{
     PROTOCOL_VERSION, Request, RpcError, SharedWriter, read_request, send_error, send_result,
+};
+use repository_lease::AcquireRepositoryMetadataLeaseParams;
+use repository_transaction::{
+    AcquireRepositoryTransactionLeaseParams, BeginRepositoryTransactionParams,
+    BoundRepositoryTransactionParams, ContinueRepositoryTransactionParams,
+    RecoverRepositoryTransactionsParams, ReleaseRepositoryRunBaselineParams,
+    RestoreRepositoryRunBaselineParams,
 };
 use sandbox::ProcessParams;
 use scratch::{AcquireScratchLeaseParams, ReleaseScratchLeaseParams};
@@ -77,6 +86,62 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
         "sandbox.revoke" => {
             let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox revoke params")?;
             sandbox::revoke_sandbox(&params.workspace_path)
+        }
+        "repositoryMetadata.acquire" => {
+            state.acquire_repository_metadata_lease(decode::<AcquireRepositoryMetadataLeaseParams>(
+                request.params,
+                "repository metadata lease params",
+            )?)
+        }
+        "repositoryTransaction.acquire" => state.acquire_repository_transaction_lease(decode::<
+            AcquireRepositoryTransactionLeaseParams,
+        >(
+            request.params,
+            "repository transaction lease params",
+        )?),
+        "repositoryTransaction.begin" => state.begin_repository_transaction(
+            request.request_id,
+            decode::<BeginRepositoryTransactionParams>(
+                request.params,
+                "repository transaction begin params",
+            )?,
+        ),
+        "repositoryTransaction.continue" => state.continue_repository_transaction(
+            request.request_id,
+            decode::<ContinueRepositoryTransactionParams>(
+                request.params,
+                "repository transaction continue params",
+            )?,
+        ),
+        "repositoryTransaction.abort" => {
+            state.abort_repository_transaction(decode::<BoundRepositoryTransactionParams>(
+                request.params,
+                "repository transaction abort params",
+            )?)
+        }
+        "repositoryTransaction.recover" => {
+            state.recover_repository_transactions(decode::<RecoverRepositoryTransactionsParams>(
+                request.params,
+                "repository transaction recovery params",
+            )?)
+        }
+        "repositoryTransaction.seal" => {
+            state.seal_repository_transaction(decode::<BoundRepositoryTransactionParams>(
+                request.params,
+                "repository transaction seal params",
+            )?)
+        }
+        "repositoryRunBaseline.restore" => {
+            state.restore_repository_run_baseline(decode::<RestoreRepositoryRunBaselineParams>(
+                request.params,
+                "repository run baseline restore params",
+            )?)
+        }
+        "repositoryRunBaseline.release" => {
+            state.release_repository_run_baseline(decode::<ReleaseRepositoryRunBaselineParams>(
+                request.params,
+                "repository run baseline release params",
+            )?)
         }
         "scratch.acquire" => state.acquire_scratch_lease(decode::<AcquireScratchLeaseParams>(
             request.params,
@@ -325,8 +390,10 @@ fn main() {
             continue;
         }
         if request.method == "shutdown" {
-            send_result(&writer, request.request_id, json!({ "shutdown": true }));
-            state.shutdown();
+            match state.shutdown() {
+                Ok(()) => send_result(&writer, request.request_id, json!({ "shutdown": true })),
+                Err(error) => send_error(&writer, request.request_id, error),
+            }
             thread::sleep(Duration::from_millis(100));
             return;
         }
@@ -338,7 +405,7 @@ fn main() {
         let request_writer = writer.clone();
         thread::spawn(move || handle_request(request_state, request_writer, request));
     }
-    state.shutdown();
+    let _ = state.shutdown();
 }
 
 #[cfg(test)]

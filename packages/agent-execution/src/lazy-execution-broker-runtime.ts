@@ -6,6 +6,7 @@ import { isSecretEnvironmentKey } from "./environment.js";
 import { BrokerToolchainUnavailableError } from "./errors.js";
 import { resolvePortableNodeExecutable, resolveSigmaExecBinary } from "./paths.js";
 import { trustedToolchainCommandAliases } from "./trusted-toolchains.js";
+import { repositoryBrokerCapabilities } from "./repository-broker-forwarding.js";
 import type {
   BrokerDoctorReport,
   BrokerRequestOptions,
@@ -131,6 +132,7 @@ export function withTrustedRuntimeCapabilities(
       releaseScratchLease: async (sessionId: string, options?: BrokerRequestOptions): Promise<void> =>
         await broker.releaseScratchLease!(sessionId, options)
     } : {}),
+    ...repositoryBrokerCapabilities(broker),
     execute: async (request: ExecutionRequest, options) => await broker.execute(request, options),
     spawn: async (request: ProcessSpawnRequest, options) => await broker.spawn(request, options),
     poll: async (handle, options): Promise<ProcessPollResult> => await broker.poll(handle, options),

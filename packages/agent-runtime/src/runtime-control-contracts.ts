@@ -1,5 +1,6 @@
 import type { CheckpointManager, CheckpointRecord } from "agent-checkpoint";
 import type { SkillCatalog, SkillExecutionManifest } from "agent-extensions";
+import type { ProcessExecutionPort } from "agent-platform";
 import type { CheckpointRef, LoadedSkillResourceAccess, PlanGraph } from "agent-protocol";
 import type { BudgetController } from "./budget-controller.js";
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
@@ -7,6 +8,7 @@ import type { RuntimeSession } from "./types.js";
 
 export interface RuntimeControlServiceOptions {
   checkpoints: CheckpointManager;
+  execution?: ProcessExecutionPort;
   emit: RuntimeEventEmitter;
   skills?: SkillCatalog;
   createArtifact(sessionId: string, content: string | Uint8Array): Promise<string>;

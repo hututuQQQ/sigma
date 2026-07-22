@@ -103,6 +103,21 @@ function readOnlyValidationWorkspaceRoot(policy: ExecutionPolicy): string | unde
   return path.resolve(value);
 }
 
+function repositoryMetadataLeaseId(policy: ExecutionPolicy): string | undefined {
+  const lease = policy.repositoryMetadataLease;
+  if (lease === undefined) return undefined;
+  if (lease.protocolVersion !== 1 || lease.uses !== 1 || lease.network !== "none"
+    || policy.network !== "none" || !lease.leaseId
+    || !/^[a-f0-9]{64}$/u.test(lease.executableSha256)) {
+    throw new BrokerPolicyError("repositoryMetadataLease is invalid or not local-only.");
+  }
+  if (policy.disposableWorkspaceRoot !== undefined
+    || policy.readOnlyValidationWorkspaceRoot !== undefined) {
+    throw new BrokerPolicyError("Repository metadata leases cannot be combined with validation workspace projection.");
+  }
+  return lease.leaseId;
+}
+
 function scratchLeaseCapability(policy: ExecutionPolicy): {
   scratchLeaseId: string;
   scratchSessionId: string;
@@ -197,6 +212,7 @@ function wirePolicy(
   const backend = options.executionBackend ?? "native";
   const disposableRoot = disposableWorkspaceRoot(policy);
   const readOnlyValidationRoot = readOnlyValidationWorkspaceRoot(policy);
+  const repositoryLeaseId = repositoryMetadataLeaseId(policy);
   const scratchLease = scratchLeaseCapability(policy);
   const resolvedExecutionRoots = executionRoots(command, policy, toolchains, verifiedExecutables, backend);
   const runtimeRoots = toolchains
@@ -237,6 +253,9 @@ function wirePolicy(
     ...(disposableRoot === undefined ? {} : { disposableWorkspaceRoot: disposableRoot }),
     ...(readOnlyValidationRoot === undefined ? {} : {
       readOnlyValidationWorkspaceRoot: readOnlyValidationRoot
+    }),
+    ...(repositoryLeaseId === undefined ? {} : {
+      repositoryMetadataLeaseId: repositoryLeaseId
     }),
     ...(scratchLease ?? {})
   };

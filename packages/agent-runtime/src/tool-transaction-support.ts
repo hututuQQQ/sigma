@@ -11,6 +11,7 @@ import { mutatingPlan, turnPayload, type ToolAttempt } from "./effect-runner-hel
 import type { RuntimeSession } from "./types.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import { assertReceiptWithinPlan } from "./tool-plan-enforcement.js";
+import { toolTaskControlContext } from "./repository-recovery-context.js";
 
 interface NoChangePreparedTool {
   call: ModelToolCall;
@@ -58,6 +59,7 @@ async function probeNoChange(
     runId: session.durable.runId,
     workspacePath: session.identity.workspacePath,
     runMode: session.durable.mode,
+    ...toolTaskControlContext(session),
     runtimeControl: options.control.forSession(session),
     signal,
     callPlan: plan
@@ -101,6 +103,11 @@ export async function settleNoChangeProbe(
     sessionId: session.identity.sessionId,
     runId: session.durable.runId,
     workspaceDeltas: []
+    , repositoryScope: {
+      goalEpoch: session.durable.state.taskControl.goalEpoch,
+      frontier: session.durable.state.mutationFrontier,
+      mutationEvidence: [...session.durable.state.mutationEvidence]
+    }
   });
   await options.emit(session, "execution.completed", "runtime", {
     executionId: call.id,
@@ -114,7 +121,9 @@ export async function createMutationCheckpoint(
   session: RuntimeSession,
   plan: ToolCallPlan
 ): Promise<CheckpointRef | undefined> {
-  if (plan.checkpointAction) return undefined;
+  if (plan.checkpointAction || plan.mutationAuthority === "broker_repository_transaction_v2") {
+    return undefined;
+  }
   if (!mutatingPlan(plan) || delegatesWorkspaceMutation(plan)) return undefined;
   const scope = plan.checkpointScope.length > 0 ? plan.checkpointScope : ["."];
   return await options.control.createCheckpoint(session, scope);

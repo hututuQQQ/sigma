@@ -56,6 +56,7 @@ export const toolCallPlanSchema = z.object({
     kind: z.literal("restore"),
     checkpointId: nonEmptyStringSchema
   }).strict().optional(),
+  mutationAuthority: z.literal("broker_repository_transaction_v2").optional(),
   idempotence: z.enum(["read_only", "replay_safe", "non_replayable"]),
   executionIntent: z.object({
     invocation: z.object({

@@ -78,10 +78,16 @@ pub struct ExecutionPolicy {
     pub disposable_workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub read_only_validation_workspace_root: Option<PathBuf>,
+    /** One-use broker capability. Cleared and consumed before launch. */
+    #[serde(default)]
+    pub repository_metadata_lease_id: Option<String>,
     #[serde(default)]
     pub scratch_lease_id: Option<String>,
     #[serde(default)]
     pub scratch_session_id: Option<String>,
+    /** Broker-populated exact metadata roots authorized by the consumed lease. */
+    #[serde(default)]
+    pub repository_metadata_roots: Vec<PathBuf>,
     /** Broker-populated scratch roots. Request payloads are cleared before use. */
     #[serde(default)]
     pub session_scratch_roots: Vec<PathBuf>,
@@ -760,6 +766,14 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
         .as_ref()
         .or(params.policy.read_only_validation_workspace_root.as_ref())
     {
+        if params.policy.repository_metadata_lease_id.is_some()
+            || !params.policy.repository_metadata_roots.is_empty()
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "repository metadata leases cannot be combined with isolated validation",
+            ));
+        }
         let validation_root = canonicalize_sandbox_root(validation_root)?;
         let scratch_roots = canonical_roots(&params.policy.session_scratch_roots)?;
         if write_roots.iter().any(|root| {
@@ -802,7 +816,9 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        if name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".agent") {
+        if (name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".agent"))
+            && !metadata_path_authorized(write_root, &params.policy.repository_metadata_roots)
+        {
             return Err(RpcError::new(
                 "policy_denied",
                 "metadata directories cannot be writable roots",
@@ -840,6 +856,9 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
             ));
         }
         let canonical = canonicalize_allow_missing(protected)?;
+        if metadata_path_authorized(&canonical, &params.policy.repository_metadata_roots) {
+            continue;
+        }
         if !all_roots.iter().any(|root| canonical.starts_with(root)) {
             return Err(RpcError::new(
                 "policy_denied",
@@ -873,6 +892,9 @@ fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, Rpc
     let mut resolved = BTreeMap::<String, PathBuf>::new();
     for candidate in candidates {
         let canonical = canonicalize_allow_missing(&candidate)?;
+        if metadata_path_authorized(&canonical, &params.policy.repository_metadata_roots) {
+            continue;
+        }
         let key = if cfg!(windows) {
             canonical.to_string_lossy().to_lowercase()
         } else {
@@ -881,6 +903,10 @@ fn protected_path_candidates(params: &ProcessParams) -> Result<Vec<PathBuf>, Rpc
         resolved.entry(key).or_insert(canonical);
     }
     Ok(resolved.into_values().collect())
+}
+
+fn metadata_path_authorized(path: &Path, metadata_roots: &[PathBuf]) -> bool {
+    metadata_roots.iter().any(|root| path.starts_with(root))
 }
 
 fn guard_token() -> String {
@@ -1679,6 +1705,12 @@ fn resolve_protected(
             continue;
         }
         let source = ResolvedMountSource::resolve(&item)?;
+        if metadata_path_authorized(
+            source.destination(),
+            &params.policy.repository_metadata_roots,
+        ) {
+            continue;
+        }
         if !read_roots
             .iter()
             .any(|root| source.destination().starts_with(root.destination()))
@@ -2000,6 +2032,8 @@ mod tests {
                 scratch_lease_id: None,
                 scratch_session_id: None,
                 session_scratch_roots: Vec::new(),
+                repository_metadata_lease_id: None,
+                repository_metadata_roots: Vec::new(),
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },

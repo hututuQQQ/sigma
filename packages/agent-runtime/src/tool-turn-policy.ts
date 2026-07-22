@@ -60,7 +60,8 @@ function baseDescriptorAllowedForRepair(
     case "none":
     case "focused": return descriptor.name !== "environment_prepare";
     case "generic_repair": return descriptor.possibleEffects.some((effect) =>
-      effect === "filesystem.write" || effect === "validation" || terminalEffect(effect));
+      effect === "filesystem.write" || effect === "repository.write"
+        || effect === "validation" || terminalEffect(effect));
     case "completion_evidence":
       return descriptor.name === "validate" || descriptor.name === "request_review"
         || descriptor.possibleEffects.includes("filesystem.read");
@@ -95,7 +96,8 @@ function baseEffectsAllowedForRepair(
     case "none":
     case "focused": return true;
     case "generic_repair": return effects.some((effect) =>
-      effect === "filesystem.write" || effect === "validation" || terminalEffect(effect));
+      effect === "filesystem.write" || effect === "repository.write"
+        || effect === "validation" || terminalEffect(effect));
     case "completion_evidence":
       return effects.includes("validation") || effects.includes("filesystem.read")
         || effects.includes("runtime.control");

@@ -37,6 +37,9 @@ export interface ExecutionPolicy {
   /** Explicit fallback for targets without same-path COW. The broker executes
    * at the real path with read-only workspace access and writable scratch. */
   readOnlyValidationWorkspaceRoot?: string;
+  /** Broker-issued one-use capability for an exact local Git executable and
+   * canonical repository topology. Model/tool arguments cannot mint it. */
+  repositoryMetadataLease?: RepositoryMetadataLeaseV1;
   /** Runtime-only broker capability. Tool/model arguments cannot construct or
    * select its host paths or lease id. */
   scratchLease?: ScratchLeaseV1;
@@ -272,7 +275,7 @@ export interface BrokerRequestOptions {
   timeoutMs?: number;
 }
 
-export interface ExecutionBroker {
+export interface ExecutionBroker extends RepositoryExecutionBroker {
   readonly lostProcessHandles: readonly ProcessHandle[];
   connect(signal?: AbortSignal): Promise<BrokerDoctorReport>;
   doctor(signal?: AbortSignal): Promise<BrokerDoctorReport>;
@@ -338,6 +341,8 @@ export interface SigmaExecBrokerClientOptions {
 }
 import type { Duplex } from "node:stream";
 import type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+import type { RepositoryMetadataLeaseV1 } from "./repository-metadata-lease-types.js";
+import type { RepositoryExecutionBroker } from "./repository-execution-broker.js";
 import type {
   ManagedEnvironmentPrepareRequestV1,
   ManagedEnvironmentPrepareResultV1
@@ -351,6 +356,28 @@ import type {
   TrustedManagedContainerAttestationV1
 } from "./container-types.js";
 export type { ScratchLeaseRequestV1, ScratchLeaseV1 } from "./scratch-lease-types.js";
+export type {
+  RepositoryMetadataLeaseRequestV1,
+  RepositoryMetadataLeaseV1
+} from "./repository-metadata-lease-types.js";
+export type {
+  RepositoryExpectedPostconditionsV3,
+  RepositoryOperationV2,
+  RepositoryRunBaselineLeaseV1,
+  RepositoryRunBaselineBoundRequestV1,
+  RepositoryRunBaselineRequestV1,
+  RepositoryRunBaselineResultV1,
+  RepositorySemanticAssertionsV3,
+  RepositoryTargetAssertionsV3,
+  RepositoryTransactionBeginRequestV2,
+  RepositoryTransactionBoundRequestV2,
+  RepositoryTransactionContinueRequestV2,
+  RepositoryTransactionLeaseRequestV2,
+  RepositoryTransactionLeaseV2,
+  RepositoryTransactionRecoverRequestV2,
+  RepositoryTransactionResultV2,
+  RepositoryTransactionResultV3
+} from "./repository-transaction-types.js";
 export type {
   BrokerContainerReport,
   BrokerRuntimeClosureV1,

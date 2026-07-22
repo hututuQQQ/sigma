@@ -1,10 +1,13 @@
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutionBroker } from "../packages/agent-execution/src/index.js";
-import type { AgentEventEnvelope } from "../packages/agent-protocol/src/index.js";
+import type { AgentEventEnvelope, RepositoryDeltaEvidence } from "../packages/agent-protocol/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
+import { releaseRepositoryRunBaselines } from "../packages/agent-runtime/src/runtime-restoration-control.js";
+import { repositoryTransactionTool } from "../packages/agent-runtime/src/repository-transaction-tool.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
 import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tools/src/index.js";
 import {
@@ -13,6 +16,17 @@ import {
   fakeFinalTurn,
   SmokeFakeGateway
 } from "../scripts/smoke-fake-model.mjs";
+import { createHostExecutionBroker } from "./helpers/host-execution-broker.js";
+import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
+
+function git(repository: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: repository,
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  }).trim();
+}
 
 async function events(store: SegmentedJsonlStore, sessionId: string): Promise<AgentEventEnvelope[]> {
   const result: AgentEventEnvelope[] = [];
@@ -21,6 +35,57 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
 }
 
 describe("restore_run_changes transaction control", () => {
+  it("releases each broker-held run baseline once when the runtime session is released", async () => {
+    const workspace = path.resolve(await mkdtemp(path.join(os.tmpdir(), "sigma-baseline-release-")));
+    const repositoryDelta: RepositoryDeltaEvidence = {
+      evidenceId: "repository-delta",
+      sessionId: "session",
+      runId: "run",
+      kind: "repository_delta",
+      status: "passed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      producer: { authority: "tool", id: "git-call" },
+      summary: "repository changed",
+      data: {
+        repositoryRoot: ".",
+        operationCount: 1,
+        operations: ["commit"],
+        beforeStateDigest: "a".repeat(64),
+        afterStateDigest: "b".repeat(64),
+        headBefore: null,
+        headAfter: "1".repeat(40),
+        refsBeforeDigest: "c".repeat(64),
+        refsAfterDigest: "d".repeat(64),
+        indexBeforeDigest: "e".repeat(64),
+        indexAfterDigest: "f".repeat(64),
+        reachableObjectsBefore: 0,
+        reachableObjectsAfter: 1
+      }
+    };
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    active.durable.state.evidence = [repositoryDelta];
+    active.durable.state.mutationEvidence = [repositoryDelta];
+    const requests: unknown[] = [];
+    const execution = {
+      releaseRepositoryRunBaseline: async (request: unknown) => {
+        requests.push(request);
+        return {
+          protocolVersion: 1 as const,
+          status: "released" as const,
+          baselineId: "baseline",
+          sessionId: "session",
+          runId: "run",
+          repositoryRoot: workspace
+        };
+      }
+    } as unknown as ExecutionBroker;
+
+    await releaseRepositoryRunBaselines(execution, active);
+    expect(requests).toEqual([expect.objectContaining({
+      sessionId: "session", runId: "run", repositoryRoot: workspace
+    })]);
+  });
+
   it("restores every current-run checkpoint as one baseline transaction and completes from restoration evidence", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-restore-run-group-"));
     const workspace = path.join(root, "workspace");
@@ -56,7 +121,72 @@ describe("restore_run_changes transaction control", () => {
       type: "evidence.recorded",
       payload: expect.objectContaining({ kind: "restoration", status: "passed" })
     }));
-  });
+  }, 30_000);
+
+  it("restores broker-held repository metadata before confirming the run baseline", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-restore-repository-"));
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    git(workspace, ["init", "-q", "--initial-branch=main"]);
+    git(workspace, ["config", "user.email", "sigma@example.invalid"]);
+    git(workspace, ["config", "user.name", "Sigma"]);
+    await writeFile(path.join(workspace, "state.txt"), "baseline", "utf8");
+    git(workspace, ["add", "state.txt"]);
+    git(workspace, ["commit", "-qm", "baseline"]);
+    const baselineHead = git(workspace, ["rev-parse", "HEAD"]);
+    const storeRootDir = path.join(root, "state");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const broker = createHostExecutionBroker();
+    const tools = registerBuiltinTools(new EffectToolRegistry(), { broker });
+    tools.register(repositoryTransactionTool(broker));
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([
+        fakeToolTurn([fakeToolCall("write", "write", {
+          path: "state.txt", content: "temporary"
+        })]),
+        fakeToolTurn([fakeToolCall("commit", "git_transaction", {
+          operations: [
+            { op: "add", paths: ["state.txt"] },
+            { op: "commit", message: "temporary" }
+          ]
+        })]),
+        fakeToolTurn([fakeToolCall("restore", "restore_run_changes", {})]),
+        fakeFinalTurn("All workspace and repository changes were restored.")
+      ]),
+      tools,
+      execution: broker,
+      store,
+      storeRootDir,
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+    await runtime.command({
+      type: "submit",
+      sessionId: session.sessionId,
+      text: "Make a temporary commit and then restore every run change."
+    });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed"
+    });
+    expect(git(workspace, ["rev-parse", "HEAD"])).toBe(baselineHead);
+    expect(git(workspace, ["status", "--porcelain", "--untracked-files=no"])).toBe("");
+    await expect(readFile(path.join(workspace, "state.txt"), "utf8"))
+      .resolves.toBe("baseline");
+    expect(await events(store, session.sessionId)).toContainEqual(expect.objectContaining({
+      type: "evidence.recorded",
+      payload: expect.objectContaining({
+        kind: "restoration",
+        status: "passed",
+        data: expect.objectContaining({
+          repository: expect.objectContaining({ status: "restored" })
+        })
+      })
+    }));
+    await runtime.releaseSession(session.sessionId);
+    await broker.close();
+  }, 60_000);
 
   it("restores the latest mutation from this run without creating a nested checkpoint", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-restore-run-"));

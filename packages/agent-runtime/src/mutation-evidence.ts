@@ -1,12 +1,21 @@
 import { createHash } from "node:crypto";
-import type { EvidenceRecord, ReviewEvidence, ValidationEvidence, WorkspaceDeltaEvidence } from "agent-protocol";
+import type {
+  EvidenceRecord,
+  RepositoryAcceptanceEvidenceV1,
+  ReviewEvidence,
+  ValidationEvidence,
+  WorkspaceDeltaEvidence
+} from "agent-protocol";
 import type { RuntimeSession } from "./types.js";
 import { CHECKPOINT_INTEGRITY_VALIDATOR } from "./validation-policy.js";
 import {
   assurancePathsForClaim, assuranceRequirement, validationClaimSatisfies
 } from "./assurance-engine.js";
 
-const MUTATION_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
+const MUTATION_KINDS = new Set([
+  "workspace_delta", "repository_delta", "repository_acceptance",
+  "validation", "review", "user_waiver"
+]);
 
 export function sessionMutationEvidence(session: RuntimeSession): EvidenceRecord[] {
   const byId = new Map<string, EvidenceRecord>();
@@ -36,22 +45,43 @@ export interface FrontierValidationReadiness {
   ready: boolean;
 }
 
+export function currentRepositoryAcceptance(
+  session: RuntimeSession
+): RepositoryAcceptanceEvidenceV1 | undefined {
+  const frontier = session.durable.state.mutationFrontier;
+  const goalEpoch = session.durable.state.taskControl.goalEpoch;
+  return sessionMutationEvidence(session).filter((item): item is RepositoryAcceptanceEvidenceV1 =>
+    item.kind === "repository_acceptance"
+    && item.status === "passed"
+    && item.data.goalEpoch === goalEpoch
+    && item.data.frontierRevision === frontier.revision
+    && item.data.frontierStateDigest === frontier.currentStateDigest
+    && item.data.repositoryStateDigest === frontier.repositoryStateDigest).at(-1);
+}
+
 export function frontierValidationReadiness(session: RuntimeSession): FrontierValidationReadiness {
   const changed = session.durable.state.mutationFrontier.changedPaths;
   const validations = sessionMutationEvidence(session).filter((item) => isCurrentValidation(session, item));
   const requirement = assuranceRequirement(session);
   const passed = validations.filter((item) => item.status === "passed");
+  const acceptance = currentRepositoryAcceptance(session);
+  const acceptedPaths = new Set(acceptance ? sessionMutationEvidence(session).flatMap((item) =>
+    item.kind === "repository_delta"
+      && item.data.transactionHandle === acceptance.data.transactionHandle
+      ? [".git", ...(item.data.reviewDiffPaths ?? [])] : []) : []);
   const missingClaims = requirement.requiredClaims.filter((required) => {
-    const requiredPaths = assurancePathsForClaim(changed, required);
+    const requiredPaths = assurancePathsForClaim(changed, required)
+      .filter((changedPath) => !acceptedPaths.has(changedPath));
     return requiredPaths.length > 0 && !requiredPaths.every((changedPath) => passed.some((validation) =>
       validationClaimSatisfies(validation.data.claim?.kind, required)
         && validation.data.coveredPaths.includes(changedPath)));
   });
-  const coveredPaths = changed.filter((changedPath) => requirement.requiredClaims.every((required) => {
+  const coveredPaths = changed.filter((changedPath) => acceptedPaths.has(changedPath)
+    || requirement.requiredClaims.every((required) => {
     if (!assurancePathsForClaim([changedPath], required).includes(changedPath)) return true;
     return passed.some((validation) => validationClaimSatisfies(validation.data.claim?.kind, required)
       && validation.data.coveredPaths.includes(changedPath));
-  }));
+    }));
   const missingPaths = changed.filter((path) => !coveredPaths.includes(path));
   const latestFailed = [...validations].reverse().find((item) => item.status === "failed"
     && requirement.requiredClaims.some((required) =>
@@ -117,8 +147,38 @@ export function currentFrontierReview(
  * contribute a path to the current final frontier are returned. */
 export function unresolvedWorkspaceDeltas(session: RuntimeSession): WorkspaceDeltaEvidence[] {
   const changed = new Set(session.durable.state.mutationFrontier.changedPaths);
-  return sessionMutationEvidence(session).filter((item): item is WorkspaceDeltaEvidence =>
+  const evidence = sessionMutationEvidence(session);
+  const workspace = evidence.filter((item): item is WorkspaceDeltaEvidence =>
     item.kind === "workspace_delta" && item.status === "passed"
     && [...item.data.delta.added, ...item.data.delta.modified, ...item.data.delta.deleted]
       .some((path) => changed.has(path)));
+  const repositories = evidence.flatMap((item): WorkspaceDeltaEvidence[] => {
+    if (item.kind !== "repository_delta" || item.status !== "passed") return [];
+    const delta = item.data.worktreeDelta ?? { added: [], modified: [".git"], deleted: [] };
+    const paths = [...delta.added, ...delta.modified, ...delta.deleted];
+    if (!paths.some((changedPath) => changed.has(changedPath))) return [];
+    const semanticSummary = JSON.stringify({
+      operations: item.data.operations,
+      headBefore: item.data.headBefore,
+      headAfter: item.data.headAfter,
+      semanticAssertions: item.data.semanticAssertions ?? null
+    }, null, 2);
+    return [{
+      evidenceId: `repository-review:${item.evidenceId}`,
+      sessionId: item.sessionId,
+      runId: item.runId,
+      kind: "workspace_delta",
+      status: "passed",
+      createdAt: item.createdAt,
+      producer: { authority: "runtime", id: item.evidenceId },
+      summary: "Broker-journaled repository transaction review projection.",
+      data: {
+        delta,
+        checkpointId: item.data.transactionHandle ?? item.evidenceId,
+        reviewDiff: item.data.reviewDiff ?? semanticSummary,
+        reviewDiffPaths: item.data.reviewDiffPaths ?? paths
+      }
+    }];
+  });
+  return [...workspace, ...repositories];
 }

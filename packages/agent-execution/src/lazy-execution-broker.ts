@@ -11,8 +11,13 @@ import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult,
   ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
-  ScratchLeaseRequestV1, ScratchLeaseV1
+  ScratchLeaseRequestV1, ScratchLeaseV1,
 } from "./types.js";
+import {
+  invokeRepositoryOperation,
+  RepositoryExecutionBrokerBase,
+  type RepositoryOperationMethod
+} from "./repository-execution-broker-base.js";
 import type {
   BrokerGeneration, ConnectedGeneration, GenerationResult, LazyExecutionBrokerOptions
 } from "./lazy-execution-broker-types.js";
@@ -26,7 +31,7 @@ export type { LazyExecutionBrokerOptions } from "./lazy-execution-broker-types.j
  * affected generation; unknown-result operations are never replayed. Calls
  * rejected before dispatch may be retried once on a fresh generation.
  */
-export class LazyExecutionBroker implements ExecutionBroker {
+export class LazyExecutionBroker extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private readonly createClient: () => ExecutionBroker;
   private readonly clients = new WeakSet<ExecutionBroker>();
   private readonly processHandles = new LazyExecutionHandleRegistry();
@@ -38,6 +43,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
   private closed = false;
 
   constructor(options: LazyExecutionBrokerOptions) {
+    super();
     this.createClient = options.clientFactory ?? defaultBrokerClientFactory(options);
     this.generation = this.newGeneration();
   }
@@ -46,10 +52,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
     this.captureLost(this.generation.client);
     return this.processHandles.lostProcessHandles;
   }
-  async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
-    return (await this.ensureConnected(signal)).report;
-  }
-
+  async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> { return (await this.ensureConnected(signal)).report; }
   async doctor(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     return (await this.invokeFresh((client) => client.doctor(signal), signal)).value;
   }
@@ -87,6 +90,11 @@ export class LazyExecutionBroker implements ExecutionBroker {
     await this.scratchLeases.release(sessionId, async () => {
       await this.invokeFresh((client) => forwardScratchLeaseRelease(client, sessionId, options), options?.signal);
     });
+  }
+  protected async repositoryOperation(method: RepositoryOperationMethod, request: unknown,
+    options?: BrokerRequestOptions): Promise<unknown> {
+    return (await this.invokeFresh((client) => invokeRepositoryOperation(client, method, request, options,
+      "Repository transaction capability is unavailable for this broker."), options?.signal)).value;
   }
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {
     return (await this.invokeFresh((client) => client.execute(request, options), options?.signal)).value;

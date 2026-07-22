@@ -23,6 +23,7 @@ import {
   resolveTaskObligation,
   terminalResolutionObligation
 } from "./task-control.js";
+import { advanceRepositoryEvidenceObligation } from "./repository-task-control.js";
 
 export type KernelEventReducer = (
   state: KernelState,
@@ -33,7 +34,10 @@ export type KernelEventReducer = (
 const TOOL_EVIDENCE_KINDS = new Set([
   "workspace_delta", "repository_delta", "command", "validation", "diagnostic", "input_access"
 ]);
-const MUTATION_EVIDENCE_KINDS = new Set(["workspace_delta", "repository_delta", "validation", "review", "user_waiver"]);
+const MUTATION_EVIDENCE_KINDS = new Set([
+  "workspace_delta", "repository_delta", "repository_acceptance",
+  "validation", "review", "user_waiver"
+]);
 
 function evidenceAuthorityAllowed(event: AgentEventEnvelope, evidence: EvidenceRecord): boolean {
   if (event.type === "review.completed") {
@@ -115,15 +119,21 @@ function applyWorkspaceRestorationEvidence(state: KernelState, evidence: Evidenc
   const data = evidence.data;
   const frontier = state.mutationFrontier;
   const explicitRestore = data.restoredCheckpointIds.length > 0;
+  const repositoryRestored = frontier.repositoryStateDigest === undefined
+    ? data.repository.status === "unchanged"
+    : data.repository.status === "restored" && data.repository.stateDigest !== undefined;
   if (data.goalEpoch !== state.taskControl.goalEpoch
     || data.frontierRevision !== frontier.revision
     || data.frontierStateDigest !== frontier.currentStateDigest
     || data.baselineManifestDigest !== data.currentManifestDigest
     || (!explicitRestore && state.taskControl.goalEpochSource !== "steer")
-    || frontier.repositoryStateDigest !== undefined) return state;
+    || !repositoryRestored) return state;
   return {
     ...state,
     taskControl: resolveTaskObligation(state.taskControl),
+    mutationEvidence: state.mutationEvidence.filter((item) =>
+      item.runId !== evidence.runId
+      || (item.kind !== "repository_delta" && item.kind !== "repository_acceptance")),
     mutationFrontier: {
       revision: frontier.revision + 1,
       baselineManifestDigest: data.currentManifestDigest,
@@ -135,6 +145,8 @@ function applyWorkspaceRestorationEvidence(state: KernelState, evidence: Evidenc
 }
 
 function advanceEvidenceObligation(state: KernelState, evidence: EvidenceRecord): KernelState {
+  const repository = advanceRepositoryEvidenceObligation(state, evidence);
+  if (repository) return repository;
   const obligation = state.taskControl.obligation;
   if (obligation?.kind !== "review_repair") return state;
   if (obligation.stage === "mutate" && evidence.kind === "workspace_delta"

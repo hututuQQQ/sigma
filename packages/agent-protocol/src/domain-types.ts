@@ -26,6 +26,9 @@ import type {
   planGraphSchema,
   reviewEvidenceSchema,
   repositoryDeltaEvidenceSchema,
+  repositoryAcceptanceEvidenceV1Schema,
+  repositoryRecoveryDecisionEvidenceV1Schema,
+  repositoryRecoverySelectionEvidenceV1Schema,
   usageRecordSchema,
   userWaiverEvidenceSchema,
   workspaceRestorationEvidenceV1Schema,
@@ -57,6 +60,13 @@ export type CheckpointDelta = z.infer<typeof checkpointDeltaSchema>;
 export type OpaqueArtifactEvidence = z.infer<typeof opaqueArtifactEvidenceSchema>;
 export type WorkspaceDeltaEvidence = z.infer<typeof workspaceDeltaEvidenceSchema>;
 export type RepositoryDeltaEvidence = z.infer<typeof repositoryDeltaEvidenceSchema>;
+export type RepositoryRecoverySelectionEvidenceV1 = z.infer<
+  typeof repositoryRecoverySelectionEvidenceV1Schema
+>;
+export type RepositoryRecoveryDecisionEvidenceV1 = z.infer<
+  typeof repositoryRecoveryDecisionEvidenceV1Schema
+>;
+export type RepositoryAcceptanceEvidenceV1 = z.infer<typeof repositoryAcceptanceEvidenceV1Schema>;
 export type MutationFrontier = z.infer<typeof mutationFrontierSchema>;
 export type CommandEvidence = z.infer<typeof commandEvidenceSchema>;
 export type ValidationEvidence = z.infer<typeof validationEvidenceSchema>;

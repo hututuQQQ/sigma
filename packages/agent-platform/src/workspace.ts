@@ -11,6 +11,42 @@ export interface RepositoryTopologyV1 {
   trust: "workspace" | "external_trusted" | "external_untrusted";
 }
 
+/**
+ * Resolve only filesystem-declared Git topology. This is a capability request,
+ * not authorization: callers must bind every returned path into a broker-issued
+ * metadata lease before starting Git.
+ */
+export async function repositoryMetadataTopologyCandidate(
+  workspace: string
+): Promise<RepositoryTopologyV1 | null> {
+  const root = await realpath(path.resolve(workspace));
+  const markerPath = path.join(root, ".git");
+  const marker = await lstat(markerPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!marker) return await bareRepositoryTopology(root);
+  if (marker.isSymbolicLink() || (!marker.isDirectory() && !marker.isFile())) {
+    throw Object.assign(new Error("Git metadata marker must be a stable directory or gitdir file."), {
+      code: "git_probe_failed"
+    });
+  }
+  if (marker.isDirectory()) {
+    const gitDir = await realpath(markerPath);
+    const commonDir = await commonGitDirectory(gitDir);
+    return {
+      kind: "worktree",
+      worktreeRoot: root,
+      gitDir,
+      commonDir,
+      objectDirs: [path.join(commonDir, "objects")],
+      trust: isInside(root, gitDir) && isInside(root, commonDir)
+        ? "workspace" : "external_untrusted"
+    };
+  }
+  return await indirectRepositoryTopology(root, markerPath, true);
+}
+
 export function isInside(parent: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));

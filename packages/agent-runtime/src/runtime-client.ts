@@ -11,7 +11,7 @@ import { waitForSessionIdleOutcome, waitForSessionOutcome } from "./runtime-wait
 import type { RuntimeOptions, RuntimeSession } from "./types.js";
 import { releaseRuntimeSession } from "./release-session.js";
 import { BudgetController } from "./budget-controller.js";
-import { RuntimeControlService } from "./runtime-control.js";
+import type { RuntimeControlService } from "./runtime-control.js";
 import { ModelReviewer } from "./reviewer.js";
 import { handleChildEvent } from "./child-event-handler.js";
 import { reconcileInterruptedChildren } from "./durable-children.js";
@@ -30,11 +30,12 @@ import { RuntimeCheckpointCoordinator } from "./runtime-checkpoint-coordinator.j
 import { assertProfileResources, constrainBudget, resolveChildProfile, roleForMode, type SessionProfileSelection } from "./session-profile.js";
 import { createCheckpointManager } from "./runtime-checkpoint-manager.js";
 import type { CheckpointManager } from "agent-checkpoint";
-import { FrozenSkillMaterializer } from "./frozen-skill-assets.js";
 import { ChildCheckpointRecoveryCoordinator } from "./child-workspace-recovery.js";
 import { ManagedSessionLifecycle } from "./managed-session-lifecycle.js";
 import { createProductionProfileRunner } from "./production-profile-runner.js";
 import { resumeRuntimeSession } from "./runtime-session-resume.js";
+import { createRuntimeControlService } from "./create-runtime-control.js";
+import { releaseRepositoryRunBaselines } from "./runtime-restoration-control.js";
 export class InProcessRuntimeClient implements RuntimeClient {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly artifacts: ContentAddressedArtifactStore;
@@ -90,20 +91,12 @@ export class InProcessRuntimeClient implements RuntimeClient {
       async (session, type, authority, value) => await this.emit(session, type, authority, value)
     );
     this.checkpointManager = testing.checkpointManager ?? createCheckpointManager(options);
-    this.control = new RuntimeControlService({
+    this.control = createRuntimeControlService(options, {
       checkpoints: this.checkpointManager,
-      skills: options.skills,
       budgets: this.budgets,
-      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
-      createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
-      readArtifact: async (sessionId, artifactId) => (await this.artifacts.get(sessionId, artifactId)).toString("utf8"),
-      hasActiveChildren: options.hasActiveChildren,
-      skillMaterializer: new FrozenSkillMaterializer(options.storeRootDir, this.artifacts),
-      planChanged: async (session, previousRevision, plan) => {
-        await this.hooks.dispatch(session, "plan_changed", {
-          previousRevision, plan, source: "tool"
-        }, session.execution.controller?.signal ?? new AbortController().signal);
-      }
+      artifacts: this.artifacts,
+      hooks: this.hooks,
+      emit: async (session, type, authority, value) => await this.emit(session, type, authority, value)
     });
     this.effects = new EffectRunner({
       runtime: options,
@@ -285,6 +278,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
     if (!session || !await releaseRuntimeSession(session,
       async () => await this.effects.waitForQuiescence(sessionId),
       async () => {
+        await releaseRepositoryRunBaselines(this.options.execution, session);
         await this.managedSessions.release(sessionId);
         await this.commandBus.release(sessionId);
       })) return;
@@ -376,6 +370,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       );
     }
     await recoverInterruptedSession(session, {
+      execution: this.options.execution,
       descriptors: this.options.tools.descriptors(),
       emit: async (type, authority, payload) => await this.emit(session, type, authority, payload),
       settleToolBudget: async (callId, disposition, checkpointId) =>

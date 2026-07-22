@@ -3,6 +3,7 @@ import { protocolRecord } from "./protocol.js";
 import { booleanValue, stringValue } from "./broker-value-primitives.js";
 import {
   BROKER_PROTOCOL_VERSION,
+  type RepositoryMetadataLeaseV1,
   type ScratchLeaseV1,
   type ProcessLaunchFailureV1,
   type ProcessState
@@ -198,6 +199,33 @@ export function parseSpawnedProcess(input: unknown): { id: string; systemProcess
     throw new BrokerProtocolError("Process processId must be a positive integer when present.");
   }
   return { id, ...(processId === undefined ? {} : { systemProcessId: processId as number }) };
+}
+
+export function parseRepositoryMetadataLease(input: unknown): RepositoryMetadataLeaseV1 {
+  const value = protocolRecord(input, "Repository metadata lease");
+  if (value.protocolVersion !== 1 || value.network !== "none" || value.uses !== 1) {
+    throw new BrokerProtocolError("Repository metadata lease has unsupported semantics.");
+  }
+  const lease = {
+    protocolVersion: 1 as const,
+    leaseId: stringValue(value.leaseId, "Repository metadata leaseId"),
+    repositoryRoot: stringValue(value.repositoryRoot, "Repository metadata repositoryRoot"),
+    gitDir: stringValue(value.gitDir, "Repository metadata gitDir"),
+    commonDir: stringValue(value.commonDir, "Repository metadata commonDir"),
+    executable: stringValue(value.executable, "Repository metadata executable"),
+    executableSha256: stringValue(value.executableSha256, "Repository metadata executableSha256"),
+    network: "none" as const,
+    uses: 1 as const
+  };
+  if (Object.values(lease).some((item) => typeof item === "string" && item.length === 0)) {
+    throw new BrokerProtocolError("Repository metadata lease is incomplete.");
+  }
+  if (!/^[a-f0-9]{64}$/u.test(lease.executableSha256)) {
+    throw new BrokerProtocolError(
+      "Repository metadata executableSha256 must be a lowercase SHA-256 digest."
+    );
+  }
+  return lease;
 }
 
 export function parseProcessHandoff(input: unknown): { handoffId: string; systemProcessId?: number } {

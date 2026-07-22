@@ -48,13 +48,18 @@ import type {
   ProcessSpawnRequest,
   ScratchLeaseRequestV1, ScratchLeaseV1
 } from "./types.js";
+import {
+  invokeRepositoryOperation,
+  RepositoryExecutionBrokerBase,
+  type RepositoryOperationMethod
+} from "./repository-execution-broker-base.js";
 
 export const OWNED_OCI_HELPER_TARGET = "/opt/sigma-helper/sigma-exec";
 export const OWNED_OCI_SANDBOX_HELPER_TARGET = "/usr/local/bin/bwrap";
 export type { OwnedContainerExecutionBrokerOptions } from "./owned-container-broker-support.js";
 
 /** Owns exactly one digest-pinned OCI target and its sigma-exec connection. */
-export class OwnedContainerExecutionBroker implements ExecutionBroker {
+export class OwnedContainerExecutionBroker extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private readonly targetName: string;
   private readonly proofLabels: Record<string, string>;
   private readonly clientFactory: (stream: Duplex, artifactParent: string) => ExecutionBroker;
@@ -71,6 +76,7 @@ export class OwnedContainerExecutionBroker implements ExecutionBroker {
   private retired = false;
 
   constructor(private readonly options: OwnedContainerExecutionBrokerOptions) {
+    super();
     ownedContainerImageDigest(options.config.image);
     if (!path.isAbsolute(options.workspace) || !path.isAbsolute(options.helperPath)
       || !path.isAbsolute(options.sandboxHelperPath)) {
@@ -144,6 +150,18 @@ export class OwnedContainerExecutionBroker implements ExecutionBroker {
       throw new ContainerUnavailableError("Owned OCI RuntimeSession scratch lease release is unavailable.");
     }
     await this.guard(() => client.releaseScratchLease!(sessionId, options));
+  }
+
+  protected async repositoryOperation(
+    method: RepositoryOperationMethod,
+    request: unknown,
+    options?: BrokerRequestOptions
+  ): Promise<unknown> {
+    const client = await this.attestedClient(options?.signal);
+    return await this.guard(async () => await invokeRepositoryOperation(
+      client, method, request, options,
+      "Owned OCI broker does not expose broker-journaled repository transactions."
+    ));
   }
 
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {

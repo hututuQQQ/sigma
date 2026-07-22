@@ -35,6 +35,11 @@ import {
   type PinnedContainerIdentity
 } from "./container-attestation.js";
 import { ManagedEnvironmentCoordinator } from "./managed-environment-coordinator.js";
+import {
+  invokeRepositoryOperation,
+  RepositoryExecutionBrokerBase,
+  type RepositoryOperationMethod
+} from "./repository-execution-broker-base.js";
 export {
   assertContainerExecutionConfig,
   MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1,
@@ -59,7 +64,7 @@ export interface ContainerExecutionBrokerOptions {
  * identity before every operation, preventing a stale selector or replaced
  * container from silently becoming the execution target.
  */
-export class AttestedContainerExecutionBroker implements ExecutionBroker {
+export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerBase implements ExecutionBroker {
   private pinned?: PinnedContainerIdentity;
   private readonly managedBindings = new Map<string, ManagedSessionBindingV1>();
   private readonly managedEnvironment = new ManagedEnvironmentCoordinator();
@@ -68,6 +73,7 @@ export class AttestedContainerExecutionBroker implements ExecutionBroker {
     private readonly broker: ExecutionBroker,
     private readonly options: ContainerExecutionBrokerOptions
   ) {
+    super();
     assertContainerExecutionConfig(options.config, options.managedAttestation);
   }
 
@@ -195,6 +201,18 @@ export class AttestedContainerExecutionBroker implements ExecutionBroker {
       this.managedBindings.delete(sessionId);
       this.managedEnvironment.release(sessionId);
     }
+  }
+
+  protected async repositoryOperation(
+    method: RepositoryOperationMethod,
+    request: unknown,
+    options?: BrokerRequestOptions
+  ): Promise<unknown> {
+    await this.verify(options?.signal);
+    return await invokeRepositoryOperation(
+      this.broker, method, request, options,
+      "OCI broker does not expose broker-journaled repository transactions."
+    );
   }
 
   async prepareManagedEnvironment(

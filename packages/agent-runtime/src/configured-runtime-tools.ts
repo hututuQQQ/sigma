@@ -1,7 +1,13 @@
 import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import type { BrokerDoctorReport, ExecutionBroker } from "agent-execution";
 import type { AgentSupervisor } from "agent-supervisor";
-import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
+import {
+  EffectToolRegistry,
+  registerBuiltinTools,
+  registerSupervisorTools,
+  repositoryInspectTool,
+  RepositoryRecoverySelectionStore
+} from "agent-tools";
 import {
   brokerRuntimeEnvironment,
   verifiedNetworkPolicy,
@@ -25,6 +31,7 @@ export function createConfiguredTools(
   executionReport: BrokerDoctorReport,
   storeRootDir: string
 ): EffectToolRegistry {
+  const recoverySelections = new RepositoryRecoverySelectionStore();
   const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
   const executionBackend = executionReport.container?.available === true ? "oci" : "native";
   const builtins = registerBuiltinTools(new EffectToolRegistry(), {
@@ -58,9 +65,11 @@ export function createConfiguredTools(
       }
     } : {})
   });
+  builtins.register(repositoryInspectTool(execution, recoverySelections));
   builtins.register(repositoryTransactionTool(execution, {
     maxFiles: config.checkpoint?.maxFiles,
-    maxBytes: config.checkpoint?.maxBytes
+    maxBytes: config.checkpoint?.maxBytes,
+    recoverySelections
   }));
   return registerSupervisorTools(builtins, supervisor);
 }

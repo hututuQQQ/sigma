@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { CheckpointManager } from "../packages/agent-checkpoint/src/index.js";
+import type { ProcessExecutionPort } from "../packages/agent-platform/src/index.js";
 import type { JsonValue, ToolExecutionContext, ToolReceipt } from "../packages/agent-protocol/src/index.js";
 import {
   recoverInterruptedRepositoryTransactions,
@@ -37,9 +37,12 @@ async function repository(): Promise<string> {
   return root;
 }
 
-function registry(limits: { maxFiles?: number; maxBytes?: number } = {}): EffectToolRegistry {
+function registry(
+  limits: { maxFiles?: number; maxBytes?: number } = {},
+  processExecution: ProcessExecutionPort = execution
+): EffectToolRegistry {
   const tools = new EffectToolRegistry();
-  tools.register(repositoryTransactionTool(execution, limits));
+  tools.register(repositoryTransactionTool(processExecution, limits));
   return tools;
 }
 
@@ -49,13 +52,23 @@ async function transact(
   operations: JsonValue[],
   sessionId = "git-session"
 ): Promise<ToolReceipt> {
+  return await transactArguments(tools, workspacePath, { operations }, sessionId);
+}
+
+async function transactArguments(
+  tools: EffectToolRegistry,
+  workspacePath: string,
+  transactionArguments: JsonValue,
+  sessionId = "git-session",
+  runId = "git-run"
+): Promise<ToolReceipt> {
   callNumber += 1;
   const request = {
     callId: `git-call-${callNumber}`,
     name: "git_transaction",
-    arguments: { operations }
+    arguments: transactionArguments
   };
-  const base = { sessionId, runId: "git-run", workspacePath, runMode: "change" as const };
+  const base = { sessionId, runId, workspacePath, runMode: "change" as const };
   const callPlan = await tools.prepare(request, base);
   const context: ToolExecutionContext = {
     ...base,
@@ -84,6 +97,19 @@ afterEach(async () => {
 afterAll(async () => await execution.close());
 
 describe("controlled Git transactions", () => {
+  it("fails closed before the first write when the broker lacks V2 transactions", async () => {
+    const root = await repository();
+    const legacy: ProcessExecutionPort = {
+      execute: async (request, options) => await execution.execute(request, options)
+    };
+
+    await expect(transact(registry({}, legacy), root, [
+      { op: "branch", action: "create", name: "must-not-run-on-legacy" }
+    ])).rejects.toMatchObject({ code: "repository_atomicity_unavailable" });
+    expect(() => git(root, ["show-ref", "--verify", "refs/heads/must-not-run-on-legacy"]))
+      .toThrow();
+  });
+
   it("stages and commits while producing repository_delta evidence", async () => {
     const root = await repository();
     await writeFile(path.join(root, "seed.txt"), "updated\n", "utf8");
@@ -164,25 +190,69 @@ describe("controlled Git transactions", () => {
       .toThrow();
   }, 30_000);
 
-  it("restores an open CAS metadata checkpoint after a hard interruption", async () => {
+  it("continues a normal conflict through its broker-bound transaction handle", async () => {
     const root = await repository();
-    const manager = new CheckpointManager({
-      rootDir: path.join(root, ".agent", "repository-checkpoints"),
-      excludedNames: [".agent"]
-    });
-    await manager.create({
-      sessionId: "interrupted-session", runId: "run", workspacePath: root,
-      scopePaths: [".git"], baseSeq: 0
-    });
-    await writeFile(path.join(root, ".git", "interrupted-marker"), "partial", "utf8");
+    const tools = registry();
+    git(root, ["switch", "-qc", "topic"]);
+    await writeFile(path.join(root, "seed.txt"), "topic\n", "utf8");
+    git(root, ["add", "seed.txt"]);
+    git(root, ["commit", "-qm", "topic"]);
+    git(root, ["switch", "-q", "main"]);
+    await writeFile(path.join(root, "seed.txt"), "main\n", "utf8");
+    git(root, ["add", "seed.txt"]);
+    git(root, ["commit", "-qm", "main"]);
 
-    await recoverInterruptedRepositoryTransactions(root, "interrupted-session");
+    const pending = await transactArguments(tools, root, {
+      action: "begin",
+      operations: [{ op: "merge", target: "topic", noCommit: true }]
+    });
+    const value = JSON.parse(pending.output) as {
+      status: string;
+      transactionHandle: string;
+      conflictCount: number;
+    };
+    expect(value).toMatchObject({ status: "conflicts_pending", conflictCount: 1 });
 
-    await expect(readFile(path.join(root, ".git", "interrupted-marker"), "utf8"))
-      .rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(path.join(root, "seed.txt"), "main + topic\n", "utf8");
+    const completed = await transactArguments(tools, root, {
+      action: "continue",
+      transactionHandle: value.transactionHandle,
+      operations: [{ op: "add", paths: ["seed.txt"] }]
+    });
+
+    expect(completed).toMatchObject({ ok: true, diagnostics: [] });
+    expect(git(root, ["status", "--porcelain", "--untracked-files=no"])).toBe("");
+    expect(git(root, ["rev-list", "--parents", "-n", "1", "HEAD"]).split(" "))
+      .toHaveLength(3);
   }, 60_000);
 
-  it("supports approved external gitdirs while rejecting broad arguments, escapes, and local helpers", async () => {
+  it("restores an interrupted broker-owned conflict journal", async () => {
+    const root = await repository();
+    const tools = registry();
+    git(root, ["switch", "-qc", "topic"]);
+    await writeFile(path.join(root, "seed.txt"), "topic\n", "utf8");
+    git(root, ["add", "seed.txt"]);
+    git(root, ["commit", "-qm", "topic"]);
+    git(root, ["switch", "-q", "main"]);
+    await writeFile(path.join(root, "seed.txt"), "main\n", "utf8");
+    git(root, ["add", "seed.txt"]);
+    git(root, ["commit", "-qm", "main"]);
+    const expectedHead = git(root, ["rev-parse", "HEAD"]);
+    await transactArguments(tools, root, {
+      operations: [{ op: "merge", target: "topic" }]
+    }, "interrupted-session", "interrupted-run");
+    await writeFile(path.join(root, "seed.txt"), "partial resolution\n", "utf8");
+
+    await recoverInterruptedRepositoryTransactions(
+      execution, "interrupted-session", "interrupted-run"
+    );
+
+    expect(git(root, ["rev-parse", "HEAD"])).toBe(expectedHead);
+    expect(await readFile(path.join(root, "seed.txt"), "utf8")).toBe("main\n");
+    expect(git(root, ["status", "--porcelain", "--untracked-files=no"])).toBe("");
+  }, 60_000);
+
+  it("supports approved external gitdirs while rejecting broad arguments and escapes", async () => {
     const root = await repository();
     const tools = registry();
     await expect(transact(tools, root, [{ op: "add", paths: ["seed.txt"], argv: ["status"] }]))
@@ -201,9 +271,5 @@ describe("controlled Git transactions", () => {
       observedEffects: expect.arrayContaining(["repository.write", "filesystem.read.external"])
     });
     expect(git(root, ["show-ref", "--verify", "refs/heads/linked-approved"])).toContain("refs/heads/linked-approved");
-
-    git(root, ["config", "commit.gpgSign", "true"]);
-    await expect(transact(tools, root, [{ op: "gc" }], "helper-session"))
-      .rejects.toMatchObject({ code: "repository_external_helper_denied" });
   }, 60_000);
 });

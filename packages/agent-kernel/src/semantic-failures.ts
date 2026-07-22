@@ -68,7 +68,8 @@ export function recordSemanticToolResult(
 }
 
 const CONTENT_READ_TOOLS = new Set([
-  "read", "list", "grep", "repository_stats", "git_status", "git_diff", "lsp"
+  "read", "list", "grep", "repository_stats", "git_status", "git_diff",
+  "repository_inspect", "lsp"
 ]);
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -120,6 +121,13 @@ function semanticMutationEvidence(evidence: EvidenceRecord): SemanticEvidence | 
         refsAfterDigest: evidence.data.refsAfterDigest,
         indexAfterDigest: evidence.data.indexAfterDigest
       } };
+    case "repository_acceptance":
+      return { kind: "repository", subject: {
+        goalEpoch: evidence.data.goalEpoch,
+        frontierRevision: evidence.data.frontierRevision,
+        repositoryStateDigest: evidence.data.repositoryStateDigest,
+        targetAssertions: evidence.data.semanticAssertions.targetAssertions ?? null
+      } };
     case "validation":
       return { kind: "validation", subject: {
         status: evidence.status,
@@ -161,6 +169,17 @@ function semanticAuxiliaryEvidence(evidence: EvidenceRecord): SemanticEvidence |
       } };
     case "restoration":
       return { kind: "restoration", subject: evidence.data };
+    case "repository_recovery_selection":
+      return { kind: "repository", subject: {
+        goalEpoch: evidence.data.goalEpoch,
+        candidateId: evidence.data.candidateId,
+        inspectionBasisDigest: evidence.data.inspectionBasisDigest
+      } };
+    case "repository_recovery_decision":
+      return { kind: "repository", subject: {
+        goalEpoch: evidence.data.goalEpoch,
+        candidateSetDigest: evidence.data.candidateSetDigest
+      } };
     case "command":
     case "diagnostic":
     case "checkpoint":

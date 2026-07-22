@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   isCompletionEligibleEvidence,
   type BudgetAmounts,
@@ -19,6 +18,7 @@ import {
   type RuntimeControlServiceOptions
 } from "./runtime-control-contracts.js";
 import { RuntimeCheckpointControl } from "./runtime-checkpoint-control.js";
+import { RuntimeRestorationControl } from "./runtime-restoration-control.js";
 import { RuntimeSkillControl } from "./runtime-skill-control.js";
 import { reviewReadiness } from "./review-coordinator.js";
 import {
@@ -32,49 +32,16 @@ export { DEFAULT_CHILD_BUDGET } from "./child-budget-control.js";
 
 export type { OpenCheckpointRecoveryResult, RuntimeControlServiceOptions } from "./runtime-control-contracts.js";
 
-function restorationFailure(message: string, code: string): never {
-  throw Object.assign(new Error(message), { code });
-}
-
-function assertIsolatedRestorationCall(session: RuntimeSession, callId: string): void {
-  const pending = session.durable.state.pendingTools;
-  if (pending.length !== 1 || pending[0]?.request.callId !== callId || !pending[0].started
-    || session.durable.state.activeModelTurn) {
-    restorationFailure("Restoration requires one isolated runtime-control call.", "restoration_not_quiescent");
-  }
-}
-
-function assertLocalRestorationState(
-  session: RuntimeSession,
-  callId: string,
-  manualConfirmation: boolean
-): void {
-  assertIsolatedRestorationCall(session, callId);
-  if (session.durable.state.activeProcessIds.length > 0) {
-    restorationFailure("Restoration requires all processes to be settled.", "checkpoint_processes_active");
-  }
-  if (session.recovery.openCheckpointRecovery || session.durable.state.checkpointHead?.status === "open") {
-    restorationFailure("Restoration requires the open checkpoint to be resolved.", "checkpoint_recovery_required");
-  }
-  if (session.durable.state.mutationFrontier.revision === 0) {
-    restorationFailure("The current run has no mutation frontier to restore.", "restoration_mutation_missing");
-  }
-  if (session.durable.state.mutationFrontier.repositoryStateDigest) {
-    restorationFailure("Repository metadata must be restored and verified separately.", "repository_restoration_required");
-  }
-  if (manualConfirmation && session.durable.state.taskControl.goalEpochSource !== "steer") {
-    restorationFailure("Manual restoration confirmation requires a current user steer.", "restoration_steer_required");
-  }
-}
-
 export class RuntimeControlService {
   private readonly planQueues = new Map<string, Promise<void>>();
   private readonly checkpoints: RuntimeCheckpointControl;
+  private readonly restoration: RuntimeRestorationControl;
   private readonly childBudgets: ChildBudgetControl;
   private readonly skillControl: RuntimeSkillControl;
 
   constructor(private readonly options: RuntimeControlServiceOptions) {
     this.checkpoints = new RuntimeCheckpointControl(options);
+    this.restoration = new RuntimeRestorationControl(options, this.checkpoints);
     this.childBudgets = new ChildBudgetControl(options.budgets);
     this.skillControl = new RuntimeSkillControl(options);
   }
@@ -236,80 +203,14 @@ export class RuntimeControlService {
     session: RuntimeSession,
     callId: string
   ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
-    await this.assertRestorationQuiescence(session, callId, false);
-    if (session.durable.state.mutationFrontier.repositoryStateDigest) {
-      throw Object.assign(new Error("Workspace checkpoint restore cannot restore repository metadata."), {
-        code: "repository_restoration_required"
-      });
-    }
-    const inspection = await this.checkpoints.restoreRunChanges(session);
-    return await this.recordRestorationEvidence(session, inspection, true);
+    return await this.restoration.restoreRunChanges(session, callId);
   }
 
   async confirmRunRestored(
     session: RuntimeSession,
     callId: string
   ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
-    await this.assertRestorationQuiescence(session, callId, true);
-    const inspection = await this.checkpoints.inspectRunRestoration(session);
-    if (!inspection.restored) {
-      throw Object.assign(new Error("Workspace does not match the run baseline."), {
-        code: "workspace_not_restored"
-      });
-    }
-    return await this.recordRestorationEvidence(session, inspection, false);
-  }
-
-  private async assertRestorationQuiescence(
-    session: RuntimeSession,
-    callId: string,
-    manualConfirmation: boolean
-  ): Promise<void> {
-    assertLocalRestorationState(session, callId, manualConfirmation);
-    if (await this.options.hasActiveChildren?.(session.identity.sessionId)) {
-      restorationFailure("Restoration requires all child agents to be settled.", "checkpoint_children_active");
-    }
-  }
-
-  private async recordRestorationEvidence(
-    session: RuntimeSession,
-    inspection: import("agent-checkpoint").RunRestorationInspection,
-    explicitRestore: boolean
-  ): Promise<WorkspaceRestorationEvidenceV1["data"]> {
-    const frontier = session.durable.state.mutationFrontier;
-    const data: WorkspaceRestorationEvidenceV1["data"] = {
-      schemaVersion: 1,
-      goalEpoch: session.durable.state.taskControl.goalEpoch,
-      frontierRevision: frontier.revision,
-      frontierStateDigest: frontier.currentStateDigest,
-      baselineManifestDigest: inspection.baselineManifestDigest,
-      currentManifestDigest: inspection.currentManifestDigest,
-      restoredCheckpointIds: explicitRestore
-        ? inspection.checkpoints.map((item) => item.checkpointId) : [],
-      quiescence: {
-        supersededExecutionStopped: true,
-        noPendingMutations: true,
-        noProcesses: true,
-        noChildren: true,
-        noOpenCheckpoint: true
-      },
-      repository: { status: "unchanged" }
-    };
-    const evidence: WorkspaceRestorationEvidenceV1 = {
-      evidenceId: randomUUID(),
-      sessionId: session.identity.sessionId,
-      runId: session.durable.runId,
-      kind: "restoration",
-      status: inspection.restored ? "passed" : "failed",
-      createdAt: new Date().toISOString(),
-      producer: { authority: "runtime", id: "workspace-restoration-v1" },
-      summary: inspection.restored
-        ? "The current goal epoch is quiescent and the workspace matches its run baseline."
-        : "The workspace does not match its run baseline.",
-      data
-    };
-    await this.options.emit(session, "evidence.recorded", "runtime", evidence);
-    return data;
+    return await this.restoration.confirmRunRestored(session, callId);
   }
 
   async sealCheckpoint(session: RuntimeSession, checkpointId: string): Promise<CheckpointRef> {
