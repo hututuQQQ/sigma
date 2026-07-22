@@ -1,25 +1,23 @@
 import { attachBrokerLifecycleFailure, BrokerConnectionError, BrokerProcessLostError } from "./errors.js";
 import {
-  awaitWithSignal, cancellationError, errorIdentity, lifecycleFailure,
-  preserveConnectionFailure, retireTerminalGenerationError
+  ScratchLeaseLifecycle, assertBrokerGenerationUsable, awaitWithSignal, cancellationError,
+  errorIdentity, lifecycleFailure, preserveConnectionFailure, retireTerminalGenerationError
 } from "./lazy-execution-broker-lifecycle.js";
 import { defaultBrokerClientFactory } from "./lazy-execution-broker-runtime.js";
+import { forwardSandboxLeaseRevoke, forwardSandboxLeaseStatus,
+  forwardScratchLease, forwardScratchLeaseRelease } from "./lazy-execution-broker-forwarding.js";
 import { LazyExecutionHandleRegistry, type LazyProcessHandleOwner } from "./lazy-execution-handles.js";
 import type {
   BrokerDoctorReport, BrokerRequestOptions, BrokerSandboxLeaseStatus, BrokerSandboxRevokeResult,
   ExecutionBroker, ExecutionRequest, ExecutionResult,
-  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest
+  ProcessHandle, ProcessHandoffResult, ProcessPollResult, ProcessSpawnRequest,
+  ScratchLeaseRequestV1, ScratchLeaseV1
 } from "./types.js";
 import type {
   BrokerGeneration, ConnectedGeneration, GenerationResult, LazyExecutionBrokerOptions
 } from "./lazy-execution-broker-types.js";
-export {
-  defaultSigmaExecPath,
-  runtimeNodeBinding,
-  runtimeTrustedToolchains,
-  runtimeTrustedToolchainsForBinding,
-  type RuntimeNodeBinding
-} from "./lazy-execution-broker-runtime.js";
+export { defaultSigmaExecPath, runtimeNodeBinding, runtimeTrustedToolchains,
+  runtimeTrustedToolchainsForBinding, type RuntimeNodeBinding } from "./lazy-execution-broker-runtime.js";
 
 export type { LazyExecutionBrokerOptions } from "./lazy-execution-broker-types.js";
 
@@ -32,6 +30,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
   private readonly createClient: () => ExecutionBroker;
   private readonly clients = new WeakSet<ExecutionBroker>();
   private readonly processHandles = new LazyExecutionHandleRegistry();
+  private readonly scratchLeases = new ScratchLeaseLifecycle();
   private generationSequence = 0;
   private generation: BrokerGeneration;
   private replacement?: Promise<BrokerGeneration>;
@@ -47,7 +46,6 @@ export class LazyExecutionBroker implements ExecutionBroker {
     this.captureLost(this.generation.client);
     return this.processHandles.lostProcessHandles;
   }
-
   async connect(signal?: AbortSignal): Promise<BrokerDoctorReport> {
     return (await this.ensureConnected(signal)).report;
   }
@@ -69,23 +67,27 @@ export class LazyExecutionBroker implements ExecutionBroker {
   }
 
   async sandboxLeaseStatus(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxLeaseStatus> {
-    return (await this.invokeFresh(async (client) => {
-      if (!client.sandboxLeaseStatus) throw Object.assign(new Error("Sandbox lease status is unavailable."), {
-        code: "sandbox_recovery_required"
-      });
-      return await client.sandboxLeaseStatus(workspacePath, signal);
-    }, signal)).value;
+    return (await this.invokeFresh((client) =>
+      forwardSandboxLeaseStatus(client, workspacePath, signal), signal)).value;
   }
 
   async revokeSandboxLease(workspacePath: string, signal?: AbortSignal): Promise<BrokerSandboxRevokeResult> {
-    return (await this.invokeFresh(async (client) => {
-      if (!client.revokeSandboxLease) throw Object.assign(new Error("Sandbox lease revoke is unavailable."), {
-        code: "sandbox_recovery_required"
-      });
-      return await client.revokeSandboxLease(workspacePath, signal);
-    }, signal)).value;
+    return (await this.invokeFresh((client) =>
+      forwardSandboxLeaseRevoke(client, workspacePath, signal), signal)).value;
   }
 
+  async acquireScratchLease(request: ScratchLeaseRequestV1, options?: BrokerRequestOptions): Promise<ScratchLeaseV1> {
+    const lease = (await this.invokeFresh(
+      (client) => forwardScratchLease(client, request, options), options?.signal
+    )).value;
+    this.scratchLeases.acquired(request.sessionId);
+    return lease;
+  }
+  async releaseScratchLease(sessionId: string, options?: BrokerRequestOptions): Promise<void> {
+    await this.scratchLeases.release(sessionId, async () => {
+      await this.invokeFresh((client) => forwardScratchLeaseRelease(client, sessionId, options), options?.signal);
+    });
+  }
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {
     return (await this.invokeFresh((client) => client.execute(request, options), options?.signal)).value;
   }
@@ -195,6 +197,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
     this.captureLost(client);
     try { await client.close(); } catch (error) { closeFailures.push(error); }
     finally { this.captureLost(client); }
+    this.scratchLeases.clear();
     if (replacementFailure !== undefined) closeFailures.unshift(replacementFailure);
     if (closeFailures.length === 1) throw closeFailures[0];
     if (closeFailures.length > 1) throw new AggregateError(closeFailures, "Execution broker shutdown failed.");
@@ -379,17 +382,7 @@ export class LazyExecutionBroker implements ExecutionBroker {
   }
 
   private assertGenerationUsable(generation: BrokerGeneration): void {
-    if (this.closed) {
-      throw new BrokerConnectionError("Execution broker is closed.", { retrySafe: true });
-    }
-    if (generation !== this.generation || generation.failure
-      || generation.retiring || generation.retired) {
-      throw new BrokerConnectionError("Execution broker generation is not accepting new requests.", {
-        cause: generation.failure,
-        retrySafe: true,
-        diagnostic: { generationId: generation.id }
-      });
-    }
+    assertBrokerGenerationUsable(generation, this.generation, this.closed);
   }
 
   private captureLost(client: ExecutionBroker): void {

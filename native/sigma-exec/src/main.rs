@@ -8,6 +8,7 @@ mod platform;
 mod process;
 mod protocol;
 mod sandbox;
+mod scratch;
 #[cfg(target_os = "linux")]
 mod unix_pty;
 #[cfg(windows)]
@@ -19,6 +20,7 @@ use protocol::{
     PROTOCOL_VERSION, Request, RpcError, SharedWriter, read_request, send_error, send_result,
 };
 use sandbox::ProcessParams;
+use scratch::{AcquireScratchLeaseParams, ReleaseScratchLeaseParams};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -70,6 +72,14 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
             let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox revoke params")?;
             sandbox::revoke_sandbox(&params.workspace_path)
         }
+        "scratch.acquire" => state.acquire_scratch_lease(decode::<AcquireScratchLeaseParams>(
+            request.params,
+            "scratch lease params",
+        )?),
+        "scratch.release" => state.release_scratch_lease(decode::<ReleaseScratchLeaseParams>(
+            request.params,
+            "scratch release params",
+        )?),
         "exec" => state.execute(
             request.request_id,
             decode::<ProcessParams>(request.params, "exec params")?,

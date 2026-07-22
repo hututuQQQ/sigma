@@ -1,9 +1,9 @@
-import path from "node:path";
 import { BrokerProtocolError } from "./errors.js";
 import { protocolRecord } from "./protocol.js";
+import { booleanValue, stringValue } from "./broker-value-primitives.js";
 import {
   BROKER_PROTOCOL_VERSION,
-  type BrokerDoctorReport,
+  type ScratchLeaseV1,
   type ProcessLaunchFailureV1,
   type ProcessState
 } from "./types.js";
@@ -46,37 +46,6 @@ export interface ExecutionValue extends ProcessValue {
   timedOut: boolean;
   idleTimedOut: boolean;
   cancelled: boolean;
-}
-
-function stringValue(value: unknown, label: string): string {
-  if (typeof value !== "string") throw new BrokerProtocolError(`${label} must be a string.`);
-  return value;
-}
-
-const brokerPlatforms = new Set([
-  "aix", "darwin", "freebsd", "linux", "macos", "openbsd", "sunos", "win32", "windows"
-]);
-const architecturePattern = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/u;
-
-function brokerPlatform(value: unknown): string {
-  const platform = stringValue(value, "Broker platform");
-  if (!brokerPlatforms.has(platform)) {
-    throw new BrokerProtocolError(`Broker platform '${platform}' is unsupported.`);
-  }
-  return platform;
-}
-
-function brokerArchitecture(value: unknown): string {
-  const architecture = stringValue(value, "Broker architecture");
-  if (!architecturePattern.test(architecture)) {
-    throw new BrokerProtocolError("Broker architecture must be a short printable identifier.");
-  }
-  return architecture;
-}
-
-function booleanValue(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") throw new BrokerProtocolError(`${label} must be boolean.`);
-  return value;
 }
 
 function integerValue(value: unknown, label: string): number {
@@ -179,41 +148,27 @@ function processState(input: unknown): Exclude<ProcessState, "lost"> {
   throw new BrokerProtocolError(`Invalid process state '${String(input)}'.`);
 }
 
-function verifiedShells(
-  input: unknown,
-  platform: string
-): NonNullable<BrokerDoctorReport["capabilities"]["shells"]> | undefined {
-  if (input === undefined) return undefined;
-  if (!Array.isArray(input) || input.length > 8) {
-    throw new BrokerProtocolError("Broker verified shells are invalid.");
+export function parseScratchLease(input: unknown): ScratchLeaseV1 {
+  const value = protocolRecord(input, "Broker scratch lease");
+  if (value.protocolVersion !== 1 || value.lifetime !== "runtime_session"
+    || value.isolation !== "private" || value.persistentAcrossCalls !== true) {
+    throw new BrokerProtocolError("Broker scratch lease has unsupported semantics.");
   }
-  const seen = new Set<string>();
-  return input.map((raw, index) => {
-    const shell = protocolRecord(raw, `Broker verified shell[${index}]`);
-    if (shell.kind !== "powershell" && shell.kind !== "cmd" && shell.kind !== "bash") {
-      throw new BrokerProtocolError("Broker verified shell kind is invalid.");
-    }
-    const executable = stringValue(shell.executable, "Broker verified shell executable");
-    const absolute = platform === "windows" || platform === "win32"
-      ? path.win32.isAbsolute(executable) : path.posix.isAbsolute(executable);
-    if (!executable || executable.includes("\0") || !absolute || seen.has(shell.kind) || shell.verified !== true) {
-      throw new BrokerProtocolError("Broker verified shell entry is invalid or duplicated.");
-    }
-    seen.add(shell.kind);
-    const supportsChildProcesses = shell.supportsChildProcesses;
-    if (supportsChildProcesses !== undefined && typeof supportsChildProcesses !== "boolean") {
-      throw new BrokerProtocolError("Broker verified shell child-process capability is invalid.");
-    }
-    return {
-      kind: shell.kind,
-      executable,
-      verified: true as const,
-      ...(supportsChildProcesses === undefined ? {} : { supportsChildProcesses })
-    };
-  });
+  const leaseId = stringValue(value.leaseId, "Broker scratch leaseId");
+  const sessionId = stringValue(value.sessionId, "Broker scratch sessionId");
+  const home = stringValue(value.home, "Broker scratch home");
+  const temp = stringValue(value.temp, "Broker scratch temp");
+  if (!leaseId || !sessionId || !home || !temp) throw new BrokerProtocolError("Broker scratch lease is incomplete.");
+  return {
+    protocolVersion: 1, leaseId, sessionId, lifetime: "runtime_session", isolation: "private",
+    persistentAcrossCalls: true, home, temp
+  };
 }
 
-export function parseHello(input: unknown): { instanceId: string; artifactRoot?: string } {
+export function parseHello(input: unknown): {
+  instanceId: string;
+  artifactRoot?: string;
+} {
   const value = protocolRecord(input, "Broker hello result");
   if (value.protocolVersion !== BROKER_PROTOCOL_VERSION) throw new BrokerProtocolError("Broker hello version mismatch.");
   const instanceId = stringValue(value.instanceId, "Broker instanceId");
@@ -227,92 +182,7 @@ export function parseHello(input: unknown): { instanceId: string; artifactRoot?:
   };
 }
 
-function parseDoctorHardening(input: unknown): BrokerDoctorReport["sandbox"]["hardening"] | undefined {
-  if (input === undefined) return undefined;
-  const hardening = protocolRecord(input, "Broker sandbox hardening");
-  const landlockAbi = hardening.landlockAbi;
-  if (landlockAbi !== undefined && landlockAbi !== null
-    && (!Number.isSafeInteger(landlockAbi) || Number(landlockAbi) < 1)) {
-    throw new BrokerProtocolError("Broker Landlock ABI is invalid.");
-  }
-  return {
-    ...(typeof landlockAbi === "number" ? { landlockAbi } : {}),
-    noNewPrivileges: booleanValue(hardening.noNewPrivileges, "sandbox.hardening.noNewPrivileges"),
-    seccompFilter: booleanValue(hardening.seccompFilter, "sandbox.hardening.seccompFilter"),
-    lessPrivilegedAppContainer: booleanValue(
-      hardening.lessPrivilegedAppContainer,
-      "sandbox.hardening.lessPrivilegedAppContainer"
-    ),
-    mountNamespace: booleanValue(hardening.mountNamespace, "sandbox.hardening.mountNamespace"),
-    pidNamespace: booleanValue(hardening.pidNamespace, "sandbox.hardening.pidNamespace"),
-    networkNamespace: booleanValue(hardening.networkNamespace, "sandbox.hardening.networkNamespace")
-  };
-}
-
-function parseDoctorSandbox(input: unknown): BrokerDoctorReport["sandbox"] {
-  const sandbox = protocolRecord(input, "Broker sandbox report");
-  const hardening = parseDoctorHardening(sandbox.hardening);
-  const lease = sandbox.lease === undefined || sandbox.lease === null
-    ? undefined : protocolRecord(sandbox.lease, "Broker sandbox lease");
-  if (lease && (lease.protocolVersion !== 1
-    || lease.readStrategy !== "persistent_workspace_root"
-    || lease.writerStrategy !== "root_lease_checkpointed"
-    || lease.recoveryJournal !== "writes_only")) {
-    throw new BrokerProtocolError("Broker sandbox lease metadata is invalid.");
-  }
-  return {
-    available: booleanValue(sandbox.available, "sandbox.available"),
-    backend: stringValue(sandbox.backend, "sandbox.backend"),
-    selfTestPassed: booleanValue(sandbox.selfTestPassed, "sandbox.selfTestPassed"),
-    setupRequired: booleanValue(sandbox.setupRequired, "sandbox.setupRequired"),
-    ...(typeof sandbox.reason === "string" ? { reason: sandbox.reason } : {}),
-    ...(lease ? { lease: {
-      protocolVersion: 1,
-      readStrategy: "persistent_workspace_root",
-      writerStrategy: "root_lease_checkpointed",
-      recoveryJournal: "writes_only"
-    } } : {}),
-    ...(hardening ? { hardening } : {})
-  };
-}
-
-function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctorReport["capabilities"] {
-  const capabilities = protocolRecord(input, "Broker capabilities");
-  const networkModes = capabilities.networkModes;
-  if (!Array.isArray(networkModes) || networkModes.some((mode) =>
-    mode !== "none" && mode !== "loopback" && mode !== "full")) {
-    throw new BrokerProtocolError("Broker networkModes are invalid.");
-  }
-  const shells = verifiedShells(capabilities.shells, platform);
-  return {
-    foreground: booleanValue(capabilities.foreground, "capabilities.foreground"),
-    background: booleanValue(capabilities.background, "capabilities.background"),
-    stdin: booleanValue(capabilities.stdin, "capabilities.stdin"),
-    pty: booleanValue(capabilities.pty, "capabilities.pty"),
-    ...(capabilities.processHandoff === undefined ? {} : {
-      processHandoff: booleanValue(capabilities.processHandoff, "capabilities.processHandoff")
-    }),
-    networkModes: networkModes as Array<"none" | "loopback" | "full">,
-    ...(capabilities.executionRoots === undefined ? {} : {
-      executionRoots: booleanValue(capabilities.executionRoots, "capabilities.executionRoots")
-    }),
-    ...(shells ? { shells } : {})
-  };
-}
-
-export function parseDoctor(input: unknown): BrokerDoctorReport {
-  const value = protocolRecord(input, "Broker doctor result");
-  if (value.protocolVersion !== BROKER_PROTOCOL_VERSION) throw new BrokerProtocolError("Broker doctor version mismatch.");
-  const platform = brokerPlatform(value.platform);
-  return {
-    protocolVersion: BROKER_PROTOCOL_VERSION,
-    brokerVersion: stringValue(value.brokerVersion, "Broker version"),
-    platform,
-    architecture: brokerArchitecture(value.architecture),
-    sandbox: parseDoctorSandbox(value.sandbox),
-    capabilities: parseDoctorCapabilities(value.capabilities, platform)
-  };
-}
+export { parseDoctor } from "./broker-doctor-values.js";
 
 export function parseHandleId(input: unknown): string {
   const id = stringValue(protocolRecord(input, "Process spawn result").handleId, "Process handleId");

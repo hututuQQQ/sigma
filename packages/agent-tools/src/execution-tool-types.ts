@@ -3,6 +3,11 @@ import type { ShellKind } from "agent-platform";
 
 export interface ExecutionToolOptions {
   broker: ExecutionBroker;
+  /** Authenticated process boundary. OCI resolves bare commands in the target,
+   * never through the control process PATH. */
+  executionBackend?: "native" | "oci";
+  executionPlatform?: NodeJS.Platform;
+  managedEnvironment?: boolean;
   sandboxMode: "required";
   readScope: "workspace" | "host";
   processHandoff: "allow" | "deny";

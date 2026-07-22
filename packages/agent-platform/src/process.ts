@@ -3,6 +3,8 @@ import type {
   BrokerRequestOptions,
   ExecutionRequest,
   ExecutionResult,
+  ManagedSessionBindingRequestV1,
+  ManagedSessionBindingV1,
   ProcessLaunchFailureV1,
   ProcessHandle,
   ProcessHandoffResult,
@@ -17,6 +19,12 @@ export interface ProcessExecutionPort {
   terminate?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessPollResult>;
   handoff?(handle: ProcessHandle, options?: BrokerRequestOptions): Promise<ProcessHandoffResult>;
   releaseOutputArtifacts?(artifactIds: string[]): Promise<void>;
+  /** Idempotently releases broker-owned scratch after every session process has settled. */
+  releaseScratchLease?(sessionId: string, options?: BrokerRequestOptions): Promise<void>;
+  bindManagedSession?(
+    request: ManagedSessionBindingRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedSessionBindingV1>;
 }
 
 export interface ProcessRequest {

@@ -29,6 +29,7 @@ export interface CliConfig {
   permissionMode: "workspace-auto" | "ask" | "auto" | "deny";
   sandboxMode: "required";
   executionMode: "sandboxed" | "container";
+  managedEnvironmentMode: "disabled" | "required";
   readScope: "workspace" | "host";
   networkMode: "none" | "loopback" | "full";
   processHandoff: "allow" | "deny";
@@ -224,6 +225,7 @@ function cliConfig(
     permissionMode: values.permissionMode as CliConfig["permissionMode"],
     sandboxMode: values.sandboxMode as CliConfig["sandboxMode"],
     executionMode: values.executionMode as CliConfig["executionMode"],
+    managedEnvironmentMode: values.managedEnvironmentMode as CliConfig["managedEnvironmentMode"],
     readScope: values.readScope as CliConfig["readScope"],
     networkMode: values.networkMode as CliConfig["networkMode"],
     processHandoff: values.processHandoff as CliConfig["processHandoff"],

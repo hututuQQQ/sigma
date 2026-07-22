@@ -37,6 +37,25 @@ export class SandboxUnavailableError extends BrokerError {
   }
 }
 
+export class ContainerUnavailableError extends BrokerError {
+  constructor(message: string, data?: unknown, options?: ErrorOptions) {
+    super(message, "container_unavailable", data, options);
+  }
+}
+
+export class ContainerCapabilityUnavailableError extends ContainerUnavailableError {
+  constructor(capability: string, message: string, data?: unknown, options?: ErrorOptions) {
+    super(message, { capability, ...(data && typeof data === "object" ? data : { detail: data }) }, options);
+    this.name = "ContainerCapabilityUnavailableError";
+  }
+}
+
+export class ContainerAttestationInvalidError extends BrokerError {
+  constructor(message: string, data?: unknown, options?: ErrorOptions) {
+    super(message, "container_attestation_invalid", data, options);
+  }
+}
+
 export class BrokerPolicyError extends BrokerError {
   constructor(message: string, data?: unknown) {
     super(message, "policy_denied", data);

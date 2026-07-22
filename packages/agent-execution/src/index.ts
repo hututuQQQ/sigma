@@ -13,3 +13,8 @@ export * from "./types.js";
 export * from "./windows-node-compatibility.js";
 export * from "./windows-directory-lock-helper.js";
 export * from "./lazy-execution-broker.js";
+export * from "./container-execution-broker.js";
+export * from "./fixed-container-launcher.js";
+export * from "./owned-oci-engine.js";
+export * from "./owned-container-execution-broker.js";
+export * from "./fixed-owned-container-launcher.js";

@@ -6,13 +6,17 @@ import type {
   WorkspaceMcpTrustAttestation
 } from "agent-config";
 import type { JsonValue, ModelGateway, RunStore, RuntimeClient } from "agent-protocol";
-import { LazyExecutionBroker, type BrokerDoctorReport, type ExecutionBroker } from "agent-execution";
+import type {
+  BrokerDoctorReport,
+  ContainerEngine,
+  ContainerTarget,
+  ExecutionBroker,
+  TrustedContainerLauncherV1
+} from "agent-execution";
 import type { HookDefinition, HookRunnerPort } from "agent-extensions";
-import { defaultBundledLanguageServerRoot, discoverLanguageServers } from "agent-code-intel";
 import { SegmentedJsonlStore } from "agent-store";
 import { AgentSupervisor, WorkspaceIsolationManager } from "agent-supervisor";
 import { ensurePrivateStateDirectory, isInside } from "agent-platform";
-import { EffectToolRegistry, registerBuiltinTools, registerSupervisorTools } from "agent-tools";
 import { closeMcpClients, connectMcpServers } from "./composition-mcp.js";
 import { createChildAgentFactory } from "./composition-supervision.js";
 import { createRuntime } from "./create-runtime.js";
@@ -21,6 +25,7 @@ import type { ChildJoinSummary } from "./types.js";
 import { auditDurableChildren } from "./durable-children.js";
 import { verifyWorkspaceMcpTrust } from "./workspace-mcp-trust.js";
 import { runtimeStateRoot } from "./runtime-state.js";
+import { configuredExecutionBroker } from "./container-runtime-execution.js";
 import { resolveRuntimeCustomization, type RuntimeCustomization } from "./customization.js";
 import { BrokerCommandHookRunner } from "./hook-runner.js";
 import { frozenHookExecutionRoot } from "./frozen-hook-assets.js";
@@ -29,11 +34,8 @@ import { verifyWorkspaceCustomizationTrust } from "./workspace-customization-tru
 import { createRoleGateways, reviewerRouteId } from "./model-composition.js";
 import { createSubjectAttestationContextV1, type SubjectProductAttestationV1 } from "./subject-attestation.js";
 import { subjectConfigurationV1 } from "./subject-configuration.js";
-import { repositoryRuntimeProviders } from "./repository-statistics-provider.js";
-import { repositoryTransactionTool } from "./repository-transaction-tool.js";
-import {
-  brokerRuntimeEnvironment, verifiedNetworkPolicy, verifiedRuntimeCommands, verifiedShellKinds
-} from "./execution-capabilities.js";
+import { brokerRuntimeEnvironment } from "./execution-capabilities.js";
+import { createConfiguredTools } from "./configured-runtime-tools.js";
 export interface RuntimeCompositionConfig {
   workspace: string;
   provider: "deepseek" | "glm";
@@ -53,6 +55,10 @@ export interface RuntimeCompositionConfig {
   agentProfile?: string;
   sandboxMode?: "required";
   executionMode?: "sandboxed" | "container";
+  containerEngine?: ContainerEngine;
+  containerTarget?: ContainerTarget;
+  containerImage?: string;
+  managedEnvironmentMode?: "disabled" | "required";
   readScope?: "workspace" | "host";
   networkMode?: "none" | "loopback" | "full";
   processHandoff?: "allow" | "deny";
@@ -71,6 +77,9 @@ export interface RuntimeFactoryDeps {
     requestTimeoutMs: number; idleTimeoutMs: number; activeStreamTimeoutMs?: number }) => ModelGateway;
   stateRootDir?: string;
   executionBroker?: ExecutionBroker;
+  /** Trusted product launcher input. Never derive this from workspace, model,
+   * task metadata, CLI flags, or general environment variables. */
+  containerLauncher?: TrustedContainerLauncherV1;
   hookDefinitions?: readonly HookDefinition[];
   hookRunner?: HookRunnerPort;
   agentProfileHookRunner?: HookRunnerPort;
@@ -139,7 +148,7 @@ export async function createConfiguredRuntime(
       : undefined;
     const runtimeReference: { current?: InProcessRuntimeClient } = {};
     const supervisor = createSupervisor(config, execution, runtimeReference);
-    const tools = createTools(config, execution, supervisor, executionReport, storeRootDir);
+    const tools = createConfiguredTools(config, execution, supervisor, executionReport, storeRootDir);
     mcpClients = options.connectMcp === false
       ? [] : await connectMcpServers(config.mcpServers, workspace, tools, execution);
     const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
@@ -160,6 +169,8 @@ export async function createConfiguredRuntime(
       availableProfiles: customization.availableProfiles,
       gatewayForRole: gateways.forRole,
       execution,
+      managedEnvironmentMode: config.managedEnvironmentMode ?? "disabled",
+      managedNetworkMode: config.networkMode ?? "none",
       runtimeEnvironment: { ...brokerRuntimeEnvironment(executionReport), executionMode: config.executionMode ?? "sandboxed" },
       subjectAttestation,
       skills: customization.skills,
@@ -237,11 +248,6 @@ async function prepareComposition(
   deps: RuntimeFactoryDeps,
   options: RuntimeFactoryOptions
 ): Promise<PreparedComposition> {
-  if (config.executionMode === "container") {
-    throw Object.assign(new Error(
-      "The OCI execution backend is not installed for this Sigma build; host execution is never used as a fallback."
-    ), { code: "container_unavailable" });
-  }
   const workspace = await realpath(path.resolve(config.workspace));
   await verifyMcpTrust(config, options, workspace);
   const storeRootDir = await prepareStoreRoot(
@@ -250,12 +256,11 @@ async function prepareComposition(
   );
   const customization = await resolveRuntimeCustomization(config, workspace, undefined, deps.hookDefinitions);
   verifyCustomization(config, workspace, customization);
-  const execution = deps.executionBroker ?? new LazyExecutionBroker({
-    sandboxMode: "required"
-  });
+  const execution = await configuredExecutionBroker(config, deps, workspace);
   try {
     const hookRunner = createHookRunner(config, deps, workspace, storeRootDir, customization, execution);
     const executionReport = await execution.connect();
+    assertManagedRuntimeAvailable(config, execution, executionReport);
     return {
       workspace,
       storeRootDir,
@@ -266,6 +271,26 @@ async function prepareComposition(
     };
   } catch (error) {
     return await rethrowAfterCompositionClose([], execution, error);
+  }
+}
+
+function assertManagedRuntimeAvailable(
+  config: RuntimeCompositionConfig,
+  execution: ExecutionBroker,
+  report: BrokerDoctorReport
+): void {
+  if ((config.managedEnvironmentMode ?? "disabled") !== "required") return;
+  if (config.executionMode !== "container"
+    || (config.containerTarget ?? "managed") !== "managed"
+    || report.container?.available !== true
+    || report.container.target !== "managed"
+    || report.capabilities.runtimeClosure?.complete !== true
+    || report.capabilities.managedEnvironment?.available !== true
+    || report.capabilities.managedEnvironment.prepare !== true
+    || typeof execution.bindManagedSession !== "function") {
+    throw Object.assign(new Error(
+      "Managed environment is required but its launcher proof, runtime closure, or session binding is unavailable."
+    ), { code: "managed_environment_required_unavailable" });
   }
 }
 
@@ -355,46 +380,4 @@ function createSupervisor(
       await runtime.recordChildEvent(event.parentId, event.type, { childId: event.childId, payload: event.payload });
     }
   );
-}
-
-function createTools(
-  config: RuntimeCompositionConfig,
-  execution: ExecutionBroker,
-  supervisor: AgentSupervisor,
-  executionReport: BrokerDoctorReport,
-  storeRootDir: string
-): EffectToolRegistry {
-  const network = verifiedNetworkPolicy(executionReport, config.networkMode ?? "none");
-  const builtins = registerBuiltinTools(new EffectToolRegistry(), {
-    broker: execution,
-    atomicPatchStateRootDir: storeRootDir,
-    sandboxMode: "required",
-    readScope: config.readScope ?? "workspace",
-    processHandoff: config.processHandoff ?? "allow",
-    networkMode: network.defaultMode,
-    networkModes: network.modes,
-    shells: verifiedShellKinds(executionReport),
-    runtimeCommands: verifiedRuntimeCommands(executionReport),
-    foreground: executionReport.capabilities.foreground,
-    background: executionReport.capabilities.background,
-    stdin: executionReport.capabilities.stdin,
-    pty: executionReport.capabilities.pty,
-    handoff: config.processHandoff !== "deny"
-      && executionReport.capabilities.processHandoff === true
-      && typeof execution.handoff === "function",
-    ...repositoryRuntimeProviders,
-    ...(executionReport.capabilities.background
-      && executionReport.capabilities.stdin
-      && network.modes.includes("none") ? {
-      codeIntel: {
-        presets: discoverLanguageServers(),
-        additionalReadRoots: [defaultBundledLanguageServerRoot()]
-          .filter((value): value is string => Boolean(value))
-      }
-    } : {})
-  });
-  builtins.register(repositoryTransactionTool(execution, {
-    maxFiles: config.checkpoint?.maxFiles, maxBytes: config.checkpoint?.maxBytes
-  }));
-  return registerSupervisorTools(builtins, supervisor);
 }

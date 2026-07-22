@@ -19,6 +19,7 @@ import {
   type RepositoryTextSearchProvider
 } from "./repository-tools.js";
 import { workspaceTextTools } from "./workspace-text-tools.js";
+import { environmentPrepareTool } from "./managed-environment-tool.js";
 
 function deleteFileTool(): RegisteredEffectTool {
   return {
@@ -131,6 +132,9 @@ function builtinExecutionOptions(options: BuiltinToolOptions): ExecutionToolOpti
   const defaultShell = runtimeEnvironment().defaultShell;
   return {
     broker: options.broker ?? unavailableExecutionBroker(),
+    executionBackend: options.executionBackend,
+    executionPlatform: options.executionPlatform,
+    managedEnvironment: options.managedEnvironment,
     sandboxMode: options.sandboxMode ?? "required",
     readScope: options.readScope ?? "workspace",
     processHandoff: options.processHandoff ?? "allow",
@@ -156,12 +160,14 @@ export function registerBuiltinTools(
   const codeIntel = options.codeIntel
     ? [codeIntelTool({ broker: execution.broker, ...options.codeIntel })]
     : [];
+  const environmentPrepare = environmentPrepareTool(execution);
   for (const tool of [
     ...workspaceTextTools(options.atomicPatchStateRootDir, execution.readScope),
     deleteFileTool(),
     applyPatchTool(options.atomicPatchStateRootDir),
     ...codeIntel,
     ...executionTools(execution),
+    ...(environmentPrepare ? [environmentPrepare] : []),
     ...repositoryTools(options.broker, {
       list: options.repositoryList,
       statistics: options.repositoryStatistics,

@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::linux_mount_source::{PinnedMountSource, ResolvedMountSource, inherit_mount_sources};
 use crate::protocol::RpcError;
+use crate::scratch::{DisposableWorkspace, ScratchLease};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -8,7 +9,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{create_dir, read_dir, read_to_string, remove_dir, remove_file, write};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(target_os = "linux", test))]
@@ -71,6 +74,17 @@ pub struct ExecutionPolicy {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub protected_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub disposable_workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    pub read_only_validation_workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    pub scratch_lease_id: Option<String>,
+    #[serde(default)]
+    pub scratch_session_id: Option<String>,
+    /** Broker-populated scratch roots. Request payloads are cleared before use. */
+    #[serde(default)]
+    pub session_scratch_roots: Vec<PathBuf>,
     #[cfg(test)]
     #[serde(default)]
     pub unsafe_host_exec_approved: bool,
@@ -227,6 +241,8 @@ pub fn doctor_report() -> Value {
         json!([])
     };
     let shells = verified_shells(&status);
+    let executable_paths = executable_search_path_snapshot();
+    let runtime_commands = runtime_command_snapshot(&executable_paths);
     json!({
         "protocolVersion": crate::protocol::PROTOCOL_VERSION,
         "brokerVersion": env!("CARGO_PKG_VERSION"),
@@ -263,8 +279,126 @@ pub fn doctor_report() -> Value {
             "networkModes": network_modes,
             "executionRoots": true,
             "shells": shells,
+            "runtimeCommands": runtime_commands.commands,
+            "runtimeCommandSnapshotComplete": runtime_commands.complete,
+            // OCI clients reconstruct PATH from this target-observed value;
+            // they never inherit the control process PATH.
+            "executableSearchPaths": executable_paths.serialized,
         }
     })
+}
+
+const MAX_EXECUTABLE_SEARCH_PATHS: usize = 128;
+// Generic, bounded capability discovery. This list contains no task, package,
+// fixture, or benchmark identity. Omission is meaningful only within this
+// declared namespace and only while the connection-bound PATH remains stable.
+const RUNTIME_COMMAND_PROBE: &[&str] = &[
+    "bun", "cargo", "deno", "dotnet", "git", "go", "gradle", "gradlew", "java", "javac", "kotlinc",
+    "mvn", "mvnw", "node", "npm", "pnpm", "py", "pytest", "python", "python3", "rustc", "tsc",
+    "yarn",
+];
+
+struct ExecutableSearchPathSnapshot {
+    paths: Vec<PathBuf>,
+    serialized: Vec<String>,
+    complete: bool,
+}
+
+struct RuntimeCommandSnapshot {
+    commands: Vec<String>,
+    complete: bool,
+}
+
+fn executable_search_path_snapshot() -> ExecutableSearchPathSnapshot {
+    let Some(value) = std::env::var_os("PATH") else {
+        return ExecutableSearchPathSnapshot {
+            paths: Vec::new(),
+            serialized: Vec::new(),
+            complete: false,
+        };
+    };
+    let mut paths = Vec::new();
+    let mut serialized = Vec::new();
+    let mut complete = true;
+    for (index, entry) in std::env::split_paths(&value).enumerate() {
+        if index >= MAX_EXECUTABLE_SEARCH_PATHS {
+            complete = false;
+            break;
+        }
+        let Some(text) = entry.to_str().map(str::to_owned) else {
+            complete = false;
+            continue;
+        };
+        if !entry.is_absolute() {
+            complete = false;
+            continue;
+        }
+        if paths.contains(&entry) {
+            continue;
+        }
+        paths.push(entry);
+        serialized.push(text);
+    }
+    ExecutableSearchPathSnapshot {
+        paths,
+        serialized,
+        complete,
+    }
+}
+
+fn runtime_command_snapshot(paths: &ExecutableSearchPathSnapshot) -> RuntimeCommandSnapshot {
+    let mut commands = Vec::new();
+    let mut complete = paths.complete;
+    for command in RUNTIME_COMMAND_PROBE {
+        let (present, inspected) = command_on_search_path(command, &paths.paths);
+        complete &= inspected;
+        if present {
+            commands.push((*command).to_owned());
+        }
+    }
+    RuntimeCommandSnapshot { commands, complete }
+}
+
+fn command_on_search_path(command: &str, paths: &[PathBuf]) -> (bool, bool) {
+    let mut present = false;
+    let mut complete = true;
+    for directory in paths {
+        for candidate in command_candidates(directory, command) {
+            match std::fs::metadata(candidate) {
+                Ok(metadata) => present |= executable_metadata(&metadata),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(_) => complete = false,
+            }
+        }
+    }
+    (present, complete)
+}
+
+#[cfg(windows)]
+fn command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    ["", ".exe", ".com", ".bat", ".cmd"]
+        .into_iter()
+        .map(|suffix| directory.join(format!("{command}{suffix}")))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    vec![directory.join(command)]
+}
+
+#[cfg(unix)]
+fn executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 fn verified_shells(status: &SandboxStatus) -> Value {
@@ -342,6 +476,11 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     execution_roots: Vec::new(),
                     executable_sha256: None,
                     protected_paths: Vec::new(),
+                    disposable_workspace_root: None,
+                    read_only_validation_workspace_root: None,
+                    scratch_lease_id: None,
+                    scratch_session_id: None,
+                    session_scratch_roots: Vec::new(),
                     #[cfg(test)]
                     unsafe_host_exec_approved: false,
                 },
@@ -353,7 +492,7 @@ fn linux_verified_bash() -> Option<PathBuf> {
                 pty_columns: 80,
                 pty_rows: 24,
             };
-            let result = build_sandboxed_command(&params)
+            let result = build_sandboxed_command(&params, None, None)
                 .and_then(|mut prepared| prepared.command.output().map_err(RpcError::from))
                 .ok();
             let _ = std::fs::remove_dir_all(&root);
@@ -369,6 +508,8 @@ pub struct PreparedCommand {
     pub protected_path_guards: Vec<ProtectedPathGuard>,
     /** Broker-held nonce shared only with the trusted internal sandbox launcher. */
     pub launch_failure_nonce: Option<String>,
+    /** Owns and removes a writable validation mirror after the process exits. */
+    pub disposable_workspace: Option<DisposableWorkspace>,
     /** Keeps O_PATH mount sources alive until bwrap has inherited them. */
     #[cfg(target_os = "linux")]
     _mount_source_descriptors: Vec<std::fs::File>,
@@ -410,19 +551,40 @@ impl Drop for ProtectedPathGuard {
 pub fn build_command(
     params: &ProcessParams,
     allow_unsafe: bool,
+    scratch: Option<&ScratchLease>,
 ) -> Result<PreparedCommand, RpcError> {
     validate(params, allow_unsafe)?;
+    #[cfg(not(target_os = "linux"))]
+    if params.policy.disposable_workspace_root.is_some() {
+        return Err(RpcError::new(
+            "validation_disposable_workspace_unavailable",
+            "this sandbox backend cannot provide a same-path disposable validation workspace",
+        ));
+    }
+    let disposable_workspace = match (&params.policy.disposable_workspace_root, scratch) {
+        (Some(root), Some(lease)) => Some(lease.disposable_workspace(root)?),
+        (Some(_), None) => {
+            return Err(RpcError::new(
+                "validation_disposable_workspace_unavailable",
+                "validation workspace isolation requires broker session scratch",
+            ));
+        }
+        (None, _) => None,
+    };
     let guards = match params.policy.sandbox {
         SandboxMode::Required => create_missing_protected_guards(params)?,
         #[cfg(test)]
         SandboxMode::Unsafe => Vec::new(),
     };
     let mut prepared = match params.policy.sandbox {
-        SandboxMode::Required => build_sandboxed_command(params),
+        SandboxMode::Required => {
+            build_sandboxed_command(params, scratch, disposable_workspace.as_ref())
+        }
         #[cfg(test)]
         SandboxMode::Unsafe => build_host_command(params),
     }?;
     prepared.protected_path_guards = guards;
+    prepared.disposable_workspace = disposable_workspace;
     Ok(prepared)
 }
 
@@ -584,6 +746,51 @@ fn validate_roots(params: &ProcessParams) -> Result<(), RpcError> {
     let read_roots = canonical_roots(&params.policy.read_roots)?;
     let write_roots = canonical_roots(&params.policy.write_roots)?;
     let execution_roots = canonical_roots(&params.policy.execution_roots)?;
+    if params.policy.disposable_workspace_root.is_some()
+        && params.policy.read_only_validation_workspace_root.is_some()
+    {
+        return Err(RpcError::new(
+            "policy_denied",
+            "validation cannot request both same-path COW and read-only fallback",
+        ));
+    }
+    if let Some(validation_root) = params
+        .policy
+        .disposable_workspace_root
+        .as_ref()
+        .or(params.policy.read_only_validation_workspace_root.as_ref())
+    {
+        let validation_root = canonicalize_sandbox_root(validation_root)?;
+        let scratch_roots = canonical_roots(&params.policy.session_scratch_roots)?;
+        if write_roots.iter().any(|root| {
+            !scratch_roots
+                .iter()
+                .any(|scratch| root.starts_with(scratch))
+        }) {
+            return Err(RpcError::new(
+                "policy_denied",
+                "isolated validation cannot declare durable write roots",
+            ));
+        }
+        if !read_roots
+            .iter()
+            .any(|root| validation_root.starts_with(root))
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "validation workspace must be contained by a declared read root",
+            ));
+        }
+        if write_roots
+            .iter()
+            .any(|root| validation_root.starts_with(root) || root.starts_with(&validation_root))
+        {
+            return Err(RpcError::new(
+                "policy_denied",
+                "validation workspace cannot overlap durable write roots",
+            ));
+        }
+    }
     for write_root in &write_roots {
         if !read_roots.iter().any(|root| write_root.starts_with(root)) {
             return Err(RpcError::new(
@@ -888,13 +1095,18 @@ fn build_host_command(params: &ProcessParams) -> Result<PreparedCommand, RpcErro
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        disposable_workspace: None,
         #[cfg(target_os = "linux")]
         _mount_source_descriptors: Vec::new(),
     })
 }
 
 #[cfg(target_os = "linux")]
-fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    params: &ProcessParams,
+    scratch: Option<&ScratchLease>,
+    disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     let bwrap = trusted_bwrap().map_err(|error| RpcError::new("sandbox_unavailable", error))?;
     let mut command = Command::new(bwrap);
     // Session processes retain bubblewrap's parent-death cleanup in addition
@@ -943,14 +1155,27 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     let write_roots = pin_resolved_mount_sources(resolved_write_roots)?;
     let execution_roots = pin_resolved_mount_sources(resolved_execution_roots)?;
     let protected_roots = pin_resolved_mount_sources(resolved_protected_roots)?;
-    let cwd_source = resolved_cwd.pin()?;
+    let policy_cwd_source = resolved_cwd.pin()?;
+    let runtime_cwd_source = if let Some(workspace) = disposable_workspace {
+        PinnedMountSource::pin(&workspace.runtime_cwd_source(&params.command.cwd)?)?
+    } else {
+        PinnedMountSource::pin(&params.command.cwd)?
+    };
+    let disposable_source = disposable_workspace
+        .map(|workspace| PinnedMountSource::pin(workspace.source()))
+        .transpose()?;
     verify_pinned_root_hierarchy(
         &read_roots,
         &write_roots,
         &execution_roots,
         &protected_roots,
     )?;
-    verify_pinned_descendants("cwd", std::slice::from_ref(&cwd_source), &read_roots, true)?;
+    verify_pinned_descendants(
+        "cwd",
+        std::slice::from_ref(&policy_cwd_source),
+        &read_roots,
+        true,
+    )?;
     reject_internal_mount_conflicts(
         &read_roots,
         &write_roots,
@@ -958,18 +1183,35 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         &protected_roots,
     )?;
     let executable =
-        authorize_linux_executable(params, &system_roots, &execution_roots, &cwd_source)?;
+        authorize_linux_executable(params, &system_roots, &execution_roots, &runtime_cwd_source)?;
     let executable_destination = executable.source.destination().to_owned();
     for root in &system_roots {
         let value = root.to_string_lossy();
         command.args(["--ro-bind", value.as_ref(), value.as_ref()]);
     }
-    command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+    command.args(["--proc", "/proc", "--dev", "/dev"]);
+    let scratch_home = scratch
+        .map(|lease| PinnedMountSource::pin(lease.home_source()))
+        .transpose()?;
+    let scratch_temp = scratch
+        .map(|lease| PinnedMountSource::pin(lease.temp_source()))
+        .transpose()?;
+    if let (Some(lease), Some(home), Some(temp)) =
+        (scratch, scratch_home.as_ref(), scratch_temp.as_ref())
+    {
+        home.append_bind_at(&mut command, false, lease.home_destination());
+        temp.append_bind_at(&mut command, false, Path::new("/tmp"));
+    } else {
+        command.args(["--tmpfs", "/tmp"]);
+    }
     bind_pinned_roots(&mut command, &read_roots, true, &system_roots);
     bind_pinned_roots(&mut command, &write_roots, false, &[]);
     bind_pinned_roots(&mut command, &execution_roots, true, &system_roots);
+    if let (Some(workspace), Some(source)) = (disposable_workspace, disposable_source.as_ref()) {
+        source.append_bind_at(&mut command, false, workspace.destination());
+    }
     bind_pinned_roots(&mut command, &protected_roots, true, &[]);
-    cwd_source.append_bind_at(
+    runtime_cwd_source.append_bind_at(
         &mut command,
         true,
         Path::new(crate::linux_hardening::INTERNAL_CWD_PIN_MOUNT),
@@ -985,6 +1227,25 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     // with the glibc 2.28 baseline's bubblewrap 0.4 runtime.
     for (key, value) in &params.command.env {
         command.args(["--setenv", key, value]);
+    }
+    if let Some(lease) = scratch {
+        let home = lease.home_destination();
+        command.args(["--setenv", "HOME"]).arg(home);
+        command.args(["--setenv", "TMPDIR", "/tmp"]);
+        command.args(["--setenv", "TMP", "/tmp"]);
+        command.args(["--setenv", "TEMP", "/tmp"]);
+        command
+            .args(["--setenv", "XDG_CACHE_HOME"])
+            .arg(home.join(".cache"));
+        command
+            .args(["--setenv", "XDG_CONFIG_HOME"])
+            .arg(home.join(".config"));
+        command
+            .args(["--setenv", "XDG_DATA_HOME"])
+            .arg(home.join(".local/share"));
+        command
+            .args(["--setenv", "XDG_STATE_HOME"])
+            .arg(home.join(".local/state"));
     }
     let helper = std::env::current_exe().map_err(|error| {
         RpcError::new(
@@ -1027,6 +1288,12 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
     {
         command.arg("--write").arg(root);
     }
+    if let Some(workspace) = disposable_workspace {
+        command.arg("--write").arg(workspace.destination());
+    }
+    if let Some(lease) = scratch {
+        command.arg("--write").arg(lease.home_destination());
+    }
     command.arg("--");
     if params.pty {
         command
@@ -1051,9 +1318,13 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         .map(PinnedMountSource::raw_fd)
         .chain([
             helper_source.raw_fd(),
-            cwd_source.raw_fd(),
+            policy_cwd_source.raw_fd(),
+            runtime_cwd_source.raw_fd(),
             executable.source.raw_fd(),
         ])
+        .chain(scratch_home.iter().map(PinnedMountSource::raw_fd))
+        .chain(scratch_temp.iter().map(PinnedMountSource::raw_fd))
+        .chain(disposable_source.iter().map(PinnedMountSource::raw_fd))
         .collect::<Vec<_>>();
     inherit_mount_sources(&mut command, &mount_source_fds)?;
     let mount_source_descriptors = read_roots
@@ -1064,26 +1335,51 @@ fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, Rp
         .map(PinnedMountSource::into_descriptor)
         .chain([
             helper_source.into_descriptor(),
-            cwd_source.into_descriptor(),
+            policy_cwd_source.into_descriptor(),
+            runtime_cwd_source.into_descriptor(),
             executable.source.into_descriptor(),
         ])
+        .chain(
+            scratch_home
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            scratch_temp
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
+        .chain(
+            disposable_source
+                .into_iter()
+                .map(PinnedMountSource::into_descriptor),
+        )
         .collect();
     Ok(PreparedCommand {
         command,
         bootstrap_stdin: Vec::new(),
         protected_path_guards: Vec::new(),
         launch_failure_nonce: None,
+        disposable_workspace: None,
         _mount_source_descriptors: mount_source_descriptors,
     })
 }
 
 #[cfg(target_os = "windows")]
-fn build_sandboxed_command(params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    params: &ProcessParams,
+    _scratch: Option<&ScratchLease>,
+    _disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     crate::windows_sandbox::prepare_command(params)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn build_sandboxed_command(_params: &ProcessParams) -> Result<PreparedCommand, RpcError> {
+fn build_sandboxed_command(
+    _params: &ProcessParams,
+    _scratch: Option<&ScratchLease>,
+    _disposable_workspace: Option<&DisposableWorkspace>,
+) -> Result<PreparedCommand, RpcError> {
     Err(RpcError::new(
         "sandbox_unavailable",
         "required sandbox backend is unavailable on this platform",
@@ -1699,6 +1995,11 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: vec![root.join(".git"), root.join(".agent")],
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                session_scratch_roots: Vec::new(),
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },

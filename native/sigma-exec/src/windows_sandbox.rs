@@ -288,18 +288,16 @@ pub(crate) fn prepare_command(params: &ProcessParams) -> Result<PreparedCommand,
         bootstrap_stdin: bootstrap,
         protected_path_guards: Vec::new(),
         launch_failure_nonce: Some(failure_nonce),
+        disposable_workspace: None,
     })
 }
 
 fn validate_writable_acl_roots(params: &ProcessParams) -> Result<(), RpcError> {
     let read = canonical_unique(&params.policy.read_roots)?;
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
+    let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
     let mut protected = params.policy.protected_paths.clone();
-    protected.extend(
-        minimal_roots(&read)
-            .into_iter()
-            .flat_map(|root| [root.join(".git"), root.join(".agent")]),
-    );
+    protected.extend(repository_metadata_paths(&read, &scratch));
     let protected = canonical_protected(&protected, &write)?;
     for root in &write {
         inspect_acl_target_path(root, Some(root))?;
@@ -910,12 +908,12 @@ fn grant_root_lease_access(
     let declared_read = canonical_unique(&readable)?;
     let read = minimal_windows_roots(&declared_read);
     let write = minimal_windows_roots(&canonical_unique(&params.policy.write_roots)?);
+    let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
     let mut protected = params.policy.protected_paths.clone();
-    protected.extend(
-        minimal_roots(&canonical_unique(&params.policy.read_roots)?)
-            .into_iter()
-            .flat_map(|root| [root.join(".git"), root.join(".agent")]),
-    );
+    protected.extend(repository_metadata_paths(
+        &canonical_unique(&params.policy.read_roots)?,
+        &scratch,
+    ));
     let protected = canonical_protected(&protected, &write)?;
     let mut plan = Vec::new();
     for path in policy_ancestor_paths(params, user_profile)? {
@@ -971,6 +969,27 @@ fn grant_root_lease_access(
     journal.apply(&plan, sid)
 }
 
+/// Repository metadata is protected under durable read roots. Broker-issued
+/// scratch is intentionally excluded: it is private, outside the workspace,
+/// and removed with the RuntimeSession, so tools may persist ordinary caches
+/// (including their own nested repositories) without weakening workspace
+/// metadata protection.
+fn repository_metadata_paths(read_roots: &[PathBuf], scratch_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let durable = read_roots
+        .iter()
+        .filter(|root| {
+            !scratch_roots
+                .iter()
+                .any(|scratch| windows_path_within(scratch, root))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    minimal_roots(&durable)
+        .into_iter()
+        .flat_map(|root| [root.join(".git"), root.join(".agent")])
+        .collect()
+}
+
 #[allow(dead_code)]
 fn grant_policy_access(
     params: &ProcessParams,
@@ -1006,12 +1025,9 @@ fn grant_policy_access(
             0,
         )?;
     }
+    let scratch = canonical_unique(&params.policy.session_scratch_roots)?;
     let mut protected = params.policy.protected_paths.clone();
-    protected.extend(
-        minimal_roots(&workspace_read)
-            .into_iter()
-            .flat_map(|root| [root.join(".git"), root.join(".agent")]),
-    );
+    protected.extend(repository_metadata_paths(&workspace_read, &scratch));
     let protected = canonical_protected(&protected, &write)?;
     for path in &write {
         plan_write_tree(
@@ -4714,6 +4730,11 @@ fn self_test() -> Result<(), RpcError> {
             execution_roots: Vec::new(),
             executable_sha256: None,
             protected_paths: vec![root.join(".git"), root.join(".agent")],
+            disposable_workspace_root: None,
+            read_only_validation_workspace_root: None,
+            scratch_lease_id: None,
+            scratch_session_id: None,
+            session_scratch_roots: Vec::new(),
             #[cfg(test)]
             unsafe_host_exec_approved: false,
         },
@@ -6432,6 +6453,36 @@ mod tests {
     }
 
     #[test]
+    fn broker_scratch_does_not_become_repository_metadata_scope() {
+        let unique = ephemeral_profile_name()
+            .expect("create scratch metadata fixture name")
+            .replace('.', "-");
+        let fixture = std::env::temp_dir().join(format!("sigma-scratch-metadata-{unique}"));
+        let workspace = fixture.join("workspace");
+        let scratch = fixture.join("scratch");
+        std::fs::create_dir_all(workspace.join(".git")).expect("create workspace metadata");
+        std::fs::create_dir_all(scratch.join(".git")).expect("create scratch cache repository");
+        let read =
+            canonical_unique(&[workspace.clone(), scratch.clone()]).expect("resolve read roots");
+        let scratch_roots =
+            canonical_unique(std::slice::from_ref(&scratch)).expect("resolve scratch root");
+
+        let protected = repository_metadata_paths(&read, &scratch_roots);
+        assert!(
+            protected
+                .iter()
+                .any(|path| windows_path_eq(path, &workspace.join(".git")))
+        );
+        assert!(
+            !protected
+                .iter()
+                .any(|path| windows_path_eq(path, &scratch.join(".git")))
+        );
+
+        std::fs::remove_dir_all(&fixture).expect("remove scratch metadata fixture");
+    }
+
+    #[test]
     fn stable_read_lease_excludes_external_capability_roots() {
         let unique = ephemeral_profile_name()
             .expect("create read lease selection fixture name")
@@ -6462,6 +6513,11 @@ mod tests {
                 execution_roots,
                 executable_sha256: None,
                 protected_paths: Vec::new(),
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                session_scratch_roots: Vec::new(),
                 unsafe_host_exec_approved: false,
             },
             max_output_bytes: 1_024,
@@ -6525,6 +6581,11 @@ mod tests {
                 execution_roots: Vec::new(),
                 executable_sha256: None,
                 protected_paths: Vec::new(),
+                disposable_workspace_root: None,
+                read_only_validation_workspace_root: None,
+                scratch_lease_id: None,
+                scratch_session_id: None,
+                session_scratch_roots: Vec::new(),
                 #[cfg(test)]
                 unsafe_host_exec_approved: false,
             },
