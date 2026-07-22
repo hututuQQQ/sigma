@@ -87,15 +87,6 @@ export class ToolTransactionRunner {
     const { call, modelTurn } = attempt;
     const descriptor = this.options.runtime.tools.descriptors().find((item) => item.name === call.name);
     if (!descriptor) return failed(call, startedAt, `Unknown tool '${call.name}'.`, "unknown_tool");
-    if (descriptor.possibleEffects.some((effect) => effect === "process.spawn" || effect === "process.spawn.readonly")
-      && [...session.interaction.capabilityFailures.values()].some((count) => count >= 2)) {
-      return failed(
-        call,
-        startedAt,
-        "Execution is blocked after the same sandbox capability failed twice. Do not substitute a weaker probe; report the typed environment blocker.",
-        "capability_retry_exhausted"
-      );
-    }
     await this.options.emit(session, "tool.requested", "runtime", {
       callId: call.id, name: call.name, arguments: call.arguments, ...turnPayload(modelTurn)
     });

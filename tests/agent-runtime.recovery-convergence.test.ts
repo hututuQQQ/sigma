@@ -43,9 +43,8 @@ function runtime(toolIdleWatchdogMs?: number | false): RuntimeOptions {
 }
 
 describe("runtime recovery convergence", () => {
-  it("counts repeated capability failures per semantic invocation", () => {
+  it("leaves capability retry authority to the durable task-control reducer", () => {
     const session = runtimeSessionFixture();
-    session.interaction.capabilityFailures = new Map();
     const signal = new AbortController().signal;
     const failure = Object.assign(new Error("runtime unavailable"), { code: "toolchain_unavailable" });
     const first = { id: "first", name: "exec", arguments: { executable: "node", args: ["--version"] } };
@@ -58,7 +57,8 @@ describe("runtime recovery convergence", () => {
     ).diagnostics).toContain("toolchain_unavailable");
     expect(convergedToolFailure(
       session, { ...first, id: "retry" }, "2026-01-01T00:00:00.000Z", failure, signal
-    ).diagnostics).toContain("capability_retry_exhausted");
+    ).diagnostics).toContain("toolchain_unavailable");
+    expect(session.interaction).not.toHaveProperty("capabilityFailures");
   });
 
   it("keeps the outer idle watchdog behind a tool-owned idle deadline and allows an explicit policy", () => {

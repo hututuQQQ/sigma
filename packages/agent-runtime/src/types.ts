@@ -161,9 +161,6 @@ export interface RuntimeSessionInteractionState {
   /** One-shot grants, bound to a call and intentionally not restored. */
   callApprovals: Map<string, CallApprovalGrant>;
   alwaysAllowedEffects: Set<string>;
-  /** Runtime-local convergence guard; infrastructure failures are summarized
-   * instead of being replayed through durable model history. */
-  capabilityFailures: Map<string, number>;
   steeringPending: number;
   followUps: QueuedFollowUp[];
   contextItems: ContextItem[];
