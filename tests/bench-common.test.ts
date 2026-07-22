@@ -214,7 +214,7 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
-  it("keeps standard runs at task resources and marks relaxed runs diagnostic", () => {
+  it("keeps the full task timeout for solving and reserves cleanup outside it", () => {
     const standard = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"]);
     const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
     const config = buildHarborJobConfig(standard, "jobs", standardPlan);
@@ -222,13 +222,14 @@ describe("Terminal-Bench command construction", () => {
       benchmarkClass: "standard", executionMode: "sandboxed", agentProfile: "standard"
     });
     expect(standardPlan).toMatchObject({
-      agent_wall_time_sec: 780,
+      agent_wall_time_sec: 900,
+      harness_timeout_sec: 1020,
       benchmark_class: "standard",
-      agent_timeout_multiplier: null,
+      agent_timeout_multiplier: "1.14",
       verifier_timeout_multiplier: null,
       environment_build_timeout_multiplier: null
     });
-    expect(config).not.toHaveProperty("agent_timeout_multiplier");
+    expect(config.agent_timeout_multiplier).toBe(1.14);
     expect(config.agents[0].kwargs.execution_mode).toBe("sandboxed");
     expect(config.agents[0].kwargs.agent_profile).toBe("standard");
 
@@ -257,10 +258,11 @@ describe("Terminal-Bench command construction", () => {
     ]);
     expect(computeHarborTimeoutPlan(options, { max_agent_timeout_sec: 900 })).toMatchObject({
       recommended_agent_timeout_sec: 900,
-      agent_wall_time_sec: 780,
+      agent_wall_time_sec: 900,
+      harness_timeout_sec: 1020,
       leniency_multiplier: 1,
       leniency_min_extra_sec: 0,
-      agent_timeout_multiplier: null,
+      agent_timeout_multiplier: "1.14",
       benchmark_class: "standard"
     });
   });
@@ -422,9 +424,9 @@ describe("Terminal-Bench command construction", () => {
     const plan = computeHarborTimeoutPlan({ benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, timeoutProbe);
 
     expect(plan).toMatchObject({
-      requested_agent_wall_time_sec: 1080,
-      agent_wall_time_sec: 1080,
-      child_deadline_sec: 1080,
+      requested_agent_wall_time_sec: 1200,
+      agent_wall_time_sec: 1200,
+      child_deadline_sec: 1200,
       outer_trial_deadline_sec: null,
       outer_trial_deadline_scope: "harbor_per_trial",
       deadline_cleanup_grace_sec: 120,
@@ -433,7 +435,7 @@ describe("Terminal-Bench command construction", () => {
     const kwargs = buildHarborJobConfig({
       mode: "k", k: 2, provider: "deepseek", model: "deepseek-v4-pro", agentTimeoutGraceSec: 120
     }, "jobs", plan, timeoutProbe).agents[0].kwargs;
-    expect(kwargs).toMatchObject({ max_wall_time_sec: 1080 });
+    expect(kwargs).toMatchObject({ max_wall_time_sec: 1200 });
     expect(kwargs).not.toHaveProperty("outer_trial_deadline_sec");
   });
 
@@ -458,8 +460,8 @@ describe("Terminal-Bench command construction", () => {
         { benchmarkClass: "standard", agentTimeoutGraceSec: 120 }, group.timeout_probe
       ).agent_wall_time_sec
     }))).toEqual([
-      { timeout: 900, tasks: ["terminal-bench/short-a", "terminal-bench/short-b"], plan: 780 },
-      { timeout: 3600, tasks: ["terminal-bench/long"], plan: 3480 }
+      { timeout: 900, tasks: ["terminal-bench/short-a", "terminal-bench/short-b"], plan: 900 },
+      { timeout: 3600, tasks: ["terminal-bench/long"], plan: 3600 }
     ]);
   });
 
@@ -474,8 +476,8 @@ describe("Terminal-Bench command construction", () => {
     );
 
     expect(plan).toMatchObject({
-      agent_wall_time_sec: 780,
-      outer_trial_deadline_sec: 900,
+      agent_wall_time_sec: 900,
+      outer_trial_deadline_sec: 1020,
       outer_trial_deadline_scope: "uniform_task_timeout",
       deadline_cleanup_grace_sec: 120
     });

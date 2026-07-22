@@ -491,26 +491,27 @@ export function computeHarborTimeoutPlan(options = {}, timeoutProbe = null) {
     Math.ceil(asFinitePositiveNumber(options.agentTimeoutGraceSec) ?? defaultAgentTimeoutGraceSec)
   );
   const cleanupGraceSec = graceSec;
-  const standardAgentWallTimeSec = Math.max(1, Math.floor(recommendedAgentTimeoutSec - cleanupGraceSec));
+  // The task-declared timeout belongs to solving. Settlement and container
+  // cleanup use a separate outer grace window; subtracting that window from
+  // the solver silently changes the benchmark contract.
+  const standardAgentWallTimeSec = Math.max(1, Math.floor(recommendedAgentTimeoutSec));
   const agentWallTimeSec = runClass === "standard"
     ? standardAgentWallTimeSec
     : Math.ceil(requestedWallTimeSec ?? lenientAgentWallTimeSec);
   const harnessTimeoutSec = agentWallTimeSec + cleanupGraceSec;
-  const agentTimeoutMultiplier = runClass === "diagnostic" &&
-    harnessTimeoutSec > recommendedAgentTimeoutSec
-      ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
-      : null;
+  const agentTimeoutMultiplier = harnessTimeoutSec > recommendedAgentTimeoutSec
+    ? formatMultiplier(harnessTimeoutSec / recommendedAgentTimeoutSec)
+    : null;
   const timeoutTasks = Array.isArray(timeoutProbe?.tasks) ? timeoutProbe.tasks : [];
   const taskAgentTimeouts = timeoutTasks
     .map((task) => asFinitePositiveNumber(task?.agent_timeout_sec));
   const knownTaskAgentTimeouts = taskAgentTimeouts.filter((value) => value !== null);
-  const appliedAgentTimeoutMultiplier = agentTimeoutMultiplier ? Number(agentTimeoutMultiplier) : 1;
   const allTaskTimeoutsAvailable = timeoutTasks.length > 0
     && knownTaskAgentTimeouts.length === timeoutTasks.length;
   const uniformTaskTimeout = allTaskTimeoutsAvailable
     && knownTaskAgentTimeouts.every((value) => value === knownTaskAgentTimeouts[0]);
   const outerTrialDeadlineSec = uniformTaskTimeout
-    ? knownTaskAgentTimeouts[0] * appliedAgentTimeoutMultiplier
+    ? harnessTimeoutSec
     : null;
   const outerTrialDeadlineScope = uniformTaskTimeout
     ? "uniform_task_timeout"
