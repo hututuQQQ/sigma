@@ -9,3 +9,4 @@ export * from "./task-control-state.js";
 export * from "./task-control.js";
 export * from "./capability-task-control.js";
 export * from "./repository-task-control.js";
+export * from "./restoration-task-control.js";

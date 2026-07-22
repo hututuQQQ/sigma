@@ -29,7 +29,11 @@ import {
   validationScope
 } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
 import { ReviewCoordinator, reviewReadiness } from "../packages/agent-runtime/src/review-coordinator.js";
-import { frontierValidationReadiness, unresolvedWorkspaceDeltas } from "../packages/agent-runtime/src/mutation-evidence.js";
+import {
+  frontierValidationReadiness,
+  reviewBasisDigest,
+  unresolvedWorkspaceDeltas
+} from "../packages/agent-runtime/src/mutation-evidence.js";
 import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 import { runtimeSessionFixture } from "./testkit/runtime-session-fixture.js";
 
@@ -496,7 +500,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
-  it("reports a failed explicitly requested Node check as validation_failed", () => {
+  it("requires completion review before accepting an honestly reported failed check", () => {
     const active = frontierSession();
     active.durable.state.plan = {
       ...active.durable.state.plan,
@@ -544,6 +548,7 @@ describe("V5 assurance-coordinated mutation completion", () => {
     };
     expect(frontierValidationReadiness(active)).toMatchObject({
       ready: false,
+      executionReady: true,
       missingClaims: ["acceptance"],
       latestFailed: { evidenceId: "node-check-failed" }
     });
@@ -551,7 +556,71 @@ describe("V5 assurance-coordinated mutation completion", () => {
       possibleEffects: ["outcome.propose"]
     } as ToolDescriptor, now)).toMatchObject({
       ok: false,
-      diagnostics: ["validation_failed"]
+      diagnostics: ["validation_result_reporting_required"],
+      result: { nextActions: [{ tool: "request_review", arguments: {} }] }
+    });
+
+    const candidateDigest = "c".repeat(64);
+    active.durable.state.taskControl.completionCandidate = {
+      answer: "The requested check failed.",
+      digest: candidateDigest
+    };
+    active.durable.state.evidence.push({
+      evidenceId: "completion-review",
+      sessionId: "session",
+      runId: "run",
+      kind: "review",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "The requested failed check was reported honestly.",
+      data: {
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        frontierRevision: active.durable.state.mutationFrontier.revision,
+        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
+        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
+        validationEvidenceIds: ["node-check-failed"]
+      }
+    });
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toBeNull();
+
+    active.durable.state.mutationFrontier.changedPaths = ["packages/agent-runtime/service.mjs"];
+    const failedEvidence = active.durable.state.evidence.find(
+      (item): item is ValidationEvidence => item.evidenceId === "node-check-failed"
+    )!;
+    failedEvidence.data.coveredPaths = ["packages/agent-runtime/service.mjs"];
+    active.durable.state.evidence = active.durable.state.evidence.filter(
+      (item) => item.evidenceId !== "completion-review"
+    );
+    active.durable.state.evidence.push({
+      evidenceId: "high-risk-completion-review",
+      sessionId: "session",
+      runId: "run",
+      kind: "review",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "runtime", id: "reviewer" },
+      summary: "The failed check was reported, but high-risk validation remains required.",
+      data: {
+        reviewerId: "reviewer",
+        verdict: "approved",
+        findings: [],
+        frontierRevision: active.durable.state.mutationFrontier.revision,
+        stateDigest: active.durable.state.mutationFrontier.currentStateDigest,
+        reviewBasisDigest: reviewBasisDigest(active, undefined, candidateDigest),
+        validationEvidenceIds: ["node-check-failed"]
+      }
+    });
+    expect(assuranceRequirement(active).risk).toBe("high");
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_result_reporting_required"]
     });
   });
 

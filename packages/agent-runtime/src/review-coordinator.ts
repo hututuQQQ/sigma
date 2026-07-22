@@ -29,6 +29,7 @@ import {
 import type { RuntimeEventEmitter } from "./runtime-event-emitter.js";
 import { reviewerWaivedDeltaIds } from "./review-waiver-policy.js";
 import { deadlineForecast } from "./convergence-policy.js";
+import { assuranceRequirement } from "./assurance-engine.js";
 
 function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "required" {
   return session.services.profile?.profile.mutationPolicy.reviewMode ?? "advisory";
@@ -88,7 +89,10 @@ export interface ReviewReadiness {
   retryableReview?: ReviewEvidence;
 }
 
-export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
+export function reviewReadiness(
+  session: RuntimeSession,
+  reviewMode: ReviewerInput["reviewMode"] = "workspace"
+): ReviewReadiness {
   const validation = frontierValidationReadiness(session);
   const unresolved = unresolvedWorkspaceDeltas(session);
   const waived = reviewerWaivedDeltaIds(sessionMutationEvidence(session));
@@ -98,9 +102,13 @@ export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
     ? unresolved
     : unresolved.filter((item) => !waived.has(item.evidenceId));
   const latest = currentFrontierReview(session);
+  const executedFailureReviewable = reviewMode === "completion"
+    && validation.executionReady
+    && assuranceRequirement(session).risk !== "high";
   return {
     pending,
-    eligible: validation.ready ? pending : [],
+    eligible: validation.ready || executedFailureReviewable
+      ? pending : [],
     validations: validation.validations,
     relevantValidations: validation.validations,
     ...(latest?.status === "failed" && !latest.data.failureKind ? { blockedReview: latest } : {}),
@@ -160,7 +168,7 @@ function eligibleReviewAttempt(
   explicitlyRequested: boolean,
   reviewMode: ReviewerInput["reviewMode"]
 ): ReviewAttempt | null {
-  const { eligible, relevantValidations } = reviewReadiness(session);
+  const { eligible, relevantValidations } = reviewReadiness(session, reviewMode);
   if (eligible.length === 0) return null;
   const candidate = reviewMode === "completion" ? session.durable.state.taskControl.completionCandidate : undefined;
   const basisDigest = reviewBasisDigest(session, relevantValidations, candidate?.digest);

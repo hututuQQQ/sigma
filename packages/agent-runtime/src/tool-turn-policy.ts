@@ -15,6 +15,9 @@ export type CompletionRepairPhase =
   | "repository_select"
   | "repository_transact"
   | "repository_validate"
+  | "restoration_quiesce"
+  | "restoration_restore"
+  | "restoration_confirm"
   | "terminal";
 
 const REVIEW_REPAIR_PHASES = {
@@ -29,18 +32,19 @@ const REPOSITORY_CONFLICT_TOOL_NAMES = new Set([
 
 function obligationRepairPhase(session: RuntimeSession): CompletionRepairPhase | null {
   const obligation = session.durable.state.taskControl.obligation;
-  if (obligation?.kind === "review_repair") return REVIEW_REPAIR_PHASES[obligation.stage];
-  if (obligation?.kind === "capability_recovery") {
-    return obligation.stage === "prepare" ? "capability_prepare" : "capability_re_probe";
+  if (!obligation) return null;
+  switch (obligation.kind) {
+    case "review_repair": return REVIEW_REPAIR_PHASES[obligation.stage];
+    case "capability_recovery":
+      return obligation.stage === "prepare" ? "capability_prepare" : "capability_re_probe";
+    case "repository_recovery": return `repository_${obligation.stage}`;
+    case "restoration": return `restoration_${obligation.stage}`;
+    case "completion_evidence":
+      return obligation.stage === "acquire" ? "completion_evidence" : "terminal";
+    case "terminal_resolution":
+    case "user_decision": return "terminal";
+    case "process_settlement": return "generic_repair";
   }
-  if (obligation?.kind === "repository_recovery") {
-    return `repository_${obligation.stage}`;
-  }
-  if (obligation?.kind === "completion_evidence") {
-    return obligation.stage === "acquire" ? "completion_evidence" : "terminal";
-  }
-  if (obligation?.kind === "terminal_resolution" || obligation?.kind === "user_decision") return "terminal";
-  return null;
 }
 
 export function completionRepairPhase(session: RuntimeSession): CompletionRepairPhase {
@@ -61,7 +65,7 @@ function userInputAllowed(session: RuntimeSession): boolean {
 }
 
 type DirectedRepairPhase = Extract<CompletionRepairPhase,
-  "capability_prepare" | "capability_re_probe" | `repository_${string}`>;
+  "capability_prepare" | "capability_re_probe" | `repository_${string}` | `restoration_${string}`>;
 type BaseRepairPhase = Exclude<CompletionRepairPhase, DirectedRepairPhase>;
 
 function baseDescriptorAllowedForRepair(
@@ -98,6 +102,11 @@ export function descriptorAllowedForRepair(
     return obligation?.kind === "capability_recovery"
       && descriptor.name === obligation.probeToolName;
   }
+  if (phase === "restoration_quiesce") {
+    return descriptor.name === "process_terminate" || descriptor.name === "process_list";
+  }
+  if (phase === "restoration_restore") return descriptor.name === "restore_run_changes";
+  if (phase === "restoration_confirm") return descriptor.name === "confirm_run_restored";
   const repository = repositoryDescriptorAllowed(session, descriptor, phase);
   if (repository !== undefined) return repository;
   return baseDescriptorAllowedForRepair(session, descriptor, phase as BaseRepairPhase);
@@ -154,6 +163,12 @@ export function effectsAllowedForRepair(
     && effects.includes("network") && effects.includes("open_world");
   if (phase === "capability_re_probe") return effects.includes("process.spawn")
     || effects.includes("process.spawn.readonly");
+  if (phase === "restoration_quiesce") return effects.includes("runtime.control")
+    || effects.includes("process.spawn");
+  if (phase === "restoration_restore") return effects.includes("checkpoint.restore")
+    && effects.includes("filesystem.write");
+  if (phase === "restoration_confirm") return effects.includes("runtime.control")
+    && effects.includes("filesystem.read") && !effects.includes("filesystem.write");
   const repository = repositoryEffectsAllowed(effects, phase);
   return repository ?? baseEffectsAllowedForRepair(effects, phase as BaseRepairPhase);
 }

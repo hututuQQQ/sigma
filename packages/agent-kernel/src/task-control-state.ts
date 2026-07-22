@@ -50,6 +50,7 @@ export type TaskObligationV1 =
       basisDigest: string;
       openedRevision: number;
       attempts: number;
+      nextDecisionCode?: string;
     }
   | {
       kind: "process_settlement";
@@ -172,7 +173,9 @@ const OBLIGATION_VALIDATORS: Record<TaskObligationV1["kind"], ObligationValidato
     && (obligation.selectionEvidenceId === undefined
       || typeof obligation.selectionEvidenceId === "string" && obligation.selectionEvidenceId.length > 0)
     && (obligation.scopePaths === undefined || nonEmptyStrings(obligation.scopePaths)),
-  restoration: (obligation) => ["quiesce", "restore", "confirm"].includes(String(obligation.stage)),
+  restoration: (obligation) => ["quiesce", "restore", "confirm"].includes(String(obligation.stage))
+    && (obligation.nextDecisionCode === undefined
+      || typeof obligation.nextDecisionCode === "string" && obligation.nextDecisionCode.length > 0),
   process_settlement: (obligation) => obligation.stage === "settle" && nonEmptyStrings(obligation.processIds),
   user_decision: (obligation) => obligation.stage === "request"
     && typeof obligation.decisionCode === "string" && obligation.decisionCode.length > 0,

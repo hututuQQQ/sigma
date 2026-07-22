@@ -28,6 +28,7 @@ import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 const NOW = "2026-01-01T00:00:00.000Z";
 const nonBlankText = fc.string({ minLength: 1, maxLength: 80 })
   .filter((value) => value.trim().length > 0);
+const completionText = nonBlankText.filter((value) => !/[?？]\s*$/u.test(value));
 
 function initial(): KernelState {
   return createKernelState({
@@ -151,7 +152,7 @@ describe("terminal convergence properties", () => {
   });
 
   it("always converges an explicit concrete question to a typed input proposal", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, question) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
       let prepared = apply(initial(), "user.message", { text: answer });
       prepared = apply(prepared, "evidence.recorded", evidence());
       let attempted = settleModel(startModel(prepared, 1), {
@@ -197,7 +198,7 @@ describe("terminal convergence properties", () => {
   });
 
   it("always publishes ordinary text when its runtime completion intent succeeds", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, summary) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, summary) => {
       let state = protectedAnswer(answer);
       const pending = state.pendingTools[0]!;
       state = apply(state, "tool.completed", {
@@ -250,7 +251,7 @@ describe("terminal convergence properties", () => {
   });
 
   it("rejects an input-effect receipt from a custom tool during protected recovery", () => {
-    fc.assert(fc.property(nonBlankText, nonBlankText, (answer, question) => {
+    fc.assert(fc.property(completionText, nonBlankText, (answer, question) => {
       const protectedState = protectedAnswer(answer);
       const modelTurn = { turnId: 2, effectRevision: protectedState.revision };
       const recoveryState: KernelState = {

@@ -121,6 +121,17 @@ function hasPassedValidation(
     && paths.some((path) => item.data.coveredPaths.includes(path)));
 }
 
+function hasExecutedValidation(
+  delta: WorkspaceDeltaEvidence,
+  validations: readonly ValidationEvidence[]
+): boolean {
+  const paths = [...delta.data.delta.added, ...delta.data.delta.modified, ...delta.data.delta.deleted];
+  return validations.some((item) => item.status === "failed"
+    && item.data.termination?.processStarted === true
+    && item.data.termination.state === "exited"
+    && paths.some((path) => item.data.coveredPaths.includes(path)));
+}
+
 type EvidenceIndex<T> = { value: T } | { failure: string };
 
 function invalidOpaqueArtifact(
@@ -215,7 +226,8 @@ function reviewDiffEvidenceFailure(
 
 function completeReviewEvidenceFailure(
   delta: WorkspaceDeltaEvidence,
-  validations: readonly ValidationEvidence[]
+  validations: readonly ValidationEvidence[],
+  reviewMode: ReviewerInput["reviewMode"]
 ): string | undefined {
   const changes = changedPathKinds(delta);
   if (!changes) return `Delta ${delta.evidenceId} has invalid or duplicate workspace paths.`;
@@ -225,7 +237,12 @@ function completeReviewEvidenceFailure(
   if ("failure" in coverageResult) return coverageResult.failure;
   const diffFailure = reviewDiffEvidenceFailure(delta, changes, artifactResult.value, coverageResult.value);
   if (diffFailure) return diffFailure;
-  if (!hasPassedValidation(delta, validations)) {
+  const hasOpaqueContent = [...changes].some(([path, kind]) =>
+    pathIsFullyOpaque(kind, artifactResult.value.get(path)));
+  const validationAvailable = hasPassedValidation(delta, validations)
+    || reviewMode === "completion" && !hasOpaqueContent
+      && hasExecutedValidation(delta, validations);
+  if (!validationAvailable) {
     return `Delta ${delta.evidenceId} has no passed validation evidence bound to its workspace delta.`;
   }
   return undefined;
@@ -237,7 +254,7 @@ export function reviewInputFailure(input: ReviewerInput): string | undefined {
       return `${delta.data.reviewProblem.code}: ${delta.data.reviewProblem.message} ${delta.data.reviewProblem.action}`;
     }
     if (delta.data.reviewDiffPaths !== undefined) {
-      const completeFailure = completeReviewEvidenceFailure(delta, input.validations);
+      const completeFailure = completeReviewEvidenceFailure(delta, input.validations, input.reviewMode);
       if (completeFailure) return completeFailure;
       continue;
     }

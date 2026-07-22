@@ -68,10 +68,12 @@ export class RuntimeControlService {
   }
 
   private requestReview(session: RuntimeSession): ReviewRequestResult {
-    const readiness = reviewReadiness(session);
+    const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+    const reviewMode = candidateDigest ? "completion" as const : "workspace" as const;
+    const readiness = reviewReadiness(session, reviewMode);
     const validation = frontierValidationReadiness(session);
     const frontier = session.durable.state.mutationFrontier;
-    const currentReview = currentFrontierReview(session);
+    const currentReview = currentFrontierReview(session, candidateDigest);
     const latestReview = latestFrontierReview(session);
     return {
       status: readiness.pending.length === 0
@@ -79,7 +81,7 @@ export class RuntimeControlService {
         : readiness.eligible.length === 0 ? "validation_required"
           : readiness.blockedReview ? "changes_required" : "review_requested",
       reviewState: currentReview ? "current" : latestReview ? "stale" : "none",
-      reviewBasisDigest: reviewBasisDigest(session),
+      reviewBasisDigest: reviewBasisDigest(session, undefined, candidateDigest),
       frontierRevision: frontier.revision,
       stateDigest: frontier.currentStateDigest,
       changedPaths: [...frontier.changedPaths],

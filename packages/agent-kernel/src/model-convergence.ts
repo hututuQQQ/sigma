@@ -244,6 +244,14 @@ function userDecisionResponseCorrection(
   };
 }
 
+function naturalStopRequestsInput(state: KernelState, response: string): boolean {
+  return state.mode === "change"
+    && state.mutationFrontier.changedPaths.length === 0
+    && state.taskControl.obligation === undefined
+    && hasCurrentRunEvidence(state)
+    && /[?？]\s*$/u.test(response);
+}
+
 export function incompleteModelCompletion(
   state: KernelState,
   payload: Record<string, JsonValue>,
@@ -274,14 +282,26 @@ export function incompleteModelCompletion(
   }
   const turnId = typeof payload.turnId === "number" ? payload.turnId : 0;
   const effectRevision = typeof payload.effectRevision === "number" ? payload.effectRevision : state.revision;
-  const call = {
+  const requestsInput = naturalStopRequestsInput(state, response);
+  // A visible final question after workspace inspection is a waiting intent,
+  // not a claim that the requested change is complete. Providers do not
+  // always select the typed input tool even when their text clearly asks the
+  // user, so normalize that protocol boundary just as we normalize ordinary
+  // natural stops into runtime completion intents.
+  const call: ModelToolCall = requestsInput ? {
+    id: `runtime_input_intent_${turnId}_${effectRevision}`,
+    name: "request_user_input",
+    arguments: { message: response }
+  } : {
     id: `runtime_completion_intent_${turnId}_${effectRevision}`,
     name: "runtime_finalize",
     arguments: { summary: response }
   };
   const projectedMessages = messages.map((message, index) => index === messages.length - 1
     && message.role === "assistant" ? { ...message, toolCalls: [call] } : message);
-  const taskControl = startActionBatch(protectCompletionCandidate(state.taskControl, response));
+  const taskControl = startActionBatch(requestsInput
+    ? state.taskControl
+    : protectCompletionCandidate(state.taskControl, response));
   return {
     ...state,
     messages: projectedMessages,

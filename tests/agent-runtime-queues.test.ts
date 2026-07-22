@@ -82,25 +82,6 @@ function validationFailureReport(_request: ModelRequest): ModelResponse {
   };
 }
 
-function changedWorkspaceValidationFailureReport(_request: ModelRequest): ModelResponse {
-  return {
-    message: {
-      role: "assistant",
-      content: "",
-      toolCalls: [{
-        id: "complete-changed-validation-failure",
-        name: "report_blocked",
-        arguments: {
-          code: "validation_failed",
-          summary: "The documentation change is applied and the failed validation is reported.",
-          recoveryAttempted: "The changed file was validated against the requested expectation."
-        }
-      }]
-    },
-    finishReason: "tool_calls"
-  };
-}
-
 class ScriptedGateway implements ModelGateway {
   readonly provider = "test";
   readonly model = "scripted";
@@ -238,6 +219,41 @@ describe("runtime queues and non-blocking instruction steering", () => {
     expect(events.filter((event) => event.type === "model.started")).toHaveLength(1);
     expect(events.filter((event) => event.type === "run.completed")).toHaveLength(1);
   });
+
+  it("treats a final question after inspection as a typed input request", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-natural-input-stop-"));
+    await writeFile(path.join(workspace, "settings.json"), "{}\n", "utf8");
+    const gateway = new ScriptedGateway([
+      {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "inspect-settings", name: "read", arguments: { path: "settings.json" } }]
+        },
+        finishReason: "tool_calls"
+      },
+      {
+        message: { role: "assistant", content: "Which production value should I use?" },
+        finishReason: "stop"
+      }
+    ]);
+    const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
+    const runtime = createRuntime({
+      gateway, store, storeRootDir: path.join(workspace, ".agent"),
+      tools: registerBuiltinTools(new EffectToolRegistry()), permissionMode: "auto", runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Set the production value." });
+
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "needs_input",
+      message: "Which production value should I use?"
+    });
+    const events = await storedEvents(store, session.sessionId);
+    expect(events.some((event) => event.type === "tool.requested"
+      && (event.payload as { name?: string }).name === "request_user_input")).toBe(true);
+    expect(events.filter((event) => event.type === "run.suspended")).toHaveLength(1);
+  }, 30_000);
 
   it("allows a no-change analysis to complete from ordinary text", async () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-evidence-repair-"));
@@ -452,7 +468,13 @@ describe("runtime queues and non-blocking instruction steering", () => {
         },
         finishReason: "stop"
       },
-      changedWorkspaceValidationFailureReport
+      {
+        message: {
+          role: "assistant",
+          content: "The documentation change is applied; validation ran and failed, and that failure is reported."
+        },
+        finishReason: "stop"
+      }
     ]);
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspace, ".agent") });
     const runtime = createRuntime({
@@ -467,11 +489,10 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Update README and validate it." });
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
-      kind: "recoverable_failure",
-      code: "validation_failed",
+      kind: "completed",
       message: expect.stringContaining("validation ran and failed")
     });
-    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests).toHaveLength(4);
     expect(gateway.requests[2]?.messages.at(-1)?.content).toContain("validation");
     const restored = await restoreStoredSession(store, session.sessionId, 30_000);
     expect(restored.state.budget.reservations.filter((reservation) => reservation.status === "reserved"))

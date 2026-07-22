@@ -21,7 +21,8 @@ import {
   completionEvidenceObligation,
   recordSemanticFact,
   resolveTaskObligation,
-  terminalResolutionObligation
+  terminalResolutionObligation,
+  userDecisionObligation
 } from "./task-control.js";
 import { advanceRepositoryEvidenceObligation } from "./repository-task-control.js";
 
@@ -132,7 +133,14 @@ function applyWorkspaceRestorationEvidence(state: KernelState, evidence: Evidenc
     || !repositoryRestored) return state;
   return {
     ...state,
-    taskControl: resolveTaskObligation(state.taskControl),
+    taskControl: state.taskControl.obligation?.kind === "restoration"
+      && state.taskControl.obligation.nextDecisionCode
+      ? userDecisionObligation(
+          state.taskControl,
+          state.revision,
+          state.taskControl.obligation.nextDecisionCode
+        )
+      : resolveTaskObligation(state.taskControl),
     mutationEvidence: state.mutationEvidence.filter((item) =>
       item.runId !== evidence.runId
       || (item.kind !== "repository_delta" && item.kind !== "repository_acceptance")),

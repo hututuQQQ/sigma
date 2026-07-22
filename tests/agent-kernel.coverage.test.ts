@@ -208,7 +208,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state.receipts.at(-1)?.diagnostics).toEqual(["active_processes"]);
   });
 
-  it("converts an evidence-backed ordinary text stop into a completion intent", () => {
+  it("converts an evidence-backed final question into a typed input intent", () => {
     let state = apply(initial(), "user.message", { text: "inspect the current state" });
     state = apply(state, "evidence.recorded", diagnosticEvidence("answer-evidence"));
     state = settleModel(startModel(state), "model.completed", {
@@ -218,15 +218,15 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
     expect(state).toMatchObject({
       phase: "tool_pending",
-      pendingTools: [{ request: { name: "runtime_finalize", arguments: {
-        summary: "Which target should I change?"
+      pendingTools: [{ request: { name: "request_user_input", arguments: {
+        message: "Which target should I change?"
       } } }]
     });
     const callId = state.pendingTools[0]!.request.callId;
     state = toolEvent(state, "tool.completed", callId, {
       ok: true,
-      output: JSON.stringify({ summary: "Which target should I change?" }),
-      observedEffects: ["outcome.propose"],
+      output: JSON.stringify({ message: "Which target should I change?" }),
+      observedEffects: ["outcome.request_input"],
       artifacts: [],
       diagnostics: [],
       startedAt: "start",
@@ -235,25 +235,29 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(state).toMatchObject({
       phase: "outcome_pending",
       proposedOutcome: {
-        kind: "completed",
+        kind: "needs_input",
+        requestId: callId,
         message: "Which target should I change?"
       }
     });
     expect(() => assertKernelInvariants(state)).not.toThrow();
 
     const outcomeRevision = state.revision;
-    state = apply(state, "run.completed", {
+    state = apply(state, "run.suspended", {
+      kind: "needs_input",
+      requestId: callId,
       message: "Which target should I change?",
       outcomeRevision
     });
     expect(state).toMatchObject({
-      phase: "terminal",
+      phase: "needs_input",
       outcome: {
-        kind: "completed",
+        kind: "needs_input",
+        requestId: callId,
         message: "Which target should I change?"
       }
     });
-    expect(state.taskControl.completionCandidate?.answer).toBe("Which target should I change?");
+    expect(state.taskControl.completionCandidate).toBeUndefined();
     expect(() => assertKernelInvariants(state)).not.toThrow();
   });
 

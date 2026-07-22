@@ -3,13 +3,21 @@ import type { KernelState } from "./state.js";
 import {
   resolveTaskObligation,
   reviewRepairObligation,
-  terminalResolutionObligation
+  terminalResolutionObligation,
+  userDecisionObligation
 } from "./task-control.js";
+import { restorationObligation } from "./restoration-task-control.js";
 
 function actionableReviewFinding(value: JsonValue): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return true;
   const finding = value as Record<string, JsonValue>;
   return finding.actionable === true && finding.severity === "error";
+}
+
+function findingCode(value: JsonValue): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const code = (value as Record<string, JsonValue>).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 function reviewFailureTransition(
@@ -32,6 +40,16 @@ function actionableReviewTransition(
   review: Extract<EvidenceRecord, { kind: "review" }>
 ): KernelState {
   const obligation = state.taskControl.obligation;
+  const userDecision = review.data.findings.find((finding) =>
+    actionableReviewFinding(finding) && findingCode(finding) === "user_decision_required");
+  if (userDecision) {
+    return {
+      ...state,
+      taskControl: state.mutationFrontier.changedPaths.length > 0
+        ? restorationObligation(state.taskControl, state.revision, "review_user_decision_required")
+        : userDecisionObligation(state.taskControl, state.revision, "review_user_decision_required")
+    };
+  }
   if (obligation?.kind === "review_repair" && obligation.stage === "re_review") {
     return {
       ...state,

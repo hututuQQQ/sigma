@@ -51,8 +51,9 @@ function shouldReviewReceipt(name: string, reviewMode: "off" | "advisory" | "req
 }
 
 function settledReviewRequestReceipt(session: RuntimeSession, receipt: ToolReceipt): ToolReceipt {
-  const review = currentFrontierReview(session);
-  const basis = reviewBasisDigest(session);
+  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const review = currentFrontierReview(session, candidateDigest);
+  const basis = reviewBasisDigest(session, undefined, candidateDigest);
   if (review?.status === "passed" && review.data.verdict === "approved") {
     return {
       ...receipt,
@@ -263,7 +264,12 @@ export class ToolBatchCoordinator {
     }
     let receipt = await this.transactions.execute(session, attempt, signal);
     if (call.name === "request_review" && receipt.ok) {
-      await this.reviews.maybeReview(session, signal, true, "workspace");
+      await this.reviews.maybeReview(
+        session,
+        signal,
+        true,
+        session.durable.state.taskControl.completionCandidate ? "completion" : "workspace"
+      );
       receipt = settledReviewRequestReceipt(session, receipt);
     }
     await this.emitReceipt(session, receipt, modelTurn);

@@ -316,6 +316,74 @@ describe("TaskControlStateV1", () => {
     assertKernelInvariants(state);
   });
 
+  it("restores speculative changes before requesting a reviewer-identified user decision", () => {
+    let state = workspaceDelta(initial());
+    state = {
+      ...state,
+      mutationFrontier: {
+        ...state.mutationFrontier,
+        revision: 1,
+        currentStateDigest: DIGEST_A,
+        changedPaths: ["settings.json"],
+        sourceCheckpointIds: ["checkpoint-current-run"]
+      }
+    };
+    state = review(state, "decision-review", "changes_requested", {
+      findings: [{
+        actionable: true,
+        severity: "error",
+        code: "user_decision_required",
+        summary: "Restore the speculative value and ask the user."
+      }]
+    });
+    expect(state.taskControl).toMatchObject({
+      phase: "repair_only",
+      obligation: {
+        kind: "restoration",
+        stage: "restore",
+        nextDecisionCode: "review_user_decision_required"
+      }
+    });
+
+    const frontier = state.mutationFrontier;
+    state = apply(state, "evidence.recorded", {
+      evidenceId: "decision-restoration",
+      sessionId: state.sessionId,
+      runId: state.runId,
+      kind: "restoration",
+      status: "passed",
+      createdAt: NOW,
+      producer: { authority: "runtime", id: "workspace-restoration-v1" },
+      summary: "restored",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        frontierRevision: frontier.revision,
+        frontierStateDigest: frontier.currentStateDigest,
+        baselineManifestDigest: DIGEST_B,
+        currentManifestDigest: DIGEST_B,
+        restoredCheckpointIds: ["checkpoint-current-run"],
+        quiescence: {
+          supersededExecutionStopped: true,
+          noPendingMutations: true,
+          noProcesses: true,
+          noChildren: true,
+          noOpenCheckpoint: true
+        },
+        repository: { status: "unchanged" }
+      }
+    });
+    expect(state.mutationFrontier.changedPaths).toEqual([]);
+    expect(state.taskControl).toMatchObject({
+      phase: "terminal",
+      obligation: {
+        kind: "user_decision",
+        decisionCode: "review_user_decision_required"
+      }
+    });
+    assertKernelInvariants(state);
+  });
+
   it("exhausts repair after failed validation, a no-delta mutation, or a second rejection", () => {
     let failedValidation = workspaceDelta(review(initial(), "review-a", "changes_requested"));
     failedValidation = validation(failedValidation, "failed");

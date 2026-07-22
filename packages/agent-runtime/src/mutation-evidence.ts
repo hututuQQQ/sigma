@@ -41,8 +41,19 @@ export interface FrontierValidationReadiness {
   coveredPaths: string[];
   missingPaths: string[];
   missingClaims: string[];
+  executedPaths: string[];
+  missingExecutionPaths: string[];
+  missingExecutionClaims: string[];
+  executionReady: boolean;
   latestFailed?: ValidationEvidence;
   ready: boolean;
+}
+
+function isExecutedValidation(item: ValidationEvidence): boolean {
+  if (item.status === "passed") return true;
+  return item.status === "failed"
+    && item.data.termination?.processStarted === true
+    && item.data.termination.state === "exited";
 }
 
 export function currentRepositoryAcceptance(
@@ -64,6 +75,7 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
   const validations = sessionMutationEvidence(session).filter((item) => isCurrentValidation(session, item));
   const requirement = assuranceRequirement(session);
   const passed = validations.filter((item) => item.status === "passed");
+  const executed = validations.filter(isExecutedValidation);
   const acceptance = currentRepositoryAcceptance(session);
   const acceptedPaths = new Set(acceptance ? sessionMutationEvidence(session).flatMap((item) =>
     item.kind === "repository_delta"
@@ -83,6 +95,20 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
       && validation.data.coveredPaths.includes(changedPath));
     }));
   const missingPaths = changed.filter((path) => !coveredPaths.includes(path));
+  const missingExecutionClaims = requirement.requiredClaims.filter((required) => {
+    const requiredPaths = assurancePathsForClaim(changed, required)
+      .filter((changedPath) => !acceptedPaths.has(changedPath));
+    return requiredPaths.length > 0 && !requiredPaths.every((changedPath) => executed.some((validation) =>
+      validationClaimSatisfies(validation.data.claim?.kind, required)
+        && validation.data.coveredPaths.includes(changedPath)));
+  });
+  const executedPaths = changed.filter((changedPath) => acceptedPaths.has(changedPath)
+    || requirement.requiredClaims.every((required) => {
+      if (!assurancePathsForClaim([changedPath], required).includes(changedPath)) return true;
+      return executed.some((validation) => validationClaimSatisfies(validation.data.claim?.kind, required)
+        && validation.data.coveredPaths.includes(changedPath));
+    }));
+  const missingExecutionPaths = changed.filter((path) => !executedPaths.includes(path));
   const latestFailed = [...validations].reverse().find((item) => item.status === "failed"
     && requirement.requiredClaims.some((required) =>
       validationClaimSatisfies(item.data.claim?.kind, required)));
@@ -91,6 +117,10 @@ export function frontierValidationReadiness(session: RuntimeSession): FrontierVa
     coveredPaths,
     missingPaths,
     missingClaims,
+    executedPaths,
+    missingExecutionPaths,
+    missingExecutionClaims,
+    executionReady: missingExecutionPaths.length === 0 && missingExecutionClaims.length === 0,
     ...(latestFailed ? { latestFailed } : {}),
     ready: missingPaths.length === 0 && missingClaims.length === 0
   };
