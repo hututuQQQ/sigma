@@ -39,6 +39,7 @@ describe("DockerCompatibleOciEngine", () => {
       let createBody: Record<string, unknown> | undefined;
       let removed = false;
       let attachedInput = "";
+      let upgradedSocket: import("node:stream").Duplex | undefined;
       const server = createServer((request, response) => {
         const route = request.url ?? "";
         if (route === "/version") return json(response, 200, { ApiVersion: "1.52" });
@@ -79,6 +80,7 @@ describe("DockerCompatibleOciEngine", () => {
         json(response, 404, { message: `unexpected route ${route}` });
       });
       server.on("upgrade", (request, socket) => {
+        upgradedSocket = socket;
         expect(request.url).toContain(`/containers/${TARGET_ID}/attach?`);
         socket.write("HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n");
         socket.once("data", (chunk) => {
@@ -152,6 +154,7 @@ describe("DockerCompatibleOciEngine", () => {
         expect(removed).toBe(true);
       } finally {
         attachedStream?.destroy();
+        upgradedSocket?.destroy();
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     }

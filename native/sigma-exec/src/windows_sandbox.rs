@@ -6468,15 +6468,19 @@ mod tests {
             canonical_unique(std::slice::from_ref(&scratch)).expect("resolve scratch root");
 
         let protected = repository_metadata_paths(&read, &scratch_roots);
+        let canonical_workspace = read
+            .iter()
+            .find(|path| !windows_path_within(&scratch_roots[0], path))
+            .expect("retain canonical workspace root");
         assert!(
             protected
                 .iter()
-                .any(|path| windows_path_eq(path, &workspace.join(".git")))
+                .any(|path| windows_path_eq(path, &canonical_workspace.join(".git")))
         );
         assert!(
             !protected
                 .iter()
-                .any(|path| windows_path_eq(path, &scratch.join(".git")))
+                .any(|path| windows_path_eq(path, &scratch_roots[0].join(".git")))
         );
 
         std::fs::remove_dir_all(&fixture).expect("remove scratch metadata fixture");

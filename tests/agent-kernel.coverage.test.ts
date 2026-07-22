@@ -613,6 +613,10 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(invalidTwice.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_no_action" });
     const missingMessage = settleModel(inFlight(), "model.completed", { message: null, toolCalls: [] });
     expect(missingMessage.taskControl.obligation).toMatchObject({ failureCode: "empty_visible_response" });
+    const nonStringContent = settleModel(inFlight(), "model.completed", {
+      message: { role: "assistant", content: 7 }, toolCalls: []
+    });
+    expect(nonStringContent.taskControl.obligation).toMatchObject({ failureCode: "empty_visible_response" });
 
     const modelFailure = settleModel(inFlight(), "model.failed", { message: "network" });
     expect(modelFailure.proposedOutcome).toMatchObject({ kind: "recoverable_failure", code: "model_error" });
