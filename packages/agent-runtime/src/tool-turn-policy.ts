@@ -11,6 +11,10 @@ export type CompletionRepairPhase =
   | "review_review"
   | "capability_prepare"
   | "capability_re_probe"
+  | "repository_inspect"
+  | "repository_select"
+  | "repository_transact"
+  | "repository_validate"
   | "terminal";
 
 const REVIEW_REPAIR_PHASES = {
@@ -19,11 +23,18 @@ const REVIEW_REPAIR_PHASES = {
   re_review: "review_review"
 } as const;
 
+const REPOSITORY_CONFLICT_TOOL_NAMES = new Set([
+  "read", "write", "edit", "apply_patch", "delete_file"
+]);
+
 function obligationRepairPhase(session: RuntimeSession): CompletionRepairPhase | null {
   const obligation = session.durable.state.taskControl.obligation;
   if (obligation?.kind === "review_repair") return REVIEW_REPAIR_PHASES[obligation.stage];
   if (obligation?.kind === "capability_recovery") {
     return obligation.stage === "prepare" ? "capability_prepare" : "capability_re_probe";
+  }
+  if (obligation?.kind === "repository_recovery") {
+    return `repository_${obligation.stage}`;
   }
   if (obligation?.kind === "completion_evidence") {
     return obligation.stage === "acquire" ? "completion_evidence" : "terminal";
@@ -49,7 +60,9 @@ function userInputAllowed(session: RuntimeSession): boolean {
   return session.durable.state.taskControl.obligation?.kind === "user_decision";
 }
 
-type BaseRepairPhase = Exclude<CompletionRepairPhase, "capability_prepare" | "capability_re_probe">;
+type DirectedRepairPhase = Extract<CompletionRepairPhase,
+  "capability_prepare" | "capability_re_probe" | `repository_${string}`>;
+type BaseRepairPhase = Exclude<CompletionRepairPhase, DirectedRepairPhase>;
 
 function baseDescriptorAllowedForRepair(
   session: RuntimeSession,
@@ -85,7 +98,31 @@ export function descriptorAllowedForRepair(
     return obligation?.kind === "capability_recovery"
       && descriptor.name === obligation.probeToolName;
   }
-  return baseDescriptorAllowedForRepair(session, descriptor, phase);
+  const repository = repositoryDescriptorAllowed(session, descriptor, phase);
+  if (repository !== undefined) return repository;
+  return baseDescriptorAllowedForRepair(session, descriptor, phase as BaseRepairPhase);
+}
+
+function repositoryDescriptorAllowed(
+  session: RuntimeSession,
+  descriptor: ToolDescriptor,
+  phase: CompletionRepairPhase
+): boolean | undefined {
+  if (phase === "repository_inspect" || phase === "repository_select") {
+    return descriptor.name === "repository_inspect";
+  }
+  if (phase === "repository_transact") {
+    const obligation = session.durable.state.taskControl.obligation;
+    if (obligation?.kind !== "repository_recovery") return false;
+    if (descriptor.name === "git_transaction") return true;
+    return Boolean(obligation.transactionId && obligation.scopePaths?.length)
+      && REPOSITORY_CONFLICT_TOOL_NAMES.has(descriptor.name);
+  }
+  if (phase === "repository_validate") {
+    return descriptor.name === "repository_inspect"
+      || descriptor.possibleEffects.includes("validation");
+  }
+  return undefined;
 }
 
 function baseEffectsAllowedForRepair(
@@ -117,7 +154,24 @@ export function effectsAllowedForRepair(
     && effects.includes("network") && effects.includes("open_world");
   if (phase === "capability_re_probe") return effects.includes("process.spawn")
     || effects.includes("process.spawn.readonly");
-  return baseEffectsAllowedForRepair(effects, phase);
+  const repository = repositoryEffectsAllowed(effects, phase);
+  return repository ?? baseEffectsAllowedForRepair(effects, phase as BaseRepairPhase);
+}
+
+function repositoryEffectsAllowed(
+  effects: readonly ToolEffect[],
+  phase: CompletionRepairPhase
+): boolean | undefined {
+  if (phase === "repository_inspect" || phase === "repository_select") {
+    return effects.includes("filesystem.read")
+      && !effects.includes("filesystem.write")
+      && !effects.includes("repository.write");
+  }
+  if (phase === "repository_transact") return effects.includes("repository.write")
+    || effects.includes("filesystem.read") || effects.includes("filesystem.write");
+  if (phase === "repository_validate") return effects.includes("validation")
+    || effects.includes("filesystem.read");
+  return undefined;
 }
 
 export function descriptorsAllowedForRepair(

@@ -15,7 +15,10 @@ import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { completedToolBatchProgress, startedToolBatchProgress } from "./tool-batch-progress.js";
 import { beginGoalEpoch, terminalResolutionObligation } from "./task-control.js";
 import { runtimeDependencyDiagnostic } from "./runtime-dependency-reducer.js";
-import { repositoryRecoveryDecisionState } from "./repository-task-control.js";
+import {
+  repositoryRecoveryDecisionState,
+  resumeRepositoryRecoveryDecision
+} from "./repository-task-control.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
@@ -88,18 +91,24 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   outcome: undefined
 });
 
-const followUpInput: EventReducer = (state, _event, payload) => payload.status === "queued"
-  ? state
-  : {
+const followUpInput: EventReducer = (state, _event, payload) => {
+  if (payload.status === "queued") return state;
+  const repositoryDecision = resumeRepositoryRecoveryDecision(
+    state.taskControl,
+    state.revision
+  );
+  return {
       ...state,
       phase: "ready_model",
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
       messages: [...state.messages, { role: "user", content: text(payload.text) }],
-      taskControl: beginGoalEpoch(state.taskControl, state.revision, "follow_up"),
+      taskControl: repositoryDecision
+        ?? beginGoalEpoch(state.taskControl, state.revision, "follow_up"),
       outcome: undefined,
       proposedOutcome: undefined
     };
+};
 
 const modelStarted: EventReducer = (state, _event, payload) => {
   const turn = modelTurn(payload);
@@ -218,7 +227,11 @@ const toolFinished: EventReducer = (state, event) => {
     phase: nextPhase(pendingTools)
   };
   const semantic = recordSemanticToolResult(next, receipt, pending.request.name);
-  const decisionState = repositoryRecoveryDecisionState(semantic.state, receipt.diagnostics);
+  const decisionState = repositoryRecoveryDecisionState(
+    semantic.state,
+    pending.request.name,
+    receipt
+  );
   const progressed = pendingTools.length === 0
     ? { ...decisionState, ...completedToolBatchProgress(decisionState) }
     : decisionState;

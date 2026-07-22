@@ -40,6 +40,9 @@ export type TaskObligationV1 =
       openedRevision: number;
       attempts: number;
       transactionId?: string;
+      candidateId?: string;
+      selectionEvidenceId?: string;
+      scopePaths?: string[];
     }
   | {
       kind: "restoration";
@@ -137,7 +140,8 @@ function nonNegativeInteger(value: unknown): boolean {
 }
 
 function nonEmptyStrings(value: unknown): boolean {
-  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0);
+  return Array.isArray(value) && value.length > 0
+    && value.every((item) => typeof item === "string" && item.length > 0);
 }
 
 function validObligationHeader(obligation: Record<string, unknown>): boolean {
@@ -160,7 +164,14 @@ const OBLIGATION_VALIDATORS: Record<TaskObligationV1["kind"], ObligationValidato
     && typeof obligation.requestedExecutable === "string" && obligation.requestedExecutable.length > 0
     && ["exec", "validate", "process_spawn"].includes(String(obligation.probeToolName))
     && typeof obligation.runtimeClosureDigest === "string" && obligation.runtimeClosureDigest.length > 0,
-  repository_recovery: (obligation) => ["inspect", "select", "transact", "validate"].includes(String(obligation.stage)),
+  repository_recovery: (obligation) => ["inspect", "select", "transact", "validate"].includes(String(obligation.stage))
+    && (obligation.transactionId === undefined
+      || typeof obligation.transactionId === "string" && obligation.transactionId.length > 0)
+    && (obligation.candidateId === undefined
+      || typeof obligation.candidateId === "string" && DIGEST.test(obligation.candidateId))
+    && (obligation.selectionEvidenceId === undefined
+      || typeof obligation.selectionEvidenceId === "string" && obligation.selectionEvidenceId.length > 0)
+    && (obligation.scopePaths === undefined || nonEmptyStrings(obligation.scopePaths)),
   restoration: (obligation) => ["quiesce", "restore", "confirm"].includes(String(obligation.stage)),
   process_settlement: (obligation) => obligation.stage === "settle" && nonEmptyStrings(obligation.processIds),
   user_decision: (obligation) => obligation.stage === "request"

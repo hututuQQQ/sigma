@@ -36,7 +36,10 @@ import {
   type GitOperation,
   type GitTransactionInput
 } from "./repository-transaction-schema.js";
-import { collectRepositoryEvidenceState } from "./repository-transaction-state.js";
+import {
+  collectRepositoryEvidenceState,
+  repositoryConflictPaths
+} from "./repository-transaction-state.js";
 
 export interface RepositoryTransactionLimits {
   maxFiles?: number;
@@ -113,6 +116,44 @@ function pendingForInput(
   return pending.resolve(input.transactionHandle, context.sessionId, context.runId);
 }
 
+async function conflictReceiptOrRestore(
+  execution: RepositoryTransactionPort,
+  request: { callId: string },
+  context: PlannedToolExecutionContext,
+  transaction: PendingRepositoryTransaction,
+  result: Awaited<ReturnType<RepositoryTransactionPort["beginRepositoryTransaction"]>>,
+  pending: PendingRepositoryTransactions,
+  startedAt: string
+): Promise<ToolReceipt> {
+  try {
+    const conflictPaths = await repositoryConflictPaths(
+      execution, transaction.topology, context.signal
+    );
+    return pendingRepositoryReceipt(
+      request.callId, transaction, result, conflictPaths, startedAt
+    );
+  } catch (probeError) {
+    try {
+      const restored = await execution.abortRepositoryTransaction({
+        protocolVersion: 2,
+        transactionHandle: transaction.handle,
+        sessionId: transaction.sessionId,
+        runId: transaction.runId
+      }, { signal: context.signal });
+      if (restored.status !== "aborted" || restored.rollbackState !== "restored") {
+        throw new Error("Broker did not confirm repository restoration.", { cause: probeError });
+      }
+      pending.consume(transaction.handle);
+    } catch (rollbackError) {
+      throw Object.assign(new AggregateError(
+        [probeError, rollbackError],
+        "Repository conflict inspection failed and broker rollback was not confirmed."
+      ), { code: "repository_state_uncertain" });
+    }
+    throw probeError;
+  }
+}
+
 async function beginTransaction(
   execution: RepositoryTransactionPort,
   request: { callId: string },
@@ -172,7 +213,9 @@ async function beginTransaction(
   };
   if (result.status === "conflicts_pending") {
     pending.record(transaction);
-    return pendingRepositoryReceipt(request.callId, transaction, result, startedAt);
+    return await conflictReceiptOrRestore(
+      execution, request, context, transaction, result, pending, startedAt
+    );
   }
   try {
     return await completedRepositoryReceipt(
@@ -200,7 +243,9 @@ async function continueTransaction(
     operations: brokerOperations(input.operations)
   }, { signal: context.signal });
   if (result.status === "conflicts_pending") {
-    return pendingRepositoryReceipt(request.callId, transaction, result, startedAt);
+    return await conflictReceiptOrRestore(
+      execution, request, context, transaction, result, pending, startedAt
+    );
   }
   try {
     return await completedRepositoryReceipt(

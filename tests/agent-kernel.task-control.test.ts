@@ -28,6 +28,7 @@ import {
   recordToolPolicyViolation,
   repositoryRecoveryDecisionState,
   repositoryRecoveryObligation,
+  resumeRepositoryRecoveryDecision,
   resolveTaskObligation,
   reviewRepairObligation,
   startActionBatch,
@@ -469,6 +470,15 @@ describe("TaskControlStateV1", () => {
         runtimeClosureDigest: DIGEST_A
       },
       { ...header, kind: "repository_recovery", stage: "select" },
+      {
+        ...header,
+        kind: "repository_recovery",
+        stage: "transact",
+        transactionId: "transaction",
+        candidateId: DIGEST_B,
+        selectionEvidenceId: "selection",
+        scopePaths: ["src/conflict.ts"]
+      },
       { ...header, kind: "restoration", stage: "confirm" },
       { ...header, kind: "process_settlement", stage: "settle", processIds: ["process"] },
       { ...header, kind: "user_decision", stage: "request", decisionCode: "choose" },
@@ -481,6 +491,14 @@ describe("TaskControlStateV1", () => {
     expect(isTaskControlStateV1(null)).toBe(false);
     expect(isTaskControlStateV1({ ...base, obligation: [] })).toBe(false);
     expect(isTaskControlStateV1({ ...base, obligation: { ...header, kind: "unknown", stage: "none" } })).toBe(false);
+    for (const obligation of [
+      { ...header, kind: "repository_recovery", stage: "transact", transactionId: "" },
+      { ...header, kind: "repository_recovery", stage: "transact", candidateId: "not-a-digest" },
+      { ...header, kind: "repository_recovery", stage: "transact", selectionEvidenceId: "" },
+      { ...header, kind: "repository_recovery", stage: "transact", scopePaths: [] }
+    ]) {
+      expect(isTaskControlStateV1({ ...base, obligation })).toBe(false);
+    }
     expect(isTaskControlStateV1({
       ...base,
       obligation: { ...header, kind: "completion_evidence", stage: "acquire", evidenceCount: 0, failureCode: "" }
@@ -660,7 +678,11 @@ describe("TaskControlStateV1", () => {
     const recovering = {
       ...state,
       taskControl: repositoryRecoveryObligation(
-        state.taskControl, state.revision, "validate", { candidateId: "d".repeat(64) }, "transaction"
+        state.taskControl,
+        state.revision,
+        "validate",
+        { candidateId: "d".repeat(64) },
+        { transactionId: "transaction" }
       )
     };
     const acceptance: EvidenceRecord = {
@@ -733,14 +755,107 @@ describe("TaskControlStateV1", () => {
     expect(apply(recovering, "evidence.recorded", auditAcceptance).evidence)
       .toContainEqual(auditAcceptance);
 
-    expect(repositoryRecoveryDecisionState(recovering, [])).toBe(recovering);
-    expect(repositoryRecoveryDecisionState(recovering, ["repository_restored"]).taskControl.obligation)
-      .toBeUndefined();
-    expect(repositoryRecoveryDecisionState(recovering, ["conflicts_pending"])).toMatchObject({
-      taskControl: { obligation: { kind: "repository_recovery", stage: "transact" } }
+    const repositoryReceipt = (
+      diagnostics: string[],
+      result?: JsonValue
+    ): ToolReceipt => ({
+      callId: "repository-call",
+      ok: true,
+      output: "",
+      observedEffects: ["repository.write"],
+      actualEffects: ["repository.write"],
+      artifacts: [],
+      diagnostics,
+      evidence: [],
+      ...(result === undefined ? {} : { result }),
+      startedAt: NOW,
+      completedAt: NOW
     });
-    expect(repositoryRecoveryDecisionState(recovering, ["recovery_result_lost_no_replay"])).toMatchObject({
+    expect(repositoryRecoveryDecisionState(
+      recovering, "read", repositoryReceipt(["conflicts_pending"])
+    )).toBe(recovering);
+    expect(repositoryRecoveryDecisionState(
+      recovering, "git_transaction", repositoryReceipt([])
+    )).toBe(recovering);
+    expect(repositoryRecoveryDecisionState(
+      recovering, "git_transaction", repositoryReceipt(["conflicts_pending"])
+    )).toMatchObject({
+      taskControl: { obligation: { kind: "terminal_resolution", failureCode: "repository_state_uncertain" } }
+    });
+    expect(repositoryRecoveryDecisionState(
+      recovering,
+      "git_transaction",
+      repositoryReceipt(["conflicts_pending"], {
+        transactionHandle: 1,
+        conflictPaths: ["", 2]
+      })
+    )).toMatchObject({
+      taskControl: { obligation: { kind: "terminal_resolution", failureCode: "repository_state_uncertain" } }
+    });
+    expect(repositoryRecoveryDecisionState(
+      recovering, "git_transaction", repositoryReceipt(["repository_restored"])
+    ).taskControl.obligation)
+      .toBeUndefined();
+    expect(repositoryRecoveryDecisionState(
+      recovering,
+      "git_transaction",
+      repositoryReceipt(["conflicts_pending"], {
+        transactionHandle: "transaction-handle",
+        conflictPaths: ["src/conflict.ts"]
+      })
+    )).toMatchObject({
+      taskControl: { obligation: {
+        kind: "repository_recovery",
+        stage: "transact",
+        transactionId: "transaction-handle",
+        scopePaths: ["src/conflict.ts"]
+      } }
+    });
+    const boundRecovery = {
+      ...state,
+      taskControl: repositoryRecoveryObligation(
+        state.taskControl,
+        state.revision,
+        "transact",
+        { conflict: "pending" },
+        { candidateId: DIGEST_B, selectionEvidenceId: "selection" }
+      )
+    };
+    expect(repositoryRecoveryDecisionState(
+      boundRecovery,
+      "git_transaction",
+      repositoryReceipt(["conflicts_pending"], {
+        transactionHandle: "transaction-handle",
+        conflictPaths: ["src/conflict.ts"]
+      })
+    )).toMatchObject({
+      taskControl: { obligation: {
+        candidateId: DIGEST_B,
+        selectionEvidenceId: "selection"
+      } }
+    });
+    expect(repositoryRecoveryDecisionState(
+      recovering,
+      "git_transaction",
+      repositoryReceipt(["recovery_result_lost_no_replay"])
+    )).toMatchObject({
       taskControl: { obligation: { kind: "user_decision", decisionCode: "recovery_result_lost_no_replay" } }
+    });
+
+    const awaitingDecision = apply(state, "evidence.recorded", decision);
+    expect(resumeRepositoryRecoveryDecision(state.taskControl, state.revision)).toBeUndefined();
+    expect(resumeRepositoryRecoveryDecision(
+      userDecisionObligation(state.taskControl, state.revision, "repository_recovery:not-a-digest"),
+      state.revision
+    )).toBeUndefined();
+    const resumedDecision = apply(awaitingDecision, "user.follow_up", {
+      text: `Use ${decision.data.candidates[0]!.candidateId}`,
+      queueId: "repository-choice",
+      status: "delivered"
+    }, "user");
+    expect(resumedDecision.taskControl).toMatchObject({
+      goalEpoch: state.taskControl.goalEpoch,
+      obligation: { kind: "repository_recovery", stage: "select" }
     });
 
     const failedRestoration: EvidenceRecord = {

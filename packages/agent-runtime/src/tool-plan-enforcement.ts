@@ -13,6 +13,10 @@ import { canonicalWorkspacePath, isInside } from "agent-platform";
 import { effectsOutsidePlan } from "./tool-evidence.js";
 import type { RuntimeSession } from "./types.js";
 import { assurancePathsForClaim } from "./assurance-engine.js";
+import {
+  assertRepositoryConflictPlanAllowed,
+  assertRepositoryRecoveryCallAllowed
+} from "./repository-task-control-policy.js";
 
 export interface FrozenValidationScope {
   frontierRevision: number;
@@ -50,6 +54,10 @@ export function assertTaskControlCallAllowed(
   call: ModelToolCall
 ): void {
   const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind === "repository_recovery") {
+    assertRepositoryRecoveryCallAllowed(session, call);
+    return;
+  }
   if (obligation?.kind !== "capability_recovery") return;
   const executable = requestedExecutable(call);
   const allowed = obligation.stage === "prepare"
@@ -211,7 +219,22 @@ export async function assertTaskControlPlanAllowed(
   plan: ToolCallPlan
 ): Promise<void> {
   const obligation = session.durable.state.taskControl.obligation;
-  if (obligation?.kind !== "review_repair" || obligation.stage !== "mutate") return;
+  if (obligation?.kind === "repository_recovery" && obligation.stage === "transact"
+    && obligation.transactionId && obligation.scopePaths?.length
+    && !plan.exactEffects.includes("repository.write")) {
+    await assertRepositoryConflictPlanAllowed(session, plan, obligation.scopePaths);
+    return;
+  }
+  if (obligation?.kind === "review_repair" && obligation.stage === "mutate") {
+    await assertReviewRepairPlanAllowed(session, plan, obligation.scopePaths);
+  }
+}
+
+async function assertReviewRepairPlanAllowed(
+  session: RuntimeSession,
+  plan: ToolCallPlan,
+  scopePaths: string[]
+): Promise<void> {
   if (!plan.exactEffects.includes("filesystem.write")) {
     throw Object.assign(new Error(
       "The active review repair requires one scoped workspace mutation."
@@ -223,7 +246,7 @@ export async function assertTaskControlPlanAllowed(
       "The review repair mutation did not declare any exact write path."
     ), { code: "tool_unavailable_for_repair" });
   }
-  const allowed = (await Promise.all(obligation.scopePaths.map(async (item) =>
+  const allowed = (await Promise.all(scopePaths.map(async (item) =>
     await canonicalWrittenObjectPath(session.identity.workspacePath, item))))
     .filter((item): item is string => Boolean(item));
   const targets = await Promise.all(requested.map(async (item) => ({
@@ -232,7 +255,7 @@ export async function assertTaskControlPlanAllowed(
   })));
   const outside = targets.filter(({ canonical }) => !canonical
     || !allowed.some((scope) => isInside(scope, canonical))).map(({ item }) => item);
-  if (allowed.length === obligation.scopePaths.length && outside.length === 0) return;
+  if (allowed.length === scopePaths.length && outside.length === 0) return;
   throw Object.assign(new Error(
     `Review repair write plan is outside the authenticated finding scope: ${outside.join(", ") || "invalid scope"}.`
   ), { code: "tool_unavailable_for_repair" });

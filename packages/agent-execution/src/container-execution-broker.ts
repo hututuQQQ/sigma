@@ -35,6 +35,7 @@ import {
   type PinnedContainerIdentity
 } from "./container-attestation.js";
 import { ManagedEnvironmentCoordinator } from "./managed-environment-coordinator.js";
+import { refreshManagedSessionBinding } from "./managed-binding-refresh.js";
 import {
   invokeRepositoryOperation,
   RepositoryExecutionBrokerBase,
@@ -54,7 +55,6 @@ export interface ContainerExecutionBrokerOptions {
   workspace?: string;
   managedEnvironmentMode?: "disabled" | "required";
 }
-
 /**
  * Defense-in-depth adapter for a trusted OCI broker.
  *
@@ -245,27 +245,11 @@ export class AttestedContainerExecutionBroker extends RepositoryExecutionBrokerB
     const accepted = this.managedEnvironment.accept(
       canonical, previousRuntimeClosureDigest, result, closure
     );
-    const refreshedPayload = {
-      protocolVersion: binding.protocolVersion,
-      sessionId: binding.sessionId,
-      workspace: binding.workspace,
-      network: binding.network,
-      protectedPaths: binding.protectedPaths,
-      lifetime: binding.lifetime,
-      targetId: binding.targetId,
-      targetStartedAt: binding.targetStartedAt,
-      targetAttestationDigest: binding.targetAttestationDigest,
-      protectedPathsDigest: binding.protectedPathsDigest,
-      runtimeClosure: accepted.runtimeClosure,
-      scratchLease: binding.scratchLease
-    };
     // The runtime session holds this broker-issued object by reference. Update
     // it only after the target doctor and signed preparation receipt agree, so
     // subsequent tool policy observes the refreshed closure without creating
     // a second session capability.
-    Object.assign(binding, refreshedPayload, {
-      bindingId: stableSha256(refreshedPayload)
-    });
+    refreshManagedSessionBinding(binding, accepted.runtimeClosure);
     return accepted;
   }
 

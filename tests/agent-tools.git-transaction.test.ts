@@ -210,8 +210,13 @@ describe("controlled Git transactions", () => {
       status: string;
       transactionHandle: string;
       conflictCount: number;
+      conflictPaths: string[];
     };
-    expect(value).toMatchObject({ status: "conflicts_pending", conflictCount: 1 });
+    expect(value).toMatchObject({
+      status: "conflicts_pending",
+      conflictCount: 1,
+      conflictPaths: ["seed.txt"]
+    });
 
     await writeFile(path.join(root, "seed.txt"), "main + topic\n", "utf8");
     const completed = await transactArguments(tools, root, {

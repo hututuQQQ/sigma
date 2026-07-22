@@ -60,6 +60,28 @@ export async function collectRepositoryEvidenceState(
   return { ...value, stateDigest: sha256(JSON.stringify(value)) };
 }
 
+/** Return only bounded, repository-relative unmerged paths. The broker-owned
+ * transaction remains the mutation authority; this probe merely gives the
+ * repair state machine an exact workspace scope. */
+export async function repositoryConflictPaths(
+  execution: ProcessExecutionPort,
+  topology: RepositoryWorktreeTopology,
+  signal: AbortSignal
+): Promise<string[]> {
+  const output = await checkedGit(execution, topology, [
+    "diff", "--name-only", "--diff-filter=U", "-z", "--"
+  ], signal);
+  const paths = output.split("\0").filter(Boolean).map((item) => item.replaceAll("\\", "/"));
+  if (paths.length === 0 || paths.length > 4_096
+    || paths.some((item) => item.startsWith("/") || item.startsWith(":")
+      || item.split("/").some((part) => part === ".." || part.toLowerCase() === ".git"))) {
+    throw Object.assign(new Error(
+      "Repository conflict paths were missing, excessive, or outside the worktree policy."
+    ), { code: "repository_state_uncertain" });
+  }
+  return [...new Set(paths)].sort();
+}
+
 export interface RepositoryRevisionDelta {
   added: string[];
   modified: string[];

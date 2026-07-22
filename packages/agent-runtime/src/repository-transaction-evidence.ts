@@ -169,6 +169,7 @@ export function pendingRepositoryReceipt(
   callId: string,
   transaction: PendingRepositoryTransaction,
   result: RepositoryTransactionResultV2,
+  conflictPaths: string[],
   startedAt: string
 ): ToolReceipt {
   const effects = transactionEffects(transaction.operations, transaction.topology);
@@ -180,13 +181,15 @@ export function pendingRepositoryReceipt(
       transactionHandle: transaction.handle,
       operation: result.operation ?? null,
       conflictCount: result.conflictCount ?? 0,
+      conflictPaths,
       nextActions: ["resolve conflicts", "git_transaction continue", "git_transaction abort"]
     }),
     result: {
       status: "conflicts_pending",
       transactionHandle: transaction.handle,
       operation: result.operation ?? null,
-      conflictCount: result.conflictCount ?? 0
+      conflictCount: result.conflictCount ?? 0,
+      conflictPaths
     },
     observedEffects: effects,
     actualEffects: effects,
