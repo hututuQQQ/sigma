@@ -18,6 +18,7 @@ import {
   frontierAfterCheckpoint,
   frontierAfterEvidence,
   isCompletionRepairState,
+  InvalidBudgetTransitionError,
   isKernelState,
   isStaleEffect,
   isTerminal,
@@ -1211,12 +1212,16 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(state, "usage.recorded", { ...usage, usageId: "other", sessionId: "other" }).usage).toHaveLength(1);
 
     expect(apply(state, "plan.updated", { previousRevision: "0", plan: null }).plan).toBe(state.plan);
-    expect(apply(state, "budget.released", { ledger: null }).budget).toBe(state.budget);
+    expect(() => apply(state, "budget.released", { ledger: null })).toThrow(InvalidBudgetTransitionError);
     const increased = createBudgetLedger({ ...state.budget.limits, toolCalls: state.budget.limits.toolCalls + 1 });
-    expect(apply(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }).budget)
-      .toBe(state.budget);
+    expect(() => apply(state, "budget.limit_increased", {
+      ledger: increased, previousLimits: state.budget.limits, increase: { toolCalls: 1 }
+    })).toThrow(InvalidBudgetTransitionError);
+    const previousLimits = state.budget.limits;
     state = evolve(state, {
-      ...envelope(state, "budget.limit_increased", { ledger: increased, increase: { toolCalls: 1 } }), authority: "user"
+      ...envelope(state, "budget.limit_increased", {
+        ledger: increased, previousLimits, increase: { toolCalls: 1 }
+      }), authority: "user"
     });
     expect(state.budget.limits.toolCalls).toBe(increased.limits.toolCalls);
 

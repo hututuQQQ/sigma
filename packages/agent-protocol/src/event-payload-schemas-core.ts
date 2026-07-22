@@ -151,6 +151,7 @@ export const coreEventPayloadSchemas = {
     writeScope: z.array(z.string()),
     strictWriteScope: z.boolean(),
     modelRole: sharedSchemas.modelExecutionRoleSchema,
+    budgetLimits: sharedSchemas.budgetLimitsSchema.optional(),
     parentSessionId: nonEmptyStringSchema.optional()
   }).strict(),
   "run.started": z.object({ mode: runModeSchema, deadlineAt: dateTimeSchema }).strict(),

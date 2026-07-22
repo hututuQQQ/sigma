@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import {
   SNAPSHOT_SCHEMA_VERSION,
   STORE_LAYOUT_VERSION,
+  createBudgetLedger,
   type AgentEventEnvelope,
+  type BudgetLimits,
   type ContextItem,
   type JsonValue,
   type ModelExecutionRole,
@@ -23,6 +25,10 @@ import {
   type KernelState
 } from "agent-kernel";
 import { jsonValue } from "./json.js";
+import {
+  createdSessionMetadata,
+  type RestoredSessionMetadata
+} from "./restore-session-metadata.js";
 import {
   approvalEffectsForPlan,
   createApprovalBinding,
@@ -47,41 +53,22 @@ export interface RestoredSessionData {
   pendingApprovals: Array<RecoveredApprovalMetadata & { callId: string }>;
 }
 
-function createdData(event: AgentEventEnvelope | undefined): {
-  workspacePath: string;
-  parentSessionId?: string;
-  mode: RunMode;
-  writeScope: string[];
-  strictWriteScope: boolean;
-  modelRole: ModelExecutionRole;
-} | null {
-  if (!event || event.type !== "session.created" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return null;
-  const value = event.payload as Record<string, JsonValue>;
-  return {
-    workspacePath: typeof value.workspacePath === "string" ? value.workspacePath : ".",
-    ...(typeof value.parentSessionId === "string" && value.parentSessionId
-      ? { parentSessionId: value.parentSessionId } : {}),
-    mode: value.mode === "analyze" ? "analyze" : "change",
-    writeScope: Array.isArray(value.writeScope)
-      ? value.writeScope.filter((item): item is string => typeof item === "string") : [],
-    strictWriteScope: value.strictWriteScope === true,
-    modelRole: modelExecutionRole(value.modelRole)
-  };
-}
-
-function modelExecutionRole(value: JsonValue | undefined): ModelExecutionRole {
-  return value === "planner" || value === "reviewer" || value === "child_analyze"
-    || value === "child_write" || value === "summarizer" ? value : "orchestrator";
-}
-
-function freshState(sessionId: string, event: AgentEventEnvelope, mode: RunMode, runDeadlineMs: number): KernelState {
-  return createKernelState({
+function freshState(
+  sessionId: string,
+  event: AgentEventEnvelope,
+  mode: RunMode,
+  runDeadlineMs: number,
+  budgetLimits?: BudgetLimits
+): KernelState {
+  const state = createKernelState({
     sessionId,
     runId: event.runId || randomUUID(),
     mode,
     startedAt: event.occurredAt,
     deadlineAt: new Date(Date.now() + runDeadlineMs).toISOString()
   });
+  if (budgetLimits) state.budget = createBudgetLedger(budgetLimits);
+  return state;
 }
 
 function eventRunMode(event: AgentEventEnvelope, fallback: RunMode): RunMode {
@@ -108,7 +95,7 @@ function nextRun(state: KernelState, event: AgentEventEnvelope, runDeadlineMs: n
 }
 
 interface RestoreAccumulator {
-  metadata: ReturnType<typeof createdData>;
+  metadata: RestoredSessionMetadata | null;
   state: KernelState | undefined;
   modelTurn: number;
   lastSeq: number;
@@ -290,9 +277,15 @@ function initializeFromCreated(
   runDeadlineMs: number
 ): void {
   if (accumulator.metadata || event.type !== "session.created") return;
-  accumulator.metadata = createdData(event);
+  accumulator.metadata = createdSessionMetadata(event);
   if (!accumulator.state && accumulator.metadata) {
-    accumulator.state = freshState(sessionId, event, accumulator.metadata.mode, runDeadlineMs);
+    accumulator.state = freshState(
+      sessionId,
+      event,
+      accumulator.metadata.mode,
+      runDeadlineMs,
+      accumulator.metadata.budgetLimits
+    );
   }
 }
 

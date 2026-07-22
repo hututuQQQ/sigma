@@ -451,7 +451,8 @@ export async function collectOptimizerObservations(options, dependencies = {}) {
   const all = await readStoredObservations(output);
   const registry = path.join(repositoryStateRoot, "optimizer", "experiments");
   const experiments = await readRegisteredOptimizationExperiments(registry);
-  const cards = createOptimizerClusterCards(all, experiments);
+  const cardOptions = dependencies.asOf === undefined ? undefined : { asOf: dependencies.asOf };
+  const cards = createOptimizerClusterCards(all, experiments, cardOptions);
   const cardDirectory = path.join(repositoryStateRoot, "optimizer", "clusters");
   await mkdir(cardDirectory, { recursive: true });
   for (const card of cards) await writeClusterCard(cardDirectory, card);

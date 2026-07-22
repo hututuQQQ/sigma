@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   AgentEventEnvelope,
+  BudgetLedgerState,
   ModelCapabilities,
   ModelGateway,
   ModelMessage,
@@ -12,6 +13,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
+import { replayBudgetLedgerEvent } from "../packages/agent-kernel/src/index.js";
 import { OpenAIModelGateway } from "../packages/agent-model/src/index.js";
 import { createRuntime } from "../packages/agent-runtime/src/testing.js";
 import { SegmentedJsonlStore } from "../packages/agent-store/src/index.js";
@@ -161,19 +163,15 @@ describe("runtime model stream lifecycle", () => {
         sseTrailingBytes: 0
       }
     });
-    const committed = events.find((event) => event.type === "budget.committed") as
-      | (AgentEventEnvelope & { payload: { ledger: {
-        reserved: Record<string, number>;
-        reservations: Array<{ status: string }>;
-      } } })
-      | undefined;
-    expect(committed?.payload.ledger.reserved).toMatchObject({
+    let ledger: BudgetLedgerState | undefined;
+    for (const event of events) ledger = replayBudgetLedgerEvent(ledger, event);
+    expect(ledger?.reserved).toMatchObject({
       inputTokens: 0,
       outputTokens: 0,
       costMicroUsd: 0,
       modelTurns: 0
     });
-    expect(committed?.payload.ledger.reservations.every((item) => item.status !== "reserved")).toBe(true);
+    expect(ledger?.reservations.every((item) => item.status !== "reserved")).toBe(true);
     expect(events.at(-1)?.type).toBe("run.failed");
   });
 });

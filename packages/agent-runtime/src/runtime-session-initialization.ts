@@ -158,7 +158,8 @@ export async function initializeRuntimeSession(
     writeScope: session.identity.writeScope,
     strictWriteScope: session.identity.strictWriteScope,
     modelRole: session.services.modelRole,
-    ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {})
+    ...(session.identity.parentSessionId ? { parentSessionId: session.identity.parentSessionId } : {}),
+    budgetLimits: session.durable.state.budget.limits
   });
   await emitSubjectAttestationV1(session, options.subjectAttestation, options.emit);
   await emitResolvedProfile(session, options);

@@ -1,5 +1,6 @@
 import type { JsonValue } from "./json.js";
 import type { z } from "zod";
+import type { budgetMutationV1Schema } from "./budget-mutation-schemas.js";
 import type {
   budgetAmountsSchema,
   budgetLedgerStateSchema,
@@ -86,6 +87,7 @@ export type BudgetLimits = z.infer<typeof budgetLimitsSchema>;
 export type BudgetReservation = z.infer<typeof budgetReservationSchema>;
 export type BudgetReservationStatus = BudgetReservation["status"];
 export type BudgetLedgerState = z.infer<typeof budgetLedgerStateSchema>;
+export type BudgetMutationV1 = z.infer<typeof budgetMutationV1Schema>;
 
 export const DEFAULT_ROOT_BUDGET_LIMITS: BudgetLimits = {
   inputTokens: 8_000_000,

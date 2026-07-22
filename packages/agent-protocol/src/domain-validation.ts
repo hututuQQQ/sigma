@@ -3,6 +3,7 @@ import {
   type BudgetAmounts,
   type BudgetLedgerState,
   type BudgetLimits,
+  type BudgetMutationV1,
   type CheckpointRef,
   type EvidenceRecord,
   type EvidenceClaim,
@@ -10,6 +11,7 @@ import {
   type PlanGraph,
   type UsageRecord
 } from "./domain-types.js";
+import { budgetMutationV1Schema } from "./budget-mutation-schemas.js";
 import {
   budgetLedgerStateSchema,
   checkpointRefSchema,
@@ -103,6 +105,10 @@ export function isPlanGraph(value: unknown): value is PlanGraph {
 
 export function isBudgetLedgerState(value: unknown): value is BudgetLedgerState {
   return budgetLedgerStateSchema.safeParse(value).success;
+}
+
+export function isBudgetMutationV1(value: unknown): value is BudgetMutationV1 {
+  return budgetMutationV1Schema.safeParse(value).success;
 }
 
 export function isCheckpointRef(value: unknown): value is CheckpointRef {

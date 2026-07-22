@@ -1,5 +1,4 @@
 import {
-  isBudgetLedgerState,
   isCheckpointRef,
   isCompletionEligibleEvidence,
   isCompletionReferenceableEvidence,
@@ -15,6 +14,7 @@ import type { KernelState } from "./state.js";
 import { frontierAfterCheckpoint, frontierAfterEvidence } from "./mutation-frontier.js";
 import { nextPhase } from "./terminal-reducer-helpers.js";
 import { recordSemanticEvidenceProgress, recordSemanticWorkspaceRestore } from "./semantic-failures.js";
+import { durableBudgetReducers } from "./durable-budget-reducers.js";
 
 export type KernelEventReducer = (
   state: KernelState,
@@ -87,15 +87,6 @@ const planUpdated: KernelEventReducer = (state, _event, payload) => {
     || payload.previousRevision !== state.plan.revision || payload.plan.revision !== state.plan.revision + 1) return state;
   return { ...state, plan: payload.plan };
 };
-
-const budgetUpdated: KernelEventReducer = (state, _event, payload) => isBudgetLedgerState(payload.ledger)
-  ? { ...state, budget: payload.ledger }
-  : state;
-
-const budgetLimitIncreased: KernelEventReducer = (state, event, payload) =>
-  event.authority === "user" && isBudgetLedgerState(payload.ledger)
-    ? { ...state, budget: payload.ledger }
-    : state;
 
 function pruneRestoredCheckpointEvidence(
   state: KernelState,
@@ -251,11 +242,7 @@ export const durableReducers: Partial<Record<AgentEventType, KernelEventReducer>
   "evidence.recorded": evidenceRecorded,
   "usage.recorded": usageRecorded,
   "plan.updated": planUpdated,
-  "budget.reserved": budgetUpdated,
-  "budget.reservation_bound": budgetUpdated,
-  "budget.committed": budgetUpdated,
-  "budget.released": budgetUpdated,
-  "budget.limit_increased": budgetLimitIncreased,
+  ...durableBudgetReducers,
   "checkpoint.created": checkpointUpdated,
   "checkpoint.sealed": checkpointUpdated,
   "checkpoint.restored": checkpointUpdated,
