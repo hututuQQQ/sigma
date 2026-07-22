@@ -21,15 +21,44 @@ function sha256(value) {
 function canonicalGitUrl(value) {
   const text = nonEmptyString(value);
   if (!text) return undefined;
+  if (text.includes("\0") || /[?#]/u.test(text)) {
+    throw new Error("Git task URLs cannot contain NUL, query, or fragment data.");
+  }
   try {
     const parsed = new URL(text);
-    parsed.hash = "";
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error("Git task URLs cannot contain credentials, query, or fragment data.");
+    }
+    if (!["git:", "http:", "https:", "ssh:"].includes(parsed.protocol)) {
+      throw new Error(`Unsupported Git task URL protocol '${parsed.protocol}'.`);
+    }
     parsed.hostname = parsed.hostname.toLowerCase();
     parsed.pathname = parsed.pathname.replace(/\/+$/u, "");
     return parsed.toString();
-  } catch {
-    return text.replace(/\/+$/u, "");
+  } catch (error) {
+    if (error instanceof Error && /Git task URL|Unsupported Git/u.test(error.message)) throw error;
+    const scp = /^(?<user>[A-Za-z0-9._-]+)@(?<host>[A-Za-z0-9.-]+):(?<repo>[^\s]+)$/u.exec(text);
+    if (!scp?.groups || scp.groups.repo.startsWith("/") || scp.groups.repo.split("/").includes("..")) {
+      throw new Error(
+        "Git task URL must be an absolute URL or canonical SCP-style SSH location.",
+        { cause: error }
+      );
+    }
+    return `${scp.groups.user}@${scp.groups.host.toLowerCase()}:${scp.groups.repo.replace(/\/+$/u, "")}`;
   }
+}
+
+function portableRepositoryPath(value) {
+  const text = nonEmptyString(value);
+  if (!text || text.includes("\0") || text.includes("\\")
+    || path.posix.isAbsolute(text) || /^[A-Za-z]:/u.test(text)) {
+    throw new Error("Git task path must be a portable repository-relative path.");
+  }
+  const normalized = path.posix.normalize(text);
+  if (normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error("Git task path must remain within its repository.");
+  }
+  return normalized;
 }
 
 function canonicalPath(value, baseDir = process.cwd()) {
@@ -74,7 +103,9 @@ export function validateExternalTaskRecord(value, index, baseDir = process.cwd()
     throw new Error(`tasks-file[${index}] source and provenance_source conflict.`);
   }
   return {
-    ...(name ? { name } : { path: canonicalPath(taskPath, baseDir) }),
+    ...(name ? { name } : {
+      path: gitUrl ? portableRepositoryPath(taskPath) : canonicalPath(taskPath, baseDir)
+    }),
     ...(gitUrl ? { git_url: gitUrl, git_commit_id: gitCommit } : {}),
     ...(provenance || legacyProvenance
       ? { provenance_source: provenance ?? legacyProvenance }
@@ -98,7 +129,9 @@ export function projectHarborTaskConfig(task) {
   }
   if (name && gitUrl) throw new Error("Named Harbor tasks cannot include Git source fields.");
   return {
-    ...(name ? { name } : { path: canonicalPath(taskPath) }),
+    ...(name ? { name } : {
+      path: gitUrl ? portableRepositoryPath(taskPath) : canonicalPath(taskPath)
+    }),
     ...(gitUrl ? { git_url: gitUrl, git_commit_id: gitCommit } : {})
   };
 }

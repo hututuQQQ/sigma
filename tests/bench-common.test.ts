@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -65,7 +65,7 @@ describe("Terminal-Bench command construction", () => {
     expect(options.tasksFileSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(config.tasks).toEqual([
       {
-        path: path.join(directory, "tasks", "one"),
+        path: "tasks/one",
         git_url: "https://example.test/tasks.git",
         git_commit_id: "a".repeat(40)
       },
@@ -75,6 +75,51 @@ describe("Terminal-Bench command construction", () => {
       type: "docker",
       extra_docker_compose: [expect.stringMatching(/docker-compose-sigma-sandbox\.yaml$/u)]
     });
+  });
+
+  it("keeps Git task paths repository-relative and host-independent", async () => {
+    const left = await mkdtemp(path.join(os.tmpdir(), "sigma-git-task-left-"));
+    const right = await mkdtemp(path.join(os.tmpdir(), "sigma-git-task-right-"));
+    const task = {
+      path: "nested/task-one",
+      git_url: "https://EXAMPLE.test/tasks.git/",
+      git_commit_id: "a".repeat(40),
+      provenance_source: "frozen"
+    };
+    const leftFile = path.join(left, "tasks.json");
+    const rightFile = path.join(right, "tasks.json");
+    await writeFile(leftFile, `${JSON.stringify([task])}\n`, "utf8");
+    await writeFile(rightFile, `${JSON.stringify([task])}\n`, "utf8");
+    try {
+      const [leftTask] = readTaskSelectionFile(leftFile);
+      const [rightTask] = readTaskSelectionFile(rightFile);
+      expect(leftTask.path).toBe("nested/task-one");
+      expect(rightTask.path).toBe("nested/task-one");
+      expect(harborTaskExecutionIdentitySha256(leftTask)).toBe(
+        harborTaskExecutionIdentitySha256(rightTask)
+      );
+    } finally {
+      await rm(left, { recursive: true, force: true });
+      await rm(right, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unsafe Git locations before Harbor task resolution", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-git-task-invalid-"));
+    const tasksFile = path.join(directory, "tasks.json");
+    try {
+      for (const record of [
+        { path: "../task", git_url: "https://example.test/tasks.git", git_commit_id: "a".repeat(40) },
+        { path: "C:/task", git_url: "https://example.test/tasks.git", git_commit_id: "a".repeat(40) },
+        { path: "task", git_url: "https://user:secret@example.test/tasks.git", git_commit_id: "a".repeat(40) },
+        { path: "task", git_url: "https://example.test/tasks.git?token=secret", git_commit_id: "a".repeat(40) }
+      ]) {
+        await writeFile(tasksFile, `${JSON.stringify([record])}\n`, "utf8");
+        expect(() => readTaskSelectionFile(tasksFile)).toThrow(/Git task/u);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("requires a frozen archive digest when reusing a package", () => {
