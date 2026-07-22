@@ -222,7 +222,7 @@ fn run_server(config: ServerConfig) -> Result<(), RpcError> {
                 thread::spawn(move || serve_connection(state, stream));
             }
             Err(error) => {
-                state.shutdown();
+                state.shutdown()?;
                 return Err(RpcError::new(
                     "broker_io_error",
                     format!("managed broker socket failed: {error}"),
@@ -230,7 +230,7 @@ fn run_server(config: ServerConfig) -> Result<(), RpcError> {
             }
         }
     }
-    state.shutdown();
+    state.shutdown()?;
     Ok(())
 }
 
@@ -260,8 +260,10 @@ fn serve_connection(state: Arc<BrokerState>, mut stream: UnixStream) {
             continue;
         }
         if request.method == "shutdown" {
-            send_result(&writer, request.request_id, json!({ "shutdown": true }));
-            state.shutdown();
+            match state.shutdown() {
+                Ok(()) => send_result(&writer, request.request_id, json!({ "shutdown": true })),
+                Err(error) => send_error(&writer, request.request_id, error),
+            }
             return;
         }
         if let Err(error) = state.begin_request(request.request_id, &request.method) {
