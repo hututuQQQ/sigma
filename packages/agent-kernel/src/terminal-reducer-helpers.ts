@@ -320,7 +320,9 @@ function blockedReportTransition(input: TerminalReceiptTransition): KernelState 
     ?? proposedOutcomeState(input.progressed, {
       kind: "recoverable_failure",
       code: report.code,
-      message: report.message
+      message: report.message,
+      failureKind: "blocked",
+      failureCode: report.code
     });
 }
 

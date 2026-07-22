@@ -421,6 +421,8 @@ describe("runtime queues and non-blocking instruction steering", () => {
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toEqual({
       kind: "recoverable_failure",
       code: "validation_failed",
+      failureKind: "blocked",
+      failureCode: "validation_failed",
       message: "The validation was executed and failed; that result is reported honestly.\n\nRecovery attempted: The requested validation was run once."
     });
     expect(gateway.requests).toHaveLength(2);

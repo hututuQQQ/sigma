@@ -136,18 +136,28 @@ function expectedTerminalEvent(outcome: RunOutcome): "run.completed" | "run.canc
   return "run.failed";
 }
 
+export function runResult(outcome: RunOutcome, sessionId: string): Record<string, unknown> {
+  return {
+    status: status(outcome),
+    finishReason: outcome.kind,
+    sessionId,
+    finalMessage: outcomeMessage(outcome),
+    ...(outcome.kind === "recoverable_failure" && outcome.failureKind === "blocked"
+      ? {
+        failureKind: outcome.failureKind,
+        failureCode: outcome.failureCode ?? outcome.code
+      }
+      : {})
+  };
+}
+
 function writeResult(
   outcome: RunOutcome,
   sessionId: string,
   config: CliConfig,
   stdout: NodeJS.WritableStream
 ): void {
-  const result = {
-    status: status(outcome),
-    finishReason: outcome.kind,
-    sessionId,
-    finalMessage: outcomeMessage(outcome)
-  };
+  const result = runResult(outcome, sessionId);
   if (config.outputFormat === "stream-json") {
     for (const line of outputJsonLines(
       outputResult(result, config.outputSchema), `result:${sessionId}`, config.streamJsonMaxLineBytes

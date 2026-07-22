@@ -38,7 +38,9 @@ TERMINAL_EVENT_TYPES = {"run.completed", "run.cancelled", "run.failed"}
 FAILURE_KINDS = {
     "needs_input", "timeout", "tool_error", "api_error", "agent_failure", "verifier_failure",
     "validation_blocked", "convergence_no_progress", "runtime_invariant_failure",
+    "structured_blocker",
 }
+DECLARED_FAILURE_KINDS = FAILURE_KINDS - {"structured_blocker"}
 DOCTOR_REPORT_SCHEMA_VERSION = 1
 BROKER_PROTOCOL_VERSION = 1
 SUPPORTED_NETWORK_MODES = {"none", "full"}
@@ -75,6 +77,13 @@ def _failure_kind_for_code(code: Any, payload: dict[str, Any] | None = None) -> 
     if normalized.startswith(("tool_", "execution_", "process_")):
         return "tool_error"
     return None
+
+
+def _structured_blocker_code(payload: dict[str, Any]) -> str | None:
+    """Recognize only the explicit runtime-authorized CLI blocker contract."""
+    kind = payload.get("failureKind") or payload.get("failure_kind")
+    code = payload.get("failureCode") or payload.get("failure_code")
+    return code if kind == "blocked" and isinstance(code, str) and code.strip() else None
 
 
 def _default_model(provider: str) -> str:
@@ -182,27 +191,22 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
 
 def _append_bounded_jsonl(path: pathlib.Path, record: dict[str, Any], maximum: int) -> None:
     line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-    existing_size = path.stat().st_size if path.is_file() else 0
-    if existing_size + len(line) <= maximum:
+    existing = path.read_bytes() if path.is_file() else b""
+    if b'"type": "trace_truncated"' in existing:
+        return
+    existing_size = len(existing)
+    marker = (json.dumps({
+        "type": "trace_truncated",
+        "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
+    }, ensure_ascii=False) + "\n").encode("utf-8")
+    reserve = min(len(marker), maximum)
+    if existing_size + len(line) <= maximum - reserve:
         with path.open("ab") as handle:
             handle.write(line)
         return
-    existing = path.read_bytes() if path.is_file() else b""
-    content = existing + line
-    digest = hashlib.sha256(content).hexdigest()
-    marker = (json.dumps({
-        "type": "trace_truncated",
-        "omitted_bytes_sha256": digest,
-    }, ensure_ascii=False) + "\n").encode("utf-8")
-    if len(marker) >= maximum:
-        bounded = marker[:maximum]
-    else:
-        tail = content[-(maximum - len(marker)):].decode("utf-8", errors="ignore").encode("utf-8")
-        bounded = marker + tail
-        if len(bounded) > maximum:
-            bounded = bounded[:maximum]
-    with path.open("wb") as handle:
-        handle.write(bounded)
+    if existing_size + len(marker) <= maximum:
+        with path.open("ab") as handle:
+            handle.write(marker)
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -277,6 +281,62 @@ def _bounded_event(event: dict[str, Any], maximum: int = 32_768) -> dict[str, An
         "seq": event.get("seq"),
         "payload_summary": _text_artifact_summary(raw),
         "truncated": True,
+    }
+
+
+def _trace_record(
+    event: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+    trace_type: str | None = None,
+) -> dict[str, Any]:
+    """Store the bounded Sigma event once and only scalar indexing metadata."""
+    event_type = str(event.get("type") or "event")
+    payload = _event_payload(event)
+    if trace_type is None:
+        if event_type == "usage.recorded":
+            trace_type = "usage"
+        elif event_type == "tool.started":
+            trace_type = "tool_start"
+        elif event_type in {"tool.completed", "tool.failed"}:
+            trace_type = "tool_end"
+        elif event_type == "model.started":
+            trace_type = "model_start"
+        elif event_type in {"model.completed", "model.failed"}:
+            trace_type = "model_end"
+        elif event_type in TERMINAL_EVENT_TYPES:
+            trace_type = "run_end"
+        else:
+            trace_type = event_type
+
+    metadata: dict[str, Any] = {"event_type": event_type}
+    scalar_keys = {
+        "status", "finishReason", "failureKind", "failureCode", "code", "origin",
+        "toolName", "name", "inputTokens", "outputTokens", "reasoningTokens",
+        "cacheReadTokens", "cacheWriteTokens", "costMicroUsd", "durationMs",
+    }
+    for key in scalar_keys:
+        value = payload.get(key)
+        if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) <= 512):
+            metadata[key] = value
+    if "toolName" not in metadata and isinstance(metadata.get("name"), str):
+        metadata["toolName"] = metadata.pop("name")
+    if summary is not None and event_type in TERMINAL_EVENT_TYPES:
+        summary_keys = {
+            "status", "finish_reason", "commands_executed", "input_tokens", "output_tokens",
+            "reasoning_tokens", "cache_tokens", "cache_read_tokens", "length_finish_count",
+            "converge_turns", "cost_usd", "duration_ms", "suspension_to_exit_ms",
+            "terminal_origin", "execution_mode", "agent_profile", "failure_kind", "failure_code",
+        }
+        for key in summary_keys:
+            value = summary.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                metadata[key] = value
+    return {
+        "type": trace_type,
+        "seq": event.get("seq"),
+        "occurredAt": event.get("occurredAt"),
+        "metadata": metadata,
+        "sigma_event": _bounded_event(event),
     }
 
 
@@ -419,13 +479,11 @@ class _OutputRecorder:
             if "retry" in event_type.lower() or "retry" in str(payload.get("status", "")).lower():
                 self.retry_count += 1
                 self.last_retry = _bounded_event(event)
-            _append_bounded_jsonl(self.trace_path, {
-                "type": "event",
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": {"event_type": event_type},
-                "sigma_event": _bounded_event(event),
-            }, MAX_TRACE_ARTIFACT_BYTES)
+            _append_bounded_jsonl(
+                self.trace_path,
+                _trace_record(event),
+                MAX_TRACE_ARTIFACT_BYTES,
+            )
             self._write_state()
             return
         if value.get("kind") == "result" or value.get("type") == "result":
@@ -596,6 +654,7 @@ class SigmaCliHarborAgent(BaseAgent):
         result: Any | None = None
         error_message: str | None = None
         failure_kind: str | None = None
+        failure_code: str | None = None
         timed_out = False
         cancelled_error: asyncio.CancelledError | None = None
         artifact_warnings: list[str] = []
@@ -624,8 +683,12 @@ class SigmaCliHarborAgent(BaseAgent):
                     error_message = recovery[2]
                     failure_kind = "checkpoint_recovery_required"
             reported_failure = output_result.get("failureKind") or output_result.get("failure_kind")
-            if reported_failure not in FAILURE_KINDS:
+            if reported_failure not in DECLARED_FAILURE_KINDS:
                 reported_failure = None
+            blocker_code = _structured_blocker_code(output_result) or next((
+                code for event in reversed(events)
+                if (code := _structured_blocker_code(_event_payload(event))) is not None
+            ), None)
             event_failure = self._failure_kind_from_events(events, output_result)
             protocol_failure = self._incomplete_terminal_protocol(result, events, output_result)
             # needs_input is a terminal protocol state, even when the CLI uses
@@ -636,6 +699,10 @@ class SigmaCliHarborAgent(BaseAgent):
             elif output_result.get("status") == "needs_input":
                 error_message = str(output_result.get("finalMessage") or output_result.get("message") or "agent requires external input")
                 failure_kind = "needs_input"
+            elif blocker_code is not None:
+                error_message = str(output_result.get("finalMessage") or output_result.get("message") or blocker_code)
+                failure_kind = "structured_blocker"
+                failure_code = blocker_code
             elif reported_failure is not None:
                 error_message = str(output_result.get("message") or output_result.get("finalMessage") or reported_failure)
                 failure_kind = reported_failure
@@ -672,15 +739,20 @@ class SigmaCliHarborAgent(BaseAgent):
                         or "agent requires external input"
                     )
                 elif status != "completed":
+                    blocker_code = _structured_blocker_code(recorded_terminal)
                     reported_failure = (
                         recorded_terminal.get("failureKind")
                         or recorded_terminal.get("failure_kind")
                     )
-                    failure_kind = (
-                        reported_failure
-                        if reported_failure in FAILURE_KINDS
-                        else "agent_failure"
-                    )
+                    if blocker_code is not None:
+                        failure_kind = "structured_blocker"
+                        failure_code = blocker_code
+                    else:
+                        failure_kind = (
+                            reported_failure
+                            if reported_failure in DECLARED_FAILURE_KINDS
+                            else "agent_failure"
+                        )
                     error_message = str(
                         recorded_terminal.get("finalMessage")
                         or recorded_terminal.get("message")
@@ -747,8 +819,10 @@ class SigmaCliHarborAgent(BaseAgent):
                     artifact_warnings.append(f"attempts: {exc}")
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
                 trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
-                if trace_path == recorder.trace_path:
+                if trace_path == recorder.trace_path and not recorder.events:
                     trace_path = None
+                elif trace_path is None and recorder.events and recorder.trace_path.is_file():
+                    trace_path = recorder.trace_path
 
         derived_summary = self._summary_from_events(events, output_result)
         derived_summary.update(recorder.timing_snapshot())
@@ -788,10 +862,12 @@ class SigmaCliHarborAgent(BaseAgent):
                 "last_error": error_message,
                 "protocol_failure": protocol_failure,
             })
-        if failure_kind is None and summary.get("failure_kind") in FAILURE_KINDS:
+        if failure_kind is None and summary.get("failure_kind") in DECLARED_FAILURE_KINDS:
             failure_kind = summary["failure_kind"]
         if failure_kind is not None:
             summary["failure_kind"] = failure_kind
+        if failure_code is not None:
+            summary["failure_code"] = failure_code
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
@@ -804,6 +880,7 @@ class SigmaCliHarborAgent(BaseAgent):
         if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
         self._set_context_value(context, "failure_kind", failure_kind)
+        self._set_context_value(context, "failure_code", failure_code)
         self._set_context_value(context, "artifact_warnings", artifact_warnings)
         if summary_path is not None:
             summary_path.write_text(
@@ -1044,8 +1121,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                          if event.get("type") in {"run.failed", "run.cancelled"}), None)
         if terminal is not None:
             payload = _event_payload(terminal)
+            if _structured_blocker_code(payload) is not None:
+                return "structured_blocker"
             explicit = payload.get("failureKind") or payload.get("failure_kind")
-            if explicit in FAILURE_KINDS:
+            if explicit in DECLARED_FAILURE_KINDS:
                 return explicit
             classified = _failure_kind_for_code(
                 payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode"),
@@ -1058,8 +1137,10 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         for event in reversed(events):
             event_type = event.get("type")
             payload = _event_payload(event)
+            if _structured_blocker_code(payload) is not None:
+                return "structured_blocker"
             explicit = payload.get("failureKind") or payload.get("failure_kind")
-            if explicit in FAILURE_KINDS:
+            if explicit in DECLARED_FAILURE_KINDS:
                 return explicit
             code = payload.get("code") or payload.get("diagnosticCode") or payload.get("failureCode")
             if isinstance(code, str):
@@ -1523,12 +1604,20 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         trace_target = trace_path or (self.logs_dir / "trace.jsonl")
         existing = trace_target.read_text(encoding="utf-8") if trace_target.is_file() else ""
         if '"type": "run_timeout"' not in existing:
-            _append_bounded_jsonl(trace_target, {
-                "type": "run_timeout",
+            timeout_event = {
+                "type": "run.timeout",
                 "occurredAt": time.time(),
-                "metadata": {"timeout": state},
-                "sigma_event": last_event,
-            }, MAX_TRACE_ARTIFACT_BYTES)
+                "payload": {
+                    "failureKind": "timeout",
+                    "failureCode": "adapter_timeout",
+                    "origin": "adapter_timeout",
+                },
+            }
+            _append_bounded_jsonl(
+                trace_target,
+                _trace_record(timeout_event, trace_type="run_timeout"),
+                MAX_TRACE_ARTIFACT_BYTES,
+            )
         return summary_target, trace_target
 
     def _trace_records(
@@ -1536,65 +1625,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         events: list[dict[str, Any]],
         summary: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for event in events:
-            event_type = event.get("type")
-            payload = _event_payload(event)
-            if event_type == "usage.recorded":
-                trace_type = "usage"
-                metadata = {"usage": {
-                    **payload,
-                    "cacheTokens": payload.get("cacheTokens", _as_int(payload.get("cacheReadTokens"), 0)
-                        + _as_int(payload.get("cacheWriteTokens"), 0)),
-                    "costUsd": payload.get("costUsd", _as_int(payload.get("costMicroUsd"), 0) / 1_000_000),
-                }}
-            elif event_type == "tool.started":
-                trace_type = "tool_start"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type in {"tool.completed", "tool.failed"}:
-                trace_type = "tool_end"
-                metadata = {**payload, "toolName": payload.get("toolName") or payload.get("name")}
-            elif event_type == "model.started":
-                trace_type = "model_start"
-                metadata = payload
-            elif event_type in {"model.completed", "model.failed"}:
-                trace_type = "model_end"
-                metadata = payload
-            elif event_type in TERMINAL_EVENT_TYPES:
-                trace_type = "run_end"
-                result = {
-                    **payload,
-                    **({
-                        "status": summary.get("status"),
-                        "finishReason": summary.get("finish_reason"),
-                        "commands_executed": summary.get("commands_executed", 0),
-                        "input_tokens": summary.get("input_tokens", 0),
-                        "output_tokens": summary.get("output_tokens", 0),
-                        "reasoning_tokens": summary.get("reasoning_tokens", 0),
-                        "cache_tokens": summary.get("cache_tokens", 0),
-                        "cache_read_tokens": summary.get("cache_read_tokens", 0),
-                        "length_finish_count": summary.get("length_finish_count", 0),
-                        "converge_turns": summary.get("converge_turns", 0),
-                        "cost_usd": summary.get("cost_usd"),
-                        "duration_ms": summary.get("duration_ms", 0),
-                        "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
-                        "terminal_origin": summary.get("terminal_origin"),
-                        "execution_mode": summary.get("execution_mode"),
-                        "agent_profile": summary.get("agent_profile"),
-                    } if summary is not None else {}),
-                }
-                metadata = {"result": result}
-            else:
-                trace_type = str(event_type or "event")
-                metadata = {"payload": payload}
-            records.append({
-                "type": trace_type,
-                "seq": event.get("seq"),
-                "occurredAt": event.get("occurredAt"),
-                "metadata": metadata,
-                "sigma_event": event,
-            })
-        return records
+        return [_trace_record(event, summary) for event in events]
 
     def _write_accounting_artifacts(
         self,
@@ -1609,10 +1640,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         if summary_path is not None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if trace_path is not None:
-            trace_path.write_text(
-                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in self._trace_records(events, summary)),
-                encoding="utf-8",
-            )
+            trace_path.unlink(missing_ok=True)
+            for record in self._trace_records(events, summary):
+                _append_bounded_jsonl(trace_path, record, MAX_TRACE_ARTIFACT_BYTES)
         return summary_path, trace_path
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -1945,7 +1975,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
         if not run_dir:
             return
 
-        task_id = self._context_task_id(context) or str(uuid.uuid4())
+        run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
+        task_id = run_slot or self._context_task_id(context) or str(uuid.uuid4())
         safe_task_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-") or "task"
         task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -1961,11 +1992,13 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
 
         metadata = {
             "task_id": task_id,
+            "run_slot": run_slot,
             "source_logs_dir": str(self.logs_dir),
             "agent_setup_ok": True,
             "exit_code": getattr(context, "exit_code", None),
             "error_message": getattr(context, "error_message", None),
             "failure_kind": getattr(context, "failure_kind", None),
+            "failure_code": getattr(context, "failure_code", None),
             "duration_ms": getattr(context, "duration_ms", 0),
             "suspension_to_exit_ms": getattr(context, "suspension_to_exit_ms", None),
             "terminal_origin": getattr(context, "terminal_origin", None),

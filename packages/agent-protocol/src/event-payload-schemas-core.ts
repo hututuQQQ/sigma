@@ -216,6 +216,8 @@ export const coreEventPayloadSchemas = {
     code: nonEmptyStringSchema,
     message: z.string(),
     resumeToken: z.string().optional(),
+    failureKind: z.literal("blocked").optional(),
+    failureCode: nonEmptyStringSchema.optional(),
     outcomeRevision: z.number().int().nonnegative().optional()
   }).strict(),
   "user.message": z.object({ text: z.string() }).strict(),

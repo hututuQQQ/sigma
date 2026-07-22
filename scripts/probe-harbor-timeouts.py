@@ -63,20 +63,26 @@ def _timeout_record(trial_task_config: Any, task_path: Path | None) -> dict[str,
 
 
 def _resolved_task_config(trial_task_config: Any, record: dict[str, Any]) -> dict[str, Any]:
-    name = record.get("task_name")
-    if isinstance(name, str) and name and name != "unknown":
-        return {"name": name}
-
     try:
         dumped = trial_task_config.model_dump(mode="json", exclude_none=True)
         if isinstance(dumped, dict):
-            for key in ["name", "path", "git_url", "git_commit_id", "ref", "source"]:
-                value = dumped.get(key)
-                if value:
-                    return {key: value}
+            config_name = dumped.get("name")
+            config_path = dumped.get("path")
+            if isinstance(config_name, str) and config_name:
+                return {"name": config_name}
+            if isinstance(config_path, str) and config_path:
+                resolved = {"path": config_path}
+                git_url = dumped.get("git_url")
+                git_commit = dumped.get("git_commit_id")
+                if isinstance(git_url, str) and git_url and isinstance(git_commit, str) and git_commit:
+                    resolved.update({"git_url": git_url, "git_commit_id": git_commit})
+                return resolved
     except Exception:
         pass
 
+    name = record.get("task_name")
+    if isinstance(name, str) and name and name != "unknown":
+        return {"name": name}
     path_value = record.get("task_path")
     if isinstance(path_value, str) and path_value:
         return {"path": path_value}

@@ -592,7 +592,62 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 for line in (logs_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual([record["type"] for record in trace], ["model_end", "run_end"])
-            self.assertEqual(trace[0]["metadata"]["diagnostics"], diagnostics)
+            self.assertEqual(trace[0]["sigma_event"]["payload"]["diagnostics"], diagnostics)
+            self.assertNotIn("diagnostics", trace[0]["metadata"])
+            self.assertNotIn("payload", trace[0]["metadata"])
+
+    async def test_only_explicit_runtime_blocker_contract_is_structured(self):
+        module = import_portable_agent_module()
+        cases = (
+            ({"failureKind": "blocked", "failureCode": "dependency_unavailable"}, "structured_blocker"),
+            ({}, "agent_failure"),
+            ({"failureKind": "structured_blocker", "failureCode": "dependency_unavailable"}, "agent_failure"),
+        )
+        for marker, expected in cases:
+            with self.subTest(marker=marker), TemporaryDirectory() as tmp:
+                payload = {
+                    "kind": "recoverable_failure",
+                    "code": "dependency_unavailable",
+                    "message": "blocked after recovery was exhausted",
+                    **marker,
+                }
+                stdout = "\n".join([
+                    json.dumps({"kind": "event", "event": {
+                        "eventId": "run-failure",
+                        "sessionId": "blocked-session",
+                        "seq": 1,
+                        "type": "run.failed",
+                        "payload": payload,
+                    }}),
+                    json.dumps({"kind": "result", "result": {
+                        "status": "error",
+                        "finishReason": "recoverable_failure",
+                        "sessionId": "blocked-session",
+                        "finalMessage": payload["message"],
+                        **marker,
+                    }}),
+                ]) + "\n"
+
+                async def exec_side_effect(command, **kwargs):
+                    if "/usr/local/bin/agent run" in command:
+                        return SimpleNamespace(return_code=1, stdout=stdout, stderr="")
+                    if command.startswith("test -f ") or command.startswith("test -d "):
+                        return SimpleNamespace(return_code=1, stdout="", stderr="")
+                    return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+                env = SimpleNamespace(
+                    exec=AsyncMock(side_effect=exec_side_effect),
+                    upload_file=AsyncMock(),
+                    download_file=AsyncMock(),
+                )
+                context = SimpleNamespace(task_id="blocked")
+                agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+                agent._workspace = "/app"
+                with self.assertRaisesRegex(RuntimeError, f"^{expected}:"):
+                    await agent.run("run", env, context)
+                self.assertEqual(context.failure_kind, expected)
+                if marker.get("failureKind") == "blocked":
+                    self.assertEqual(context.failure_code, "dependency_unavailable")
 
     async def test_terminal_model_and_tool_errors_keep_distinct_categories(self):
         module = import_portable_agent_module()
@@ -1291,16 +1346,41 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
                 module.MAX_PARTIAL_ARTIFACT_CHARS,
             )
 
-    async def test_incremental_trace_is_bounded_and_keeps_tail(self):
+    async def test_incremental_trace_is_bounded_and_keeps_stable_prefix(self):
         module = import_portable_agent_module()
         with TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "trace.jsonl"
-            for index in range(20):
+            module._append_bounded_jsonl(trace_path, {"type": "event", "seq": 0, "payload": "z" * 40}, 256)
+            prefix = trace_path.read_bytes()
+            for index in range(1, 20):
                 module._append_bounded_jsonl(trace_path, {"type": "event", "seq": index, "payload": "z" * 40}, 256)
             self.assertLessEqual(trace_path.stat().st_size, 256)
+            self.assertTrue(trace_path.read_bytes().startswith(prefix))
             trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(json.loads(line).get("type") == "trace_truncated" for line in trace_lines))
-            self.assertEqual(json.loads(trace_lines[-1]).get("seq"), 19)
+            self.assertEqual(json.loads(trace_lines[-1]).get("type"), "trace_truncated")
+
+    async def test_accounting_trace_is_single_copy_and_strictly_bounded(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(logs_dir=Path(tmp) / "logs")
+            events = [{
+                "eventId": f"event-{index}",
+                "sessionId": "session",
+                "seq": index,
+                "type": "tool.completed",
+                "payload": {"toolName": "exec", "output": "x" * 40_000},
+            } for index in range(200)]
+            _, trace_path = agent._write_accounting_artifacts(events, {}, write_summary=False)
+            self.assertIsNotNone(trace_path)
+            self.assertLessEqual(trace_path.stat().st_size, module.MAX_TRACE_ARTIFACT_BYTES)
+            records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            events_written = [record for record in records if record.get("type") != "trace_truncated"]
+            self.assertGreater(len(events_written), 0)
+            for record in events_written:
+                self.assertIn("sigma_event", record)
+                self.assertNotIn("payload", record["metadata"])
+                self.assertNotIn("output", record["metadata"])
 
 
 if __name__ == "__main__":

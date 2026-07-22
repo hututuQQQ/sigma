@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertUniqueHarborTaskExecutionIdentities,
+  buildResolvedTaskAttestationV2,
   buildHarborArgs,
   buildHarborJobConfig,
   buildHarborTimeoutProbeConfig,
@@ -17,14 +19,18 @@ import {
   groupHarborTimeoutProbe,
   assertComparableBenchmarkReports,
   harborEnvForRun,
+  harborTaskExecutionIdentitySha256,
   harborRuntimeDir,
   parseHarborTimeoutProbe,
   portableAgentImportPath,
+  projectHarborTaskConfig,
+  readTaskSelectionFile,
   removedHarborAdapterErrorMessage,
   removedHarborPackageName,
   resolveHarborCommand,
   resolveRunOptions,
   suggestedOwnerForFailureCategory,
+  taskSelectionIdentitySha256,
   terminalBenchDataset
 } from "../scripts/bench-common.mjs";
 
@@ -59,7 +65,7 @@ describe("Terminal-Bench command construction", () => {
     expect(options.tasksFileSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(config.tasks).toEqual([
       {
-        path: "tasks/one",
+        path: path.join(directory, "tasks", "one"),
         git_url: "https://example.test/tasks.git",
         git_commit_id: "a".repeat(40)
       },
@@ -75,6 +81,51 @@ describe("Terminal-Bench command construction", () => {
     expect(() => resolveRunOptions([
       "--mode", "task", "--task-id", "one", "--reuse-package"
     ])).toThrow("--reuse-package requires --expected-archive-sha256");
+  });
+
+  it("separates provenance from source-free Harbor execution identity", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-task-provenance-"));
+    const tasksFile = path.join(directory, "tasks.json");
+    await writeFile(tasksFile, `${JSON.stringify([{
+      name: "registry/task-one",
+      source: "legacy-catalog"
+    }])}\n`, "utf8");
+
+    const [task] = readTaskSelectionFile(tasksFile);
+    expect(task).toMatchObject({ name: "registry/task-one", provenance_source: "legacy-catalog" });
+    expect(projectHarborTaskConfig({ ...task, untrusted: "ignored" })).toEqual({ name: "registry/task-one" });
+    expect(buildHarborJobConfig({ mode: "batch", tasks: [task] }, "jobs").tasks).toEqual([
+      { name: "registry/task-one" }
+    ]);
+    expect(taskSelectionIdentitySha256(task)).not.toBe(harborTaskExecutionIdentitySha256(task));
+
+    const attestation = buildResolvedTaskAttestationV2({
+      jobConfigSha256: "a".repeat(64),
+      taskSelectionSha256: "b".repeat(64),
+      selectedTasks: [task],
+      resolvedTasks: [{ name: "registry/task-one" }]
+    });
+    expect(attestation).toMatchObject({
+      schema_version: 2,
+      job_config_sha256: "a".repeat(64),
+      task_selection_sha256: "b".repeat(64),
+      tasks: [{ selection_identity: { provenance_source: "legacy-catalog" } }]
+    });
+  });
+
+  it("rejects conflicting provenance aliases and duplicate execution identities", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-task-provenance-conflict-"));
+    const tasksFile = path.join(directory, "tasks.json");
+    await writeFile(tasksFile, `${JSON.stringify([{
+      name: "registry/task-one",
+      source: "catalog-a",
+      provenance_source: "catalog-b"
+    }])}\n`, "utf8");
+    expect(() => readTaskSelectionFile(tasksFile)).toThrow(/source and provenance_source conflict/u);
+    expect(() => assertUniqueHarborTaskExecutionIdentities([
+      { name: "registry/task-one", provenance_source: "a" },
+      { name: "registry/task-one", provenance_source: "b" }
+    ])).toThrow(/duplicate Harbor execution identities/u);
   });
 
   it("rejects comparisons across agent profiles and evaluation lanes", () => {
@@ -662,6 +713,8 @@ describe("Terminal-Bench command construction", () => {
 
     const existingEnv = harborEnvForRun("run-dir", { PYTHONPATH: ["one", "two"].join(path.delimiter) });
     expect(existingEnv.PYTHONPATH.split(path.delimiter)).toEqual([harborRuntimeDir, "one", "two"]);
+    expect(portableEnv.PYTHONDONTWRITEBYTECODE).toBe("1");
+    expect(portableEnv.PYTHONPYCACHEPREFIX).toContain(path.join("runtime-scratch", "pycache"));
   });
 
   it("rejects removed Harbor import paths before building run env", () => {
@@ -726,7 +779,7 @@ describe("failure classifier", () => {
       })
     ).toBe("tool_timeout");
     expect(classifyFailure({ logText: '{"max_wall_time_sec":2700}', exitCode: 1 })).toBe("agent_crashed");
-    expect(classifyFailure({ logText: '{"finish_reason":"max_wall_time"}' })).toBe("agent_timeout");
+    expect(classifyFailure({ summary: { finish_reason: "max_wall_time" } })).toBe("agent_timeout");
     expect(classifyFailure({ summary: { status: "error" }, exitCode: 1 })).toBe("agent_crashed");
   });
 
@@ -736,6 +789,8 @@ describe("failure classifier", () => {
     expect(classifyFailure({ failureKind: "tool_error" })).toBe("tool_error");
     expect(classifyFailure({ failureKind: "api_error" })).toBe("api_error");
     expect(classifyFailure({ failureKind: "verifier_failure" })).toBe("verifier_failure");
+    expect(classifyFailure({ failureKind: "structured_blocker" })).toBe("structured_blocker");
+    expect(classifyFailure({ logText: "the final message says blocked", exitCode: 1 })).toBe("agent_crashed");
   });
 
   it("maps failure categories to suggested owners", () => {
@@ -891,6 +946,86 @@ describe("benchmark report generation", () => {
     });
     expect(markdown).toContain("Evaluation lane: solving");
     expect(jsonReport.tasks.find((task) => task.task_id === "api-task")?.suggested_owner).toBe("agent-model");
+  });
+
+  it("reports an authorized structured blocker as valid without calling it a crash", async () => {
+    const runDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-blocker-"));
+    const slot = "slot-blocked";
+    const trialDir = path.join(runDir, "harbor-jobs", slot, "job-1", "trial-1");
+    const taskDir = path.join(runDir, "tasks", slot);
+    await writeFile(path.join(runDir, "config.json"), `${JSON.stringify({
+      run_id: "structured-blocker-run",
+      started_at: "2026-07-06T00:00:00.000Z",
+      finished_at: "2026-07-06T00:01:00.000Z",
+      provider: "deepseek",
+      model: "model",
+      mode: "batch",
+      exit_code: 1,
+      status: "failed",
+      resolved_job_config_path: "resolved-job.config.json",
+      run_slots: [{
+        run_slot: slot,
+        harbor_task_identity: { kind: "name", name: "registry/task-one" },
+        provenance_source: "selection",
+        selection_identity: { execution: { kind: "name", name: "registry/task-one" } }
+      }]
+    })}\n`, "utf8");
+    await writeFile(path.join(runDir, "resolved-job.config.json"), `${JSON.stringify({
+      n_concurrent_trials: 1,
+      tasks: [{ name: "registry/task-one" }]
+    })}\n`, "utf8");
+    for (const name of ["harbor.stdout.log", "harbor.stderr.log", "result.raw.log"]) {
+      await writeFile(path.join(runDir, name), "", "utf8");
+    }
+    await mkdir(taskDir, { recursive: true });
+    await writeFile(path.join(taskDir, "metadata.json"), `${JSON.stringify({
+      task_id: "registry/task-one",
+      run_slot: slot,
+      exit_code: 1,
+      failure_kind: "structured_blocker",
+      failure_code: "dependency_unavailable"
+    })}\n`, "utf8");
+    await writeFile(path.join(taskDir, "summary.json"), `${JSON.stringify({
+      status: "error",
+      failure_kind: "structured_blocker",
+      failure_code: "dependency_unavailable",
+      last_error: "Dependency recovery was exhausted."
+    })}\n`, "utf8");
+    await mkdir(trialDir, { recursive: true });
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1",
+      task_name: "registry/task-one",
+      exception_info: { exception_message: "structured_blocker: Dependency recovery was exhausted." },
+      agent_result: { metadata: {
+        exit_code: 1,
+        failure_kind: "structured_blocker",
+        failure_code: "dependency_unavailable"
+      } }
+    })}\n`, "utf8");
+    await writeHarborJobResult(path.dirname(trialDir), 1, 1, 0);
+
+    const report = await generateBenchReport(runDir);
+
+    expect(report.incomplete_reason).toBeNull();
+    expect(report.counts.structured_blocker).toBe(1);
+    expect(report.tasks[0]).toMatchObject({
+      failure_category: "structured_blocker",
+      failure_code: "dependency_unavailable",
+      agent_outcome: "blocked",
+      verifier_outcome: "not_run",
+      validity: "valid",
+      provenance_source: "selection",
+      agent_exception: null
+    });
+
+    await writeFile(path.join(trialDir, "result.json"), `${JSON.stringify({
+      trial_name: "trial-1",
+      task_name: "registry/different-task",
+      agent_result: { metadata: { exit_code: 1, failure_kind: "structured_blocker" } }
+    })}\n`, "utf8");
+    const mismatched = await generateBenchReport(runDir);
+    expect(mismatched.status).toBe("incomplete");
+    expect(mismatched.incomplete_reason?.join("\n")).toMatch(/identity does not match run slot/u);
   });
 
   it("uses Harbor verifier reward to mark completed agents as failed", async () => {
@@ -1494,19 +1629,34 @@ describe("benchmark report generation", () => {
     await writeFile(
       path.join(trialDir, "agent", "trace.jsonl"),
       [
-        JSON.stringify({ type: "usage", metadata: { usage: { inputTokens: 10, outputTokens: 3, cacheTokens: 1 } } }),
-        JSON.stringify({ type: "tool_end", metadata: { toolName: "bash", result: { metadata: {} } } }),
+        JSON.stringify({
+          type: "usage",
+          metadata: { event_type: "usage.recorded", inputTokens: 10, outputTokens: 3 },
+          sigma_event: {
+            type: "usage.recorded",
+            payload: { inputTokens: 10, outputTokens: 3, cacheReadTokens: 1, cacheWriteTokens: 0 }
+          }
+        }),
+        JSON.stringify({
+          type: "tool_end",
+          metadata: { event_type: "tool.completed", toolName: "bash" },
+          sigma_event: { type: "tool.completed", payload: { toolName: "bash" } }
+        }),
         JSON.stringify({
           type: "run_end",
           metadata: {
-            result: {
-              status: "stopped",
-              finishReason: "max_wall_time",
-              commandsExecuted: 2,
-              usage: { inputTokens: 20, outputTokens: 5, cacheTokens: 1 },
-              durationMs: 1234,
-              lastError: "wall time"
-            }
+            event_type: "run.failed",
+            status: "stopped",
+            finish_reason: "max_wall_time",
+            commands_executed: 2,
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_tokens: 1,
+            duration_ms: 1234
+          },
+          sigma_event: {
+            type: "run.failed",
+            payload: { kind: "recoverable_failure", code: "budget_exhausted", message: "wall time" }
           }
         }),
         ""

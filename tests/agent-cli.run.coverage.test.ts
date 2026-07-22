@@ -11,7 +11,7 @@ import type {
   ModelStreamEvent,
   ModelToolDefinition
 } from "../packages/agent-protocol/src/index.js";
-import { runCommand } from "../packages/agent-cli/src/commands/run.js";
+import { runCommand, runResult } from "../packages/agent-cli/src/commands/run.js";
 import { createModelGateway } from "../packages/agent-model/src/index.js";
 import { describe, expect, it } from "vitest";
 import { typedCompletion } from "./helpers/typed-evidence.js";
@@ -184,6 +184,23 @@ function runDeps(script: ScriptedResponse[]) {
 }
 
 describe("run command branch coverage", () => {
+  it("emits blocker fields only for a runtime-authorized blocked outcome", () => {
+    expect(runResult({
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    }, "session")).toMatchObject({
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    });
+    expect(runResult({
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked"
+    }, "session")).not.toHaveProperty("failureKind");
+  });
   it("renders both run and inspect help and reports empty instructions", async () => {
     const runHelp = new Capture();
     await expect(runCommand(["--help"], { stdout: runHelp })).resolves.toBe(0);

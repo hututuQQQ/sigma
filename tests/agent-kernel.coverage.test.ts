@@ -662,6 +662,17 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     expect(apply(initial(), "run.cancelled", { reason: "user" }).outcome).toMatchObject({ reason: "user" });
     expect(apply(initial(), "run.failed", { kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" }).outcome)
       .toEqual({ kind: "recoverable_failure", code: "retry", message: "later", resumeToken: "r" });
+    expect(apply(initial(), "run.failed", {
+      kind: "recoverable_failure",
+      code: "dependency_unavailable",
+      message: "blocked",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    }).outcome).toMatchObject({
+      kind: "recoverable_failure",
+      failureKind: "blocked",
+      failureCode: "dependency_unavailable"
+    });
     expect(apply(initial(), "run.failed", { kind: "fatal" }).outcome).toMatchObject({ kind: "fatal", code: "runtime_error" });
     expect(apply(initial(), "run.completed", { message: "forged", evidence: [], outcomeRevision: 0 }).phase).toBe("idle");
 

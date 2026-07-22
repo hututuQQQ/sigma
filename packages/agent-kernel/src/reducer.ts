@@ -281,7 +281,10 @@ const runFailed: EventReducer = (state, _event, payload) => {
       kind: "recoverable_failure",
       code: text(payload.code) || "runtime_error",
       message: completionRepairFailureMessage(state, text(payload.message)),
-      ...(typeof payload.resumeToken === "string" ? { resumeToken: payload.resumeToken } : {})
+      ...(typeof payload.resumeToken === "string" ? { resumeToken: payload.resumeToken } : {}),
+      ...(payload.failureKind === "blocked" ? { failureKind: "blocked" as const } : {}),
+      ...(payload.failureKind === "blocked" && typeof payload.failureCode === "string"
+        ? { failureCode: payload.failureCode } : {})
     }
     : {
       kind: "fatal",

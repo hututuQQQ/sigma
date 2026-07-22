@@ -101,6 +101,22 @@ describe("AgentEventEnvelope V5 runtime boundary", () => {
     })).toBe(true);
   });
 
+  it("accepts only the explicit blocked run failure marker", () => {
+    const event = validAgentEventFixture("run.failed");
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: {
+        ...event.payload,
+        failureKind: "blocked",
+        failureCode: "dependency_unavailable"
+      }
+    })).toBe(true);
+    expect(isAgentEventEnvelope({
+      ...event,
+      payload: { ...event.payload, failureKind: "structured_blocker" }
+    })).toBe(false);
+  });
+
   it("rejects wrong versions and authority/scope violations", () => {
     expect(isAgentEventEnvelope({ ...validAgentEventFixture(), schemaVersion: 3 })).toBe(false);
     expect(isAgentEventEnvelope({ ...validAgentEventFixture(), authority: "external_verifier" })).toBe(false);

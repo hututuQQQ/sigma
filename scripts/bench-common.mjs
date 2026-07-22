@@ -4,6 +4,26 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  assertUniqueHarborTaskExecutionIdentities,
+  buildResolvedTaskAttestationV2,
+  harborTaskExecutionIdentity,
+  harborTaskExecutionIdentitySha256,
+  projectHarborTaskConfig,
+  taskSelectionIdentity,
+  taskSelectionIdentitySha256,
+  validateExternalTaskRecord
+} from "./harbor-task-identity.mjs";
+
+export {
+  assertUniqueHarborTaskExecutionIdentities,
+  buildResolvedTaskAttestationV2,
+  harborTaskExecutionIdentity,
+  harborTaskExecutionIdentitySha256,
+  projectHarborTaskConfig,
+  taskSelectionIdentity,
+  taskSelectionIdentitySha256
+};
 
 export const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const artifactsDir = path.join(rootDir, ".artifacts");
@@ -29,7 +49,10 @@ export const defaultBenchmarkTurnCadenceSec = 5;
 export const defaultBenchmarkMaxTurnsCap = 1000;
 export const defaultConcurrentTrials = 5;
 
-const COUNT_KEYS = ["passed", "failed", "infra_failed", "timeout", "api_error", "needs_input", "tool_error", "verifier_failure", "unknown"];
+const COUNT_KEYS = [
+  "passed", "failed", "infra_failed", "structured_blocker", "timeout", "api_error",
+  "needs_input", "tool_error", "verifier_failure", "unknown"
+];
 const FAILURE_COUNT_BUCKETS = new Map([
   ["host_proxy_error", "infra_failed"],
   ["host_encoding_error", "infra_failed"],
@@ -42,6 +65,7 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["timeout", "timeout"],
   ["tool_error", "tool_error"],
   ["verifier_failure", "verifier_failure"],
+  ["structured_blocker", "structured_blocker"],
   ["agent_timeout", "timeout"],
   ["max_turns", "timeout"],
   ["tool_timeout", "timeout"],
@@ -61,6 +85,7 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["timeout", "agent-runtime"],
   ["tool_error", "agent-tools"],
   ["verifier_failure", "agent-runtime"],
+  ["structured_blocker", "agent-runtime"],
   ["agent_timeout", "agent-runtime"],
   ["max_turns", "agent-runtime"],
   ["tool_timeout", "agent-tools"],
@@ -258,33 +283,6 @@ function normalizedSha256(value, name) {
   return text;
 }
 
-function validateTaskRecord(value, index) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`tasks-file[${index}] must be an object.`);
-  }
-  const allowed = new Set(["name", "path", "git_url", "git_commit_id", "source"]);
-  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new Error(`tasks-file[${index}] has unsupported fields: ${unknown.join(", ")}.`);
-  const name = asString(value.name);
-  const taskPath = asString(value.path);
-  if (Boolean(name) === Boolean(taskPath)) {
-    throw new Error(`tasks-file[${index}] must contain exactly one of name or path.`);
-  }
-  const gitUrl = asString(value.git_url);
-  const gitCommit = asString(value.git_commit_id);
-  if (Boolean(gitUrl) !== Boolean(gitCommit)) {
-    throw new Error(`tasks-file[${index}] git_url and git_commit_id must be supplied together.`);
-  }
-  if (gitCommit && !/^[a-f0-9]{40}$/u.test(gitCommit)) {
-    throw new Error(`tasks-file[${index}].git_commit_id must be a lowercase 40-character Git commit.`);
-  }
-  return {
-    ...(name ? { name } : { path: taskPath }),
-    ...(gitUrl ? { git_url: gitUrl, git_commit_id: gitCommit } : {}),
-    ...(asString(value.source) ? { source: asString(value.source) } : {})
-  };
-}
-
 export function readTaskSelectionFile(filePath) {
   if (!filePath) return [];
   const resolved = path.resolve(filePath);
@@ -292,9 +290,8 @@ export function readTaskSelectionFile(filePath) {
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error("--tasks-file must contain a non-empty JSON array.");
   }
-  const tasks = parsed.map(validateTaskRecord);
-  const identities = tasks.map((task) => task.name ?? `${task.git_url}\0${task.git_commit_id}\0${task.path}`);
-  if (new Set(identities).size !== identities.length) throw new Error("--tasks-file contains duplicate tasks.");
+  const tasks = parsed.map((record, index) => validateExternalTaskRecord(record, index, path.dirname(resolved)));
+  assertUniqueHarborTaskExecutionIdentities(tasks);
   return tasks;
 }
 
@@ -571,17 +568,11 @@ function selectedTaskRecords(timeoutProbe) {
       : [];
   return tasks
     .map((task) => {
-      if (task?.name) return { name: task.name };
-      if (task?.path) return { path: task.path };
+      if (task?.name) return projectHarborTaskConfig(task);
+      if (task?.path) return projectHarborTaskConfig(task);
       return null;
     })
     .filter(Boolean);
-}
-
-function harborTaskRecord(task) {
-  if (!task || typeof task !== "object") return task;
-  const { source: _controlPlaneSource, ...record } = task;
-  return record;
 }
 
 function benchmarkAgentKwargs(options, timeoutPlan = null) {
@@ -640,7 +631,8 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
     // Harbor 0.17 does not resolve metrics for explicit task sources. Leaving
     // source unset selects its supported adhoc Mean metric while Git/path
     // provenance remains frozen in the external control-plane task file.
-    config.tasks = configuredTasks.map(harborTaskRecord);
+    assertUniqueHarborTaskExecutionIdentities(configuredTasks);
+    config.tasks = configuredTasks.map(projectHarborTaskConfig);
   } else if (resolvedTasks.length > 0) {
     config.tasks = resolvedTasks;
   } else if (options.mode === "task") {
@@ -842,6 +834,10 @@ export function buildCommandScript(commandOrArgs, maybeArgs, maybeEnv) {
     `cd ${shellQuote(rootDir)}`,
     `export AGENT_CLI_TARBALL=${shellQuote(env.AGENT_CLI_TARBALL)}`,
     `export PYTHONPATH=${shellQuote(env.PYTHONPATH ?? "")}`,
+    `export PYTHONDONTWRITEBYTECODE=${shellQuote(env.PYTHONDONTWRITEBYTECODE ?? "1")}`,
+    `export PYTHONPYCACHEPREFIX=${shellQuote(env.PYTHONPYCACHEPREFIX ?? "")}`,
+    `export SIGMA_BENCH_RUN_DIR=${shellQuote(env.SIGMA_BENCH_RUN_DIR ?? "")}`,
+    `export SIGMA_BENCH_RUN_SLOT=${shellQuote(env.SIGMA_BENCH_RUN_SLOT ?? "")}`,
     `${shellQuote(harborCommand)} ${harborArgs.map(shellQuote).join(" ")}`,
     ""
   ].join("\n");
@@ -987,23 +983,13 @@ function containsTimedOut(value) {
 }
 
 export function traceHasToolTimeout(events) {
-  return events.some((event) => event?.type === "tool_end" && containsTimedOut(event.metadata));
+  return events.some((event) => event?.type === "tool_end" && (
+    containsTimedOut(event.metadata) || containsTimedOut(event.sigma_event?.payload)
+  ));
 }
 
 function summaryHasFinishReason(summary, finishReason) {
   return summary?.finish_reason === finishReason || summary?.finishReason === finishReason;
-}
-
-function logIndicatesMaxWallTime(logText = "") {
-  return (
-    /finish[_ ]?reason"?\s*[:=]\s*"?max_wall_time/i.test(logText) ||
-    /finishReason"?\s*[:=]\s*"?max_wall_time/.test(logText) ||
-    /agent execution timed out|timed out after|max wall time/i.test(logText)
-  );
-}
-
-function logIndicatesGenericTimeout(logText = "") {
-  return /agent execution timed out|execution timed out|timed out after|\btimed out\b/i.test(logText);
 }
 
 export function classifyFailure(input = {}) {
@@ -1014,7 +1000,9 @@ export function classifyFailure(input = {}) {
   const declared = input.failureKind
     ?? input.metadata?.failure_kind
     ?? summary.failure_kind;
-  if (["needs_input", "timeout", "tool_error", "api_error", "verifier_failure"].includes(declared)) {
+  if ([
+    "needs_input", "timeout", "tool_error", "api_error", "verifier_failure", "structured_blocker"
+  ].includes(declared)) {
     return declared;
   }
 
@@ -1044,7 +1032,9 @@ export function classifyFailure(input = {}) {
   }
   if (summaryHasFinishReason(summary, "max_turns")) return "max_turns";
   if (traceHasToolTimeout(events)) return "tool_timeout";
-  if (summaryHasFinishReason(summary, "max_wall_time") || logIndicatesMaxWallTime(logText) || logIndicatesGenericTimeout(logText)) {
+  if (summaryHasFinishReason(summary, "max_wall_time")
+    || summary.terminal_origin === "adapter_timeout"
+    || summary.termination_source === "adapter_timeout") {
     return "agent_timeout";
   }
   if (
@@ -1148,10 +1138,9 @@ function collectFailureSignals(input = {}) {
     .join("\n");
   const logText = `${input.logText ?? ""}\n${verifierText}`;
 
-  if (
-    summaryHasFinishReason(summary, "max_wall_time") ||
-    logIndicatesMaxWallTime(logText)
-  ) {
+  if (summaryHasFinishReason(summary, "max_wall_time")
+    || summary.terminal_origin === "adapter_timeout"
+    || summary.termination_source === "adapter_timeout") {
     addSignal(signals, "max_wall_time");
   }
   if (traceHasToolTimeout(events)) {
@@ -1267,14 +1256,21 @@ function summarizeTraceEvents(events) {
 
   for (const event of events) {
     const metadata = event?.metadata ?? {};
+    const sigmaEvent = event?.sigma_event && typeof event.sigma_event === "object"
+      ? event.sigma_event : {};
+    const payload = sigmaEvent.payload && typeof sigmaEvent.payload === "object"
+      ? sigmaEvent.payload : metadata.payload && typeof metadata.payload === "object"
+        ? metadata.payload : {};
     if (event?.type === "usage") {
-      const usage = metadata.usage ?? {};
+      const usage = metadata.usage ?? payload;
       summary.input_tokens += Number(usage.inputTokens ?? usage.input_tokens ?? 0);
       summary.output_tokens += Number(usage.outputTokens ?? usage.output_tokens ?? 0);
       summary.reasoning_tokens += Number(usage.reasoningTokens ?? usage.reasoning_tokens ?? 0);
-      summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens ?? 0);
+      summary.cache_tokens += Number(usage.cacheTokens ?? usage.cache_tokens
+        ?? Number(usage.cacheReadTokens ?? 0) + Number(usage.cacheWriteTokens ?? 0));
       summary.cache_read_tokens += Number(usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0);
-      const usageCost = Number(usage.costUsd ?? usage.cost_usd);
+      const usageCost = Number(usage.costUsd ?? usage.cost_usd
+        ?? (Number.isFinite(Number(usage.costMicroUsd)) ? Number(usage.costMicroUsd) / 1_000_000 : NaN));
       if (Number.isFinite(usageCost)) summary.cost_usd = (summary.cost_usd ?? 0) + usageCost;
     }
     if (event?.type === "model_end"
@@ -1282,18 +1278,23 @@ function summarizeTraceEvents(events) {
       summary.length_finish_count += 1;
     }
     if (event?.type === "diagnostic") {
-      const payload = metadata.payload ?? metadata;
-      if (payload.kind === "deadline.stage" && payload.stage === "converge") summary.converge_turns += 1;
+      const diagnostic = Object.keys(payload).length > 0 ? payload : metadata;
+      if (diagnostic.kind === "deadline.stage" && diagnostic.stage === "converge") summary.converge_turns += 1;
     }
     if (event?.type === "tool_end" && metadata.toolName === "bash") {
       summary.commands_executed += 1;
     }
-    if (event?.type === "error" && metadata.message) {
-      summary.last_error = String(metadata.message);
+    if (event?.type === "error" && (payload.message || metadata.message)) {
+      summary.last_error = String(payload.message ?? metadata.message);
     }
-    if (event?.type === "run_end" && metadata.result && typeof metadata.result === "object") {
-      const result = metadata.result;
+    if (event?.type === "run_end") {
+      const result = metadata.result && typeof metadata.result === "object"
+        ? metadata.result : { ...payload, ...metadata };
+      const durableType = sigmaEvent.type;
       summary.status = result.status ?? summary.status;
+      if (!summary.status && durableType === "run.completed") summary.status = "completed";
+      if (!summary.status && durableType === "run.failed") summary.status = "error";
+      if (!summary.status && durableType === "run.cancelled") summary.status = "cancelled";
       summary.finish_reason = result.finishReason ?? result.finish_reason ?? summary.finish_reason;
       summary.commands_executed = Number(result.commandsExecuted ?? result.commands_executed ?? summary.commands_executed);
       summary.input_tokens = Number(result.usage?.inputTokens ?? result.input_tokens ?? summary.input_tokens);
@@ -1449,11 +1450,13 @@ async function readHarborTrialResults(runDir) {
     const value = await readJsonSafe(filePath);
     if (value && typeof value === "object" && value.trial_name && value.task_name) {
       const trialDir = path.dirname(filePath);
+      const relativeParts = path.relative(jobsDir, filePath).split(path.sep);
       results.push({
         ...value,
         ...(await readVerifierDetails(runDir, trialDir)),
         ...(await readTrialTraceFallback(runDir, trialDir)),
         result_path: path.relative(runDir, filePath).replace(/\\/g, "/"),
+        run_slot: relativeParts.length > 1 ? relativeParts[0] : null,
         trial_dir: trialDir
       });
     }
@@ -1503,6 +1506,81 @@ async function resolvedJobConfigForReport(runDir, config) {
     : "resolved-job.config.json";
   const filePath = path.isAbsolute(configured) ? configured : path.join(runDir, configured);
   return existsSync(filePath) ? await readJsonSafe(filePath) : null;
+}
+
+async function runSlotIntegrityReasons(runDir, config) {
+  const slots = Array.isArray(config.run_slots) ? config.run_slots : [];
+  if (slots.length === 0) return [];
+  const reasons = [];
+  const slotIds = new Set();
+  const executionIds = new Set();
+  for (const slot of slots) {
+    if (typeof slot?.run_slot !== "string" || !slot.run_slot) {
+      reasons.push("Harbor run-slot manifest contains an invalid slot identifier.");
+      continue;
+    }
+    if (slotIds.has(slot.run_slot)) reasons.push(`Harbor run-slot manifest repeats ${slot.run_slot}.`);
+    slotIds.add(slot.run_slot);
+    if (typeof slot.harbor_task_identity_sha256 === "string") {
+      if (executionIds.has(slot.harbor_task_identity_sha256)) {
+        reasons.push("Harbor run-slot manifest repeats a task execution identity.");
+      }
+      executionIds.add(slot.harbor_task_identity_sha256);
+    }
+    if (typeof slot.job_config_sha256 !== "string") continue;
+    const configured = slot.resolved_job_config_path;
+    const configPath = typeof configured === "string"
+      ? path.resolve(runDir, configured)
+      : null;
+    if (!configPath || !(configPath === path.resolve(runDir) || configPath.startsWith(`${path.resolve(runDir)}${path.sep}`))
+      || !existsSync(configPath)) {
+      reasons.push(`Harbor run slot ${slot.run_slot} has no readable frozen JobConfig.`);
+      continue;
+    }
+    const jobConfigBytes = await readFile(configPath);
+    const actualConfigSha256 = createHash("sha256").update(jobConfigBytes).digest("hex");
+    if (actualConfigSha256 !== slot.job_config_sha256) {
+      reasons.push(`Harbor run slot ${slot.run_slot} JobConfig digest does not match its manifest.`);
+      continue;
+    }
+    const jobConfig = await readJsonSafe(configPath);
+    if (slot.harbor_task_identity) {
+      if (!Array.isArray(jobConfig.tasks) || jobConfig.tasks.length !== 1) {
+        reasons.push(`Harbor run slot ${slot.run_slot} does not contain exactly one task.`);
+      } else {
+        const task = jobConfig.tasks[0];
+        if (!task || typeof task !== "object" || Array.isArray(task)) {
+          reasons.push(`Harbor run slot ${slot.run_slot} JobConfig task identity is invalid.`);
+          continue;
+        }
+        if (Object.hasOwn(task, "source") || Object.hasOwn(task, "provenance_source")) {
+          reasons.push(`Harbor run slot ${slot.run_slot} leaked provenance into JobConfig.`);
+        }
+        try {
+          if (harborTaskExecutionIdentitySha256(task) !== slot.harbor_task_identity_sha256) {
+            reasons.push(`Harbor run slot ${slot.run_slot} JobConfig task identity does not match its manifest.`);
+          }
+        } catch {
+          reasons.push(`Harbor run slot ${slot.run_slot} JobConfig task identity is invalid.`);
+        }
+      }
+    }
+    if (slot.harbor_task_identity && typeof slot.resolved_task_attestation_path !== "string") {
+      reasons.push(`Harbor run slot ${slot.run_slot} is missing its resolved-task attestation.`);
+    } else if (typeof slot.resolved_task_attestation_path === "string") {
+      const attestationPath = path.resolve(runDir, slot.resolved_task_attestation_path);
+      const attestation = await readJsonSafe(attestationPath);
+      if (attestation.schema_version === 2) {
+        if (attestation.job_config_sha256 !== slot.job_config_sha256
+          || attestation.task_selection_sha256 !== config.task_selection_sha256) {
+          reasons.push(`Harbor run slot ${slot.run_slot} V2 attestation does not match frozen controls.`);
+        }
+      } else if (attestation.schema_version !== 1) {
+        reasons.push(`Harbor run slot ${slot.run_slot} task attestation is missing or unsupported.`);
+      }
+    }
+  }
+  return reasons;
 }
 
 function expectedTrialCount(config, resolvedJobConfig) {
@@ -1600,6 +1678,19 @@ function withLayeredOutcomes(task, trialResult) {
   const reward = trialResult?.verifier_result?.rewards?.reward;
   const infrastructureEvidence = Array.isArray(trialResult?.verifier_infrastructure_evidence)
     ? trialResult.verifier_infrastructure_evidence : [];
+  if (task.failure_category === "structured_blocker") {
+    return withSuggestedOwner({
+      ...task,
+      status: "failed",
+      agent_outcome: "blocked",
+      agent_exception_audit: task.agent_exception ?? null,
+      agent_exception: null,
+      verifier_status: "not_run",
+      verifier_outcome: "not_run",
+      validity: "valid",
+      verifier_infrastructure_evidence: []
+    });
+  }
   if (infrastructureEvidence.length > 0) {
     return withSuggestedOwner({
       ...task,
@@ -1625,19 +1716,56 @@ function withLayeredOutcomes(task, trialResult) {
   });
 }
 
-function mergeHarborTrialResults(mirroredTasks, harborTrialResults) {
+function slotMatchesObservedTask(slot, trialResult) {
+  const expected = slot?.harbor_task_identity;
+  if (!expected || expected.kind !== "name") return true;
+  return expected.name === trialResult?.task_name;
+}
+
+function mergeHarborTrialResults(mirroredTasks, harborTrialResults, runSlots = []) {
   const unused = new Set(mirroredTasks.map((_task, index) => index));
+  const slots = new Map(runSlots
+    .filter((slot) => typeof slot?.run_slot === "string")
+    .map((slot) => [slot.run_slot, slot]));
+  const slotTrialCounts = new Map();
+  const mappingErrors = [];
   const tasks = harborTrialResults.map((trialResult, index) => {
-    const mirrorIndex = mirroredTasks.findIndex((task, candidateIndex) => (
-      unused.has(candidateIndex) && artifactMatchesTrial(task, trialResult)
+    const slot = slots.get(trialResult.run_slot);
+    if (slots.size > 0 && !slot) {
+      mappingErrors.push(`Harbor trial ${trialResult.trial_name} has unknown run slot ${trialResult.run_slot ?? "none"}.`);
+    }
+    if (slot) {
+      slotTrialCounts.set(slot.run_slot, (slotTrialCounts.get(slot.run_slot) ?? 0) + 1);
+      if (!slotMatchesObservedTask(slot, trialResult)) {
+        mappingErrors.push(
+          `Harbor trial ${trialResult.trial_name} task identity does not match run slot ${slot.run_slot}.`
+        );
+      }
+    }
+    const mirrorIndex = mirroredTasks.findIndex((task, candidateIndex) => unused.has(candidateIndex) && (
+      slot ? task.run_slot === slot.run_slot : artifactMatchesTrial(task, trialResult)
     ));
     const mirror = mirrorIndex >= 0 ? mirroredTasks[mirrorIndex] : emptyTaskForTrial(trialResult, index);
     if (mirrorIndex >= 0) unused.delete(mirrorIndex);
-    return withLayeredOutcomes(
+    const merged = withLayeredOutcomes(
       mergeHarborTrialResult({ ...mirror, index }, trialResult),
       trialResult
     );
+    return slot ? {
+      ...merged,
+      run_slot: slot.run_slot,
+      provenance_source: slot.provenance_source ?? null,
+      selection_identity: slot.selection_identity ?? null,
+      selection_identity_sha256: slot.selection_identity_sha256 ?? null,
+      harbor_task_identity: slot.harbor_task_identity ?? null,
+      observed_harbor_task_name: trialResult.task_name ?? null
+    } : merged;
   });
+  for (const slot of slots.values()) {
+    if (!slot.harbor_task_identity) continue;
+    const count = slotTrialCounts.get(slot.run_slot) ?? 0;
+    if (count !== 1) mappingErrors.push(`Harbor run slot ${slot.run_slot} contains ${count} trial results; expected 1.`);
+  }
   const orphanArtifacts = [...unused].map((index) => {
     const task = mirroredTasks[index];
     return {
@@ -1648,7 +1776,7 @@ function mergeHarborTrialResults(mirroredTasks, harborTrialResults) {
       last_error: task.last_error
     };
   });
-  return { tasks, orphanArtifacts };
+  return { tasks, orphanArtifacts, mappingErrors };
 }
 
 function mergeHarborTrialResult(task, trialResult) {
@@ -1660,11 +1788,18 @@ function mergeHarborTrialResult(task, trialResult) {
   const agentErrorMessage = typeof agentMetadata.error_message === "string" && agentMetadata.error_message
     ? agentMetadata.error_message
     : null;
-  const traceSummary = trialResult?.agent_trace_summary ?? {};
+  const traceSummary = {
+    ...(task.runtime_status ? { status: task.runtime_status } : {}),
+    ...(task.finish_reason ? { finish_reason: task.finish_reason } : {}),
+    ...(task.terminal_origin ? { terminal_origin: task.terminal_origin } : {}),
+    ...(task.termination_source ? { termination_source: task.termination_source } : {}),
+    ...(trialResult?.agent_trace_summary ?? {})
+  };
   const verifierFailedTests = Array.isArray(trialResult?.verifier_failed_tests) ? trialResult.verifier_failed_tests : [];
   const next = {
     ...task,
     task_id: trialResult?.task_name ?? task.task_id,
+    run_slot: trialResult?.run_slot ?? task.run_slot ?? null,
     trial_name: trialResult?.trial_name ?? null,
     harbor_result_path: trialResult?.result_path ?? null,
     reward: typeof reward === "number" ? reward : null,
@@ -1705,6 +1840,7 @@ function mergeHarborTrialResult(task, trialResult) {
     sigma_deadline_sec: task.sigma_deadline_sec ?? traceSummary.sigma_deadline_sec
       ?? agentMetadata.sigma_deadline_sec ?? null,
     last_error: agentErrorMessage ?? task.last_error ?? traceSummary.last_error ?? null,
+    failure_code: agentMetadata.failure_code ?? traceSummary.failure_code ?? task.failure_code ?? null,
     verifier_failed_tests: verifierFailedTests,
     verifier_log_path: trialResult?.verifier_log_path ?? null,
     failure_signals: Array.isArray(task.failure_signals) ? [...task.failure_signals] : [],
@@ -1861,10 +1997,13 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
 
   return {
     task_id: metadata.task_id ?? metadata.task_name ?? path.basename(taskDir),
+    run_slot: metadata.run_slot ?? metadata.task_id ?? path.basename(taskDir),
     source_logs_dir: typeof metadata.source_logs_dir === "string" ? metadata.source_logs_dir : null,
     artifact_dir: path.relative(runDir, taskDir).replace(/\\/g, "/"),
     index,
     status,
+    runtime_status: summary.status ?? null,
+    finish_reason: summary.finish_reason ?? summary.finishReason ?? null,
     agent_outcome: summary.status === "completed" ? "completed"
       : ["error", "failed", "cancelled"].includes(summary.status) ? "failed" : "unknown",
     failure_category: failureCategory,
@@ -1891,6 +2030,7 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     harbor_deadline_sec: summary.harbor_deadline_sec ?? metadata.harbor_deadline_sec ?? null,
     sigma_deadline_sec: summary.sigma_deadline_sec ?? metadata.sigma_deadline_sec ?? null,
     last_error: summary.last_error ?? metadata.error_message ?? null,
+    failure_code: summary.failure_code ?? metadata.failure_code ?? null,
     trial_name: null,
     harbor_result_path: null,
     reward: null,
@@ -2094,9 +2234,9 @@ export function formatMarkdownReport(report) {
     "",
     "## Counts",
     "",
-    "| passed | failed | infra_failed | timeout | api_error | needs_input | tool_error | verifier_failure | unknown |",
-    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.needs_input} | ${report.counts.tool_error} | ${report.counts.verifier_failure} | ${report.counts.unknown} |`,
+    "| passed | failed | infra_failed | structured_blocker | timeout | api_error | needs_input | tool_error | verifier_failure | unknown |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${report.counts.passed} | ${report.counts.failed} | ${report.counts.infra_failed} | ${report.counts.structured_blocker} | ${report.counts.timeout} | ${report.counts.api_error} | ${report.counts.needs_input} | ${report.counts.tool_error} | ${report.counts.verifier_failure} | ${report.counts.unknown} |`,
     "",
     "## Tasks",
     "",
@@ -2194,9 +2334,13 @@ export async function generateBenchReport(runDir) {
   if (config.exit_code === null || config.exit_code === undefined) {
     incompleteReason.push("config.json does not contain an exit_code.");
   }
+  if (config.frozen_runtime_integrity === "failed") {
+    incompleteReason.push("Frozen Harbor runtime changed or became unverifiable during the run.");
+  }
   if (missingLogFiles.length > 0) {
     incompleteReason.push(`missing expected log files: ${missingLogFiles.join(", ")}`);
   }
+  incompleteReason.push(...await runSlotIntegrityReasons(runDir, config));
   const globalLogText = [
     await readTextSafe(path.join(runDir, "harbor.stdout.log")),
     await readTextSafe(path.join(runDir, "harbor.stderr.log")),
@@ -2239,9 +2383,14 @@ export async function generateBenchReport(runDir) {
   let tasks = mirroredTasks;
   let orphanArtifacts = [];
   if (harborTrialResults.length > 0) {
-    const merged = mergeHarborTrialResults(mirroredTasks, harborTrialResults);
+    const merged = mergeHarborTrialResults(
+      mirroredTasks,
+      harborTrialResults,
+      Array.isArray(config.run_slots) ? config.run_slots : []
+    );
     tasks = merged.tasks;
     orphanArtifacts = merged.orphanArtifacts;
+    incompleteReason.push(...merged.mappingErrors);
   }
   tasks = tasks.map((task) => withSuggestedOwner({
     agent_outcome: task.agent_outcome ?? (task.status === "passed" ? "completed" : "unknown"),
@@ -2275,7 +2424,8 @@ export async function generateBenchReport(runDir) {
   }
 
   const failedCount = counts.failed + counts.infra_failed + counts.timeout + counts.api_error
-    + counts.needs_input + counts.tool_error + counts.verifier_failure + counts.unknown;
+    + counts.structured_blocker + counts.needs_input + counts.tool_error
+    + counts.verifier_failure + counts.unknown;
   const exitCode = Number(config.exit_code ?? 1);
   const scoreStatus = incompleteReason.length > 0
     ? "incomplete"
@@ -2331,6 +2481,8 @@ export async function generateBenchReport(runDir) {
     timeout_probe_tasks: Array.isArray(config.timeout_probe?.tasks) ? config.timeout_probe.tasks : [],
     resolved_job_config_path: config.resolved_job_config_path ?? null,
     tasks_file_sha256: config.tasks_file_sha256 ?? null,
+    task_selection_sha256: config.task_selection_sha256 ?? null,
+    run_slots: Array.isArray(config.run_slots) ? config.run_slots : [],
     agent_cli_sha256: config.agent_cli_sha256 ?? null,
     package_reused: config.package_reused ?? false,
     n_concurrent_trials: resolvedJobConfig?.n_concurrent_trials ?? config.n_concurrent_trials ?? null,
@@ -2407,6 +2559,8 @@ export function harborEnvForRun(runDir, env = process.env) {
     SIGMA_HARBOR_RUN_ID: safePathPart(path.basename(path.resolve(runDir))),
     PYTHONIOENCODING: env.PYTHONIOENCODING || "utf-8",
     PYTHONUTF8: env.PYTHONUTF8 || "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONPYCACHEPREFIX: path.join(path.resolve(runDir), "runtime-scratch", "pycache"),
     NO_COLOR: env.NO_COLOR || "1",
     FORCE_COLOR: "0",
     PY_COLORS: env.PY_COLORS || "0",
