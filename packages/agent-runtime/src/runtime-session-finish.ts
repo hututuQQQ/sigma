@@ -34,6 +34,16 @@ function failureFromHook(error: unknown): RunOutcome {
   };
 }
 
+function failureFromSettlement(error: unknown, fallbackCode: string): RunOutcome {
+  return {
+    kind: "recoverable_failure",
+    code: typeof (error as { code?: unknown })?.code === "string"
+      ? (error as { code: string }).code
+      : fallbackCode,
+    message: error instanceof Error ? error.message : String(error)
+  };
+}
+
 async function applyFinishHooks(
   hooks: RuntimeHookCoordinator,
   session: RuntimeSession,
@@ -106,6 +116,53 @@ async function cancelChildrenAfterFailure(
   await options.cancelChildren?.(session.identity.sessionId, `Parent run ended as ${outcome.kind}.`);
 }
 
+async function settleBeforeTerminalEvent(
+  options: RuntimeSessionFinishOptions,
+  session: RuntimeSession,
+  outcome: RunOutcome
+): Promise<RunOutcome> {
+  let settled = outcome;
+  try {
+    await options.beforeOutcome?.(session, settled);
+  } catch (error) {
+    settled = failureFromSettlement(error, "process_settlement_failed");
+  }
+  try {
+    await cancelChildrenAfterFailure(options, session, settled);
+  } catch (error) {
+    settled = failureFromSettlement(error, "child_settlement_failed");
+  }
+  return settled;
+}
+
+async function finishPostCommit(
+  options: RuntimeSessionFinishOptions,
+  session: RuntimeSession,
+  runId: string,
+  outcome: RunOutcome
+): Promise<void> {
+  // The appended terminal event is the durable source of truth. Record it
+  // before snapshot compaction or lease release so a failure in either
+  // maintenance operation cannot manufacture a second outcome. The waiter is
+  // resolved after those best-effort operations to preserve the lease handoff
+  // ordering required by immediate resume in another runtime.
+  session.recovery.lastOutcome = outcome;
+  try {
+    await options.events.writeSnapshot(session);
+  } catch {
+    // A snapshot is an optimization; recovery can replay the committed event.
+  }
+  if (session.interaction.followUps.length === 0) {
+    try {
+      await options.commandBus.release(session.identity.sessionId);
+    } catch {
+      // releaseSession retries lease cleanup. The committed terminal outcome
+      // must remain authoritative even if that best-effort release fails.
+    }
+  }
+  resolveOutcomeWaiters(session, runId, outcome);
+}
+
 export async function finishRuntimeSession(
   options: RuntimeSessionFinishOptions,
   session: RuntimeSession,
@@ -120,17 +177,13 @@ export async function finishRuntimeSession(
     code: "completion_coordinator_rejected",
     message: `Model stopped, but completion gates remain unsatisfied (assurance=${coordinator.assuranceSatisfied}, review=${coordinator.reviewSatisfied}).`
   } : outcome;
-  const finalOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
+  const hookedOutcome = await applyFinishHooks(options.hooks, session, coordinatedOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
-  await options.beforeOutcome?.(session, finalOutcome);
+  const finalOutcome = await settleBeforeTerminalEvent(options, session, hookedOutcome);
   if (outcomeRevision !== undefined && session.durable.state.phase !== "outcome_pending") return false;
   const commitRevision = outcomeRevision === undefined ? undefined : session.durable.state.revision;
   const event = await emitOutcome(options, session, finalOutcome, commitRevision, suspensionContext);
   if (!event || session.durable.state.lastSeq !== event.seq || !outcomeWasCommitted(session, finalOutcome)) return false;
-  await cancelChildrenAfterFailure(options, session, finalOutcome);
-  session.recovery.lastOutcome = finalOutcome;
-  await options.events.writeSnapshot(session);
-  if (session.interaction.followUps.length === 0) await options.commandBus.release(session.identity.sessionId);
-  resolveOutcomeWaiters(session, event.runId, finalOutcome);
+  await finishPostCommit(options, session, event.runId, finalOutcome);
   return true;
 }

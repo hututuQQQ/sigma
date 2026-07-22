@@ -165,7 +165,33 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
+            self.assertIn("workspace-auto", command)
+            self.assertIn("workspace-auto", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
+
+    async def test_verified_managed_environment_uses_noninteractive_auto_approval(self):
+        module = import_portable_agent_module()
+        with TemporaryDirectory() as tmp:
+            agent = module.SigmaCliHarborAgent(
+                logs_dir=Path(tmp) / "logs",
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
+            )
+            agent._workspace = "/app"
+
+            # Configuration alone is not authority. The strict managed doctor
+            # contract must have succeeded before Harbor can remove prompts.
+            self.assertEqual(agent._permission_mode(), "workspace-auto")
+            agent._managed_environment_verified = True
+
+            command = agent._agent_command()
+            session_command = agent._session_command("resume", "session-fixture")
+            permission_index = command.index("--permission-mode")
+            session_permission_index = session_command.index("--permission-mode")
+            self.assertEqual(command[permission_index + 1], "auto")
+            self.assertEqual(session_command[session_permission_index + 1], "auto")
 
     async def test_required_managed_setup_bootstraps_before_configured_doctor(self):
         module = import_portable_agent_module()
@@ -198,10 +224,13 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--managed-server --workspace /app --engine docker --network full", commands[4])
             self.assertIn("--execution-mode container", commands[6])
             self.assertIn("--managed-environment-mode required", commands[6])
+            self.assertTrue(agent._managed_environment_verified)
+            self.assertEqual(agent._permission_mode(), "auto")
             self.assertNotIn("harbor-topology", commands[6])
             record = json.loads((Path(tmp) / "logs" / "setup-check.json").read_text(encoding="utf-8"))
             self.assertEqual(record["managed_environment_mode"], "required")
             self.assertEqual(record["harbor_topology"], "managed_three_role")
+            self.assertEqual(record["permission_mode_effective"], "auto")
             self.assertEqual(
                 [check["stage"] for check in record["checks"]],
                 ["managed_broker_bootstrap", "help", "strict_doctor"],

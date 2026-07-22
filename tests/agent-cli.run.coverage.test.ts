@@ -284,6 +284,35 @@ describe("run command branch coverage", () => {
     expect(stderr.text()).not.toContain("Allow exec");
   });
 
+  it("emits one coherent NeedsInput terminal for a headless workspace-auto sensitive call", async () => {
+    const root = await workspace("sigma-run-network-workspace-auto-");
+    const stdout = new Capture();
+    const stderr = new Capture();
+    const stdin = Object.assign(new PassThrough(), { isTTY: false });
+    const code = await runCommand([
+      "run a network-enabled process",
+      "--workspace", root,
+      "--network", "full",
+      "--permission-mode", "workspace-auto",
+      "--output-format", "stream-json"
+    ], { stdin, stdout, stderr, mode: "analyze", ...runDeps([
+      networkExecutionRequest()
+    ]) });
+
+    expect(code).toBe(2);
+    const records = stdout.text().trim().split(/\r?\n/).map((line) => JSON.parse(line) as {
+      type: string;
+      status?: string;
+      payload?: { kind?: string; approvalMode?: string };
+    });
+    expect(records.filter((record) => record.type === "run.suspended")).toHaveLength(1);
+    expect(records.some((record) => record.type === "run.failed")).toBe(false);
+    expect(records.find((record) => record.type === "tool.approval_requested")?.payload)
+      .toMatchObject({ approvalMode: "human" });
+    expect(records.at(-1)).toMatchObject({ type: "result", status: "needs_input" });
+    expect(stderr.text()).toBe("");
+  });
+
   it.each([true, false])("reads instructions from stdin (explicit=%s)", async (explicit) => {
     const root = await workspace("sigma-run-stdin-");
     const stdin = Object.assign(new PassThrough(), { isTTY: false });

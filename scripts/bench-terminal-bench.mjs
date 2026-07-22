@@ -68,7 +68,7 @@ export function boundedBenchmarkRunId(baseRunId, runLabel) {
 
 export function portableHarborJobsDir(runDir, platform = process.platform, tempDir = os.tmpdir()) {
   if (platform !== "win32") return path.join(runDir, "harbor-jobs");
-  return path.join(tempDir, "sigma-harbor", randomBytes(12).toString("hex"));
+  return path.win32.join(tempDir, "sigma-harbor", randomBytes(12).toString("hex"));
 }
 
 export async function runWithConcurrency(items, limit, worker) {

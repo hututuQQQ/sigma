@@ -661,6 +661,7 @@ class SigmaCliHarborAgent(BaseAgent):
         self._process_cleanup: dict[str, Any] | None = None
         self._managed_broker_bootstrap: dict[str, Any] | None = None
         self._managed_broker_cleanup: dict[str, Any] | None = None
+        self._managed_environment_verified = False
         self.checkpoint_recovery = recovery_policy
         self.reviewer_waiver_reason = (
             str(reviewer_waiver_reason).strip() if reviewer_waiver_reason else None
@@ -675,6 +676,7 @@ class SigmaCliHarborAgent(BaseAgent):
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        self._managed_environment_verified = False
         try:
             await self._setup_agent(environment)
         except Exception as exc:
@@ -932,6 +934,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["execution_mode"] = self.execution_mode
         summary["managed_environment_mode"] = self.managed_environment_mode
         summary["harbor_topology"] = self.harbor_topology
+        summary["permission_mode_effective"] = self._permission_mode()
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
@@ -962,6 +965,14 @@ class SigmaCliHarborAgent(BaseAgent):
         if failure_kind in {"agent_failure", "checkpoint_recovery_required", *FAILURE_KINDS}:
             raise RuntimeError(f"{failure_kind}: {error_message or 'agent exited unsuccessfully.'}")
 
+    def _permission_mode(self) -> str:
+        # A required managed environment is disposable, isolated, and
+        # launcher-attested before the first model turn. Once its strict
+        # doctor contract has passed, asking a non-interactive Harbor process
+        # for human approval cannot add authority; it can only deadlock the
+        # run. Other topologies retain the narrower workspace-auto policy.
+        return "auto" if self._managed_environment_verified else "workspace-auto"
+
     def _agent_command(self, context: AgentContext | None = None) -> list[str]:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
@@ -987,7 +998,7 @@ class SigmaCliHarborAgent(BaseAgent):
             "--process-handoff",
             "allow",
             "--permission-mode",
-            "workspace-auto",
+            self._permission_mode(),
             "--execution-mode",
             self.execution_mode,
             "--managed-environment-mode",
@@ -1411,7 +1422,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "--agent-profile",
             self.agent_profile,
             "--permission-mode",
-            "workspace-auto",
+            self._permission_mode(),
             "--execution-mode",
             self.execution_mode,
             "--managed-environment-mode",
@@ -1894,6 +1905,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             )
         self.effective_network_mode = self.network_mode
         self.process_handoff_available = capabilities["processHandoff"]
+        self._managed_environment_verified = self.managed_environment_mode == "required"
         self._write_setup_checks(checks, "passed")
 
     def _setup_check_record(self, stage: str, result: Any) -> dict[str, Any]:
@@ -1964,6 +1976,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "execution_mode": self.execution_mode,
             "managed_environment_mode": self.managed_environment_mode,
             "harbor_topology": self.harbor_topology,
+            "permission_mode_effective": self._permission_mode(),
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
