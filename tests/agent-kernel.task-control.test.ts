@@ -9,17 +9,29 @@ import {
   type ToolReceipt
 } from "../packages/agent-protocol/src/index.js";
 import {
+  advanceReviewRepair,
   assertKernelInvariants,
+  beginGoalEpoch,
   completionEvidenceObligation,
   completeActionBatch,
   createKernelState,
   createTaskControlState,
   evolve,
+  hasPublishedTaskControlLegacyFields,
   isKernelState,
+  isTaskControlStateV1,
+  openTaskObligation,
+  protectCompletionCandidate,
   recordSemanticFact,
   recordSemanticToolResult,
   recordToolPolicyViolation,
+  resolveTaskObligation,
+  reviewRepairObligation,
   startActionBatch,
+  taskControlAnswer,
+  taskControlFailureMessage,
+  terminalResolutionObligation,
+  userDecisionObligation,
   type KernelState,
   type TaskControlStateV1
 } from "../packages/agent-kernel/src/index.js";
@@ -74,7 +86,7 @@ function review(
   state: KernelState,
   id: string,
   verdict: "approved" | "changes_requested",
-  options: { failureKind?: "protocol"; basis?: string } = {}
+  options: { failureKind?: "protocol"; basis?: string; omitBasis?: boolean; findings?: JsonValue[] } = {}
 ): KernelState {
   const evidence: EvidenceRecord = {
     evidenceId: id,
@@ -88,14 +100,14 @@ function review(
     data: {
       reviewerId: "reviewer",
       verdict,
-      findings: options.failureKind ? [] : verdict === "approved" ? [] : [{
+      findings: options.findings ?? (options.failureKind ? [] : verdict === "approved" ? [] : [{
         actionable: true,
         severity: "error",
         summary: "Repair the current frontier."
-      }],
+      }]),
       frontierRevision: state.mutationFrontier.revision,
       stateDigest: state.mutationFrontier.currentStateDigest,
-      reviewBasisDigest: options.basis ?? DIGEST_A,
+      ...(options.omitBasis ? {} : { reviewBasisDigest: options.basis ?? DIGEST_A }),
       validationEvidenceIds: [],
       ...(options.failureKind
         ? { failureKind: options.failureKind, failureCode: "review_protocol_invalid" }
@@ -289,5 +301,118 @@ describe("TaskControlStateV1", () => {
     expect(isKernelState(state)).toBe(true);
     expect(isKernelState({ ...state, completionRepairAttempts: 0 })).toBe(false);
     expect(isKernelState({ ...state, semanticFailureCluster: { attempts: 1 } })).toBe(false);
+  });
+
+  it("validates every obligation family and rejects malformed durable control state", () => {
+    const base = createTaskControlState(3, 2);
+    const header = { basisDigest: DIGEST_A, openedRevision: 3, attempts: 0 };
+    const obligations = [
+      { ...header, kind: "completion_evidence", stage: "acquire", evidenceCount: 0 },
+      { ...header, kind: "completion_evidence", stage: "terminal", evidenceCount: 1, failureCode: "blocked" },
+      { ...header, kind: "review_repair", stage: "mutate", scopePaths: ["src/index.ts"] },
+      { ...header, kind: "capability_recovery", stage: "prepare", opportunityId: "opportunity" },
+      { ...header, kind: "repository_recovery", stage: "select" },
+      { ...header, kind: "restoration", stage: "confirm" },
+      { ...header, kind: "process_settlement", stage: "settle", processIds: ["process"] },
+      { ...header, kind: "user_decision", stage: "request", decisionCode: "choose" },
+      { ...header, kind: "terminal_resolution", stage: "report", failureCode: "blocked" }
+    ];
+    for (const obligation of obligations) {
+      expect(isTaskControlStateV1({ ...base, obligation })).toBe(true);
+    }
+
+    expect(isTaskControlStateV1(null)).toBe(false);
+    expect(isTaskControlStateV1({ ...base, obligation: [] })).toBe(false);
+    expect(isTaskControlStateV1({ ...base, obligation: { ...header, kind: "unknown", stage: "none" } })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...base,
+      obligation: { ...header, kind: "completion_evidence", stage: "acquire", evidenceCount: 0, failureCode: "" }
+    })).toBe(false);
+    expect(isTaskControlStateV1({ ...base, semanticFacts: { entries: [{ kind: "content" }] } })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...base,
+      semanticFacts: { entries: [
+        { kind: "content", digest: DIGEST_A, revision: 1 },
+        { kind: "content", digest: DIGEST_A, revision: 2 }
+      ] }
+    })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...base,
+      policyCorrection: { basisDigest: DIGEST_A, attempts: -1, failureCode: "blocked" }
+    })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...base,
+      policyCorrection: { basisDigest: DIGEST_A, attempts: 1, failureCode: 1 }
+    })).toBe(false);
+    expect(isTaskControlStateV1({
+      ...base,
+      completionCandidate: { answer: " ", digest: DIGEST_A }
+    })).toBe(false);
+  });
+
+  it("covers task-control helper boundaries without creating a second authority", () => {
+    const base = createTaskControlState(1, 2);
+    expect(protectCompletionCandidate(base, "   ")).toBe(base);
+    expect(taskControlAnswer(base)).toBeNull();
+    const protectedControl = protectCompletionCandidate(base, " final answer ");
+    expect(taskControlAnswer(protectedControl)).toBe("final answer");
+    const nextEpoch = beginGoalEpoch(protectedControl, 4, "steer");
+    expect(nextEpoch).toMatchObject({
+      goalEpoch: 3,
+      goalEpochSource: "steer"
+    });
+    expect(taskControlAnswer(nextEpoch)).toBeNull();
+
+    const reviewControl = reviewRepairObligation(base, 2, DIGEST_A, ["b.ts", "a.ts", "b.ts"]);
+    expect(reviewControl.obligation).toMatchObject({ scopePaths: ["a.ts", "b.ts"] });
+    expect(advanceReviewRepair(base, "validate", 3)).toBe(base);
+    expect(advanceReviewRepair(reviewControl, "validate", 3)).toMatchObject({
+      obligation: { kind: "review_repair", stage: "validate", attempts: 1 }
+    });
+
+    const decision = userDecisionObligation(base, 2, "select_candidate");
+    expect(decision.phase).toBe("terminal");
+    expect(resolveTaskObligation(decision)).toMatchObject({ phase: "normal", obligation: undefined });
+    expect(terminalResolutionObligation(base, 2, "validation_failed")).toMatchObject({
+      phase: "terminal",
+      obligation: { failureCode: "validation_failed" }
+    });
+    expect(openTaskObligation(base, {
+      kind: "restoration",
+      stage: "restore",
+      basisDigest: DIGEST_A,
+      openedRevision: 2,
+      attempts: 0
+    }).phase).toBe("repair_only");
+
+    expect(completeActionBatch(base, 2)).toBe(base);
+    const started = startActionBatch(reviewControl);
+    const withFact = recordSemanticFact(started, "review", { verdict: "approved" }, 3).control;
+    expect(completeActionBatch(withFact, 4)).toMatchObject({
+      phase: "repair_only",
+      episode: { noProgressBatches: 0, factCountAtBatchStart: undefined }
+    });
+    const alreadyTerminal = terminalResolutionObligation(base, 1, "validation_failed");
+    let exhausted = alreadyTerminal;
+    for (let revision = 2; revision <= 8; revision += 1) exhausted = noProgress(exhausted, revision);
+    expect(exhausted.obligation).toMatchObject({ failureCode: "validation_failed" });
+
+    expect(taskControlFailureMessage(base, "detail")).toBe("detail");
+    expect(taskControlFailureMessage(protectedControl, "detail")).toContain("final answer");
+    expect(taskControlFailureMessage(protectedControl, "final answer already included")).toBe(
+      "final answer already included"
+    );
+    expect(hasPublishedTaskControlLegacyFields([])).toBe(false);
+    expect(hasPublishedTaskControlLegacyFields({ continuationAttempts: 1 })).toBe(true);
+
+    const fallbackBasis = review(initial(), "fallback-basis", "changes_requested", { omitBasis: true });
+    expect(fallbackBasis.taskControl.obligation).toMatchObject({
+      kind: "review_repair",
+      basisDigest: fallbackBasis.mutationFrontier.currentStateDigest
+    });
+    const advisoryOnly = review(initial(), "advisory", "changes_requested", {
+      findings: [{ actionable: false, severity: "warning", summary: "Optional." }]
+    });
+    expect(advisoryOnly.taskControl.obligation).toBeUndefined();
   });
 });
