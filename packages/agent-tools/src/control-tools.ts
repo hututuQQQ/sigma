@@ -125,11 +125,12 @@ function requestReviewTool(): RegisteredEffectTool {
       const startedAt = new Date().toISOString();
       const result = await requiredControl(context).requestReview();
       const base = receipt(request, startedAt, result, ["runtime.control"]);
-      return result.status === "validation_required" || result.status === "changes_required" ? {
+      return result.status === "validation_required" || result.status === "changes_required"
+        || result.status === "review_unavailable" ? {
         ...base,
         ok: false,
-        diagnostics: [result.status === "validation_required"
-          ? "review_validation_required" : "review_changes_required"]
+        diagnostics: [result.status === "validation_required" ? "review_validation_required"
+          : result.status === "changes_required" ? "review_changes_required" : "review_unavailable"]
       } : base;
     }
   };
@@ -143,7 +144,7 @@ function restoreRunChangesTool(): RegisteredEffectTool {
     descriptor: {
       ...descriptor(
         "restore_run_changes",
-        "Restore the latest sealed mutation checkpoint created by this run. The runtime freezes the target, checks LIFO safety, and does not create a nested checkpoint.",
+        "Atomically restore every sealed mutation checkpoint created by this run. The runtime verifies the complete LIFO postimage chain and does not create a nested checkpoint.",
         {},
         [],
         effects
@@ -151,18 +152,22 @@ function restoreRunChangesTool(): RegisteredEffectTool {
       availableModes: ["change"],
       prepare: async (_argumentsValue, context): Promise<ToolCallPlan> => {
         const checkpoints = await requiredControl(context).listCheckpoints();
-        const latest = [...checkpoints].reverse().find((item) => item.status !== "restored");
+        const unresolved = checkpoints.filter((item) => item.status !== "restored");
+        const latest = unresolved.at(-1);
         if (!latest) throw controlError("The current session has no checkpoint to restore.", "checkpoint_missing");
         if (latest.status !== "sealed") {
           throw controlError("Resolve the open checkpoint before restoring run changes.", "checkpoint_recovery_required");
         }
-        if (latest.runId !== context.runId) {
-          throw controlError("The latest checkpoint was not created by the current run.", "checkpoint_run_mismatch");
+        const first = unresolved.findIndex((item) => item.runId === context.runId);
+        if (first < 0 || unresolved.slice(first).some((item) => item.runId !== context.runId)) {
+          throw controlError("The current run is not the latest restorable checkpoint group.", "checkpoint_run_mismatch");
         }
-        const delta = latest.delta;
-        const paths = delta
-          ? [...new Set([...delta.added, ...delta.modified, ...delta.deleted])]
-          : [];
+        const targets = unresolved.slice(first);
+        if (targets.some((item) => item.status !== "sealed" || !item.delta)) {
+          throw controlError("All current-run checkpoints must be sealed before restoration.", "checkpoint_not_sealed");
+        }
+        const paths = [...new Set(targets.flatMap((item) => item.delta
+          ? [...item.delta.added, ...item.delta.modified, ...item.delta.deleted] : []))].sort();
         if (paths.length === 0) {
           throw controlError("The latest checkpoint contains no workspace changes.", "checkpoint_delta_empty");
         }
@@ -184,21 +189,62 @@ function restoreRunChangesTool(): RegisteredEffectTool {
       if (!action || action.kind !== "restore") {
         throw controlError("A frozen checkpoint restore plan is required.", "checkpoint_action_invalid");
       }
-      const restored = await requiredControl(context).restoreRunCheckpoint(action.checkpointId);
-      if (!restored.delta) {
-        throw controlError("The restored checkpoint has no workspace delta.", "checkpoint_delta_empty");
-      }
+      const restoration = await requiredControl(context).restoreRunChanges(request.callId);
+      const restored = (await requiredControl(context).listCheckpoints())
+        .filter((item) => restoration.restoredCheckpointIds.includes(item.checkpointId));
+      const delta = inverseRunDelta(restored);
       return {
         ...receipt(request, startedAt, {
-          checkpointId: restored.checkpointId,
-          status: restored.status
+          checkpointIds: restoration.restoredCheckpointIds,
+          status: "restored",
+          restoration
         }, effects),
-        workspaceDelta: {
-          added: [...restored.delta.deleted],
-          modified: [...restored.delta.modified],
-          deleted: [...restored.delta.added]
-        }
+        workspaceDelta: delta
       };
+    }
+  };
+}
+
+function inverseRunDelta(checkpoints: readonly import("agent-protocol").CheckpointRef[]): {
+  added: string[]; modified: string[]; deleted: string[];
+} {
+  const states = new Map<string, "added" | "modified" | "deleted">();
+  for (const checkpoint of checkpoints) {
+    if (!checkpoint.delta) continue;
+    for (const path of checkpoint.delta.added) {
+      const before = states.get(path);
+      states.set(path, before === "deleted" || before === "modified" ? "modified" : "added");
+    }
+    for (const path of checkpoint.delta.modified) if (states.get(path) !== "added") states.set(path, "modified");
+    for (const path of checkpoint.delta.deleted) {
+      if (states.get(path) === "added") states.delete(path);
+      else states.set(path, "deleted");
+    }
+  }
+  return {
+    added: [...states].filter(([, state]) => state === "deleted").map(([path]) => path).sort(),
+    modified: [...states].filter(([, state]) => state === "modified").map(([path]) => path).sort(),
+    deleted: [...states].filter(([, state]) => state === "added").map(([path]) => path).sort()
+  };
+}
+
+function confirmRunRestoredTool(): RegisteredEffectTool {
+  const effects: ToolDescriptor["possibleEffects"] = ["runtime.control", "filesystem.read"];
+  return {
+    descriptor: {
+      ...descriptor(
+        "confirm_run_restored",
+        "Confirm that a user-steered run is quiescent and its workspace exactly matches the recorded pre-run baseline. This does not mutate the workspace.",
+        {},
+        [],
+        effects
+      ),
+      availableModes: ["change"]
+    },
+    async execute(request, context) {
+      const startedAt = new Date().toISOString();
+      const restoration = await requiredControl(context).confirmRunRestored(request.callId);
+      return receipt(request, startedAt, restoration, effects);
     }
   };
 }
@@ -223,7 +269,7 @@ function loadSkillTool(): RegisteredEffectTool {
 export function registerControlTools(registry: EffectToolRegistry): EffectToolRegistry {
   for (const tool of [
     readPlanTool(), updatePlanTool(), budgetTool(), checkpointTool(), requestReviewTool(),
-    restoreRunChangesTool(), loadSkillTool()
+    restoreRunChangesTool(), confirmRunRestoredTool(), loadSkillTool()
   ]) {
     registry.register(tool);
   }

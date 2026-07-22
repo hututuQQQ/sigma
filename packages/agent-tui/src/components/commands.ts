@@ -8,7 +8,7 @@ export interface TuiCommandDefinition {
 
 export const tuiCommands: readonly TuiCommandDefinition[] = [
   { action: "new", name: "/new", usage: "/new", description: "Start a new session" },
-  { action: "mode", name: "/mode", usage: "/mode analyze|change", description: "Change mode for the next run", acceptsArguments: true },
+  { action: "mode", name: "/mode", usage: "/mode analyze|change", description: "Start an idle session in another mode", acceptsArguments: true },
   { action: "followup", name: "/followup", usage: "/followup <message>", description: "Queue work after the active answer", acceptsArguments: true },
   { action: "activity", name: "/activity", usage: "/activity", description: "Collapse or expand activity" },
   { action: "help", name: "/help", usage: "/help", description: "Show commands and shortcuts" },

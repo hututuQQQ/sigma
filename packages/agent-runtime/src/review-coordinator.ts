@@ -37,7 +37,9 @@ function profileReviewMode(session: RuntimeSession): "off" | "advisory" | "requi
 function normalizeReview(session: RuntimeSession, raw: ReviewEvidence, basisDigest: string): ReviewEvidence {
   const frontier = session.durable.state.mutationFrontier;
   const findings = [...raw.data.findings];
-  const verdict = findings.some(isActionableErrorFinding) ? "changes_requested" : "approved";
+  const protocolOrInfrastructureFailure = raw.data.failureKind !== undefined;
+  const verdict = protocolOrInfrastructureFailure || findings.some(isActionableErrorFinding)
+    ? "changes_requested" : "approved";
   return {
     evidenceId: randomUUID(),
     sessionId: session.identity.sessionId,
@@ -46,7 +48,8 @@ function normalizeReview(session: RuntimeSession, raw: ReviewEvidence, basisDige
     status: verdict === "approved" ? "passed" : "failed",
     createdAt: new Date().toISOString(),
     producer: { authority: "runtime", id: raw.data.reviewerId },
-    summary: verdict === "approved" ? raw.summary : "Independent reviewer requested changes.",
+    summary: protocolOrInfrastructureFailure ? raw.summary
+      : verdict === "approved" ? raw.summary : "Independent reviewer requested changes.",
     data: {
       reviewerId: raw.data.reviewerId,
       verdict,
@@ -105,7 +108,12 @@ export function reviewReadiness(session: RuntimeSession): ReviewReadiness {
   };
 }
 
-function requestIdentity(session: RuntimeSession, reviewerId: string, attempt: number): string {
+function requestIdentity(
+  session: RuntimeSession,
+  reviewerId: string,
+  basisDigest: string,
+  attempt: number
+): string {
   const frontier = session.durable.state.mutationFrontier;
   return `review:${createHash("sha256").update(JSON.stringify({
     sessionId: session.identity.sessionId,
@@ -113,7 +121,7 @@ function requestIdentity(session: RuntimeSession, reviewerId: string, attempt: n
     reviewerId,
     revision: frontier.revision,
     stateDigest: frontier.currentStateDigest,
-    reviewBasisDigest: reviewBasisDigest(session),
+    reviewBasisDigest: basisDigest,
     attempt
   })).digest("hex")}`;
 }
@@ -125,6 +133,68 @@ function stableUsage(usage: UsageRecord, requestId: string): UsageRecord {
 function activeReservation(session: RuntimeSession, ownerId: string): BudgetReservation | undefined {
   return [...session.durable.state.budget.reservations].reverse().find((item) =>
     item.ownerId === ownerId && item.status !== "released");
+}
+
+interface ReviewAttempt {
+  eligible: WorkspaceDeltaEvidence[];
+  relevantValidations: ValidationEvidence[];
+  basisDigest: string;
+  basisAttempts: number;
+  candidate?: { answer: string; digest: string };
+}
+
+function reviewAttemptAllowed(
+  existing: ReviewEvidence | undefined,
+  explicitlyRequested: boolean,
+  attemptCount: number
+): boolean {
+  if (existing?.status === "passed") return false;
+  if (existing?.status === "failed" && !existing.data.failureKind) return false;
+  if (existing?.data.failureKind !== "protocol" && existing && !explicitlyRequested) return false;
+  const attemptLimit = existing?.data.failureKind === "protocol" ? 2 : 3;
+  return attemptCount < attemptLimit;
+}
+
+function eligibleReviewAttempt(
+  session: RuntimeSession,
+  explicitlyRequested: boolean,
+  reviewMode: ReviewerInput["reviewMode"]
+): ReviewAttempt | null {
+  const { eligible, relevantValidations } = reviewReadiness(session);
+  if (eligible.length === 0) return null;
+  const candidate = reviewMode === "completion" ? session.durable.state.taskControl.completionCandidate : undefined;
+  const basisDigest = reviewBasisDigest(session, relevantValidations, candidate?.digest);
+  const reviews = session.durable.state.evidence.filter((item): item is ReviewEvidence => item.kind === "review"
+    && item.sessionId === session.identity.sessionId && item.runId === session.durable.runId
+    && item.data.reviewBasisDigest === basisDigest);
+  const existing = reviews.at(-1);
+  if (!reviewAttemptAllowed(existing, explicitlyRequested, reviews.length)) return null;
+  return { eligible, relevantValidations, basisDigest, basisAttempts: reviews.length, ...(candidate ? { candidate } : {}) };
+}
+
+function reviewerInput(
+  session: RuntimeSession,
+  reviewMode: ReviewerInput["reviewMode"],
+  attempt: ReviewAttempt
+): ReviewerInput {
+  const frontier = session.durable.state.mutationFrontier;
+  return {
+    sessionId: session.identity.sessionId,
+    runId: session.durable.runId,
+    goal: session.durable.state.plan.goal,
+    frontierRevision: frontier.revision,
+    stateDigest: frontier.currentStateDigest,
+    reviewBasisDigest: attempt.basisDigest,
+    reviewMode,
+    ...(attempt.candidate ? {
+      completionCandidate: attempt.candidate.answer,
+      completionCandidateDigest: attempt.candidate.digest
+    } : {}),
+    workspaceDeltas: attempt.eligible,
+    validations: attempt.relevantValidations,
+    inputAccesses: session.durable.state.evidence.filter((item): item is InputAccessEvidence =>
+      item.kind === "input_access" && item.runId === session.durable.runId)
+  };
 }
 
 export class ReviewCoordinator {
@@ -139,81 +209,90 @@ export class ReviewCoordinator {
     this.reviewerForSession = typeof reviewer === "function" ? reviewer : () => reviewer;
   }
 
-  async maybeReview(session: RuntimeSession, signal: AbortSignal, explicitlyRequested = false): Promise<void> {
+  async maybeReview(
+    session: RuntimeSession,
+    signal: AbortSignal,
+    explicitlyRequested = false,
+    reviewMode: ReviewerInput["reviewMode"] = "workspace"
+  ): Promise<void> {
     if (profileReviewMode(session) === "off") return;
     if (deadlineForecast(session).stage === "stop") return;
     const existing = this.active.get(session.identity.sessionId);
     if (existing) return await existing;
-    const task = this.reviewEligibleChange(session, signal, explicitlyRequested);
+    const task = this.reviewEligibleChange(session, signal, explicitlyRequested, reviewMode);
     this.active.set(session.identity.sessionId, task);
     try { await task; } finally {
       if (this.active.get(session.identity.sessionId) === task) this.active.delete(session.identity.sessionId);
     }
   }
 
-  private async reviewEligibleChange(session: RuntimeSession, signal: AbortSignal, explicitlyRequested: boolean): Promise<void> {
-    const { eligible, relevantValidations, retryableReview } = reviewReadiness(session);
-    if (eligible.length === 0) return;
-    const existing = currentFrontierReview(session);
-    let basisAttempts = 0;
-    if (existing) {
-      if (!(explicitlyRequested && retryableReview)) return;
-      basisAttempts = session.durable.state.evidence.filter((item) => item.kind === "review"
-        && item.sessionId === session.identity.sessionId
-        && item.runId === session.durable.runId
-        && item.data.reviewBasisDigest === existing.data.reviewBasisDigest).length;
-      if (basisAttempts >= 3) return;
-    }
+  private async reviewEligibleChange(
+    session: RuntimeSession,
+    signal: AbortSignal,
+    explicitlyRequested: boolean,
+    reviewMode: ReviewerInput["reviewMode"]
+  ): Promise<void> {
+    const attempt = eligibleReviewAttempt(session, explicitlyRequested, reviewMode);
+    if (!attempt) return;
     const reviewer = this.reviewerForSession(session);
     const reviewerId = reviewer.reviewerId ?? "builtin-reviewer";
-    const frontier = session.durable.state.mutationFrontier;
-    const basisDigest = reviewBasisDigest(session, relevantValidations);
-    const input: ReviewerInput = {
-      sessionId: session.identity.sessionId,
-      runId: session.durable.runId,
-      goal: session.durable.state.plan.goal,
-      frontierRevision: frontier.revision,
-      stateDigest: frontier.currentStateDigest,
-      reviewBasisDigest: basisDigest,
-      workspaceDeltas: eligible,
-      validations: relevantValidations,
-      inputAccesses: session.durable.state.evidence.filter((item): item is InputAccessEvidence =>
-        item.kind === "input_access" && item.runId === session.durable.runId)
-    };
-    const requestId = requestIdentity(session, reviewerId, basisAttempts + 1);
-    if (this.budgets && isAccountableReviewer(reviewer)) {
-      const prior = activeReservation(session, `reviewer:${requestId}`);
-      if (prior) {
-        await this.recoverInterruptedReview(session, reviewer, reviewerId, input, requestId, prior);
-        return;
-      }
-    }
+    const input = reviewerInput(session, reviewMode, attempt);
+    const requestId = requestIdentity(session, reviewerId, attempt.basisDigest, attempt.basisAttempts + 1);
+    if (await this.recoverActiveReview(session, reviewer, reviewerId, input, requestId)) return;
     const inputProblem = reviewInputFailure(input);
     if (inputProblem) {
       await this.emit(session, "review.completed", "runtime", normalizeReview(
-        session, reviewInputFailureEvidence(input, reviewerId, inputProblem), basisDigest
+        session, reviewInputFailureEvidence(input, reviewerId, inputProblem), attempt.basisDigest
       ));
       return;
     }
-    if (this.budgets && isAccountableReviewer(reviewer)) {
-      await this.reviewAccounted(session, reviewer, reviewerId, input, requestId, signal);
-      return;
+    const normalized = this.budgets && isAccountableReviewer(reviewer)
+      ? await this.reviewAccounted(session, reviewer, reviewerId, input, requestId, signal)
+      : await this.reviewUnaccounted(session, reviewer, reviewerId, input, requestId, signal);
+    if (normalized.data.failureKind === "protocol" && attempt.basisAttempts + 1 < 2) {
+      await this.reviewEligibleChange(session, signal, true, reviewMode);
     }
+  }
+
+  private async recoverActiveReview(
+    session: RuntimeSession,
+    reviewer: ReviewerPort,
+    reviewerId: string,
+    input: ReviewerInput,
+    requestId: string
+  ): Promise<boolean> {
+    if (!this.budgets || !isAccountableReviewer(reviewer)) return false;
+    const prior = activeReservation(session, `reviewer:${requestId}`);
+    if (!prior) return false;
+    await this.recoverInterruptedReview(session, reviewer, reviewerId, input, requestId, prior);
+    return true;
+  }
+
+  private async reviewUnaccounted(
+    session: RuntimeSession,
+    reviewer: ReviewerPort,
+    reviewerId: string,
+    input: ReviewerInput,
+    requestId: string,
+    signal: AbortSignal
+  ): Promise<ReviewEvidence> {
     await this.emit(session, "review.started", "runtime", {
       reviewerId, requestId,
-      workspaceDeltaEvidenceIds: eligible.map((item) => item.evidenceId),
-      validationEvidenceIds: relevantValidations.map((item) => item.evidenceId)
+      workspaceDeltaEvidenceIds: input.workspaceDeltas.map((item) => item.evidenceId),
+      validationEvidenceIds: input.validations.map((item) => item.evidenceId)
     });
     let raw: ReviewEvidence;
     try { raw = await reviewer.review(input, signal); } catch (error) {
       raw = failedReview(input, reviewerId,
         `Independent reviewer failed: ${error instanceof Error ? error.message : String(error)}`, "infrastructure");
     }
-    await this.emit(session, "review.completed", "runtime", normalizeReview(session, raw, basisDigest));
+    const normalized = normalizeReview(session, raw, input.reviewBasisDigest);
+    await this.emit(session, "review.completed", "runtime", normalized);
+    return normalized;
   }
 
   private async reviewAccounted(session: RuntimeSession, reviewer: AccountableReviewerPort,
-    reviewerId: string, input: ReviewerInput, requestId: string, signal: AbortSignal): Promise<void> {
+    reviewerId: string, input: ReviewerInput, requestId: string, signal: AbortSignal): Promise<ReviewEvidence> {
     const remaining = Math.max(0, session.durable.state.budget.limits.costMicroUsd
       - session.durable.state.budget.consumed.costMicroUsd
       - session.durable.state.budget.reserved.costMicroUsd);
@@ -233,17 +312,20 @@ export class ReviewCoordinator {
       const usage = stableUsage(reviewer.failedUsage(input, requestId, prepared, performance.now() - startedAt, error), requestId);
       await this.budgets!.commit(session, reservationId, consumedBudget(usage, prepared.budget));
       await this.emit(session, "usage.recorded", "runtime", usage);
-      await this.emit(session, "review.completed", "runtime", normalizeReview(session, failedReview(
+      const normalized = normalizeReview(session, failedReview(
         input, reviewerId, `Independent reviewer failed: ${error instanceof Error ? error.message : String(error)}`, "infrastructure"
-      ), input.reviewBasisDigest));
-      return;
+      ), input.reviewBasisDigest);
+      await this.emit(session, "review.completed", "runtime", normalized);
+      return normalized;
     }
     const usage = stableUsage(result.usage, requestId);
     await this.budgets!.commitMeasured(session, reservationId, consumedBudget(usage, prepared.budget));
     await this.emit(session, "usage.recorded", "runtime", usage);
-    await this.emit(session, "review.completed", "runtime", normalizeReview(
+    const normalized = normalizeReview(
       session, result.evidence, input.reviewBasisDigest
-    ));
+    );
+    await this.emit(session, "review.completed", "runtime", normalized);
+    return normalized;
   }
 
   private async recoverInterruptedReview(session: RuntimeSession, reviewer: AccountableReviewerPort,

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import { EffectToolRegistry, registerBuiltinTools } from "../packages/agent-tool
 import {
   fakeToolCall,
   fakeToolTurn,
+  fakeFinalTurn,
   SmokeFakeGateway
 } from "../scripts/smoke-fake-model.mjs";
 
@@ -20,6 +21,43 @@ async function events(store: SegmentedJsonlStore, sessionId: string): Promise<Ag
 }
 
 describe("restore_run_changes transaction control", () => {
+  it("restores every current-run checkpoint as one baseline transaction and completes from restoration evidence", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "sigma-restore-run-group-"));
+    const workspace = path.join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "state.txt"), "baseline", "utf8");
+    const storeRootDir = path.join(root, "state");
+    const store = new SegmentedJsonlStore({ rootDir: storeRootDir });
+    const runtime = createRuntime({
+      gateway: new SmokeFakeGateway([
+        fakeToolTurn([fakeToolCall("first", "write", { path: "state.txt", content: "changed" })]),
+        fakeToolTurn([fakeToolCall("second", "write", { path: "extra.txt", content: "temporary" })]),
+        fakeToolTurn([fakeToolCall("restore-all", "restore_run_changes", {})]),
+        fakeFinalTurn("All run changes were restored.")
+      ]),
+      tools: registerBuiltinTools(new EffectToolRegistry()),
+      store,
+      storeRootDir,
+      permissionMode: "auto",
+      runDeadlineMs: 60_000
+    });
+    const session = await runtime.createSession({ workspacePath: workspace, mode: "change" });
+
+    await runtime.command({ type: "submit", sessionId: session.sessionId, text: "Make temporary changes, then restore them." });
+    await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
+      kind: "completed",
+      message: expect.stringContaining("All run changes were restored.")
+    });
+    await expect(readFile(path.join(workspace, "state.txt"), "utf8")).resolves.toBe("baseline");
+    await expect(readFile(path.join(workspace, "extra.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    const stored = await events(store, session.sessionId);
+    expect(stored.filter((event) => event.type === "checkpoint.restored")).toHaveLength(2);
+    expect(stored).toContainEqual(expect.objectContaining({
+      type: "evidence.recorded",
+      payload: expect.objectContaining({ kind: "restoration", status: "passed" })
+    }));
+  });
+
   it("restores the latest mutation from this run without creating a nested checkpoint", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "sigma-restore-run-"));
     const workspace = path.join(root, "workspace");

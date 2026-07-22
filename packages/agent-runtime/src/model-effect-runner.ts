@@ -194,7 +194,7 @@ export class ModelEffectRunner {
     // from silently switching modes between the repair call and its recovery.
     const repairPending = repairPhase !== "none";
     const ledger = evidenceLedger(session);
-    const descriptors = descriptorsAllowedForRepair(availableDescriptors, repairPhase);
+    const descriptors = descriptorsAllowedForRepair(session, availableDescriptors, repairPhase);
     const query = [...session.durable.state.messages].reverse().find((message) => message.role === "user")?.content ?? "";
     const dynamic = await this.repositoryContext.collect(session.identity.workspacePath, query, signal);
     const forecast = deadlineForecast(session);

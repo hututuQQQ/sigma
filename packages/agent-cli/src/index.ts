@@ -57,7 +57,7 @@ async function runTuiCommand(argv: string[], options: AgentCliMainOptions): Prom
   const tuiOptions: TuiAppOptions = {
     runtime: configured.runtime,
     workspace: configured.workspace,
-    mode: "change",
+    mode: cliConfig.initialMode,
     maxFps: cliConfig.tuiFps,
     sessionId: typeof flags.session === "string" ? flags.session : undefined
   };

@@ -103,6 +103,13 @@ const diagnosticSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("recovery.retry_model"), message: nonEmptyStringSchema }).strict(),
   z.object({
+    kind: z.literal("tool.batch_settled"),
+    callId: nonEmptyStringSchema,
+    ok: z.boolean(),
+    evidenceIds: z.array(nonEmptyStringSchema),
+    diagnosticCodes: z.array(nonEmptyStringSchema)
+  }).strict(),
+  z.object({
     kind: z.literal("deadline.stage"),
     stage: z.enum(["normal", "converge", "stop"]),
     budgetStage: z.enum(["normal", "converge", "terminal"]).optional(),

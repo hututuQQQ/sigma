@@ -31,10 +31,19 @@ export interface RestoreTransactionOptions {
   faultInjector?: (event: CheckpointRestoreFaultEvent) => void | Promise<void>;
 }
 
-export interface RestoreFinalization {
+export interface CheckpointRestoreFinalization {
+  kind?: "checkpoint";
   record: CheckpointRecord;
   desiredManifestDigest: string;
 }
+
+export interface RunRestoreFinalization {
+  kind: "run";
+  records: CheckpointRecord[];
+  desiredManifestDigest: string;
+}
+
+export type RestoreFinalization = CheckpointRestoreFinalization | RunRestoreFinalization;
 
 export interface RestoreDirectoryMode {
   path: string;

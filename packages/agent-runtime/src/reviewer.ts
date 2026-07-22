@@ -30,6 +30,9 @@ export interface ReviewerInput {
   frontierRevision: number;
   stateDigest: string;
   reviewBasisDigest: string;
+  reviewMode: "workspace" | "completion";
+  completionCandidate?: string;
+  completionCandidateDigest?: string;
   workspaceDeltas: WorkspaceDeltaEvidence[];
   validations: ValidationEvidence[];
   inputAccesses?: InputAccessEvidence[];
@@ -228,6 +231,13 @@ function reviewMessages(input: ReviewerInput): ModelMessage[] {
       frontierRevision: input.frontierRevision,
       stateDigest: input.stateDigest,
       reviewBasisDigest: input.reviewBasisDigest,
+      reviewMode: input.reviewMode,
+      ...(input.reviewMode === "completion" && input.completionCandidate
+        ? {
+            completionCandidate: input.completionCandidate,
+            completionCandidateDigest: input.completionCandidateDigest
+          }
+        : {}),
       inputAccesses: input.inputAccesses ?? [],
       workspaceDeltas: input.workspaceDeltas.map((item) => ({
         evidenceId: item.evidenceId,
@@ -254,20 +264,33 @@ export function isActionableErrorFinding(finding: JsonValue): boolean {
   return true;
 }
 
+interface ParsedReviewResult {
+  findings: JsonValue[];
+  protocolFailure: boolean;
+  verdict: "approved" | "changes_requested";
+}
+
+function parsedReviewResult(input: ReviewerInput, response: ModelResponse): ParsedReviewResult {
+  const parsed = responseObject(response.message.content);
+  const inputProblem = reviewInputFailure(input);
+  const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
+  const validVerdict = parsed?.verdict === "approved" || parsed?.verdict === "changes_requested";
+  const protocolFailure = !inputProblem && (!parsed || !validVerdict || rawFindings === undefined);
+  const findings = inputProblem ? [inputProblem] : rawFindings
+    ? rawFindings.filter((item): item is JsonValue => item === null
+      || ["string", "number", "boolean", "object"].includes(typeof item))
+    : [];
+  const verdict = !inputProblem && !protocolFailure && !findings.some(isActionableErrorFinding)
+    ? "approved" : "changes_requested";
+  return { findings, protocolFailure, verdict };
+}
+
 function reviewEvidence(
   input: ReviewerInput,
   reviewerId: string,
   response: ModelResponse
 ): ReviewEvidence {
-    const parsed = responseObject(response.message.content);
-    const inputProblem = reviewInputFailure(input);
-    const rawFindings = Array.isArray(parsed?.findings) ? parsed.findings : undefined;
-    const validFindings = rawFindings !== undefined;
-    const findings = inputProblem ? [inputProblem] : validFindings
-      ? rawFindings.filter((item): item is JsonValue => item === null || ["string", "number", "boolean", "object"].includes(typeof item))
-      : [parsed ? "Reviewer response omitted findings." : "Reviewer returned invalid JSON."];
-    const verdict = !inputProblem && validFindings && !findings.some(isActionableErrorFinding)
-      ? "approved" : "changes_requested";
+    const { findings, protocolFailure, verdict } = parsedReviewResult(input, response);
     return {
       evidenceId: randomUUID(),
       sessionId: input.sessionId,
@@ -276,7 +299,9 @@ function reviewEvidence(
       status: verdict === "approved" ? "passed" : "failed",
       createdAt: new Date().toISOString(),
       producer: { authority: "runtime", id: reviewerId },
-      summary: verdict === "approved" ? "Independent reviewer approved the change." : "Independent reviewer requested changes.",
+      summary: protocolFailure ? "Independent reviewer returned an invalid protocol response."
+        : verdict === "approved" ? "Independent reviewer approved the change."
+          : "Independent reviewer requested changes.",
       data: {
         reviewerId,
         verdict,
@@ -285,6 +310,9 @@ function reviewEvidence(
         stateDigest: input.stateDigest,
         reviewBasisDigest: input.reviewBasisDigest,
         validationEvidenceIds: input.validations.map((item) => item.evidenceId),
+        ...(protocolFailure
+          ? { failureKind: "protocol" as const, failureCode: "review_protocol_invalid" as const }
+          : {}),
         ...(input.workspaceDeltas.some((item) => item.data.reviewProblem?.code === "review_scope_too_large")
           ? { failureCode: "review_scope_too_large" as const } : {})
       }

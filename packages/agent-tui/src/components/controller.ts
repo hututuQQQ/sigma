@@ -1,6 +1,7 @@
 import { createPresentationState, projectEvent } from "agent-presentation";
 import type { AgentEventEnvelope, RunMode } from "agent-protocol";
 import { parseTuiCommand } from "./commands.js";
+import { assertDurableSessionMode, ffiReady } from "./session-mode.js";
 import { TuiView } from "./view.js";
 import type { SubmissionKind, TuiAppOptions, TuiSnapshot, TuiViewActions } from "./types.js";
 
@@ -12,13 +13,6 @@ interface ControllerView {
 }
 
 type ViewFactory = (options: TuiAppOptions, actions: TuiViewActions) => Promise<ControllerView>;
-
-function ffiReady(): boolean {
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  const supported = major > 26 || major === 26 && minor >= 4;
-  return supported && (process.execArgv.includes("--experimental-ffi")
-    || (process.env.NODE_OPTIONS ?? "").split(/\s+/u).includes("--experimental-ffi"));
-}
 
 export class TuiSessionController {
   private mode: RunMode;
@@ -75,7 +69,7 @@ export class TuiSessionController {
       }),
       interrupt: async () => await this.protect(async () => await this.interrupt()),
       newSession: async () => await this.protect(async () => await this.beginSessionTransition(async () => await this.newSession())),
-      setMode: (mode) => { this.mode = mode; this.notice(`Mode changed to ${mode}.`); this.refresh(); },
+      setMode: async (mode) => await this.protect(async () => await this.switchMode(mode)),
       stop: () => this.stop(),
       userAction: () => { if (this.noticeState?.error) this.notice(); }
     };
@@ -118,7 +112,7 @@ export class TuiSessionController {
     if (action === "activity") { this.view?.toggleActivity(); return true; }
     if (action === "mode") {
       if (argument !== "analyze" && argument !== "change") throw new Error("Mode must be analyze or change.");
-      this.mode = argument; this.notice(`Mode changed to ${argument}.`); this.refresh(); return true;
+      await this.switchMode(argument); return true;
     }
     if (action === "followup") {
       if (!argument) throw new Error("/followup requires a message.");
@@ -152,8 +146,22 @@ export class TuiSessionController {
     if (this.active) this.notice("New session. Type a request and press Enter.");
   }
 
+  private async switchMode(mode: RunMode): Promise<void> {
+    await this.sessionReady;
+    if (mode === this.mode) return;
+    if (["running", "needs_input"].includes(this.presentation.status)) {
+      throw new Error("Mode cannot change while a session is running. Cancel or wait for it to finish first.");
+    }
+    await this.beginSessionTransition(async () => {
+      this.mode = mode;
+      await this.newSession();
+      if (this.active) this.notice(`Started a new ${mode} session.`);
+    });
+  }
+
   private async resume(sessionId: string): Promise<void> {
     if (!this.active) return;
+    await assertDurableSessionMode(this.options.runtime, sessionId, this.mode);
     await this.options.runtime.command({ type: "resume", sessionId });
     if (!this.active) {
       await this.release(sessionId);

@@ -5,3 +5,5 @@ export * from "./effects.js";
 export * from "./rehydrate.js";
 export * from "./semantic-failures.js";
 export * from "./durable-budget-reducers.js";
+export * from "./task-control-state.js";
+export * from "./task-control.js";

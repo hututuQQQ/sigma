@@ -17,6 +17,7 @@ export interface RuntimeControlServiceOptions {
   };
   planChanged?(session: RuntimeSession, previousRevision: number, plan: PlanGraph): Promise<void>;
   budgets: BudgetController;
+  hasActiveChildren?(parentSessionId: string): Promise<boolean> | boolean;
 }
 export type OpenCheckpointRecoveryResult =
   | { kind: "clean" }

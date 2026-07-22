@@ -13,6 +13,7 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
+  terminalResolutionObligation,
   type KernelState
 } from "../packages/agent-kernel/src/index.js";
 import {
@@ -22,6 +23,7 @@ import {
   descriptorAllowedForRepair,
   effectsAllowedForRepair
 } from "../packages/agent-runtime/src/tool-turn-policy.js";
+import type { RuntimeSession } from "../packages/agent-runtime/src/types.js";
 
 const NOW = "2026-01-01T00:00:00.000Z";
 const nonBlankText = fc.string({ minLength: 1, maxLength: 80 })
@@ -115,7 +117,7 @@ function descriptor(
 }
 
 describe("terminal convergence properties", () => {
-  it("keeps every normal tool available during terminal correction", () => {
+  it("projects only terminal effects during terminal resolution", () => {
     const effects = fc.uniqueArray(fc.constantFrom<ToolEffect>(
       "outcome.propose",
       "outcome.request_input",
@@ -127,18 +129,24 @@ describe("terminal convergence properties", () => {
     fc.assert(fc.property(effects, effects, effects, names,
       (possibleEffects, maximumEffects, exactEffects, name) => {
       const tool = descriptor(possibleEffects, maximumEffects, name);
-      expect(descriptorAllowedForRepair(tool, "protected_completion")).toBe(true);
+      const state = initial();
+      state.taskControl = terminalResolutionObligation(state.taskControl, state.revision, "property_terminal");
+      const session = { durable: { state } } as RuntimeSession;
+      const terminalEffects = new Set<ToolEffect>([
+        "outcome.propose", "outcome.report_blocked", "outcome.request_input"
+      ]);
+      const expectedDescriptor = name !== "request_user_input" && possibleEffects.length > 0
+        && possibleEffects.every((effect) => terminalEffects.has(effect));
+      expect(descriptorAllowedForRepair(session, tool, "terminal")).toBe(expectedDescriptor);
       const pureAction = possibleEffects.length === 1 && maximumEffects.length === 1
         && possibleEffects[0] === maximumEffects[0]
         ? possibleEffects[0] === "outcome.propose" ? "complete"
           : possibleEffects[0] === "outcome.request_input" ? "request_input" : null
         : null;
       expect(terminalProtocolAction(tool)).toBe(pureAction);
-      expect(descriptorAllowedForRepair(tool, "evidence")).toBe(true);
-      expect(descriptorAllowedForRepair(tool, "protected_recovery")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "protected_completion")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "evidence")).toBe(true);
-      expect(effectsAllowedForRepair(exactEffects, "protected_recovery")).toBe(true);
+      expect(effectsAllowedForRepair(session, exactEffects, "terminal")).toBe(
+        exactEffects.length > 0 && exactEffects.every((effect) => terminalEffects.has(effect))
+      );
     }));
   });
 
@@ -248,8 +256,11 @@ describe("terminal convergence properties", () => {
       const recoveryState: KernelState = {
         ...protectedState,
         phase: "tool_pending",
-        completionRepairAttempts: 0,
-        completionRepair: { kind: "protected_recovery", answer: answer.trim() },
+        taskControl: terminalResolutionObligation(
+          protectedState.taskControl,
+          protectedState.revision,
+          "terminal_protocol_invalid"
+        ),
         pendingTools: [{
           request: { callId: "custom-input", name: "custom_terminal_alias", arguments: {} },
           modelTurn,

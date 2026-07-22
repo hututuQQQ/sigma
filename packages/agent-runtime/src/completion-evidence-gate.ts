@@ -172,8 +172,24 @@ function requiredReviewFailure(
 ): ToolReceipt | null {
   if (reviewMode(session) !== "required" && assuranceRequirement(session).review !== "required") return null;
   const frontier = session.durable.state.mutationFrontier;
-  const review = currentFrontierReview(session);
+  const candidateDigest = session.durable.state.taskControl.completionCandidate?.digest;
+  const review = currentFrontierReview(session, candidateDigest);
   if (review?.status === "passed" && review.data.verdict === "approved") return null;
+  if (review?.data.failureKind === "protocol") {
+    const attempts = session.durable.state.evidence.filter((item) => item.kind === "review"
+      && item.data.reviewBasisDigest === review.data.reviewBasisDigest).length;
+    if (attempts >= 2) {
+      return failed(call, startedAt,
+        "Required independent review returned invalid protocol output twice for the same basis.",
+        "review_unavailable",
+        {
+          status: "rejected", code: "review_unavailable",
+          frontierRevision: frontier.revision, stateDigest: frontier.currentStateDigest,
+          nextActions: [{ tool: "report_blocked" }]
+        }
+      );
+    }
+  }
   if (review?.data.failureCode === "review_scope_too_large") {
     return failed(call, startedAt,
       `${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`,
@@ -187,7 +203,7 @@ function requiredReviewFailure(
     );
   }
   return failed(call, startedAt,
-    review
+    review && !review.data.failureKind
       ? `Strict review requested changes: ${review.data.findings.slice(0, 20).map(findingText).join("; ")}.`
       : "Strict profile requires an approved review of the validated current state.",
     "review_evidence_required",

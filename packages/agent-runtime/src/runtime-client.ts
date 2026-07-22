@@ -84,6 +84,7 @@ export class InProcessRuntimeClient implements RuntimeClient {
       emit: async (session, type, authority, value) => await this.emit(session, type, authority, value),
       createArtifact: async (sessionId, content) => await this.artifacts.put(sessionId, content),
       readArtifact: async (sessionId, artifactId) => (await this.artifacts.get(sessionId, artifactId)).toString("utf8"),
+      hasActiveChildren: options.hasActiveChildren,
       skillMaterializer: new FrozenSkillMaterializer(options.storeRootDir, this.artifacts),
       planChanged: async (session, previousRevision, plan) => {
         await this.hooks.dispatch(session, "plan_changed", {

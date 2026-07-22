@@ -3,24 +3,22 @@ import type { ActiveModelTurn, KernelState, PendingTool } from "./state.js";
 import {
   completionRepairFailureMessage,
   completionRepairRequiresTerminalAction,
-  conflictingTerminalBatch,
   hasCompletionRepair,
   incompleteModelCompletion,
-  protectedCompletionAnswer,
-  repairConflictingTerminalBatch
+  protectedCompletionAnswer
 } from "./model-convergence.js";
 import { receiptContent, toolReceipt } from "./receipt-parsing.js";
 import { durableReducers, type KernelEventReducer } from "./durable-reducers.js";
 import { isCurrentModelTurn, modelMessage, modelToolCalls, modelTurn } from "./model-event-parsing.js";
 import { recordSemanticToolResult } from "./semantic-failures.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
-import { completedToolBatchProgress, repeatsCompletedToolBatch } from "./tool-batch-progress.js";
+import { completedToolBatchProgress, startedToolBatchProgress } from "./tool-batch-progress.js";
+import { beginGoalEpoch, terminalResolutionObligation, userDecisionObligation } from "./task-control.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
   nextPhase,
   pendingForEvent,
-  protectedToolBatchFailure,
   proposedOutcomeState,
   terminalReceiptTransition,
   terminalState
@@ -56,15 +54,7 @@ const runStarted: EventReducer = (state, _event, payload) => ({
   deadlineRemainingMs: undefined,
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
-  completionRepairAttempts: 0,
-  completionRepair: undefined,
-  continuationAttempts: 0,
-  repeatedToolBatchCount: 0,
-  receiptCountAtLastUserInput: state.receipts.length,
-  semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: state.revision },
-  semanticFailureCluster: undefined,
-  lastToolBatchSignature: undefined,
-  lastToolBatchOutcomeSignature: undefined,
+  taskControl: state.taskControl,
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -75,14 +65,7 @@ const userInput: EventReducer = (state, _event, payload) => ({
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   messages: [...state.messages, { role: "user", content: text(payload.text) }],
-  completionRepairAttempts: 0,
-  completionRepair: undefined,
-  continuationAttempts: 0,
-  repeatedToolBatchCount: 0,
-  receiptCountAtLastUserInput: state.receipts.length,
-  semanticFailureCluster: undefined,
-  lastToolBatchSignature: undefined,
-  lastToolBatchOutcomeSignature: undefined,
+  taskControl: beginGoalEpoch(state.taskControl, state.revision, "submit"),
   outcome: undefined,
   proposedOutcome: undefined
 });
@@ -98,21 +81,23 @@ const steeringInput: EventReducer = (state, _event, payload) => ({
   activeModelTurn: undefined,
   activeModelSemanticDelta: undefined,
   pendingTools: [],
-  completionRepairAttempts: 0,
-  completionRepair: undefined,
-  continuationAttempts: 0,
-  repeatedToolBatchCount: 0,
-  receiptCountAtLastUserInput: state.receipts.length,
-  semanticFailureCluster: undefined,
-  lastToolBatchSignature: undefined,
-  lastToolBatchOutcomeSignature: undefined,
+  taskControl: beginGoalEpoch(state.taskControl, state.revision, "steer"),
   proposedOutcome: undefined,
   outcome: undefined
 });
 
-const followUpInput: EventReducer = (state, event, payload) => payload.status === "queued"
+const followUpInput: EventReducer = (state, _event, payload) => payload.status === "queued"
   ? state
-  : userInput(state, event, payload);
+  : {
+      ...state,
+      phase: "ready_model",
+      activeModelTurn: undefined,
+      activeModelSemanticDelta: undefined,
+      messages: [...state.messages, { role: "user", content: text(payload.text) }],
+      taskControl: beginGoalEpoch(state.taskControl, state.revision, "follow_up"),
+      outcome: undefined,
+      proposedOutcome: undefined
+    };
 
 const modelStarted: EventReducer = (state, _event, payload) => {
   const turn = modelTurn(payload);
@@ -131,16 +116,12 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
   const messages = message ? [...state.messages, message] : state.messages;
   const calls = modelToolCalls(payload.toolCalls);
   const modelTurn = state.activeModelTurn!;
-  const completedState = { ...state, activeModelTurn: undefined, activeModelSemanticDelta: undefined };
+  const completedState = {
+    ...state,
+    activeModelTurn: undefined,
+    activeModelSemanticDelta: undefined
+  };
   if (calls.length === 0) return incompleteModelCompletion(completedState, payload, messages);
-  const protectedFailure = protectedToolBatchFailure(state, calls);
-  if (protectedFailure) {
-    return proposedOutcomeState({ ...completedState, messages }, {
-      kind: "recoverable_failure",
-      code: protectedFailure.code,
-      message: completionRepairFailureMessage(state, protectedFailure.message)
-    });
-  }
   const identifiers = calls.map((call) => call.id);
   const seen = new Set(state.toolCallIds);
   const duplicate = identifiers.find((id, index) => identifiers.indexOf(id) !== index || seen.has(id));
@@ -154,31 +135,17 @@ const modelCompleted: EventReducer = (state, _event, payload) => {
       )
     });
   }
-  if (conflictingTerminalBatch(calls, hasCompletionRepair(state))) {
-    return repairConflictingTerminalBatch({ ...completedState, messages }, messages);
-  }
-  if (repeatsCompletedToolBatch(state, calls)) {
-    return proposedOutcomeState({
-      ...completedState,
-      messages,
-      toolCallIds: [...state.toolCallIds, ...identifiers]
-    }, {
-      kind: "recoverable_failure",
-      code: "convergence_no_progress",
-      message: completionRepairFailureMessage(
-        state,
-        "The same tool batch produced the same completed outcome twice and was proposed again without progress."
-      )
-    });
-  }
   const pendingTools = pendingFromCalls(calls, modelTurn);
+  const taskControl = startedToolBatchProgress({
+    ...completedState,
+    taskControl: { ...completedState.taskControl, modelContinuationAttempts: 0 }
+  }).taskControl;
   return {
     ...completedState,
+    taskControl,
     messages,
     pendingTools,
     toolCallIds: [...state.toolCallIds, ...identifiers],
-    completionRepairAttempts: state.completionRepairAttempts,
-    continuationAttempts: 0,
     phase: "tool_pending"
   };
 };
@@ -226,6 +193,18 @@ const toolStarted: EventReducer = (state, _event, payload) => {
   return { ...state, pendingTools, phase: "tool_in_flight" };
 };
 
+function recoveryDecisionState(state: KernelState, diagnostics: readonly string[]): KernelState {
+  if (!diagnostics.includes("recovery_result_lost_no_replay")) return state;
+  return {
+    ...state,
+    taskControl: userDecisionObligation(
+      state.taskControl,
+      state.revision,
+      "recovery_result_lost_no_replay"
+    )
+  };
+}
+
 const toolFinished: EventReducer = (state, event) => {
   const receipt = toolReceipt(event.payload);
   const pending = pendingForEvent(state, objectPayload(event.payload));
@@ -245,12 +224,14 @@ const toolFinished: EventReducer = (state, event) => {
     // Receipt evidence is untrusted tool output. Only separately emitted,
     // authority-checked evidence.recorded/review events enter the ledger.
     evidence: state.evidence,
-    continuationAttempts: 0,
+    taskControl: { ...state.taskControl, modelContinuationAttempts: 0 },
     phase: nextPhase(pendingTools)
   };
-  const completedBatch = pendingTools.length === 0 ? completedToolBatchProgress(next, receipt.callId) : {};
-  const semantic = recordSemanticToolResult({ ...next, ...completedBatch }, receipt, pending.request.name);
-  const progressed = semantic.state;
+  const semantic = recordSemanticToolResult(next, receipt, pending.request.name);
+  const decisionState = recoveryDecisionState(semantic.state, receipt.diagnostics);
+  const progressed = pendingTools.length === 0
+    ? { ...decisionState, ...completedToolBatchProgress(decisionState) }
+    : decisionState;
   return terminalReceiptTransition({
     state,
     progressed,
@@ -259,7 +240,7 @@ const toolFinished: EventReducer = (state, event) => {
     remainingTools: pendingTools.length,
     repairPending,
     terminalRepairPending,
-    semanticLimitReached: semantic.limitReached
+    semanticLimitReached: progressed.taskControl.phase === "terminal"
   }) ?? progressed;
 };
 
@@ -284,7 +265,7 @@ const runSuspended: EventReducer = (state, _event, payload) => {
     phase: "needs_input",
     activeModelTurn: undefined,
     activeModelSemanticDelta: undefined,
-    ...(!approvalSuspension ? { completionRepairAttempts: 0, completionRepair: undefined } : {}),
+    taskControl: state.taskControl,
     proposedOutcome: undefined,
     outcome: { kind: "needs_input", requestId: text(payload.requestId), message: text(payload.message) }
   };
@@ -328,18 +309,30 @@ const diagnostic: EventReducer = (state, _event, payload) => {
     activeModelSemanticDelta: undefined,
     outcome: undefined
   };
+  if (payload.kind === "tool.batch_settled") {
+    const obligation = state.taskControl.obligation;
+    if (obligation?.kind !== "review_repair" || obligation.stage === "re_review") return state;
+    const diagnosticCodes = Array.isArray(payload.diagnosticCodes)
+      ? payload.diagnosticCodes.filter((item): item is string => typeof item === "string") : [];
+    if (diagnosticCodes.some((code) => code === "model_tool_policy_violation"
+      || code === "tool_unavailable_for_repair")) return state;
+    return {
+      ...state,
+      taskControl: terminalResolutionObligation(
+        state.taskControl,
+        state.revision,
+        obligation.stage === "mutate" ? "review_repair_no_delta" : "validation_evidence_missing"
+      )
+    };
+  }
   if (payload.kind === "child.join_failed") {
     const failures = Array.isArray(payload.failures) ? payload.failures.filter((item): item is string => typeof item === "string") : [];
-    const protectedAnswer = protectedCompletionAnswer(state);
     return {
       ...state,
       phase: "ready_model",
       activeModelTurn: undefined,
       activeModelSemanticDelta: undefined,
-      completionRepairAttempts: 0,
-      completionRepair: protectedAnswer
-        ? { kind: "protected_recovery", answer: protectedAnswer }
-        : undefined,
+      taskControl: state.taskControl,
       proposedOutcome: undefined,
       outcome: undefined,
       messages: [...state.messages, {

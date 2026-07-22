@@ -105,7 +105,7 @@ export class ToolTransactionRunner {
       return failed(call, startedAt, `Tool '${call.name}' is denied by the frozen Agent Profile.`, "profile_denied");
     }
     const repairPhase = completionRepairPhase(session);
-    if (!descriptorAllowedForRepair(descriptor, repairPhase)) {
+    if (!descriptorAllowedForRepair(session, descriptor, repairPhase)) {
       return failed(
         call,
         startedAt,
@@ -125,7 +125,7 @@ export class ToolTransactionRunner {
         callId: call.id, name: call.name, arguments: call.arguments
       }, context)
       : await prepareToolCallPlan(descriptor, call.arguments, context);
-    if (!effectsAllowedForRepair(plan.exactEffects, repairPhase)) {
+    if (!effectsAllowedForRepair(session, plan.exactEffects, repairPhase)) {
       return failed(
         call,
         startedAt,

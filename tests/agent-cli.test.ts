@@ -193,10 +193,11 @@ describe("Sigma CLI", () => {
     const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-cli-tui-"));
     const canonicalWorkspace = await realpath(workspace);
     let received = false;
-    await expect(runAgentCommand(["tui", "--workspace", workspace], {
+    await expect(runAgentCommand(["tui", "--workspace", workspace, "--initial-mode", "analyze"], {
       runtimeFactoryDeps: { executionBroker: createHostExecutionBroker() },
       tuiRunner: async (options) => {
-        received = typeof options.runtime.command === "function" && options.workspace === canonicalWorkspace;
+        received = typeof options.runtime.command === "function"
+          && options.workspace === canonicalWorkspace && options.mode === "analyze";
       }
     })).resolves.toBe(0);
     expect(received).toBe(true);

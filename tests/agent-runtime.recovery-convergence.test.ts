@@ -87,7 +87,7 @@ describe("runtime recovery convergence", () => {
     }
   });
 
-  it("defaults semantic progress when restoring a pre-feature V5 snapshot", async () => {
+  it("migrates the published V5 task authorities and strips every legacy field", async () => {
     const workspacePath = await mkdtemp(path.join(os.tmpdir(), "sigma-semantic-restore-"));
     const store = new SegmentedJsonlStore({ rootDir: path.join(workspacePath, ".agent") });
     const sessionId = "legacy-semantic-session";
@@ -112,8 +112,14 @@ describe("runtime recovery convergence", () => {
       deadlineAt: "2026-07-12T00:15:00.000Z"
     });
     const oldSnapshot = JSON.parse(JSON.stringify({ ...current, lastSeq: 1 })) as Record<string, JsonValue>;
-    delete oldSnapshot.semanticProgress;
-    delete oldSnapshot.semanticFailureCluster;
+    delete oldSnapshot.taskControl;
+    Object.assign(oldSnapshot, {
+      completionRepairAttempts: 0,
+      continuationAttempts: 0,
+      repeatedToolBatchCount: 0,
+      receiptCountAtLastUserInput: 0,
+      semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
+    });
     await store.writeSnapshot({
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       storeLayoutVersion: STORE_LAYOUT_VERSION,
@@ -124,8 +130,16 @@ describe("runtime recovery convergence", () => {
     });
 
     const restored = await restoreStoredSession(store, sessionId, 60_000);
-    expect(restored.state.semanticProgress).toEqual({ workspaceChanges: 0, durableEvidence: 0, revision: 0 });
-    expect(restored.state.semanticFailureCluster).toBeUndefined();
+    expect(restored.state.taskControl).toMatchObject({
+      schemaVersion: 1,
+      phase: "normal",
+      semanticFacts: { entries: [] }
+    });
+    for (const key of [
+      "completionRepairAttempts", "completionRepair", "continuationAttempts",
+      "repeatedToolBatchCount", "receiptCountAtLastUserInput", "semanticProgress",
+      "semanticFailureCluster", "lastToolBatchSignature", "lastToolBatchOutcomeSignature"
+    ]) expect(restored.state).not.toHaveProperty(key);
   });
 
   it("preserves failed validation status, scope, and execution claim across snapshot restore", async () => {

@@ -51,7 +51,7 @@ export interface TurnPreparationInput {
 
 function actionPolicy(input: TurnPreparationInput): ActionPolicy {
   const { session, forecast, turnId, defaultOutputReserveTokens, budgetStage } = input;
-  const lengthRecovery = session.durable.state.continuationAttempts > 0;
+  const lengthRecovery = session.durable.state.taskControl.modelContinuationAttempts > 0;
   const required = lengthRecovery || forecast.stage === "converge" || budgetStage !== "normal";
   const outputReserveTokens = required ? Math.min(2_048, defaultOutputReserveTokens) : defaultOutputReserveTokens;
   if (!required) return { required, outputReserveTokens, context: [] };

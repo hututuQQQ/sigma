@@ -82,14 +82,16 @@ function validationSemanticSignature(validation: ValidationEvidence): string {
 
 export function reviewBasisDigest(
   session: RuntimeSession,
-  validations = frontierValidationReadiness(session).validations
+  validations = frontierValidationReadiness(session).validations,
+  completionCandidateDigest?: string
 ): string {
   const frontier = session.durable.state.mutationFrontier;
   const signatures = [...new Set(validations.map(validationSemanticSignature))].sort();
   return createHash("sha256").update(JSON.stringify({
     frontierRevision: frontier.revision,
     stateDigest: frontier.currentStateDigest,
-    validations: signatures
+    validations: signatures,
+    ...(completionCandidateDigest ? { completionCandidateDigest } : {})
   })).digest("hex");
 }
 
@@ -100,8 +102,11 @@ export function latestFrontierReview(session: RuntimeSession): ReviewEvidence | 
     && item.data.stateDigest === frontier.currentStateDigest).at(-1);
 }
 
-export function currentFrontierReview(session: RuntimeSession): ReviewEvidence | undefined {
-  const basisDigest = reviewBasisDigest(session);
+export function currentFrontierReview(
+  session: RuntimeSession,
+  completionCandidateDigest?: string
+): ReviewEvidence | undefined {
+  const basisDigest = reviewBasisDigest(session, undefined, completionCandidateDigest);
   return sessionMutationEvidence(session).filter((item): item is ReviewEvidence => item.kind === "review"
     && item.data.frontierRevision === session.durable.state.mutationFrontier.revision
     && item.data.stateDigest === session.durable.state.mutationFrontier.currentStateDigest

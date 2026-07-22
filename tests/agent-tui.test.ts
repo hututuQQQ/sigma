@@ -22,11 +22,13 @@ function event(seq: number, type: AgentEventEnvelope["type"], payload: AgentEven
 class FakeRuntime implements RuntimeClient {
   readonly commands: RunCommand[] = [];
   readonly released: string[] = [];
+  readonly creations: StartSession[] = [];
   private sessions = 0;
 
   constructor(readonly events: AgentEventEnvelope[] = [event(1, "session.created", {})]) {}
 
-  async createSession(_input: StartSession): Promise<SessionRef> {
+  async createSession(input: StartSession): Promise<SessionRef> {
+    this.creations.push(input);
     this.sessions += 1;
     return { sessionId: this.sessions === 1 ? "session" : `session-${this.sessions}`, runId: "run" };
   }
@@ -34,7 +36,7 @@ class FakeRuntime implements RuntimeClient {
   async *subscribe(): AsyncIterable<AgentEventEnvelope> { for (const item of this.events) yield item; }
   async waitForOutcome(): Promise<RunOutcome> { return { kind: "completed", message: "ok", evidence: [] }; }
   async listSessions(): Promise<SessionOverview[]> { return []; }
-  async *sessionEvents(): AsyncIterable<AgentEventEnvelope> { /* no persisted events */ }
+  async *sessionEvents(): AsyncIterable<AgentEventEnvelope> { for (const item of this.events) yield item; }
   async releaseSession(sessionId: string): Promise<void> { this.released.push(sessionId); }
 }
 
@@ -53,7 +55,7 @@ async function viewHarness(width = 80, height = 24) {
     approve: async (requestId, decision) => { approvals.push({ requestId, decision }); },
     interrupt: async () => { interrupts += 1; },
     newSession: async () => undefined,
-    setMode: () => undefined,
+    setMode: async () => undefined,
     stop: () => undefined,
     userAction: () => undefined
   };
@@ -409,6 +411,45 @@ describe("Sigma OpenTUI", () => {
     expect(runtime.commands).toContainEqual({ type: "cancel", sessionId: "session", reason: "Replaced by /new from TUI." });
     expect(runtime.released).toContain("session");
     expect(activityToggles).toBe(1);
+  });
+
+  it("creates analyze mode before the first request and changes mode only through a new idle session", async () => {
+    const runtime = new FakeRuntime([]);
+    const stdin = Object.assign(new PassThrough(), { isTTY: true }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 }) as unknown as NodeJS.WriteStream;
+    let actions!: TuiViewActions;
+    let latest!: TuiSnapshot;
+    const controller = new TuiSessionController({
+      runtime, workspace: ".", mode: "analyze", stdin, stdout
+    }, async (_options, nextActions) => {
+      actions = nextActions;
+      return { update: (next) => { latest = next; }, showHelp: () => undefined,
+        toggleActivity: () => undefined, destroy: () => undefined };
+    });
+    const running = controller.run();
+    await waitUntil(() => latest?.sessionId === "session");
+    expect(runtime.creations[0]).toMatchObject({ mode: "analyze" });
+    await actions.submit("/mode change", "default");
+    await waitUntil(() => latest?.sessionId === "session-2");
+    expect(runtime.creations[1]).toMatchObject({ mode: "change" });
+    expect(runtime.released).toContain("session");
+    await actions.interrupt(); await actions.interrupt(); await running;
+  });
+
+  it("rejects a resumed session whose durable mode conflicts with --initial-mode", async () => {
+    const created = event(1, "session.created", {
+      workspacePath: ".", mode: "change", title: "", writeScope: [], strictWriteScope: false,
+      modelRole: "orchestrator"
+    });
+    const runtime = new FakeRuntime([created]);
+    const stdin = Object.assign(new PassThrough(), { isTTY: true }) as unknown as NodeJS.ReadStream;
+    const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 }) as unknown as NodeJS.WriteStream;
+    const controller = new TuiSessionController({
+      runtime, workspace: ".", mode: "analyze", sessionId: "session", stdin, stdout
+    }, async () => ({ update: () => undefined, showHelp: () => undefined,
+      toggleActivity: () => undefined, destroy: () => undefined }));
+    await expect(controller.run()).rejects.toMatchObject({ code: "initial_mode_mismatch" });
+    expect(runtime.commands).not.toContainEqual(expect.objectContaining({ type: "resume" }));
   });
 
   it("exits promptly while initial session creation is still blocked", async () => {

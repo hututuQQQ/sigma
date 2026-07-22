@@ -197,6 +197,7 @@ export const SIGMA_CONFIG_SCHEMA: readonly ConfigField[] = [
       throw new Error("Configuration 'streamJsonMaxLineBytes' must be 0 or an integer of at least 4096.");
     return value;
   } },
+  { key: "initialMode", flag: "initial-mode", description: "Initial TUI session mode", defaultValue: "change", parse: (raw) => enumValue(raw, "initialMode", ["analyze", "change"] as const) },
   { key: "tuiFps", flag: "tui-fps", env: "SIGMA_TUI_FPS", toml: "tui.fps", description: "Maximum TUI frames per second", defaultValue: 30, parse: (raw) => numberValue(raw, "tuiFps", 1, 30) },
   { key: "mcpServers", flag: "mcp-server", kind: "repeatable", env: "SIGMA_MCP_SERVERS", toml: "mcp.servers", description: "MCP stdio server JSON (repeatable)", defaultValue: [], parse: mcpServersValue },
   {

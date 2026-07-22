@@ -18,10 +18,9 @@ import {
   assertKernelInvariants,
   createKernelState,
   evolve,
-  isCompletionRepairState,
   isKernelState,
-  isSemanticFailureCluster,
-  isSemanticProgressWatermark,
+  migratePublishedTaskControlState,
+  PUBLISHED_TASK_CONTROL_LEGACY_KEYS,
   type KernelState
 } from "agent-kernel";
 import { jsonValue } from "./json.js";
@@ -213,53 +212,28 @@ function validSnapshotShape(state: KernelState, sessionId: string): boolean {
   return isKernelState(state) && state.sessionId === sessionId;
 }
 
-function restoredSemanticState(stored: Partial<KernelState>): Pick<
-  KernelState,
-  "semanticProgress" | "semanticFailureCluster"
-> {
-  return {
-    semanticProgress: isSemanticProgressWatermark(stored.semanticProgress)
-      ? stored.semanticProgress
-      : { workspaceChanges: 0, durableEvidence: 0, revision: 0 },
-    semanticFailureCluster: isSemanticFailureCluster(stored.semanticFailureCluster)
-      ? stored.semanticFailureCluster : undefined
-  };
-}
-
-function restoredCompletionRepairState(stored: Partial<KernelState>): Pick<
-  KernelState,
-  "completionRepairAttempts" | "completionRepair"
-> | null {
-  const completionRepairAttempts = Number.isInteger(stored.completionRepairAttempts)
-    ? Number(stored.completionRepairAttempts)
-    : 0;
-  const repair = stored.completionRepair;
-  if (repair !== undefined && !isCompletionRepairState(repair)) return null;
-  if (completionRepairAttempts > 0 && !isCompletionRepairState(repair)) return null;
-  return {
-    completionRepairAttempts,
-    completionRepair: isCompletionRepairState(repair) ? repair : undefined
-  };
-}
-
 function snapshotState(snapshot: Awaited<ReturnType<RunStore["latestSnapshot"]>>, sessionId: string): KernelState | undefined {
   if (!snapshot?.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) return undefined;
-  const stored = snapshot.state as unknown as Partial<KernelState>;
-  const completionRepair = restoredCompletionRepairState(stored);
-  if (!completionRepair) return undefined;
+  const raw = snapshot.state as unknown as Record<string, unknown>;
+  if (["actionConvergenceState", "convergenceStageHighWater", "semanticFactLedgerV2",
+    "taskControlStateV2", "taskControlStateV3", "taskControlStateV4"].some((key) => key in raw)) {
+    throw Object.assign(new Error("Experimental PR #55 session schemas are not supported."), {
+      code: "unsupported_experimental_session_schema"
+    });
+  }
+  const stored = raw as unknown as Partial<KernelState>;
+  const taskControl = migratePublishedTaskControlState(raw, Number(stored.revision ?? 0));
+  if (!taskControl) return undefined;
+  const migrated = { ...raw };
+  for (const key of PUBLISHED_TASK_CONTROL_LEGACY_KEYS) delete migrated[key];
   const state = {
-    ...stored,
+    ...migrated,
     toolCallIds: Array.isArray(stored.toolCallIds)
       ? stored.toolCallIds
       : [...new Set([...(stored.receipts ?? []).map((receipt) => receipt.callId),
         ...(stored.pendingTools ?? []).map((pending) => pending.request.callId)])],
     activeProcessIds: Array.isArray(stored.activeProcessIds) ? stored.activeProcessIds : [],
-    ...restoredSemanticState(stored),
-    ...completionRepair,
-    continuationAttempts: Number.isInteger(stored.continuationAttempts) ? stored.continuationAttempts : 0,
-    repeatedToolBatchCount: Number.isInteger(stored.repeatedToolBatchCount) ? stored.repeatedToolBatchCount : 0,
-    receiptCountAtLastUserInput: Number.isInteger(stored.receiptCountAtLastUserInput)
-      ? stored.receiptCountAtLastUserInput : 0
+    taskControl
   } as KernelState;
   if (!validSnapshotShape(state, sessionId)) return undefined;
   try {

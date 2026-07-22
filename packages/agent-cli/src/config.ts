@@ -56,6 +56,7 @@ export interface CliConfig {
   outputFormat: "text" | "json" | "stream-json";
   outputSchema: 2 | 3;
   streamJsonMaxLineBytes: number;
+  initialMode: "analyze" | "change";
   tuiFps: number;
   mcpServers: McpServerConfigValue[];
   mcpSource: McpConfigSource;
@@ -246,6 +247,7 @@ function cliConfig(
     outputFormat: values.outputFormat as CliConfig["outputFormat"],
     outputSchema: Number(values.outputSchema) as 2 | 3,
     streamJsonMaxLineBytes: Number(values.streamJsonMaxLineBytes),
+    initialMode: values.initialMode as CliConfig["initialMode"],
     tuiFps: Number(values.tuiFps),
     mcpServers,
     mcpSource: source,

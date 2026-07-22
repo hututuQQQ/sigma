@@ -6,7 +6,8 @@ import type {
   EvidenceRecord,
   BudgetAmounts,
   BudgetLimits,
-  PlanGraph
+  PlanGraph,
+  WorkspaceRestorationEvidenceV1
 } from "./domain.js";
 import type { RunMode } from "./outcomes.js";
 import type { ExecutionIntentV1, ResolvedExecutionCapabilityV1 } from "./execution-v5.js";
@@ -129,6 +130,8 @@ export interface RuntimeControlPort {
   listCheckpoints(): Promise<CheckpointRef[]>;
   createCheckpoint(scopePaths: string[]): Promise<CheckpointRef>;
   restoreRunCheckpoint(checkpointId: string): Promise<CheckpointRef>;
+  restoreRunChanges(callId: string): Promise<WorkspaceRestorationEvidenceV1["data"]>;
+  confirmRunRestored(callId: string): Promise<WorkspaceRestorationEvidenceV1["data"]>;
   requestReview(): Promise<ReviewRequestResult>;
   loadSkill(qualifiedName: string): Promise<{ content: string; evidence: EvidenceRecord }>;
   resolveLoadedSkillResource(input: {
@@ -143,7 +146,8 @@ export interface RuntimeControlPort {
 }
 
 export interface ReviewRequestResult {
-  status: "review_requested" | "validation_required" | "changes_required" | "not_required";
+  status: "review_requested" | "approved" | "validation_required" | "changes_required"
+    | "review_unavailable" | "not_required";
   reviewState: "none" | "current" | "stale";
   reviewBasisDigest: string;
   frontierRevision: number;

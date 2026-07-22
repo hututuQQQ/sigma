@@ -157,6 +157,13 @@ export interface SealedCheckpointInspection {
   changed: boolean;
 }
 
+export interface RunRestorationInspection {
+  checkpoints: CheckpointRecord[];
+  baselineManifestDigest: string;
+  currentManifestDigest: string;
+  restored: boolean;
+}
+
 export class CheckpointConflictError extends Error {
   readonly code = "checkpoint_conflict";
 

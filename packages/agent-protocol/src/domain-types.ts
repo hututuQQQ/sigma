@@ -28,6 +28,7 @@ import type {
   repositoryDeltaEvidenceSchema,
   usageRecordSchema,
   userWaiverEvidenceSchema,
+  workspaceRestorationEvidenceV1Schema,
   validationEvidenceSchema,
   workspaceDeltaEvidenceSchema
 } from "./domain-schemas.js";
@@ -65,6 +66,7 @@ export type ReviewEvidence = z.infer<typeof reviewEvidenceSchema>;
 export type CheckpointEvidence = z.infer<typeof checkpointEvidenceSchema>;
 export type ChildOutcomeEvidence = z.infer<typeof childOutcomeEvidenceSchema>;
 export type UserWaiverEvidence = z.infer<typeof userWaiverEvidenceSchema>;
+export type WorkspaceRestorationEvidenceV1 = z.infer<typeof workspaceRestorationEvidenceV1Schema>;
 export type EvidenceRecord = z.infer<typeof evidenceRecordSchema>;
 export type EvidenceRef = z.infer<typeof evidenceRefSchema>;
 

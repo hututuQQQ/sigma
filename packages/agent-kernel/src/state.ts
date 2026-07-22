@@ -5,7 +5,6 @@ import {
   isBudgetLedgerState,
   isCheckpointRef,
   isEvidenceRecord,
-  isJsonValue,
   isMutationFrontier,
   isPlanGraph,
   isUsageRecord,
@@ -24,6 +23,8 @@ import {
   type UsageRecord
 } from "agent-protocol";
 import { emptyMutationFrontier } from "./mutation-frontier.js";
+import { createTaskControlState, hasPublishedTaskControlLegacyFields } from "./task-control.js";
+import { isTaskControlStateV1, type TaskControlStateV1 } from "./task-control-state.js";
 
 export type KernelPhase =
   | "idle"
@@ -46,43 +47,6 @@ export interface PendingTool {
   approval: "not_required" | "pending" | "allowed" | "denied";
   started: boolean;
 }
-
-export interface SemanticProgressWatermark {
-  /** Number of concrete changed paths (plus explicit checkpoint restores) observed in this run. */
-  workspaceChanges: number;
-  /** Number of accepted, non-failed durable evidence records observed in this run. */
-  durableEvidence: number;
-  /** Kernel revision at which either progress dimension last advanced. */
-  revision: number;
-}
-
-export interface SemanticFailureCluster {
-  /** Stable execution diagnostic family; deliberately independent of command text and tool arguments. */
-  family: string;
-  attempts: number;
-  firstRevision: number;
-  lastRevision: number;
-  diagnosticCodes: string[];
-  /** Latest global progress watermark. Execution clusters are rebased across
-   * unrelated evidence or workspace progress. Capability clusters clear after
-   * a successful process launch; dependency clusters retain their retry bound. */
-  progress: SemanticProgressWatermark;
-}
-
-export type CompletionRepairState =
-  | { kind: "evidence_acquisition" }
-  | { kind: "terminal_action" }
-  | { kind: "protected_completion"; answer: string }
-  | { kind: "protected_recovery"; answer: string }
-  | {
-      kind: "completion_prerequisite";
-      answer: string;
-      arguments: ToolRequest["arguments"];
-      originalCallId: string;
-      evidenceCount: number;
-      retryCount: number;
-      modelTurn: ActiveModelTurn;
-    };
 
 export interface KernelState {
   schemaVersion: typeof KERNEL_STATE_VERSION;
@@ -118,20 +82,9 @@ export interface KernelState {
   frozenSkills: FrozenArtifactRef[];
   activeProcessIds: string[];
   childIds: string[];
-  completionRepairAttempts: number;
-  /** Durable reason for a bounded protocol-repair turn. Protected completion
-   * locks the exact evidence-backed natural answer while the model chooses one
-   * typed terminal intent: finalize it or request concrete user input. */
-  completionRepair?: CompletionRepairState;
-  continuationAttempts: number;
-  repeatedToolBatchCount: number;
-  receiptCountAtLastUserInput: number;
-  semanticProgress: SemanticProgressWatermark;
-  semanticFailureCluster?: SemanticFailureCluster;
-  /** Signature of the most recently fully completed tool-call batch. */
-  lastToolBatchSignature?: string;
-  /** Stable receipt semantics for that completed batch; excludes call IDs and timestamps. */
-  lastToolBatchOutcomeSignature?: string;
+  /** The sole authority for task obligations, action convergence, protocol
+   * correction, and completion delivery. Execution lifecycle remains in phase. */
+  taskControl: TaskControlStateV1;
   proposedOutcome?: RunOutcome;
   outcome?: RunOutcome;
 }
@@ -168,11 +121,7 @@ export function createKernelState(options: CreateKernelStateOptions): KernelStat
     frozenSkills: [],
     activeProcessIds: [],
     childIds: [],
-    completionRepairAttempts: 0,
-    continuationAttempts: 0,
-    repeatedToolBatchCount: 0,
-    receiptCountAtLastUserInput: 0,
-    semanticProgress: { workspaceChanges: 0, durableEvidence: 0, revision: 0 }
+    taskControl: createTaskControlState()
   };
 }
 
@@ -185,72 +134,10 @@ function validDeadlineState(state: Record<string, unknown>): boolean {
     || (Number.isSafeInteger(state.deadlineRemainingMs) && Number(state.deadlineRemainingMs) >= 1));
 }
 
-function nonNegativeInteger(value: unknown): boolean {
-  return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-function validToolBatchProgressState(state: Record<string, unknown>): boolean {
-  if (state.lastToolBatchSignature !== undefined && typeof state.lastToolBatchSignature !== "string") return false;
-  if (state.lastToolBatchOutcomeSignature === undefined) return true;
-  return typeof state.lastToolBatchSignature === "string" && state.lastToolBatchSignature.length > 0
-    && typeof state.lastToolBatchOutcomeSignature === "string"
-    && /^[a-f0-9]{64}$/u.test(state.lastToolBatchOutcomeSignature)
-    && Number.isSafeInteger(state.repeatedToolBatchCount) && Number(state.repeatedToolBatchCount) >= 1;
-}
-
-export function isSemanticProgressWatermark(value: unknown): value is SemanticProgressWatermark {
-  const progress = record(value);
-  return Boolean(progress && [progress.workspaceChanges, progress.durableEvidence, progress.revision]
-    .every(nonNegativeInteger));
-}
-
-export function isSemanticFailureCluster(value: unknown): value is SemanticFailureCluster {
-  const cluster = record(value);
-  return Boolean(cluster
-    && typeof cluster.family === "string" && cluster.family.length > 0
-    && Number.isSafeInteger(cluster.attempts) && Number(cluster.attempts) >= 1
-    && [cluster.firstRevision, cluster.lastRevision].every(nonNegativeInteger)
-    && Array.isArray(cluster.diagnosticCodes)
-    && cluster.diagnosticCodes.every((item) => typeof item === "string" && item.length > 0)
-    && isSemanticProgressWatermark(cluster.progress));
-}
-
-function isCompletionPrerequisiteRepair(repair: Record<string, unknown>): boolean {
-  const modelTurn = record(repair.modelTurn);
-  if (!modelTurn) return false;
-  const validIdentity = typeof repair.originalCallId === "string" && repair.originalCallId.length > 0;
-  const validCounts = nonNegativeInteger(repair.evidenceCount) && nonNegativeInteger(repair.retryCount);
-  const validTurn = nonNegativeInteger(modelTurn.turnId) && nonNegativeInteger(modelTurn.effectRevision);
-  return typeof repair.answer === "string" && repair.answer.trim().length > 0
-    && validIdentity && isJsonValue(repair.arguments) && validCounts && validTurn;
-}
-
-export function isCompletionRepairState(value: unknown): value is CompletionRepairState {
-  const repair = record(value);
-  if (!repair) return false;
-  if (repair.kind === "evidence_acquisition" || repair.kind === "terminal_action") {
-    return Object.keys(repair).length === 1;
-  }
-  if (repair.kind === "completion_prerequisite") return isCompletionPrerequisiteRepair(repair);
-  return (repair.kind === "protected_completion" || repair.kind === "protected_recovery")
-    && typeof repair.answer === "string"
-    && repair.answer.trim().length > 0
-    && Object.keys(repair).every((key) => key === "kind" || key === "answer");
-}
-
-function validSemanticState(state: Record<string, unknown>): boolean {
-  if (!isSemanticProgressWatermark(state.semanticProgress)) return false;
-  const revision = Number(state.revision);
-  if (state.semanticProgress.revision > revision) return false;
-  if (state.semanticFailureCluster === undefined) return true;
-  if (!isSemanticFailureCluster(state.semanticFailureCluster)) return false;
-  return state.semanticFailureCluster.firstRevision <= state.semanticFailureCluster.lastRevision
-    && state.semanticFailureCluster.lastRevision <= revision;
-}
-
 export function isKernelState(value: unknown): value is KernelState {
   const state = record(value);
-  if (!state || state.schemaVersion !== KERNEL_STATE_VERSION) return false;
+  if (!state || state.schemaVersion !== KERNEL_STATE_VERSION
+    || hasPublishedTaskControlLegacyFields(state)) return false;
   return [
     typeof state.sessionId === "string" && state.sessionId.length > 0,
     typeof state.runId === "string" && state.runId.length > 0,
@@ -275,11 +162,7 @@ export function isKernelState(value: unknown): value is KernelState {
     validFrozenState(state),
     Array.isArray(state.activeProcessIds) && state.activeProcessIds.every((item) => typeof item === "string" && item.length > 0),
     Array.isArray(state.childIds),
-    state.completionRepair === undefined || isCompletionRepairState(state.completionRepair),
-    validSemanticState(state),
-    validToolBatchProgressState(state),
-    [state.completionRepairAttempts, state.continuationAttempts, state.repeatedToolBatchCount,
-      state.receiptCountAtLastUserInput].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
+    isTaskControlStateV1(state.taskControl)
   ].every(Boolean);
 }
 
