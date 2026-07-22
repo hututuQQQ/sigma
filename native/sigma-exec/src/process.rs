@@ -23,6 +23,9 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use crate::managed_server::{ManagedEnvironmentPrepareParams, ManagedServerContext};
+
 static ARTIFACT_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) const INTERNAL_LAUNCH_FAILURE_MARKER_PREFIX: &str =
     "@@SIGMA_EXEC_INTERNAL_LAUNCH_FAILURE_V1@@";
@@ -100,11 +103,21 @@ pub struct BrokerState {
     artifacts: Mutex<HashMap<String, PathBuf>>,
     redaction: Mutex<RedactionConfig>,
     scratch: ScratchLeases,
+    #[cfg(target_os = "linux")]
+    managed: Option<Arc<ManagedServerContext>>,
 }
 
 impl BrokerState {
     pub fn new(instance_id: String, allow_unsafe: bool) -> Self {
-        let artifact_root = std::env::temp_dir().join(format!(
+        Self::new_with_artifact_parent(instance_id, allow_unsafe, &std::env::temp_dir())
+    }
+
+    pub fn new_with_artifact_parent(
+        instance_id: String,
+        allow_unsafe: bool,
+        artifact_parent: &std::path::Path,
+    ) -> Self {
+        let artifact_root = artifact_parent.join(format!(
             "sigma-exec-artifacts-{instance_id}-{}",
             ARTIFACT_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -120,7 +133,53 @@ impl BrokerState {
             artifacts: Mutex::new(HashMap::new()),
             redaction: Mutex::new(RedactionConfig::default()),
             scratch: ScratchLeases::default(),
+            #[cfg(target_os = "linux")]
+            managed: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_managed(
+        instance_id: String,
+        artifact_parent: &std::path::Path,
+        managed: Arc<ManagedServerContext>,
+    ) -> Self {
+        let mut state = Self::new_with_artifact_parent(instance_id, false, artifact_parent);
+        state.managed = Some(managed);
+        state
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn has_scratch_session(&self, session_id: &str) -> Result<bool, RpcError> {
+        self.scratch.contains(session_id)
+    }
+
+    pub fn doctor_report(&self) -> Value {
+        self.decorate_doctor_report(crate::sandbox::doctor_report())
+    }
+
+    pub fn decorate_doctor_report(&self, report: Value) -> Value {
+        #[cfg(target_os = "linux")]
+        if let Some(managed) = &self.managed {
+            return managed.decorate_doctor(report);
+        }
+        report
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn prepare_managed_environment(
+        &self,
+        params: ManagedEnvironmentPrepareParams,
+    ) -> Result<Value, RpcError> {
+        self.managed
+            .as_ref()
+            .ok_or_else(|| {
+                RpcError::new(
+                    "method_not_found",
+                    "managed environment preparation is unavailable on this broker",
+                )
+            })?
+            .prepare(self, params)
     }
 
     pub fn instance_id(&self) -> &str {

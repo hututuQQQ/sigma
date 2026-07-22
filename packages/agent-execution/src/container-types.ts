@@ -68,6 +68,7 @@ export interface BrokerRuntimeClosureV1 {
   architecture: string;
   executableSearchPathsDigest: string;
   runtimeCommandsDigest: string;
+  runtimeDataDigest?: string;
   targetAttestationDigest: string;
 }
 

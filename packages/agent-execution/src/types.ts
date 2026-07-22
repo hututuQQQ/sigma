@@ -166,6 +166,10 @@ export interface BrokerCapabilities {
    * this connection-bound value instead of inheriting the control process's
    * PATH when the target resolves a bare executable name. */
   executableSearchPaths?: string[];
+  /** Digest of broker-attested runtime data installed in the disposable
+   * target. It is absent for legacy/native brokers and cannot be supplied by
+   * a model request. */
+  runtimeDataDigest?: string;
   /** Connection-bound closure of the authenticated target runtime. */
   runtimeClosure?: BrokerRuntimeClosureV1;
   managedEnvironment?: {

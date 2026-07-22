@@ -16,6 +16,7 @@ import type {
 export const MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1 = [
   "/app",
   "/logs",
+  "/opt/agent-cli",
   "/opt/sigma-control",
   "/opt/sigma-helper",
   "/opt/sigma-package",
@@ -23,7 +24,9 @@ export const MANAGED_ENVIRONMENT_PROTECTED_PATHS_V1 = [
   "/root/.ssh",
   "/run/credentials",
   "/run/secrets",
-  "/run/sigma-oci"
+  "/run/sigma-oci",
+  "/usr/local/bin/agent",
+  "/usr/local/bin/bwrap"
 ] as const;
 
 export interface PinnedContainerIdentity {
@@ -234,12 +237,14 @@ export function containerRuntimeClosure(
   const searchPaths = [...new Set(report.capabilities.executableSearchPaths ?? [])].sort();
   const runtimeCommands = [...new Set(report.capabilities.runtimeCommands ?? [])].sort();
   const targetAttestationDigest = observed.attestationDigest ?? stableSha256(observed);
+  const runtimeDataDigest = report.capabilities.runtimeDataDigest;
   const payload = {
     protocolVersion: 1 as const,
     platform: report.platform,
     architecture: report.architecture,
     executableSearchPathsDigest: stableSha256(searchPaths),
     runtimeCommandsDigest: stableSha256(runtimeCommands),
+    ...(runtimeDataDigest ? { runtimeDataDigest } : {}),
     targetAttestationDigest,
     complete: report.capabilities.runtimeCommandSnapshotComplete === true
       && searchPaths.length > 0

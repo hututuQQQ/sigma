@@ -54,6 +54,8 @@ function runtimeClosure(value: unknown): BrokerRuntimeClosureV1 {
   if (closure.protocolVersion !== 1 || typeof closure.complete !== "boolean") {
     throw new ContainerAttestationInvalidError("Managed environment runtime closure is invalid.");
   }
+  const runtimeDataDigest = closure.runtimeDataDigest === undefined
+    ? undefined : digestField(closure.runtimeDataDigest, "runtimeClosure.runtimeDataDigest");
   return {
     protocolVersion: 1,
     digest: digestField(closure.digest, "runtimeClosure.digest"),
@@ -66,6 +68,7 @@ function runtimeClosure(value: unknown): BrokerRuntimeClosureV1 {
     runtimeCommandsDigest: digestField(
       closure.runtimeCommandsDigest, "runtimeClosure.runtimeCommandsDigest"
     ),
+    ...(runtimeDataDigest ? { runtimeDataDigest } : {}),
     targetAttestationDigest: digestField(
       closure.targetAttestationDigest, "runtimeClosure.targetAttestationDigest"
     )

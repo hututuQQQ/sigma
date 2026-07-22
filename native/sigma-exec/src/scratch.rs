@@ -269,6 +269,16 @@ impl ScratchLease {
 }
 
 impl ScratchLeases {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn contains(&self, session_id: &str) -> Result<bool, RpcError> {
+        validate_session_id(session_id)?;
+        Ok(self
+            .by_session
+            .lock()
+            .map_err(lock_error)?
+            .contains_key(session_id))
+    }
+
     pub(crate) fn acquire(
         &self,
         instance_id: &str,

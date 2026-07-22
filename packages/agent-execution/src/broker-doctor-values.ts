@@ -146,6 +146,9 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
     );
   const searchPaths = executableSearchPaths(capabilities.executableSearchPaths, platform);
   const managedEnvironment = managedEnvironmentCapability(capabilities.managedEnvironment);
+  const runtimeDataDigest = optionalSha256(
+    capabilities.runtimeDataDigest, "capabilities.runtimeDataDigest"
+  );
   return {
     foreground: booleanValue(capabilities.foreground, "capabilities.foreground"),
     background: booleanValue(capabilities.background, "capabilities.background"),
@@ -162,6 +165,7 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
     ...(runtimeCommands ? { runtimeCommands } : {}),
     ...(runtimeCommandSnapshotComplete === undefined ? {} : { runtimeCommandSnapshotComplete }),
     ...(searchPaths ? { executableSearchPaths: searchPaths } : {}),
+    ...(runtimeDataDigest ? { runtimeDataDigest } : {}),
     ...(managedEnvironment ? { managedEnvironment } : {})
   };
 }
@@ -169,6 +173,14 @@ function parseDoctorCapabilities(input: unknown, platform: string): BrokerDoctor
 function optionalString(value: unknown, label: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   return stringValue(value, label);
+}
+
+function optionalSha256(value: unknown, label: string): string | undefined {
+  const result = optionalString(value, label);
+  if (result !== undefined && !/^sha256:[0-9a-f]{64}$/u.test(result)) {
+    throw new BrokerProtocolError(`${label} is not a SHA-256 digest.`);
+  }
+  return result;
 }
 
 function addContainerStrings(

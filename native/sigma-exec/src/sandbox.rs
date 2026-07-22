@@ -293,9 +293,9 @@ const MAX_EXECUTABLE_SEARCH_PATHS: usize = 128;
 // fixture, or benchmark identity. Omission is meaningful only within this
 // declared namespace and only while the connection-bound PATH remains stable.
 const RUNTIME_COMMAND_PROBE: &[&str] = &[
-    "bun", "cargo", "deno", "dotnet", "git", "go", "gradle", "gradlew", "java", "javac", "kotlinc",
-    "mvn", "mvnw", "node", "npm", "pnpm", "py", "pytest", "python", "python3", "rustc", "tsc",
-    "yarn",
+    "apk", "apt-get", "bun", "cargo", "deno", "dnf", "dotnet", "git", "go", "gradle", "gradlew",
+    "java", "javac", "kotlinc", "microdnf", "mvn", "mvnw", "node", "npm", "pnpm", "py", "pytest",
+    "python", "python3", "rustc", "tsc", "yum", "yarn",
 ];
 
 struct ExecutableSearchPathSnapshot {

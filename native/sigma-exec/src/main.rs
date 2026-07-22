@@ -2,6 +2,8 @@
 mod linux_hardening;
 #[cfg(target_os = "linux")]
 mod linux_mount_source;
+#[cfg(target_os = "linux")]
+mod managed_server;
 mod output;
 mod output_artifact;
 mod platform;
@@ -61,9 +63,13 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
                 "server": { "name": "sigma-exec", "version": env!("CARGO_PKG_VERSION") }
             }))
         }
-        "doctor" => Ok(sandbox::doctor_report()),
-        "sandbox.setup" => sandbox::setup_sandbox(),
-        "sandbox.repair" => sandbox::repair_sandbox(),
+        "doctor" => Ok(state.doctor_report()),
+        "sandbox.setup" => {
+            sandbox::setup_sandbox().map(|report| state.decorate_doctor_report(report))
+        }
+        "sandbox.repair" => {
+            sandbox::repair_sandbox().map(|report| state.decorate_doctor_report(report))
+        }
         "sandbox.status" => {
             let params = decode::<SandboxWorkspaceParams>(request.params, "sandbox status params")?;
             sandbox::sandbox_lease_status(&params.workspace_path)
@@ -79,6 +85,13 @@ fn dispatch(state: &BrokerState, request: Request) -> Result<Value, RpcError> {
         "scratch.release" => state.release_scratch_lease(decode::<ReleaseScratchLeaseParams>(
             request.params,
             "scratch release params",
+        )?),
+        #[cfg(target_os = "linux")]
+        "environment.prepare" => state.prepare_managed_environment(decode::<
+            managed_server::ManagedEnvironmentPrepareParams,
+        >(
+            request.params,
+            "managed environment preparation params",
         )?),
         "exec" => state.execute(
             request.request_id,
@@ -124,7 +137,7 @@ fn state_instance_id(state: &BrokerState) -> String {
     state.instance_id().to_owned()
 }
 
-fn handle_request(state: Arc<BrokerState>, writer: SharedWriter, request: Request) {
+pub(crate) fn handle_request(state: Arc<BrokerState>, writer: SharedWriter, request: Request) {
     let request_id = request.request_id;
     if request.protocol_version != PROTOCOL_VERSION {
         send_error(
@@ -270,6 +283,10 @@ fn main() {
     }
     #[cfg(target_os = "linux")]
     if let Some(code) = unix_pty::try_run_internal_mode() {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(code) = managed_server::try_run_managed_server() {
         std::process::exit(code);
     }
     #[cfg(windows)]

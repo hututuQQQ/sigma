@@ -180,6 +180,19 @@ function fixtureBroker(managedEnvironment = true): ExecutionBroker & {
 }
 
 describe("managed session binding and environment preparation", () => {
+  it("binds runtime-data changes even when the executable set is unchanged", () => {
+    const before = report(["apt-get"]);
+    const after = report(["apt-get"]);
+    before.capabilities.runtimeDataDigest = digest("a");
+    after.capabilities.runtimeDataDigest = digest("b");
+    const beforeClosure = containerRuntimeClosure(before, containerIdentity(before));
+    const afterClosure = containerRuntimeClosure(after, containerIdentity(after));
+    expect(beforeClosure.runtimeCommandsDigest).toBe(afterClosure.runtimeCommandsDigest);
+    expect(beforeClosure.runtimeDataDigest).toBe(digest("a"));
+    expect(afterClosure.runtimeDataDigest).toBe(digest("b"));
+    expect(beforeClosure.digest).not.toBe(afterClosure.digest);
+  });
+
   it("requires a launcher-authenticated disposable COW proof in required mode", async () => {
     const guarded = new AttestedContainerExecutionBroker(fixtureBroker(), {
       config: { engine: "docker", target: "managed", network: "full" },
