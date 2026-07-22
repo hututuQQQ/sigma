@@ -1396,6 +1396,21 @@ describe("agent-kernel exhaustive protocol behavior", () => {
     });
 
     frontier = frontierAfterEvidence(frontier, [], {
+      ...importedCheckpoint,
+      evidenceId: "imported-later",
+      data: {
+        checkpointId: "imported-cp-later",
+        preManifestDigest: "9".repeat(64),
+        sourceSessionId: "source-session-later"
+      }
+    });
+    expect(frontier).toMatchObject({
+      revision: 2,
+      baselineManifestDigest: "a".repeat(64),
+      sourceCheckpointIds: ["imported-cp", "imported-cp-later"]
+    });
+
+    frontier = frontierAfterEvidence(frontier, [], {
       evidenceId: "repo", sessionId: "session", runId: "run",
       kind: "repository_delta", status: "passed", createdAt: "2026-01-01T00:00:01.000Z",
       producer: { authority: "runtime" }, summary: "updated repository",
@@ -1408,7 +1423,7 @@ describe("agent-kernel exhaustive protocol behavior", () => {
       }
     });
     expect(frontier).toMatchObject({
-      revision: 2, repositoryStateDigest: "d".repeat(64), changedPaths: [".git"]
+      revision: 3, repositoryStateDigest: "d".repeat(64), changedPaths: [".git"]
     });
 
     const unchanged = frontierAfterEvidence(frontier, [], diagnosticEvidence("diagnostic-v4"));
