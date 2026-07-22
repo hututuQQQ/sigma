@@ -164,7 +164,7 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     harbor_topology: options.harborTopology,
     provider: options.provider,
     model: options.model ?? null,
-    dataset: terminalBenchDataset,
+    dataset: options.dataset ?? terminalBenchDataset,
     k: options.mode === "k" ? options.k : null,
     n_concurrent_trials: options.nConcurrentTrials,
     task_id: options.mode === "task" ? options.taskId : null,
@@ -476,10 +476,25 @@ export async function runTerminalBenchCli(argv, deps = {}) {
       configPath,
       jobsDir: slotJobsDir,
       timeoutPlan: slotPlan,
+      taskProbe: spec.taskProbe,
       task: spec.task,
+      resolvedTask: spec.resolvedTask,
       attestation,
       attestationPath,
       jobConfigSha256
+    });
+  }
+  if (deps.assertFrozenRunControls) {
+    await deps.assertFrozenRunControls({
+      options,
+      timeoutProbe,
+      slots: launchSlots.map((slot) => ({
+        task: slot.task,
+        resolvedTask: slot.resolvedTask,
+        taskProbe: slot.taskProbe,
+        timeoutPlan: slot.timeoutPlan,
+        jobConfigSha256: slot.jobConfigSha256
+      }))
     });
   }
   harborArgs = launchSlots[0].args;

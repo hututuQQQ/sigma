@@ -4,17 +4,14 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  buildHarborJobConfig,
   defaultAgentCliTarballForEnv,
   harborRuntimeDir as defaultHarborRuntimeDir,
   harborSandboxComposePath as defaultHarborSandboxComposePath,
   portableAgentImportPath,
   removedHarborDirectoryName,
   removedHarborPackageName,
-  rootDir as defaultRootDir,
-  terminalBenchDataset
+  rootDir as defaultRootDir
 } from "./bench-common.mjs";
-import { sigmaManifest } from "./lib/sigma-manifest.mjs";
 
 function resolveArtifactsDir(rootDir, options) {
   return options.artifactsDir ? path.resolve(options.artifactsDir) : path.join(rootDir, ".artifacts");
@@ -35,19 +32,6 @@ function resolveAgentCliTarball(rootDir, artifactsDir, env, options) {
   return path.join(artifactsDir, `agent-cli-linux-${targetArch}.tgz`);
 }
 
-function baseBenchmarkOptions(agentCliTarball) {
-  return {
-    provider: sigmaManifest.evaluation.provider,
-    model: sigmaManifest.evaluation.model,
-    maxTurns: 200,
-    commandTimeoutSec: 180,
-    validationMode: "auto",
-    agentCliTarball,
-    agentImportPath: portableAgentImportPath,
-    env: {}
-  };
-}
-
 function runtimeReadme(agentCliTarball) {
   return `# Portable Harbor Runtime
 
@@ -61,7 +45,7 @@ pnpm package:agent-cli
 pnpm package:harbor-runtime
 \`\`\`
 
-The generated JobConfig files point at this agent CLI tarball:
+Formal JobConfig files bind this agent CLI tarball by SHA-256:
 
 \`\`\`text
 ${agentCliTarball}
@@ -69,12 +53,15 @@ ${agentCliTarball}
 
 ## Run
 
-Set your provider key on the host, then point Harbor at this directory:
+Formal runs create source-free per-task JobConfig files from their SHA-bound
+\`SigmaFormalRunPreregistrationV1\`. This portable package deliberately contains
+no dataset, provider, model, task count, retry, or score-threshold defaults.
 
 \`\`\`bash
-export DEEPSEEK_API_KEY=...
-PYTHONPATH="$PWD/.artifacts/harbor-runtime" \\
-harbor run --config .artifacts/harbor-runtime/jobconfig.deepseek.k5.json
+pnpm bench:tb:formal -- \\
+  --preregistration-file formal-run.json \\
+  --expected-preregistration-sha256 <sha256> \\
+  --batch <batch-id>
 \`\`\`
 
 The Python adapter only depends on the Python standard library and Harbor. It uploads the packaged Sigma CLI, installs it as \`/usr/local/bin/agent\` in the task container, invokes \`agent run\`, and records its structured result after the run. Evaluation output is never passed back into the solving session.
@@ -124,31 +111,18 @@ export async function packageHarborRuntime(options = {}) {
   await writeFile(runtimePath, sourceText, "utf8");
   await writeFile(sandboxComposePath, sandboxComposeText, "utf8");
 
-  const k5Config = buildHarborJobConfig(
-    {
-      ...baseBenchmarkOptions(agentCliTarball),
-      mode: "k",
-      k: 5,
-      harborSandboxComposePath: sandboxComposePath
-    },
-    path.join(harborRuntimeDir, "jobs", "deepseek-k5")
-  );
   const readmeText = runtimeReadme(agentCliTarball);
-  const k5ConfigText = `${JSON.stringify(k5Config, null, 2)}\n`;
 
   assertNoRemovedHarborAdapter(readmeText, "Portable Harbor runtime README");
-  assertNoRemovedHarborAdapter(k5ConfigText, "Portable Harbor k5 JobConfig");
 
   await writeFile(path.join(harborRuntimeDir, "README.md"), readmeText, "utf8");
-  await writeFile(path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json"), k5ConfigText, "utf8");
 
   return {
     artifactsDir,
     harborRuntimeDir,
     runtimePath,
     sandboxComposePath,
-    agentCliTarball,
-    k5ConfigPath: path.join(harborRuntimeDir, "jobconfig.deepseek.k5.json")
+    agentCliTarball
   };
 }
 
@@ -158,7 +132,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.log(`Created ${path.relative(defaultRootDir, result.harborRuntimeDir)}`);
     console.log(`Runtime import: ${portableAgentImportPath}`);
     console.log(`Agent CLI tarball: ${result.agentCliTarball}`);
-    console.log(`Dataset: ${terminalBenchDataset}`);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

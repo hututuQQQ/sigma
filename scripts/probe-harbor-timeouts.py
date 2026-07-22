@@ -44,6 +44,11 @@ def _timeout_record(trial_task_config: Any, task_path: Path | None) -> dict[str,
         task_definition = TaskDefinitionConfig.model_validate_toml(config_path.read_text(encoding="utf-8"))
 
     metadata = task_definition.metadata if task_definition is not None else {}
+    network_mode = (
+        getattr(task_definition.environment.network_mode, "value", task_definition.environment.network_mode)
+        if task_definition is not None
+        else None
+    )
     return {
         "task_name": _task_name(trial_task_config, task_definition),
         "task_path": str(task_path) if task_path is not None else None,
@@ -57,6 +62,7 @@ def _timeout_record(trial_task_config: Any, task_path: Path | None) -> dict[str,
         "environment_build_timeout_sec": (
             _number(task_definition.environment.build_timeout_sec) if task_definition is not None else None
         ),
+        "network_mode": str(network_mode) if network_mode is not None else None,
         "expert_time_estimate_min": _number(metadata.get("expert_time_estimate_min")),
         "junior_time_estimate_min": _number(metadata.get("junior_time_estimate_min")),
     }

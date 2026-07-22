@@ -360,9 +360,11 @@ export function resolveRunOptions(argv, env = process.env) {
   if (resolvedHarborTopology === "managed_three_role" && resolvedManagedEnvironmentMode !== "required") {
     throw new Error("Harbor topology managed_three_role requires managed environment mode required.");
   }
+  const configuredMaxTurns = flags["max-turns"] ?? env.AGENT_MAX_TURNS;
   return {
     mode,
     benchmarkClass: runClass,
+    dataset: asString(flags.dataset ?? env.SIGMA_BENCH_DATASET, terminalBenchDataset),
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
     agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "standard"),
@@ -377,6 +379,8 @@ export function resolveRunOptions(argv, env = process.env) {
       defaultConcurrentTrials,
       "--concurrency"
     ),
+    attemptsPerTask: asPositiveInt(flags.attempts, 1, "--attempts"),
+    retries: asNonNegativeInt(flags.retries, 0, "--retries"),
     taskId: asString(flags["task-id"]),
     tasksFile: tasksFile ? path.resolve(tasksFile) : null,
     tasksFileSha256: tasksFile
@@ -385,14 +389,18 @@ export function resolveRunOptions(argv, env = process.env) {
     tasks,
     reusePackage: flags["reuse-package"] === true,
     expectedArchiveSha256,
-    maxTurns: asPositiveInt(env.AGENT_MAX_TURNS, 200, "AGENT_MAX_TURNS"),
-    maxTurnsExplicit: env.AGENT_MAX_TURNS !== undefined && env.AGENT_MAX_TURNS !== null && env.AGENT_MAX_TURNS !== "",
-    commandTimeoutSec: asPositiveInt(env.AGENT_COMMAND_TIMEOUT_SEC, 180, "AGENT_COMMAND_TIMEOUT_SEC"),
+    maxTurns: asPositiveInt(configuredMaxTurns, 200, "--max-turns"),
+    maxTurnsExplicit: configuredMaxTurns !== undefined && configuredMaxTurns !== null && configuredMaxTurns !== "",
+    commandTimeoutSec: asPositiveInt(
+      flags["command-timeout-sec"] ?? env.AGENT_COMMAND_TIMEOUT_SEC,
+      180,
+      "--command-timeout-sec"
+    ),
     maxWallTimeSec: asOptionalPositiveInt(env.AGENT_MAX_WALL_TIME_SEC, "AGENT_MAX_WALL_TIME_SEC"),
     agentTimeoutGraceSec: asPositiveInt(
-      env.AGENT_TIMEOUT_GRACE_SEC,
+      flags["agent-timeout-grace-sec"] ?? env.AGENT_TIMEOUT_GRACE_SEC,
       defaultAgentTimeoutGraceSec,
-      "AGENT_TIMEOUT_GRACE_SEC"
+      "--agent-timeout-grace-sec"
     ),
     agentTimeoutLeniencyMultiplier: asPositiveNumber(
       flags["timeout-leniency-multiplier"] ?? env.AGENT_TIMEOUT_LENIENCY_MULTIPLIER,
@@ -651,6 +659,8 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
 
   const config = {
     jobs_dir: jobsDir,
+    n_attempts: options.attemptsPerTask ?? 1,
+    retry: { max_retries: options.retries ?? 0 },
     n_concurrent_trials: options.nConcurrentTrials ?? defaultConcurrentTrials,
     agents: [
       {
@@ -682,7 +692,7 @@ export function buildHarborJobConfig(options, jobsDir, timeoutPlan = null, timeo
   } else {
     config.datasets = [
       {
-        name: terminalBenchDataset,
+        name: options.dataset ?? terminalBenchDataset,
         n_tasks: options.mode === "smoke" ? 5 : options.k
       }
     ];
@@ -796,7 +806,10 @@ export function buildHarborArgs(options) {
   }
 
   if (options.mode === "smoke") {
-    const args = ["run", "-d", terminalBenchDataset, "-a", "oracle", capabilities.taskLimitFlag ?? "-l", "5"];
+    const args = [
+      "run", "-d", options.dataset ?? terminalBenchDataset,
+      "-a", "oracle", capabilities.taskLimitFlag ?? "-l", "5"
+    ];
     if (options.jobsDir) args.push("--jobs-dir", options.jobsDir);
     if (capabilities.yesFlag) args.push(capabilities.yesFlag);
     return args;
@@ -808,7 +821,7 @@ export function buildHarborArgs(options) {
   const args = [
     "run",
     "-d",
-    terminalBenchDataset,
+    options.dataset ?? terminalBenchDataset,
     capabilities.agentFlag ?? "--agent-import-path",
     selectedAgentImportPath
   ];

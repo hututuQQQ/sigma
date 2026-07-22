@@ -220,13 +220,19 @@ describe("Terminal-Bench command construction", () => {
       "--network", "full",
       "--execution-mode", "container",
       "--managed-environment-mode", "required",
-      "--harbor-topology", "managed_three_role"
+      "--harbor-topology", "managed_three_role",
+      "--max-turns", "73",
+      "--command-timeout-sec", "41",
+      "--agent-timeout-grace-sec", "17"
     ]);
     expect(options).toMatchObject({
       networkMode: "full",
       executionMode: "container",
       managedEnvironmentMode: "required",
-      harborTopology: "managed_three_role"
+      harborTopology: "managed_three_role",
+      maxTurns: 73,
+      commandTimeoutSec: 41,
+      agentTimeoutGraceSec: 17
     });
     expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
       network_mode: "full",
@@ -251,6 +257,17 @@ describe("Terminal-Bench command construction", () => {
       "--mode", "task", "--task-id", "generic-task",
       "--harbor-topology", "managed_three_role"
     ])).toThrow(/managed environment mode required/iu);
+    for (const invalid of [
+      ["--execution-mode", "sandboxed", "--network", "full", "--harbor-topology", "managed_three_role"],
+      ["--execution-mode", "container", "--network", "none", "--harbor-topology", "managed_three_role"],
+      ["--execution-mode", "container", "--network", "full", "--harbor-topology", "main_only"]
+    ]) {
+      expect(() => resolveRunOptions([
+        "--mode", "task", "--task-id", "generic-task",
+        "--managed-environment-mode", "required",
+        ...invalid
+      ])).toThrow(/managed environment mode required/iu);
+    }
   });
 
   it("keeps the full task timeout for solving and reserves cleanup outside it", () => {

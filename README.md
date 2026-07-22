@@ -16,7 +16,7 @@
 <p align="center">
   <img alt="Status: Stable" src="https://img.shields.io/badge/status-v4.0.0-2ea44f">
   <img alt="Release targets: Linux stable and Windows preview" src="https://img.shields.io/badge/release%20targets-Linux%20stable%20%2B%20Windows%20preview-0078d4">
-  <img alt="Formal evaluation: DeepSeek only" src="https://img.shields.io/badge/formal%20evaluation-DeepSeek%20only-4cc9c0">
+  <img alt="Formal evaluation: preregistered" src="https://img.shields.io/badge/formal%20evaluation-preregistered-4cc9c0">
 </p>
 
 <p align="center">
@@ -35,8 +35,8 @@ guide](CONTRIBUTING.md) before reporting or proposing changes.
 > **Current product boundary**
 >
 > - **Linux x64 is the official stable binary release. Windows x64 is an unsigned preview.** Both archives pass native sandbox, packaged-product, checksum, SBOM, and signed-provenance gates, but the Windows executables do not yet have a trusted Authenticode signature and may trigger Windows security warnings.
-> - **Formal evaluation and benchmark runs are currently DeepSeek-only.** Sigma's evaluator, Harbor adapter, and Terminal-Bench harness are maintained around DeepSeek; results from other providers are not used for formal claims.
-> - The runtime contains DeepSeek and GLM/Z.ai gateway support, but the GLM path does not have the same formal evaluation coverage.
+> - **Formal evaluation is preregistered, not provider-coded.** The SHA-bound run manifest freezes the provider, model, source, archive, task selection, network, timeouts, concurrency, attempts, and retries before execution.
+> - Provider comparisons are valid only when their SHA-bound run manifests freeze comparable controls; the harness does not infer comparability from a model name.
 > - Sigma treats **OpenCode as a direct competitor and a product target, not a parity claim**. There is still a real gap between Sigma and OpenCode in overall practical performance and maturity today.
 
 ## Why Sigma Code
@@ -298,11 +298,11 @@ process_handoff = "deny"
 
 Older configuration files can be checked with `agent config migrate --workspace . --check` and atomically upgraded with `agent config migrate --workspace . --write`. Durable V5 sessions are written only to `stores/v5`; V5 never reads or falls back to a V4 session store.
 
-DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path, but formal Sigma evaluation remains DeepSeek-only.
+DeepSeek uses `DEEPSEEK_API_KEY`. The runtime also recognizes `GLM_API_KEY`, `ZAI_API_KEY`, or `BIGMODEL_API_KEY` for the experimental GLM/Z.ai path. A provider is part of a formal claim only when it is frozen in that run's preregistration.
 
 ## Evaluation and benchmark boundary
 
-Sigma's formal experience evaluator runs the packaged product in fresh, opaque workspaces and reduces the durable event stream into separate correctness, safety, experience, and reliability results. The current manifest fixes formal evaluation to **DeepSeek** (currently `deepseek-v4-pro`). Terminal-Bench runs through the dedicated Harbor-compatible DeepSeek harness.
+Sigma's formal experience evaluator runs the packaged product in fresh, opaque workspaces and reduces the durable event stream into separate correctness, safety, experience, and reliability results. Terminal-Bench formal runs require a `SigmaFormalRunPreregistrationV1`; code supplies no formal dataset, model, quota, retry, or score threshold default.
 
 The evaluator may select a task, launch the packaged CLI, and collect artifacts after the run. It must not send scenario identity, verifier output, scores, rewards, hidden checks, or post-run failures into the solving session, and verifier feedback never triggers another solving attempt. This fairness boundary is enforced by protocol types and production-source scans.
 
@@ -310,10 +310,13 @@ The evaluator may select a task, launch the packaged CLI, and collect artifacts 
 # Audit existing sessions without a model call.
 pnpm eval:session -- --workspace . --latest 2
 
-# DeepSeek-only live evaluation and benchmark paths.
+# Live evaluation uses explicitly supplied provider/model controls.
 pnpm eval:agent -- --suite quick
 pnpm eval:agent -- --suite experience --repeat 3
-pnpm bench:deepseek
+
+# Create and consume an immutable formal run manifest.
+pnpm bench:tb:preregister -- --draft formal-draft.json --output formal-run.json
+pnpm bench:tb:formal -- --preregistration-file formal-run.json --expected-preregistration-sha256 <sha256> --batch <batch-id>
 ```
 
 No cross-provider benchmark conclusion should be inferred from these results.
@@ -360,4 +363,4 @@ Sigma Code is available under the [MIT License](LICENSE).
 
 ## Direction
 
-Sigma's near-term focus is deliberately narrow: make the Windows product dependable, deepen the DeepSeek-specific harness and long-session convergence, improve real task performance toward OpenCode, and keep evaluation feedback outside the solving boundary. Broader formal platform/provider support should follow demonstrated product reliability rather than lead it.
+Sigma's near-term focus is deliberately narrow: make the Windows product dependable, deepen long-session convergence, improve real task performance, and keep evaluation feedback outside the solving boundary. Broader formal platform/provider claims should follow reproducible preregistration and demonstrated product reliability rather than lead it.

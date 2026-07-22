@@ -129,6 +129,12 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             )
         with self.assertRaisesRegex(ValueError, "needs managed_environment_mode=required"):
             module.SigmaCliHarborAgent(harbor_topology="managed_three_role")
+        with self.assertRaisesRegex(ValueError, "managed_environment_mode"):
+            module.SigmaCliHarborAgent(
+                execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="unknown",
+            )
 
     async def test_container_execution_mode_is_forwarded_without_host_opt_in(self):
         module = import_portable_agent_module()
@@ -136,6 +142,9 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             agent = module.SigmaCliHarborAgent(
                 logs_dir=Path(tmp) / "logs",
                 execution_mode="container",
+                network_mode="full",
+                managed_environment_mode="required",
+                harbor_topology="managed_three_role",
             )
             agent._workspace = "/app"
 
@@ -145,11 +154,15 @@ class HarborAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", command)
             self.assertIn("container", command)
+            self.assertIn("--managed-environment-mode", command)
+            self.assertIn("required", command)
             self.assertIn("--agent-profile", command)
             self.assertIn("standard", command)
             self.assertEqual(session_command[0], "/usr/local/bin/agent")
             self.assertIn("--execution-mode", session_command)
             self.assertIn("container", session_command)
+            self.assertIn("--managed-environment-mode", session_command)
+            self.assertIn("required", session_command)
             self.assertIn("--agent-profile", session_command)
             self.assertIn("standard", session_command)
             self.assertNotIn("HOME=/tmp/agent/disposable-home", command)
