@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1524,8 +1525,7 @@ function agentExceptionFromTrial(trialResult, exceptionMessage) {
   };
 }
 
-async function readHarborTrialResults(runDir) {
-  const jobsDir = path.join(runDir, "harbor-jobs");
+async function readHarborTrialResults(runDir, jobsDir) {
   const resultFiles = await listJsonFiles(jobsDir);
   const results = [];
   for (const filePath of resultFiles) {
@@ -1546,8 +1546,8 @@ async function readHarborTrialResults(runDir) {
   return results.sort((a, b) => String(a.trial_name).localeCompare(String(b.trial_name)));
 }
 
-async function readHarborJobAccounting(runDir) {
-  const resultFiles = await listJsonFiles(path.join(runDir, "harbor-jobs"));
+async function readHarborJobAccounting(runDir, jobsDir) {
+  const resultFiles = await listJsonFiles(jobsDir);
   const jobs = [];
   for (const filePath of resultFiles) {
     const value = await readJsonSafe(filePath);
@@ -2468,16 +2468,28 @@ export async function generateBenchReport(runDir) {
     await readTextSafe(path.join(runDir, "harbor.stderr.log")),
     await readTextSafe(path.join(runDir, "result.raw.log"))
   ].join("\n");
+  const defaultJobsDir = path.join(runDir, "harbor-jobs");
+  const configuredJobsDir = typeof config.harbor_jobs_dir === "string"
+    ? path.resolve(config.harbor_jobs_dir)
+    : defaultJobsDir;
+  const allowedJobRoots = [path.resolve(runDir), path.resolve(os.tmpdir(), "sigma-harbor")];
+  const jobsDirAllowed = allowedJobRoots.some((root) => {
+    const relative = path.relative(root, configuredJobsDir);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`));
+  });
+  if (!jobsDirAllowed) {
+    incompleteReason.push("Configured Harbor jobs directory is outside the run or runtime scratch roots.");
+  }
   const taskDirs = await listTaskDirs(runDir);
   const mirroredTasks = taskDirs.length > 0
     ? await Promise.all(taskDirs.map((taskDir, index) => taskReportFromDir(runDir, taskDir, index, config, globalLogText)))
     : [syntheticRunTask(config, globalLogText)];
-  const harborTrialResults = await readHarborTrialResults(runDir);
-  const harborJobAccounting = await readHarborJobAccounting(runDir);
+  const harborTrialResults = jobsDirAllowed ? await readHarborTrialResults(runDir, configuredJobsDir) : [];
+  const harborJobAccounting = jobsDirAllowed ? await readHarborJobAccounting(runDir, configuredJobsDir) : null;
   const resolvedJobConfig = await resolvedJobConfigForReport(runDir, config);
   const expected = expectedTrialCount(config, resolvedJobConfig);
   const accounting = trialAccounting(expected, harborTrialResults);
-  const hasHarborEvidence = existsSync(path.join(runDir, "harbor-jobs"))
+  const hasHarborEvidence = jobsDirAllowed && existsSync(configuredJobsDir)
     || typeof config.resolved_job_config_path === "string";
   if (hasHarborEvidence && expected > 0) {
     if (accounting.observed !== expected) {

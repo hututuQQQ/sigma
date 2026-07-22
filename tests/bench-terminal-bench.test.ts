@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { runTerminalBenchCli } from "../scripts/bench-terminal-bench.mjs";
+import {
+  boundedBenchmarkRunId,
+  portableHarborJobsDir,
+  runTerminalBenchCli
+} from "../scripts/bench-terminal-bench.mjs";
 
 interface RunnerLogOptions {
   stdoutPath?: string;
@@ -92,7 +96,31 @@ async function packageRuntimeFixture(fixtureDir: string) {
   return { exitCode: 0, stdout: "", stderr: "", harborRuntimeDir };
 }
 
+async function removeRunArtifacts(runDir: string) {
+  const config = JSON.parse(await readFile(path.join(runDir, "config.json"), "utf8"));
+  const jobsDir = typeof config.harbor_jobs_dir === "string" ? path.resolve(config.harbor_jobs_dir) : null;
+  if (jobsDir && jobsDir !== path.join(runDir, "harbor-jobs")) {
+    await rm(jobsDir, { recursive: true, force: true });
+  }
+  await rm(runDir, { recursive: true, force: true });
+}
+
 describe("Terminal-Bench CLI verifier result handling", () => {
+  it("keeps Windows Harbor workspaces and labeled run identifiers within a portable path budget", () => {
+    const runId = boundedBenchmarkRunId(
+      "20260723-120000-deepseek-deepseek-v4-pro",
+      "formal-a-deliberately-long-preregistered-evaluation-identifier"
+    );
+    const jobsDir = portableHarborJobsDir(
+      path.join("D:\\very-long-worktree", runId),
+      "win32",
+      "C:\\t"
+    );
+    expect(runId.length).toBeLessThanOrEqual(72);
+    expect(jobsDir).toMatch(/^C:\\t\\sigma-harbor\\[a-f0-9]{24}$/u);
+    expect(jobsDir).not.toContain(runId);
+  });
+
   it("reuses only an archive matching the frozen SHA-256", async () => {
     const fixtureDir = await mkdtemp(path.join(os.tmpdir(), "sigma-bench-archive-"));
     const tarball = path.join(fixtureDir, "agent-cli-linux-x64.tgz");
@@ -135,7 +163,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(result.report.agent_cli_sha256).toBe(sha);
       expect(result.report.package_reused).toBe(true);
     } finally {
-      await rm(result.runDir, { recursive: true, force: true });
+      await removeRunArtifacts(result.runDir);
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;
       else process.env.AGENT_CLI_TARBALL = previousTarball;
       await rm(fixtureDir, { recursive: true, force: true });
@@ -199,7 +227,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(runConfig.resolved_job_config_paths).toHaveLength(1);
       expect(runConfig.run_slots).toHaveLength(1);
     } finally {
-      await rm(result.runDir, { recursive: true, force: true });
+      await removeRunArtifacts(result.runDir);
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;
       else process.env.AGENT_CLI_TARBALL = previousTarball;
       await rm(fixtureDir, { recursive: true, force: true });
@@ -296,7 +324,7 @@ describe("Terminal-Bench CLI verifier result handling", () => {
       expect(result.report.tasks.every((task: { provenance_source?: string }) =>
         task.provenance_source === "frozen-selection")).toBe(true);
     } finally {
-      await rm(result.runDir, { recursive: true, force: true });
+      await removeRunArtifacts(result.runDir);
       if (previousTarball === undefined) delete process.env.AGENT_CLI_TARBALL;
       else process.env.AGENT_CLI_TARBALL = previousTarball;
       await rm(fixtureDir, { recursive: true, force: true });

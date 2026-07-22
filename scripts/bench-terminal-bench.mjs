@@ -2,6 +2,7 @@
 import { existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupHarborDockerResources } from "./harbor-docker-cleanup.mjs";
@@ -53,6 +54,23 @@ function evaluationLane(agentProfile) {
   return agentProfile === "strict" ? "strict_conformance" : "solving";
 }
 
+const MAX_PORTABLE_RUN_ID_LENGTH = 72;
+
+export function boundedBenchmarkRunId(baseRunId, runLabel) {
+  if (!runLabel) return baseRunId;
+  const label = safePathPart(runLabel);
+  const candidate = `${baseRunId}-${label}`;
+  if (candidate.length <= MAX_PORTABLE_RUN_ID_LENGTH) return candidate;
+  const digest = createHash("sha256").update(label).digest("hex").slice(0, 16);
+  const prefixLength = Math.max(0, MAX_PORTABLE_RUN_ID_LENGTH - baseRunId.length - digest.length - 2);
+  return `${baseRunId}-${label.slice(0, prefixLength)}-${digest}`;
+}
+
+export function portableHarborJobsDir(runDir, platform = process.platform, tempDir = os.tmpdir()) {
+  if (platform !== "win32") return path.join(runDir, "harbor-jobs");
+  return path.join(tempDir, "sigma-harbor", randomBytes(12).toString("hex"));
+}
+
 export async function runWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
@@ -71,7 +89,7 @@ export async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
-function freshRunSlotId(existing, makeId = () => randomBytes(16).toString("hex")) {
+function freshRunSlotId(existing, makeId = () => randomBytes(8).toString("hex")) {
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const id = safePathPart(makeId(), "slot");
     if (!existing.has(id)) {
@@ -135,9 +153,9 @@ export async function runTerminalBenchCli(argv, deps = {}) {
   }
 
   const baseRunId = makeRunId(new Date(), options.provider, options.model);
-  const runId = options.runLabel ? `${baseRunId}-${safePathPart(options.runLabel)}` : baseRunId;
+  const runId = boundedBenchmarkRunId(baseRunId, options.runLabel);
   const runDir = path.join(benchRootDir, runId);
-  const jobsDir = path.join(runDir, "harbor-jobs");
+  const jobsDir = deps.harborJobsDir ?? portableHarborJobsDir(runDir);
   const env = harborEnvForRun(runDir);
   const startedAt = new Date().toISOString();
   const runner = deps.runProcess ?? runProcess;
