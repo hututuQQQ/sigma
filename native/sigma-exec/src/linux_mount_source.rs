@@ -1,7 +1,7 @@
 use crate::protocol::RpcError;
 use std::ffi::CString;
 use std::fs::{File, Metadata};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -137,6 +137,68 @@ impl PinnedMountSource {
             .metadata()
             .map(|metadata| metadata.is_file())
             .map_err(|error| invalid_root(&self.destination, error))
+    }
+
+    pub(crate) fn sha256(&self) -> Result<String, RpcError> {
+        use sha2::{Digest, Sha256};
+
+        let pinned_metadata = self
+            .descriptor
+            .metadata()
+            .map_err(|error| invalid_root(&self.destination, error))?;
+        if !pinned_metadata.is_file() {
+            return Err(RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot hash pinned non-file executable '{}'",
+                    self.destination.display()
+                ),
+            ));
+        }
+        // Reopen the already pinned inode through procfs. This does not perform
+        // another lookup of the caller-controlled pathname, so replacement of
+        // the original directory entry cannot change the bytes being hashed.
+        let mut file = File::open(self.fd_path()).map_err(|error| {
+            RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot read pinned executable '{}': {error}",
+                    self.destination.display()
+                ),
+            )
+        })?;
+        let opened_metadata = file.metadata().map_err(|error| {
+            RpcError::new(
+                "executable_unavailable",
+                format!(
+                    "cannot inspect pinned executable '{}': {error}",
+                    self.destination.display()
+                ),
+            )
+        })?;
+        if FileIdentity::from_metadata(&opened_metadata)
+            != FileIdentity::from_metadata(&pinned_metadata)
+        {
+            return Err(changed_root(&self.destination));
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| {
+                RpcError::new(
+                    "executable_unavailable",
+                    format!(
+                        "cannot hash pinned executable '{}': {error}",
+                        self.destination.display()
+                    ),
+                )
+            })?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     pub(crate) fn is_executable_file(&self) -> Result<bool, RpcError> {
@@ -395,6 +457,7 @@ fn changed_root(path: &Path) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -461,6 +524,29 @@ mod tests {
             std::fs::read_to_string(file_fd).expect("read pinned file"),
             "trusted-file"
         );
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn hashes_the_pinned_file_identity_instead_of_a_replacement_path() {
+        let root = test_root("hash");
+        let file = root.join("tool");
+        let moved = root.join("trusted-tool");
+        std::fs::create_dir_all(&root).expect("create hash root");
+        std::fs::write(&file, b"trusted-file").expect("write trusted file");
+        let source = PinnedMountSource::pin(&file).expect("pin trusted file");
+        std::fs::rename(&file, &moved).expect("move trusted file");
+        std::fs::write(&file, b"replacement-file").expect("write replacement file");
+
+        assert_eq!(
+            source.sha256().expect("hash pinned file"),
+            format!("{:x}", Sha256::digest(b"trusted-file"))
+        );
+        let directory = PinnedMountSource::pin(&root).expect("pin directory");
+        let error = directory
+            .sha256()
+            .expect_err("directory hash must fail closed");
+        assert_eq!(error.code, "executable_unavailable");
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 

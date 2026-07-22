@@ -487,6 +487,8 @@ fn linux_verified_bash() -> Option<PathBuf> {
                     scratch_lease_id: None,
                     scratch_session_id: None,
                     session_scratch_roots: Vec::new(),
+                    repository_metadata_lease_id: None,
+                    repository_metadata_roots: Vec::new(),
                     #[cfg(test)]
                     unsafe_host_exec_approved: false,
                 },

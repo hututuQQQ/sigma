@@ -10,6 +10,7 @@ import {
 } from "../packages/agent-protocol/src/index.js";
 import {
   advanceReviewRepair,
+  advanceRepositoryEvidenceObligation,
   assertKernelInvariants,
   beginGoalEpoch,
   completionEvidenceObligation,
@@ -25,6 +26,8 @@ import {
   recordSemanticFact,
   recordSemanticToolResult,
   recordToolPolicyViolation,
+  repositoryRecoveryDecisionState,
+  repositoryRecoveryObligation,
   resolveTaskObligation,
   reviewRepairObligation,
   startActionBatch,
@@ -568,5 +571,202 @@ describe("TaskControlStateV1", () => {
       findings: [{ actionable: false, severity: "warning", summary: "Optional." }]
     });
     expect(advisoryOnly.taskControl.obligation).toBeUndefined();
+  });
+
+  it("binds repository recovery decisions, selections, and acceptance to the current goal", () => {
+    const state = initial();
+    const evidenceBase = {
+      sessionId: state.sessionId,
+      runId: state.runId,
+      status: "passed" as const,
+      createdAt: NOW,
+      producer: { authority: "runtime" as const },
+      summary: "repository recovery evidence"
+    };
+    const decision: EvidenceRecord = {
+      ...evidenceBase,
+      evidenceId: "repository-decision",
+      kind: "repository_recovery_decision",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        repositoryRoot: "/workspace",
+        inspectionBasisDigest: DIGEST_A,
+        candidateSetDigest: DIGEST_B,
+        repositoryStateDigest: "c".repeat(64),
+        candidates: [
+          {
+            candidateId: "d".repeat(64), timestamp: 2, relationToHead: "descendant_of_head",
+            action: "reset", subject: "newer", subjectTrusted: false
+          },
+          {
+            candidateId: "e".repeat(64), timestamp: 1, relationToHead: "diverged",
+            action: "reset", subject: "older", subjectTrusted: false
+          }
+        ]
+      }
+    };
+    const staleDecision = {
+      ...decision,
+      data: { ...decision.data, goalEpoch: state.taskControl.goalEpoch + 1 }
+    } as EvidenceRecord;
+    expect(advanceRepositoryEvidenceObligation(state, staleDecision)).toBeUndefined();
+    expect(apply(state, "evidence.recorded", decision)).toMatchObject({
+      taskControl: {
+        phase: "terminal",
+        obligation: {
+          kind: "user_decision",
+          decisionCode: `repository_recovery:${DIGEST_B}`
+        }
+      }
+    });
+
+    const selection: EvidenceRecord = {
+      ...evidenceBase,
+      evidenceId: "repository-selection",
+      kind: "repository_recovery_selection",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        repositoryRoot: "/workspace",
+        candidateId: "d".repeat(64),
+        selectedObject: "1".repeat(40),
+        selectionKind: "user_selected",
+        inspectionBasisDigest: DIGEST_A,
+        inspectedHead: "2".repeat(40),
+        inspectedSymbolicRef: "refs/heads/main",
+        statusDigest: "3".repeat(64),
+        refsDigest: "4".repeat(64),
+        reflogDigest: "5".repeat(64),
+        repositoryStateDigest: "6".repeat(64)
+      }
+    };
+    expect(advanceRepositoryEvidenceObligation(state, {
+      ...selection,
+      data: { ...selection.data, goalEpoch: state.taskControl.goalEpoch + 1 }
+    } as EvidenceRecord)).toBeUndefined();
+    expect(advanceRepositoryEvidenceObligation(state, selection)).toMatchObject({
+      taskControl: {
+        obligation: {
+          kind: "repository_recovery",
+          stage: "transact"
+        }
+      }
+    });
+    expect(apply(state, "evidence.recorded", selection)).toMatchObject({
+      taskControl: { obligation: { kind: "repository_recovery", stage: "transact" } }
+    });
+
+    const recovering = {
+      ...state,
+      taskControl: repositoryRecoveryObligation(
+        state.taskControl, state.revision, "validate", { candidateId: "d".repeat(64) }, "transaction"
+      )
+    };
+    const acceptance: EvidenceRecord = {
+      ...evidenceBase,
+      evidenceId: "repository-acceptance",
+      kind: "repository_acceptance",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        frontierRevision: state.mutationFrontier.revision,
+        frontierStateDigest: state.mutationFrontier.currentStateDigest,
+        repositoryRoot: "/workspace",
+        transactionHandle: "transaction",
+        operationClasses: ["recover"],
+        repositoryStateDigest: "7".repeat(64),
+        selectionEvidenceId: selection.evidenceId,
+        candidateId: "d".repeat(64),
+        semanticAssertions: {
+          schemaVersion: 3,
+          head: "1".repeat(40),
+          symbolicRef: "refs/heads/main",
+          refsDigest: "8".repeat(64),
+          reachabilityDigest: "9".repeat(64),
+          reachableObjectCount: 1,
+          indexDigest: "a".repeat(64),
+          conflictsDigest: "b".repeat(64),
+          conflictCount: 0,
+          trackedDigest: "c".repeat(64),
+          trackedCount: 1,
+          untrackedDigest: "d".repeat(64),
+          untrackedCount: 0,
+          targetAssertions: {
+            schemaVersion: 3,
+            selectedHead: "1".repeat(40),
+            selectedSymbolicRef: "refs/heads/main",
+            requiredReachableObjects: ["1".repeat(40)],
+            satisfied: true
+          }
+        }
+      }
+    };
+    const acceptanceWith = (changes: Partial<typeof acceptance.data>): EvidenceRecord => ({
+      ...acceptance,
+      data: { ...acceptance.data, ...changes }
+    } as EvidenceRecord);
+    expect(advanceRepositoryEvidenceObligation(recovering,
+      acceptanceWith({ goalEpoch: state.taskControl.goalEpoch + 1 }))).toBeUndefined();
+    expect(advanceRepositoryEvidenceObligation(recovering,
+      acceptanceWith({ frontierRevision: state.mutationFrontier.revision + 1 }))).toBeUndefined();
+    expect(advanceRepositoryEvidenceObligation(recovering,
+      acceptanceWith({ frontierStateDigest: DIGEST_B }))).toBeUndefined();
+    expect(advanceRepositoryEvidenceObligation(recovering, acceptance)).toMatchObject({
+      taskControl: { phase: "normal", obligation: undefined }
+    });
+    expect(apply(recovering, "evidence.recorded", acceptance)).toMatchObject({
+      taskControl: { phase: "normal", obligation: undefined }
+    });
+    const assertionsWithoutTarget = { ...acceptance.data.semanticAssertions };
+    delete assertionsWithoutTarget.targetAssertions;
+    const auditAcceptance = {
+      ...acceptance,
+      evidenceId: "repository-acceptance-without-selection-target",
+      data: {
+        ...acceptance.data,
+        selectionEvidenceId: undefined,
+        candidateId: undefined,
+        semanticAssertions: assertionsWithoutTarget
+      }
+    } as EvidenceRecord;
+    expect(apply(recovering, "evidence.recorded", auditAcceptance).evidence)
+      .toContainEqual(auditAcceptance);
+
+    expect(repositoryRecoveryDecisionState(recovering, [])).toBe(recovering);
+    expect(repositoryRecoveryDecisionState(recovering, ["repository_restored"]).taskControl.obligation)
+      .toBeUndefined();
+    expect(repositoryRecoveryDecisionState(recovering, ["conflicts_pending"])).toMatchObject({
+      taskControl: { obligation: { kind: "repository_recovery", stage: "transact" } }
+    });
+    expect(repositoryRecoveryDecisionState(recovering, ["recovery_result_lost_no_replay"])).toMatchObject({
+      taskControl: { obligation: { kind: "user_decision", decisionCode: "recovery_result_lost_no_replay" } }
+    });
+
+    const failedRestoration: EvidenceRecord = {
+      ...evidenceBase,
+      evidenceId: "failed-restoration",
+      kind: "restoration",
+      status: "failed",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        frontierRevision: state.mutationFrontier.revision,
+        frontierStateDigest: state.mutationFrontier.currentStateDigest,
+        baselineManifestDigest: DIGEST_A,
+        currentManifestDigest: DIGEST_A,
+        restoredCheckpointIds: [],
+        quiescence: {
+          supersededExecutionStopped: true,
+          noPendingMutations: true,
+          noProcesses: true,
+          noChildren: true,
+          noOpenCheckpoint: true
+        },
+        repository: { status: "unchanged" }
+      }
+    };
+    expect(apply(state, "evidence.recorded", failedRestoration).mutationFrontier)
+      .toEqual(state.mutationFrontier);
   });
 });

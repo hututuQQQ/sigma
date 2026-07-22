@@ -762,26 +762,27 @@ fn corrupted_content_addressed_preimage_fails_closed_without_consuming_the_journ
 }
 
 #[test]
-fn snapshot_limit_fails_before_the_first_repository_write() {
+fn snapshot_limit_fails_during_lease_acquisition_before_the_first_repository_write() {
     let root = repository("limit");
     let store = test_store("test-limit");
-    let Some(lease_id) = acquire(&store, &root, "session-f", "run-f", Some(1)) else {
+    let Some(executable) = executable() else {
         let _ = remove_any(&root);
         return;
     };
+    let (git_dir, common_dir) = topology(&root);
     let error = store
-        .begin(
-            4,
-            BeginRepositoryTransactionParams {
-                protocol_version: 2,
-                lease_id,
-                expected_postconditions: None,
-                operations: vec![RepositoryOperationV2 {
-                    operation_class: "branch".into(),
-                    args: vec!["branch".into(), "must-not-exist".into()],
-                }],
-            },
-        )
+        .acquire(AcquireRepositoryTransactionLeaseParams {
+            protocol_version: 2,
+            session_id: "session-f".into(),
+            run_id: "run-f".into(),
+            repository_root: root.clone(),
+            git_dir,
+            common_dir,
+            executable: executable.to_string_lossy().into_owned(),
+            network: NetworkMode::None,
+            max_snapshot_files: None,
+            max_snapshot_bytes: Some(1),
+        })
         .unwrap_err();
     assert_eq!(error.code, "repository_checkpoint_too_large");
     assert!(
