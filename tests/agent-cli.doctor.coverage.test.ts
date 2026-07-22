@@ -131,6 +131,7 @@ describe("doctor command branch coverage", () => {
         targetId: "managed-target"
       }
     };
+    broker.connect = async () => report;
     broker.doctor = async () => report;
     const stdout = new Capture();
     await expect(runDoctorCommand([

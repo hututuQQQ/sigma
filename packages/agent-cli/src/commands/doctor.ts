@@ -19,7 +19,7 @@ interface DoctorDeps {
 
 async function sandboxCheck(broker: ExecutionBroker, workspace: string): Promise<SandboxProbe> {
   try {
-    const report = await broker.doctor();
+    const report = await broker.connect();
     const lease = broker.sandboxLeaseStatus
       ? await broker.sandboxLeaseStatus(workspace).catch(() => undefined) : undefined;
     const ready = report.sandbox.available && report.sandbox.selfTestPassed;
