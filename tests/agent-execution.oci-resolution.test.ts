@@ -4,7 +4,10 @@ import {
   requestParams,
   type VerifiedTargetExecutableEnvironment
 } from "../packages/agent-execution/src/broker-request-policy.js";
-import { normalizeTrustedToolchains } from "../packages/agent-execution/src/trusted-toolchains.js";
+import {
+  normalizeTrustedToolchains,
+  pathWithin
+} from "../packages/agent-execution/src/trusted-toolchains.js";
 import type {
   ExecutionRequest,
   SigmaExecBrokerClientOptions
@@ -81,5 +84,36 @@ describe("OCI executable request resolution", () => {
         path.join(path.resolve("fixture-workspace"), ".agent")
       ])
     );
+  });
+
+  it("does not protect repository sentinels inside broker-issued ephemeral scratch", () => {
+    const scratchHome = path.resolve("scratch", "home");
+    const scratchTemp = path.resolve("scratch", "temp");
+    const workspace = path.join(scratchHome, "workspace");
+    const value = request("/target/usr/bin/target-command");
+    value.command.cwd = workspace;
+    value.policy.readRoots = [workspace, scratchHome];
+    value.policy.writeRoots = [workspace, scratchHome];
+    value.policy.scratchLease = {
+      protocolVersion: 1,
+      sessionId: "verifier-session",
+      leaseId: "broker-issued-lease",
+      lifetime: "runtime_session",
+      isolation: "private",
+      persistentAcrossCalls: true,
+      home: scratchHome,
+      temp: scratchTemp
+    };
+
+    const params = requestParams(
+      value,
+      options("oci"),
+      normalizeTrustedToolchains([]),
+      [],
+      target
+    ) as { policy: { protectedPaths: string[]; scratchLeaseId: string } };
+
+    expect(params.policy.scratchLeaseId).toBe("broker-issued-lease");
+    expect(params.policy.protectedPaths.some((item) => pathWithin(item, scratchHome))).toBe(false);
   });
 });

@@ -9,7 +9,7 @@ function substitute(value, variables) {
   return String(value).replace(/\$(WORKSPACE|MANIFEST_DIR)/gu, (_match, key) => variables[key]);
 }
 
-async function connectVerifierBroker(context) {
+export async function connectVerifierBroker(context) {
   if (!context.brokerPath) throw new Error("A target-native sigma-exec broker is required for command verification.");
   if (!context.nodePath) throw new Error("A verified Node runtime is required for command verification.");
   const api = await import("../../packages/agent-execution/dist/index.js");
@@ -72,7 +72,8 @@ async function execute(broker, executable, args, options) {
       sandbox: "required",
       network: "none",
       readRoots: [...new Set([options.workspace, options.manifestDir, path.dirname(executable), options.home])],
-      writeRoots: [options.workspace, options.home]
+      writeRoots: [options.workspace, options.home],
+      ...(options.scratchLease ? { scratchLease: options.scratchLease } : {})
     },
     timeoutMs,
     maxOutputBytes: OUTPUT_LIMIT
@@ -219,7 +220,8 @@ async function commandCheck(check, context, broker) {
     timeoutMs: check.timeoutMs,
     workspace: context.workspace,
     manifestDir: context.manifestDir,
-    home: context.verifierHome
+    home: context.verifierHome,
+    scratchLease: context.scratchLease
   });
   const expected = Number.isInteger(check.expectedExitCode) ? check.expectedExitCode
     : Number.isInteger(check.exitCode) ? check.exitCode : 0;
@@ -283,22 +285,34 @@ async function executeVerifierCheck(check, context, answer, broker) {
   throw new Error(`Unknown verifier check type '${String(check.type)}'.`);
 }
 
+function verifierBrokerState(context) {
+  return context.broker
+    ? { promise: Promise.resolve(context.broker), owned: false }
+    : { promise: undefined, owned: true };
+}
+
+async function closeVerifierBroker(state) {
+  if (!state.owned) return;
+  const broker = await state.promise?.catch(() => null);
+  await broker?.close();
+}
+
 export async function runPostVerifier(context) {
   const {
     scenario, workspace, manifestDir, delta, subjectResult, events, metrics, artifactDir, redactor
   } = context;
   const answer = finalAnswerFrom(subjectResult, events);
   const checks = [];
-  let brokerPromise;
+  const brokerState = verifierBrokerState(context);
   try {
     for (const [index, check] of (scenario.verifier?.checks ?? []).entries()) {
       let result;
       try {
         if (check.type === "command") {
-          brokerPromise ??= connectVerifierBroker(context);
+          brokerState.promise ??= connectVerifierBroker(context);
         }
         result = await executeVerifierCheck(
-          check, { ...context, workspace, manifestDir, delta, events }, answer, await brokerPromise
+          check, { ...context, workspace, manifestDir, delta, events }, answer, await brokerState.promise
         );
       } catch (error) {
         result = {
@@ -310,8 +324,7 @@ export async function runPostVerifier(context) {
       checks.push({ index, type: check.type, ...result });
     }
   } finally {
-    const broker = await brokerPromise?.catch(() => null);
-    await broker?.close();
+    await closeVerifierBroker(brokerState);
   }
   const expectedTerminal = scenario.expectedTerminal ?? "completed";
   const actualTerminal = terminalStatus(subjectResult, metrics);

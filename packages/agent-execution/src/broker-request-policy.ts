@@ -44,7 +44,11 @@ function assertAbsoluteRoots(roots: string[], label: string): void {
 
 function defaultProtectedPaths(policy: ExecutionPolicy): string[] {
   const explicit = policy.protectedPaths ?? [];
-  const resolved = [...new Set(policy.readRoots.map((root) => path.resolve(root)))];
+  const scratchRoots = policy.scratchLease
+    ? [policy.scratchLease.home, policy.scratchLease.temp].map((root) => path.resolve(root))
+    : [];
+  const resolved = [...new Set(policy.readRoots.map((root) => path.resolve(root)))]
+    .filter((root) => !scratchRoots.some((scratch) => pathWithin(root, scratch)));
   const roots = resolved.filter((root) => !resolved.some((candidate) =>
     candidate !== root && pathWithin(root, candidate)
   ));
