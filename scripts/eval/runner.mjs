@@ -870,7 +870,11 @@ async function verifyAttempt(context, lifecycle, prepared, subjectResult, collec
   lifecycle.phase = "verifier";
   await mkdir(verifierHome, { recursive: true });
   await Promise.all([
-    copyWorkspaceEvidence(workspace, verifierWorkspace),
+    // The verifier consumes an immutable file-tree witness plus the separately
+    // captured Git status/diff. Repository metadata is neither verifier input
+    // nor safe writable sandbox state, so do not copy it into the disposable
+    // command-verification workspace.
+    copyWorkspaceEvidence(workspace, verifierWorkspace, { excludeRepositoryMetadata: true }),
     cp(manifestDir, verifierManifestDir, { recursive: true, force: false, errorOnExist: true })
   ]);
   const verifierBefore = await snapshotWorkspace(verifierWorkspace);

@@ -734,8 +734,9 @@ export function parseHarborTimeoutProbe(stdout) {
     throw new Error("Harbor timeout probe did not print JSON.");
   }
 
+  let parsed;
   try {
-    return JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch {
     const jsonLine = text
       .split(/\r?\n/)
@@ -744,8 +745,22 @@ export function parseHarborTimeoutProbe(stdout) {
     if (!jsonLine) {
       throw new Error("Harbor timeout probe output did not contain a JSON object.");
     }
-    return JSON.parse(jsonLine);
+    parsed = JSON.parse(jsonLine);
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+  const resolvedTasks = Array.isArray(parsed.resolved_tasks)
+    ? parsed.resolved_tasks.map((task) => {
+        if (!task || typeof task !== "object" || Array.isArray(task)
+          || typeof task.path !== "string" || !task.git_url) return task;
+        // Harbor resolves Git task paths with host-native separators. This is
+        // a trusted process boundary, so normalize only this derived field and
+        // then let the existing portable-path projector reject absolute paths,
+        // traversal, UNC paths, and drive-qualified paths. External task files
+        // remain strict and continue to reject backslashes.
+        return { ...task, path: task.path.replace(/\\/gu, "/") };
+      })
+    : parsed.resolved_tasks;
+  return { ...parsed, ...(resolvedTasks ? { resolved_tasks: resolvedTasks } : {}) };
 }
 
 /** Partitions resolved trials by their Harbor agent timeout. Each partition

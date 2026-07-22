@@ -293,8 +293,9 @@ describe("formal benchmark controller", () => {
     try {
       const frozen = await frozenManifest(directory);
       const invocations: string[][] = [];
-      const runner = async (argv: string[]) => {
+      const runner = async (argv: string[], runnerDeps: { beforeHarborDispatch: () => Promise<void> }) => {
         invocations.push(argv);
+        await runnerDeps.beforeHarborDispatch();
         const tasksPath = argv[argv.indexOf("--tasks-file") + 1];
         const tasks = JSON.parse(await readFile(tasksPath, "utf8"));
         return {
@@ -367,12 +368,51 @@ describe("formal benchmark controller", () => {
       ];
       await expect(runFormalBenchmark(args, {
         ...verificationDeps,
-        runBatch: async () => { throw new Error("simulated interruption"); }
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          throw new Error("simulated interruption");
+        }
       })).rejects.toThrow("simulated interruption");
       await expect(runFormalBenchmark([...args, "--resume"], {
         ...verificationDeps,
         runBatch: async () => { throw new Error("must not dispatch"); }
       })).rejects.toThrow(/retrying a consumed batch is prohibited/u);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a batch that fails before Harbor dispatch", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "sigma-formal-preflight-"));
+    const output = path.join(directory, "output");
+    try {
+      const frozen = await frozenManifest(directory);
+      const args = [
+        "--preregistration-file", frozen.file,
+        "--expected-preregistration-sha256", frozen.sha256,
+        "--output", output,
+        "--batch", "001"
+      ];
+      await expect(runFormalBenchmark(args, {
+        ...verificationDeps,
+        runBatch: async () => { throw new Error("preflight failed"); }
+      })).rejects.toThrow("preflight failed");
+      await expect(readFile(path.join(output, "batch-001.started.json"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+
+      const result = await runFormalBenchmark(args, {
+        ...verificationDeps,
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 0,
+            runDir: "recovered-run",
+            dockerCleanup: { clean: true },
+            report: report(2, 2)
+          };
+        }
+      });
+      expect(result.report.status).toBe("running");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -403,12 +443,15 @@ describe("formal benchmark controller", () => {
         "--batch", "001"
       ], {
         ...verificationDeps,
-        runBatch: async () => ({
-          exitCode: 1,
-          runDir: "incomplete-run",
-          dockerCleanup: { clean: true },
-          report: incomplete
-        })
+        runBatch: async (_manifest, _batch, _options, deps) => {
+          await deps.beforeHarborDispatch();
+          return {
+            exitCode: 1,
+            runDir: "incomplete-run",
+            dockerCleanup: { clean: true },
+            report: incomplete
+          };
+        }
       });
       expect(first.exitCode).toBe(1);
       await expect(runFormalBenchmark([

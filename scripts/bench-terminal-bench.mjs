@@ -561,6 +561,13 @@ export async function runTerminalBenchCli(argv, deps = {}) {
     );
   }
 
+  // Formal controllers use this as the irreversible consumption boundary.
+  // All package, capability, task-resolution, attestation, and cleanup
+  // preflights have succeeded, while no Harbor trial has started yet.
+  if (deps.beforeHarborDispatch) {
+    await deps.beforeHarborDispatch({ runDir, config, slots: launchSlots });
+  }
+
   const harborResults = await runWithConcurrency(
     launchSlots,
     options.nConcurrentTrials,

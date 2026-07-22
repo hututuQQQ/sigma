@@ -606,6 +606,26 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
+  it("normalizes only probe-derived Git task paths at the platform boundary", () => {
+    const gitCommit = "a".repeat(40);
+    const parsed = parseHarborTimeoutProbe(JSON.stringify({
+      resolved_tasks: [{
+        path: "tasks\\portable-task",
+        git_url: "https://example.test/tasks.git",
+        git_commit_id: gitCommit
+      }]
+    }));
+    expect(parsed.resolved_tasks[0].path).toBe("tasks/portable-task");
+    expect(projectHarborTaskConfig(parsed.resolved_tasks[0])).toMatchObject({
+      path: "tasks/portable-task"
+    });
+    expect(() => projectHarborTaskConfig({
+      path: "tasks\\external-task",
+      git_url: "https://example.test/tasks.git",
+      git_commit_id: gitCommit
+    })).toThrow(/portable repository-relative path/u);
+  });
+
   it("omits model ak when the model is not set", () => {
     const args = buildHarborArgs({
       mode: "k",

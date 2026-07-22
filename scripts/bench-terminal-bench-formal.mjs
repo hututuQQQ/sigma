@@ -17,6 +17,7 @@ import {
 } from "./bench-common.mjs";
 import {
   assertFrozenBatchControls,
+  canonicalJson,
   loadFormalPreregistration,
   sha256,
   validateFormalPreregistration
@@ -120,6 +121,17 @@ async function writeExclusiveJson(filePath, value) {
     await handle.sync();
   } finally {
     await handle.close();
+  }
+}
+
+async function ensureStableJson(filePath, value) {
+  const existing = await readJsonIfPresent(filePath);
+  if (existing === null) {
+    await writeExclusiveJson(filePath, value);
+    return;
+  }
+  if (canonicalJson(existing) !== canonicalJson(value)) {
+    throw new Error(`Formal run state ${filePath} conflicts with the frozen preregistration.`);
   }
 }
 
@@ -317,7 +329,7 @@ async function writeFormalReport(outputDir, manifest, records, preregistrationSh
 
 async function runBatch(manifest, batch, options, deps) {
   const files = batchPaths(options.outputDir, batch.id);
-  await writeExclusiveJson(files.tasks, selectedTasks(manifest, batch));
+  await ensureStableJson(files.tasks, selectedTasks(manifest, batch));
   const runner = deps.runTerminalBenchCli ?? runTerminalBenchCli;
   return await runner([
     "--mode", "batch",
@@ -344,6 +356,7 @@ async function runBatch(manifest, batch, options, deps) {
     "--expected-archive-sha256", manifest.archive_sha256
   ], {
     ...(deps.terminalBenchDeps ?? {}),
+    beforeHarborDispatch: deps.beforeHarborDispatch,
     assertFrozenRunControls: (context) => assertFrozenBatchControls(manifest, batch, context)
   });
 }
@@ -394,18 +407,30 @@ export async function runFormalBenchmark(argv = process.argv.slice(2), deps = {}
     throw new Error(`The next preregistered batch is ${nextBatch.id}; received ${options.batchId}.`);
   }
   const files = batchPaths(outputDir, nextBatch.id);
-  const started = {
-    schemaVersion: 1,
-    kind: "SigmaFormalBatchStartedV1",
-    formal_run_id: manifest.formal_run_id,
-    consumption_identity_sha256: manifest.consumption_identity_sha256,
-    preregistration_sha256: bundle.sha256,
-    batch: nextBatch.id,
-    task_selection_sha256: nextBatch.task_selection_sha256,
-    started_at: new Date().toISOString()
+  let started = null;
+  const beforeHarborDispatch = async () => {
+    if (started) throw new Error(`Formal batch ${nextBatch.id} dispatch boundary was entered more than once.`);
+    started = {
+      schemaVersion: 1,
+      kind: "SigmaFormalBatchStartedV1",
+      formal_run_id: manifest.formal_run_id,
+      consumption_identity_sha256: manifest.consumption_identity_sha256,
+      preregistration_sha256: bundle.sha256,
+      batch: nextBatch.id,
+      task_selection_sha256: nextBatch.task_selection_sha256,
+      started_at: new Date().toISOString()
+    };
+    await writeExclusiveJson(files.started, started);
   };
-  await writeExclusiveJson(files.started, started);
-  const result = await (deps.runBatch ?? runBatch)(manifest, nextBatch, options, deps);
+  const result = await (deps.runBatch ?? runBatch)(manifest, nextBatch, options, {
+    ...deps,
+    beforeHarborDispatch
+  });
+  if (!started) {
+    throw new Error(
+      `Formal batch ${nextBatch.id} did not reach Harbor dispatch and remains unconsumed.`
+    );
+  }
   const completed = {
     schemaVersion: 1,
     kind: "SigmaFormalBatchCompletedV1",
