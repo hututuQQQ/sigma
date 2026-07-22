@@ -214,6 +214,45 @@ describe("Terminal-Bench command construction", () => {
     });
   });
 
+  it("makes the managed three-role topology an explicit reachable run control", () => {
+    const options = resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--network", "full",
+      "--execution-mode", "container",
+      "--managed-environment-mode", "required",
+      "--harbor-topology", "managed_three_role"
+    ]);
+    expect(options).toMatchObject({
+      networkMode: "full",
+      executionMode: "container",
+      managedEnvironmentMode: "required",
+      harborTopology: "managed_three_role"
+    });
+    expect(buildHarborJobConfig(options, "jobs").agents[0].kwargs).toMatchObject({
+      network_mode: "full",
+      execution_mode: "container",
+      managed_environment_mode: "required",
+      harbor_topology: "managed_three_role"
+    });
+    expect(buildHarborArgs({
+      ...options,
+      taskSelectionFlag: "--task-id",
+      timeoutPlan: { agent_wall_time_sec: 60, effective_harness_timeout_sec: 180 }
+    })).toEqual(expect.arrayContaining([
+      "managed_environment_mode:str=required",
+      "harbor_topology:str=managed_three_role"
+    ]));
+
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--managed-environment-mode", "required"
+    ])).toThrow(/execution-mode container/iu);
+    expect(() => resolveRunOptions([
+      "--mode", "task", "--task-id", "generic-task",
+      "--harbor-topology", "managed_three_role"
+    ])).toThrow(/managed environment mode required/iu);
+  });
+
   it("keeps the full task timeout for solving and reserves cleanup outside it", () => {
     const standard = resolveRunOptions(["--mode", "task", "--task-id", "generic-task"]);
     const standardPlan = computeHarborTimeoutPlan(standard, { max_agent_timeout_sec: 900 });
@@ -1787,7 +1826,7 @@ describe("benchmark report generation", () => {
     expect(report.status).toBe("failed");
     expect(report.incomplete_reason).toBeNull();
     expect(report.tasks).toHaveLength(5);
-    expect(report.tasks.every((task) => task.status === "failed")).toBe(true);
+    expect(report.tasks.every((task) => ["failed", "infra_failed"].includes(task.status))).toBe(true);
     expect(report.counts.failed).toBe(2);
     expect(report.counts.infra_failed).toBe(3);
     expect(report.tasks.filter((task) => task.failure_category === "agent_setup_failed")).toHaveLength(3);

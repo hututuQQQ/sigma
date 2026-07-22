@@ -149,7 +149,7 @@ def _is_timeout_error(error: BaseException) -> bool:
         "timeout", "timed_out", "process_timed_out", "broker_timeout", "process_deadline"
     }:
         return True
-    return "timed out" in str(error).lower() or "timeout" in str(error).lower()
+    return False
 
 
 def _bounded_text(value: str, maximum: int = MAX_CONTEXT_TEXT_CHARS) -> str:
@@ -189,24 +189,39 @@ def _write_utf8_artifact(path: pathlib.Path, value: str) -> None:
         handle.write(value)
 
 
-def _append_bounded_jsonl(path: pathlib.Path, record: dict[str, Any], maximum: int) -> None:
-    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-    existing = path.read_bytes() if path.is_file() else b""
-    if b'"type": "trace_truncated"' in existing:
-        return
-    existing_size = len(existing)
-    marker = (json.dumps({
-        "type": "trace_truncated",
-        "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
-    }, ensure_ascii=False) + "\n").encode("utf-8")
-    reserve = min(len(marker), maximum)
-    if existing_size + len(line) <= maximum - reserve:
-        with path.open("ab") as handle:
-            handle.write(line)
-        return
-    if existing_size + len(marker) <= maximum:
-        with path.open("ab") as handle:
-            handle.write(marker)
+class _BoundedJsonlWriter:
+    """Append-only JSONL writer with a stable prefix and a hard byte cap."""
+
+    def __init__(self, path: pathlib.Path, maximum: int, *, reset: bool = False) -> None:
+        self.path = path
+        self.maximum = max(0, maximum)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if reset:
+            self.path.unlink(missing_ok=True)
+            self.path.touch()
+        existing = self.path.read_bytes() if self.path.is_file() else b""
+        self.size = len(existing)
+        self.truncated = b'"type": "trace_truncated"' in existing
+
+    def append(self, record: dict[str, Any]) -> None:
+        if self.truncated or self.maximum <= 0:
+            return
+        line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        marker = (json.dumps({
+            "type": "trace_truncated",
+            "omitted_record_sha256": hashlib.sha256(line).hexdigest(),
+        }, ensure_ascii=False) + "\n").encode("utf-8")
+        reserve = min(len(marker), self.maximum)
+        if self.size + len(line) <= self.maximum - reserve:
+            with self.path.open("ab") as handle:
+                handle.write(line)
+            self.size += len(line)
+            return
+        if self.size + len(marker) <= self.maximum:
+            with self.path.open("ab") as handle:
+                handle.write(marker)
+            self.size += len(marker)
+        self.truncated = True
 
 
 def _text_artifact_summary(value: str) -> dict[str, Any]:
@@ -326,7 +341,7 @@ def _trace_record(
             "reasoning_tokens", "cache_tokens", "cache_read_tokens", "length_finish_count",
             "converge_turns", "cost_usd", "duration_ms", "suspension_to_exit_ms",
             "terminal_origin", "execution_mode", "managed_environment_mode", "agent_profile",
-            "failure_kind", "failure_code",
+            "harbor_topology", "failure_kind", "failure_code",
         }
         for key in summary_keys:
             value = summary.get(key)
@@ -413,8 +428,11 @@ class _OutputRecorder:
         self._suspended_monotonic: float | None = None
         self._process_exit_monotonic: float | None = None
         logs_dir.mkdir(parents=True, exist_ok=True)
-        for path in (self.stdout_path, self.stderr_path, self.trace_path):
+        for path in (self.stdout_path, self.stderr_path):
             path.write_text("", encoding="utf-8")
+        self._trace_writer = _BoundedJsonlWriter(
+            self.trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True
+        )
         self._write_state()
 
     async def callback(self, text: str, stream: str) -> None:
@@ -480,11 +498,7 @@ class _OutputRecorder:
             if "retry" in event_type.lower() or "retry" in str(payload.get("status", "")).lower():
                 self.retry_count += 1
                 self.last_retry = _bounded_event(event)
-            _append_bounded_jsonl(
-                self.trace_path,
-                _trace_record(event),
-                MAX_TRACE_ARTIFACT_BYTES,
-            )
+            self.append_trace(_trace_record(event))
             self._write_state()
             return
         if value.get("kind") == "result" or value.get("type") == "result":
@@ -503,6 +517,19 @@ class _OutputRecorder:
                 **({"failureKind": failure} if failure else {}),
             }
             self._write_state()
+
+    def append_trace(self, record: dict[str, Any]) -> None:
+        self._trace_writer.append(record)
+
+    def reconcile_trace(self, events: list[dict[str, Any]]) -> None:
+        """Append events missed by the callback without rewriting its prefix."""
+        for event in events:
+            identity = _event_identity(event)
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
+            self.events.append(event)
+            self.append_trace(_trace_record(event))
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -552,6 +579,7 @@ class SigmaCliHarborAgent(BaseAgent):
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
         managed_environment_mode: str = "disabled",
+        harbor_topology: str = "main_only",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -592,13 +620,24 @@ class SigmaCliHarborAgent(BaseAgent):
             raise ValueError(
                 "managed_environment_mode must be one of: disabled, required"
             )
+        if harbor_topology not in {"main_only", "managed_three_role"}:
+            raise ValueError(
+                "harbor_topology must be one of: main_only, managed_three_role"
+            )
         if managed_environment_mode == "required" and (
             execution_mode != "container" or network_mode != "full"
+            or harbor_topology != "managed_three_role"
         ):
             raise ValueError(
-                "managed_environment_mode=required needs execution_mode=container and network_mode=full"
+                "managed_environment_mode=required needs execution_mode=container, "
+                "network_mode=full, and harbor_topology=managed_three_role"
+            )
+        if harbor_topology == "managed_three_role" and managed_environment_mode != "required":
+            raise ValueError(
+                "harbor_topology=managed_three_role needs managed_environment_mode=required"
             )
         self.managed_environment_mode = managed_environment_mode
+        self.harbor_topology = harbor_topology
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
@@ -636,6 +675,13 @@ class SigmaCliHarborAgent(BaseAgent):
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        try:
+            await self._setup_agent(environment)
+        except Exception as exc:
+            self._mirror_setup_failure(exc)
+            raise
+
+    async def _setup_agent(self, environment: BaseEnvironment) -> None:
         self._workspace = await self._resolve_workspace(environment)
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
@@ -818,28 +864,19 @@ class SigmaCliHarborAgent(BaseAgent):
         finally:
             recorder.mark_process_exit()
             if cancelled_error is None and not timed_out:
-                for remote_path, filename in (
-                    ("/tmp/agent/summary.json", "summary.json"),
-                    ("/tmp/agent/trace.jsonl", "trace.jsonl"),
-                ):
-                    try:
-                        downloaded = await self._download_if_present(environment, remote_path, filename)
-                        if filename == "summary.json":
-                            summary_path = downloaded
-                        else:
-                            trace_path = downloaded
-                    except Exception as exc:
-                        artifact_warnings.append(f"{filename}: {exc}")
+                try:
+                    summary_path = await self._download_if_present(
+                        environment, "/tmp/agent/summary.json", "summary.json"
+                    )
+                except Exception as exc:
+                    artifact_warnings.append(f"summary.json: {exc}")
                 try:
                     artifact_warnings.extend(await self._download_attempt_artifacts(environment))
                 except Exception as exc:
                     artifact_warnings.append(f"attempts: {exc}")
                 summary_path = summary_path or self._latest_downloaded_artifact("summary.json")
-                trace_path = trace_path or self._latest_downloaded_artifact("trace.jsonl")
-                if trace_path == recorder.trace_path and not recorder.events:
-                    trace_path = None
-                elif trace_path is None and recorder.events and recorder.trace_path.is_file():
-                    trace_path = recorder.trace_path
+                recorder.reconcile_trace(events)
+                trace_path = recorder.trace_path if events else None
             self._managed_broker_cleanup = await self._cleanup_managed_broker(environment)
             if self._managed_broker_cleanup and self._managed_broker_cleanup.get("error"):
                 artifact_warnings.append(
@@ -894,6 +931,7 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
         summary["managed_environment_mode"] = self.managed_environment_mode
+        summary["harbor_topology"] = self.harbor_topology
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
@@ -1539,6 +1577,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
             "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
             "agent_profile": self.agent_profile,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
@@ -1645,11 +1684,11 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
                     "origin": "adapter_timeout",
                 },
             }
-            _append_bounded_jsonl(
-                trace_target,
-                _trace_record(timeout_event, trace_type="run_timeout"),
-                MAX_TRACE_ARTIFACT_BYTES,
-            )
+            timeout_record = _trace_record(timeout_event, trace_type="run_timeout")
+            if recorder is not None and trace_target == recorder.trace_path:
+                recorder.append_trace(timeout_record)
+            else:
+                _BoundedJsonlWriter(trace_target, MAX_TRACE_ARTIFACT_BYTES).append(timeout_record)
         return summary_target, trace_target
 
     def _trace_records(
@@ -1672,9 +1711,9 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
         if summary_path is not None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if trace_path is not None:
-            trace_path.unlink(missing_ok=True)
+            writer = _BoundedJsonlWriter(trace_path, MAX_TRACE_ARTIFACT_BYTES, reset=True)
             for record in self._trace_records(events, summary):
-                _append_bounded_jsonl(trace_path, record, MAX_TRACE_ARTIFACT_BYTES)
+                writer.append(record)
         return summary_path, trace_path
 
     def _tarball_from_env(self) -> pathlib.Path | None:
@@ -1924,6 +1963,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
             "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
             "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
@@ -2090,6 +2130,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "managed_environment_mode": summary.get(
                 "managed_environment_mode", self.managed_environment_mode
             ),
+            "harbor_topology": summary.get("harbor_topology", self.harbor_topology),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
@@ -2120,6 +2161,59 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
         except Exception:
             pass
 
+    def _mirror_setup_failure(self, error: BaseException) -> None:
+        run_dir = os.environ.get("SIGMA_BENCH_RUN_DIR")
+        run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
+        if not run_dir or not run_slot:
+            return
+        safe_slot = re.sub(r"[^A-Za-z0-9._-]+", "-", run_slot).strip("-") or "task"
+        task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_slot)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        failure_code = (
+            "managed_environment_required_unavailable"
+            if self.managed_environment_mode == "required"
+            else "agent_setup_failed"
+        )
+        message = _bounded_text(str(error) or failure_code)
+        summary = {
+            "schema_version": 1,
+            "status": "error",
+            "failure_kind": "infrastructure_incomplete",
+            "failure_code": failure_code,
+            "last_error": message,
+            "network_mode_requested": self.network_mode,
+            "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
+            "terminal_origin": "adapter_setup",
+            "termination_source": "adapter_setup",
+        }
+        (task_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        setup_check = self.logs_dir / "setup-check.json"
+        if setup_check.is_file():
+            shutil.copy2(setup_check, task_dir / "setup-check.json")
+        metadata = {
+            "task_id": run_slot,
+            "run_slot": run_slot,
+            "source_logs_dir": str(self.logs_dir),
+            "agent_setup_ok": False,
+            "exit_code": 1,
+            "error_message": message,
+            "failure_kind": "infrastructure_incomplete",
+            "failure_code": failure_code,
+            "terminal_origin": "adapter_setup",
+            "termination_source": "adapter_setup",
+            "network_mode_requested": self.network_mode,
+            "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "harbor_topology": self.harbor_topology,
+        }
+        (task_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
     def _mirror_bench_artifacts(
         self,
         context: AgentContext,
@@ -2133,7 +2227,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             return
 
         run_slot = os.environ.get("SIGMA_BENCH_RUN_SLOT")
-        task_id = run_slot or self._context_task_id(context) or str(uuid.uuid4())
+        task_id = run_slot or str(uuid.uuid4())
         safe_task_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-") or "task"
         task_dir = self._unique_task_dir(pathlib.Path(run_dir) / "tasks" / safe_task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -2163,6 +2257,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             "managed_environment_mode": getattr(
                 context, "managed_environment_mode", self.managed_environment_mode
             ),
+            "harbor_topology": getattr(context, "harbor_topology", self.harbor_topology),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),
@@ -2203,7 +2298,7 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
                     files.update(str(path) for path in related if isinstance(path, str))
         return sorted(files)
 
-    def _failure_signals_for_metadata(self, result: Any | None, summary: dict[str, Any]) -> list[str]:
+    def _failure_signals_for_metadata(self, _result: Any | None, summary: dict[str, Any]) -> list[str]:
         signals: list[str] = []
 
         def add(signal: str) -> None:
@@ -2216,30 +2311,12 @@ printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n'
             add(failure_kind)
         if isinstance(summary.get("timeout"), dict):
             add("partial_trace_saved")
-        result_text = _output_text(result) if result is not None else ""
-        if re.search(r"finish[_ ]?reason\"?\s*[:=]\s*\"?max_wall_time", result_text, flags=re.IGNORECASE) or re.search(
-            r"agent execution timed out|timed out after|max wall time",
-            result_text,
-            flags=re.IGNORECASE,
-        ):
+        if (summary.get("finish_reason") == "max_wall_time"
+                or summary.get("terminal_origin") == "adapter_timeout"
+                or summary.get("termination_source") == "adapter_timeout"):
             add("max_wall_time")
 
         return signals
-
-    def _context_task_id(self, context: AgentContext) -> str | None:
-        for attr in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
-            value = getattr(context, attr, None)
-            if isinstance(value, str) and value:
-                return value
-
-        metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, dict):
-            for key in ("task_id", "task_name", "benchmark_task_id", "id", "name"):
-                value = metadata.get(key)
-                if isinstance(value, str) and value:
-                    return value
-
-        return None
 
     def _unique_task_dir(self, base_dir: pathlib.Path) -> pathlib.Path:
         if not base_dir.exists() or not any(base_dir.iterdir()):

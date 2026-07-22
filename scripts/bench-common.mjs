@@ -59,6 +59,7 @@ const FAILURE_COUNT_BUCKETS = new Map([
   ["harbor_cli_error", "infra_failed"],
   ["node_missing", "infra_failed"],
   ["agent_setup_failed", "infra_failed"],
+  ["infrastructure_incomplete", "infra_failed"],
   ["verifier_setup_failed", "infra_failed"],
   ["api_error", "api_error"],
   ["needs_input", "needs_input"],
@@ -79,6 +80,7 @@ const SUGGESTED_OWNER_BY_FAILURE_CATEGORY = new Map([
   ["harbor_cli_error", "scripts/bench"],
   ["node_missing", "package-agent-cli"],
   ["agent_setup_failed", "portable/harbor"],
+  ["infrastructure_incomplete", "environment"],
   ["verifier_setup_failed", "environment"],
   ["api_error", "agent-model"],
   ["needs_input", "agent-runtime"],
@@ -268,6 +270,22 @@ function executionMode(value, fallback = "sandboxed") {
   return mode;
 }
 
+function managedEnvironmentMode(value, fallback = "disabled") {
+  const mode = asString(value, fallback);
+  if (mode !== "disabled" && mode !== "required") {
+    throw new Error("managed environment mode must be disabled or required.");
+  }
+  return mode;
+}
+
+function harborTopology(value, fallback = "main_only") {
+  const topology = asString(value, fallback);
+  if (topology !== "main_only" && topology !== "managed_three_role") {
+    throw new Error("Harbor topology must be main_only or managed_three_role.");
+  }
+  return topology;
+}
+
 function benchmarkClass(value, fallback = "standard") {
   const classification = asString(value, fallback);
   if (classification !== "standard" && classification !== "diagnostic") {
@@ -323,14 +341,35 @@ export function resolveRunOptions(argv, env = process.env) {
     || (requestedLeniencyExtra !== undefined && Number(requestedLeniencyExtra) !== 0))) {
     throw new Error("Standard benchmark runs prohibit timeout/resource overrides; use --benchmark-class diagnostic.");
   }
+  const resolvedNetworkMode = networkMode(flags.network ?? env.SIGMA_NETWORK);
+  const resolvedExecutionMode = executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE);
+  const resolvedManagedEnvironmentMode = managedEnvironmentMode(
+    flags["managed-environment-mode"] ?? env.SIGMA_MANAGED_ENVIRONMENT_MODE
+  );
+  const resolvedHarborTopology = harborTopology(
+    flags["harbor-topology"] ?? env.SIGMA_HARBOR_TOPOLOGY,
+    resolvedManagedEnvironmentMode === "required" ? "managed_three_role" : "main_only"
+  );
+  if (resolvedManagedEnvironmentMode === "required"
+    && (resolvedExecutionMode !== "container" || resolvedNetworkMode !== "full"
+      || resolvedHarborTopology !== "managed_three_role")) {
+    throw new Error(
+      "managed environment mode required needs execution-mode container, network full, and Harbor topology managed_three_role."
+    );
+  }
+  if (resolvedHarborTopology === "managed_three_role" && resolvedManagedEnvironmentMode !== "required") {
+    throw new Error("Harbor topology managed_three_role requires managed environment mode required.");
+  }
   return {
     mode,
     benchmarkClass: runClass,
     provider: asString(flags.provider, env.AGENT_PROVIDER ?? "deepseek"),
     model: asString(flags.model, env.AGENT_MODEL),
     agentProfile: asString(flags["agent-profile"], env.SIGMA_AGENT_PROFILE ?? "standard"),
-    networkMode: networkMode(flags.network ?? env.SIGMA_NETWORK),
-    executionMode: executionMode(flags["execution-mode"] ?? env.SIGMA_EXECUTION_MODE),
+    networkMode: resolvedNetworkMode,
+    executionMode: resolvedExecutionMode,
+    managedEnvironmentMode: resolvedManagedEnvironmentMode,
+    harborTopology: resolvedHarborTopology,
     runLabel: asString(flags["run-label"]),
     k: asPositiveInt(flags.k, 1, "--k"),
     nConcurrentTrials: asPositiveInt(
@@ -583,7 +622,8 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "none",
     execution_mode: options.executionMode ?? "sandboxed",
-    managed_environment_mode: options.managedEnvironmentMode ?? "disabled"
+    managed_environment_mode: options.managedEnvironmentMode ?? "disabled",
+    harbor_topology: options.harborTopology ?? "main_only"
   };
   if (options.model) {
     agentKwargs.model = options.model;
@@ -803,6 +843,14 @@ export function buildHarborArgs(options) {
   if (options.executionMode !== undefined) {
     args.push("--ak", formatAgentKwarg("execution_mode", "str", options.executionMode, capabilities));
   }
+  if (options.managedEnvironmentMode !== undefined) {
+    args.push("--ak", formatAgentKwarg(
+      "managed_environment_mode", "str", options.managedEnvironmentMode, capabilities
+    ));
+  }
+  if (options.harborTopology !== undefined) {
+    args.push("--ak", formatAgentKwarg("harbor_topology", "str", options.harborTopology, capabilities));
+  }
   if (options.model) {
     args.push("--ak", formatAgentKwarg("model", "str", options.model, capabilities));
   }
@@ -1003,7 +1051,8 @@ export function classifyFailure(input = {}) {
     ?? input.metadata?.failure_kind
     ?? summary.failure_kind;
   if ([
-    "needs_input", "timeout", "tool_error", "api_error", "verifier_failure", "structured_blocker"
+    "needs_input", "timeout", "tool_error", "api_error", "verifier_failure", "structured_blocker",
+    "agent_setup_failed", "infrastructure_incomplete"
   ].includes(declared)) {
     return declared;
   }
@@ -1249,7 +1298,10 @@ function summarizeTraceEvents(events) {
     suspension_to_exit_ms: null,
     terminal_origin: null,
     termination_source: null,
+    network_mode_effective: null,
     execution_mode: null,
+    managed_environment_mode: null,
+    harbor_topology: null,
     agent_profile: null,
     harbor_deadline_sec: null,
     sigma_deadline_sec: null,
@@ -1546,6 +1598,26 @@ async function runSlotIntegrityReasons(runDir, config) {
       continue;
     }
     const jobConfig = await readJsonSafe(configPath);
+    if (config.mode !== "smoke") {
+      const kwargs = Array.isArray(jobConfig.agents) && jobConfig.agents.length === 1
+        && jobConfig.agents[0] && typeof jobConfig.agents[0] === "object"
+        ? jobConfig.agents[0].kwargs : null;
+      const frozenControls = {
+        network_mode: config.network_mode,
+        execution_mode: config.execution_mode,
+        managed_environment_mode: config.managed_environment_mode,
+        harbor_topology: config.harbor_topology
+      };
+      if (!kwargs || typeof kwargs !== "object" || Array.isArray(kwargs)) {
+        reasons.push(`Harbor run slot ${slot.run_slot} has no unique agent execution controls.`);
+      } else {
+        for (const [key, expected] of Object.entries(frozenControls)) {
+          if (typeof expected === "string" && kwargs[key] !== expected) {
+            reasons.push(`Harbor run slot ${slot.run_slot} agent control ${key} does not match its frozen run.`);
+          }
+        }
+      }
+    }
     if (slot.harbor_task_identity) {
       if (!Array.isArray(jobConfig.tasks) || jobConfig.tasks.length !== 1) {
         reasons.push(`Harbor run slot ${slot.run_slot} does not contain exactly one task.`);
@@ -1680,6 +1752,17 @@ function withLayeredOutcomes(task, trialResult) {
   const reward = trialResult?.verifier_result?.rewards?.reward;
   const infrastructureEvidence = Array.isArray(trialResult?.verifier_infrastructure_evidence)
     ? trialResult.verifier_infrastructure_evidence : [];
+  if (FAILURE_COUNT_BUCKETS.get(task.failure_category) === "infra_failed") {
+    return withSuggestedOwner({
+      ...task,
+      status: "infra_failed",
+      agent_outcome: "infrastructure_incomplete",
+      verifier_status: "not_run",
+      verifier_outcome: "not_run",
+      validity: "infra_failed",
+      verifier_infrastructure_evidence: []
+    });
+  }
   if (task.failure_category === "structured_blocker") {
     return withSuggestedOwner({
       ...task,
@@ -1835,7 +1918,13 @@ function mergeHarborTrialResult(task, trialResult) {
     terminal_origin: task.terminal_origin ?? traceSummary.terminal_origin ?? agentMetadata.terminal_origin ?? null,
     termination_source: task.termination_source ?? traceSummary.termination_source
       ?? agentMetadata.termination_source ?? null,
+    network_mode_effective: task.network_mode_effective ?? traceSummary.network_mode_effective
+      ?? agentMetadata.network_mode_effective ?? null,
     execution_mode: task.execution_mode ?? traceSummary.execution_mode ?? agentMetadata.execution_mode ?? null,
+    managed_environment_mode: task.managed_environment_mode ?? traceSummary.managed_environment_mode
+      ?? agentMetadata.managed_environment_mode ?? null,
+    harbor_topology: task.harbor_topology ?? traceSummary.harbor_topology
+      ?? agentMetadata.harbor_topology ?? null,
     agent_profile: task.agent_profile ?? traceSummary.agent_profile ?? agentMetadata.agent_profile ?? null,
     harbor_deadline_sec: task.harbor_deadline_sec ?? traceSummary.harbor_deadline_sec
       ?? agentMetadata.harbor_deadline_sec ?? null,
@@ -1867,7 +1956,7 @@ function mergeHarborTrialResult(task, trialResult) {
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: exceptionMessage,
       exitCode: 1,
-      failureKind: agentMetadata.failure_kind
+      failureKind: agentMetadata.failure_kind ?? task.failure_category
     });
     next.last_error = exceptionMessage;
     next.failure_signals = collectFailureSignals({
@@ -1897,7 +1986,7 @@ function mergeHarborTrialResult(task, trialResult) {
       traceEvents: trialResult?.agent_trace_events ?? [],
       logText: trialLogText,
       exitCode: agentExitCode ?? 1,
-      failureKind: agentMetadata.failure_kind
+      failureKind: agentMetadata.failure_kind ?? task.failure_category
     });
     next.last_error = agentErrorMessage ?? `agent exited with code ${agentExitCode}`;
     next.failure_signals = collectFailureSignals({
@@ -2027,7 +2116,10 @@ async function taskReportFromDir(runDir, taskDir, index, config, globalLogText) 
     suspension_to_exit_ms: summary.suspension_to_exit_ms ?? metadata.suspension_to_exit_ms ?? null,
     terminal_origin: summary.terminal_origin ?? metadata.terminal_origin ?? null,
     termination_source: summary.termination_source ?? metadata.termination_source ?? null,
+    network_mode_effective: summary.network_mode_effective ?? metadata.network_mode_effective ?? null,
     execution_mode: summary.execution_mode ?? metadata.execution_mode ?? null,
+    managed_environment_mode: summary.managed_environment_mode ?? metadata.managed_environment_mode ?? null,
+    harbor_topology: summary.harbor_topology ?? metadata.harbor_topology ?? null,
     agent_profile: summary.agent_profile ?? metadata.agent_profile ?? null,
     harbor_deadline_sec: summary.harbor_deadline_sec ?? metadata.harbor_deadline_sec ?? null,
     sigma_deadline_sec: summary.sigma_deadline_sec ?? metadata.sigma_deadline_sec ?? null,
@@ -2509,7 +2601,10 @@ export async function generateBenchReport(runDir) {
     harbor_exit_code: exitCode,
     score_status: scoreStatus,
     infra_status: infraStatus,
+    network_mode: config.network_mode ?? null,
     execution_mode: config.execution_mode ?? "sandboxed",
+    managed_environment_mode: config.managed_environment_mode ?? "disabled",
+    harbor_topology: config.harbor_topology ?? "main_only",
     score_mode: config.score_mode ?? (config.benchmark_class === "diagnostic" ? "diagnostic" : "standard_benchmark"),
     status: incompleteReason.length > 0
       ? "incomplete"

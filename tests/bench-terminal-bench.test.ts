@@ -222,7 +222,14 @@ describe("Terminal-Bench CLI verifier result handling", () => {
     let nextSlot = 0;
 
     const result = await runTerminalBenchCli([
-      "--mode", "batch", "--tasks-file", tasksFile, "--concurrency", "5", "--run-label", "five-slots"
+      "--mode", "batch",
+      "--tasks-file", tasksFile,
+      "--concurrency", "5",
+      "--run-label", "five-slots",
+      "--network", "full",
+      "--execution-mode", "container",
+      "--managed-environment-mode", "required",
+      "--harbor-topology", "managed_three_role"
     ], {
       makeRunSlotId: () => `slot-${++nextSlot}`,
       resolveHarborCommand: () => ({ command: "harbor", source: "test", exists: true }),
@@ -263,11 +270,28 @@ describe("Terminal-Bench CLI verifier result handling", () => {
         expect(call.config.tasks).toHaveLength(1);
         expect(call.config.tasks[0]).not.toHaveProperty("source");
         expect(call.config.tasks[0]).not.toHaveProperty("provenance_source");
+        expect(call.config.agents[0].kwargs).toMatchObject({
+          network_mode: "full",
+          execution_mode: "container",
+          managed_environment_mode: "required",
+          harbor_topology: "managed_three_role"
+        });
       }
       const runConfig = JSON.parse(await readFile(path.join(result.runDir, "config.json"), "utf8"));
+      expect(runConfig).toMatchObject({
+        network_mode: "full",
+        execution_mode: "container",
+        managed_environment_mode: "required",
+        harbor_topology: "managed_three_role"
+      });
       expect(runConfig.run_slots).toHaveLength(5);
       expect(runConfig.resolved_task_attestation_paths).toHaveLength(5);
       expect(result.report.trial_accounting).toMatchObject({ expected: 5, observed: 5 });
+      expect(result.report).toMatchObject({
+        network_mode: "full",
+        managed_environment_mode: "required",
+        harbor_topology: "managed_three_role"
+      });
       expect(result.report.incomplete_reason).toBeNull();
       expect(result.report.tasks.every((task: { provenance_source?: string }) =>
         task.provenance_source === "frozen-selection")).toBe(true);
