@@ -60,4 +60,3 @@ export interface RepositoryInspectionV2 {
   recoveryCandidates: RepositoryRecoveryCandidateV2[];
   selectionStatus: RepositoryRecoverySelectionStatusV2;
 }
-

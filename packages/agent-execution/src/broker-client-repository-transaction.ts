@@ -334,5 +334,3 @@ export async function releaseRepositoryRunBaseline(
 ): Promise<RepositoryRunBaselineResultV1> {
   return await repositoryRunBaselineRequest(transport, "release", request, options);
 }
-
-

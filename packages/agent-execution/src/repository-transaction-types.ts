@@ -138,5 +138,3 @@ export interface RepositoryRunBaselineResultV1 {
   repositoryRoot: string;
   semanticAssertions?: RepositorySemanticAssertionsV3;
 }
-
-

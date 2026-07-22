@@ -14,5 +14,3 @@ export interface RepositoryMetadataLeaseV1 extends RepositoryMetadataLeaseReques
   /** Capabilities are deliberately single-use and are burned before launch. */
   uses: 1;
 }
-
-

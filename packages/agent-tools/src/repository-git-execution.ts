@@ -91,5 +91,3 @@ export async function runLeasedRepositoryGit(
     repositoryMetadataLease: lease
   });
 }
-
-
