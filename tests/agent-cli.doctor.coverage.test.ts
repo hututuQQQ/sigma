@@ -102,6 +102,53 @@ afterEach(() => {
 });
 
 describe("doctor command branch coverage", () => {
+  it.each([true, false])("preflights required managed execution (available=%s)", async (available) => {
+    const root = await workspace();
+    const broker = healthyBroker();
+    const base = await broker.doctor();
+    const report: BrokerDoctorReport = {
+      ...base,
+      capabilities: {
+        ...base.capabilities,
+        networkModes: ["none", "full"],
+        runtimeClosure: {
+          protocolVersion: 1,
+          digest: `sha256:${"1".repeat(64)}`,
+          complete: available,
+          platform: process.platform,
+          architecture: process.arch,
+          executableSearchPathsDigest: `sha256:${"2".repeat(64)}`,
+          runtimeCommandsDigest: `sha256:${"3".repeat(64)}`,
+          targetAttestationDigest: `sha256:${"4".repeat(64)}`
+        },
+        managedEnvironment: { available, prepare: available }
+      },
+      container: {
+        available,
+        backend: "oci",
+        engine: "docker",
+        target: "managed",
+        targetId: "managed-target"
+      }
+    };
+    broker.doctor = async () => report;
+    const stdout = new Capture();
+    await expect(runDoctorCommand([
+      "--workspace", root,
+      "--execution-mode", "container",
+      "--network", "full",
+      "--managed-environment-mode", "required",
+      "--json"
+    ], { stdout, executionBroker: broker, languageServers: [] })).resolves.toBe(available ? 0 : 1);
+    const result = JSON.parse(stdout.text()) as {
+      container: { target?: string };
+      checks: Array<{ name: string; status: string }>;
+    };
+    expect(result.container.target).toBe("managed");
+    expect(result.checks.find((check) => check.name === "managed_environment")?.status)
+      .toBe(available ? "ok" : "error");
+  });
+
   it("prints help", async () => {
     const stdout = new Capture();
     await expect(runDoctorCommand(["-h"], { stdout })).resolves.toBe(0);
