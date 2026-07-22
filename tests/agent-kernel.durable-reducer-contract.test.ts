@@ -280,6 +280,20 @@ describe("durable reducer contracts", () => {
       .toMatchObject({ kind: "completion_evidence", stage: "terminal" });
   });
 
+  it("settles evidence acquisition against its opening count, not the whole run", () => {
+    const prior = diagnosticEvidence("prior");
+    const base = initial();
+    const repairing: KernelState = {
+      ...base,
+      evidence: [prior],
+      taskControl: completionEvidenceObligation(base.taskControl, base.revision, "acquire", 1)
+    };
+
+    const settled = reduce(repairing, "evidence.recorded", diagnosticEvidence("new"));
+    expect(settled.taskControl).toMatchObject({ phase: "normal", obligation: undefined });
+    expect(settled.evidence.map((item) => item.evidenceId)).toEqual(["prior", "new"]);
+  });
+
   it("requires monotonic plans and validates frozen runtime identities", () => {
     const state = initial();
     const nextPlan = {

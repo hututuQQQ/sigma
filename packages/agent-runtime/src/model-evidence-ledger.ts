@@ -22,6 +22,8 @@ export function evidenceLedger(session: RuntimeSession): ContextItem {
     `- net changed paths (${frontier.changedPaths.length}): ${changed.length > 0 ? changed.join(", ") : "none"}`,
     ...(changed.length < frontier.changedPaths.length ? [`- ${frontier.changedPaths.length - changed.length} additional paths omitted from this display`] : []),
     `- semantic validation: ${frontier.changedPaths.length === 0 ? "not required" : validation.ready ? "passed for every net changed path" : "blocking"}`,
+    ...(validation.missingClaims.length > 0
+      ? [`- required validation claim kinds still missing/failed: ${validation.missingClaims.join(", ")}`] : []),
     ...(validation.missingPaths.length > 0 ? [`- validation still missing/failed for: ${validation.missingPaths.join(", ")}`] : []),
     ...(validation.latestFailed ? [`- latest failed validation: ${validation.latestFailed.summary}`] : []),
     `- independent review mode: ${reviewMode}`,

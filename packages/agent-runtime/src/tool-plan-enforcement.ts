@@ -6,7 +6,6 @@ import type {
   ModelToolCall,
   ToolCallPlan,
   ToolReceipt,
-  ValidationClaimKindV1,
   ValidationClaimV1
 } from "agent-protocol";
 import { canonicalWorkspacePath, isInside } from "agent-platform";
@@ -17,6 +16,7 @@ import {
   assertRepositoryConflictPlanAllowed,
   assertRepositoryRecoveryCallAllowed
 } from "./repository-task-control-policy.js";
+import { semanticValidationCommand } from "./semantic-validation-command.js";
 
 export interface FrozenValidationScope {
   frontierRevision: number;
@@ -92,58 +92,13 @@ function invocation(call: ModelToolCall): { executable: string; args: string[]; 
   return { executable: words[0] ?? "", args: words.slice(1), display: command };
 }
 
-function executableName(value: string): string {
-  return path.basename(value).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/u, "");
-}
-
-function scriptName(executable: string, args: string[]): string | undefined {
-  if (!["pnpm", "npm", "yarn", "bun"].includes(executable)) return undefined;
-  const candidate = args[0] === "run" ? args[1] : args[0];
-  return candidate?.toLowerCase();
-}
-
-function cargoSubcommand(args: string[]): string | undefined {
-  const optionsWithValues = new Set(["--color", "--config", "-C", "-Z"]);
-  let skipValue = false;
-  for (const argument of args) {
-    if (skipValue) {
-      skipValue = false;
-      continue;
-    }
-    if (argument.startsWith("+")) continue;
-    const option = argument.split("=", 1)[0] ?? argument;
-    if (optionsWithValues.has(option)) {
-      skipValue = !argument.includes("=");
-      continue;
-    }
-    if (argument.startsWith("-")) continue;
-    return argument.toLowerCase();
-  }
-  return undefined;
-}
-
-function cargoClaimKind(args: string[]): ValidationClaimKindV1 | undefined {
-  const subcommand = cargoSubcommand(args);
-  if (subcommand === "test") return "unit";
-  if (subcommand === "clippy" || subcommand === "fmt") return "lint";
-  if (["build", "check", "bench"].includes(subcommand ?? "")) return "acceptance";
-  return undefined;
-}
-
-function claimKind(executable: string, args: string[]): ValidationClaimKindV1 {
-  if (executable === "node" && args[0] === "--check") return "syntax";
-  if (executable === "tsc" || args.some((item) => executableName(item) === "tsc")) return "typecheck";
-  if (["eslint", "biome", "stylelint", "ruff"].includes(executable)) return "lint";
-  if (["vitest", "jest", "mocha", "pytest", "cargo-test"].includes(executable)) return "unit";
-  if (executable === "cargo") return cargoClaimKind(args) ?? "probe";
-  const script = scriptName(executable, args);
-  if (!script) return "probe";
-  if (/integration|e2e/u.test(script)) return "integration";
-  if (/test|spec/u.test(script)) return "unit";
-  if (/typecheck|check-types|tsc/u.test(script)) return "typecheck";
-  if (/lint|format-check/u.test(script)) return "lint";
-  if (/build|verify|validate|check/u.test(script)) return "acceptance";
-  return "probe";
+function inlineNodeExactFiles(
+  workspaceRoot: string,
+  projectRoot: string,
+  candidates: readonly string[]
+): string[] {
+  return [...new Set(candidates.flatMap((value) =>
+    workspaceSubjectPath(workspaceRoot, projectRoot, value) ?? []))].sort();
 }
 
 function workspaceSubjectPath(workspaceRoot: string, projectRoot: string, requested: string): string | undefined {
@@ -165,13 +120,22 @@ function validationClaim(
   call: ModelToolCall
 ): Omit<ValidationClaimV1, "status"> {
   const command = invocation(call);
-  const executable = executableName(command.executable);
+  const semantic = semanticValidationCommand(command.executable, command.args);
+  const executable = semantic.executable;
   // Registered non-process validators are trusted semantic adapters. Process
   // tools still derive their exact strength from the executable and args.
-  const kind = !executable && call.name !== "validate"
-    ? "acceptance" as const : claimKind(executable, command.args);
+  const adaptedKind = !executable && call.name !== "validate"
+    ? "acceptance" as const : semantic.kind;
   const project = projectRootForCall(workspaceRoot, call);
-  const exactFiles = kind === "syntax"
+  const inlineExactFiles = executable === "node"
+    ? inlineNodeExactFiles(workspaceRoot, project.absolute, semantic.inlineExactPathCandidates) : [];
+  const kind = adaptedKind === "probe" && inlineExactFiles.length > 0
+    ? inlineExactFiles.some((item) => assurancePathsForClaim([item], "unit").includes(item))
+      ? "unit" as const : "acceptance" as const
+    : adaptedKind;
+  const exactFiles = inlineExactFiles.length > 0
+    ? inlineExactFiles
+    : kind === "syntax"
     ? command.args.slice(1, 2).flatMap((item) => workspaceSubjectPath(workspaceRoot, project.absolute, item) ?? [])
     : [];
   const projectFlag = command.args.findIndex((item) => item === "-p" || item === "--project");
@@ -277,7 +241,7 @@ export function validationScope(
   const project = claim.subject.projectId ?? ".";
   const coveredPaths = claim.kind === "probe"
     ? []
-    : claim.kind === "syntax"
+    : exact.size > 0
       ? frontier.changedPaths.filter((item) => exact.has(portable(item)))
       : assurancePathsForClaim(
           frontier.changedPaths.filter((item) => coveredByProject(item, project)),

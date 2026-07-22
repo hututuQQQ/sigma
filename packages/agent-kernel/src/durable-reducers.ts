@@ -104,9 +104,11 @@ function settleFirstCompletionEvidence(
 const evidenceRecorded: KernelEventReducer = (state, event) => {
   const evidence = event.payload;
   if (!isEvidenceRecord(evidence) || !canRecordEvidence(state, event, evidence)) return state;
+  const evidenceCount = state.taskControl.obligation?.kind === "completion_evidence"
+    ? state.taskControl.obligation.evidenceCount : 0;
   const firstCompletionEvidence = isEvidenceAcquisitionRepair(state)
     && isCompletionReferenceableEvidence(evidence, state.sessionId, state.runId)
-    && !state.evidence.some((item) => isCompletionReferenceableEvidence(item, state.sessionId, state.runId));
+    && currentReferenceableEvidenceCount(state) >= evidenceCount;
   const repaired = settleFirstCompletionEvidence(appendEvidence(state, evidence), evidence, firstCompletionEvidence);
   return advanceEvidenceObligation(
     evidence.kind === "review" ? reviewTaskControl(repaired, evidence) : repaired,

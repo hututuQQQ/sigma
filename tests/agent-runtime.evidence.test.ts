@@ -369,6 +369,192 @@ describe("V5 assurance-coordinated mutation completion", () => {
     });
   });
 
+  it("recognizes direct Node test and check runners as semantic validation", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs", "config.json"];
+
+    expect(validationScope(active, {
+      id: "node-test", name: "validate",
+      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["src/code.mjs"],
+      claim: { kind: "unit", subject: { selectedTests: ["tests/code.test.mjs"] } }
+    });
+    expect(validationScope(active, {
+      id: "node-check-script", name: "validate",
+      arguments: { executable: "node", args: ["check.mjs"] }
+    }, validationPlan)).toMatchObject({
+      coveredPaths: ["src/code.mjs", "config.json"],
+      claim: { kind: "acceptance" }
+    });
+  });
+
+  it("gives falsifiable inline Node assertions exact-file coverage only", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = [
+      "src/app.mjs", "config.json", "docs/unrelated.md"
+    ];
+
+    const source = validationScope(active, {
+      id: "inline-source", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "import('./src/app.mjs').then(m => { if (!m.ok) process.exit(1); })"]
+      }
+    }, validationPlan);
+    expect(source).toMatchObject({
+      coveredPaths: ["src/app.mjs"],
+      claim: { kind: "unit", subject: { exactFiles: ["src/app.mjs"] } }
+    });
+
+    const config = validationScope(active, {
+      id: "inline-config", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["--eval", "const c=JSON.parse(readFileSync('config.json','utf8')); if (!c.ok) throw new Error('bad')"]
+      }
+    }, validationPlan);
+    expect(config).toMatchObject({
+      coveredPaths: ["config.json"],
+      claim: { kind: "acceptance", subject: { exactFiles: ["config.json"] } }
+    });
+
+    const observation = validationScope(active, {
+      id: "inline-observation", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "console.log(readFileSync('config.json','utf8'))"]
+      }
+    }, validationPlan);
+    expect(observation).toMatchObject({ coveredPaths: [], claim: { kind: "probe" } });
+
+    const unrelated = validationScope(active, {
+      id: "inline-unrelated", name: "validate",
+      arguments: {
+        executable: "node",
+        args: ["-e", "const c=readFileSync('not-changed.json','utf8'); if (!c) process.exit(1)"]
+      }
+    }, validationPlan);
+    expect(unrelated).toMatchObject({
+      coveredPaths: [],
+      claim: { kind: "acceptance", subject: { exactFiles: ["not-changed.json"] } }
+    });
+  });
+
+  it("keeps an explicitly requested direct Node check as an acceptance obligation", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node check.mjs` and report the result."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
+
+    expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["acceptance"] });
+    expect(evidenceLedger(active).content).toContain(
+      "required validation claim kinds still missing/failed: acceptance"
+    );
+
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node checker.mjs`."
+    };
+    expect(assuranceRequirement(active)).toMatchObject({ requiredClaims: ["unit"] });
+  });
+
+  it("turns recognized Node validation into current-frontier readiness", () => {
+    const active = frontierSession();
+    active.durable.state.mutationFrontier.changedPaths = ["src/code.mjs"];
+    const scope = validationScope(active, {
+      id: "node-test", name: "validate",
+      arguments: { executable: "node", args: ["--test", "tests/code.test.mjs"] }
+    }, validationPlan)!;
+    active.durable.state.evidence.push({
+      evidenceId: "node-test-evidence",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "passed",
+      createdAt: now,
+      producer: { authority: "tool", id: "node-test" },
+      summary: "tests passed",
+      data: {
+        validator: "command",
+        command: "node --test tests/code.test.mjs",
+        exitCode: 0,
+        artifactIds: [],
+        frontierRevision: scope.frontierRevision,
+        stateDigest: scope.stateDigest,
+        coveredPaths: scope.coveredPaths,
+        claim: { ...scope.claim, status: "passed" }
+      }
+    });
+
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: true,
+      coveredPaths: ["src/code.mjs"],
+      missingClaims: []
+    });
+  });
+
+  it("reports a failed explicitly requested Node check as validation_failed", () => {
+    const active = frontierSession();
+    active.durable.state.plan = {
+      ...active.durable.state.plan,
+      goal: "Update service.mjs, then run `node check.mjs` and report the result."
+    };
+    active.durable.state.mutationFrontier.changedPaths = ["service.mjs"];
+    const scope = validationScope(active, {
+      id: "node-check", name: "validate",
+      arguments: { executable: "node", args: ["check.mjs"] }
+    }, validationPlan)!;
+    active.durable.state.evidence.push({
+      evidenceId: "node-check-failed",
+      sessionId: "session",
+      runId: "run",
+      kind: "validation",
+      status: "failed",
+      createdAt: now,
+      producer: { authority: "tool", id: "node-check" },
+      summary: "check failed",
+      data: {
+        validator: "command",
+        command: "node check.mjs",
+        exitCode: 1,
+        termination: {
+          processStarted: true,
+          state: "exited",
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          idleTimedOut: false,
+          cancelled: false
+        },
+        artifactIds: [],
+        frontierRevision: scope.frontierRevision,
+        stateDigest: scope.stateDigest,
+        coveredPaths: scope.coveredPaths,
+        claim: { ...scope.claim, status: "failed" }
+      }
+    });
+
+    const call: ModelToolCall = {
+      id: "runtime_completion_intent_failed-check",
+      name: "runtime_finalize",
+      arguments: { summary: "The requested check failed." }
+    };
+    expect(frontierValidationReadiness(active)).toMatchObject({
+      ready: false,
+      missingClaims: ["acceptance"],
+      latestFailed: { evidenceId: "node-check-failed" }
+    });
+    expect(completionFailure(active, call, {
+      possibleEffects: ["outcome.propose"]
+    } as ToolDescriptor, now)).toMatchObject({
+      ok: false,
+      diagnostics: ["validation_failed"]
+    });
+  });
+
   it("requires unit evidence for non-source assets under tests", () => {
     const active = frontierSession();
     active.durable.state.mutationFrontier.changedPaths = ["tests/fixtures/data.json"];

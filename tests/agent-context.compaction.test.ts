@@ -124,6 +124,38 @@ describe("ContextPlanner long-running tool history compaction", () => {
     expectWireSafe(retainedHistory(result));
   });
 
+  it("never replays the runtime-owned completion action as a model-callable tool", () => {
+    const callId = "runtime_completion_intent_4_120";
+    const result = plan([
+      { role: "user", content: "Make the requested change and validate it." },
+      {
+        role: "assistant",
+        content: "The change is complete.",
+        toolCalls: [{
+          id: callId,
+          name: "runtime_finalize",
+          arguments: { summary: "The change is complete." }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: callId,
+        content: [
+          `Failed tool receipt ID: ${callId}`,
+          'Receipt summary (JSON): {"outcome":{"status":"failed","diagnosticCodes":["validation_evidence_required"]}}',
+          "Output:",
+          "Current-state semantic validation is required."
+        ].join("\n")
+      }
+    ], 10_000, 100);
+    const history = retainedHistory(result);
+
+    expect(history.flatMap((message) => message.toolCalls ?? [])).toEqual([]);
+    expect(history.at(-1)?.content).toContain("validation_evidence_required");
+    expect(history.at(-1)?.content).not.toContain("runtime_finalize");
+    expectWireSafe(history);
+  });
+
   it("prioritizes semantic receipt output over invocation markers in tight summaries", () => {
     const receipt = [
       "Failed tool receipt ID: compact-command",

@@ -14,8 +14,12 @@ function explicitAcceptanceClaims(goal: string): ValidationClaimKindV1[] {
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?lint\b|\beslint\b/u.test(lower)) claims.push("lint");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:typecheck|check-types)\b|\btsc\b/u.test(lower)) claims.push("typecheck");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test\b|\b(?:vitest|jest|pytest)\b/u.test(lower)) claims.push("unit");
+  if (/\bnode(?:\.exe)?\s+--test(?:\s|=|$)/u.test(lower)) claims.push("unit");
   if (/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build\b/u.test(lower)) claims.push("acceptance");
   if (/\bnode(?:\.exe)?\s+--check\b/u.test(lower)) claims.push("syntax");
+  if (/\bnode(?:\.exe)?\s+(?:["'`])?(?!-)(?:[^\s"'`]*[/\\._-])?(?:check|verify|validate)(?:[/\\._-][^\s"'`]*)?(?=["'`]?\s|["'`.,;:]|$)/u.test(lower)) {
+    claims.push("acceptance");
+  }
   return claims;
 }
 

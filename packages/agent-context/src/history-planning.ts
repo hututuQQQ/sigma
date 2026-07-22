@@ -70,6 +70,7 @@ export function historyBlocks(history: readonly ModelMessage[]): HistoryBlock[] 
     blocks.push({
       messages,
       wireSafe: expected.size === calls.length && matched.size === expected.size
+        && !calls.some((call) => call.id.startsWith("runtime_completion_intent_"))
     });
     index = cursor;
   }
