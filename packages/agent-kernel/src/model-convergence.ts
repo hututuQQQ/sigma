@@ -126,7 +126,7 @@ export function failedTerminalRepairState(
   return propose({ ...state, taskControl }, {
     kind: "recoverable_failure",
     code: taskControl.obligation?.kind === "terminal_resolution"
-      ? taskControl.obligation.failureCode : "model_tool_policy_violation",
+      ? taskControl.obligation.failureCode : "action_convergence_no_progress",
     message: completionRepairFailureMessage(state, `Task-control correction was rejected twice (${detail}).`)
   });
 }
@@ -147,7 +147,8 @@ export function repairConflictingTerminalBatch(state: KernelState, messages: Mod
   return taskControl.phase === "terminal"
     ? propose({ ...state, messages, taskControl }, {
         kind: "recoverable_failure",
-        code: "terminal_batch_conflict",
+        code: taskControl.obligation?.kind === "terminal_resolution"
+          ? taskControl.obligation.failureCode : "action_convergence_no_progress",
         message: completionRepairFailureMessage(state, "A terminal action was repeatedly mixed with another call.")
       })
     : {

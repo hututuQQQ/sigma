@@ -226,7 +226,7 @@ describe("TaskControlStateV1", () => {
     const second = recordToolPolicyViolation(first, "tool_unavailable_for_repair", 2);
     expect(second).toMatchObject({
       phase: "terminal",
-      obligation: { kind: "terminal_resolution", failureCode: "tool_unavailable_for_repair" }
+      obligation: { kind: "terminal_resolution", failureCode: "action_convergence_no_progress" }
     });
   });
 
@@ -244,6 +244,60 @@ describe("TaskControlStateV1", () => {
       phase: "terminal",
       obligation: { kind: "terminal_resolution", failureCode: "validation_evidence_required" }
     });
+  });
+
+  it("classifies an exhausted review-scope correction as review repair failure", () => {
+    const repair = reviewRepairObligation(
+      createTaskControlState(),
+      1,
+      DIGEST_A,
+      ["src/target.ts"]
+    );
+    const first = recordToolPolicyViolation(repair, "tool_unavailable_for_repair", 2);
+    const second = recordToolPolicyViolation(first, "tool_unavailable_for_repair", 3);
+    expect(second).toMatchObject({
+      phase: "terminal",
+      obligation: { kind: "terminal_resolution", failureCode: "review_repair_exhausted" }
+    });
+  });
+
+  it("clears repair and convergence state when current-epoch restoration is accepted", () => {
+    let state = workspaceDelta(initial());
+    state = {
+      ...state,
+      taskControl: terminalResolutionObligation(state.taskControl, state.revision, "review_repair_exhausted")
+    };
+    const frontier = state.mutationFrontier;
+    const evidence: EvidenceRecord = {
+      evidenceId: "restoration-current-epoch",
+      sessionId: state.sessionId,
+      runId: state.runId,
+      kind: "restoration",
+      status: "passed",
+      createdAt: NOW,
+      producer: { authority: "runtime", id: "workspace-restoration-v1" },
+      summary: "restored",
+      data: {
+        schemaVersion: 1,
+        goalEpoch: state.taskControl.goalEpoch,
+        frontierRevision: frontier.revision,
+        frontierStateDigest: frontier.currentStateDigest,
+        baselineManifestDigest: DIGEST_B,
+        currentManifestDigest: DIGEST_B,
+        restoredCheckpointIds: ["checkpoint-current-run"],
+        quiescence: {
+          supersededExecutionStopped: true,
+          noPendingMutations: true,
+          noProcesses: true,
+          noChildren: true,
+          noOpenCheckpoint: true
+        },
+        repository: { status: "unchanged" }
+      }
+    };
+    state = apply(state, "evidence.recorded", evidence);
+    expect(state.mutationFrontier.changedPaths).toEqual([]);
+    expect(state.taskControl).toMatchObject({ phase: "normal", obligation: undefined });
   });
 
   it("runs one review repair cycle and resolves only after validation and approval", () => {

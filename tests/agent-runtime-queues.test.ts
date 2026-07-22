@@ -500,7 +500,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "model_tool_policy_violation"
+      code: "action_convergence_no_progress"
     });
     expect(gateway.requests).toHaveLength(2);
     for (const request of gateway.requests) {
@@ -538,7 +538,7 @@ describe("runtime queues and non-blocking instruction steering", () => {
 
     await expect(runtime.waitForOutcome(session.sessionId)).resolves.toMatchObject({
       kind: "recoverable_failure",
-      code: "invalid_user_input_request"
+      code: "action_convergence_no_progress"
     });
     expect(gateway.requests).toHaveLength(2);
     const events = await storedEvents(store, session.sessionId);

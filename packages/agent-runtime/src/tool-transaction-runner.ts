@@ -18,6 +18,7 @@ import { profileAllowsTool } from "./profile-policy.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
+  assertTaskControlPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "./tool-plan-enforcement.js";
@@ -168,6 +169,7 @@ export class ToolTransactionRunner {
         "plan_required"
       );
     }
+    await assertTaskControlPlanAllowed(session, plan);
     const scopeError = await writeScopeFailure(session, call, descriptor, startedAt, plan);
     if (scopeError) return scopeError;
     const completionError = completionFailure(session, call, descriptor, startedAt);

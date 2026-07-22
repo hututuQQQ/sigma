@@ -175,6 +175,41 @@ async function canonicalWrittenObjectPath(
   return parent ? path.join(parent, path.basename(lexical)) : null;
 }
 
+/** Keep a review-directed mutation inside the runtime-authenticated finding
+ * scope. The model may narrow the prepared write plan, but it cannot widen
+ * the obligation by changing arguments, checkpoint roots, or call IDs. */
+export async function assertTaskControlPlanAllowed(
+  session: RuntimeSession,
+  plan: ToolCallPlan
+): Promise<void> {
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind !== "review_repair" || obligation.stage !== "mutate") return;
+  if (!plan.exactEffects.includes("filesystem.write")) {
+    throw Object.assign(new Error(
+      "The active review repair requires one scoped workspace mutation."
+    ), { code: "tool_unavailable_for_repair" });
+  }
+  const requested = plan.writePaths.length > 0 ? plan.writePaths : plan.checkpointScope;
+  if (requested.length === 0) {
+    throw Object.assign(new Error(
+      "The review repair mutation did not declare any exact write path."
+    ), { code: "tool_unavailable_for_repair" });
+  }
+  const allowed = (await Promise.all(obligation.scopePaths.map(async (item) =>
+    await canonicalWrittenObjectPath(session.identity.workspacePath, item))))
+    .filter((item): item is string => Boolean(item));
+  const targets = await Promise.all(requested.map(async (item) => ({
+    item,
+    canonical: await canonicalWrittenObjectPath(session.identity.workspacePath, item)
+  })));
+  const outside = targets.filter(({ canonical }) => !canonical
+    || !allowed.some((scope) => isInside(scope, canonical))).map(({ item }) => item);
+  if (allowed.length === obligation.scopePaths.length && outside.length === 0) return;
+  throw Object.assign(new Error(
+    `Review repair write plan is outside the authenticated finding scope: ${outside.join(", ") || "invalid scope"}.`
+  ), { code: "tool_unavailable_for_repair" });
+}
+
 /** Freeze validation authority at preparation time. Coverage comes only from
  * a semantic command adapter and its selected project/files. Filesystem grants
  * and cwd traversal authority are deliberately irrelevant. */

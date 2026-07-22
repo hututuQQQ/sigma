@@ -6,6 +6,7 @@ import type {
   TaskObligationV1
 } from "./task-control-state.js";
 import { isTaskControlStateV1 } from "./task-control-state.js";
+import { policyExhaustionCode } from "./task-control-resolution.js";
 
 const EMPTY_BASIS = createHash("sha256").update("sigma-task-control-v1").digest("hex");
 
@@ -288,8 +289,7 @@ export function recordToolPolicyViolation(
     phase: control.obligation || control.phase !== "normal" ? control.phase : "focused",
     policyCorrection: { basisDigest, attempts, failureCode }
   };
-  const resolutionCode = obligation?.kind === "completion_evidence" && obligation.failureCode
-    ? obligation.failureCode : failureCode;
+  const resolutionCode = policyExhaustionCode(control);
   return attempts >= 2 ? terminalResolutionObligation(updated, revision, resolutionCode) : updated;
 }
 

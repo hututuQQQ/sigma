@@ -123,6 +123,7 @@ function applyWorkspaceRestorationEvidence(state: KernelState, evidence: Evidenc
     || frontier.repositoryStateDigest !== undefined) return state;
   return {
     ...state,
+    taskControl: resolveTaskObligation(state.taskControl),
     mutationFrontier: {
       revision: frontier.revision + 1,
       baselineManifestDigest: data.currentManifestDigest,

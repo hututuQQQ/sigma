@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createKernelState } from "../packages/agent-kernel/src/index.js";
+import { createKernelState, reviewRepairObligation } from "../packages/agent-kernel/src/index.js";
 import type {
   AgentEventEnvelope,
   EvidenceRecord,
@@ -23,6 +23,7 @@ import { RuntimeControlService } from "../packages/agent-runtime/src/runtime-con
 import type { RuntimeControlServiceOptions } from "../packages/agent-runtime/src/runtime-control-contracts.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "../packages/agent-runtime/src/tool-evidence.js";
 import {
+  assertTaskControlPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
 } from "../packages/agent-runtime/src/tool-plan-enforcement.js";
@@ -456,6 +457,46 @@ describe("leaf-aware effect-plan enforcement", () => {
     };
 
     await expect(assertReceiptWithinPlan(active, result, plan)).resolves.toBeUndefined();
+  });
+});
+
+describe("review repair plan enforcement", () => {
+  function repairPlan(writePaths: string[]): ToolCallPlan {
+    return {
+      exactEffects: ["filesystem.write"], readPaths: [], writePaths,
+      network: "none", processMode: "none", checkpointScope: writePaths,
+      idempotence: "non_replayable"
+    };
+  }
+
+  it("allows only writes inside the runtime-authenticated finding scope", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-plan-"));
+    await mkdir(path.join(workspace, "src"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    active.durable.state.taskControl = reviewRepairObligation(
+      active.durable.state.taskControl,
+      active.durable.state.revision,
+      "a".repeat(64),
+      ["src/target.ts"]
+    );
+
+    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/target.ts"])))
+      .resolves.toBeUndefined();
+    await expect(assertTaskControlPlanAllowed(active, repairPlan(["src/other.ts"])))
+      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
+  });
+
+  it("rejects mutation plans without an exact write target", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "sigma-review-repair-empty-plan-"));
+    const active = runtimeSessionFixture({ workspacePath: workspace });
+    active.durable.state.taskControl = reviewRepairObligation(
+      active.durable.state.taskControl,
+      active.durable.state.revision,
+      "b".repeat(64),
+      ["target.ts"]
+    );
+    await expect(assertTaskControlPlanAllowed(active, repairPlan([])))
+      .rejects.toMatchObject({ code: "tool_unavailable_for_repair" });
   });
 });
 
