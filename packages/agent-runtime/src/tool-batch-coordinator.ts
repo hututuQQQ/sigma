@@ -16,6 +16,7 @@ import {
 } from "./tool-turn-policy.js";
 import type { ToolTransactionRunner } from "./tool-transaction-runner.js";
 import type { RuntimeSession } from "./types.js";
+import { emitRuntimeDependencyOutcome } from "./runtime-dependency-outcome.js";
 
 type DurableToolReceipt = ToolReceipt & { outcome: ToolOutcome };
 
@@ -315,8 +316,20 @@ export class ToolBatchCoordinator {
     receipt: ToolReceipt,
     modelTurn: ActiveModelTurn
   ): Promise<void> {
+    const pendingRequest = session.durable.state.pendingTools.find((item) =>
+      item.request.callId === receipt.callId
+      && item.modelTurn.turnId === modelTurn.turnId
+      && item.modelTurn.effectRevision === modelTurn.effectRevision)?.request;
+    const capabilityObligation = session.durable.state.taskControl.obligation;
     const name = receiptToolName(session, receipt, modelTurn);
     await this.emitDurableReceipt(session, receipt, modelTurn, name);
+    await emitRuntimeDependencyOutcome({
+      emit: this.options.emit,
+      session,
+      receipt,
+      ...(pendingRequest ? { request: pendingRequest } : {}),
+      ...(capabilityObligation ? { obligation: capabilityObligation } : {})
+    });
     try {
       await this.dispatchPostTool(session, receipt, name);
       await this.reviewAfterReceipt(session, name);

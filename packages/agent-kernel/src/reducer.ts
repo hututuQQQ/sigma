@@ -14,6 +14,7 @@ import { recordSemanticToolResult } from "./semantic-failures.js";
 import { acceptMutationFrontier } from "./mutation-frontier.js";
 import { completedToolBatchProgress, startedToolBatchProgress } from "./tool-batch-progress.js";
 import { beginGoalEpoch, terminalResolutionObligation, userDecisionObligation } from "./task-control.js";
+import { runtimeDependencyDiagnostic } from "./runtime-dependency-reducer.js";
 import {
   acceptsOutcomeRevision,
   isRecoverySuspension,
@@ -297,7 +298,9 @@ const runCompleted: EventReducer = (state, _event, payload) => {
   }, { ...state.proposedOutcome, evidence: state.evidence });
 };
 
-const diagnostic: EventReducer = (state, _event, payload) => {
+const diagnostic: EventReducer = (state, event, payload) => {
+  const dependency = runtimeDependencyDiagnostic(state, event, payload);
+  if (dependency) return dependency;
   // user.steer is the durable authority for superseding a turn. The later
   // steering.restart event is observational only: applying it could erase a
   // newer turn that completed while the cancelled provider was unwinding.

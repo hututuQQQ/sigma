@@ -7,3 +7,4 @@ export * from "./semantic-failures.js";
 export * from "./durable-budget-reducers.js";
 export * from "./task-control-state.js";
 export * from "./task-control.js";
+export * from "./capability-task-control.js";

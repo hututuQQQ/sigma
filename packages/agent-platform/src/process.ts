@@ -3,6 +3,8 @@ import type {
   BrokerRequestOptions,
   ExecutionRequest,
   ExecutionResult,
+  ManagedEnvironmentPrepareRequestV1,
+  ManagedEnvironmentPrepareResultV1,
   ManagedSessionBindingRequestV1,
   ManagedSessionBindingV1,
   ProcessLaunchFailureV1,
@@ -25,6 +27,10 @@ export interface ProcessExecutionPort {
     request: ManagedSessionBindingRequestV1,
     options?: BrokerRequestOptions
   ): Promise<ManagedSessionBindingV1>;
+  prepareManagedEnvironment?(
+    request: ManagedEnvironmentPrepareRequestV1,
+    options?: BrokerRequestOptions
+  ): Promise<ManagedEnvironmentPrepareResultV1>;
 }
 
 export interface ProcessRequest {

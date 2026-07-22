@@ -280,6 +280,8 @@ describe("managed session binding and environment preparation", () => {
       network: "full",
       protectedPaths: ["/workspace/.git", "/workspace/.agent"]
     });
+    const originalBindingId = binding.bindingId;
+    const originalClosureDigest = binding.runtimeClosure.digest;
     const result = await guarded.prepareManagedEnvironment({
       protocolVersion: 1,
       sessionId: "session-1",
@@ -292,7 +294,9 @@ describe("managed session binding and environment preparation", () => {
       packageManager: "apt-get",
       signaturePolicy: "trusted-system-package-manager-defaults"
     });
-    expect(result.runtimeClosure.digest).not.toBe(binding.runtimeClosure.digest);
+    expect(result.runtimeClosure.digest).not.toBe(originalClosureDigest);
+    expect(binding.runtimeClosure.digest).toBe(result.runtimeClosure.digest);
+    expect(binding.bindingId).not.toBe(originalBindingId);
     expect(underlying.prepareManagedEnvironment).toHaveBeenCalledWith({
       protocolVersion: 1,
       sessionId: "session-1",

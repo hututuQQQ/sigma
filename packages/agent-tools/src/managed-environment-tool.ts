@@ -67,6 +67,7 @@ export function environmentPrepareTool(
       }, { signal: context.signal, timeoutMs: 600_000 });
       return receipt(request, startedAt, {
         output: JSON.stringify(result),
+        result: JSON.parse(JSON.stringify(result)) as JsonValue,
         observedEffects: ["process.spawn", "network", "open_world"],
         diagnostics: [
           "managed_environment_prepared",

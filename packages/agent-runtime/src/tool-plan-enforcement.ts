@@ -37,6 +37,34 @@ function argumentObject(value: JsonValue): Record<string, JsonValue> {
     ? value as Record<string, JsonValue> : {};
 }
 
+function requestedExecutable(call: ModelToolCall): string | undefined {
+  const input = argumentObject(call.arguments);
+  return typeof input.executable === "string" ? input.executable : undefined;
+}
+
+/** Bind a capability-recovery action to the runtime-issued opportunity. The
+ * model may choose one package set, but cannot change the missing executable,
+ * substitute another probe, or reuse the obligation for unrelated execution. */
+export function assertTaskControlCallAllowed(
+  session: RuntimeSession,
+  call: ModelToolCall
+): void {
+  const obligation = session.durable.state.taskControl.obligation;
+  if (obligation?.kind !== "capability_recovery") return;
+  const executable = requestedExecutable(call);
+  const allowed = obligation.stage === "prepare"
+    ? call.name === "environment_prepare" && (() => {
+        const input = argumentObject(call.arguments);
+        return input.requestedExecutable === obligation.requestedExecutable;
+      })()
+    : call.name === obligation.probeToolName
+      && executable === obligation.requestedExecutable;
+  if (allowed) return;
+  throw Object.assign(new Error(
+    "The active capability recovery is bound to one broker-observed executable and probe."
+  ), { code: "tool_unavailable_for_repair" });
+}
+
 function shellWords(command: string): string[] {
   const words: string[] = [];
   const pattern = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s]+)/gu;

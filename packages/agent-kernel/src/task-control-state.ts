@@ -29,6 +29,9 @@ export type TaskObligationV1 =
       openedRevision: number;
       attempts: number;
       opportunityId: string;
+      requestedExecutable: string;
+      probeToolName: "exec" | "validate" | "process_spawn";
+      runtimeClosureDigest: string;
     }
   | {
       kind: "repository_recovery";
@@ -153,7 +156,10 @@ const OBLIGATION_VALIDATORS: Record<TaskObligationV1["kind"], ObligationValidato
   review_repair: (obligation) => ["mutate", "validate", "re_review"].includes(String(obligation.stage))
     && nonEmptyStrings(obligation.scopePaths),
   capability_recovery: (obligation) => ["prepare", "re_probe"].includes(String(obligation.stage))
-    && typeof obligation.opportunityId === "string" && obligation.opportunityId.length > 0,
+    && typeof obligation.opportunityId === "string" && obligation.opportunityId.length > 0
+    && typeof obligation.requestedExecutable === "string" && obligation.requestedExecutable.length > 0
+    && ["exec", "validate", "process_spawn"].includes(String(obligation.probeToolName))
+    && typeof obligation.runtimeClosureDigest === "string" && obligation.runtimeClosureDigest.length > 0,
   repository_recovery: (obligation) => ["inspect", "select", "transact", "validate"].includes(String(obligation.stage)),
   restoration: (obligation) => ["quiesce", "restore", "confirm"].includes(String(obligation.stage)),
   process_settlement: (obligation) => obligation.stage === "settle" && nonEmptyStrings(obligation.processIds),

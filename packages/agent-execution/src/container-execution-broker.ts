@@ -224,9 +224,31 @@ export class AttestedContainerExecutionBroker implements ExecutionBroker {
     const result = await this.broker.prepareManagedEnvironment(canonical, options);
     const after = this.accept(await this.broker.doctor(options?.signal));
     const closure = after.capabilities.runtimeClosure!;
-    return this.managedEnvironment.accept(
+    const accepted = this.managedEnvironment.accept(
       canonical, previousRuntimeClosureDigest, result, closure
     );
+    const refreshedPayload = {
+      protocolVersion: binding.protocolVersion,
+      sessionId: binding.sessionId,
+      workspace: binding.workspace,
+      network: binding.network,
+      protectedPaths: binding.protectedPaths,
+      lifetime: binding.lifetime,
+      targetId: binding.targetId,
+      targetStartedAt: binding.targetStartedAt,
+      targetAttestationDigest: binding.targetAttestationDigest,
+      protectedPathsDigest: binding.protectedPathsDigest,
+      runtimeClosure: accepted.runtimeClosure,
+      scratchLease: binding.scratchLease
+    };
+    // The runtime session holds this broker-issued object by reference. Update
+    // it only after the target doctor and signed preparation receipt agree, so
+    // subsequent tool policy observes the refreshed closure without creating
+    // a second session capability.
+    Object.assign(binding, refreshedPayload, {
+      bindingId: stableSha256(refreshedPayload)
+    });
+    return accepted;
   }
 
   async execute(request: ExecutionRequest, options?: BrokerRequestOptions): Promise<ExecutionResult> {

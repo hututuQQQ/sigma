@@ -18,6 +18,7 @@ import { profileAllowsTool } from "./profile-policy.js";
 import { assertToolReceiptIdentity, normalizeReceiptEvidence } from "./tool-evidence.js";
 import {
   assertCheckpointActionAllowed,
+  assertTaskControlCallAllowed,
   assertTaskControlPlanAllowed,
   assertReceiptWithinPlan,
   validationScope
@@ -40,6 +41,7 @@ import {
 } from "./tool-transaction-support.js";
 import { convergedToolFailure } from "./capability-failure-convergence.js";
 import type { PreparedTool, TransactionState } from "./tool-transaction-types.js";
+import { recordRuntimeDependencyFailure } from "./runtime-dependency-observation.js";
 export class ToolTransactionRunner {
   private readonly locks = new ResourceLockManager();
   private readonly workspaceLease = new WorkspaceMutationLease();
@@ -105,6 +107,7 @@ export class ToolTransactionRunner {
         "tool_unavailable_for_repair"
       );
     }
+    assertTaskControlCallAllowed(session, call);
     const context = {
       sessionId: session.identity.sessionId,
       runId: session.durable.runId,
@@ -238,6 +241,13 @@ export class ToolTransactionRunner {
       );
       return await this.runReserved(session, { ...prepared, ...(approval ? { approval } : {}) }, reservationId, signal);
     } catch (error) {
+      try {
+        await recordRuntimeDependencyFailure(this.options, session, call, error);
+      } catch {
+        // The observation is an authorization prerequisite. If it cannot be
+        // durably recorded, preserve the original failure and expose no
+        // environment-recovery capability.
+      }
       const code = failureCode(error, signal);
       const receipt = failed(
         call,

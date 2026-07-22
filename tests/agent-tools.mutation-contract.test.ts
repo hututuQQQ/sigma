@@ -251,18 +251,19 @@ describe("typed workspace mutation contracts", () => {
       executionBackend: "oci",
       executionPlatform: "linux"
     });
+    const targetExecutable = "/usr/bin/node";
     const calls = [
       request("read-exec", "exec", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       }),
       request("read-shell", "shell", {
         shell: "powershell", command: "Get-Location", cwd: "work"
       }),
       request("read-validate", "validate", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       }),
       request("read-spawn", "process_spawn", {
-        executable: process.execPath, cwd: "work"
+        executable: targetExecutable, cwd: "work"
       })
     ];
 

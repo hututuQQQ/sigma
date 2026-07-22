@@ -51,6 +51,9 @@ export function availableRuntimeCommands(options: ExecutionToolOptions): string[
 }
 
 export function executableCapabilityDescription(options: ExecutionToolOptions): string {
+  if (options.managedEnvironment === true) {
+    return "Bare executable aliases are resolved and authenticated inside the launcher-attested managed target. A missing alias returns a structured dependency observation; do not infer availability from stderr.";
+  }
   const commands = availableRuntimeCommands(options);
   const aliasDescription = commands.length > 0
     ? `Connection-verified bare runtime command alias. Available aliases: ${commands.join(", ")}. Unlisted bare commands are unavailable.`
@@ -60,13 +63,17 @@ export function executableCapabilityDescription(options: ExecutionToolOptions): 
 
 export function executableCapabilitySchema(options: ExecutionToolOptions): JsonValue {
   const commands = availableRuntimeCommands(options);
+  const managedAlias = { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$" };
+  const windows = (options.executionPlatform ?? process.platform) === "win32";
   const explicitPath = {
     type: "string",
-    pattern: process.platform === "win32" ? "[\\\\/]" : "/"
+    pattern: windows ? "[\\\\/]" : "/"
   };
   return {
     type: "string",
-    ...(commands.length > 0
+    ...(options.managedEnvironment === true
+      ? { anyOf: [managedAlias, explicitPath] }
+      : commands.length > 0
       ? { anyOf: [{ type: "string", enum: commands }, explicitPath] }
       : { pattern: explicitPath.pattern }),
     description: executableCapabilityDescription(options)
@@ -78,12 +85,15 @@ export function assertAvailableExecutable(
   options: ExecutionToolOptions
 ): void {
   const requested = executionText(input, "executable");
-  const explicitPath = process.platform === "win32" ? /[\\/]/u : /\//u;
+  const explicitPath = (options.executionPlatform ?? process.platform) === "win32" ? /[\\/]/u : /\//u;
   if (explicitPath.test(requested)) return;
-  const key = process.platform === "win32" ? requested.toLowerCase() : requested;
+  if (options.managedEnvironment === true
+    && /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(requested)) return;
+  const windows = (options.executionPlatform ?? process.platform) === "win32";
+  const key = windows ? requested.toLowerCase() : requested;
   const available = availableRuntimeCommands(options);
   if (available.some((command) =>
-    (process.platform === "win32" ? command.toLowerCase() : command) === key)) return;
+    (windows ? command.toLowerCase() : command) === key)) return;
   throw Object.assign(new Error(
     `Executable alias '${requested}' is not verified for this broker connection.`
   ), { code: "executable_unavailable" });

@@ -350,6 +350,98 @@ describe("TaskControlStateV1", () => {
     });
   });
 
+  it("drives one managed dependency recovery from runtime-authenticated facts", () => {
+    const observed = {
+      kind: "runtime.dependency_observed",
+      protocolVersion: 1,
+      callId: "probe-1",
+      toolName: "exec",
+      requestedExecutable: "new-tool",
+      failureCode: "executable_not_found",
+      runtimeClosureDigest: "sha256:before",
+      opportunityId: "opportunity-1",
+      recoveryAvailable: true
+    } as const;
+    expect(apply(initial(), "diagnostic", observed, "tool").taskControl.obligation).toBeUndefined();
+
+    let state = apply(initial(), "diagnostic", observed);
+    expect(state.taskControl.obligation).toMatchObject({
+      kind: "capability_recovery",
+      stage: "prepare",
+      requestedExecutable: "new-tool",
+      probeToolName: "exec"
+    });
+    state = apply(state, "diagnostic", {
+      kind: "runtime.dependency_prepared",
+      protocolVersion: 1,
+      callId: "prepare-1",
+      requestedExecutable: "new-tool",
+      opportunityId: "opportunity-1",
+      previousRuntimeClosureDigest: "sha256:before",
+      runtimeClosureDigest: "sha256:after"
+    });
+    expect(state.taskControl.obligation).toMatchObject({
+      kind: "capability_recovery",
+      stage: "re_probe",
+      runtimeClosureDigest: "sha256:after"
+    });
+    state = apply(state, "diagnostic", {
+      kind: "runtime.dependency_reprobed",
+      protocolVersion: 1,
+      callId: "probe-2",
+      toolName: "exec",
+      requestedExecutable: "new-tool",
+      opportunityId: "opportunity-1",
+      runtimeClosureDigest: "sha256:after",
+      ok: true
+    });
+    expect(state.taskControl.phase).toBe("normal");
+    expect(state.taskControl.obligation).toBeUndefined();
+    expect(state.taskControl.semanticFacts.entries.filter((item) =>
+      item.kind === "runtime_environment")).toHaveLength(3);
+  });
+
+  it("stabilizes a failed managed dependency re-probe as capability exhaustion", () => {
+    let state = apply(initial(), "diagnostic", {
+      kind: "runtime.dependency_observed",
+      protocolVersion: 1,
+      callId: "probe-1",
+      toolName: "validate",
+      requestedExecutable: "new-tool",
+      failureCode: "executable_unavailable",
+      runtimeClosureDigest: "sha256:before",
+      opportunityId: "opportunity-2",
+      recoveryAvailable: true
+    });
+    state = apply(state, "diagnostic", {
+      kind: "runtime.dependency_prepared",
+      protocolVersion: 1,
+      callId: "prepare-1",
+      requestedExecutable: "new-tool",
+      opportunityId: "opportunity-2",
+      previousRuntimeClosureDigest: "sha256:before",
+      runtimeClosureDigest: "sha256:after"
+    });
+    state = apply(state, "diagnostic", {
+      kind: "runtime.dependency_reprobed",
+      protocolVersion: 1,
+      callId: "probe-2",
+      toolName: "validate",
+      requestedExecutable: "new-tool",
+      opportunityId: "opportunity-2",
+      runtimeClosureDigest: "sha256:after",
+      ok: false,
+      failureCode: "executable_not_found"
+    });
+    expect(state.taskControl).toMatchObject({
+      phase: "terminal",
+      obligation: {
+        kind: "terminal_resolution",
+        failureCode: "capability_recovery_exhausted"
+      }
+    });
+  });
+
   it("rejects new snapshots that carry any legacy task-control authority", () => {
     const state = initial();
     expect(isKernelState(state)).toBe(true);
@@ -364,7 +456,15 @@ describe("TaskControlStateV1", () => {
       { ...header, kind: "completion_evidence", stage: "acquire", evidenceCount: 0 },
       { ...header, kind: "completion_evidence", stage: "terminal", evidenceCount: 1, failureCode: "blocked" },
       { ...header, kind: "review_repair", stage: "mutate", scopePaths: ["src/index.ts"] },
-      { ...header, kind: "capability_recovery", stage: "prepare", opportunityId: "opportunity" },
+      {
+        ...header,
+        kind: "capability_recovery",
+        stage: "prepare",
+        opportunityId: "opportunity",
+        requestedExecutable: "tool",
+        probeToolName: "exec",
+        runtimeClosureDigest: DIGEST_A
+      },
       { ...header, kind: "repository_recovery", stage: "select" },
       { ...header, kind: "restoration", stage: "confirm" },
       { ...header, kind: "process_settlement", stage: "settle", processIds: ["process"] },
