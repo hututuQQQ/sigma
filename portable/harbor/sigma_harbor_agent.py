@@ -325,7 +325,8 @@ def _trace_record(
             "status", "finish_reason", "commands_executed", "input_tokens", "output_tokens",
             "reasoning_tokens", "cache_tokens", "cache_read_tokens", "length_finish_count",
             "converge_turns", "cost_usd", "duration_ms", "suspension_to_exit_ms",
-            "terminal_origin", "execution_mode", "agent_profile", "failure_kind", "failure_code",
+            "terminal_origin", "execution_mode", "managed_environment_mode", "agent_profile",
+            "failure_kind", "failure_code",
         }
         for key in summary_keys:
             value = summary.get(key)
@@ -550,6 +551,7 @@ class SigmaCliHarborAgent(BaseAgent):
         agent_profile: str = "standard",
         network_mode: str = "full",
         execution_mode: str = "sandboxed",
+        managed_environment_mode: str = "disabled",
         max_wall_time_sec: int = 7200,
         agent_timeout_grace_sec: int = 120,
         outer_trial_deadline_sec: int | float | None = None,
@@ -586,6 +588,17 @@ class SigmaCliHarborAgent(BaseAgent):
                 "execution_mode must be one of: sandboxed, container"
             )
         self.execution_mode = execution_mode
+        if managed_environment_mode not in {"disabled", "required"}:
+            raise ValueError(
+                "managed_environment_mode must be one of: disabled, required"
+            )
+        if managed_environment_mode == "required" and (
+            execution_mode != "container" or network_mode != "full"
+        ):
+            raise ValueError(
+                "managed_environment_mode=required needs execution_mode=container and network_mode=full"
+            )
+        self.managed_environment_mode = managed_environment_mode
         self.effective_network_mode: str | None = network_mode
         self.available_network_modes: list[str] = []
         self.effective_read_scope = "host"
@@ -607,6 +620,8 @@ class SigmaCliHarborAgent(BaseAgent):
         self.check_api = bool(check_api)
         self._output_recorder: _OutputRecorder | None = None
         self._process_cleanup: dict[str, Any] | None = None
+        self._managed_broker_bootstrap: dict[str, Any] | None = None
+        self._managed_broker_cleanup: dict[str, Any] | None = None
         self.checkpoint_recovery = recovery_policy
         self.reviewer_waiver_reason = (
             str(reviewer_waiver_reason).strip() if reviewer_waiver_reason else None
@@ -625,12 +640,14 @@ class SigmaCliHarborAgent(BaseAgent):
         await environment.exec("mkdir -p /tmp/agent", timeout_sec=30)
         installed = await environment.exec("command -v /usr/local/bin/agent >/dev/null 2>&1", timeout_sec=30)
         if _return_code(installed) == 0:
+            await self._bootstrap_managed_broker(environment)
             await self._verify_agent_ready(environment)
             return
 
         tarball = self.agent_cli_tarball or self._tarball_from_env()
         if tarball is not None:
             await self._install_tarball(environment, tarball)
+            await self._bootstrap_managed_broker(environment)
             await self._verify_agent_ready(environment)
             return
 
@@ -823,6 +840,11 @@ class SigmaCliHarborAgent(BaseAgent):
                     trace_path = None
                 elif trace_path is None and recorder.events and recorder.trace_path.is_file():
                     trace_path = recorder.trace_path
+            self._managed_broker_cleanup = await self._cleanup_managed_broker(environment)
+            if self._managed_broker_cleanup and self._managed_broker_cleanup.get("error"):
+                artifact_warnings.append(
+                    f"managed broker cleanup: {self._managed_broker_cleanup['error']}"
+                )
 
         derived_summary = self._summary_from_events(events, output_result)
         derived_summary.update(recorder.timing_snapshot())
@@ -871,11 +893,16 @@ class SigmaCliHarborAgent(BaseAgent):
         summary["network_mode_requested"] = self.network_mode
         summary["network_mode_effective"] = self.effective_network_mode
         summary["execution_mode"] = self.execution_mode
+        summary["managed_environment_mode"] = self.managed_environment_mode
         summary["agent_profile"] = self.agent_profile
         summary["read_scope_effective"] = self.effective_read_scope
         summary["process_handoff_available"] = self.process_handoff_available
         if self._process_cleanup is not None:
             summary["process_cleanup"] = self._process_cleanup
+        if self._managed_broker_bootstrap is not None:
+            summary["managed_broker_bootstrap"] = self._managed_broker_bootstrap
+        if self._managed_broker_cleanup is not None:
+            summary["managed_broker_cleanup"] = self._managed_broker_cleanup
         self._populate_context(context, result, summary, error_message)
         if timed_out or protocol_failure is not None:
             self._set_context_value(context, "exit_code", 1)
@@ -925,6 +952,8 @@ class SigmaCliHarborAgent(BaseAgent):
             "workspace-auto",
             "--execution-mode",
             self.execution_mode,
+            "--managed-environment-mode",
+            self.managed_environment_mode,
             "--output-format",
             "stream-json",
             "--output-schema",
@@ -1347,6 +1376,8 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "workspace-auto",
             "--execution-mode",
             self.execution_mode,
+            "--managed-environment-mode",
+            self.managed_environment_mode,
             "--network",
             self.network_mode,
             "--read-scope",
@@ -1507,6 +1538,7 @@ printf '{{"pid_recorded":true,"pid":%s,"pgid":%s,"target":"%s","term_status":%s,
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
             "agent_profile": self.agent_profile,
             "harbor_deadline_sec": self.outer_trial_deadline_sec,
             "sigma_deadline_sec": self.max_wall_time_sec,
@@ -1670,10 +1702,112 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             timeout_sec=180,
         )
 
+    async def _bootstrap_managed_broker(self, environment: BaseEnvironment) -> None:
+        if self.managed_environment_mode != "required":
+            return
+        if self._workspace is None:
+            raise RuntimeError("agent_setup_failed: workspace was not resolved")
+        workspace = shlex.quote(self._workspace)
+        command = f"""
+set -eu
+test ! -e /run/sigma-oci
+test -x /opt/agent-cli/bin/sigma-exec
+umask 077
+nohup /opt/agent-cli/bin/sigma-exec --managed-server --workspace {workspace} --engine docker --network full >/tmp/agent/managed-broker.log 2>&1 &
+broker_pid=$!
+printf '%s\n' "$broker_pid" >/tmp/agent/managed-broker.pid
+ready=0
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+  if test -S /run/sigma-oci/broker.sock && test -f /run/sigma-oci/attestation.json; then ready=1; break; fi
+  kill -0 "$broker_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if test "$ready" -ne 1; then
+  kill "$broker_pid" 2>/dev/null || true
+  wait "$broker_pid" 2>/dev/null || true
+  sed -n '1,80p' /tmp/agent/managed-broker.log >&2 || true
+  exit 1
+fi
+test "$(stat -c %u /run/sigma-oci)" = 0
+test "$(stat -c %u /run/sigma-oci/attestation.json)" = 0
+test "$(stat -c %u /run/sigma-oci/broker.sock)" = 0
+printf '{{"status":"ready","pid":%s}}\n' "$broker_pid"
+""".strip()
+        result = await environment.exec(command, timeout_sec=30)
+        self._managed_broker_bootstrap = self._setup_check_record(
+            "managed_broker_bootstrap", result
+        )
+        if _return_code(result) != 0:
+            raise RuntimeError(
+                self._setup_failure_message("managed_broker_bootstrap", result)
+            )
+
+    async def _cleanup_managed_broker(self, environment: BaseEnvironment) -> dict[str, Any] | None:
+        if self.managed_environment_mode != "required":
+            return None
+        command = """
+set +e
+pid_file=/tmp/agent/managed-broker.pid
+if test ! -f "$pid_file"; then
+  printf '%s\n' '{"status":"missing","pid_recorded":false}'
+  exit 0
+fi
+broker_pid=$(sed -n '1{s/[^0-9].*$//;p;}' "$pid_file")
+case "$broker_pid" in ''|*[!0-9]*) printf '%s\n' '{"status":"invalid_pid"}'; exit 1;; esac
+expected=/opt/agent-cli/bin/sigma-exec
+observed=$(readlink -f "/proc/$broker_pid/exe" 2>/dev/null)
+if test -n "$observed" && test "$observed" != "$expected"; then
+  printf '{"status":"identity_mismatch","pid":%s}\n' "$broker_pid"
+  exit 1
+fi
+kill -TERM "$broker_pid" 2>/dev/null
+term_status=$?
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  kill -0 "$broker_pid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$broker_pid" 2>/dev/null
+alive=$?
+if test "$alive" -eq 0; then kill -KILL "$broker_pid" 2>/dev/null; fi
+wait "$broker_pid" 2>/dev/null
+if test -d /run/sigma-oci && test ! -L /run/sigma-oci && test "$(stat -c %u /run/sigma-oci)" = 0; then
+  chmod 0700 /run/sigma-oci
+  rm -f /run/sigma-oci/broker.sock /run/sigma-oci/attestation.json
+  if test -d /run/sigma-oci/artifacts && test ! -L /run/sigma-oci/artifacts; then rm -rf /run/sigma-oci/artifacts; fi
+  rmdir /run/sigma-oci 2>/dev/null
+fi
+rm -f "$pid_file"
+printf '{"status":"stopped","pid":%s,"term_status":%s,"alive_after_grace":%s}\n' "$broker_pid" "$term_status" "$alive"
+""".strip()
+        try:
+            result = await environment.exec(command, timeout_sec=15)
+        except Exception as exc:
+            return {"status": "cleanup_failed", "error": _bounded_text(str(exc))}
+        output = _stdout_text(result).strip()
+        if output:
+            try:
+                parsed = json.loads(output.splitlines()[-1])
+                if isinstance(parsed, dict):
+                    if _return_code(result) != 0:
+                        parsed["error"] = _bounded_text(_stderr_text(result) or output)
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {
+            "status": "cleanup_failed" if _return_code(result) != 0 else "stopped",
+            "return_code": _return_code(result),
+            "stdout": _bounded_text(output),
+            "stderr": _bounded_text(_stderr_text(result)),
+        }
+
     async def _verify_agent_ready(self, environment: BaseEnvironment) -> None:
         if self._workspace is None:
             raise RuntimeError("agent_setup_failed: workspace was not resolved")
-        checks: list[dict[str, Any]] = []
+        checks: list[dict[str, Any]] = (
+            [dict(self._managed_broker_bootstrap)]
+            if self._managed_broker_bootstrap is not None
+            else []
+        )
         help_check = await environment.exec("/usr/local/bin/agent --help", timeout_sec=30)
         checks.append(self._setup_check_record("help", help_check))
         self._write_setup_checks(checks, "running")
@@ -1686,6 +1820,12 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
                 "/usr/local/bin/agent doctor --workspace",
                 shlex.quote(self._workspace),
                 "--json --strict",
+                "--execution-mode",
+                shlex.quote(self.execution_mode),
+                "--network",
+                shlex.quote(self.network_mode),
+                "--managed-environment-mode",
+                shlex.quote(self.managed_environment_mode),
                 *( ["--check-api"] if self.check_api else [] ),
             ]),
             env=self._agent_env() or None,
@@ -1761,6 +1901,18 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             return "capabilities.networkModes are missing or invalid"
         if not isinstance(capabilities.get("processHandoff"), bool):
             return "capabilities.processHandoff is missing or invalid"
+        if self.managed_environment_mode == "required":
+            container = doctor_json.get("container")
+            managed = capabilities.get("managedEnvironment")
+            closure = capabilities.get("runtimeClosure")
+            if not isinstance(container, dict) or container.get("available") is not True \
+                    or container.get("target") != "managed":
+                return "required managed container identity is unavailable"
+            if not isinstance(managed, dict) or managed.get("available") is not True \
+                    or managed.get("prepare") is not True:
+                return "required managed environment preparation capability is unavailable"
+            if not isinstance(closure, dict) or closure.get("complete") is not True:
+                return "required managed runtime closure is incomplete"
         return None
 
     def _write_setup_checks(self, checks: list[dict[str, Any]], status: str) -> None:
@@ -1771,6 +1923,8 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "network_mode_requested": self.network_mode,
             "network_mode_effective": self.effective_network_mode,
             "execution_mode": self.execution_mode,
+            "managed_environment_mode": self.managed_environment_mode,
+            "managed_broker_bootstrap": self._managed_broker_bootstrap,
             "agent_profile": self.agent_profile,
             "available_network_modes": list(self.available_network_modes),
             "read_scope_effective": self.effective_read_scope,
@@ -1933,6 +2087,9 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "suspension_to_exit_ms": summary.get("suspension_to_exit_ms"),
             "terminal_origin": summary.get("terminal_origin"),
             "execution_mode": summary.get("execution_mode", self.execution_mode),
+            "managed_environment_mode": summary.get(
+                "managed_environment_mode", self.managed_environment_mode
+            ),
             "agent_profile": summary.get("agent_profile", self.agent_profile),
             "network_mode_requested": summary.get("network_mode_requested", self.network_mode),
             "network_mode_effective": summary.get("network_mode_effective", self.effective_network_mode),
@@ -2003,6 +2160,9 @@ ln -sf /opt/agent-cli/bin/agent /usr/local/bin/agent
             "suspension_to_exit_ms": getattr(context, "suspension_to_exit_ms", None),
             "terminal_origin": getattr(context, "terminal_origin", None),
             "execution_mode": getattr(context, "execution_mode", self.execution_mode),
+            "managed_environment_mode": getattr(
+                context, "managed_environment_mode", self.managed_environment_mode
+            ),
             "agent_profile": getattr(context, "agent_profile", self.agent_profile),
             "network_mode_requested": getattr(context, "network_mode_requested", self.network_mode),
             "network_mode_effective": getattr(context, "network_mode_effective", self.effective_network_mode),

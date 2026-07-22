@@ -582,7 +582,8 @@ function benchmarkAgentKwargs(options, timeoutPlan = null) {
     provider: options.provider,
     agent_profile: options.agentProfile ?? "standard",
     network_mode: options.networkMode ?? "none",
-    execution_mode: options.executionMode ?? "sandboxed"
+    execution_mode: options.executionMode ?? "sandboxed",
+    managed_environment_mode: options.managedEnvironmentMode ?? "disabled"
   };
   if (options.model) {
     agentKwargs.model = options.model;
